@@ -40,17 +40,11 @@ pub enum WireMessage {
 
     /// Request missing directives by ID.
     #[serde(rename = "want")]
-    Want {
-        v: u64,
-        ids: Vec<String>,
-    },
+    Want { v: u64, ids: Vec<String> },
 
     /// Supply requested directives.
     #[serde(rename = "supply")]
-    Supply {
-        v: u64,
-        entries: Vec<SupplyEntry>,
-    },
+    Supply { v: u64, entries: Vec<SupplyEntry> },
 }
 
 /// The kind of directive being announced or supplied.
@@ -157,8 +151,8 @@ impl WireMessage {
         if data.len() < 4 + len {
             return Err(WireError::InsufficientData);
         }
-        let msg = Self::from_cbor(&data[4..4 + len])
-            .map_err(|e| WireError::CborDecode(e.to_string()))?;
+        let msg =
+            Self::from_cbor(&data[4..4 + len]).map_err(|e| WireError::CborDecode(e.to_string()))?;
         if msg.version() != WIRE_VERSION {
             return Err(WireError::UnsupportedVersion(msg.version()));
         }
@@ -251,7 +245,8 @@ mod tests {
         let entry = SupplyEntry {
             id: "txid123".to_owned(),
             kind: DirectiveKind::Transaction,
-            economic_bean: "2024-01-15 * \"Test\"\n  Assets:Cash 100 USD\n  Equity:Opening -100 USD".to_owned(),
+            economic_bean:
+                "2024-01-15 * \"Test\"\n  Assets:Cash 100 USD\n  Equity:Opening -100 USD".to_owned(),
             envelope: BTreeMap::from([
                 ("openledger-author".to_owned(), "peer-1".to_owned()),
                 ("openledger-lamport".to_owned(), "1".to_owned()),

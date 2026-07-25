@@ -8,8 +8,8 @@ pub mod types;
 
 use std::sync::Arc;
 
-use async_graphql::Schema;
 use async_graphql::http::GraphiQLSource;
+use async_graphql::Schema;
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::extract::State;
 use axum::response::{Html, IntoResponse};
@@ -76,10 +76,12 @@ mod tests {
     #[tokio::test]
     async fn test_schema_introspection() {
         let schema = build_schema();
-        let result = schema
-            .execute("{ __schema { queryType { name } } }")
-            .await;
-        assert!(result.errors.is_empty(), "introspection errors: {:?}", result.errors);
+        let result = schema.execute("{ __schema { queryType { name } } }").await;
+        assert!(
+            result.errors.is_empty(),
+            "introspection errors: {:?}",
+            result.errors
+        );
         let data = result.data.into_json().unwrap();
         assert_eq!(data["__schema"]["queryType"]["name"], "QueryRoot");
     }
@@ -100,9 +102,7 @@ mod tests {
     async fn test_all_query_fields_present() {
         let schema = build_schema();
         let result = schema
-            .execute(
-                r#"{ __type(name: "QueryRoot") { fields { name } } }"#,
-            )
+            .execute(r#"{ __type(name: "QueryRoot") { fields { name } } }"#)
             .await;
         assert!(result.errors.is_empty());
         let data = result.data.into_json().unwrap();
@@ -124,10 +124,7 @@ mod tests {
             "peers",
         ];
         for name in &expected {
-            assert!(
-                field_names.contains(name),
-                "missing query field: {name}"
-            );
+            assert!(field_names.contains(name), "missing query field: {name}");
         }
     }
 
@@ -135,9 +132,7 @@ mod tests {
     async fn test_all_mutation_fields_present() {
         let schema = build_schema();
         let result = schema
-            .execute(
-                r#"{ __type(name: "MutationRoot") { fields { name } } }"#,
-            )
+            .execute(r#"{ __type(name: "MutationRoot") { fields { name } } }"#)
             .await;
         assert!(result.errors.is_empty());
         let data = result.data.into_json().unwrap();
@@ -149,10 +144,7 @@ mod tests {
             .collect();
         let expected = ["appendTransaction", "openAccount", "closeAccount"];
         for name in &expected {
-            assert!(
-                field_names.contains(name),
-                "missing mutation field: {name}"
-            );
+            assert!(field_names.contains(name), "missing mutation field: {name}");
         }
     }
 
@@ -164,7 +156,10 @@ mod tests {
             let result = schema.execute(&query).await;
             assert!(result.errors.is_empty());
             let data = result.data.into_json().unwrap();
-            assert_eq!(data["__type"]["kind"], "SCALAR", "expected {scalar_name} to be a SCALAR");
+            assert_eq!(
+                data["__type"]["kind"], "SCALAR",
+                "expected {scalar_name} to be a SCALAR"
+            );
         }
     }
 
@@ -180,9 +175,7 @@ mod tests {
         let schema = build_schema_with_service(ledger, broadcast);
 
         // Health should show 0 heads.
-        let result = schema
-            .execute("{ health { status heads } }")
-            .await;
+        let result = schema.execute("{ health { status heads } }").await;
         assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
         let data = result.data.into_json().unwrap();
         assert_eq!(data["health"]["status"], "ok");

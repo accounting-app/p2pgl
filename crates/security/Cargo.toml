@@ -10,5 +10,11 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 hex = "0.4"
 
+[dev-dependencies]
+ledger = { path = "../ledger" }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = "1"
+
 [lints]
 workspace = true

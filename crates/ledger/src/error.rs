@@ -41,7 +41,12 @@ pub enum ParseErrorKind {
 }
 
 impl ParseError {
-    pub fn new(line: usize, column: usize, message: impl Into<String>, kind: ParseErrorKind) -> Self {
+    pub fn new(
+        line: usize,
+        column: usize,
+        message: impl Into<String>,
+        kind: ParseErrorKind,
+    ) -> Self {
         ParseError {
             line,
             column,

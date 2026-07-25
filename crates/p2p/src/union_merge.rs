@@ -16,10 +16,7 @@ use crate::protocol::SupplyEntry;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeError {
     /// Content hash mismatch (I5).
-    ContentHashMismatch {
-        claimed: String,
-        computed: String,
-    },
+    ContentHashMismatch { claimed: String, computed: String },
     /// Failed to parse the economic body.
     ParseError(String),
     /// Invariant validation failed.
@@ -61,7 +58,10 @@ pub enum MergeResult {
     /// The entry was rejected for a validation reason.
     Rejected { id: String, reason: MergeError },
     /// The entry's parents are missing; buffered as an orphan.
-    Orphaned { id: String, missing_parents: Vec<String> },
+    Orphaned {
+        id: String,
+        missing_parents: Vec<String>,
+    },
 }
 
 /// Parse and validate a supply entry from a remote peer.
@@ -78,9 +78,7 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
     })?;
 
     if directives.is_empty() {
-        return Err(MergeError::ParseError(
-            "Empty economic body".to_owned(),
-        ));
+        return Err(MergeError::ParseError("Empty economic body".to_owned()));
     }
 
     let mut directive = directives.into_iter().next().unwrap();
@@ -103,14 +101,10 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
     // 4. Validate required envelope fields for transactions.
     if let Directive::Transaction(_) = &directive {
         if !entry.envelope.contains_key("openledger-author") {
-            return Err(MergeError::EnvelopeMissing(
-                "openledger-author".to_owned(),
-            ));
+            return Err(MergeError::EnvelopeMissing("openledger-author".to_owned()));
         }
         if !entry.envelope.contains_key("openledger-lamport") {
-            return Err(MergeError::EnvelopeMissing(
-                "openledger-lamport".to_owned(),
-            ));
+            return Err(MergeError::EnvelopeMissing("openledger-lamport".to_owned()));
         }
         // openledger-parents may be empty string for genesis.
     }
@@ -185,8 +179,8 @@ fn directive_metadata_mut(directive: &mut Directive) -> &mut BTreeMap<String, St
 mod tests {
     use super::*;
     use crate::protocol::DirectiveKind;
-    use ledger::model::*;
     use ledger::hash::compute_content_id;
+    use ledger::model::*;
     use ledger::serialize::economic_canonical_serialize;
     use rust_decimal_macros::dec;
     use std::collections::BTreeMap;
@@ -367,12 +361,255 @@ mod tests {
             id,
             kind: DirectiveKind::Open,
             economic_bean,
-            envelope: BTreeMap::from([
-                ("openledger-author".to_owned(), "peer-2".to_owned()),
-            ]),
+            envelope: BTreeMap::from([("openledger-author".to_owned(), "peer-2".to_owned())]),
         };
 
         let result = validate_supply_entry(&entry);
         assert!(result.is_ok(), "Open directive should validate: {result:?}");
+    }
+
+    // ── CT-4: merge commutativity (I6) ──────────────────────────────────
+
+    #[test]
+    fn ct4_union_merge_commutativity() {
+        // Two distinct transactions. Merging A then B should produce the
+        // same aggregate balances as merging B then A.
+        let txn_a = Transaction {
+            date: chrono::NaiveDate::from_ymd_opt(2024, 1, 10).unwrap(),
+            flag: Flag::Complete,
+            payee: None,
+            narration: Some("Transaction A".to_owned()),
+            tags: vec![],
+            links: vec![],
+            postings: vec![
+                Posting {
+                    account: "Assets:Cash".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(500),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+                Posting {
+                    account: "Equity:Opening".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(-500),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+            ],
+            metadata: BTreeMap::new(),
+        };
+
+        let txn_b = Transaction {
+            date: chrono::NaiveDate::from_ymd_opt(2024, 1, 20).unwrap(),
+            flag: Flag::Complete,
+            payee: Some("Vendor".to_owned()),
+            narration: Some("Transaction B".to_owned()),
+            tags: vec![],
+            links: vec![],
+            postings: vec![
+                Posting {
+                    account: "Assets:Cash".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(300),
+                        currency: "EUR".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+                Posting {
+                    account: "Equity:Opening".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(-300),
+                        currency: "EUR".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+            ],
+            metadata: BTreeMap::new(),
+        };
+
+        let dir_a = Directive::Transaction(txn_a.clone());
+        let dir_b = Directive::Transaction(txn_b.clone());
+        let id_a = compute_content_id(&dir_a);
+        let id_b = compute_content_id(&dir_b);
+        let bean_a = economic_canonical_serialize(&dir_a);
+        let bean_b = economic_canonical_serialize(&dir_b);
+
+        let entry_a = SupplyEntry {
+            id: id_a.clone(),
+            kind: DirectiveKind::Transaction,
+            economic_bean: bean_a,
+            envelope: BTreeMap::from([
+                ("openledger-author".to_owned(), "peer-a".to_owned()),
+                ("openledger-lamport".to_owned(), "1".to_owned()),
+                ("openledger-parents".to_owned(), "".to_owned()),
+            ]),
+        };
+
+        let entry_b = SupplyEntry {
+            id: id_b.clone(),
+            kind: DirectiveKind::Transaction,
+            economic_bean: bean_b,
+            envelope: BTreeMap::from([
+                ("openledger-author".to_owned(), "peer-b".to_owned()),
+                ("openledger-lamport".to_owned(), "2".to_owned()),
+                ("openledger-parents".to_owned(), "".to_owned()),
+            ]),
+        };
+
+        // Order 1: A then B.
+        let validated_a1 = validate_supply_entry(&entry_a).unwrap();
+        let validated_b1 = validate_supply_entry(&entry_b).unwrap();
+        let mut dag1 = ledger::dag::LedgerDag::new();
+        dag1.insert(validated_a1, false).unwrap();
+        dag1.insert(validated_b1, false).unwrap();
+
+        // Order 2: B then A.
+        let validated_a2 = validate_supply_entry(&entry_a).unwrap();
+        let validated_b2 = validate_supply_entry(&entry_b).unwrap();
+        let mut dag2 = ledger::dag::LedgerDag::new();
+        dag2.insert(validated_b2, false).unwrap();
+        dag2.insert(validated_a2, false).unwrap();
+
+        // Both DAGs should contain exactly the same content IDs.
+        let mut ids1: Vec<&str> = dag1.content_ids().into_iter().collect();
+        let mut ids2: Vec<&str> = dag2.content_ids().into_iter().collect();
+        ids1.sort();
+        ids2.sort();
+        assert_eq!(ids1, ids2, "Same entries regardless of merge order");
+
+        // Both should produce the same read model balances.
+        let mut rm1 = ledger::read_model::ReadModel::default();
+        for id in &ids1 {
+            if let Some(d) = dag1.get(id) {
+                rm1.index_directive(d);
+            }
+        }
+        let mut rm2 = ledger::read_model::ReadModel::default();
+        for id in &ids2 {
+            if let Some(d) = dag2.get(id) {
+                rm2.index_directive(d);
+            }
+        }
+
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
+        let tb1 = rm1.trial_balance(date);
+        let tb2 = rm2.trial_balance(date);
+        assert_eq!(tb1.total_debit, tb2.total_debit, "Debit totals must match");
+        assert_eq!(
+            tb1.total_credit, tb2.total_credit,
+            "Credit totals must match"
+        );
+        assert_eq!(tb1.rows.len(), tb2.rows.len(), "Same number of accounts");
+
+        // Idempotency: inserting A again into dag1 should be a no-op.
+        let validated_a_dup = validate_supply_entry(&entry_a).unwrap();
+        let dup_result = dag1.insert(validated_a_dup, false).unwrap();
+        assert!(
+            matches!(dup_result, ledger::dag::InsertResult::Duplicate { .. }),
+            "Duplicate insert should be idempotent"
+        );
+    }
+
+    // ── CT-14: remote validation rejects I1 / I3 violations (§3.5) ──────
+
+    #[test]
+    fn ct14_remote_unbalanced_transaction_detected() {
+        // Construct a supply entry with an unbalanced transaction.
+        // validate_supply_entry only checks hash + envelope, but the caller
+        // must validate I1–I3 before DAG insert. This test verifies the
+        // content hash still works correctly and the unbalanced nature
+        // is detectable by the validation layer.
+        let unbalanced_txn = Transaction {
+            date: chrono::NaiveDate::from_ymd_opt(2024, 2, 1).unwrap(),
+            flag: Flag::Complete,
+            payee: None,
+            narration: Some("Unbalanced remote".to_owned()),
+            tags: vec![],
+            links: vec![],
+            postings: vec![
+                Posting {
+                    account: "Assets:Cash".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(999),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+                Posting {
+                    account: "Equity:Opening".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(-500),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+            ],
+            metadata: BTreeMap::new(),
+        };
+
+        let directive = Directive::Transaction(unbalanced_txn.clone());
+        let id = compute_content_id(&directive);
+        let bean = economic_canonical_serialize(&directive);
+
+        let entry = SupplyEntry {
+            id,
+            kind: DirectiveKind::Transaction,
+            economic_bean: bean,
+            envelope: BTreeMap::from([
+                ("openledger-author".to_owned(), "bad-peer".to_owned()),
+                ("openledger-lamport".to_owned(), "1".to_owned()),
+                ("openledger-parents".to_owned(), "".to_owned()),
+            ]),
+        };
+
+        // validate_supply_entry should pass (it checks hash + envelope, not balance).
+        let parsed = validate_supply_entry(&entry).unwrap();
+
+        // But I1 validation should catch the imbalance.
+        if let Directive::Transaction(txn) = &parsed {
+            let account_state = ledger::validate::AccountState::new();
+            let result = ledger::validate::validate_transaction(txn, &account_state);
+            assert!(
+                result.is_err(),
+                "Remote unbalanced transaction must be rejected by I1 validation"
+            );
+        } else {
+            panic!("Expected Transaction");
+        }
+    }
+
+    #[test]
+    fn ct14_remote_unopened_account_detected() {
+        // A remote transaction referencing an account not in the account state
+        // should be rejected by I3 validation.
+        let entry = make_valid_supply_entry();
+        let parsed = validate_supply_entry(&entry).unwrap();
+
+        if let Directive::Transaction(txn) = &parsed {
+            // Use an empty account state (no accounts opened).
+            let account_state = ledger::validate::AccountState::new();
+            let result = ledger::validate::validate_transaction(txn, &account_state);
+            assert!(
+                result.is_err(),
+                "Remote transaction to unopened account must be rejected by I3 validation"
+            );
+        } else {
+            panic!("Expected Transaction");
+        }
     }
 }

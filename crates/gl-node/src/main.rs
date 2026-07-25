@@ -99,7 +99,10 @@ async fn main() {
     let graphql_routes = Router::new()
         .route("/graphql", get(graphiql_handler).post(graphql_handler))
         .with_state(schema)
-        .layer(middleware::from_fn_with_state(auth_state, auth::auth_middleware));
+        .layer(middleware::from_fn_with_state(
+            auth_state,
+            auth::auth_middleware,
+        ));
 
     // Build full application router.
     // /health is exempt from auth (§2.9).

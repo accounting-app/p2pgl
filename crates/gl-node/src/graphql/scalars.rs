@@ -40,8 +40,9 @@ impl ScalarType for DecimalScalar {
             }
             // Also accept JSON numbers for convenience.
             Value::Number(number) => {
-                let decimal = Decimal::from_str(&number.to_string())
-                    .map_err(|_| InputValueError::custom("Number cannot be represented as decimal"))?;
+                let decimal = Decimal::from_str(&number.to_string()).map_err(|_| {
+                    InputValueError::custom("Number cannot be represented as decimal")
+                })?;
                 Ok(DecimalScalar(decimal))
             }
             _ => Err(InputValueError::expected_type(value)),
@@ -63,7 +64,9 @@ impl ScalarType for TransactionId {
         match &value {
             Value::String(hex_string) => {
                 if hex_string.len() == 64
-                    && hex_string.chars().all(|character| character.is_ascii_hexdigit())
+                    && hex_string
+                        .chars()
+                        .all(|character| character.is_ascii_hexdigit())
                 {
                     Ok(TransactionId(hex_string.to_lowercase()))
                 } else {

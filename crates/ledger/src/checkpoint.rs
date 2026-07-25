@@ -32,15 +32,10 @@ pub struct AssertionResult {
 ///
 /// Per §3.6: assertions are informational — failed ones are reported, never
 /// used to reject transactions.
-pub fn evaluate_balance_assertion(
-    balance: &Balance,
-    read_model: &ReadModel,
-) -> AssertionResult {
+pub fn evaluate_balance_assertion(balance: &Balance, read_model: &ReadModel) -> AssertionResult {
     let actual = read_model
         .account_balance(&balance.account, Some(balance.date))
-        .and_then(|entry| {
-            entry.balances.get(&balance.amount.currency).copied()
-        })
+        .and_then(|entry| entry.balances.get(&balance.amount.currency).copied())
         .unwrap_or(Decimal::ZERO);
 
     let ok = actual == balance.amount.number;
@@ -143,17 +138,17 @@ pub fn evaluate_all_assertions(
 /// Per §3.6: a `pad` directive is followed by a `balance` directive for the
 /// same account. We match them by account and generate pad transactions
 /// for the first balance after each pad.
-pub fn generate_all_pads(
-    directives: &[Directive],
-    read_model: &ReadModel,
-) -> Vec<Transaction> {
+pub fn generate_all_pads(directives: &[Directive], read_model: &ReadModel) -> Vec<Transaction> {
     let mut pads_by_account: BTreeMap<String, Vec<&Pad>> = BTreeMap::new();
     let mut balances_by_account: BTreeMap<String, Vec<&Balance>> = BTreeMap::new();
 
     for d in directives {
         match d {
             Directive::Pad(p) => {
-                pads_by_account.entry(p.account.clone()).or_default().push(p);
+                pads_by_account
+                    .entry(p.account.clone())
+                    .or_default()
+                    .push(p);
             }
             Directive::Balance(b) => {
                 balances_by_account
@@ -338,10 +333,7 @@ mod tests {
         assert_eq!(txn.postings.len(), 2);
         // delta = 1000 - 800 = 200
         assert_eq!(txn.postings[0].amount.as_ref().unwrap().number, dec!(200));
-        assert_eq!(
-            txn.postings[1].amount.as_ref().unwrap().number,
-            dec!(-200)
-        );
+        assert_eq!(txn.postings[1].amount.as_ref().unwrap().number, dec!(-200));
     }
 
     #[test]
@@ -503,8 +495,7 @@ mod tests {
         assert!(
             results[0].ok,
             "Golden fixture balance assertion should pass: expected={}, actual={}",
-            results[0].expected,
-            results[0].actual
+            results[0].expected, results[0].actual
         );
     }
 }

@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use crate::protocol::{WireMessage, SupplyEntry};
+use crate::protocol::{SupplyEntry, WireMessage};
 
 /// Compute which IDs the remote has that we don't (the `want` set).
 ///
@@ -141,14 +141,24 @@ mod tests {
     #[test]
     fn test_compute_want_empty_local() {
         let local = HashSet::new();
-        let want = compute_want(&local, &HashSet::new(), &["tx1".to_owned(), "tx2".to_owned()], &[]);
+        let want = compute_want(
+            &local,
+            &HashSet::new(),
+            &["tx1".to_owned(), "tx2".to_owned()],
+            &[],
+        );
         assert_eq!(want.len(), 2);
     }
 
     #[test]
     fn test_compute_want_all_present() {
         let local = set(&["tx1", "tx2"]);
-        let want = compute_want(&local, &HashSet::new(), &["tx1".to_owned(), "tx2".to_owned()], &[]);
+        let want = compute_want(
+            &local,
+            &HashSet::new(),
+            &["tx1".to_owned(), "tx2".to_owned()],
+            &[],
+        );
         assert!(want.is_empty(), "All present → nothing to want");
     }
 
@@ -220,12 +230,7 @@ mod tests {
     #[test]
     fn test_head_exchange_remote_behind() {
         let local = set(&["tx1", "tx2", "tx3"]);
-        let result = head_exchange(
-            &local,
-            &HashSet::new(),
-            &["tx1".to_owned()],
-            &[],
-        );
+        let result = head_exchange(&local, &HashSet::new(), &["tx1".to_owned()], &[]);
         assert!(!result.is_synced);
         assert!(result.want_from_remote.is_empty());
         assert_eq!(result.want_from_local.len(), 2); // tx2, tx3

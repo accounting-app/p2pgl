@@ -67,8 +67,7 @@ mod tests {
 
         let txid = compute_content_id(&Directive::Transaction(txn));
         assert_eq!(
-            txid,
-            "dd4a9ec5ec298be6edaa02c4408c0b1cb1b25eb51426599b7eda600cfc5fa88f",
+            txid, "dd4a9ec5ec298be6edaa02c4408c0b1cb1b25eb51426599b7eda600cfc5fa88f",
             "CT-3: worked fixture txid must match §3.3.3"
         );
     }
@@ -140,7 +139,8 @@ mod tests {
         let id = compute_content_id(&Directive::Open(open));
         assert_eq!(id.len(), 64, "content ID must be 64 hex characters");
         assert!(
-            id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            id.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "content ID must be lowercase hex"
         );
     }

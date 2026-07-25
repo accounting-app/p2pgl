@@ -15,18 +15,11 @@ use crate::weights::{resolve_elided, sum_weights, WeightError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
     /// I1: per-currency weights don't sum to zero.
-    UnbalancedTransaction {
-        imbalances: Vec<CurrencyImbalance>,
-    },
+    UnbalancedTransaction { imbalances: Vec<CurrencyImbalance> },
     /// I2: more than one elided posting, or elision can't resolve.
-    InvalidElision {
-        reason: String,
-    },
+    InvalidElision { reason: String },
     /// I3: account not open at transaction date.
-    AccountNotOpen {
-        account: String,
-        date: NaiveDate,
-    },
+    AccountNotOpen { account: String, date: NaiveDate },
     /// I3: account closed before transaction date.
     AccountClosed {
         account: String,
@@ -40,9 +33,7 @@ pub enum ValidationError {
         allowed: Vec<String>,
     },
     /// §3.5.1: both cost and price on the same posting.
-    InvalidPosting {
-        message: String,
-    },
+    InvalidPosting { message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,11 +153,7 @@ impl AccountState {
     }
 
     /// Register an account closing.
-    pub fn close_account(
-        &mut self,
-        account: &str,
-        date: NaiveDate,
-    ) -> Result<(), ValidationError> {
+    pub fn close_account(&mut self, account: &str, date: NaiveDate) -> Result<(), ValidationError> {
         match self.accounts.get_mut(account) {
             Some(info) => {
                 info.close_date = Some(date);
@@ -190,12 +177,13 @@ impl AccountState {
         account: &str,
         date: NaiveDate,
     ) -> Result<(), ValidationError> {
-        let info = self.accounts.get(account).ok_or_else(|| {
-            ValidationError::AccountNotOpen {
+        let info = self
+            .accounts
+            .get(account)
+            .ok_or_else(|| ValidationError::AccountNotOpen {
                 account: account.to_owned(),
                 date,
-            }
-        })?;
+            })?;
 
         if info.open_date > date {
             return Err(ValidationError::AccountNotOpen {
@@ -242,7 +230,9 @@ impl AccountState {
 
     /// Returns the currency constraint list for an account (empty = any currency).
     pub fn currencies(&self, account: &str) -> Option<&[String]> {
-        self.accounts.get(account).map(|info| info.currencies.as_slice())
+        self.accounts
+            .get(account)
+            .map(|info| info.currencies.as_slice())
     }
 
     /// Returns true if the account is currently open (opened and not yet closed).
@@ -459,7 +449,10 @@ mod tests {
             metadata: BTreeMap::new(),
         };
         let result = validate_transaction(&txn, &accounts);
-        assert!(result.is_ok(), "Multi-currency with price should balance: {result:?}");
+        assert!(
+            result.is_ok(),
+            "Multi-currency with price should balance: {result:?}"
+        );
     }
 
     // ── CT-2: I2 elided posting ──────────────────────────────────────────
@@ -566,7 +559,10 @@ mod tests {
 
         let txn = simple_balanced_txn(); // date = 2024-01-15
         let result = validate_transaction(&txn, &accounts);
-        assert!(result.is_ok(), "Same-day close should be allowed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "Same-day close should be allowed: {result:?}"
+        );
     }
 
     #[test]
@@ -657,11 +653,19 @@ mod tests {
     fn test_currency_constraint() {
         let mut state = AccountState::new();
         state
-            .open_account("Assets:Cash", make_date(2024, 1, 1), &["USD".to_owned(), "EUR".to_owned()])
+            .open_account(
+                "Assets:Cash",
+                make_date(2024, 1, 1),
+                &["USD".to_owned(), "EUR".to_owned()],
+            )
             .unwrap();
 
-        assert!(state.check_currency_constraint("Assets:Cash", "USD").is_ok());
-        assert!(state.check_currency_constraint("Assets:Cash", "EUR").is_ok());
+        assert!(state
+            .check_currency_constraint("Assets:Cash", "USD")
+            .is_ok());
+        assert!(state
+            .check_currency_constraint("Assets:Cash", "EUR")
+            .is_ok());
         assert!(state
             .check_currency_constraint("Assets:Cash", "GBP")
             .is_err());

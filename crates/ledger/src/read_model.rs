@@ -143,8 +143,9 @@ impl ReadModel {
                         .account_balances
                         .entry(posting.account.clone())
                         .or_default();
-                    *balances.entry(amount.currency.clone()).or_insert(Decimal::ZERO) +=
-                        amount.number;
+                    *balances
+                        .entry(amount.currency.clone())
+                        .or_insert(Decimal::ZERO) += amount.number;
                 }
             }
 
@@ -416,8 +417,7 @@ impl ReadModel {
             }
             for posting in &indexed.transaction.postings {
                 if let Some(ref amount) = posting.amount {
-                    let account_balances =
-                        balances.entry(posting.account.clone()).or_default();
+                    let account_balances = balances.entry(posting.account.clone()).or_default();
                     *account_balances
                         .entry(amount.currency.clone())
                         .or_insert(Decimal::ZERO) += amount.number;
@@ -442,8 +442,7 @@ impl ReadModel {
             }
             for posting in &indexed.transaction.postings {
                 if let Some(ref amount) = posting.amount {
-                    let account_balances =
-                        balances.entry(posting.account.clone()).or_default();
+                    let account_balances = balances.entry(posting.account.clone()).or_default();
                     *account_balances
                         .entry(amount.currency.clone())
                         .or_insert(Decimal::ZERO) += amount.number;
@@ -454,9 +453,6 @@ impl ReadModel {
         balances
     }
 }
-
-
-
 
 /// Extract the root account type (e.g., "Assets" from "Assets:Cash:Checking").
 fn account_root(account: &str) -> &str {
@@ -748,10 +744,7 @@ mod tests {
         let model = ReadModel::build(&directives);
         let journal = model.journal(Some("Expenses:Rent"), None, None, 100, 0);
         assert_eq!(journal.len(), 1);
-        assert_eq!(
-            journal[0].transaction.narration,
-            Some("Rent".to_owned())
-        );
+        assert_eq!(journal[0].transaction.narration, Some("Rent".to_owned()));
     }
 
     #[test]
@@ -910,7 +903,11 @@ mod tests {
         let model = ReadModel::build(&directives);
 
         // The fixture has 3 transactions.
-        assert_eq!(model.transaction_count(), 3, "Fixture should have 3 transactions");
+        assert_eq!(
+            model.transaction_count(),
+            3,
+            "Fixture should have 3 transactions"
+        );
 
         // Balance sheet should satisfy the accounting equation (per currency).
         let bs = model.balance_sheet(make_date(2025, 12, 31));

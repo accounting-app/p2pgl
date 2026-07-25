@@ -48,7 +48,9 @@ impl QueryRoot {
         if let Ok(ledger) = ctx.data::<SharedLedger>() {
             let svc = ledger.read().await;
             let report = svc.read_model().balance_sheet(at.0);
-            fn convert_balances(entries: &[ledger::read_model::AccountBalanceEntry]) -> Vec<AccountBalance> {
+            fn convert_balances(
+                entries: &[ledger::read_model::AccountBalanceEntry],
+            ) -> Vec<AccountBalance> {
                 entries
                     .iter()
                     .map(|entry| AccountBalance {
@@ -90,7 +92,9 @@ impl QueryRoot {
         if let Ok(ledger) = ctx.data::<SharedLedger>() {
             let svc = ledger.read().await;
             let report = svc.read_model().income_statement(from.0, to.0);
-            fn convert_entries(entries: &[ledger::read_model::AccountBalanceEntry]) -> Vec<AccountBalance> {
+            fn convert_entries(
+                entries: &[ledger::read_model::AccountBalanceEntry],
+            ) -> Vec<AccountBalance> {
                 entries
                     .iter()
                     .map(|entry| AccountBalance {
@@ -160,11 +164,7 @@ impl QueryRoot {
     }
 
     /// Look up a single transaction by its content hash.
-    async fn transaction(
-        &self,
-        ctx: &Context<'_>,
-        txid: TransactionId,
-    ) -> Option<Transaction> {
+    async fn transaction(&self, ctx: &Context<'_>, txid: TransactionId) -> Option<Transaction> {
         if let Ok(ledger) = ctx.data::<SharedLedger>() {
             let svc = ledger.read().await;
             if let Some(ledger::model::Directive::Transaction(txn)) = svc.get_directive(&txid.0) {
@@ -250,9 +250,8 @@ pub fn domain_txn_to_graphql(
     txn: &ledger::model::Transaction,
     svc: &ledger::service::LedgerService,
 ) -> Transaction {
-    let content_id = ledger::hash::compute_content_id(&ledger::model::Directive::Transaction(
-        txn.clone(),
-    ));
+    let content_id =
+        ledger::hash::compute_content_id(&ledger::model::Directive::Transaction(txn.clone()));
     Transaction {
         txid: TransactionId(content_id),
         date: DateScalar(txn.date),

@@ -1,0 +1,15 @@
+; Cost and price fixture — exercises @ and {cost} weight paths (§3.5.1, §5.1).
+
+2024-01-01 open Assets:Cash USD
+2024-01-01 open Assets:Stock AAPL
+2024-01-01 open Equity:Opening USD
+2024-01-01 open Income:Gains USD
+
+2024-01-15 * "Broker" "Buy 10 shares AAPL"
+  Assets:Stock                                     10 AAPL {150.00 USD}
+  Assets:Cash                                      -1500.00 USD
+
+2024-06-01 * "Broker" "Sell 5 shares AAPL"
+  Assets:Cash                                      900.00 USD
+  Assets:Stock                                     -5 AAPL {150.00 USD}
+  Income:Gains                                     -150.00 USD

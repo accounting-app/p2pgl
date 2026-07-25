@@ -205,7 +205,11 @@ mod tests {
         assert!(provider.is_enabled());
 
         let sig = provider.sign(content_id).unwrap();
-        assert_eq!(sig.len(), 128, "Ed25519 signature should be 128 hex chars (64 bytes)");
+        assert_eq!(
+            sig.len(),
+            128,
+            "Ed25519 signature should be 128 hex chars (64 bytes)"
+        );
 
         // Verify with the provider's own public key.
         let result = provider.verify(content_id, &sig, &provider.public_key_hex());
@@ -281,5 +285,100 @@ mod tests {
 
         let result = verify_signature(content_id, &sig, &provider.public_key_hex());
         assert!(result.is_ok());
+    }
+
+    // ── CT-10: signing toggle (§3.8) ────────────────────────────────────
+
+    #[test]
+    fn ct10_signing_toggle_does_not_change_txid() {
+        use ledger::hash::compute_content_id;
+        use ledger::model::*;
+        use rust_decimal_macros::dec;
+        use std::collections::BTreeMap;
+
+        // Create a transaction with no envelope metadata.
+        let txn_unsigned = Transaction {
+            date: chrono::NaiveDate::from_ymd_opt(2024, 1, 15).unwrap(),
+            flag: Flag::Complete,
+            payee: Some("Acme Corp".to_owned()),
+            narration: Some("CT-10 test".to_owned()),
+            tags: vec![],
+            links: vec![],
+            postings: vec![
+                Posting {
+                    account: "Assets:Cash".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(100),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+                Posting {
+                    account: "Equity:Opening".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(-100),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+            ],
+            metadata: BTreeMap::new(),
+        };
+        let txid_unsigned = compute_content_id(&Directive::Transaction(txn_unsigned.clone()));
+
+        // Same transaction WITH envelope metadata (signing on).
+        let provider = PeerKeySignatureProvider::generate();
+        let sig = provider.sign(&txid_unsigned).unwrap();
+        let mut signed_metadata = BTreeMap::new();
+        signed_metadata.insert("openledger-author".to_owned(), "test-peer".to_owned());
+        signed_metadata.insert("openledger-lamport".to_owned(), "42".to_owned());
+        signed_metadata.insert("openledger-parents".to_owned(), "".to_owned());
+        signed_metadata.insert("openledger-signature".to_owned(), sig.clone());
+
+        let txn_signed = Transaction {
+            metadata: signed_metadata,
+            ..txn_unsigned.clone()
+        };
+        let txid_signed = compute_content_id(&Directive::Transaction(txn_signed));
+
+        // KEY ASSERTION: txid must be identical whether signing is on or off.
+        // This proves envelope keys never enter the economic hash (I5 / CT-10).
+        assert_eq!(
+            txid_unsigned, txid_signed,
+            "Toggling signing must not change txid (envelope excluded from hash)"
+        );
+    }
+
+    #[test]
+    fn ct10_verify_accepts_valid_signature() {
+        let provider = PeerKeySignatureProvider::generate();
+        let content_id = "ct10_valid";
+        let sig = provider.sign(content_id).unwrap();
+
+        let result = provider.verify(content_id, &sig, &provider.public_key_hex());
+        assert!(result.is_ok(), "Valid signature must be accepted");
+    }
+
+    #[test]
+    fn ct10_verify_rejects_forged_signature() {
+        let provider = PeerKeySignatureProvider::generate();
+        let content_id = "ct10_forged";
+        let sig = provider.sign(content_id).unwrap();
+
+        // Forge by using a different key's public key.
+        let attacker = PeerKeySignatureProvider::generate();
+        let result = provider.verify(content_id, &sig, &attacker.public_key_hex());
+        assert!(result.is_err(), "Forged signature must be rejected");
+    }
+
+    #[test]
+    fn ct10_noop_provider_leaves_txid_unaffected() {
+        let noop = NoopSignatureProvider;
+        assert!(!noop.is_enabled());
+        assert_eq!(noop.sign("any-id"), None, "Noop should return None");
     }
 }

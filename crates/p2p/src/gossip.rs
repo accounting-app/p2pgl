@@ -167,6 +167,9 @@ mod tests {
 
         // Verify: hash(economic_bean) == id (§3.4.1 verification rule).
         let computed_id = compute_content_id(&directive);
-        assert_eq!(entry.id, computed_id, "Supply entry id must match hash of economic body");
+        assert_eq!(
+            entry.id, computed_id,
+            "Supply entry id must match hash of economic body"
+        );
     }
 }

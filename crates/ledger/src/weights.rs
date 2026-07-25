@@ -111,9 +111,7 @@ pub fn sum_weights(postings: &[Posting]) -> Result<(HashMap<String, Decimal>, us
 /// Resolve a single elided posting so that all per-currency weight sums become zero.
 ///
 /// Returns the `Amount` to fill in, or an error if it cannot be resolved.
-pub fn resolve_elided(
-    sums: &HashMap<String, Decimal>,
-) -> Result<Amount, WeightError> {
+pub fn resolve_elided(sums: &HashMap<String, Decimal>) -> Result<Amount, WeightError> {
     // The elided posting must zero-out exactly one currency.
     // Filter to non-zero currencies.
     let nonzero: Vec<(&String, &Decimal)> = sums

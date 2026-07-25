@@ -12,10 +12,7 @@ impl SubscriptionRoot {
     /// Notified whenever a transaction is appended to the ledger.
     ///
     /// Publishes for local writes, remote gossip inserts, and adopted file-watcher entries.
-    async fn transaction_appended(
-        &self,
-        ctx: &Context<'_>,
-    ) -> impl Stream<Item = Transaction> {
+    async fn transaction_appended(&self, ctx: &Context<'_>) -> impl Stream<Item = Transaction> {
         let broadcast = ctx.data_unchecked::<TransactionBroadcast>();
         let rx = broadcast.subscribe();
         BroadcastStream::new(rx).filter_map(|result| result.ok())

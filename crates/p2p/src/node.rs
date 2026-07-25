@@ -185,8 +185,14 @@ mod tests {
     #[test]
     fn test_all_remote_heads() {
         let registry = PeerRegistry::new();
-        registry.upsert("peer-1".to_owned(), vec!["tx1".to_owned(), "tx2".to_owned()]);
-        registry.upsert("peer-2".to_owned(), vec!["tx2".to_owned(), "tx3".to_owned()]);
+        registry.upsert(
+            "peer-1".to_owned(),
+            vec!["tx1".to_owned(), "tx2".to_owned()],
+        );
+        registry.upsert(
+            "peer-2".to_owned(),
+            vec!["tx2".to_owned(), "tx3".to_owned()],
+        );
 
         let heads = registry.all_remote_heads();
         assert_eq!(heads.len(), 3); // tx1, tx2, tx3 (deduped)

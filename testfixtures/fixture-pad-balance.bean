@@ -1,0 +1,12 @@
+; Pad + balance fixture — exercises §3.6 checkpoint path (§5.1).
+
+2024-01-01 open Assets:Checking USD
+2024-01-01 open Equity:Opening USD
+
+2024-01-15 * "Deposit"
+  Assets:Checking                                  1000.00 USD
+  Equity:Opening                                   -1000.00 USD
+
+2024-02-01 pad Assets:Checking Equity:Opening
+
+2024-02-01 balance Assets:Checking                 1000.00 USD

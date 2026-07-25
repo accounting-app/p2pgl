@@ -63,10 +63,7 @@ mod tests {
     fn build_app(auth_state: AuthState) -> Router {
         Router::new()
             .route("/protected", get(ok_handler))
-            .layer(middleware::from_fn_with_state(
-                auth_state,
-                auth_middleware,
-            ))
+            .layer(middleware::from_fn_with_state(auth_state, auth_middleware))
     }
 
     #[tokio::test]

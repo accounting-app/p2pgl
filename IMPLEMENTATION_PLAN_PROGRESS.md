@@ -23,7 +23,7 @@
 | **11** | M5 | Signing + subscriptions + file watcher | ✅ Done | 265 |
 | **12** | M6 | Full-stack wiring + integration tests + Dockerfile | ✅ Done | 271 |
 
-**Current totals:** 271 tests passing · 4 crates compiling · clippy clean · **ALL PASSES COMPLETE** ✅
+**Current totals:** 294 tests passing · 4 crates compiling · clippy clean · **ALL PASSES + ALL CTs COMPLETE** ✅
 
 ---
 
@@ -671,15 +671,15 @@ openledger-v2/
 | CT-1 | I1 (balance) | Pass 5 | ✅ |
 | CT-2 | I2 (elided posting) | Pass 5 | ✅ |
 | CT-3 | I5 (txid stable) | Pass 4 | ✅ |
-| CT-4 | I6 (merge commutativity) | Pass 9 | 🔲 |
+| CT-4 | I6 (merge commutativity) | Pass 9 | ✅ |
 | CT-5 | I7 (round-trip) | Pass 4 | ✅ |
 | CT-6 | I7 (golden corpus) | Pass 4 | ✅ |
 | CT-7 | I3 (account lifecycle) | Pass 5 | ✅ |
-| CT-8 | I8 (verify detects tamper) | Pass 10 | 🔲 |
-| CT-9 | FR-4 (partition converge) | Pass 9 | 🔲 |
-| CT-10 | §3.8 (signing toggle) | Pass 11 | 🔲 |
-| CT-11 | §3.3 (external edit disabled) | Pass 6 | 🔲 |
-| CT-12 | §3.3 (external edit enabled) | Pass 9 | 🔲 |
+| CT-8 | I8 (verify detects tamper) | Pass 10 | ✅ |
+| CT-9 | FR-4 (partition converge) | Pass 9 | ✅ |
+| CT-10 | §3.8 (signing toggle) | Pass 11 | ✅ |
+| CT-11 | §3.3 (external edit disabled) | Pass 6 | ✅ |
+| CT-12 | §3.3 (external edit enabled) | Pass 9 | ✅ |
 | CT-13 | §3.3.1 (envelope idempotency) | Pass 4 | ✅ |
-| CT-14 | §3.5 (remote validation) | Pass 9 | 🔲 |
+| CT-14 | §3.5 (remote validation) | Pass 9 | ✅ |
 | CT-15 | §2.3 (unsupported directive) | Pass 3 | ✅ |

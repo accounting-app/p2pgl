@@ -47,7 +47,12 @@ impl OrphanBuffer {
     }
 
     /// Buffer an orphan. Returns false if the buffer is full.
-    pub fn insert(&mut self, id: String, directive: Directive, missing_parents: Vec<String>) -> bool {
+    pub fn insert(
+        &mut self,
+        id: String,
+        directive: Directive,
+        missing_parents: Vec<String>,
+    ) -> bool {
         // Evict expired entries first.
         self.evict_expired();
 

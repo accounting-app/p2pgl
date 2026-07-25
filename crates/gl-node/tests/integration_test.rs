@@ -114,18 +114,14 @@ fn test_verify_after_boot() {
     let report = ledger::verify::verify_dag(svc.dag());
     assert!(report.nodes_checked > 0);
 
-    assert!(
-        !report
-            .errors
-            .iter()
-            .any(|e| matches!(e, ledger::verify::VerifyError::ContentHashMismatch { .. }))
-    );
-    assert!(
-        !report
-            .errors
-            .iter()
-            .any(|e| matches!(e, ledger::verify::VerifyError::CycleDetected { .. }))
-    );
+    assert!(!report
+        .errors
+        .iter()
+        .any(|e| matches!(e, ledger::verify::VerifyError::ContentHashMismatch { .. })));
+    assert!(!report
+        .errors
+        .iter()
+        .any(|e| matches!(e, ledger::verify::VerifyError::CycleDetected { .. })));
 }
 
 #[test]

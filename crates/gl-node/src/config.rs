@@ -222,8 +222,7 @@ mod tests {
     #[test]
     fn test_minimal_config_loads() {
         let file = write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean" }"#);
-        let config =
-            NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
         assert_eq!(config.ledger_path, "./data/ledger.bean");
         assert_eq!(config.bind_address, "127.0.0.1");
         assert_eq!(config.port, 4000);
@@ -252,8 +251,7 @@ mod tests {
             }
         }"#;
         let file = write_temp_config(content);
-        let config =
-            NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
         assert_eq!(config.bind_address, "0.0.0.0");
         assert_eq!(config.port, 8080);
         assert_eq!(config.external_file_edits, "disabled");
@@ -267,9 +265,8 @@ mod tests {
 
     #[test]
     fn test_unknown_key_rejected() {
-        let file = write_temp_config(
-            r#"{ "ledgerPath": "./data/ledger.bean", "unknownKey": true }"#,
-        );
+        let file =
+            write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean", "unknownKey": true }"#);
         let result = NodeConfig::load_from_path(&file.path().to_path_buf());
         assert!(result.is_err());
         let error_message = format!("{}", result.unwrap_err());

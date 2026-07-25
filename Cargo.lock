@@ -3552,9 +3552,13 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 name = "security"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "ed25519-dalek 2.2.0",
  "hex",
+ "ledger",
  "rand 0.8.7",
+ "rust_decimal",
+ "rust_decimal_macros",
  "serde",
 ]
 

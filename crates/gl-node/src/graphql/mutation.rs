@@ -54,10 +54,12 @@ impl MutationRoot {
                         }),
                         date: None,
                     }),
-                    price: p.price.map(|pr| PriceSpec::Unit(Amount {
-                        number: pr.number.0,
-                        currency: pr.currency,
-                    })),
+                    price: p.price.map(|pr| {
+                        PriceSpec::Unit(Amount {
+                            number: pr.number.0,
+                            currency: pr.currency,
+                        })
+                    }),
                 })
                 .collect(),
         };

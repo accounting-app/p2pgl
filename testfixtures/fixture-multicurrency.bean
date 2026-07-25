@@ -1,0 +1,23 @@
+; Multi-currency fixture — exercises I1 per currency (§5.1).
+; Must parse, round-trip, and produce balanced trial balance per currency.
+
+2024-01-01 open Assets:Cash USD,EUR
+2024-01-01 open Assets:Savings EUR
+2024-01-01 open Equity:Opening USD,EUR
+2024-01-01 open Expenses:Travel EUR
+
+2024-01-15 * "Employer" "Salary deposit"
+  Assets:Cash                                      5000.00 USD
+  Equity:Opening                                   -5000.00 USD
+
+2024-01-20 * "Exchange" "Currency exchange"
+  Assets:Cash                                      1000.00 EUR
+  Equity:Opening                                   -1000.00 EUR
+
+2024-02-01 * "Transfer to savings"
+  Assets:Savings                                   500.00 EUR
+  Assets:Cash                                      -500.00 EUR
+
+2024-02-15 * "Hotel" "Business trip"
+  Expenses:Travel                                  200.00 EUR
+  Assets:Cash                                      -200.00 EUR

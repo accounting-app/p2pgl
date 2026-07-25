@@ -59,7 +59,10 @@ impl std::fmt::Display for DagError {
                 write!(f, "Cycle detected: adding {txid} would create a cycle")
             }
             DagError::MissingParent { txid, parent } => {
-                write!(f, "Missing parent: {txid} references unknown parent {parent}")
+                write!(
+                    f,
+                    "Missing parent: {txid} references unknown parent {parent}"
+                )
             }
         }
     }
@@ -236,6 +239,39 @@ impl LedgerDag {
     }
 }
 
+#[cfg(test)]
+impl LedgerDag {
+    /// Test-only: insert a directive under a fake/tampered content ID.
+    ///
+    /// This bypasses the normal content-hash computation so we can test
+    /// `verify_dag` detection of mismatched hashes (CT-8).
+    pub fn insert_with_fake_id(
+        &mut self,
+        fake_id: String,
+        directive: Directive,
+        parents: Vec<String>,
+    ) {
+        let node = DagNode {
+            directive,
+            parents: parents.clone(),
+            children: Vec::new(),
+        };
+        self.nodes.insert(fake_id.clone(), node);
+        self.insertion_order.push(fake_id.clone());
+
+        // Update parent→child edges.
+        for parent_id in &parents {
+            if !parent_id.is_empty() {
+                self.heads.remove(parent_id);
+                if let Some(parent_node) = self.nodes.get_mut(parent_id) {
+                    parent_node.children.push(fake_id.clone());
+                }
+            }
+        }
+        self.heads.insert(fake_id);
+    }
+}
+
 impl Default for LedgerDag {
     fn default() -> Self {
         Self::new()
@@ -379,10 +415,7 @@ mod tests {
         assert_eq!(dag.heads().len(), 1);
 
         // Parent → child edge.
-        assert!(dag
-            .children_of(&genesis_id)
-            .unwrap()
-            .contains(&child_id));
+        assert!(dag.children_of(&genesis_id).unwrap().contains(&child_id));
     }
 
     // ── Missing parent (strict mode) ─────────────────────────────────────

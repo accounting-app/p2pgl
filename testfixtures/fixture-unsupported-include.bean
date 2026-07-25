@@ -1,0 +1,6 @@
+; This file must fail to parse — contains unsupported `include` directive (CT-15).
+
+option "title" "Test Ledger"
+include "other-file.bean"
+
+2024-01-01 open Assets:Cash USD

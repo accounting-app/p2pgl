@@ -425,7 +425,12 @@ fn parse_directive_block(
 
     // Read date.
     let date = scanner.read_date().map_err(|message| {
-        ParseError::new(line_number, scanner.column(), message, ParseErrorKind::InvalidDate)
+        ParseError::new(
+            line_number,
+            scanner.column(),
+            message,
+            ParseErrorKind::InvalidDate,
+        )
     })?;
 
     scanner.skip_whitespace();
@@ -473,14 +478,10 @@ fn parse_directive_block(
             }
 
             match keyword.as_str() {
-                "txn" => parse_transaction(
-                    &mut scanner,
-                    date,
-                    Flag::Complete,
-                    body_lines,
-                    line_number,
-                )
-                .map(Directive::Transaction),
+                "txn" => {
+                    parse_transaction(&mut scanner, date, Flag::Complete, body_lines, line_number)
+                        .map(Directive::Transaction)
+                }
                 "open" => {
                     parse_open(&mut scanner, date, body_lines, line_number).map(Directive::Open)
                 }
@@ -489,9 +490,7 @@ fn parse_directive_block(
                 }
                 "commodity" => parse_commodity(&mut scanner, date, body_lines, line_number)
                     .map(Directive::Commodity),
-                "pad" => {
-                    parse_pad(&mut scanner, date, body_lines, line_number).map(Directive::Pad)
-                }
+                "pad" => parse_pad(&mut scanner, date, body_lines, line_number).map(Directive::Pad),
                 "balance" => parse_balance(&mut scanner, date, body_lines, line_number)
                     .map(Directive::Balance),
                 "note" => {
@@ -533,7 +532,12 @@ fn parse_transaction(
 
     if scanner.peek() == Some('"') {
         let first_string = scanner.read_quoted_string().map_err(|message| {
-            ParseError::new(line_number, scanner.column(), message, ParseErrorKind::UnterminatedString)
+            ParseError::new(
+                line_number,
+                scanner.column(),
+                message,
+                ParseErrorKind::UnterminatedString,
+            )
         })?;
         scanner.skip_whitespace();
         if scanner.peek() == Some('"') {
@@ -560,13 +564,23 @@ fn parse_transaction(
         match scanner.peek() {
             Some('#') => {
                 let tag = scanner.read_tag().map_err(|message| {
-                    ParseError::new(line_number, scanner.column(), message, ParseErrorKind::InvalidTag)
+                    ParseError::new(
+                        line_number,
+                        scanner.column(),
+                        message,
+                        ParseErrorKind::InvalidTag,
+                    )
                 })?;
                 tags.push(tag);
             }
             Some('^') => {
                 let link = scanner.read_link().map_err(|message| {
-                    ParseError::new(line_number, scanner.column(), message, ParseErrorKind::InvalidLink)
+                    ParseError::new(
+                        line_number,
+                        scanner.column(),
+                        message,
+                        ParseErrorKind::InvalidLink,
+                    )
                 })?;
                 links.push(link);
             }
@@ -1342,7 +1356,10 @@ mod tests {
                 assert_eq!(txn.postings.len(), 2);
                 assert_eq!(txn.postings[0].account, "Expenses:Food");
                 assert_eq!(txn.postings[0].amount.as_ref().unwrap().number, dec!(50.00));
-                assert_eq!(txn.postings[1].amount.as_ref().unwrap().number, dec!(-50.00));
+                assert_eq!(
+                    txn.postings[1].amount.as_ref().unwrap().number,
+                    dec!(-50.00)
+                );
             }
             other => panic!("Expected Transaction, got {other:?}"),
         }
@@ -1428,7 +1445,8 @@ mod tests {
 
     #[test]
     fn test_parse_posting_with_cost() {
-        let input = "2024-01-15 *\n  Assets:Stock 10 AAPL {150.00 USD}\n  Assets:Cash -1500.00 USD\n";
+        let input =
+            "2024-01-15 *\n  Assets:Stock 10 AAPL {150.00 USD}\n  Assets:Cash -1500.00 USD\n";
         let directives = parse_file(input).unwrap();
         match &directives[0] {
             Directive::Transaction(txn) => {
@@ -1451,7 +1469,10 @@ mod tests {
         match &directives[0] {
             Directive::Transaction(txn) => {
                 let cost = txn.postings[0].cost.as_ref().unwrap();
-                assert_eq!(cost.date, Some(NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()));
+                assert_eq!(
+                    cost.date,
+                    Some(NaiveDate::from_ymd_opt(2024, 1, 1).unwrap())
+                );
             }
             other => panic!("Expected Transaction, got {other:?}"),
         }
@@ -1672,8 +1693,25 @@ mod tests {
 
     #[test]
     fn test_directive_type_priority() {
-        assert_eq!(Directive::Open(Open { date: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(), account: String::new(), currencies: Vec::new(), metadata: BTreeMap::new() }).type_priority(), 0);
-        assert_eq!(Directive::Close(Close { date: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(), account: String::new(), metadata: BTreeMap::new() }).type_priority(), 9);
+        assert_eq!(
+            Directive::Open(Open {
+                date: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+                account: String::new(),
+                currencies: Vec::new(),
+                metadata: BTreeMap::new()
+            })
+            .type_priority(),
+            0
+        );
+        assert_eq!(
+            Directive::Close(Close {
+                date: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+                account: String::new(),
+                metadata: BTreeMap::new()
+            })
+            .type_priority(),
+            9
+        );
     }
 
     #[test]
@@ -1754,8 +1792,96 @@ mod tests {
             _ => None,
         });
         let stock = stock_txn.expect("Should find 'Buy stock' transaction");
-        let cost = stock.postings[0].cost.as_ref().expect("Should have cost spec");
+        let cost = stock.postings[0]
+            .cost
+            .as_ref()
+            .expect("Should have cost spec");
         assert_eq!(cost.amount.as_ref().unwrap().number, dec!(150.00));
         assert_eq!(cost.amount.as_ref().unwrap().currency, "USD");
+    }
+
+    // ── Golden corpus tests (§5.1) ──────────────────────────────────────
+
+    #[test]
+    fn test_golden_fixture_multicurrency() {
+        let fixture = include_str!("../../../testfixtures/fixture-multicurrency.bean");
+        let directives = parse_file(fixture).unwrap();
+        // 4 opens + 4 transactions = 8
+        assert!(
+            directives.len() >= 8,
+            "Multi-currency fixture: expected ≥8 directives, got {}",
+            directives.len()
+        );
+
+        // Verify USD and EUR transactions exist.
+        let currencies: Vec<_> = directives
+            .iter()
+            .filter_map(|d| {
+                if let Directive::Transaction(t) = d {
+                    Some(
+                        t.postings
+                            .iter()
+                            .filter_map(|p| p.amount.as_ref().map(|a| a.currency.clone()))
+                            .collect::<Vec<_>>(),
+                    )
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect();
+        assert!(currencies.contains(&"USD".to_owned()), "Must contain USD");
+        assert!(currencies.contains(&"EUR".to_owned()), "Must contain EUR");
+    }
+
+    #[test]
+    fn test_golden_fixture_cost_price() {
+        let fixture = include_str!("../../../testfixtures/fixture-cost-price.bean");
+        let directives = parse_file(fixture).unwrap();
+        // Should have opens + transactions with cost specs.
+        assert!(
+            directives.len() >= 6,
+            "Cost-price fixture: expected ≥6 directives, got {}",
+            directives.len()
+        );
+
+        // Find a posting with a cost.
+        let has_cost = directives.iter().any(|d| {
+            if let Directive::Transaction(t) = d {
+                t.postings.iter().any(|p| p.cost.is_some())
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_cost,
+            "Cost-price fixture must contain at least one posting with cost spec"
+        );
+    }
+
+    #[test]
+    fn test_golden_fixture_pad_balance() {
+        let fixture = include_str!("../../../testfixtures/fixture-pad-balance.bean");
+        let directives = parse_file(fixture).unwrap();
+        // Should have opens + transaction + pad + balance.
+        let has_pad = directives.iter().any(|d| matches!(d, Directive::Pad(_)));
+        let has_balance = directives
+            .iter()
+            .any(|d| matches!(d, Directive::Balance(_)));
+        assert!(has_pad, "Pad-balance fixture must contain a pad directive");
+        assert!(
+            has_balance,
+            "Pad-balance fixture must contain a balance directive"
+        );
+    }
+
+    #[test]
+    fn test_golden_fixture_unsupported_include() {
+        let fixture = include_str!("../../../testfixtures/fixture-unsupported-include.bean");
+        let result = parse_file(fixture);
+        assert!(
+            result.is_err(),
+            "CT-15: Unsupported include fixture must fail to parse"
+        );
     }
 }

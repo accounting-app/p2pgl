@@ -17,14 +17,9 @@ pub enum VerifyError {
         computed_id: String,
     },
     /// A parent txid references a node not in the DAG.
-    MissingParent {
-        txid: String,
-        parent: String,
-    },
+    MissingParent { txid: String, parent: String },
     /// Cycle detected in the DAG.
-    CycleDetected {
-        txid: String,
-    },
+    CycleDetected { txid: String },
 }
 
 impl std::fmt::Display for VerifyError {
@@ -40,7 +35,10 @@ impl std::fmt::Display for VerifyError {
                 )
             }
             VerifyError::MissingParent { txid, parent } => {
-                write!(f, "Missing parent: {txid} references unknown parent {parent}")
+                write!(
+                    f,
+                    "Missing parent: {txid} references unknown parent {parent}"
+                )
             }
             VerifyError::CycleDetected { txid } => {
                 write!(f, "Cycle detected involving {txid}")
@@ -264,7 +262,11 @@ mod tests {
 
         // All content hashes should match in a properly constructed DAG.
         let report = verify_dag(&dag);
-        assert!(report.ok, "Content hashes should match: {:?}", report.errors);
+        assert!(
+            report.ok,
+            "Content hashes should match: {:?}",
+            report.errors
+        );
     }
 
     #[test]
@@ -329,6 +331,66 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, VerifyError::CycleDetected { .. })),
             "No cycles expected"
+        );
+    }
+
+    // ── CT-8: verify detects tamper + dangling parent (I8) ───────────────
+
+    #[test]
+    fn ct8_verify_detects_tampered_txid() {
+        let mut dag = LedgerDag::new();
+
+        // Insert a legit genesis transaction.
+        let legit = make_txn(make_date(2024, 1, 1), "Legit", "");
+        dag.insert(legit, false).unwrap();
+
+        // Insert a transaction under a FAKE content ID (tampered).
+        let tampered = make_txn(make_date(2024, 1, 2), "Tampered narration", "");
+        dag.insert_with_fake_id(
+            "aaaa000000000000000000000000000000000000000000000000000000000000".to_owned(),
+            tampered,
+            vec![], // genesis
+        );
+
+        let report = verify_dag(&dag);
+        assert!(!report.ok, "Should detect tamper");
+        assert!(
+            report.errors.iter().any(|e| matches!(
+                e,
+                VerifyError::ContentHashMismatch { stored_id, .. }
+                if stored_id == "aaaa000000000000000000000000000000000000000000000000000000000000"
+            )),
+            "Should report content hash mismatch for tampered txid"
+        );
+    }
+
+    #[test]
+    fn ct8_verify_detects_dangling_parent() {
+        let mut dag = LedgerDag::new();
+
+        // Insert a genesis transaction normally.
+        let t1 = make_txn(make_date(2024, 1, 1), "Genesis", "");
+        let id1 = match dag.insert(t1, false).unwrap() {
+            crate::dag::InsertResult::Inserted { content_id } => content_id,
+            _ => panic!("Expected insert"),
+        };
+
+        // Insert a transaction that references a nonexistent parent.
+        let t2 = make_txn(make_date(2024, 1, 2), "Orphan child", "");
+        let t2_real_id = compute_content_id(&make_txn(make_date(2024, 1, 2), "Orphan child", ""));
+        let dangling_parent = "bbbb000000000000000000000000000000000000000000000000000000000000";
+        dag.insert_with_fake_id(t2_real_id, t2, vec![id1, dangling_parent.to_owned()]);
+
+        let report = verify_dag(&dag);
+        assert!(!report.ok, "Should detect dangling parent");
+        assert!(
+            report.errors.iter().any(|e| matches!(
+                e,
+                VerifyError::MissingParent { parent, .. }
+                if parent == dangling_parent
+            )),
+            "Should report missing parent for dangling link: {:?}",
+            report.errors
         );
     }
 }

@@ -44,7 +44,11 @@ pub fn full_file_serialize(directives: &[Directive], leading_comments: &[String]
         directive_a
             .date()
             .cmp(&directive_b.date())
-            .then_with(|| directive_a.type_priority().cmp(&directive_b.type_priority()))
+            .then_with(|| {
+                directive_a
+                    .type_priority()
+                    .cmp(&directive_b.type_priority())
+            })
             .then_with(|| stable_sort_key(directive_a).cmp(&stable_sort_key(directive_b)))
     });
 
@@ -105,11 +109,23 @@ fn serialize_directive(output: &mut String, directive: &Directive, include_envel
 
 fn serialize_transaction(output: &mut String, txn: &Transaction, include_envelope: bool) {
     // Header: DATE FLAG ["payee"] ["narration"] [#tags] [^links]
-    write!(output, "{} {}", txn.date.format("%Y-%m-%d"), txn.flag.as_char()).unwrap();
+    write!(
+        output,
+        "{} {}",
+        txn.date.format("%Y-%m-%d"),
+        txn.flag.as_char()
+    )
+    .unwrap();
 
     match (&txn.payee, &txn.narration) {
         (Some(payee), Some(narration)) => {
-            write!(output, " {} {}", quote_string(payee), quote_string(narration)).unwrap();
+            write!(
+                output,
+                " {} {}",
+                quote_string(payee),
+                quote_string(narration)
+            )
+            .unwrap();
         }
         (None, Some(narration)) => {
             write!(output, " {}", quote_string(narration)).unwrap();
@@ -203,7 +219,13 @@ fn serialize_posting(output: &mut String, posting: &Posting, include_envelope: b
 // ─── Non-transaction directives ──────────────────────────────────────────────
 
 fn serialize_open(output: &mut String, open: &Open, include_envelope: bool) {
-    write!(output, "{} open {}", open.date.format("%Y-%m-%d"), open.account).unwrap();
+    write!(
+        output,
+        "{} open {}",
+        open.date.format("%Y-%m-%d"),
+        open.account
+    )
+    .unwrap();
     if !open.currencies.is_empty() {
         write!(output, " {}", open.currencies.join(", ")).unwrap();
     }
@@ -212,7 +234,13 @@ fn serialize_open(output: &mut String, open: &Open, include_envelope: bool) {
 }
 
 fn serialize_close(output: &mut String, close: &Close, include_envelope: bool) {
-    writeln!(output, "{} close {}", close.date.format("%Y-%m-%d"), close.account).unwrap();
+    writeln!(
+        output,
+        "{} close {}",
+        close.date.format("%Y-%m-%d"),
+        close.account
+    )
+    .unwrap();
     serialize_metadata(output, &close.metadata, include_envelope, "  ");
 }
 
@@ -366,7 +394,11 @@ mod tests {
 
         // "  Assets:Cash" = 13 chars, gap = 38, number at column 52.
         let line = output.trim_end_matches('\n');
-        assert_eq!(&line[51..58], "1000.00", "number must start at column 52 (index 51)");
+        assert_eq!(
+            &line[51..58],
+            "1000.00",
+            "number must start at column 52 (index 51)"
+        );
     }
 
     #[test]
@@ -502,14 +534,20 @@ mod tests {
             postings: vec![
                 Posting {
                     account: "Assets:Cash".to_owned(),
-                    amount: Some(Amount { number: dec!(100), currency: "USD".to_owned() }),
+                    amount: Some(Amount {
+                        number: dec!(100),
+                        currency: "USD".to_owned(),
+                    }),
                     cost: None,
                     price: None,
                     metadata: BTreeMap::new(),
                 },
                 Posting {
                     account: "Equity:Opening".to_owned(),
-                    amount: Some(Amount { number: dec!(-100), currency: "USD".to_owned() }),
+                    amount: Some(Amount {
+                        number: dec!(-100),
+                        currency: "USD".to_owned(),
+                    }),
                     cost: None,
                     price: None,
                     metadata: BTreeMap::new(),
@@ -536,14 +574,20 @@ mod tests {
             postings: vec![
                 Posting {
                     account: "Assets:Cash".to_owned(),
-                    amount: Some(Amount { number: dec!(100), currency: "USD".to_owned() }),
+                    amount: Some(Amount {
+                        number: dec!(100),
+                        currency: "USD".to_owned(),
+                    }),
                     cost: None,
                     price: None,
                     metadata: BTreeMap::new(),
                 },
                 Posting {
                     account: "Equity:Opening".to_owned(),
-                    amount: Some(Amount { number: dec!(-100), currency: "USD".to_owned() }),
+                    amount: Some(Amount {
+                        number: dec!(-100),
+                        currency: "USD".to_owned(),
+                    }),
                     cost: None,
                     price: None,
                     metadata: BTreeMap::new(),
@@ -583,14 +627,20 @@ mod tests {
                 postings: vec![
                     Posting {
                         account: "Assets:Cash".to_owned(),
-                        amount: Some(Amount { number: dec!(100), currency: "USD".to_owned() }),
+                        amount: Some(Amount {
+                            number: dec!(100),
+                            currency: "USD".to_owned(),
+                        }),
                         cost: None,
                         price: None,
                         metadata: BTreeMap::new(),
                     },
                     Posting {
                         account: "Equity:Opening".to_owned(),
-                        amount: Some(Amount { number: dec!(-100), currency: "USD".to_owned() }),
+                        amount: Some(Amount {
+                            number: dec!(-100),
+                            currency: "USD".to_owned(),
+                        }),
                         cost: None,
                         price: None,
                         metadata: BTreeMap::new(),
@@ -744,10 +794,7 @@ mod tests {
             currencies: Vec::new(),
             metadata: BTreeMap::new(),
         };
-        let output = full_file_serialize(
-            &[Directive::Open(open)],
-            &["Header comment".to_owned()],
-        );
+        let output = full_file_serialize(&[Directive::Open(open)], &["Header comment".to_owned()]);
         assert!(output.starts_with("; Header comment\n\n"));
         assert!(output.contains("open Assets:Cash"));
     }
@@ -832,9 +879,7 @@ mod tests {
         let reparsed = parse_file(&serialized).unwrap();
 
         assert_eq!(directives.len(), reparsed.len(), "directive count mismatch");
-        for (index, (original, parsed)) in
-            directives.iter().zip(reparsed.iter()).enumerate()
-        {
+        for (index, (original, parsed)) in directives.iter().zip(reparsed.iter()).enumerate() {
             assert_eq!(
                 original.date(),
                 parsed.date(),
@@ -865,7 +910,10 @@ mod tests {
         };
         let output = economic_canonical_serialize(&Directive::Open(open));
         let lines: Vec<&str> = output.lines().collect();
-        assert!(lines[1].contains("alpha:"), "alpha should be first metadata");
+        assert!(
+            lines[1].contains("alpha:"),
+            "alpha should be first metadata"
+        );
         assert!(lines[2].contains("middle:"), "middle should be second");
         assert!(lines[3].contains("zebra:"), "zebra should be last");
     }
@@ -918,6 +966,9 @@ mod tests {
         let canonical_a = economic_canonical_serialize(&Directive::Transaction(txn_a));
         let canonical_b = economic_canonical_serialize(&Directive::Transaction(txn_b));
 
-        assert_eq!(canonical_a, canonical_b, "envelope differences must not affect economic form");
+        assert_eq!(
+            canonical_a, canonical_b,
+            "envelope differences must not affect economic form"
+        );
     }
 }
