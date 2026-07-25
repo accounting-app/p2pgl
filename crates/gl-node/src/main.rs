@@ -5,14 +5,17 @@ mod health;
 
 use auth::AuthState;
 use config::NodeConfig;
-use graphql::{build_schema, graphiql_handler, graphql_handler};
+use graphql::broadcast::TransactionBroadcast;
+use graphql::{build_schema_with_service, graphiql_handler, graphql_handler, SharedLedger};
 use health::health_handler;
 
 use axum::routing::get;
 use axum::{middleware, Router};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::signal;
+use tokio::sync::RwLock;
 use tracing::{error, info};
 
 #[tokio::main]
@@ -58,8 +61,33 @@ async fn main() {
         }
     }
 
-    // Build the GraphQL schema.
-    let schema = build_schema();
+    // Boot the ledger service (§3.3).
+    let author_id = "local".to_owned(); // Will be replaced by Iroh EndpointId when P2P boots.
+    let service = match ledger::service::LedgerService::boot(&ledger_path, author_id) {
+        Ok(service) => service,
+        Err(error) => {
+            error!(%error, "failed to boot ledger service — aborting");
+            std::process::exit(1);
+        }
+    };
+
+    let directive_count = service.directive_count();
+    let head_count = service.head_count();
+    info!(
+        directives = directive_count,
+        heads = head_count,
+        path = %ledger_path.display(),
+        "ledger service booted"
+    );
+
+    // Wrap in Arc<RwLock> for concurrent access (§3.5).
+    let shared_ledger: SharedLedger = Arc::new(RwLock::new(service));
+
+    // Transaction broadcast for subscriptions.
+    let broadcast = TransactionBroadcast::new();
+
+    // Build the GraphQL schema with live service.
+    let schema = build_schema_with_service(shared_ledger, broadcast);
 
     // Auth state for middleware (§3.8).
     let auth_state = AuthState {

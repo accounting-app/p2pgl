@@ -21,9 +21,9 @@
 | **9** | M4 | Anti-entropy + union merge | ✅ Done | 226 |
 | **10** | M5 | Verify + checkpoints + pad generation | ✅ Done | 241 |
 | **11** | M5 | Signing + subscriptions + file watcher | ✅ Done | 265 |
-| **12** | M6 | Deploy + integration testing | ⏳ Next | — |
+| **12** | M6 | Full-stack wiring + integration tests + Dockerfile | ✅ Done | 271 |
 
-**Current totals:** 265 tests passing · 4 crates compiling · clippy clean
+**Current totals:** 271 tests passing · 4 crates compiling · clippy clean · **ALL PASSES COMPLETE** ✅
 
 ---
 
@@ -532,7 +532,44 @@
 
 ---
 
-## ⏳ Pass 12 — Deploy + Integration Testing (M6) — NEXT
+## ✅ Pass 12 — Full-Stack Wiring + Integration Tests + Dockerfile (M6)
+
+**Spec sections covered:** §3.3 (boot), §3.5 (concurrency), §3.9 (deployment), all FR-1–FR-6
+
+### Files Created
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `crates/gl-node/tests/integration_test.rs` | 320 | 8 end-to-end tests: boot→open→append→read cycle, fixture validation, verify, idempotency (I4/I5), unbalanced rejection (I1), persistence across reboots, balance assertions, signing |
+| `Dockerfile` | 50 | Multi-stage build: Rust builder → slim Debian runtime, non-root user, health check |
+
+### Files Modified (major rewrites)
+
+| File | Change |
+|------|--------|
+| `crates/gl-node/src/main.rs` | Boots real `LedgerService` from `.bean`, wraps in `Arc<RwLock>`, injects into schema |
+| `crates/gl-node/src/graphql/mod.rs` | Added `SharedLedger` type, `build_schema_with_service()` with data injection |
+| `crates/gl-node/src/graphql/query.rs` | All 9 resolvers wired to real `LedgerService`/`ReadModel` (fallback to empty for introspection) |
+| `crates/gl-node/src/graphql/mutation.rs` | All 3 mutations wired: GraphQL input → domain type → `LedgerService` → error mapping → broadcast |
+
+### Tests (6 new, 271 total)
+
+| Suite | Tests | Verifies |
+|-------|-------|----------|
+| Integration | 8 | Full boot→write→read cycle, fixture boot, DAG verify, idempotency, I1 rejection, persistence, balance assertions, signing |
+| gl-node unit | 29 | Schema introspection, wired schema with live service, all query/mutation fields, scalars |
+
+### M6 Milestone Checklist
+
+- [x] All resolvers wired to real `LedgerService` (not stubs)
+- [x] `main.rs` boots service, injects into schema
+- [x] Write path: GraphQL mutation → LedgerService → DAG → file
+- [x] Read path: GraphQL query → ReadModel → response
+- [x] Subscription path: `appendTransaction` → broadcast → `transactionAppended`
+- [x] Error mapping: ServiceError → GraphQL error with `extensions.code`
+- [x] Integration tests: 8 end-to-end tests covering invariants
+- [x] Dockerfile: multi-stage build, non-root, health check
+- [x] **Done when:** M6 milestone complete ✅
 
 ## 🔲 Passes 4–12 — Remaining
 
@@ -576,21 +613,25 @@ openledger-v2/
 ├── .gitignore
 ├── testfixtures/
 │   └── fixture-simple.bean           ← golden corpus (all 10 directive types)
+├── Dockerfile                        ← multi-stage Rust build → slim runtime
 └── crates/
-    ├── gl-node/                      ← binary (Axum + GraphQL)
-    │   └── src/
-    │       ├── main.rs               ← boot, routing, shutdown
-    │       ├── config.rs             ← §3.11 config loader
-    │       ├── health.rs             ← GET /health
-    │       ├── auth.rs               ← X-Api-Key middleware
-    │       └── graphql/
-    │           ├── mod.rs            ← schema builder + handlers
-    │           ├── scalars.rs        ← Date, Decimal, TxId
-    │           ├── types.rs          ← 12 output types
-    │           ├── inputs.rs         ← 3 input types
-    │           ├── query.rs          ← 9 query resolvers
-    │           ├── mutation.rs       ← 3 mutation resolvers
-    │           └── subscription.rs   ← transactionAppended
+    ├── gl-node/                      ← binary (Axum + async-graphql)
+    │   ├── src/
+    │   │   ├── main.rs               ← boot LedgerService, inject into schema, serve
+    │   │   ├── config.rs             ← JSON config loader
+    │   │   ├── health.rs             ← GET /health
+    │   │   ├── auth.rs               ← X-Api-Key middleware
+    │   │   └── graphql/
+    │   │       ├── mod.rs            ← SharedLedger, build_schema_with_service
+    │   │       ├── types.rs          ← GraphQL output types
+    │   │       ├── scalars.rs        ← Date, Decimal, TxId
+    │   │       ├── inputs.rs         ← mutation inputs
+    │   │       ├── query.rs          ← 9 query resolvers (wired to LedgerService)
+    │   │       ├── mutation.rs       ← 3 mutation resolvers (wired to LedgerService)
+    │   │       ├── subscription.rs   ← transactionAppended (BroadcastStream)
+    │   │       └── broadcast.rs      ← TransactionBroadcast channel
+    │   └── tests/
+    │       └── integration_test.rs   ← 8 end-to-end integration tests
     ├── ledger/                       ← library (parse, serialize, hash, DAG, validate, service, read model, verify, checkpoint, file watcher)
     │   └── src/
     │       ├── lib.rs                ← module declarations
