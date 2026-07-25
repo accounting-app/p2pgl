@@ -1,0 +1,42 @@
+; OpenLedger golden fixture — exercises all 10 supported directive types
+; Used by parser and serializer round-trip tests
+
+2024-01-01 open Assets:Cash USD, EUR
+2024-01-01 open Assets:Stock AAPL
+2024-01-01 open Expenses:Food USD
+2024-01-01 open Income:Salary USD
+2024-01-01 open Equity:Opening USD
+
+2024-01-01 commodity EUR
+
+2024-01-01 pad Assets:Cash Equity:Opening
+
+2024-01-15 * "Acme Corp" "Initial funding" #setup ^opening-001
+  openledger-author: "local"
+  openledger-lamport: "1"
+  openledger-parents: ""
+  Assets:Cash                                      1000.00 USD
+  Equity:Opening                                  -1000.00 USD
+
+2024-01-20 ! "Pending refund"
+  openledger-author: "local"
+  openledger-lamport: "2"
+  openledger-parents: "dd4a9ec5ec298be6edaa02c4408c0b1cb1b25eb51426599b7eda600cfc5fa88f"
+  Assets:Cash                                        25.00 USD
+  Expenses:Food                                     -25.00 USD
+
+2024-02-01 balance Assets:Cash 1025.00 USD
+
+2024-03-01 note Assets:Cash "Reconciled with bank statement"
+
+2024-03-01 document Assets:Cash "/statements/2024-Q1.pdf"
+
+2024-06-01 event "location" "San Francisco"
+
+2024-06-15 * "Buy stock"
+  Assets:Stock                                        10 AAPL {150.00 USD}
+  Assets:Cash                                     -1500.00 USD
+
+2024-12-01 price EUR 1.10 USD
+
+2024-12-31 close Expenses:Food

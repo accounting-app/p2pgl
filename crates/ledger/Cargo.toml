@@ -7,6 +7,10 @@ rust-version.workspace = true
 [dependencies]
 serde = { workspace = true }
 rust_decimal = { workspace = true }
+chrono = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+rust_decimal_macros = "1"
