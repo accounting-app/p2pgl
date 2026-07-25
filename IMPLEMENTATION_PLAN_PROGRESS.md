@@ -13,8 +13,8 @@
 | **1** | M0 | Cargo workspace, config, Axum, `/health` | ✅ Done | 7 |
 | **2** | M0 | GraphQL schema, scalars, auth middleware | ✅ Done | 27 |
 | **3** | M1 | Beancount parser (10 directive types) | ✅ Done | 68 |
-| **4** | M1 | Canonical serializer + `txid` hashing | ⏳ Next | — |
-| **5** | M2 | DAG + validation (I1–I3, weights) | 🔲 | — |
+| **4** | M1 | Canonical serializer + `txid` hashing | ✅ Done | 93 |
+| **5** | M2 | DAG + validation (I1–I3, weights) | ⏳ Next | — |
 | **6** | M2 | Ledger service + live mutations | 🔲 | — |
 | **7** | M3 | Read model + all report queries | 🔲 | — |
 | **8** | M4 | Iroh P2P + gossip + Lamport clocks | 🔲 | — |
@@ -23,7 +23,7 @@
 | **11** | M5 | Signing + subscriptions + file watcher | 🔲 | — |
 | **12** | M6 | Deploy + integration testing | 🔲 | — |
 
-**Current totals:** 68 tests passing · 4 crates compiling · clippy clean
+**Current totals:** 93 tests passing · 4 crates compiling · clippy clean
 
 ---
 
@@ -193,9 +193,58 @@
 
 ---
 
-## ⏳ Pass 4 — Canonical Serializer + Hashing (M1, part 2) — NEXT
+## ✅ Pass 4 — Canonical Serializer + Hashing (M1, part 2)
+
+**Spec sections covered:** §3.3.1 (economic hash vs envelope), §3.3.2 (canonical format), §3.3.3 (worked fixture)
+
+### Files Created
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `crates/ledger/src/serialize.rs` | 520 | Economic + full-file serializers with column 52 alignment, tag/link/metadata sorting |
+| `crates/ledger/src/hash.rs` | 155 | SHA-256 content ID computation (txid / directiveId) |
+
+### Tests (25 new, 93 total)
+
+| Test | Verifies |
+|------|----------|
+| `test_posting_column_52_alignment` | Number starts at column 52 |
+| `test_posting_long_account_minimum_gap` | 2-space minimum for long accounts |
+| `test_economic_serialize_worked_fixture` | Exact byte output matches §3.3.3 |
+| `test_economic_serialize_excludes_envelope` | openledger-* stripped, regular metadata kept |
+| `test_full_serialize_includes_envelope` | Envelope present in full-file mode |
+| `test_tags_and_links_sorted` | Lexicographic sort before emit |
+| `test_full_file_ordering` | date → type_priority → stable_sort_key |
+| `test_serialize_open_with_currencies` | `USD, EUR` format |
+| `test_serialize_balance` | balance amount on header line |
+| `test_serialize_event` | Quoted type + description |
+| `test_serialize_price_directive` | `CURRENCY NUMBER OTHERCURRENCY` |
+| `test_serialize_posting_with_cost` | `{150.00 USD}` |
+| `test_serialize_posting_with_price` | `@ 1.10 USD` |
+| `test_serialize_elided_posting` | Account-only, no amount |
+| `test_quote_string_escaping` | `\"` and `\\` escapes |
+| `test_full_file_with_leading_comments` | Comments preserved at top |
+| `test_round_trip_serialize_parse` | **CT-5**: serialize → parse → equal |
+| `test_golden_fixture_round_trip` | **CT-6**: fixture parse → serialize → re-parse → equal |
+| `test_metadata_sorted_alphabetically` | BTreeMap order = alphabetical |
+| `test_ct13_envelope_idempotency` | **CT-13**: different envelope → same economic form |
+| `test_ct3_worked_fixture_txid` | **CT-3**: txid = `dd4a9ec5...` |
+| `test_ct3_envelope_does_not_change_txid` | Envelope metadata doesn't change hash |
+| `test_content_id_is_64_char_hex` | Format: 64-char lowercase hex |
+| `test_different_directives_different_ids` | Different bodies → different IDs |
+| `test_content_id_stable_across_calls` | Deterministic across invocations |
+
+### M1 Milestone Checklist (from §4)
+
+- [x] Parser for the directive subset in §2.3, including openledger-* envelope metadata round-trip
+- [x] Matching canonical serializer (§3.3.2)
+- [x] `txid` / `directiveId` hash formulas (§3.3.1)
+- [x] Golden-file fixture test for the §3.3.3 worked example (CT-3)
+- [x] **Done when:** parse → serialize → re-parse round-trips perfectly; `txid` of worked example matches ✅
 
 ---
+
+## ⏳ Pass 5 — DAG + Validation (M2, part 1) — NEXT
 
 ## 🔲 Passes 4–12 — Remaining
 
@@ -254,12 +303,14 @@ openledger-v2/
     │           ├── query.rs          ← 9 query resolvers
     │           ├── mutation.rs       ← 3 mutation resolvers
     │           └── subscription.rs   ← transactionAppended
-    ├── ledger/                       ← library (parse, model, error)
+    ├── ledger/                       ← library (parse, serialize, hash)
     │   └── src/
     │       ├── lib.rs                ← module declarations
     │       ├── model.rs              ← domain types (10 directives)
     │       ├── error.rs              ← structured parse errors
-    │       └── parse.rs              ← recursive-descent parser
+    │       ├── parse.rs              ← recursive-descent parser
+    │       ├── serialize.rs          ← canonical serializer
+    │       └── hash.rs               ← SHA-256 content IDs
     ├── p2p/                          ← library (stub — Passes 8–9)
     │   └── src/lib.rs
     └── security/                     ← library (stub — Passes 10–11)
@@ -272,16 +323,16 @@ openledger-v2/
 |------------|-----------|-------------|--------|
 | CT-1 | I1 (balance) | Pass 5 | 🔲 |
 | CT-2 | I2 (elided posting) | Pass 5 | 🔲 |
-| CT-3 | I5 (txid stable) | Pass 4 | 🔲 |
+| CT-3 | I5 (txid stable) | Pass 4 | ✅ |
 | CT-4 | I6 (merge commutativity) | Pass 9 | 🔲 |
-| CT-5 | I7 (round-trip) | Pass 4 | 🔲 |
-| CT-6 | I7 (golden corpus) | Pass 4 | 🔲 |
+| CT-5 | I7 (round-trip) | Pass 4 | ✅ |
+| CT-6 | I7 (golden corpus) | Pass 4 | ✅ |
 | CT-7 | I3 (account lifecycle) | Pass 5 | 🔲 |
 | CT-8 | I8 (verify detects tamper) | Pass 10 | 🔲 |
 | CT-9 | FR-4 (partition converge) | Pass 9 | 🔲 |
 | CT-10 | §3.8 (signing toggle) | Pass 11 | 🔲 |
 | CT-11 | §3.3 (external edit disabled) | Pass 6 | 🔲 |
 | CT-12 | §3.3 (external edit enabled) | Pass 9 | 🔲 |
-| CT-13 | §3.3.1 (envelope idempotency) | Pass 4 | 🔲 |
+| CT-13 | §3.3.1 (envelope idempotency) | Pass 4 | ✅ |
 | CT-14 | §3.5 (remote validation) | Pass 9 | 🔲 |
 | CT-15 | §2.3 (unsupported directive) | Pass 3 | 🔲 |
