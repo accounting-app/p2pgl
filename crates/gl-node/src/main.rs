@@ -1,11 +1,15 @@
+mod auth;
 mod config;
+mod graphql;
 mod health;
 
+use auth::AuthState;
 use config::NodeConfig;
+use graphql::{build_schema, graphiql_handler, graphql_handler};
 use health::health_handler;
 
-use axum::Router;
 use axum::routing::get;
+use axum::{middleware, Router};
 use std::path::PathBuf;
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -22,8 +26,8 @@ async fn main() {
         .init();
 
     // Determine config path from env or default.
-    let config_path = std::env::var("GL_NODE_CONFIG")
-        .unwrap_or_else(|_| "gl-node.config.json".to_owned());
+    let config_path =
+        std::env::var("GL_NODE_CONFIG").unwrap_or_else(|_| "gl-node.config.json".to_owned());
     let config_path = PathBuf::from(&config_path);
 
     info!(path = %config_path.display(), "loading configuration");
@@ -54,8 +58,26 @@ async fn main() {
         }
     }
 
-    // Build Axum router.
-    let application = Router::new().route("/health", get(health_handler));
+    // Build the GraphQL schema.
+    let schema = build_schema();
+
+    // Auth state for middleware (§3.8).
+    let auth_state = AuthState {
+        enabled: config.auth.enabled,
+        api_key: config.auth.api_key.clone(),
+    };
+
+    // GraphQL routes — behind auth middleware.
+    let graphql_routes = Router::new()
+        .route("/graphql", get(graphiql_handler).post(graphql_handler))
+        .with_state(schema)
+        .layer(middleware::from_fn_with_state(auth_state, auth::auth_middleware));
+
+    // Build full application router.
+    // /health is exempt from auth (§2.9).
+    let application = Router::new()
+        .route("/health", get(health_handler))
+        .merge(graphql_routes);
 
     // Bind and serve.
     let bind_address = format!("{}:{}", config.bind_address, config.port);
@@ -71,6 +93,7 @@ async fn main() {
         address = %bind_address,
         version = env!("CARGO_PKG_VERSION"),
         ledger = %config.ledger_path,
+        auth_enabled = config.auth.enabled,
         "gl-node starting"
     );
 
