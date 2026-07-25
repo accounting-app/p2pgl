@@ -22,7 +22,7 @@ tracing-subscriber = { workspace = true }
 async-graphql = { workspace = true }
 async-graphql-axum = "7"
 chrono = { workspace = true }
-tokio-stream = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
 rust_decimal = { workspace = true }
 
 [dev-dependencies]

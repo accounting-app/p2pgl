@@ -117,7 +117,7 @@ pub fn verify_dag(dag: &LedgerDag) -> VerifyReport {
 ///
 /// Returns any cycle errors found.
 fn detect_cycles(dag: &LedgerDag) -> Vec<VerifyError> {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     let content_ids = dag.content_ids();
 

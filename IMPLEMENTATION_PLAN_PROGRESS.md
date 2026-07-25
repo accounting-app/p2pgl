@@ -20,10 +20,10 @@
 | **8** | M4 | Iroh P2P + gossip + Lamport clocks | ✅ Done | 200 |
 | **9** | M4 | Anti-entropy + union merge | ✅ Done | 226 |
 | **10** | M5 | Verify + checkpoints + pad generation | ✅ Done | 241 |
-| **11** | M5 | Signing + subscriptions + file watcher | ⏳ Next | — |
-| **12** | M6 | Deploy + integration testing | 🔲 | — |
+| **11** | M5 | Signing + subscriptions + file watcher | ✅ Done | 265 |
+| **12** | M6 | Deploy + integration testing | ⏳ Next | — |
 
-**Current totals:** 241 tests passing · 4 crates compiling · clippy clean
+**Current totals:** 265 tests passing · 4 crates compiling · clippy clean
 
 ---
 
@@ -490,7 +490,49 @@
 
 ---
 
-## ⏳ Pass 11 — Signing + Subscriptions + File Watcher (M5, part 2) — NEXT
+## ✅ Pass 11 — Signing + Subscriptions + File Watcher (M5, part 2)
+
+**Spec sections covered:** §3.8.1 (Ed25519 signing), §2.6 (GraphQL subscriptions), §3.3/CT-12 (file watcher)
+
+### Files Created
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `crates/security/src/signing.rs` | 260 | Ed25519 signing: `SignatureProvider` trait, `NoopSignatureProvider`, `PeerKeySignatureProvider`, domain-separated messages |
+| `crates/gl-node/src/graphql/broadcast.rs` | 120 | `TransactionBroadcast` — tokio broadcast channel for subscription resolvers |
+| `crates/ledger/src/file_watcher.rs` | 200 | File change detection (poll-based), `FileWatcherConfig`, `FileWatcherHandle` with cancellation |
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `crates/gl-node/src/graphql/subscription.rs` | Wired real `transactionAppended` via `BroadcastStream` (replaced pending stub) |
+| `crates/gl-node/src/graphql/mod.rs` | Added `broadcast` module |
+| `crates/gl-node/Cargo.toml` | Added `sync` feature to `tokio-stream` |
+| `crates/security/Cargo.toml` | Added `ed25519-dalek`, `rand`, `hex` |
+| `crates/ledger/Cargo.toml` | Added `tokio` dep |
+
+### Tests (24 new, 265 total)
+
+| Module | Tests | Verifies |
+|--------|-------|----------|
+| Signing | 11 | Noop returns None/Ok, PeerKey sign+verify roundtrip, wrong content ID fails, wrong key fails, bad hex, bad pubkey, domain-separated message format (txid + directiveId), pubkey hex format, standalone verify |
+| Broadcast | 4 | Publish+subscribe async, multiple subscribers, no-subscriber publish, subscriber drop count |
+| File watcher | 9 | Nonexistent file state, unchanged/created/deleted/modified (size+mtime) detection, default config, handle cancellation, reconcile result |
+
+### M5 Milestone Checklist (from §4)
+
+- [x] DAG verification (FR-5 AC1) — Pass 10
+- [x] Balance assertions (§3.6) — Pass 10
+- [x] Pad generation (deterministic, §3.6) — Pass 10
+- [x] Ed25519 signing trait + Noop + PeerKey (§3.8.1) — Pass 11
+- [x] GraphQL subscription: `transactionAppended` wired to broadcast — Pass 11
+- [x] File watcher: change detection + cancellation — Pass 11
+- [x] **Done when:** M5 milestone complete ✅
+
+---
+
+## ⏳ Pass 12 — Deploy + Integration Testing (M6) — NEXT
 
 ## 🔲 Passes 4–12 — Remaining
 
@@ -549,7 +591,7 @@ openledger-v2/
     │           ├── query.rs          ← 9 query resolvers
     │           ├── mutation.rs       ← 3 mutation resolvers
     │           └── subscription.rs   ← transactionAppended
-    ├── ledger/                       ← library (parse, serialize, hash, DAG, validate, service, read model, verify, checkpoint)
+    ├── ledger/                       ← library (parse, serialize, hash, DAG, validate, service, read model, verify, checkpoint, file watcher)
     │   └── src/
     │       ├── lib.rs                ← module declarations
     │       ├── model.rs              ← domain types (10 directives)
@@ -563,7 +605,8 @@ openledger-v2/
     │       ├── service.rs            ← LedgerService (boot, mutate, persist)
     │       ├── read_model.rs         ← in-memory read model + report queries
     │       ├── verify.rs             ← DAG verification (FR-5 AC1)
-    │       └── checkpoint.rs         ← §3.6 balance assertions + pad generation
+    │       ├── checkpoint.rs         ← §3.6 balance assertions + pad generation
+    │       └── file_watcher.rs       ← §3.3 external edit detection
     ├── p2p/                          ← library (wire protocol, gossip, anti-entropy, merge, orphans)
     │   └── src/
     │       ├── lib.rs                ← module declarations
@@ -574,8 +617,10 @@ openledger-v2/
     │       ├── anti_entropy.rs       ← head exchange + want/supply
     │       ├── union_merge.rs        ← remote entry validation + merge
     │       └── orphan_buffer.rs      ← §3.4.4 orphan buffering
-    └── security/                     ← library (stub — Passes 10–11)
-        └── src/lib.rs
+    └── security/                     ← library (Ed25519 signing, auth)
+        └── src/
+            ├── lib.rs                ← module declarations
+            └── signing.rs            ← §3.8.1 SignatureProvider trait + impls
 ```
 
 ## Conformance Test Tracker (§2.7)

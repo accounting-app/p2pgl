@@ -1,2 +1,5 @@
-// Security crate — auth, identity, sign, verify, checkpoint helpers.
-// Stub: all modules will be added in Passes 10–11.
+// Security crate — auth, identity, signing, verification.
+//
+// Implements §3.8 (security & peer identity) and §3.8.1 (signature scheme).
+
+pub mod signing;

@@ -9,6 +9,7 @@ serde = { workspace = true }
 rust_decimal = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true
