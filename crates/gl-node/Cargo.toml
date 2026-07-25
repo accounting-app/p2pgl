@@ -1,0 +1,29 @@
+[package]
+name = "gl-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "gl-node"
+path = "src/main.rs"
+
+[dependencies]
+ledger = { path = "../ledger" }
+p2p = { path = "../p2p" }
+security = { path = "../security" }
+
+tokio = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"
+
+[lints]
+workspace = true

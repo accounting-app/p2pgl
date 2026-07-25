@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "crates/gl-node",
+    "crates/ledger",
+    "crates/p2p",
+    "crates/security",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+axum = "0.8"
+
+[workspace.lints.clippy]
+all = { level = "deny" }
