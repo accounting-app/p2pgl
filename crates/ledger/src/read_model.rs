@@ -9,7 +9,6 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::hash::compute_content_id;
 use crate::model::*;
-use crate::weights::posting_weight;
 
 // ─── Core types ──────────────────────────────────────────────────────────────
 

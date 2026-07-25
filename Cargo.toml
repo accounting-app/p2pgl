@@ -25,6 +25,11 @@ async-graphql = "7"
 chrono = { version = "0.4", features = ["serde"] }
 tokio-stream = "0.1"
 sha2 = "0.10"
+iroh = "1"
+iroh-gossip = "0.101"
+bytes = "1"
+serde_cbor = "0.11"
+anyhow = "1"
 
 [workspace.lints.clippy]
 all = { level = "deny" }

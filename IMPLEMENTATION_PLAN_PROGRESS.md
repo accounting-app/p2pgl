@@ -17,13 +17,13 @@
 | **5** | M2 | DAG + validation (I1–I3, weights) | ✅ Done | 133 |
 | **6** | M2 | Ledger service + live mutations | ✅ Done | 155 |
 | **7** | M3 | Read model + all report queries | ✅ Done | 180 |
-| **8** | M4 | Iroh P2P + gossip + Lamport clocks | ⏳ Next | — |
-| **9** | M4 | Anti-entropy + union merge | 🔲 | — |
+| **8** | M4 | Iroh P2P + gossip + Lamport clocks | ✅ Done | 200 |
+| **9** | M4 | Anti-entropy + union merge | ⏳ Next | — |
 | **10** | M5 | Verify + checkpoints + pad generation | 🔲 | — |
 | **11** | M5 | Signing + subscriptions + file watcher | 🔲 | — |
 | **12** | M6 | Deploy + integration testing | 🔲 | — |
 
-**Current totals:** 180 tests passing · 4 crates compiling · clippy clean
+**Current totals:** 200 tests passing · 4 crates compiling · clippy clean
 
 ---
 
@@ -387,7 +387,48 @@
 
 ---
 
-## ⏳ Pass 8 — Iroh P2P + Gossip + Lamport Clocks (M4) — NEXT
+## ✅ Pass 8 — Iroh P2P + Gossip + Lamport Clocks (M4, part 1)
+
+**Spec sections covered:** §3.4.1 (wire protocol), §3.4.2 (Lamport clocks), §3.4.3 (TopicId derivation), §3.4 (gossip)
+
+### Files Created
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `crates/p2p/src/protocol.rs` | 240 | Wire protocol types: `WireMessage` (Announce/HaveHeads/Want/Supply), CBOR serialization, length-prefixed framing, version check |
+| `crates/p2p/src/topic.rs` | 50 | `TopicId` derivation from swarm topic string via SHA-256 (§3.4.3) |
+| `crates/p2p/src/gossip.rs` | 165 | Gossip handler: announce/supply creation, broadcast encode/decode, envelope extraction |
+| `crates/p2p/src/node.rs` | 180 | `PeerNode` (Iroh endpoint + gossip handles), `PeerRegistry` (thread-safe peer tracking) |
+
+### Dependencies Added
+
+| Crate | Version | Purpose |
+|-------|---------|---------|
+| `iroh` | 1 | QUIC endpoint + peer identity |
+| `iroh-gossip` | 0.101 | Gossip broadcast trees |
+| `serde_cbor` | 0.11 | CBOR wire encoding (§3.4.1) |
+| `bytes` | 1 | Zero-copy byte buffers |
+| `anyhow` | 1 | Error handling |
+
+### Tests (20 new, 200 total)
+
+| Category | Tests | Verifies |
+|----------|-------|----------|
+| Protocol | 10 | CBOR roundtrip (all 4 message types), wire framing, version rejection, insufficient data, oversized message, directive kind mapping |
+| Topic | 3 | TopicId stability, different topics differ, 32-byte output |
+| Gossip | 4 | Announce creation, supply entry with envelope extraction, broadcast roundtrip, content ID verification |
+| Node | 3 | PeerRegistry CRUD, remote heads aggregation, default config |
+
+### Key Design Decisions
+- **Wire protocol is CBOR** per §3.4.1; length-prefixed framing (`uint32_be || cbor_body`)
+- **PeerRegistry is thread-safe** via `Arc<RwLock<HashMap>>` for concurrent reads from GraphQL queries
+- **TopicId derived deterministically** from `p2p.swarmTopic` config string
+- **Envelope extraction filters** to only `openledger-*` keys (non-openledger metadata stays local)
+- **PeerNode wraps** Iroh `Endpoint` + `Gossip` handles; actual event loop deferred to gl-node integration
+
+---
+
+## ⏳ Pass 9 — Anti-Entropy + Union Merge (M4, part 2) — NEXT
 
 ## 🔲 Passes 4–12 — Remaining
 
@@ -459,8 +500,13 @@ openledger-v2/
     │       ├── dag.rs                ← Merkle-DAG + G-Set
     │       ├── service.rs            ← LedgerService (boot, mutate, persist)
     │       └── read_model.rs         ← in-memory read model + report queries
-    ├── p2p/                          ← library (stub — Passes 8–9)
-    │   └── src/lib.rs
+    ├── p2p/                          ← library (wire protocol, gossip, topic, peer management)
+    │   └── src/
+    │       ├── lib.rs                ← module declarations
+    │       ├── protocol.rs           ← §3.4.1 wire types (CBOR)
+    │       ├── topic.rs              ← §3.4.3 TopicId derivation
+    │       ├── gossip.rs             ← broadcast/receive handler
+    │       └── node.rs               ← PeerNode + PeerRegistry
     └── security/                     ← library (stub — Passes 10–11)
         └── src/lib.rs
 ```
