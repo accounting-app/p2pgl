@@ -73,10 +73,10 @@ Provide a programmable, replicated General Ledger over a Beancount file, so that
 Aligned 1:1 with Beancount directives so the file stays canonical.
 
 - **Ledger** — the full set of directives = the company's books. Materialized as **exactly one** `.bean` file per node.
-- **Account** — a colon-delimited name under one of five roots: `Assets`, `Liabilities`, `Equity`, `Income`, `Expenses`. Opened with an `open` directive, optionally `close`d.
-- **Transaction (`txn`)** — a dated event with a flag (`*` complete / `!` incomplete), optional payee + narration, tags, links, and ≥2 **postings**.
+- **Account** — a colon-delimited name under one of five roots: `Assets`, `Liabilities`, `Equity`, `Income`, `Expenses`. Each segment must match `[A-Z][a-zA-Z0-9-]*`. Opened with an `open` directive, optionally `close`d. An `open` with a currency list constrains the account to those currencies (I9).
+- **Transaction (`txn`)** — a dated event with a flag (`*` complete / `!` incomplete), optional payee + narration, tags, links, and ≥2 **postings**. Tags match `#[a-zA-Z0-9_-]+`; links match `^[a-zA-Z0-9_-]+`.
 - **Posting** — an `Account` + an `Amount` (or an elided amount to be auto-computed), optional `cost` and `price`.
-- **Amount** — a decimal `number` + a `currency` (commodity). Decimals only; never floats (see C3 / I4).
+- **Amount** — a decimal `number` + a `currency` (commodity). Currency names must match `[A-Z][A-Z0-9'._-]{0,22}[A-Z0-9]` (minimum 1 character for single-letter currencies like `$` is not allowed; use `USD`). Decimals only; never floats (see C3 / I4). All dates are validated as real calendar dates; `2024-02-30` or `2024-13-01` → structured parse error `INVALID_DATE`.
 - **Balance assertion (`balance`)** — asserts an account equals an amount at a date. Treated as a **checkpoint**, not a write gate (§3.6).
 - **Pad (`pad`)** — inserts a balancing transaction against a source account to satisfy a following `balance`. Also checkpoint-time (§3.6).
 - **Commodity / Price / Note / Document / Event** — pass-through Beancount directives, preserved verbatim when present in the supported subset.
@@ -91,18 +91,21 @@ Aligned 1:1 with Beancount directives so the file stays canonical.
 
 **Unsupported (hard fail):** `include`, `option`, `plugin`, `pushtag`/`poptag`, `pushmeta`/`popmeta`, `custom`, and any unrecognized directive keyword. On parse or boot: refuse to load the file with a structured error naming the directive and line. GraphQL writes never emit these.
 
+> **Usability note:** virtually every Beancount file in the wild contains `option` directives (e.g., `option "title" "..."`, `option "operating_currency" "USD"`). These must be stripped before a `.bean` file can be loaded by `gl-node`. This is intentional — options are process-level settings that have no meaning in a multi-node replicated system. A future import/migration tool may automate this stripping, but it is out of scope for the core node.
+
 ### 2.4 Invariants — the laws (each must have a test)
 
 | ID | Invariant |
 |----|-----------|
 | I1 | For every transaction, the sum of posting weights is zero **per currency** (after cost/price conversion per §3.5.1). Applies to **local and remote** acceptance. |
 | I2 | At most **one** posting per transaction may have an elided amount; it is computed so I1 holds. |
-| I3 | A posting's account must have an `open` directive dated on or before the transaction, and no `close` before it. Applies to **local and remote** acceptance. |
+| I3 | A posting's account must have an `open` directive dated on or before the transaction, and no `close` dated **strictly before** the transaction date. A transaction on the same date as a `close` is **allowed** (because `close` has sort priority 9, placing it after all same-day transactions in canonical order). Applies to **local and remote** acceptance. |
 | I4 | All amounts are arbitrary-precision **decimals**. No floating-point arithmetic touches money. |
 | I5 | `txid = SHA-256(economic_canonical_serialize(transaction))` is stable across peers and runs (C4). Envelope keys (`openledger-*`) never enter the digest. Digest input is UTF-8 bytes per §3.3.2. |
 | I6 | Union of two peers' **directive** sets, deduped by `txid` / `directiveId`, yields **identical aggregate balances** regardless of merge order (commutativity). |
 | I7 | The materialized `.bean` re-parses to the exact same directive set (including envelope metadata) it was rendered from (round-trip stability). |
 | I8 | The transaction DAG is acyclic. Every non-genesis transaction references ≥1 parent `txid` that exists in the DAG (after anti-entropy closes gaps). |
+| I9 | If an `open` directive specifies a currency list, postings to that account must use only those currencies. A posting in an unlisted currency is rejected with `ACCOUNT_CURRENCY_MISMATCH`. An `open` with no currency list accepts any currency. |
 
 ### 2.5 Functional requirements (user stories + acceptance criteria)
 
@@ -213,7 +216,7 @@ type Mutation {
 }
 
 type Subscription {
-  transactionAppended: Transaction!   # realtime notify of appends (API consumers / fan-out)
+  transactionAppended: Transaction!   # fires for ALL appends: local, remote/gossip, and adopted
 }
 ```
 
@@ -266,6 +269,11 @@ Failed mutations/queries that violate ledger rules return GraphQL errors with:
 | `UNSUPPORTED_DIRECTIVE` | Parse/boot of forbidden directive | `directive`, `line` |
 | `INVALID_POSTING` | Illegal posting shape (e.g. both `{cost}` and `@`/`@@`) | `account` |
 | `EXTERNAL_EDIT_REJECTED` | File changed while edits disabled | — |
+| `INVALID_DATE` | Unparseable or impossible calendar date (e.g. `2024-02-30`) | `date` |
+| `INVALID_ACCOUNT_NAME` | Account name violates `[A-Z][a-zA-Z0-9-]*` segment rule or unknown root | `account` |
+| `INVALID_CURRENCY` | Currency name violates `[A-Z][A-Z0-9'._-]{0,22}[A-Z0-9]` | `currency` |
+| `ACCOUNT_CURRENCY_MISMATCH` | Posting currency not in `open` directive's currency list (I9) | `account`, `currency`, `allowed` |
+| `RESOURCE_LIMIT_EXCEEDED` | Transaction exceeds a §3.12 resource limit | `limit`, `actual` |
 | `INTERNAL` | Unexpected server failure | — |
 
 HTTP status for GraphQL remains 200 with `errors` array except auth failures may use **401** when the entire request is rejected before GraphQL execution.
@@ -347,7 +355,7 @@ Root `Cargo.toml` is a workspace. Client tooling is out of scope for this reposi
 
 `.bean` is the source of truth (C1), **and** we need content addressing for P2P merge. We reconcile this as follows:
 
-- On **boot**: parse `.bean` → for each directive compute its content id (`txid` or `directiveId`) from the **economic** canonical form (§3.3.1) → rebuild the transaction DAG from **persisted envelope metadata** (parents, author, Lamport, signature) → build the read model. The file is authoritative; the DAG is derived and reproducible **without inventing parent edges**.
+- On **boot**: if `ledgerPath` does not exist, create an empty file (the ledger starts with zero directives; the first `openAccount` / `appendTransaction` will be genesis). Then parse `.bean` → for each directive compute its content id (`txid` or `directiveId`) from the **economic** canonical form (§3.3.1) → rebuild the transaction DAG from **persisted envelope metadata** (parents, author, Lamport, signature) → build the read model. The file is authoritative; the DAG is derived and reproducible **without inventing parent edges**.
 - On **append/merge**: update the G-Set and DAG, then **re-render** the full ledger to `.bean` via the canonical serializer (C4) and write atomically (temp file + rename). Envelope metadata is written into the file with every directive that needs it.
 - Because serialization is deterministic, two peers with the same directive set produce **byte-identical** `.bean` (I7).
 
@@ -453,7 +461,7 @@ YYYY-MM-DD FLAG "payee" "narration" #tag1 #tag2 ^link1
 ##### Strings & metadata
 
 - Strings double-quoted; escape `\"` and `\\` only
-- Metadata: `  key: "value"` — 2-space indent; keys **sorted alphabetically**; values always quoted
+- Metadata: `  key: "value"` — 2-space indent; keys **sorted alphabetically**; values are **strings only** (always quoted). Non-string metadata values (bare numbers, dates, amounts, booleans) are **not supported** — the parser rejects them with a structured parse error. This is a deliberate simplification from Beancount's full metadata value types.
 - Envelope keys sort among all metadata by the same alphabetical rule
 
 ##### Whitespace & comments
@@ -563,14 +571,20 @@ TopicId        = first 32 bytes of SHA-256( topic_preimage )
 
 ### 3.5 Double-entry validation (write path)
 
+**Concurrency:** all write operations (local mutations, file-watcher reconciliation, and remote gossip inserts) are serialized through a single **write lock** on the ledger state. Concurrent `appendTransaction` calls are queued; the second caller's `openledger-parents` will reflect the first caller's `txid` if it completes first. This lock is the consistency boundary — reads (queries, reports) use a read lock and proceed concurrently with each other but wait for any active write.
+
 On `appendTransaction` (local client write):
 
-1. Resolve elided posting (I2): at most one; compute it so per-currency **weights** (§3.5.1) sum to zero.
-2. Sum weights per currency using decimals (I4).
-3. Reject if any currency's sum ≠ 0 (I1) with `UNBALANCED_TRANSACTION` (§2.8).
-4. Check account `open`/`close` validity (I3).
-5. Compute `txid` from the economic body only (§3.3.1). Set `openledger-parents` to current heads (empty iff genesis). Set `openledger-author` to local `EndpointId`, assign Lamport (§3.4.2), optionally sign (§3.8.1).
-6. Insert into DAG / G-Set → update read model → re-serialize `.bean` (including envelope) → gossip → publish subscription.
+1. Validate input against §3.12 resource limits; reject with `RESOURCE_LIMIT_EXCEEDED` if exceeded.
+2. Validate account names (segment rule), currency names, date validity; reject with the appropriate error code (§2.8).
+3. Resolve elided posting (I2): at most one; compute it so per-currency **weights** (§3.5.1) sum to zero.
+4. Sum weights per currency using decimals (I4).
+5. Reject if any currency's sum ≠ 0 (I1) with `UNBALANCED_TRANSACTION` (§2.8).
+6. Check account `open`/`close` validity (I3) and currency constraints (I9).
+7. Compute `txid` from the economic body only (§3.3.1). Set `openledger-parents` to current heads (empty iff genesis). Set `openledger-author` to local `EndpointId`, assign Lamport (§3.4.2), optionally sign (§3.8.1).
+8. Insert into DAG / G-Set → update read model → re-serialize `.bean` (including envelope) → gossip → publish subscription (to all subscribers, including for remote/adopted appends).
+
+**Genesis flow:** a fresh empty ledger has no accounts. The client must call `openAccount` before `appendTransaction` — I3 requires each posting's account to be open. The first `openAccount` on an empty ledger is the first directive; the first `appendTransaction` after that is the genesis transaction (empty parents).
 
 On `openAccount` / `closeAccount` (and when adopting other non-transaction directives):
 
@@ -612,7 +626,9 @@ Inventory lot tracking / booking methods beyond these weights are **out of scope
 - **Quiescence:** a date range `[from, to]` is quiescent when the anti-entropy want-queue has no ids whose economic date ≤ `to`, and no orphan buffer entries dated ≤ `to`, for **≥ 1 anti-entropy interval**.
 - Assertions are evaluated at **checkpoint** boundaries when the range covering the assertion date is quiescent.
 - A failed assertion is **reported** (via `verify` and logs), never used to reject incoming transactions.
-- **Pad generation (deterministic):** when evaluating `YYYY-MM-DD pad Account SourceAccount` followed by a `balance` on `Account` for amount `B` in currency `C` at date `D`:
+- **Pad generation (deterministic):** pad transactions are generated **only when the assertion date range is quiescent** (see above). This ensures all peers that have converged to the same directive set compute the same pad `txid`. A peer that generates a pad before convergence would produce a different `txid` than peers that have more transactions — the quiescence gate prevents this divergence.
+
+  When evaluating `YYYY-MM-DD pad Account SourceAccount` followed by a `balance` on `Account` for amount `B` in currency `C` at date `D`:
   1. Let `current` = account balance of `Account` in `C` after all transactions with date `< D` (and same-day transactions that sort before the balance per §3.3.2).
   2. Let `delta = B − current`.
   3. If `delta = 0`, no pad transaction.
@@ -673,6 +689,7 @@ For `balanceSheet(at)`:
 - **Addressability:** public IP / IPv6 where available; otherwise Iroh relay + hole-punch (CAP-3).
 - **Discovery — static bootstrap + tickets (with optional relay).** Configured bootstrap `EndpointId`s (and optional connection tickets) suffice for small fixed meshes. Relay / hole-punch are additive. Local-network convenience discovery may be used in development only.
 - Container image: multi-stage Rust build → slim or distroless runtime; expose HTTP and the Iroh QUIC ports as required.
+- **Graceful shutdown:** on `SIGTERM` / `SIGINT`, the node (1) stops accepting new GraphQL requests, (2) completes in-flight requests (with a **10-second** drain timeout), (3) flushes any pending `.bean` write via the normal atomic temp-file + rename, (4) closes Iroh gossip/anti-entropy connections, and (5) exits. No data is lost because every accepted mutation has already been atomically persisted before its response was sent.
 
 ### 3.10 Host capability contract (the agnosticism boundary)
 
@@ -714,7 +731,8 @@ The architecture is **host-agnostic but not paradigm-agnostic**: it runs on any 
 
 | Key | Type | Default | Purpose |
 |-----|------|---------|---------|
-| `ledgerPath` | string | **required** | Path to the single `.bean` file |
+| `ledgerPath` | string | **required** | Path to the single `.bean` file (created if missing — see §3.3) |
+| `bindAddress` | string | `"127.0.0.1"` | HTTP listen address. Use `"0.0.0.0"` for container/remote access. |
 | `port` | number | `4000` | HTTP listen port |
 | `externalFileEdits` | `"enabled"` \| `"disabled"` | `"enabled"` | §3.3 external write path |
 | `auth.enabled` | boolean | `false` | Require `X-Api-Key` |
@@ -734,6 +752,7 @@ Unknown keys are rejected at boot (fail closed). When `auth.enabled` and `auth.a
 ```json
 {
   "ledgerPath": "./data/ledger.bean",
+  "bindAddress": "127.0.0.1",
   "port": 4000,
   "externalFileEdits": "enabled",
   "auth": { "enabled": false, "apiKey": "" },
@@ -748,6 +767,21 @@ Unknown keys are rejected at boot (fail closed). When `auth.enabled` and `auth.a
   }
 }
 ```
+
+### 3.12 Resource limits (normative defaults)
+
+To bound memory and prevent abuse, the following limits are enforced on write. Each produces `RESOURCE_LIMIT_EXCEEDED` (§2.8) when exceeded.
+
+| Limit | Default | Applies to |
+|-------|---------|------------|
+| Max postings per transaction | **1000** | `appendTransaction` input validation |
+| Max narration length | **10 000** UTF-8 bytes | `appendTransaction` |
+| Max payee length | **1 000** UTF-8 bytes | `appendTransaction` |
+| Max tags per transaction | **100** | `appendTransaction` |
+| Max links per transaction | **100** | `appendTransaction` |
+| Max metadata keys per directive | **100** | Any directive (parse + API) |
+
+These limits are not configurable in V1. They exist as named constants in the codebase so they can be promoted to config keys later without a spec change.
 
 ---
 
