@@ -15,15 +15,15 @@
 | **3** | M1 | Beancount parser (10 directive types) | ✅ Done | 68 |
 | **4** | M1 | Canonical serializer + `txid` hashing | ✅ Done | 93 |
 | **5** | M2 | DAG + validation (I1–I3, weights) | ✅ Done | 133 |
-| **6** | M2 | Ledger service + live mutations | ⏳ Next | — |
-| **7** | M3 | Read model + all report queries | 🔲 | — |
+| **6** | M2 | Ledger service + live mutations | ✅ Done | 155 |
+| **7** | M3 | Read model + all report queries | ⏳ Next | — |
 | **8** | M4 | Iroh P2P + gossip + Lamport clocks | 🔲 | — |
 | **9** | M4 | Anti-entropy + union merge | 🔲 | — |
 | **10** | M5 | Verify + checkpoints + pad generation | 🔲 | — |
 | **11** | M5 | Signing + subscriptions + file watcher | 🔲 | — |
 | **12** | M6 | Deploy + integration testing | 🔲 | — |
 
-**Current totals:** 133 tests passing · 4 crates compiling · clippy clean
+**Current totals:** 155 tests passing · 4 crates compiling · clippy clean
 
 ---
 
@@ -273,7 +273,62 @@
 
 ---
 
-## ⏳ Pass 6 — Ledger Service + Live Mutations (M2, part 2) — NEXT
+## ✅ Pass 6 — Ledger Service + Live Mutations (M2, part 2)
+
+**Spec sections covered:** §3.5 (write path), §3.3.1 (envelope stamping), §3.4.2 (Lamport clocks), FR-1 (append), FR-3 (open/close)
+
+### Files Created
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `crates/ledger/src/service.rs` | 660 | `LedgerService`: boot from `.bean`, `append_transaction`, `open_account`, `close_account`, file persistence |
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `crates/ledger/src/validate.rs` | Added `is_open()` accessor to `AccountState` |
+
+### Tests (22 new, 155 total)
+
+| Test | Verifies |
+|------|----------|
+| `test_boot_creates_empty_file` | Creates file + parent dirs if missing |
+| `test_boot_from_existing_file` | Parses and builds AccountState on boot |
+| `test_boot_from_golden_fixture` | Boots from fixture-simple.bean (16 directives) |
+| `test_open_account` | FR-3 AC1: creates directive, updates state, persists |
+| `test_open_already_open_rejected` | FR-3 AC1: ACCOUNT_ALREADY_OPEN |
+| `test_close_account` | FR-3 AC2: closes account, updates state |
+| `test_close_not_open_rejected` | ACCOUNT_NOT_OPEN error |
+| `test_close_with_later_transactions_rejected` | FR-3 AC2: ACCOUNT_HAS_LATER_TRANSACTIONS |
+| `test_append_balanced_transaction` | FR-1 AC1: returns txid, updates DAG |
+| `test_append_unbalanced_rejected` | FR-1 AC2: UNBALANCED_TRANSACTION |
+| `test_append_unopened_account_rejected` | FR-1 AC3: ACCOUNT_NOT_OPEN |
+| `test_append_currency_mismatch_rejected` | I9: ACCOUNT_CURRENCY_MISMATCH |
+| `test_append_with_elided_posting` | I2: elided posting resolved, txid returned |
+| `test_append_idempotent_by_content` | FR-1 AC4: same body → same txid |
+| `test_lamport_increments` | §3.4.2: monotonic increment per write |
+| `test_genesis_has_empty_parents` | §3.3.1: first txn has empty parents |
+| `test_second_txn_references_first_as_parent` | DAG edges: parent = previous head |
+| `test_persist_and_reboot` | Full round-trip: write → reboot → same state |
+| `test_file_round_trip_stable` | I7: re-serialize produces identical bytes |
+| `test_extract_leading_comments` | Comment preservation on boot |
+| `test_extract_no_comments` | No comments = empty vec |
+| `test_full_genesis_flow` | End-to-end: open → genesis txn → verify file |
+
+### M2 Milestone Checklist (from §4)
+
+- [x] Invariant checks I1–I4 on the write path (validate.rs)
+- [x] `LedgerService` that boots from `.bean`, validates + appends, re-serializes
+- [x] `openAccount` / `closeAccount` with FR-3 lifecycle rules
+- [x] Lamport clock stamping (§3.4.2)
+- [x] Parent head tracking for DAG edges
+- [x] File persistence (write-back after every mutation)
+- [x] **Done when:** can open accounts, append balanced transactions, reject invalid ones, and reboot from the file with identical state ✅
+
+---
+
+## ⏳ Pass 7 — Read Model + All Report Queries (M3) — NEXT
 
 ## 🔲 Passes 4–12 — Remaining
 
@@ -332,7 +387,7 @@ openledger-v2/
     │           ├── query.rs          ← 9 query resolvers
     │           ├── mutation.rs       ← 3 mutation resolvers
     │           └── subscription.rs   ← transactionAppended
-    ├── ledger/                       ← library (parse, serialize, hash, DAG, validate)
+    ├── ledger/                       ← library (parse, serialize, hash, DAG, validate, service)
     │   └── src/
     │       ├── lib.rs                ← module declarations
     │       ├── model.rs              ← domain types (10 directives)
@@ -342,7 +397,8 @@ openledger-v2/
     │       ├── hash.rs               ← SHA-256 content IDs
     │       ├── weights.rs            ← posting weight computation
     │       ├── validate.rs           ← invariant validation + AccountState
-    │       └── dag.rs                ← Merkle-DAG + G-Set
+    │       ├── dag.rs                ← Merkle-DAG + G-Set
+    │       └── service.rs            ← LedgerService (boot, mutate, persist)
     ├── p2p/                          ← library (stub — Passes 8–9)
     │   └── src/lib.rs
     └── security/                     ← library (stub — Passes 10–11)

@@ -244,6 +244,13 @@ impl AccountState {
     pub fn currencies(&self, account: &str) -> Option<&[String]> {
         self.accounts.get(account).map(|info| info.currencies.as_slice())
     }
+
+    /// Returns true if the account is currently open (opened and not yet closed).
+    pub fn is_open(&self, account: &str) -> bool {
+        self.accounts
+            .get(account)
+            .is_some_and(|info| info.close_date.is_none())
+    }
 }
 
 // ─── Transaction validation ─────────────────────────────────────────────────
