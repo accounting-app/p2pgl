@@ -16,14 +16,14 @@
 | **4** | M1 | Canonical serializer + `txid` hashing | ✅ Done | 93 |
 | **5** | M2 | DAG + validation (I1–I3, weights) | ✅ Done | 133 |
 | **6** | M2 | Ledger service + live mutations | ✅ Done | 155 |
-| **7** | M3 | Read model + all report queries | ⏳ Next | — |
-| **8** | M4 | Iroh P2P + gossip + Lamport clocks | 🔲 | — |
+| **7** | M3 | Read model + all report queries | ✅ Done | 180 |
+| **8** | M4 | Iroh P2P + gossip + Lamport clocks | ⏳ Next | — |
 | **9** | M4 | Anti-entropy + union merge | 🔲 | — |
 | **10** | M5 | Verify + checkpoints + pad generation | 🔲 | — |
 | **11** | M5 | Signing + subscriptions + file watcher | 🔲 | — |
 | **12** | M6 | Deploy + integration testing | 🔲 | — |
 
-**Current totals:** 155 tests passing · 4 crates compiling · clippy clean
+**Current totals:** 180 tests passing · 4 crates compiling · clippy clean
 
 ---
 
@@ -328,7 +328,66 @@
 
 ---
 
-## ⏳ Pass 7 — Read Model + All Report Queries (M3) — NEXT
+## ✅ Pass 7 — Read Model + All Report Queries (M3)
+
+**Spec sections covered:** §3.7 (read model), §3.7.1 (balance sheet closing), FR-2 (all report queries)
+
+### Files Created
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `crates/ledger/src/read_model.rs` | 460 | In-memory read model: account balances, transaction index, postings-by-account; report methods |
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `crates/ledger/src/service.rs` | Added `ReadModel` field, built on boot, updated incrementally on append |
+
+### Tests (25 new, 180 total)
+
+| Test | Verifies |
+|------|----------|
+| `test_build_empty` | Empty model from no directives |
+| `test_build_indexes_transactions` | Transaction count |
+| `test_build_running_balances` | Running balance accumulation |
+| `test_build_skips_non_transactions` | Only transactions indexed |
+| `test_trial_balance_totals_equal` | FR-2 AC1: total debits == total credits |
+| `test_trial_balance_at_date` | Date-filtered trial balance |
+| `test_trial_balance_rows_sorted` | Alphabetical row ordering |
+| `test_balance_sheet_closing_rule` | §3.7.1: Net-Income closing, accounting equation |
+| `test_balance_sheet_at_date` | Date-filtered balance sheet |
+| `test_income_statement` | FR-2 AC3: income, expenses, net |
+| `test_income_statement_date_range` | Period-filtered income statement |
+| `test_journal_all` | FR-2 AC4: all transactions |
+| `test_journal_by_account` | Account-filtered journal |
+| `test_journal_date_range` | Date-filtered journal |
+| `test_journal_pagination` | Limit/offset pagination |
+| `test_transaction_lookup` | Lookup by txid |
+| `test_transaction_not_found` | Missing txid returns None |
+| `test_account_balance_current` | Current running balance |
+| `test_account_balance_at_date` | Point-in-time balance |
+| `test_account_balance_unknown` | Unknown account returns None |
+| `test_multi_currency_balances` | Multi-currency support |
+| `test_incremental_update` | Incremental indexing |
+| `test_incremental_dedup` | Duplicate rejection |
+| `test_account_root` | Account root extraction |
+| `test_golden_fixture_read_model` | Golden fixture: 3 txns, cash balance, journal |
+
+### M3 Milestone Checklist (from §4)
+
+- [x] `trialBalance(at)` — per-account debit/credit; totals balanced
+- [x] `balanceSheet(at)` — Assets, Liabilities, Equity with §3.7.1 Net-Income closing
+- [x] `incomeStatement(from, to)` — Income, Expenses, net per currency
+- [x] `journal(account?, from?, to?)` — filtered, paginated
+- [x] `transaction(txid)` — single lookup
+- [x] `account(name, at?)` — per-currency balances
+- [x] Read model built on boot, updated incrementally (FR-2 AC5)
+- [x] **Done when:** all 6 report queries return correct results from the in-memory model ✅
+
+---
+
+## ⏳ Pass 8 — Iroh P2P + Gossip + Lamport Clocks (M4) — NEXT
 
 ## 🔲 Passes 4–12 — Remaining
 
@@ -387,7 +446,7 @@ openledger-v2/
     │           ├── query.rs          ← 9 query resolvers
     │           ├── mutation.rs       ← 3 mutation resolvers
     │           └── subscription.rs   ← transactionAppended
-    ├── ledger/                       ← library (parse, serialize, hash, DAG, validate, service)
+    ├── ledger/                       ← library (parse, serialize, hash, DAG, validate, service, read model)
     │   └── src/
     │       ├── lib.rs                ← module declarations
     │       ├── model.rs              ← domain types (10 directives)
@@ -398,7 +457,8 @@ openledger-v2/
     │       ├── weights.rs            ← posting weight computation
     │       ├── validate.rs           ← invariant validation + AccountState
     │       ├── dag.rs                ← Merkle-DAG + G-Set
-    │       └── service.rs            ← LedgerService (boot, mutate, persist)
+    │       ├── service.rs            ← LedgerService (boot, mutate, persist)
+    │       └── read_model.rs         ← in-memory read model + report queries
     ├── p2p/                          ← library (stub — Passes 8–9)
     │   └── src/lib.rs
     └── security/                     ← library (stub — Passes 10–11)

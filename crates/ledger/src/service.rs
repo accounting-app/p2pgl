@@ -12,6 +12,7 @@ use crate::error::ParseError;
 use crate::hash::compute_content_id;
 use crate::model::*;
 use crate::parse::parse_file;
+use crate::read_model::ReadModel;
 use crate::serialize::full_file_serialize;
 use crate::validate::{AccountState, ValidationError, validate_transaction};
 
@@ -141,6 +142,7 @@ pub struct PostingInput {
 pub struct LedgerService {
     dag: LedgerDag,
     accounts: AccountState,
+    read_model: ReadModel,
     lamport_clock: u64,
     author_id: String,
     file_path: PathBuf,
@@ -222,9 +224,14 @@ impl LedgerService {
             0
         };
 
+        // Build the read model from all directives.
+        let all_directives: Vec<Directive> = dag.directives().into_iter().cloned().collect();
+        let read_model = ReadModel::build(&all_directives);
+
         Ok(LedgerService {
             dag,
             accounts,
+            read_model,
             lamport_clock,
             author_id,
             file_path,
@@ -273,13 +280,16 @@ impl LedgerService {
 
         // Insert into DAG.
         let directive = Directive::Transaction(resolved);
-        let content_id = match self.dag.insert(directive, false)? {
+        let content_id = match self.dag.insert(directive.clone(), false)? {
             InsertResult::Inserted { content_id } => content_id,
             InsertResult::Duplicate { content_id } => {
                 // FR-1 AC4: idempotent by content. Return existing txid.
                 return Ok(content_id);
             }
         };
+
+        // Update read model incrementally.
+        self.read_model.index_directive(&directive);
 
         // Persist to file.
         self.persist()?;
@@ -455,6 +465,11 @@ impl LedgerService {
     /// The account state tracker.
     pub fn accounts(&self) -> &AccountState {
         &self.accounts
+    }
+
+    /// The in-memory read model (for report queries).
+    pub fn read_model(&self) -> &ReadModel {
+        &self.read_model
     }
 
     /// Current Lamport clock value.
