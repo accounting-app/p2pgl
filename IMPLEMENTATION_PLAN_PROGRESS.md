@@ -18,12 +18,12 @@
 | **6** | M2 | Ledger service + live mutations | ✅ Done | 155 |
 | **7** | M3 | Read model + all report queries | ✅ Done | 180 |
 | **8** | M4 | Iroh P2P + gossip + Lamport clocks | ✅ Done | 200 |
-| **9** | M4 | Anti-entropy + union merge | ⏳ Next | — |
-| **10** | M5 | Verify + checkpoints + pad generation | 🔲 | — |
+| **9** | M4 | Anti-entropy + union merge | ✅ Done | 226 |
+| **10** | M5 | Verify + checkpoints + pad generation | ⏳ Next | — |
 | **11** | M5 | Signing + subscriptions + file watcher | 🔲 | — |
 | **12** | M6 | Deploy + integration testing | 🔲 | — |
 
-**Current totals:** 200 tests passing · 4 crates compiling · clippy clean
+**Current totals:** 226 tests passing · 4 crates compiling · clippy clean
 
 ---
 
@@ -428,7 +428,41 @@
 
 ---
 
-## ⏳ Pass 9 — Anti-Entropy + Union Merge (M4, part 2) — NEXT
+## ✅ Pass 9 — Anti-Entropy + Union Merge (M4, part 2)
+
+**Spec sections covered:** §3.4 (anti-entropy), §3.4.4 (orphan buffer), §3.5 (remote insert validation)
+
+### Files Created
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `crates/p2p/src/anti_entropy.rs` | 220 | Head exchange diff computation, want-set derivation, supply filtering |
+| `crates/p2p/src/union_merge.rs` | 300 | Supply entry validation: parse → hash verify (I5) → envelope attach → required field checks |
+| `crates/p2p/src/orphan_buffer.rs` | 250 | Orphan buffer (§3.4.4): 10K/1h limits, reverse index for fast parent resolution |
+
+### Tests (26 new, 226 total)
+
+| Module | Tests | Verifies |
+|--------|-------|----------|
+| Anti-entropy | 9 | Empty local, all-present, partial overlap, directive IDs, sorted heads, synced/behind/ahead/diverged exchange |
+| Union merge | 10 | Valid entry success, content hash mismatch (I5), missing author/lamport, empty/unparseable body, lamport extraction, parent extraction (empty + multiple), open directive validation |
+| Orphan buffer | 7 | Insert + len, duplicate dedup, single-parent resolve, multi-parent partial/full, shared-parent unblocks multiple, wanted IDs, nonexistent parent no-op |
+
+### M4 Milestone Checklist (from §4)
+
+- [x] Wire protocol types (CBOR, framing) — Pass 8
+- [x] TopicId derivation (§3.4.3) — Pass 8
+- [x] Gossip broadcast/receive handler — Pass 8
+- [x] PeerNode + PeerRegistry — Pass 8
+- [x] Anti-entropy head exchange + want computation — Pass 9
+- [x] Union merge: parse → I5 verify → envelope → validate — Pass 9
+- [x] Orphan buffer (§3.4.4): 10K/1h limits, parent-arrival resolution — Pass 9
+- [x] Lamport clock remote adopt (§3.4.2) — metadata extraction ready — Pass 9
+- [x] **Done when:** M4 milestone complete ✅
+
+---
+
+## ⏳ Pass 10 — Verify + Checkpoints + Pad Generation (M5, part 1) — NEXT
 
 ## 🔲 Passes 4–12 — Remaining
 
@@ -500,13 +534,16 @@ openledger-v2/
     │       ├── dag.rs                ← Merkle-DAG + G-Set
     │       ├── service.rs            ← LedgerService (boot, mutate, persist)
     │       └── read_model.rs         ← in-memory read model + report queries
-    ├── p2p/                          ← library (wire protocol, gossip, topic, peer management)
+    ├── p2p/                          ← library (wire protocol, gossip, anti-entropy, merge, orphans)
     │   └── src/
     │       ├── lib.rs                ← module declarations
     │       ├── protocol.rs           ← §3.4.1 wire types (CBOR)
     │       ├── topic.rs              ← §3.4.3 TopicId derivation
     │       ├── gossip.rs             ← broadcast/receive handler
-    │       └── node.rs               ← PeerNode + PeerRegistry
+    │       ├── node.rs               ← PeerNode + PeerRegistry
+    │       ├── anti_entropy.rs       ← head exchange + want/supply
+    │       ├── union_merge.rs        ← remote entry validation + merge
+    │       └── orphan_buffer.rs      ← §3.4.4 orphan buffering
     └── security/                     ← library (stub — Passes 10–11)
         └── src/lib.rs
 ```
