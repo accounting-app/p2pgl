@@ -14,8 +14,8 @@
 | **2** | M0 | GraphQL schema, scalars, auth middleware | ✅ Done | 27 |
 | **3** | M1 | Beancount parser (10 directive types) | ✅ Done | 68 |
 | **4** | M1 | Canonical serializer + `txid` hashing | ✅ Done | 93 |
-| **5** | M2 | DAG + validation (I1–I3, weights) | ⏳ Next | — |
-| **6** | M2 | Ledger service + live mutations | 🔲 | — |
+| **5** | M2 | DAG + validation (I1–I3, weights) | ✅ Done | 133 |
+| **6** | M2 | Ledger service + live mutations | ⏳ Next | — |
 | **7** | M3 | Read model + all report queries | 🔲 | — |
 | **8** | M4 | Iroh P2P + gossip + Lamport clocks | 🔲 | — |
 | **9** | M4 | Anti-entropy + union merge | 🔲 | — |
@@ -23,7 +23,7 @@
 | **11** | M5 | Signing + subscriptions + file watcher | 🔲 | — |
 | **12** | M6 | Deploy + integration testing | 🔲 | — |
 
-**Current totals:** 93 tests passing · 4 crates compiling · clippy clean
+**Current totals:** 133 tests passing · 4 crates compiling · clippy clean
 
 ---
 
@@ -244,7 +244,36 @@
 
 ---
 
-## ⏳ Pass 5 — DAG + Validation (M2, part 1) — NEXT
+## ✅ Pass 5 — DAG + Validation (M2, part 1)
+
+**Spec sections covered:** §2.4 (I1–I3, I8, I9), §3.3 (G-Set/DAG), §3.4 (consistency), §3.5.1 (posting weights)
+
+### Files Created
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `crates/ledger/src/weights.rs` | 285 | Posting weight computation per §3.5.1 (plain, cost, unit/total price, elision resolution) |
+| `crates/ledger/src/validate.rs` | 485 | Transaction validation (I1 balance, I2 elision, I3 lifecycle, I9 currency), AccountState tracker |
+| `crates/ledger/src/dag.rs` | 310 | Merkle-DAG + G-Set: content-addressed insert, head tracking, cycle detection (I8), dedup |
+
+### Tests (40 new, 133 total)
+
+| Category | Tests | Verifies |
+|----------|-------|----------|
+| Weights | 13 | Plain, cost, unit price, total price weight computation; sign preservation; cost+price rejection; elision resolution; multi-currency sum |
+| Validation | 15 | **CT-1** (I1 balance), **CT-2** (I2 elision), **CT-7** (I3 lifecycle), I9 currency constraint, same-day close, cost+price rejection |
+| DAG | 12 | G-Set dedup, genesis insert, parent→child edges, head tracking, merge reduces heads, missing parent (strict/lenient), accessors |
+
+### Key Design Decisions
+- **Weight computation decoupled:** `weights.rs` is a pure function library used by both `validate.rs` and future report queries
+- **AccountState is a separate tracker:** Can be built from directives on boot and updated incrementally
+- **DAG has strict/lenient modes:** `require_parents=true` for runtime inserts; `false` for boot (file order may not match DAG order)
+- **Cycle detection:** DFS walk of ancestors before insert (I8)
+- **Elision resolution in validate:** Returns the resolved transaction with the elided posting filled in
+
+---
+
+## ⏳ Pass 6 — Ledger Service + Live Mutations (M2, part 2) — NEXT
 
 ## 🔲 Passes 4–12 — Remaining
 
@@ -303,14 +332,17 @@ openledger-v2/
     │           ├── query.rs          ← 9 query resolvers
     │           ├── mutation.rs       ← 3 mutation resolvers
     │           └── subscription.rs   ← transactionAppended
-    ├── ledger/                       ← library (parse, serialize, hash)
+    ├── ledger/                       ← library (parse, serialize, hash, DAG, validate)
     │   └── src/
     │       ├── lib.rs                ← module declarations
     │       ├── model.rs              ← domain types (10 directives)
     │       ├── error.rs              ← structured parse errors
     │       ├── parse.rs              ← recursive-descent parser
     │       ├── serialize.rs          ← canonical serializer
-    │       └── hash.rs               ← SHA-256 content IDs
+    │       ├── hash.rs               ← SHA-256 content IDs
+    │       ├── weights.rs            ← posting weight computation
+    │       ├── validate.rs           ← invariant validation + AccountState
+    │       └── dag.rs                ← Merkle-DAG + G-Set
     ├── p2p/                          ← library (stub — Passes 8–9)
     │   └── src/lib.rs
     └── security/                     ← library (stub — Passes 10–11)
@@ -321,13 +353,13 @@ openledger-v2/
 
 | Obligation | Invariant | Target Pass | Status |
 |------------|-----------|-------------|--------|
-| CT-1 | I1 (balance) | Pass 5 | 🔲 |
-| CT-2 | I2 (elided posting) | Pass 5 | 🔲 |
+| CT-1 | I1 (balance) | Pass 5 | ✅ |
+| CT-2 | I2 (elided posting) | Pass 5 | ✅ |
 | CT-3 | I5 (txid stable) | Pass 4 | ✅ |
 | CT-4 | I6 (merge commutativity) | Pass 9 | 🔲 |
 | CT-5 | I7 (round-trip) | Pass 4 | ✅ |
 | CT-6 | I7 (golden corpus) | Pass 4 | ✅ |
-| CT-7 | I3 (account lifecycle) | Pass 5 | 🔲 |
+| CT-7 | I3 (account lifecycle) | Pass 5 | ✅ |
 | CT-8 | I8 (verify detects tamper) | Pass 10 | 🔲 |
 | CT-9 | FR-4 (partition converge) | Pass 9 | 🔲 |
 | CT-10 | §3.8 (signing toggle) | Pass 11 | 🔲 |
@@ -335,4 +367,4 @@ openledger-v2/
 | CT-12 | §3.3 (external edit enabled) | Pass 9 | 🔲 |
 | CT-13 | §3.3.1 (envelope idempotency) | Pass 4 | ✅ |
 | CT-14 | §3.5 (remote validation) | Pass 9 | 🔲 |
-| CT-15 | §2.3 (unsupported directive) | Pass 3 | 🔲 |
+| CT-15 | §2.3 (unsupported directive) | Pass 3 | ✅ |
