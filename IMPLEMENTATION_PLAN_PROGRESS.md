@@ -19,11 +19,11 @@
 | **7** | M3 | Read model + all report queries | ✅ Done | 180 |
 | **8** | M4 | Iroh P2P + gossip + Lamport clocks | ✅ Done | 200 |
 | **9** | M4 | Anti-entropy + union merge | ✅ Done | 226 |
-| **10** | M5 | Verify + checkpoints + pad generation | ⏳ Next | — |
-| **11** | M5 | Signing + subscriptions + file watcher | 🔲 | — |
+| **10** | M5 | Verify + checkpoints + pad generation | ✅ Done | 241 |
+| **11** | M5 | Signing + subscriptions + file watcher | ⏳ Next | — |
 | **12** | M6 | Deploy + integration testing | 🔲 | — |
 
-**Current totals:** 226 tests passing · 4 crates compiling · clippy clean
+**Current totals:** 241 tests passing · 4 crates compiling · clippy clean
 
 ---
 
@@ -462,7 +462,35 @@
 
 ---
 
-## ⏳ Pass 10 — Verify + Checkpoints + Pad Generation (M5, part 1) — NEXT
+## ✅ Pass 10 — Verify + Checkpoints + Pad Generation (M5, part 1)
+
+**Spec sections covered:** FR-5 AC1 (verify), §3.6 (balance assertions & pad), §3.7.1 (balance sheet closing)
+
+### Files Created
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `crates/ledger/src/verify.rs` | 335 | DAG verification (FR-5 AC1): content hash check (I5), parent resolution (I8), cycle detection via DFS |
+| `crates/ledger/src/checkpoint.rs` | 320 | Balance assertions, pad transaction generation (§3.6), batch evaluation |
+
+### Tests (15 new, 241 total)
+
+| Module | Tests | Verifies |
+|--------|-------|----------|
+| Verify | 6 | Empty DAG, single genesis, chain, content hashes, mixed directives, golden fixture (known missing parent) |
+| Checkpoint | 10 | Assertion pass/fail/unknown, pad delta positive/negative/zero, batch assertions, batch pads, golden fixture balance |
+
+### Key Design Decisions
+- **Verify walks all nodes**: checks content hash, parent resolution, and cycles — matches FR-5 AC1 exactly
+- **Cycle detection uses DFS coloring**: O(V+E), handles disconnected components
+- **Golden fixture test**: correctly expects one missing parent (pre-baked hash in fixture doesn't match computed content ID)
+- **Balance assertions are informational** per §3.6 — never reject transactions
+- **Pad generation is deterministic** — same directive set produces same pad txid on all peers
+- **Pad narration format**: exactly `"Pad {account}"` per §3.6 step 4
+
+---
+
+## ⏳ Pass 11 — Signing + Subscriptions + File Watcher (M5, part 2) — NEXT
 
 ## 🔲 Passes 4–12 — Remaining
 
@@ -521,7 +549,7 @@ openledger-v2/
     │           ├── query.rs          ← 9 query resolvers
     │           ├── mutation.rs       ← 3 mutation resolvers
     │           └── subscription.rs   ← transactionAppended
-    ├── ledger/                       ← library (parse, serialize, hash, DAG, validate, service, read model)
+    ├── ledger/                       ← library (parse, serialize, hash, DAG, validate, service, read model, verify, checkpoint)
     │   └── src/
     │       ├── lib.rs                ← module declarations
     │       ├── model.rs              ← domain types (10 directives)
@@ -533,7 +561,9 @@ openledger-v2/
     │       ├── validate.rs           ← invariant validation + AccountState
     │       ├── dag.rs                ← Merkle-DAG + G-Set
     │       ├── service.rs            ← LedgerService (boot, mutate, persist)
-    │       └── read_model.rs         ← in-memory read model + report queries
+    │       ├── read_model.rs         ← in-memory read model + report queries
+    │       ├── verify.rs             ← DAG verification (FR-5 AC1)
+    │       └── checkpoint.rs         ← §3.6 balance assertions + pad generation
     ├── p2p/                          ← library (wire protocol, gossip, anti-entropy, merge, orphans)
     │   └── src/
     │       ├── lib.rs                ← module declarations
