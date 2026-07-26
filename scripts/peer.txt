@@ -1,0 +1,7 @@
+GL_NODE_CONFIG="./config/gl-node.json" cargo run -p gl-node
+
+GL_NODE_CONFIG="./config/gl-node.peer-0.json" cargo run -p gl-node
+
+GL_NODE_CONFIG="./config/gl-node.peer-1.json" cargo run -p gl-node
+
+GL_NODE_CONFIG="./config/gl-node.peer-2.json" cargo run -p gl-node
