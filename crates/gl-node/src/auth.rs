@@ -22,6 +22,11 @@ pub async fn auth_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    // Always allow CORS preflight requests through (OPTIONS).
+    if request.method() == axum::http::Method::OPTIONS {
+        return next.run(request).await;
+    }
+
     if !auth_state.enabled {
         return next.run(request).await;
     }

@@ -11,6 +11,7 @@ use health::health_handler;
 
 use axum::routing::get;
 use axum::{middleware, Router};
+use tower_http::cors::CorsLayer;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -108,7 +109,8 @@ async fn main() {
     // /health is exempt from auth (§2.9).
     let application = Router::new()
         .route("/health", get(health_handler))
-        .merge(graphql_routes);
+        .merge(graphql_routes)
+        .layer(CorsLayer::permissive());
 
     // Bind and serve.
     let bind_address = format!("{}:{}", config.bind_address, config.port);
