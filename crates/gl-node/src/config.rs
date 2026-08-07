@@ -31,6 +31,7 @@ pub struct NodeConfig {
 
     /// Transaction signing configuration.
     #[serde(default)]
+    #[allow(dead_code)] // Read when signing is wired (Phase 2).
     pub signing: SigningConfig,
 
     /// Peer-to-peer replication configuration.
@@ -59,6 +60,7 @@ pub struct AuthConfig {
 pub struct SigningConfig {
     /// Whether Ed25519 signing is enabled.
     #[serde(default)]
+    #[allow(dead_code)] // Read when signing is wired (Phase 2).
     pub enabled: bool,
 }
 
@@ -81,6 +83,7 @@ pub struct P2pConfig {
 
     /// iroh-gossip announce cadence in milliseconds.
     #[serde(default = "default_gossip_interval")]
+    #[allow(dead_code)] // Available for gossip pacing.
     pub gossip_interval_milliseconds: u64,
 
     /// ALPN head-exchange cadence in milliseconds.

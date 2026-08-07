@@ -706,6 +706,149 @@ impl LedgerService {
     pub fn content_id(directive: &Directive) -> String {
         compute_content_id(directive)
     }
+
+    /// Update the author identity (called when P2P boots and we learn our EndpointId).
+    pub fn set_author_id(&mut self, author_id: String) {
+        self.author_id = author_id;
+    }
+
+    /// Get the set of current DAG head txids (for anti-entropy exchange).
+    pub fn head_txids(&self) -> std::collections::HashSet<String> {
+        self.dag.heads().iter().cloned().collect()
+    }
+
+    /// Get the set of all directive content IDs in the DAG (for anti-entropy exchange).
+    pub fn all_directive_ids(&self) -> std::collections::HashSet<String> {
+        self.dag.content_ids().into_iter().map(|s| s.to_owned()).collect()
+    }
+
+    /// Insert a validated remote directive into the ledger (P2P receive path).
+    ///
+    /// This method is the bridge between `p2p::union_merge::validate_supply_entry()`
+    /// (which validates wire format, content hash, and envelope) and the ledger's
+    /// internal state. It:
+    ///
+    /// 1. Adopts the Lamport clock (§3.4.2)
+    /// 2. For transactions: validates I1, I2, I3 against local account state
+    /// 3. Inserts into DAG (G-Set dedup handles idempotency)
+    /// 4. Updates the read model incrementally
+    /// 5. Re-serializes the `.bean` file
+    ///
+    /// Returns `Ok(Some(content_id))` if inserted, `Ok(None)` if duplicate, or `Err` if rejected.
+    pub fn insert_remote_directive(
+        &mut self,
+        directive: Directive,
+    ) -> Result<Option<String>, ServiceError> {
+        let content_id = compute_content_id(&directive);
+
+        // G-Set dedup: if already present, no-op.
+        if self.dag.get(&content_id).is_some() {
+            return Ok(None);
+        }
+
+        // Adopt Lamport clock (§3.4.2): lamport = max(local, remote) + 1.
+        let metadata = match &directive {
+            Directive::Transaction(txn) => &txn.metadata,
+            Directive::Open(d) => &d.metadata,
+            Directive::Close(d) => &d.metadata,
+            Directive::Commodity(d) => &d.metadata,
+            Directive::Pad(d) => &d.metadata,
+            Directive::Balance(d) => &d.metadata,
+            Directive::Note(d) => &d.metadata,
+            Directive::Document(d) => &d.metadata,
+            Directive::Event(d) => &d.metadata,
+            Directive::Price(d) => &d.metadata,
+        };
+        if let Some(remote_lamport) = metadata
+            .get("openledger-lamport")
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            self.lamport_clock = self.lamport_clock.max(remote_lamport) + 1;
+        }
+
+        // Validate and insert based on directive type.
+        match &directive {
+            Directive::Transaction(txn) => {
+                // Validate I1, I2, I3, I9 against local account state.
+                let validated = validate_transaction(txn, &self.accounts)?;
+                let final_txn = Transaction {
+                    postings: validated.postings,
+                    ..txn.clone()
+                };
+                let final_directive = Directive::Transaction(final_txn);
+                match self.dag.insert(final_directive.clone(), false)? {
+                    InsertResult::Inserted { content_id } => {
+                        self.read_model.index_directive(&final_directive);
+                        self.persist()?;
+                        Ok(Some(content_id))
+                    }
+                    InsertResult::Duplicate { .. } => Ok(None),
+                }
+            }
+            Directive::Open(open) => {
+                // Register account state.
+                let _ = self.accounts.open_account(&open.account, open.date, &open.currencies);
+                match self.dag.insert(directive.clone(), false)? {
+                    InsertResult::Inserted { content_id } => {
+                        self.read_model.index_directive(&directive);
+                        self.persist()?;
+                        Ok(Some(content_id))
+                    }
+                    InsertResult::Duplicate { .. } => Ok(None),
+                }
+            }
+            Directive::Close(close) => {
+                let _ = self.accounts.close_account(&close.account, close.date);
+                match self.dag.insert(directive.clone(), false)? {
+                    InsertResult::Inserted { content_id } => {
+                        self.read_model.index_directive(&directive);
+                        self.persist()?;
+                        Ok(Some(content_id))
+                    }
+                    InsertResult::Duplicate { .. } => Ok(None),
+                }
+            }
+            _ => {
+                // All other directive types: insert directly.
+                match self.dag.insert(directive.clone(), false)? {
+                    InsertResult::Inserted { content_id } => {
+                        self.read_model.index_directive(&directive);
+                        self.persist()?;
+                        Ok(Some(content_id))
+                    }
+                    InsertResult::Duplicate { .. } => Ok(None),
+                }
+            }
+        }
+    }
+
+    /// Stamp a signature onto a directive's metadata after insert (§3.8.1).
+    ///
+    /// This is called by the mutation layer when signing is enabled. The
+    /// signature is stamped as `openledger-signature` metadata on the
+    /// already-inserted directive.
+    pub fn stamp_signature(&mut self, content_id: &str, signature_hex: &str) {
+        if let Some(directive) = self.dag.get_mut(content_id) {
+            let metadata = match directive {
+                Directive::Transaction(txn) => &mut txn.metadata,
+                Directive::Open(d) => &mut d.metadata,
+                Directive::Close(d) => &mut d.metadata,
+                Directive::Commodity(d) => &mut d.metadata,
+                Directive::Pad(d) => &mut d.metadata,
+                Directive::Balance(d) => &mut d.metadata,
+                Directive::Note(d) => &mut d.metadata,
+                Directive::Document(d) => &mut d.metadata,
+                Directive::Event(d) => &mut d.metadata,
+                Directive::Price(d) => &mut d.metadata,
+            };
+            metadata.insert(
+                "openledger-signature".to_owned(),
+                signature_hex.to_owned(),
+            );
+            // Re-persist so the signature is written to disk.
+            let _ = self.persist();
+        }
+    }
 }
 
 // ─── Comment extraction ──────────────────────────────────────────────────────

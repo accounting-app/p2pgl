@@ -32,21 +32,27 @@ pub type AppSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
 
 /// Build the async-graphql schema with the live ledger service.
 ///
-/// Injects `SharedLedger` and `TransactionBroadcast` into the schema data
-/// so resolvers can access them via `ctx.data_unchecked::<T>()`.
+/// Injects `SharedLedger`, `TransactionBroadcast`, `PeerRegistry`, and
+/// `SignatureProvider` into the schema data so resolvers can access them
+/// via `ctx.data_unchecked::<T>()`.
 pub fn build_schema_with_service(
     ledger: SharedLedger,
     broadcast: TransactionBroadcast,
+    peer_registry: p2p::node::PeerRegistry,
+    signer: std::sync::Arc<dyn security::signing::SignatureProvider>,
 ) -> AppSchema {
     Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
         .data(ledger)
         .data(broadcast)
+        .data(peer_registry)
+        .data(signer)
         .finish()
 }
 
 /// Build the schema without a ledger service (for tests / introspection only).
 ///
 /// Queries and mutations that need the ledger will return INTERNAL errors.
+#[cfg(test)]
 pub fn build_schema() -> AppSchema {
     Schema::build(QueryRoot, MutationRoot, SubscriptionRoot).finish()
 }
@@ -172,7 +178,12 @@ mod tests {
         let service = LedgerService::boot(&bean_path, "test-node".to_owned()).unwrap();
         let ledger = Arc::new(RwLock::new(service));
         let broadcast = TransactionBroadcast::new();
-        let schema = build_schema_with_service(ledger, broadcast);
+        let schema = build_schema_with_service(
+            ledger,
+            broadcast,
+            p2p::node::PeerRegistry::new(),
+            std::sync::Arc::new(security::signing::NoopSignatureProvider),
+        );
 
         // Health should show 0 heads.
         let result = schema.execute("{ health { status heads } }").await;

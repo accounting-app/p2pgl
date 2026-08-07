@@ -25,6 +25,11 @@ chrono = { workspace = true }
 tokio-stream = { workspace = true, features = ["sync"] }
 rust_decimal = { workspace = true }
 tower-http = { workspace = true }
+iroh = { workspace = true }
+iroh-gossip = { workspace = true }
+hex = "0.4"
+rand = "0.8"
+
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

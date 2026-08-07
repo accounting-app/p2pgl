@@ -1,7 +1,10 @@
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Serialize;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// Response body for `GET /health` (§2.9).
 #[derive(Debug, Serialize)]
@@ -12,15 +15,23 @@ pub struct HealthResponse {
     pub version: String,
 }
 
+/// Shared state for the health endpoint.
+#[derive(Clone)]
+pub struct HealthState {
+    pub ledger: Arc<RwLock<ledger::service::LedgerService>>,
+    pub peer_registry: p2p::node::PeerRegistry,
+}
+
 /// Handler for `GET /health`.
 ///
 /// Exempt from auth even when `auth.enabled` (§2.9).
-/// Returns head/peer counts matching GraphQL `Health` (stubbed to 0 until M2+).
-pub async fn health_handler() -> impl IntoResponse {
+/// Returns live head and peer counts from the ledger and peer registry.
+pub async fn health_handler(State(state): State<HealthState>) -> impl IntoResponse {
+    let svc = state.ledger.read().await;
     let response = HealthResponse {
         status: "ok".to_owned(),
-        heads: 0,
-        peers: 0,
+        heads: svc.head_count() as u64,
+        peers: state.peer_registry.count() as u64,
         version: env!("CARGO_PKG_VERSION").to_owned(),
     };
     (StatusCode::OK, Json(response))
@@ -38,7 +49,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_returns_ok() {
-        let application = Router::new().route("/health", get(health_handler));
+        let dir = tempfile::tempdir().unwrap();
+        let bean_path = dir.path().join("test.bean");
+        std::fs::write(&bean_path, "").unwrap();
+
+        let service =
+            ledger::service::LedgerService::boot(&bean_path, "test-node".to_owned()).unwrap();
+        let state = HealthState {
+            ledger: Arc::new(RwLock::new(service)),
+            peer_registry: p2p::node::PeerRegistry::new(),
+        };
+
+        let application = Router::new()
+            .route("/health", get(health_handler))
+            .with_state(state);
         let request = Request::builder()
             .uri("/health")
             .body(Body::empty())

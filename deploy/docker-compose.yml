@@ -1,0 +1,96 @@
+# Multi-node OpenLedger deployment (§5 layout).
+#
+# Spins up 3 gl-node instances that discover each other via
+# iroh-gossip (no bootstrap peers needed for local Docker network —
+# mDNS discovery handles it).
+#
+# Usage:
+#   docker compose -f deploy/docker-compose.yml up --build
+#
+# Each node exposes:
+#   - node-0: http://localhost:3000/graphql  (GraphiQL)
+#   - node-1: http://localhost:3001/graphql
+#   - node-2: http://localhost:3002/graphql
+#   - All nodes: GET /health for health checks
+
+services:
+  node-0:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: gl-node-0
+    ports:
+      - "3000:3000"
+    volumes:
+      - node0-data:/data
+      - ./gl-node.docker.json:/data/gl-node.config.json:ro
+    environment:
+      - RUST_LOG=info
+      - GL_NODE_CONFIG=/data/gl-node.config.json
+    networks:
+      - openledger
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  node-1:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: gl-node-1
+    ports:
+      - "3001:3000"
+    volumes:
+      - node1-data:/data
+      - ./gl-node.docker.json:/data/gl-node.config.json:ro
+    environment:
+      - RUST_LOG=info
+      - GL_NODE_CONFIG=/data/gl-node.config.json
+    networks:
+      - openledger
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      node-0:
+        condition: service_healthy
+
+  node-2:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: gl-node-2
+    ports:
+      - "3002:3000"
+    volumes:
+      - node2-data:/data
+      - ./gl-node.docker.json:/data/gl-node.config.json:ro
+    environment:
+      - RUST_LOG=info
+      - GL_NODE_CONFIG=/data/gl-node.config.json
+    networks:
+      - openledger
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      node-0:
+        condition: service_healthy
+
+volumes:
+  node0-data:
+  node1-data:
+  node2-data:
+
+networks:
+  openledger:
+    driver: bridge

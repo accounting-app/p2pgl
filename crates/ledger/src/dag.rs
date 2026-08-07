@@ -204,6 +204,13 @@ impl LedgerDag {
         self.nodes.get(content_id).map(|n| &n.directive)
     }
 
+    /// Get a mutable reference to a directive by its content ID.
+    ///
+    /// Used for post-insert metadata stamping (e.g., signatures).
+    pub fn get_mut(&mut self, content_id: &str) -> Option<&mut Directive> {
+        self.nodes.get_mut(content_id).map(|n| &mut n.directive)
+    }
+
     /// Iterate all directives in insertion order.
     pub fn directives(&self) -> Vec<&Directive> {
         self.insertion_order

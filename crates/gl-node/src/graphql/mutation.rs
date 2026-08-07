@@ -1,4 +1,5 @@
 use async_graphql::{Context, ErrorExtensions, Object, Result};
+use std::sync::Arc;
 
 use super::broadcast::TransactionBroadcast;
 use super::inputs;
@@ -9,6 +10,7 @@ use super::SharedLedger;
 
 use ledger::model::{Amount, CostSpec, Flag, PriceSpec};
 use ledger::service::{PostingInput, TransactionInput};
+use security::signing::SignatureProvider;
 
 /// GraphQL mutation root. All mutations acquire a write lock on `SharedLedger`.
 pub struct MutationRoot;
@@ -69,6 +71,15 @@ impl MutationRoot {
             async_graphql::Error::new(e.to_string())
                 .extend_with(|_, ext| ext.set("code", e.error_code()))
         })?;
+
+        // Sign the transaction if signing is enabled (§3.8.1).
+        if let Ok(signer) = ctx.data::<Arc<dyn SignatureProvider>>() {
+            if let Some(signature_hex) = signer.sign(&content_id) {
+                // Stamp the signature onto the persisted directive's metadata.
+                // This modifies the directive in-place in the DAG.
+                svc.stamp_signature(&content_id, &signature_hex);
+            }
+        }
 
         // Look up the just-inserted transaction to return it.
         let txn = svc

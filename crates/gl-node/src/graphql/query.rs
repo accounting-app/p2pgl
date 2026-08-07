@@ -221,34 +221,46 @@ impl QueryRoot {
 
     /// Node health status (§2.9 / FR-6 AC1).
     async fn health(&self, ctx: &Context<'_>) -> HealthStatus {
-        if let Ok(ledger) = ctx.data::<SharedLedger>() {
+        let heads = if let Ok(ledger) = ctx.data::<SharedLedger>() {
             let svc = ledger.read().await;
-            HealthStatus {
-                status: "ok".to_owned(),
-                heads: svc.head_count() as i32,
-                peers: 0, // Wired when P2P is integrated into gl-node.
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-            }
+            svc.head_count() as i32
         } else {
-            HealthStatus {
-                status: "ok".to_owned(),
-                heads: 0,
-                peers: 0,
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-            }
+            0
+        };
+        let peer_count = if let Ok(registry) = ctx.data::<p2p::node::PeerRegistry>() {
+            registry.count() as i32
+        } else {
+            0
+        };
+        HealthStatus {
+            status: "ok".to_owned(),
+            heads,
+            peers: peer_count,
+            version: env!("CARGO_PKG_VERSION").to_owned(),
         }
     }
 
     /// Connected peers and their heads (FR-6 AC2).
-    async fn peers(&self) -> Vec<Peer> {
-        Vec::new() // Wired when P2P is integrated into gl-node.
+    async fn peers(&self, ctx: &Context<'_>) -> Vec<Peer> {
+        if let Ok(registry) = ctx.data::<p2p::node::PeerRegistry>() {
+            registry
+                .list()
+                .into_iter()
+                .map(|p| Peer {
+                    id: p.id,
+                    heads: p.heads.into_iter().map(TransactionId).collect(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 }
 
 /// Convert a domain Transaction to the GraphQL Transaction type.
 pub fn domain_txn_to_graphql(
     txn: &ledger::model::Transaction,
-    svc: &ledger::service::LedgerService,
+    _svc: &ledger::service::LedgerService,
 ) -> Transaction {
     let content_id =
         ledger::hash::compute_content_id(&ledger::model::Directive::Transaction(txn.clone()));

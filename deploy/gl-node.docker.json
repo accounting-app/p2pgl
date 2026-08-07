@@ -1,0 +1,20 @@
+{
+    "ledgerPath": "/data/ledger.bean",
+    "port": 3000,
+    "bindAddress": "0.0.0.0",
+    "auth": {
+        "enabled": false
+    },
+    "signing": {
+        "enabled": false
+    },
+    "p2p": {
+        "enabled": true,
+        "secretKeyPath": "/data/identity.secret",
+        "bootstrapEndpointIds": [],
+        "gossipIntervalMilliseconds": 1000,
+        "antiEntropyIntervalMilliseconds": 5000,
+        "swarmTopic": "openledger/transactions"
+    },
+    "externalFileEdits": "enabled"
+}

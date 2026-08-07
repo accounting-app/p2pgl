@@ -28,6 +28,7 @@ impl TransactionBroadcast {
     }
 
     /// Create with a custom capacity.
+    #[allow(dead_code)]
     pub fn with_capacity(capacity: usize) -> Self {
         let (sender, _) = broadcast::channel(capacity);
         TransactionBroadcast {
@@ -49,6 +50,7 @@ impl TransactionBroadcast {
     }
 
     /// Number of active subscribers.
+    #[allow(dead_code)]
     pub fn subscriber_count(&self) -> usize {
         self.sender.receiver_count()
     }

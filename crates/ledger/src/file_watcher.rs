@@ -8,7 +8,6 @@
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::time::interval;
 
 /// Configuration for the file watcher.
 #[derive(Debug, Clone)]
