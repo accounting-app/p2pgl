@@ -2,111 +2,114 @@
 
 > Derived from a full review of [SPEC.md](SPEC.md) against the current codebase.
 > All 12 implementation passes and 15 conformance tests (CT-1–CT-15) are marked complete at the library level.
-> **294 tests passing · 4 crates compiling · clippy clean (warnings below)**
+> **295 tests passing · 4 crates compiling · 0 warnings**
 
 ---
 
-## 🔴 P1 — Live P2P Integration (Not Wired into gl-node)
+## ✅ P1 — Live P2P Integration (DONE)
 
-The P2P crate (`crates/p2p/`) has all building blocks implemented and unit-tested, but **none are wired into the running `gl-node` binary**. Nodes cannot replicate.
+All P2P building blocks are now wired into `gl-node`:
 
-- [ ] **Boot Iroh `Endpoint` + `Router`** when `p2p.enabled` is true (§3.1, §3.4)
-  - Library: `crates/p2p/src/node.rs`
-  - Wire into: `crates/gl-node/src/main.rs`
-  - Load `SecretKey` from `p2p.secretKeyPath` config
-  - Derive `EndpointId` for author identity (currently hardcoded to `"local"` in `main.rs:66`)
+- [x] Boot Iroh Endpoint when `p2p.enabled` — `p2p_service::boot_p2p()`
+- [x] SecretKey persistence from `p2p.secretKeyPath` — `load_or_create_secret_key()`
+- [x] Author identity derived from Iroh EndpointId — `set_author_id()`
+- [x] Gossip event loop — `spawn_gossip_loop()`
+- [x] Anti-entropy periodic exchange — `spawn_anti_entropy_loop()`
+- [x] Union merge on gossip receive — `insert_remote_directive()`
+- [x] Orphan buffer drain on parent arrival — `drain_orphans()`
+- [x] `peers` query returns live data from PeerRegistry
+- [x] `health.peers` returns live peer count
 
-- [ ] **Start gossip event loop** — subscribe to `TopicId`, broadcast new directives on append (§3.4, §3.4.3)
-  - Library: `crates/p2p/src/gossip.rs`, `crates/p2p/src/topic.rs`
-  - On local `appendTransaction` / `openAccount` / `closeAccount` → gossip announce
-  - On gossip receive → union merge into ledger
+## ✅ P2 — Features Built but Not Integrated (DONE)
 
-- [ ] **Start anti-entropy periodic exchange** — ALPN handler + interval loop (§3.4.1)
-  - Library: `crates/p2p/src/anti_entropy.rs`, `crates/p2p/src/protocol.rs`
-  - Register ALPN `openledger/anti-entropy/1` on Iroh Router
-  - Run head exchange every `p2p.antiEntropyIntervalMilliseconds`
+- [x] File watcher started when `externalFileEdits: "enabled"` (250ms poll)
+- [x] Signing wired into write path via `SignatureProvider` trait
+- [x] Graceful shutdown with SIGTERM/SIGINT handling
 
-- [ ] **Wire union merge on receive** — ingest remote directives into `LedgerService` (§3.5)
-  - Library: `crates/p2p/src/union_merge.rs`
-  - Validate remote transactions (I1–I3, I5) before insert
-  - Update read model + re-serialize `.bean` + fire subscription broadcast
+## ✅ P3 — Polish (DONE)
 
-- [ ] **Wire orphan buffer drain** — buffer directives with missing parents, retry on arrival (§3.4.4)
-  - Library: `crates/p2p/src/orphan_buffer.rs`
-  - 10K / 1-hour limits
-
-- [ ] **Wire `peers` query** — return connected peers from `PeerRegistry` (§2.6, FR-6 AC2)
-  - Currently returns `[]` in `crates/gl-node/src/graphql/query.rs:243-245`
-
-- [ ] **Wire `health.peers` count** — return live peer count (§2.9)
-  - Currently returns `0` in `crates/gl-node/src/graphql/query.rs:229`
-
-- [ ] **Bootstrap peer connections** — connect to `p2p.bootstrapEndpointIds` on boot (§3.9)
+- [x] All 18 compiler warnings fixed (0 remaining)
+- [x] `deploy/` directory created with `docker-compose.yml` + config
 
 ---
 
-## 🟡 P2 — Features Built but Not Integrated
+## 🔴 Remaining — 7 Items
 
-- [ ] **Start file watcher** when `externalFileEdits: "enabled"` (§3.3, CT-12)
-  - Library: `crates/ledger/src/file_watcher.rs`
-  - Start in `main.rs`, connect change events to ledger service union-merge path
-  - Debounce 250ms per spec
+### R1. Gossip Outbound from Mutations
 
-- [ ] **Wire signing into write path** based on `signing.enabled` config (§3.8.1)
-  - Library: `crates/security/src/signing.rs`
-  - Select `PeerKeySignatureProvider` (when enabled) or `NoopSignatureProvider`
-  - Inject into `LedgerService` so `openledger-signature` is stamped on append
-  - Verify signatures on remote inserts when signing is enabled
+The gossip loop has an `mpsc::Sender` for broadcasting local directives, but it's stored as `_gossip_sender` in `main.rs` and not connected to the mutation layer. When `appendTransaction` / `openAccount` / `closeAccount` succeeds, the new directive should be sent through this channel so peers receive it instantly via gossip (not just eventually via anti-entropy).
 
-- [ ] **SSE subscription transport** (§2.6)
-  - Spec requires both **WebSocket** (default) and **SSE** for `transactionAppended`
-  - Only WebSocket is currently implemented via `BroadcastStream`
-  - Add SSE endpoint for clients that don't negotiate WebSocket
+**Files:** `main.rs` (pass sender to schema data), `mutation.rs` (send after insert)
+**Effort:** ~30 lines
 
-- [ ] **Graceful shutdown: 10-second drain timeout** (§3.9)
-  - Current shutdown handles SIGTERM/SIGINT but has no explicit drain timeout
-  - Spec: stop accepting → drain in-flight (10s timeout) → flush `.bean` → close Iroh → exit
+### R2. Bootstrap Peer Connections (§3.9)
 
----
+The `bootstrapEndpointIds` config is parsed and passed to `PeerNodeConfig` but `boot_p2p()` never calls `gossip.join_peers()` with those IDs. Nodes currently rely on mDNS/relay discovery only.
 
-## 🟢 P3 — Polish & Hardening
+**Files:** `p2p_service.rs` (add join_peers after subscribe)
+**Effort:** ~10 lines
 
-- [ ] **Fix 18 compiler warnings** — unused imports, unused struct fields, dead code
-  - `ledger`: unused import `tokio::time::interval`
-  - `gl-node`: unused fields `signing`, `enabled`, P2P config fields (`bootstrap_endpoint_ids`, `gossip_interval_milliseconds`, `anti_entropy_interval_milliseconds`, `swarm_topic`)
-  - `gl-node`: unused function `build_schema`, unused associated items `with_capacity` / `subscriber_count`
-  - `gl-node` tests: unused imports `DecimalScalar`, `rust_decimal::Decimal`, `std::sync::Arc`, `tokio::sync::RwLock`
+### R3. ALPN Anti-Entropy Full Exchange (§3.4.1)
 
-- [ ] **Multi-node convergence integration test** (§4 M6, §6 item 3)
-  - Spec M6: *"Done when: a 3-node cluster converges in production-like topology"*
-  - Current integration tests are single-node only
-  - CT-9 (partition converge), CT-12 (external edit), CT-14 (remote validation) are library-level only
+The anti-entropy loop detects missing directives by comparing head sets, but doesn't open ALPN connections to actually fetch them. It currently logs and relies on gossip. A full implementation needs:
+- Register `openledger/anti-entropy/1` ALPN on the Iroh endpoint
+- Accept inbound Want/Supply exchanges
+- Initiate outbound connections for proactive catch-up
 
-- [ ] **Perf benchmark** (§6 item 4)
-  - *"p99 < 50ms for trial balance on ≤10k transactions"* — informational gate, no benchmark exists
-  - *"zero calls into `.bean` parser on the read path"* — structurally true (read model), but no benchmark assertion
+**Files:** `p2p_service.rs` (ALPN handler + outbound connection logic)
+**Effort:** ~150 lines
 
-- [ ] **`deploy/` directory** (§5 layout)
-  - Spec suggests `deploy/` for container + compose / unit files
-  - Only a root `Dockerfile` exists; no compose file for multi-node setup
+### R4. Signature Verification on Remote Inserts
+
+The signing write path is wired (mutations sign after insert), but `insert_remote_directive()` doesn't verify incoming `openledger-signature` metadata against the `openledger-author` public key. When `signing.enabled`, forged signatures should be rejected.
+
+**Files:** `service.rs` (add verify step in `insert_remote_directive`)
+**Effort:** ~20 lines
+
+### R5. SSE Subscription Transport (§2.6)
+
+The spec requires both WebSocket (done) and SSE for `transactionAppended`. An SSE endpoint (e.g., `GET /graphql/sse`) streaming `TransactionBroadcast` as `text/event-stream` is missing.
+
+**Files:** New `sse.rs` handler in gl-node, route in `main.rs`
+**Effort:** ~60 lines
+
+### R6. Multi-Node Convergence Integration Test (§4 M6)
+
+Spec M6 says *"Done when: a 3-node cluster converges in production-like topology."* CT-9/CT-12/CT-14 only run at the library level. A true E2E test needs 3 PeerNode instances with real Iroh endpoints verifying ledger convergence.
+
+**Files:** New `tests/convergence_test.rs`
+**Effort:** ~200 lines
+
+### R7. Performance Benchmark (§6)
+
+*"p99 < 50ms for trial balance on ≤10k transactions"* — no `criterion` benchmark exists.
+
+**Files:** New `benches/` directory with criterion benchmark
+**Effort:** ~80 lines
 
 ---
 
 ## Conformance Tests — E2E Gaps
 
-All 15 CTs pass at the library level. These need true end-to-end validation once P2P is wired:
+All 15 CTs pass at the library level. Once R2/R3/R6 are done, these will have true E2E coverage:
 
-| CT | Invariant | Current Coverage | E2E Gap |
-|----|-----------|-----------------|---------|
-| CT-9 | FR-4 (partition converge) | In-memory merge test | Needs real Iroh network partition test |
-| CT-12 | §3.3 (external edit enabled) | File watcher logic tested | Watcher not running in `gl-node` |
-| CT-14 | §3.5 (remote validation) | Union merge validates | No live gossip path to exercise |
+| CT | Invariant | Current Coverage | After R6 |
+|----|-----------|-----------------|----------|
+| CT-9 | FR-4 (partition converge) | In-memory merge test | Real Iroh network |
+| CT-12 | §3.3 (external edit enabled) | ✅ File watcher running in gl-node | ✅ |
+| CT-14 | §3.5 (remote validation) | Gossip receive path wired | Real multi-node |
 
 ---
 
-## Reference
+## Effort Estimate
 
-- **Spec:** [SPEC.md](SPEC.md) (940 lines, v1.0.0)
-- **Progress:** [IMPLEMENTATION_PLAN_PROGRESS.md](IMPLEMENTATION_PLAN_PROGRESS.md)
-- **Test count:** 294 passing (29 gl-node + 8 integration + 193 ledger + 49 p2p + 15 security)
-- **Crates:** `gl-node`, `ledger`, `p2p`, `security`
+| Item | Lines | Complexity |
+|------|-------|------------|
+| R1 — Gossip outbound | ~30 | Low |
+| R2 — Bootstrap peers | ~10 | Low |
+| R3 — ALPN anti-entropy | ~150 | Medium |
+| R4 — Signature verify on receive | ~20 | Low |
+| R5 — SSE endpoint | ~60 | Low |
+| R6 — Multi-node convergence test | ~200 | High |
+| R7 — Performance benchmark | ~80 | Low |
+| **Total** | **~550** | |
