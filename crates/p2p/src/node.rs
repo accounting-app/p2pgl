@@ -15,14 +15,14 @@ use crate::topic::derive_topic_id;
 
 /// The ID of a peer (Iroh NodeId as hex string).
 pub type PeerId = String;
-
+pub type TxId = String;
 /// Connected peer state.
 #[derive(Debug, Clone)]
 pub struct PeerState {
     /// Peer's Iroh NodeId (hex).
     pub id: PeerId,
     /// The peer's advertised head txids.
-    pub heads: Vec<String>,
+    pub heads: Vec<TxId>,
 }
 
 /// Shared peer registry — tracks connected peers and their advertised heads.
