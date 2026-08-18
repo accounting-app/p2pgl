@@ -2,8 +2,12 @@
     "ledgerPath": "/data/ledger.bean",
     "port": 3000,
     "bindAddress": "0.0.0.0",
+    "cors": {
+        "allowedOrigins": []
+    },
     "auth": {
-        "enabled": false
+        "enabled": true,
+        "apiKey": "change-me-docker-api-key"
     },
     "signing": {
         "enabled": false
@@ -16,5 +20,5 @@
         "antiEntropyIntervalMilliseconds": 5000,
         "swarmTopic": "openledger/transactions"
     },
-    "externalFileEdits": "enabled"
+    "externalFileEdits": "disabled"
 }

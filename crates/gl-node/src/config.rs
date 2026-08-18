@@ -1,5 +1,7 @@
+use axum::http::{header, HeaderName, HeaderValue, Method};
 use serde::Deserialize;
 use std::path::PathBuf;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 /// Top-level node configuration.
 ///
@@ -21,9 +23,17 @@ pub struct NodeConfig {
     pub port: u16,
 
     /// Whether external (non-API) edits to `.bean` are accepted.
-    /// `"enabled"` or `"disabled"`. Default: `"enabled"`.
+    /// `"enabled"` or `"disabled"`. Default: `"disabled"`.
     #[serde(default = "default_external_file_edits")]
     pub external_file_edits: String,
+
+    /// Serve GraphiQL on `GET /graphql`. Default: `true`. Set `false` to hide it.
+    #[serde(default = "default_graphiql")]
+    pub graphiql: bool,
+
+    /// CORS origin allowlist. Empty (default) denies browser cross-origin access.
+    #[serde(default)]
+    pub cors: CorsConfig,
 
     /// Authentication configuration.
     #[serde(default)]
@@ -95,6 +105,16 @@ pub struct P2pConfig {
     pub swarm_topic: String,
 }
 
+/// CORS settings. Empty allowlist means no `Access-Control-Allow-Origin` (same-origin only).
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub struct CorsConfig {
+    /// Explicit origins such as `"http://localhost:3000"`. `"*"` is rejected.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+}
+
 impl Default for P2pConfig {
     fn default() -> Self {
         Self {
@@ -119,7 +139,11 @@ fn default_port() -> u16 {
 }
 
 fn default_external_file_edits() -> String {
-    "enabled".to_owned()
+    "disabled".to_owned()
+}
+
+fn default_graphiql() -> bool {
+    true
 }
 
 fn default_secret_key_path() -> String {
@@ -205,7 +229,56 @@ impl NodeConfig {
             ));
         }
 
+        for origin in &self.cors.allowed_origins {
+            if origin == "*" {
+                return Err(ConfigError::Validation(
+                    "cors.allowedOrigins must not include \"*\"; list explicit origins".to_owned(),
+                ));
+            }
+            if origin.is_empty() || HeaderValue::from_str(origin).is_err() {
+                return Err(ConfigError::Validation(format!(
+                    "cors.allowedOrigins contains invalid origin: {origin}"
+                )));
+            }
+        }
+
         Ok(())
+    }
+
+    /// True when the HTTP bind address is not loopback (I-1 / H-5 warning).
+    pub fn binds_non_loopback(&self) -> bool {
+        !matches!(
+            self.bind_address.as_str(),
+            "127.0.0.1" | "::1" | "localhost"
+        )
+    }
+
+    /// Whether to serve GraphiQL on `GET /graphql`.
+    pub fn graphiql_enabled(&self) -> bool {
+        self.graphiql
+    }
+
+    /// Restrictive CORS: empty allowlist denies cross-origin browser access (H-1).
+    pub fn cors_layer(&self) -> CorsLayer {
+        if self.cors.allowed_origins.is_empty() {
+            return CorsLayer::new();
+        }
+        let origins: Vec<HeaderValue> = self
+            .cors
+            .allowed_origins
+            .iter()
+            .map(|origin| {
+                HeaderValue::from_str(origin).expect("cors origins validated at boot")
+            })
+            .collect();
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_headers([
+                header::CONTENT_TYPE,
+                header::ACCEPT,
+                HeaderName::from_static("x-api-key"),
+            ])
     }
 }
 
@@ -229,7 +302,9 @@ mod tests {
         assert_eq!(config.ledger_path, "./data/ledger.bean");
         assert_eq!(config.bind_address, "127.0.0.1");
         assert_eq!(config.port, 4000);
-        assert_eq!(config.external_file_edits, "enabled");
+        assert_eq!(config.external_file_edits, "disabled");
+        assert!(config.graphiql, "GraphiQL on by default");
+        assert!(config.cors.allowed_origins.is_empty());
         assert!(!config.auth.enabled);
         assert!(!config.signing.enabled);
         assert!(!config.p2p.enabled);
@@ -242,6 +317,7 @@ mod tests {
             "bindAddress": "0.0.0.0",
             "port": 8080,
             "externalFileEdits": "disabled",
+            "cors": { "allowedOrigins": ["http://localhost:8080"] },
             "auth": { "enabled": true, "apiKey": "secret-key-123" },
             "signing": { "enabled": true },
             "p2p": {
@@ -258,12 +334,17 @@ mod tests {
         assert_eq!(config.bind_address, "0.0.0.0");
         assert_eq!(config.port, 8080);
         assert_eq!(config.external_file_edits, "disabled");
+        assert_eq!(config.cors.allowed_origins, vec!["http://localhost:8080"]);
         assert!(config.auth.enabled);
         assert_eq!(config.auth.api_key, "secret-key-123");
         assert!(config.signing.enabled);
         assert!(config.p2p.enabled);
         assert_eq!(config.p2p.bootstrap_endpoint_ids.len(), 2);
         assert_eq!(config.p2p.gossip_interval_milliseconds, 3000);
+        assert!(
+            config.graphiql_enabled(),
+            "GraphiQL stays on for public bind unless flagged off"
+        );
     }
 
     #[test]
@@ -305,5 +386,25 @@ mod tests {
         assert!(result.is_err());
         let error_message = format!("{}", result.unwrap_err());
         assert!(error_message.contains("externalFileEdits"));
+    }
+
+    #[test]
+    fn test_wildcard_cors_origin_rejected() {
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "cors": { "allowedOrigins": ["*"] } }"#,
+        );
+        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
+        assert!(result.is_err());
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(error_message.contains("allowedOrigins"));
+    }
+
+    #[test]
+    fn test_graphiql_explicit_false_disables_playground() {
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "graphiql": false }"#,
+        );
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        assert!(!config.graphiql_enabled());
     }
 }

@@ -70,7 +70,6 @@ pub async fn graphiql_handler() -> impl IntoResponse {
     Html(
         GraphiQLSource::build()
             .endpoint("/graphql")
-            .subscription_endpoint("/graphql/ws")
             .finish(),
     )
 }
@@ -191,5 +190,43 @@ mod tests {
         let data = result.data.into_json().unwrap();
         assert_eq!(data["health"]["status"], "ok");
         assert_eq!(data["health"]["heads"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_append_transaction_rejects_invalid_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let bean_path = dir.path().join("test.bean");
+        std::fs::write(&bean_path, "").unwrap();
+
+        let service = LedgerService::boot(&bean_path, "test-node".to_owned()).unwrap();
+        let ledger = Arc::new(RwLock::new(service));
+        let schema = build_schema_with_service(
+            ledger,
+            TransactionBroadcast::new(),
+            p2p::node::PeerRegistry::new(),
+            std::sync::Arc::new(security::signing::NoopSignatureProvider),
+        );
+
+        let result = schema
+            .execute(
+                r#"
+                mutation {
+                    appendTransaction(input: {
+                        date: "2024-01-15"
+                        flag: "nope"
+                        postings: [
+                            { account: "Assets:Cash", amount: { number: "1", currency: "USD" } }
+                        ]
+                    }) { txid }
+                }
+                "#,
+            )
+            .await;
+        assert!(!result.errors.is_empty());
+        assert!(
+            result.errors[0].message.contains("flag"),
+            "unexpected error: {:?}",
+            result.errors
+        );
     }
 }

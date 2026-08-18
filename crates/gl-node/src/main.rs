@@ -10,7 +10,7 @@ use graphql::broadcast::TransactionBroadcast;
 use graphql::{build_schema_with_service, graphiql_handler, graphql_handler, SharedLedger};
 use health::{health_handler, HealthState};
 
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{middleware, Router};
 use p2p::node::PeerRegistry;
 use p2p::orphan_buffer::OrphanBuffer;
@@ -19,7 +19,6 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::RwLock;
-use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
 
 #[tokio::main]
@@ -207,14 +206,17 @@ async fn main() {
         api_key: config.auth.api_key.clone(),
     };
 
-    // GraphQL routes — behind auth middleware.
-    let graphql_routes = Router::new()
-        .route("/graphql", get(graphiql_handler).post(graphql_handler))
-        .with_state(schema)
-        .layer(middleware::from_fn_with_state(
-            auth_state,
-            auth::auth_middleware,
-        ));
+    // GraphQL routes — POST always; GraphiQL on GET only when enabled.
+    let graphql_router = if config.graphiql_enabled() {
+        info!("GraphiQL enabled on GET /graphql");
+        Router::new().route("/graphql", get(graphiql_handler).post(graphql_handler))
+    } else {
+        info!("GraphiQL disabled — POST /graphql only");
+        Router::new().route("/graphql", post(graphql_handler))
+    };
+    let graphql_routes = graphql_router.with_state(schema).layer(
+        middleware::from_fn_with_state(auth_state, auth::auth_middleware),
+    );
 
     // Health state with live shared ledger + peer registry.
     let health_state = HealthState {
@@ -222,13 +224,20 @@ async fn main() {
         peer_registry,
     };
 
+    if !config.auth.enabled && config.binds_non_loopback() {
+        warn!(
+            bind_address = %config.bind_address,
+            "auth is disabled while binding a non-loopback address — GraphQL is unauthenticated"
+        );
+    }
+
     // Build full application router.
     // /health is exempt from auth (§2.9).
     let application = Router::new()
         .route("/health", get(health_handler))
         .with_state(health_state)
         .merge(graphql_routes)
-        .layer(CorsLayer::permissive());
+        .layer(config.cors_layer());
 
     // Bind and serve.
     let bind_address = format!("{}:{}", config.bind_address, config.port);
@@ -246,6 +255,7 @@ async fn main() {
         ledger = %config.ledger_path,
         auth_enabled = config.auth.enabled,
         p2p_enabled = config.p2p.enabled,
+        graphiql = config.graphiql_enabled(),
         "gl-node starting"
     );
 

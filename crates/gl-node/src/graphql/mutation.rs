@@ -29,8 +29,14 @@ impl MutationRoot {
         })?;
 
         let flag = match input.flag.as_str() {
+            "*" => Flag::Complete,
             "!" => Flag::Incomplete,
-            _ => Flag::Complete,
+            other => {
+                return Err(async_graphql::Error::new(format!(
+                    "flag must be \"*\" or \"!\", got \"{other}\""
+                ))
+                .extend_with(|_, ext| ext.set("code", "INVALID_FLAG")));
+            }
         };
 
         let domain_input = TransactionInput {

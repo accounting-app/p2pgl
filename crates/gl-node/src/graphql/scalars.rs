@@ -38,13 +38,6 @@ impl ScalarType for DecimalScalar {
                     .map_err(|_| InputValueError::custom("Invalid decimal string"))?;
                 Ok(DecimalScalar(decimal))
             }
-            // Also accept JSON numbers for convenience.
-            Value::Number(number) => {
-                let decimal = Decimal::from_str(&number.to_string()).map_err(|_| {
-                    InputValueError::custom("Number cannot be represented as decimal")
-                })?;
-                Ok(DecimalScalar(decimal))
-            }
             _ => Err(InputValueError::expected_type(value)),
         }
     }
@@ -110,6 +103,12 @@ mod tests {
         assert_eq!(value, Value::String("1000.00".to_owned()));
         let parsed = DecimalScalar::parse(value).unwrap();
         assert_eq!(parsed, decimal);
+    }
+
+    #[test]
+    fn test_decimal_scalar_rejects_json_number() {
+        let result = DecimalScalar::parse(Value::Number(serde_json::Number::from(100)));
+        assert!(result.is_err(), "Decimal must be a string on the wire (I4)");
     }
 
     #[test]

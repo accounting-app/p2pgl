@@ -272,6 +272,10 @@ Failed mutations/queries that violate ledger rules return GraphQL errors with:
 | `INVALID_DATE` | Unparseable or impossible calendar date (e.g. `2024-02-30`) | `date` |
 | `INVALID_ACCOUNT_NAME` | Account name violates `[A-Z][a-zA-Z0-9-]*` segment rule or unknown root | `account` |
 | `INVALID_CURRENCY` | Currency name violates `[A-Z][A-Z0-9'._-]{0,22}[A-Z0-9]` | `currency` |
+| `INVALID_TAG` | Tag violates `[a-zA-Z0-9_-]+` | `tag` |
+| `INVALID_LINK` | Link violates `^[a-zA-Z0-9_-]+` | `link` |
+| `INVALID_FLAG` | Transaction `flag` is not `"*"` or `"!"` | `flag` |
+| `INVALID_INPUT` | Free-form field contains control characters | — |
 | `ACCOUNT_CURRENCY_MISMATCH` | Posting currency not in `open` directive's currency list (I9) | `account`, `currency`, `allowed` |
 | `RESOURCE_LIMIT_EXCEEDED` | Transaction exceeds a §3.12 resource limit | `limit`, `actual` |
 | `INTERNAL` | Unexpected server failure | — |
@@ -394,7 +398,7 @@ Economic serialization **strips** every metadata key with prefix `openledger-` b
 
 **Idempotency (FR-1 AC4):** Two submissions with the same economic body yield the same `txid` even if parents/author/Lamport differ. Store once (G-Set). If a duplicate arrives with different envelope data, keep the **first-accepted** envelope; log a metric `duplicate_envelope_ignored`; do not fork the economic entry. (Property test: CT-3 / CT-4 / CT-13.)
 
-**Two write paths, switchable by config.** Both the API *and* direct human/git edits to `.bean` are supported. Config key `"externalFileEdits": "enabled" | "disabled"` — `"disabled"` collapses the system to API-sole-writer mode (file is an owned projection; unexpected on-disk modification → refuse boot with `EXTERNAL_EDIT_REJECTED`). Default is `"enabled"`.
+**Two write paths, switchable by config.** Both the API *and* direct human/git edits to `.bean` are supported. Config key `"externalFileEdits": "enabled" | "disabled"` — `"disabled"` collapses the system to API-sole-writer mode (file is an owned projection; unexpected on-disk modification → refuse boot with `EXTERNAL_EDIT_REJECTED`). Default is `"disabled"`.
 
 When `"enabled"`, external edits reconcile through the **same union-merge used for peer gossip**. A file watcher (debounce **250ms**; coalesce bursts) plus a boot-time content-hash check detects change, re-parses, content-addresses each directive, and unions into the G-Set / DAG. Concurrent API append and watcher: API takes a ledger write lock; watcher waits; both end with a full re-serialize so the file matches the G-Set. *An external edit and a peer's gossip are the identical operation.*
 
@@ -734,7 +738,9 @@ The architecture is **host-agnostic but not paradigm-agnostic**: it runs on any 
 | `ledgerPath` | string | **required** | Path to the single `.bean` file (created if missing — see §3.3) |
 | `bindAddress` | string | `"127.0.0.1"` | HTTP listen address. Use `"0.0.0.0"` for container/remote access. |
 | `port` | number | `4000` | HTTP listen port |
-| `externalFileEdits` | `"enabled"` \| `"disabled"` | `"enabled"` | §3.3 external write path |
+| `externalFileEdits` | `"enabled"` \| `"disabled"` | `"disabled"` | §3.3 external write path |
+| `graphiql` | boolean | `true` | `GET /graphql` playground. Set `false` to hide it (API POST remains) |
+| `cors.allowedOrigins` | string[] | `[]` | Explicit browser origins; `"*"` is rejected. Empty = same-origin only |
 | `auth.enabled` | boolean | `false` | Require `X-Api-Key` |
 | `auth.apiKey` | string | — | Required when `auth.enabled` |
 | `signing.enabled` | boolean | `false` | §3.8.1 |
@@ -754,7 +760,9 @@ Unknown keys are rejected at boot (fail closed). When `auth.enabled` and `auth.a
   "ledgerPath": "./data/ledger.bean",
   "bindAddress": "127.0.0.1",
   "port": 4000,
-  "externalFileEdits": "enabled",
+  "externalFileEdits": "disabled",
+  "graphiql": true,
+  "cors": { "allowedOrigins": [] },
   "auth": { "enabled": false, "apiKey": "" },
   "signing": { "enabled": false },
   "p2p": {

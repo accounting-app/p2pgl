@@ -48,9 +48,9 @@ INFO  loading configuration path="gl-node.config.json"
 INFO  gl-node listening addr=127.0.0.1:4000
 ```
 
-### 4. Open GraphiQL (Interactive Playground)
+### 4. Open GraphiQL
 
-Visit **http://127.0.0.1:4000/graphiql** in your browser for an interactive query editor.
+Visit **http://127.0.0.1:4000/graphql**. The playground is on by default, including when the node binds a public address. Hide it with `"graphiql": false`.
 
 ---
 
@@ -368,7 +368,9 @@ The config file is loaded from `gl-node.config.json` (or set `GL_NODE_CONFIG` en
   "ledgerPath": "./data/company.bean",
   "bindAddress": "0.0.0.0",
   "port": 4000,
-  "externalFileEdits": "enabled",
+  "externalFileEdits": "disabled",
+  "graphiql": true,
+  "cors": { "allowedOrigins": [] },
   "auth": {
     "enabled": true,
     "apiKey": "my-secret-key-here"
@@ -392,7 +394,9 @@ The config file is loaded from `gl-node.config.json` (or set `GL_NODE_CONFIG` en
 | `ledgerPath` | **(required)** | Path to the `.bean` file |
 | `bindAddress` | `"127.0.0.1"` | HTTP listen address |
 | `port` | `4000` | HTTP listen port |
-| `externalFileEdits` | `"enabled"` | Accept hand-edits to the `.bean` file |
+| `externalFileEdits` | `"disabled"` | Accept hand-edits to the `.bean` file |
+| `graphiql` | `true` | GraphiQL playground; set `false` to hide it |
+| `cors.allowedOrigins` | `[]` | Browser origin allowlist; `"*"` is rejected |
 | `auth.enabled` | `false` | Require `X-Api-Key` header on GraphQL |
 | `auth.apiKey` | `""` | The API key value (required if auth enabled) |
 | `signing.enabled` | `false` | Sign transactions with Ed25519 |
@@ -435,7 +439,7 @@ docker run -d \
   openledger
 ```
 
-Then access at `http://localhost:4000/graphiql`.
+Then access GraphiQL at `http://localhost:4000/graphql` (or set `"graphiql": false` to hide it).
 
 ---
 

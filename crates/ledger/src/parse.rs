@@ -264,7 +264,7 @@ const VALID_ROOTS: [&str; 5] = ["Assets", "Liabilities", "Equity", "Income", "Ex
 
 /// Validate account name per §2.3: `Root:Segment:Segment` where each segment
 /// matches `[A-Z][a-zA-Z0-9-]*`.
-fn validate_account_name(name: &str) -> Result<(), String> {
+pub fn validate_account_name(name: &str) -> Result<(), String> {
     let segments: Vec<&str> = name.split(':').collect();
     if segments.len() < 2 {
         return Err(format!(
@@ -299,7 +299,7 @@ fn validate_account_name(name: &str) -> Result<(), String> {
 }
 
 /// Validate currency per §2.3: `[A-Z][A-Z0-9'._-]{0,22}[A-Z0-9]` (min 2 chars).
-fn validate_currency(currency: &str) -> Result<(), String> {
+pub fn validate_currency(currency: &str) -> Result<(), String> {
     let chars: Vec<char> = currency.chars().collect();
     if chars.len() < 2 {
         return Err(format!(
@@ -334,6 +334,42 @@ fn validate_currency(currency: &str) -> Result<(), String> {
                 "Invalid character '{character}' in currency: {currency}"
             ));
         }
+    }
+    Ok(())
+}
+
+/// Validate a tag name per §2.3: `[a-zA-Z0-9_-]+`.
+pub fn validate_tag(tag: &str) -> Result<(), String> {
+    if tag.is_empty() {
+        return Err("Tag name cannot be empty".to_owned());
+    }
+    if !tag
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '-')
+    {
+        return Err(format!("Invalid character in tag: {tag}"));
+    }
+    Ok(())
+}
+
+/// Validate a link name per §2.3: `^[a-zA-Z0-9_-]+`.
+pub fn validate_link(link: &str) -> Result<(), String> {
+    if link.is_empty() {
+        return Err("Link name cannot be empty".to_owned());
+    }
+    if !link
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '-')
+    {
+        return Err(format!("Invalid character in link: {link}"));
+    }
+    Ok(())
+}
+
+/// Reject ASCII control characters that can break `.bean` serialization (H-8).
+pub fn reject_control_characters(label: &str, value: &str) -> Result<(), String> {
+    if value.chars().any(char::is_control) {
+        return Err(format!("{label} contains control characters"));
     }
     Ok(())
 }

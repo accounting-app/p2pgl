@@ -8,10 +8,13 @@
 #   docker compose -f deploy/docker-compose.yml up --build
 #
 # Each node exposes:
-#   - node-0: http://localhost:3000/graphql  (GraphiQL)
+#   - node-0: http://localhost:3000/graphql  (GraphiQL + POST; set X-Api-Key)
 #   - node-1: http://localhost:3001/graphql
 #   - node-2: http://localhost:3002/graphql
 #   - All nodes: GET /health for health checks
+#
+# Default API key is "change-me-docker-api-key" (see gl-node.docker.json).
+# Set "graphiql": false in the mounted config to hide the playground.
 
 services:
   node-0:

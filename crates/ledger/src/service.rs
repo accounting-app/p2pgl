@@ -11,7 +11,10 @@ use crate::dag::{DagError, InsertResult, LedgerDag};
 use crate::error::ParseError;
 use crate::hash::compute_content_id;
 use crate::model::*;
-use crate::parse::parse_file;
+use crate::parse::{
+    parse_file, reject_control_characters, validate_account_name, validate_currency, validate_link,
+    validate_tag,
+};
 use crate::read_model::ReadModel;
 use crate::serialize::full_file_serialize;
 use crate::validate::{validate_transaction, AccountState, ValidationError};
@@ -54,6 +57,16 @@ pub enum ServiceError {
     AccountNotOpen { account: String },
     /// §3.12: a resource limit was exceeded.
     ResourceLimitExceeded { message: String },
+    /// Account name violates §2.3.
+    InvalidAccountName { account: String },
+    /// Currency code violates §2.3.
+    InvalidCurrency { currency: String },
+    /// Tag name violates §2.3.
+    InvalidTag { tag: String },
+    /// Link name violates §2.3.
+    InvalidLink { link: String },
+    /// Payee/narration contains control characters (H-8).
+    InvalidInput { message: String },
 }
 
 impl std::fmt::Display for ServiceError {
@@ -90,6 +103,15 @@ impl std::fmt::Display for ServiceError {
             ServiceError::ResourceLimitExceeded { message } => {
                 write!(f, "Resource limit exceeded: {message}")
             }
+            ServiceError::InvalidAccountName { account } => {
+                write!(f, "Invalid account name: {account}")
+            }
+            ServiceError::InvalidCurrency { currency } => {
+                write!(f, "Invalid currency: {currency}")
+            }
+            ServiceError::InvalidTag { tag } => write!(f, "Invalid tag: {tag}"),
+            ServiceError::InvalidLink { link } => write!(f, "Invalid link: {link}"),
+            ServiceError::InvalidInput { message } => write!(f, "{message}"),
         }
     }
 }
@@ -109,6 +131,11 @@ impl ServiceError {
             ServiceError::AccountHasLaterTransactions { .. } => "ACCOUNT_HAS_LATER_TRANSACTIONS",
             ServiceError::AccountNotOpen { .. } => "ACCOUNT_NOT_OPEN",
             ServiceError::ResourceLimitExceeded { .. } => "RESOURCE_LIMIT_EXCEEDED",
+            ServiceError::InvalidAccountName { .. } => "INVALID_ACCOUNT_NAME",
+            ServiceError::InvalidCurrency { .. } => "INVALID_CURRENCY",
+            ServiceError::InvalidTag { .. } => "INVALID_TAG",
+            ServiceError::InvalidLink { .. } => "INVALID_LINK",
+            ServiceError::InvalidInput { .. } => "INVALID_INPUT",
         }
     }
 }
@@ -315,6 +342,48 @@ impl LedgerService {
             });
         }
 
+        if let Some(ref narration) = input.narration {
+            reject_control_characters("narration", narration)
+                .map_err(|message| ServiceError::InvalidInput { message })?;
+        }
+        if let Some(ref payee) = input.payee {
+            reject_control_characters("payee", payee)
+                .map_err(|message| ServiceError::InvalidInput { message })?;
+        }
+        for tag in &input.tags {
+            validate_tag(tag).map_err(|_| ServiceError::InvalidTag { tag: tag.clone() })?;
+        }
+        for link in &input.links {
+            validate_link(link).map_err(|_| ServiceError::InvalidLink { link: link.clone() })?;
+        }
+        for posting in &input.postings {
+            validate_account_name(&posting.account).map_err(|_| ServiceError::InvalidAccountName {
+                account: posting.account.clone(),
+            })?;
+            if let Some(ref amount) = posting.amount {
+                validate_currency(&amount.currency).map_err(|_| ServiceError::InvalidCurrency {
+                    currency: amount.currency.clone(),
+                })?;
+            }
+            if let Some(ref cost) = posting.cost {
+                if let Some(ref cost_amount) = cost.amount {
+                    validate_currency(&cost_amount.currency).map_err(|_| {
+                        ServiceError::InvalidCurrency {
+                            currency: cost_amount.currency.clone(),
+                        }
+                    })?;
+                }
+            }
+            if let Some(ref price) = posting.price {
+                let currency = match price {
+                    PriceSpec::Unit(amount) | PriceSpec::Total(amount) => &amount.currency,
+                };
+                validate_currency(currency).map_err(|_| ServiceError::InvalidCurrency {
+                    currency: currency.clone(),
+                })?;
+            }
+        }
+
         // Build Transaction from input (no envelope yet).
         let txn = Transaction {
             date: input.date,
@@ -373,6 +442,15 @@ impl LedgerService {
         date: NaiveDate,
         currencies: Vec<String>,
     ) -> Result<String, ServiceError> {
+        validate_account_name(&account).map_err(|_| ServiceError::InvalidAccountName {
+            account: account.clone(),
+        })?;
+        for currency in &currencies {
+            validate_currency(currency).map_err(|_| ServiceError::InvalidCurrency {
+                currency: currency.clone(),
+            })?;
+        }
+
         // FR-3 AC1: opening an already-open account errors.
         if self.accounts.is_open(&account) {
             return Err(ServiceError::AccountAlreadyOpen {
@@ -418,6 +496,10 @@ impl LedgerService {
         account: String,
         date: NaiveDate,
     ) -> Result<String, ServiceError> {
+        validate_account_name(&account).map_err(|_| ServiceError::InvalidAccountName {
+            account: account.clone(),
+        })?;
+
         // Must be currently open.
         if !self.accounts.is_open(&account) {
             return Err(ServiceError::AccountNotOpen {
@@ -1021,6 +1103,34 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    #[test]
+    fn test_open_account_rejects_newline_injection() {
+        let (mut svc, path) = boot_empty();
+        let err = svc
+            .open_account(
+                "Assets:Cash\n2024-01-02 open Liabilities:Injected USD".to_owned(),
+                make_date(2024, 1, 1),
+                vec![],
+            )
+            .unwrap_err();
+        assert_eq!(err.error_code(), "INVALID_ACCOUNT_NAME");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_open_account_rejects_invalid_currency() {
+        let (mut svc, path) = boot_empty();
+        let err = svc
+            .open_account(
+                "Assets:Cash".to_owned(),
+                make_date(2024, 1, 1),
+                vec!["usd\nopen".to_owned()],
+            )
+            .unwrap_err();
+        assert_eq!(err.error_code(), "INVALID_CURRENCY");
+        std::fs::remove_file(path).ok();
+    }
+
     // ── Close account ────────────────────────────────────────────────────
 
     #[test]
@@ -1091,6 +1201,36 @@ mod tests {
         // No accounts opened.
         let err = svc.append_transaction(balanced_input()).unwrap_err();
         assert_eq!(err.error_code(), "ACCOUNT_NOT_OPEN");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_append_rejects_newline_in_account() {
+        let (mut svc, path) = setup_with_accounts();
+        let mut input = balanced_input();
+        input.postings[0].account = "Assets:Cash\n2024-01-02 open Liabilities:Hacked".to_owned();
+        let err = svc.append_transaction(input).unwrap_err();
+        assert_eq!(err.error_code(), "INVALID_ACCOUNT_NAME");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_append_rejects_control_characters_in_narration() {
+        let (mut svc, path) = setup_with_accounts();
+        let mut input = balanced_input();
+        input.narration = Some("ok\n2024-01-01 open Assets:Hacked".to_owned());
+        let err = svc.append_transaction(input).unwrap_err();
+        assert_eq!(err.error_code(), "INVALID_INPUT");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_append_rejects_invalid_tag() {
+        let (mut svc, path) = setup_with_accounts();
+        let mut input = balanced_input();
+        input.tags = vec!["good\nbad".to_owned()];
+        let err = svc.append_transaction(input).unwrap_err();
+        assert_eq!(err.error_code(), "INVALID_TAG");
         std::fs::remove_file(path).ok();
     }
 
