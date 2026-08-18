@@ -5,6 +5,8 @@
 //! `LedgerService` and `TransactionBroadcast`, spawning background tasks
 //! for gossip broadcasts, anti-entropy head exchanges, and orphan resolution.
 
+#[cfg(unix)]
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -311,33 +313,88 @@ async fn drain_orphans(
     }
 }
 
+/// Load 32-byte secret key material from disk, refusing group/other-readable files.
+pub(crate) fn read_secret_key_bytes(
+    path: &Path,
+) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    if !path.exists() {
+        return Err(format!("Secret key file {} does not exist", path.display()).into());
+    }
+    ensure_secret_key_permissions(path)?;
+    let hex_content = std::fs::read_to_string(path)?;
+    let bytes = hex::decode(hex_content.trim())?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "Secret key file has {} bytes, expected 32",
+            bytes.len()
+        )
+        .into());
+    }
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(&bytes);
+    Ok(key_bytes)
+}
+
 /// Load or create an Iroh `SecretKey` from disk (CAP-4: persistent identity).
 fn load_or_create_secret_key(path: &str) -> Result<SecretKey, Box<dyn std::error::Error>> {
     let path = Path::new(path);
 
     if path.exists() {
-        let hex_content = std::fs::read_to_string(path)?;
-        let bytes = hex::decode(hex_content.trim())?;
-        if bytes.len() != 32 {
-            return Err(format!(
-                "Secret key file has {} bytes, expected 32",
-                bytes.len()
-            )
-            .into());
-        }
-        let mut key_bytes = [0u8; 32];
-        key_bytes.copy_from_slice(&bytes);
+        let key_bytes = read_secret_key_bytes(path)?;
         Ok(SecretKey::from_bytes(&key_bytes))
     } else {
-        // Generate a new key and persist it.
+        // Generate a new key and persist it with owner-only permissions.
         let key = SecretKey::generate();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, hex::encode(key.to_bytes()))?;
+        write_secret_key_file(path, &hex::encode(key.to_bytes()))?;
         info!(path = %path.display(), "generated and persisted new Iroh secret key");
         Ok(key)
     }
+}
+
+/// Refuse to use a secret key file that is group- or world-readable (C-2).
+#[cfg(unix)]
+fn ensure_secret_key_permissions(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "Secret key file {} has overly permissive mode {mode:o}; expected 0600",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_secret_key_permissions(_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    Ok(())
+}
+
+fn write_secret_key_file(path: &Path, hex_key: &str) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(hex_key.as_bytes())?;
+        file.flush()?;
+        let mut permissions = file.metadata()?.permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(path, permissions)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, hex_key)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -359,6 +416,39 @@ mod tests {
             key1.to_bytes(),
             key2.to_bytes(),
             "Same key should be loaded"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_secret_key_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("perm.secret");
+        load_or_create_secret_key(key_path.to_str().unwrap()).unwrap();
+
+        let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "New secret key files must be 0600");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_secret_key_load_rejects_group_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("open.secret");
+        std::fs::write(&key_path, hex::encode([7u8; 32])).unwrap();
+        let mut permissions = std::fs::metadata(&key_path).unwrap().permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&key_path, permissions).unwrap();
+
+        let error = load_or_create_secret_key(key_path.to_str().unwrap()).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("overly permissive"),
+            "Expected permission error, got: {message}"
         );
     }
 }

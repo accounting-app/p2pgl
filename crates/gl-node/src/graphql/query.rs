@@ -8,6 +8,9 @@ use super::types::{
 };
 use super::SharedLedger;
 
+/// Maximum `journal` page size accepted from GraphQL (H-2).
+const MAX_JOURNAL_LIMIT: i32 = 10_000;
+
 /// GraphQL query root. Resolvers pull from `SharedLedger` when available,
 /// fall back to empty defaults for introspection-only schemas.
 pub struct QueryRoot;
@@ -151,8 +154,8 @@ impl QueryRoot {
                 account.as_deref(),
                 from.map(|d| d.0),
                 to.map(|d| d.0),
-                limit as usize,
-                offset as usize,
+                clamp_journal_limit(limit),
+                clamp_journal_offset(offset),
             );
             entries
                 .into_iter()
@@ -325,5 +328,42 @@ pub fn domain_txn_to_graphql(
                 }
             })
             .unwrap_or_default(),
+    }
+}
+
+/// Clamp GraphQL `limit` to `[0, MAX_JOURNAL_LIMIT]` before the `i32 as usize` cast.
+fn clamp_journal_limit(limit: i32) -> usize {
+    limit.clamp(0, MAX_JOURNAL_LIMIT) as usize
+}
+
+/// Clamp GraphQL `offset` to a non-negative `usize`.
+fn clamp_journal_offset(offset: i32) -> usize {
+    offset.max(0) as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clamp_journal_limit_default_range() {
+        assert_eq!(clamp_journal_limit(100), 100);
+        assert_eq!(clamp_journal_limit(0), 0);
+        assert_eq!(clamp_journal_limit(MAX_JOURNAL_LIMIT), 10_000);
+    }
+
+    #[test]
+    fn test_clamp_journal_limit_rejects_negative_and_huge() {
+        assert_eq!(clamp_journal_limit(-1), 0);
+        assert_eq!(clamp_journal_limit(i32::MIN), 0);
+        assert_eq!(clamp_journal_limit(50_000), 10_000);
+    }
+
+    #[test]
+    fn test_clamp_journal_offset_rejects_negative() {
+        assert_eq!(clamp_journal_offset(0), 0);
+        assert_eq!(clamp_journal_offset(25), 25);
+        assert_eq!(clamp_journal_offset(-1), 0);
+        assert_eq!(clamp_journal_offset(i32::MIN), 0);
     }
 }

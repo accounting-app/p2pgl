@@ -4,6 +4,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
+use subtle::ConstantTimeEq;
 
 /// Shared auth state for the middleware layer.
 #[derive(Clone, Debug)]
@@ -37,7 +38,7 @@ pub async fn auth_middleware(
         .and_then(|value| value.to_str().ok());
 
     match api_key_header {
-        Some(key) if key == auth_state.api_key => next.run(request).await,
+        Some(key) if api_key_matches(key, &auth_state.api_key) => next.run(request).await,
         _ => {
             let error_body = json!({
                 "errors": [{
@@ -48,6 +49,20 @@ pub async fn auth_middleware(
             (StatusCode::UNAUTHORIZED, Json(error_body)).into_response()
         }
     }
+}
+
+/// Constant-time API key comparison (C-1).
+///
+/// Length mismatches still perform a dummy compare so the failure path is not a
+/// pure short-circuit on the first differing byte of the secret.
+fn api_key_matches(provided: &str, expected: &str) -> bool {
+    let provided_bytes = provided.as_bytes();
+    let expected_bytes = expected.as_bytes();
+    if provided_bytes.len() != expected_bytes.len() {
+        let _ = expected_bytes.ct_eq(expected_bytes);
+        return false;
+    }
+    provided_bytes.ct_eq(expected_bytes).into()
 }
 
 #[cfg(test)]
@@ -123,5 +138,21 @@ mod tests {
             .unwrap();
         let response = application.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn test_api_key_matches_equal() {
+        assert!(api_key_matches("test-secret", "test-secret"));
+    }
+
+    #[test]
+    fn test_api_key_matches_rejects_wrong_value() {
+        assert!(!api_key_matches("wrong-key", "test-secret"));
+    }
+
+    #[test]
+    fn test_api_key_matches_rejects_length_mismatch() {
+        assert!(!api_key_matches("short", "test-secret"));
+        assert!(!api_key_matches("test-secret-extra", "test-secret"));
     }
 }

@@ -126,9 +126,8 @@ async fn main() {
                 Some(sender)
             }
             Err(error) => {
-                error!(%error, "failed to boot P2P — continuing without replication");
-                peer_registry = PeerRegistry::new();
-                None
+                error!(%error, "failed to boot P2P — aborting (p2p.enabled is true)");
+                std::process::exit(1);
             }
         }
     } else {
@@ -180,34 +179,19 @@ async fn main() {
     };
 
     // Build signature provider based on config (§3.8.1).
+    // When signing is enabled the key is mandatory — never fall back to noop (H-4).
     let signer: Arc<dyn security::signing::SignatureProvider> = if config.signing.enabled {
-        // Read the same secret key used for P2P identity.
         let key_path = std::path::Path::new(&config.p2p.secret_key_path);
-        if key_path.exists() {
-            match std::fs::read_to_string(key_path) {
-                Ok(hex_content) => {
-                    match hex::decode(hex_content.trim()) {
-                        Ok(bytes) if bytes.len() == 32 => {
-                            let mut key_bytes = [0u8; 32];
-                            key_bytes.copy_from_slice(&bytes);
-                            let provider = security::signing::PeerKeySignatureProvider::from_bytes(&key_bytes);
-                            info!(public_key = %provider.public_key_hex(), "signing enabled");
-                            Arc::new(provider)
-                        }
-                        _ => {
-                            warn!("signing enabled but secret key unreadable — falling back to noop");
-                            Arc::new(security::signing::NoopSignatureProvider)
-                        }
-                    }
-                }
-                Err(error) => {
-                    warn!(%error, "signing enabled but cannot read key — falling back to noop");
-                    Arc::new(security::signing::NoopSignatureProvider)
-                }
+        match p2p_service::read_secret_key_bytes(key_path) {
+            Ok(key_bytes) => {
+                let provider = security::signing::PeerKeySignatureProvider::from_bytes(&key_bytes);
+                info!(public_key = %provider.public_key_hex(), "signing enabled");
+                Arc::new(provider)
             }
-        } else {
-            warn!("signing enabled but no secret key file — falling back to noop");
-            Arc::new(security::signing::NoopSignatureProvider)
+            Err(error) => {
+                error!(%error, "signing enabled but secret key could not be loaded — aborting");
+                std::process::exit(1);
+            }
         }
     } else {
         info!("signing disabled");
