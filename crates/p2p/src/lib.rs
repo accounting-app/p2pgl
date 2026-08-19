@@ -3,6 +3,7 @@
 // Implements §3.4 (consistency & replication), §3.4.1 (wire protocol),
 // §3.4.4 (orphan buffer), and §3.5 (remote insert validation).
 
+pub mod allowlist;
 pub mod anti_entropy;
 pub mod gossip;
 pub mod node;

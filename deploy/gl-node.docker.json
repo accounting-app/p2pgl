@@ -18,7 +18,7 @@
         "bootstrapEndpointIds": [],
         "gossipIntervalMilliseconds": 1000,
         "antiEntropyIntervalMilliseconds": 5000,
-        "swarmTopic": "openledger/transactions"
+        "swarmTopic": "openledger/docker-dev"
     },
     "externalFileEdits": "disabled"
 }

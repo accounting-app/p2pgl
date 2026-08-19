@@ -22,6 +22,7 @@ use crate::graphql::broadcast::TransactionBroadcast;
 use crate::graphql::query::domain_txn_to_graphql;
 use crate::graphql::SharedLedger;
 
+use p2p::allowlist::PeerAllowlist;
 use p2p::gossip::{decode_broadcast, encode_broadcast, make_announce};
 use p2p::node::{PeerNode, PeerNodeConfig};
 use p2p::orphan_buffer::OrphanBuffer;
@@ -54,8 +55,9 @@ pub async fn boot_p2p(
     );
 
     // Create gossip handle.
-    let gossip = iroh_gossip::net::Gossip::builder()
-        .spawn(endpoint.clone());
+    let gossip = iroh_gossip::net::Gossip::builder().spawn(endpoint.clone());
+
+    let allowlist = PeerAllowlist::parse(&config.bootstrap_endpoint_ids)?;
 
     // Build PeerNode.
     let peer_config = PeerNodeConfig {
@@ -64,9 +66,10 @@ pub async fn boot_p2p(
         anti_entropy_interval_ms: config.anti_entropy_interval_milliseconds,
     };
 
-    let node = PeerNode::new(endpoint, gossip, peer_config);
+    let node = PeerNode::new(endpoint, gossip, peer_config, allowlist);
     info!(
         topic = %config.swarm_topic,
+        bootstrap_peers = config.bootstrap_endpoint_ids.len(),
         "P2P node ready"
     );
 
@@ -78,22 +81,28 @@ pub async fn boot_p2p(
 /// Listens for incoming gossip messages and broadcasts local appends.
 /// Returns an `mpsc::Sender` that the mutation layer uses to notify
 /// about local appends that should be gossiped.
+///
+/// Inbound `Supply` is applied only when `delivered_from` is on the peer
+/// allowlist (C-4). When `signing_enabled`, signatures are verified (C-3).
 pub fn spawn_gossip_loop(
     peer_node: &PeerNode,
     shared_ledger: SharedLedger,
     broadcast: TransactionBroadcast,
     orphan_buffer: Arc<RwLock<OrphanBuffer>>,
+    signing_enabled: bool,
 ) -> tokio::sync::mpsc::Sender<ledger::model::Directive> {
     let gossip = peer_node.gossip().clone();
     let topic_id = peer_node.topic_id();
     let registry = peer_node.registry.clone();
+    let allowlist = peer_node.allowlist().clone();
+    let bootstrap_peers = allowlist.bootstrap_peers();
 
     let (gossip_sender, mut gossip_receiver) =
         tokio::sync::mpsc::channel::<ledger::model::Directive>(256);
 
     tokio::spawn(async move {
-        // Join the gossip topic.
-        let topic = match gossip.subscribe(topic_id, vec![]).await {
+        // Join the gossip topic with configured bootstrap peers (R2 / §3.9).
+        let topic = match gossip.subscribe(topic_id, bootstrap_peers).await {
             Ok(topic) => topic,
             Err(error) => {
                 error!(%error, "failed to subscribe to gossip topic");
@@ -102,7 +111,16 @@ pub fn spawn_gossip_loop(
         };
 
         let (sink, mut stream) = topic.split();
-        info!("gossip loop started");
+        if allowlist.is_empty() {
+            info!(
+                "gossip loop started — inbound Supply dropped (empty bootstrapEndpointIds allowlist)"
+            );
+        } else {
+            info!(
+                admitted = allowlist.bootstrap_peers().len(),
+                "gossip loop started with peer allowlist"
+            );
+        }
 
         loop {
             tokio::select! {
@@ -126,11 +144,17 @@ pub fn spawn_gossip_loop(
                 Some(event) = stream.next() => {
                     match event {
                         Ok(iroh_gossip::api::Event::Received(msg)) => {
+                            if !allowlist.admits(msg.delivered_from) {
+                                debug!(
+                                    from = %msg.delivered_from,
+                                    "dropping gossip from endpoint not on bootstrap allowlist"
+                                );
+                                continue;
+                            }
                             let data = msg.content.as_ref();
                             match decode_broadcast(data) {
                                 Ok(WireMessage::Announce { id, kind, .. }) => {
                                     debug!(id = %id, kind = ?kind, "received gossip announce");
-                                    // Check if we already have this directive.
                                     let have_it = {
                                         let svc = shared_ledger.read().await;
                                         svc.get_directive(&id).is_some()
@@ -143,6 +167,13 @@ pub fn spawn_gossip_loop(
                                     for entry in entries {
                                         match p2p::union_merge::validate_supply_entry(&entry) {
                                             Ok(directive) => {
+                                                if let Err(error) = p2p::union_merge::verify_remote_signature(
+                                                    &directive,
+                                                    signing_enabled,
+                                                ) {
+                                                    warn!(%error, "rejected unsigned or invalid remote signature");
+                                                    continue;
+                                                }
                                                 let mut svc = shared_ledger.write().await;
                                                 match svc.insert_remote_directive(directive.clone()) {
                                                     Ok(Some(content_id)) => {
@@ -150,12 +181,10 @@ pub fn spawn_gossip_loop(
                                                             content_id = %content_id,
                                                             "merged remote directive from gossip"
                                                         );
-                                                        // Publish to subscription.
                                                         if let ledger::model::Directive::Transaction(ref txn) = directive {
                                                             let graphql_txn = domain_txn_to_graphql(txn, &svc);
                                                             broadcast.publish(graphql_txn);
                                                         }
-                                                        // Drain orphans that might now resolve.
                                                         drain_orphans(
                                                             &orphan_buffer,
                                                             &mut svc,
@@ -185,8 +214,12 @@ pub fn spawn_gossip_loop(
                             }
                         }
                         Ok(iroh_gossip::api::Event::NeighborUp(peer_id)) => {
-                            info!(peer = %peer_id, "gossip neighbor up");
-                            registry.upsert(peer_id.to_string(), vec![]);
+                            if allowlist.admits(peer_id) {
+                                info!(peer = %peer_id, "gossip neighbor up (allowlisted)");
+                                registry.upsert(peer_id.to_string(), vec![]);
+                            } else {
+                                info!(peer = %peer_id, "ignoring gossip neighbor not on bootstrap allowlist");
+                            }
                         }
                         Ok(iroh_gossip::api::Event::NeighborDown(peer_id)) => {
                             info!(peer = %peer_id, "gossip neighbor down");
@@ -225,10 +258,7 @@ pub fn spawn_anti_entropy_loop(
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
-        info!(
-            interval_ms = interval_ms,
-            "anti-entropy loop started"
-        );
+        info!(interval_ms = interval_ms, "anti-entropy loop started");
 
         loop {
             interval.tick().await;
@@ -296,7 +326,8 @@ async fn drain_orphans(
                     match service.insert_remote_directive(entry.directive.clone()) {
                         Ok(Some(content_id)) => {
                             info!(content_id = %content_id, "resolved orphan directive");
-                            if let ledger::model::Directive::Transaction(ref txn) = entry.directive {
+                            if let ledger::model::Directive::Transaction(ref txn) = entry.directive
+                            {
                                 let graphql_txn = domain_txn_to_graphql(txn, service);
                                 broadcast.publish(graphql_txn);
                             }
@@ -314,9 +345,7 @@ async fn drain_orphans(
 }
 
 /// Load 32-byte secret key material from disk, refusing group/other-readable files.
-pub(crate) fn read_secret_key_bytes(
-    path: &Path,
-) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+pub(crate) fn read_secret_key_bytes(path: &Path) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     if !path.exists() {
         return Err(format!("Secret key file {} does not exist", path.display()).into());
     }
@@ -324,11 +353,7 @@ pub(crate) fn read_secret_key_bytes(
     let hex_content = std::fs::read_to_string(path)?;
     let bytes = hex::decode(hex_content.trim())?;
     if bytes.len() != 32 {
-        return Err(format!(
-            "Secret key file has {} bytes, expected 32",
-            bytes.len()
-        )
-        .into());
+        return Err(format!("Secret key file has {} bytes, expected 32", bytes.len()).into());
     }
     let mut key_bytes = [0u8; 32];
     key_bytes.copy_from_slice(&bytes);
@@ -449,6 +474,18 @@ mod tests {
         assert!(
             message.contains("overly permissive"),
             "Expected permission error, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_iroh_endpoint_id_matches_dalek_public_key_hex() {
+        let secret = SecretKey::generate();
+        let iroh_hex = secret.public().to_string();
+        let dalek = security::signing::PeerKeySignatureProvider::from_bytes(&secret.to_bytes());
+        assert_eq!(
+            iroh_hex,
+            dalek.public_key_hex(),
+            "openledger-author (EndpointId Display) must equal the Ed25519 verifying-key hex used to verify signatures"
         );
     }
 }

@@ -23,6 +23,8 @@ pub enum MergeError {
     ValidationError(String),
     /// Missing required envelope fields.
     EnvelopeMissing(String),
+    /// Signature missing or invalid when signing is enabled (C-3 / §3.8.1).
+    InvalidSignature(String),
     /// DAG cycle detected (I8).
     CycleDetected,
 }
@@ -41,6 +43,7 @@ impl std::fmt::Display for MergeError {
             MergeError::EnvelopeMissing(field) => {
                 write!(f, "Missing required envelope field: {field}")
             }
+            MergeError::InvalidSignature(reason) => write!(f, "Invalid signature: {reason}"),
             MergeError::CycleDetected => write!(f, "DAG cycle detected (I8)"),
         }
     }
@@ -112,6 +115,49 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
     Ok(directive)
 }
 
+/// Verify `openledger-signature` when signing is enabled (§3.5 step 4 / C-3).
+///
+/// Signing off: unsigned entries are accepted. Signing on: missing or invalid
+/// signatures are rejected. The author's public key is `openledger-author`
+/// (Iroh `EndpointId` hex).
+pub fn verify_remote_signature(
+    directive: &Directive,
+    signing_enabled: bool,
+) -> Result<(), MergeError> {
+    if !signing_enabled {
+        return Ok(());
+    }
+
+    let metadata = directive_metadata(directive);
+    let author = metadata
+        .get("openledger-author")
+        .ok_or_else(|| MergeError::EnvelopeMissing("openledger-author".to_owned()))?;
+    let signature = metadata
+        .get("openledger-signature")
+        .ok_or_else(|| MergeError::EnvelopeMissing("openledger-signature".to_owned()))?;
+
+    let content_id = compute_content_id(directive);
+    let is_transaction = matches!(directive, Directive::Transaction(_));
+    security::signing::verify_signature(&content_id, signature, author, is_transaction)
+        .map_err(|error| MergeError::InvalidSignature(error.to_string()))
+}
+
+/// Immutable envelope metadata on any directive.
+fn directive_metadata(directive: &Directive) -> &BTreeMap<String, String> {
+    match directive {
+        Directive::Transaction(d) => &d.metadata,
+        Directive::Open(d) => &d.metadata,
+        Directive::Close(d) => &d.metadata,
+        Directive::Commodity(d) => &d.metadata,
+        Directive::Pad(d) => &d.metadata,
+        Directive::Balance(d) => &d.metadata,
+        Directive::Note(d) => &d.metadata,
+        Directive::Document(d) => &d.metadata,
+        Directive::Event(d) => &d.metadata,
+        Directive::Price(d) => &d.metadata,
+    }
+}
+
 /// Extract the Lamport clock value from a directive's metadata.
 pub fn extract_lamport(directive: &Directive) -> Option<u64> {
     if let Directive::Transaction(txn) = directive {
@@ -180,7 +226,6 @@ mod tests {
     use super::*;
     use crate::protocol::DirectiveKind;
     use ledger::hash::compute_content_id;
-    use ledger::model::*;
     use ledger::serialize::economic_canonical_serialize;
     use rust_decimal_macros::dec;
     use std::collections::BTreeMap;
@@ -611,5 +656,64 @@ mod tests {
         } else {
             panic!("Expected Transaction");
         }
+    }
+
+    #[test]
+    fn test_unsigned_accepted_when_signing_disabled() {
+        let entry = make_valid_supply_entry();
+        let directive = validate_supply_entry(&entry).unwrap();
+        assert!(verify_remote_signature(&directive, false).is_ok());
+    }
+
+    #[test]
+    fn test_unsigned_rejected_when_signing_enabled() {
+        let entry = make_valid_supply_entry();
+        let directive = validate_supply_entry(&entry).unwrap();
+        let result = verify_remote_signature(&directive, true);
+        assert!(matches!(
+            result,
+            Err(MergeError::EnvelopeMissing(ref field)) if field == "openledger-signature"
+        ));
+    }
+
+    #[test]
+    fn test_valid_signature_accepted_when_signing_enabled() {
+        use security::signing::{PeerKeySignatureProvider, SignatureProvider};
+
+        let provider = PeerKeySignatureProvider::generate();
+        let mut entry = make_valid_supply_entry();
+        let author = provider.public_key_hex();
+        let signature = provider.sign(&entry.id, true).unwrap();
+        entry
+            .envelope
+            .insert("openledger-author".to_owned(), author);
+        entry
+            .envelope
+            .insert("openledger-signature".to_owned(), signature);
+
+        let directive = validate_supply_entry(&entry).unwrap();
+        assert!(verify_remote_signature(&directive, true).is_ok());
+    }
+
+    #[test]
+    fn test_forged_signature_rejected_when_signing_enabled() {
+        use security::signing::{PeerKeySignatureProvider, SignatureProvider};
+
+        let author = PeerKeySignatureProvider::generate();
+        let attacker = PeerKeySignatureProvider::generate();
+        let mut entry = make_valid_supply_entry();
+        let forged = attacker.sign(&entry.id, true).unwrap();
+        entry
+            .envelope
+            .insert("openledger-author".to_owned(), author.public_key_hex());
+        entry
+            .envelope
+            .insert("openledger-signature".to_owned(), forged);
+
+        let directive = validate_supply_entry(&entry).unwrap();
+        assert!(matches!(
+            verify_remote_signature(&directive, true),
+            Err(MergeError::InvalidSignature(_))
+        ));
     }
 }

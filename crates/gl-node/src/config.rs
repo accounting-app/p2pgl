@@ -229,6 +229,19 @@ impl NodeConfig {
             ));
         }
 
+        if self.p2p.enabled {
+            if let Err(error) =
+                p2p::allowlist::PeerAllowlist::parse(&self.p2p.bootstrap_endpoint_ids)
+            {
+                return Err(ConfigError::Validation(error));
+            }
+            if self.p2p.swarm_topic == default_swarm_topic() && self.binds_non_loopback() {
+                return Err(ConfigError::Validation(
+                    "p2p.swarmTopic must not be the public default \"openledger/transactions\" when binding a non-loopback address".to_owned(),
+                ));
+            }
+        }
+
         for origin in &self.cors.allowed_origins {
             if origin == "*" {
                 return Err(ConfigError::Validation(
@@ -267,9 +280,7 @@ impl NodeConfig {
             .cors
             .allowed_origins
             .iter()
-            .map(|origin| {
-                HeaderValue::from_str(origin).expect("cors origins validated at boot")
-            })
+            .map(|origin| HeaderValue::from_str(origin).expect("cors origins validated at boot"))
             .collect();
         CorsLayer::new()
             .allow_origin(AllowOrigin::list(origins))
@@ -312,24 +323,28 @@ mod tests {
 
     #[test]
     fn test_full_config_loads() {
-        let content = r#"{
+        let peer_a = iroh::SecretKey::generate().public().to_string();
+        let peer_b = iroh::SecretKey::generate().public().to_string();
+        let content = format!(
+            r#"{{
             "ledgerPath": "./data/ledger.bean",
             "bindAddress": "0.0.0.0",
             "port": 8080,
             "externalFileEdits": "disabled",
-            "cors": { "allowedOrigins": ["http://localhost:8080"] },
-            "auth": { "enabled": true, "apiKey": "secret-key-123" },
-            "signing": { "enabled": true },
-            "p2p": {
+            "cors": {{ "allowedOrigins": ["http://localhost:8080"] }},
+            "auth": {{ "enabled": true, "apiKey": "secret-key-123" }},
+            "signing": {{ "enabled": true }},
+            "p2p": {{
                 "enabled": true,
                 "secretKeyPath": "./keys/iroh.secret",
-                "bootstrapEndpointIds": ["peer1", "peer2"],
+                "bootstrapEndpointIds": ["{peer_a}", "{peer_b}"],
                 "gossipIntervalMilliseconds": 3000,
                 "antiEntropyIntervalMilliseconds": 10000,
                 "swarmTopic": "my-org/ledger"
-            }
-        }"#;
-        let file = write_temp_config(content);
+            }}
+        }}"#
+        );
+        let file = write_temp_config(&content);
         let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
         assert_eq!(config.bind_address, "0.0.0.0");
         assert_eq!(config.port, 8080);
@@ -406,5 +421,36 @@ mod tests {
         );
         let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
         assert!(!config.graphiql_enabled());
+    }
+
+    #[test]
+    fn test_invalid_bootstrap_endpoint_id_rejected() {
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "p2p": { "enabled": true, "bootstrapEndpointIds": ["not-an-id"], "swarmTopic": "my-org/ledger" } }"#,
+        );
+        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
+        assert!(result.is_err());
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(error_message.contains("bootstrapEndpointIds"));
+    }
+
+    #[test]
+    fn test_default_swarm_topic_rejected_on_public_bind() {
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "p2p": { "enabled": true } }"#,
+        );
+        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
+        assert!(result.is_err());
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(error_message.contains("swarmTopic"));
+    }
+
+    #[test]
+    fn test_default_swarm_topic_allowed_on_loopback() {
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "p2p": { "enabled": true } }"#,
+        );
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        assert_eq!(config.p2p.swarm_topic, "openledger/transactions");
     }
 }

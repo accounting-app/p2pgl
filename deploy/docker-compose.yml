@@ -1,8 +1,9 @@
 # Multi-node OpenLedger deployment (§5 layout).
 #
-# Spins up 3 gl-node instances that discover each other via
-# iroh-gossip (no bootstrap peers needed for local Docker network —
-# mDNS discovery handles it).
+# Spins up 3 gl-node instances. Inbound ledger replication only happens
+# after you put each node's EndpointId into p2p.bootstrapEndpointIds
+# (empty allowlist = no remote Supply). Use a unique swarmTopic per mesh;
+# this sample uses openledger/docker-dev (not the public default).
 #
 # Usage:
 #   docker compose -f deploy/docker-compose.yml up --build

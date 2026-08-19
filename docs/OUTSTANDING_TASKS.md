@@ -33,7 +33,7 @@ All P2P building blocks are now wired into `gl-node`:
 
 ---
 
-## 🔴 Remaining — 7 Items
+## Remaining
 
 ### R1. Gossip Outbound from Mutations
 
@@ -44,10 +44,7 @@ The gossip loop has an `mpsc::Sender` for broadcasting local directives, but it'
 
 ### R2. Bootstrap Peer Connections (§3.9)
 
-The `bootstrapEndpointIds` config is parsed and passed to `PeerNodeConfig` but `boot_p2p()` never calls `gossip.join_peers()` with those IDs. Nodes currently rely on mDNS/relay discovery only.
-
-**Files:** `p2p_service.rs` (add join_peers after subscribe)
-**Effort:** ~10 lines
+- [x] `bootstrapEndpointIds` parsed as Iroh `EndpointId`s, passed to `gossip.subscribe`, and used as the inbound `Supply` allowlist. Empty list admits no remote writes.
 
 ### R3. ALPN Anti-Entropy Full Exchange (§3.4.1)
 
@@ -61,10 +58,7 @@ The anti-entropy loop detects missing directives by comparing head sets, but doe
 
 ### R4. Signature Verification on Remote Inserts
 
-The signing write path is wired (mutations sign after insert), but `insert_remote_directive()` doesn't verify incoming `openledger-signature` metadata against the `openledger-author` public key. When `signing.enabled`, forged signatures should be rejected.
-
-**Files:** `service.rs` (add verify step in `insert_remote_directive`)
-**Effort:** ~20 lines
+- [x] When `signing.enabled`, gossip `Supply` must carry a valid `openledger-signature` verified against `openledger-author` (Iroh `EndpointId` hex = Ed25519 public key). Unsigned entries are accepted only when signing is off.
 
 ### R5. SSE Subscription Transport (§2.6)
 
@@ -91,7 +85,7 @@ Spec M6 says *"Done when: a 3-node cluster converges in production-like topology
 
 ## Conformance Tests — E2E Gaps
 
-All 15 CTs pass at the library level. Once R2/R3/R6 are done, these will have true E2E coverage:
+All 15 CTs pass at the library level. Once R3/R6 are done, these will have true E2E coverage:
 
 | CT | Invariant | Current Coverage | After R6 |
 |----|-----------|-----------------|----------|
@@ -106,10 +100,7 @@ All 15 CTs pass at the library level. Once R2/R3/R6 are done, these will have tr
 | Item | Lines | Complexity |
 |------|-------|------------|
 | R1 — Gossip outbound | ~30 | Low |
-| R2 — Bootstrap peers | ~10 | Low |
 | R3 — ALPN anti-entropy | ~150 | Medium |
-| R4 — Signature verify on receive | ~20 | Low |
 | R5 — SSE endpoint | ~60 | Low |
 | R6 — Multi-node convergence test | ~200 | High |
 | R7 — Performance benchmark | ~80 | Low |
-| **Total** | **~550** | |

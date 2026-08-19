@@ -347,7 +347,7 @@ fn test_signing_roundtrip() {
 
     let provider = PeerKeySignatureProvider::generate();
     let content_id = "abc123";
-    let sig = provider.sign(content_id).unwrap();
+    let sig = provider.sign(content_id, true).unwrap();
 
     let result = provider.verify(content_id, &sig, &provider.public_key_hex());
     assert!(result.is_ok());

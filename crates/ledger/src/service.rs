@@ -357,8 +357,10 @@ impl LedgerService {
             validate_link(link).map_err(|_| ServiceError::InvalidLink { link: link.clone() })?;
         }
         for posting in &input.postings {
-            validate_account_name(&posting.account).map_err(|_| ServiceError::InvalidAccountName {
-                account: posting.account.clone(),
+            validate_account_name(&posting.account).map_err(|_| {
+                ServiceError::InvalidAccountName {
+                    account: posting.account.clone(),
+                }
             })?;
             if let Some(ref amount) = posting.amount {
                 validate_currency(&amount.currency).map_err(|_| ServiceError::InvalidCurrency {
@@ -801,7 +803,11 @@ impl LedgerService {
 
     /// Get the set of all directive content IDs in the DAG (for anti-entropy exchange).
     pub fn all_directive_ids(&self) -> std::collections::HashSet<String> {
-        self.dag.content_ids().into_iter().map(|s| s.to_owned()).collect()
+        self.dag
+            .content_ids()
+            .into_iter()
+            .map(|s| s.to_owned())
+            .collect()
     }
 
     /// Insert a validated remote directive into the ledger (P2P receive path).
@@ -869,7 +875,9 @@ impl LedgerService {
             }
             Directive::Open(open) => {
                 // Register account state.
-                let _ = self.accounts.open_account(&open.account, open.date, &open.currencies);
+                let _ = self
+                    .accounts
+                    .open_account(&open.account, open.date, &open.currencies);
                 match self.dag.insert(directive.clone(), false)? {
                     InsertResult::Inserted { content_id } => {
                         self.read_model.index_directive(&directive);
@@ -923,10 +931,7 @@ impl LedgerService {
                 Directive::Event(d) => &mut d.metadata,
                 Directive::Price(d) => &mut d.metadata,
             };
-            metadata.insert(
-                "openledger-signature".to_owned(),
-                signature_hex.to_owned(),
-            );
+            metadata.insert("openledger-signature".to_owned(), signature_hex.to_owned());
             // Re-persist so the signature is written to disk.
             let _ = self.persist();
         }

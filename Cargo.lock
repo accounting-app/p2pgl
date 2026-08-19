@@ -2782,6 +2782,7 @@ dependencies = [
  "ledger",
  "rust_decimal",
  "rust_decimal_macros",
+ "security",
  "serde",
  "serde_cbor",
  "serde_json",

@@ -401,6 +401,8 @@ The config file is loaded from `gl-node.config.json` (or set `GL_NODE_CONFIG` en
 | `auth.apiKey` | `""` | The API key value (required if auth enabled) |
 | `signing.enabled` | `false` | Sign transactions with Ed25519 |
 | `p2p.enabled` | `false` | Enable Iroh mesh replication |
+| `p2p.bootstrapEndpointIds` | `[]` | Allowlisted peer EndpointIds; empty drops inbound `Supply` |
+| `p2p.swarmTopic` | `openledger/transactions` | Gossip topic; required unique on a public bind |
 
 ### Using Auth
 

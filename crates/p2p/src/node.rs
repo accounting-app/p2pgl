@@ -11,6 +11,7 @@ use iroh_gossip::net::Gossip;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
+use crate::allowlist::PeerAllowlist;
 use crate::topic::derive_topic_id;
 
 /// The ID of a peer (Iroh NodeId as hex string).
@@ -104,19 +105,28 @@ pub struct PeerNode {
     pub registry: PeerRegistry,
     /// Configuration.
     config: PeerNodeConfig,
+    /// Admission list for inbound `Supply` (C-4).
+    allowlist: PeerAllowlist,
 }
 
 impl PeerNode {
     /// Create a new PeerNode with an already-bound endpoint.
     ///
     /// The caller is responsible for binding the endpoint (which may involve
-    /// loading a persistent secret key for CAP-4 compliance).
-    pub fn new(endpoint: Endpoint, gossip: Gossip, config: PeerNodeConfig) -> Self {
+    /// loading a persistent secret key for CAP-4 compliance) and for parsing
+    /// `bootstrap_peers` into an allowlist.
+    pub fn new(
+        endpoint: Endpoint,
+        gossip: Gossip,
+        config: PeerNodeConfig,
+        allowlist: PeerAllowlist,
+    ) -> Self {
         PeerNode {
             endpoint,
             gossip,
             registry: PeerRegistry::new(),
             config,
+            allowlist,
         }
     }
 
@@ -138,6 +148,11 @@ impl PeerNode {
     /// The configuration.
     pub fn config(&self) -> &PeerNodeConfig {
         &self.config
+    }
+
+    /// Admission list for inbound gossip `Supply`.
+    pub fn allowlist(&self) -> &PeerAllowlist {
+        &self.allowlist
     }
 
     /// The gossip TopicId for this node's swarm.

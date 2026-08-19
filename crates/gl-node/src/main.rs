@@ -95,7 +95,7 @@ async fn main() {
     // Peer registry — either from PeerNode (when P2P enabled) or empty default.
     let peer_registry: PeerRegistry;
 
-    // Boot P2P if enabled (§3.4).
+    // Boot P2P if enabled (§3.4). Keep identity even when the allowlist is empty.
     let _gossip_sender = if config.p2p.enabled {
         match p2p_service::boot_p2p(&config.p2p, &ledger_path).await {
             Ok(peer_node) => {
@@ -106,15 +106,26 @@ async fn main() {
 
                 peer_registry = peer_node.registry.clone();
 
-                // Spawn gossip loop (§3.4, §3.4.3).
+                if peer_node.allowlist().is_empty() {
+                    warn!(
+                        "p2p.bootstrapEndpointIds is empty — inbound gossip Supply will be dropped"
+                    );
+                }
+                if config.p2p.swarm_topic == p2p::topic::DEFAULT_SWARM_TOPIC {
+                    warn!(
+                        topic = %config.p2p.swarm_topic,
+                        "using the public default swarm topic; set a unique p2p.swarmTopic for this mesh"
+                    );
+                }
+
                 let sender = p2p_service::spawn_gossip_loop(
                     &peer_node,
                     shared_ledger.clone(),
                     broadcast.clone(),
                     orphan_buffer.clone(),
+                    config.signing.enabled,
                 );
 
-                // Spawn anti-entropy loop (§3.4.1).
                 p2p_service::spawn_anti_entropy_loop(
                     &peer_node,
                     shared_ledger.clone(),
@@ -179,26 +190,15 @@ async fn main() {
 
     // Build signature provider based on config (§3.8.1).
     // When signing is enabled the key is mandatory — never fall back to noop (H-4).
-    let signer: Arc<dyn security::signing::SignatureProvider> = if config.signing.enabled {
-        let key_path = std::path::Path::new(&config.p2p.secret_key_path);
-        match p2p_service::read_secret_key_bytes(key_path) {
-            Ok(key_bytes) => {
-                let provider = security::signing::PeerKeySignatureProvider::from_bytes(&key_bytes);
-                info!(public_key = %provider.public_key_hex(), "signing enabled");
-                Arc::new(provider)
-            }
-            Err(error) => {
-                error!(%error, "signing enabled but secret key could not be loaded — aborting");
-                std::process::exit(1);
-            }
-        }
-    } else {
-        info!("signing disabled");
-        Arc::new(security::signing::NoopSignatureProvider)
-    };
+    let signer = build_signature_provider(&config);
 
     // Build the GraphQL schema with live service + peer registry + signer.
-    let schema = build_schema_with_service(shared_ledger.clone(), broadcast, peer_registry.clone(), signer);
+    let schema = build_schema_with_service(
+        shared_ledger.clone(),
+        broadcast,
+        peer_registry.clone(),
+        signer,
+    );
 
     // Auth state for middleware (§3.8).
     let auth_state = AuthState {
@@ -214,9 +214,12 @@ async fn main() {
         info!("GraphiQL disabled — POST /graphql only");
         Router::new().route("/graphql", post(graphql_handler))
     };
-    let graphql_routes = graphql_router.with_state(schema).layer(
-        middleware::from_fn_with_state(auth_state, auth::auth_middleware),
-    );
+    let graphql_routes = graphql_router
+        .with_state(schema)
+        .layer(middleware::from_fn_with_state(
+            auth_state,
+            auth::auth_middleware,
+        ));
 
     // Health state with live shared ledger + peer registry.
     let health_state = HealthState {
@@ -260,8 +263,7 @@ async fn main() {
     );
 
     // Serve with graceful shutdown on SIGTERM / SIGINT (§3.9).
-    let server = axum::serve(listener, application)
-        .with_graceful_shutdown(shutdown_signal());
+    let server = axum::serve(listener, application).with_graceful_shutdown(shutdown_signal());
 
     if let Err(error) = server.await {
         error!(%error, "server error");
@@ -274,6 +276,26 @@ async fn main() {
     }
 
     info!("gl-node shut down gracefully");
+}
+
+fn build_signature_provider(config: &NodeConfig) -> Arc<dyn security::signing::SignatureProvider> {
+    if config.signing.enabled {
+        let key_path = std::path::Path::new(&config.p2p.secret_key_path);
+        match p2p_service::read_secret_key_bytes(key_path) {
+            Ok(key_bytes) => {
+                let provider = security::signing::PeerKeySignatureProvider::from_bytes(&key_bytes);
+                info!(public_key = %provider.public_key_hex(), "signing enabled");
+                Arc::new(provider)
+            }
+            Err(error) => {
+                error!(%error, "signing enabled but secret key could not be loaded — aborting");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        info!("signing disabled");
+        Arc::new(security::signing::NoopSignatureProvider)
+    }
 }
 
 /// Wait for SIGTERM or SIGINT (§3.9 graceful shutdown).

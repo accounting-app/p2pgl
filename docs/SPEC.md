@@ -566,6 +566,8 @@ TopicId        = first 32 bytes of SHA-256( topic_preimage )
 
 (Iroh `TopicId` is 32 bytes; use that digest directly.)
 
+The default preimage is **enumerable**. When `p2p.enabled` and the HTTP bind is non-loopback, boot **fails** unless `p2p.swarmTopic` is set to a unique, operator-chosen string. Loopback may keep the default (with a boot warning). Inbound `Supply` is accepted only from `p2p.bootstrapEndpointIds` regardless of topic.
+
 #### 3.4.4 Orphan buffer & cycles
 
 - If a remote transaction’s parents are missing: buffer up to **10_000** orphans or **1 hour** (whichever first); enqueue parent ids on `want`.
@@ -668,7 +670,8 @@ For `balanceSheet(at)`:
 
 - **Instance auth:** single-tenant → one instance-scoped API key (and optional mTLS later) on the GraphQL endpoint. Middleware from **M0** (disabled by default). Production Go/No-Go before public bind: `auth.enabled=true`, non-empty `auth.apiKey`, TLS terminated in-process or by the host (§3.9).
 - **API key header:** when `auth.enabled`, require header `X-Api-Key: <auth.apiKey>` on GraphQL HTTP, WebSocket upgrade, and SSE. Missing/mismatch → `UNAUTHORIZED` / HTTP 401. `GET /health` is exempt (§2.9).
-- **Peer identity:** Iroh `SecretKey` persisted on disk (CAP-4). Transactions carry `author` via `openledger-author` = `EndpointId`. Hand-adopted directives are stamped with the adopting node's identity.
+- **Peer identity:** Iroh `SecretKey` persisted on disk (CAP-4). Transactions carry `author` via `openledger-author` = `EndpointId` (lowercase hex of the Ed25519 public key — the same encoding used to verify signatures). Hand-adopted directives are stamped with the adopting node's identity.
+- **Peer admission:** `p2p.bootstrapEndpointIds` is the **allowlist** for inbound gossip `Supply`. Unknown `delivered_from` endpoints are ignored. An empty list admits **no** remote writes (the node may still bind an identity). Unsigned entries from allowlisted peers are accepted only when `signing.enabled` is false (§3.5 step 4).
 - **Non-repudiation — optional, pluggable.** Signing **off by default**. Trait `SignatureProvider` with `NoopSignatureProvider` and `PeerKeySignatureProvider`. Config `signing.enabled` selects. Signatures are envelope-only (§3.3.1).
 
   **Integrity vs attribution:**
@@ -691,7 +694,7 @@ For `balanceSheet(at)`:
 
 - One long-lived process per node (`gl-node`), each with a **persistent volume** for `.bean` + Iroh key material.
 - **Addressability:** public IP / IPv6 where available; otherwise Iroh relay + hole-punch (CAP-3).
-- **Discovery — static bootstrap + tickets (with optional relay).** Configured bootstrap `EndpointId`s (and optional connection tickets) suffice for small fixed meshes. Relay / hole-punch are additive. Local-network convenience discovery may be used in development only.
+- **Discovery — static bootstrap + tickets (with optional relay).** Configured bootstrap `EndpointId`s (and optional connection tickets) suffice for small fixed meshes **and are the admission list for inbound `Supply`**. Relay / hole-punch are additive. Local-network convenience discovery may be used in development only; it does **not** bypass the allowlist.
 - Container image: multi-stage Rust build → slim or distroless runtime; expose HTTP and the Iroh QUIC ports as required.
 - **Graceful shutdown:** on `SIGTERM` / `SIGINT`, the node (1) stops accepting new GraphQL requests, (2) completes in-flight requests (with a **10-second** drain timeout), (3) flushes any pending `.bean` write via the normal atomic temp-file + rename, (4) closes Iroh gossip/anti-entropy connections, and (5) exits. No data is lost because every accepted mutation has already been atomically persisted before its response was sent.
 
@@ -746,12 +749,12 @@ The architecture is **host-agnostic but not paradigm-agnostic**: it runs on any 
 | `signing.enabled` | boolean | `false` | §3.8.1 |
 | `p2p.enabled` | boolean | `false` | Iroh mesh |
 | `p2p.secretKeyPath` | string | beside ledger | Persisted Iroh `SecretKey` |
-| `p2p.bootstrapEndpointIds` | string[] | `[]` | Bootstrap peers |
+| `p2p.bootstrapEndpointIds` | string[] | `[]` | Allowlisted peer `EndpointId`s (hex). Empty = no inbound `Supply` |
 | `p2p.gossipIntervalMilliseconds` | number | `5000` | iroh-gossip announce cadence |
 | `p2p.antiEntropyIntervalMilliseconds` | number | `5000` | ALPN head-exchange cadence |
-| `p2p.swarmTopic` | string | `openledger/transactions` | TopicId preimage (§3.4.3) |
+| `p2p.swarmTopic` | string | `openledger/transactions` | TopicId preimage (§3.4.3). Required unique when `p2p.enabled` and bind is non-loopback |
 
-Unknown keys are rejected at boot (fail closed). When `auth.enabled` and `auth.apiKey` missing/empty → boot fail. When `p2p.enabled` and secret key path unreadable → boot fail.
+Unknown keys are rejected at boot (fail closed). When `auth.enabled` and `auth.apiKey` missing/empty → boot fail. When `p2p.enabled` and secret key path unreadable → boot fail. When `p2p.enabled` and a `bootstrapEndpointIds` entry is not a valid `EndpointId` → boot fail. When `p2p.enabled`, bind is non-loopback, and `swarmTopic` is the public default → boot fail.
 
 **Example:**
 

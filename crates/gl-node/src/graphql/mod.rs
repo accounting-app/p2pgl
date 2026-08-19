@@ -67,11 +67,7 @@ pub async fn graphql_handler(
 
 /// Handler for `GET /graphql` — serve the GraphiQL interactive explorer.
 pub async fn graphiql_handler() -> impl IntoResponse {
-    Html(
-        GraphiQLSource::build()
-            .endpoint("/graphql")
-            .finish(),
-    )
+    Html(GraphiQLSource::build().endpoint("/graphql").finish())
 }
 
 #[cfg(test)]
