@@ -568,7 +568,7 @@ TopicId        = first 32 bytes of SHA-256( topic_preimage )
 
 (Iroh `TopicId` is 32 bytes; use that digest directly.)
 
-The default preimage is **enumerable**. When `p2p.enabled` and the HTTP bind is non-loopback, boot **fails** unless `p2p.swarmTopic` is set to a unique, operator-chosen string. Loopback may keep the default (with a boot warning). Inbound `Supply` is accepted only from `p2p.bootstrapEndpointIds` regardless of topic.
+The default preimage is **enumerable**. When `p2p.enabled`, boot **fails** unless `p2p.swarmTopic` is set to a unique, operator-chosen string (including loopback HTTP). Inbound `Supply` is accepted only from `p2p.bootstrapEndpointIds` regardless of topic.
 
 #### 3.4.4 Orphan buffer & cycles
 
@@ -740,23 +740,23 @@ The architecture is **host-agnostic but not paradigm-agnostic**: it runs on any 
 
 | Key | Type | Default | Purpose |
 |-----|------|---------|---------|
-| `ledgerPath` | string | **required** | Path to the single `.bean` file (created if missing — see §3.3) |
+| `ledgerPath` | string | **required** | Path to the single `.bean` file (created if missing — see §3.3). Must not contain `..`; must resolve under the process working directory |
 | `bindAddress` | string | `"127.0.0.1"` | HTTP listen address. Use `"0.0.0.0"` for container/remote access. |
 | `port` | number | `4000` | HTTP listen port |
 | `externalFileEdits` | `"enabled"` \| `"disabled"` | `"disabled"` | §3.3 external write path |
-| `graphiql` | boolean | `true` | `GET /graphql` playground. Set `false` to hide it (API POST remains) |
+| `graphiql` | boolean | `false` | `GET /graphql` playground. Allowed only on loopback. Set `true` for local development. Introspection is enabled only when GraphiQL is on |
 | `cors.allowedOrigins` | string[] | `[]` | Explicit browser origins; `"*"` is rejected. Empty = same-origin only |
 | `auth.enabled` | boolean | `false` | Require `X-Api-Key` |
-| `auth.apiKey` | string | — | Required when `auth.enabled` |
+| `auth.apiKey` | string | — | Required when `auth.enabled`. Empty values may be filled from env `GL_NODE_API_KEY`. The sample `change-me-docker-api-key` is rejected |
 | `signing.enabled` | boolean | `false` | §3.8.1 |
 | `p2p.enabled` | boolean | `false` | Iroh mesh |
 | `p2p.secretKeyPath` | string | beside ledger | Persisted Iroh `SecretKey` |
 | `p2p.bootstrapEndpointIds` | string[] | `[]` | Allowlisted peer `EndpointId`s (hex). Empty = no inbound `Supply` |
 | `p2p.gossipIntervalMilliseconds` | number | `5000` | iroh-gossip announce cadence |
 | `p2p.antiEntropyIntervalMilliseconds` | number | `5000` | ALPN head-exchange cadence |
-| `p2p.swarmTopic` | string | `openledger/transactions` | TopicId preimage (§3.4.3). Required unique when `p2p.enabled` and bind is non-loopback |
+| `p2p.swarmTopic` | string | `openledger/transactions` | TopicId preimage (§3.4.3). Required unique whenever `p2p.enabled` |
 
-Unknown keys are rejected at boot (fail closed). When `auth.enabled` and `auth.apiKey` missing/empty → boot fail. When `p2p.enabled` and secret key path unreadable → boot fail. When `p2p.enabled` and a `bootstrapEndpointIds` entry is not a valid `EndpointId` → boot fail. When `p2p.enabled`, bind is non-loopback, and `swarmTopic` is the public default → boot fail.
+Unknown keys are rejected at boot (fail closed). When `auth.enabled` and `auth.apiKey` missing/empty → boot fail. The documented sample `change-me-docker-api-key` is rejected. `GL_NODE_API_KEY` fills an empty `auth.apiKey`. When `p2p.enabled` and secret key path unreadable → boot fail. When `p2p.enabled` and a `bootstrapEndpointIds` entry is not a valid `EndpointId` → boot fail. When `p2p.enabled` and `swarmTopic` is the public default → boot fail. When `graphiql` is true and the HTTP bind is non-loopback → boot fail. `ledgerPath` must not contain `..` and must resolve under the process working directory. The binary accepts `--version` and `--health-check` (`GET /health` against the configured bind/port; `0.0.0.0`/`::` are probed on loopback).
 
 **Example:**
 
@@ -795,6 +795,12 @@ To bound memory and prevent abuse, the following limits are enforced on write. E
 | Max metadata keys per directive | **100** | Any directive (parse + API + remote + reconcile) |
 | Max economic body per supply entry | **1 048 576** UTF-8 bytes | Remote `economic_bean` |
 | Max ledger file size | **67 108 864** UTF-8 bytes (64 MiB) | Boot, reconcile, and persist |
+| Max `Supply` entries per message | **256** | Gossip and ALPN `Supply` |
+| Max `Want` ids per message | **1 024** | ALPN `Want` |
+| Max GraphQL HTTP body | **2 097 152** bytes | `POST /graphql` |
+| GraphQL selection-set depth | **16** | All GraphQL operations |
+| GraphQL query complexity | **4 096** | All GraphQL operations |
+| GraphQL requests per client IP | **60 / 60s** | `POST`/`GET /graphql`; `/health` is exempt |
 
 These limits are not configurable in V1. They exist as named constants in the codebase so they can be promoted to config keys later without a spec change.
 

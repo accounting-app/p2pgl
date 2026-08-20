@@ -6,16 +6,16 @@
 # this sample uses openledger/docker-dev (not the public default).
 #
 # Usage:
-#   docker compose -f deploy/docker-compose.yml up --build
+#   GL_NODE_API_KEY="$(openssl rand -hex 32)" docker compose -f deploy/docker-compose.yml up --build
 #
 # Each node exposes:
-#   - node-0: http://localhost:3000/graphql  (GraphiQL + POST; set X-Api-Key)
+#   - node-0: http://localhost:3000/graphql  (POST; set X-Api-Key)
 #   - node-1: http://localhost:3001/graphql
 #   - node-2: http://localhost:3002/graphql
 #   - All nodes: GET /health for health checks
 #
-# Default API key is "change-me-docker-api-key" (see gl-node.docker.json).
-# Set "graphiql": false in the mounted config to hide the playground.
+# GraphiQL is off. Set GL_NODE_API_KEY in the environment; the sample
+# "change-me-docker-api-key" is rejected at boot.
 
 services:
   node-0:
@@ -31,10 +31,11 @@ services:
     environment:
       - RUST_LOG=info
       - GL_NODE_CONFIG=/data/gl-node.config.json
+      - GL_NODE_API_KEY=${GL_NODE_API_KEY:?Set GL_NODE_API_KEY to a unique secret}
     networks:
       - openledger
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:3000/health"]
+      test: ["CMD", "/usr/local/bin/gl-node", "--health-check"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -53,10 +54,11 @@ services:
     environment:
       - RUST_LOG=info
       - GL_NODE_CONFIG=/data/gl-node.config.json
+      - GL_NODE_API_KEY=${GL_NODE_API_KEY:?Set GL_NODE_API_KEY to a unique secret}
     networks:
       - openledger
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:3000/health"]
+      test: ["CMD", "/usr/local/bin/gl-node", "--health-check"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -78,10 +80,11 @@ services:
     environment:
       - RUST_LOG=info
       - GL_NODE_CONFIG=/data/gl-node.config.json
+      - GL_NODE_API_KEY=${GL_NODE_API_KEY:?Set GL_NODE_API_KEY to a unique secret}
     networks:
       - openledger
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:3000/health"]
+      test: ["CMD", "/usr/local/bin/gl-node", "--health-check"]
       interval: 10s
       timeout: 5s
       retries: 3

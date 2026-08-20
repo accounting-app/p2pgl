@@ -43,8 +43,8 @@ ENV RUST_LOG=info
 # Expose HTTP port (configurable via config).
 EXPOSE 3000
 
-# Health check (§2.9).
+# Health check (§2.9) — probes GET /health on the running process.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["/usr/local/bin/gl-node", "--version"] || exit 1
+    CMD ["/usr/local/bin/gl-node", "--health-check"]
 
 ENTRYPOINT ["gl-node"]

@@ -3,7 +3,10 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Serialize;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 /// Response body for `GET /health` (§2.9).
@@ -35,6 +38,45 @@ pub async fn health_handler(State(state): State<HealthState>) -> impl IntoRespon
         version: env!("CARGO_PKG_VERSION").to_owned(),
     };
     (StatusCode::OK, Json(response))
+}
+
+/// Probe `GET /health` on a running node (Docker HEALTHCHECK / `--health-check`).
+///
+/// `0.0.0.0` / `::` bind addresses are probed on loopback.
+pub fn probe_local_health(bind_address: &str, port: u16) -> Result<(), String> {
+    let host = match bind_address {
+        "0.0.0.0" | "*" => "127.0.0.1",
+        "::" => "::1",
+        other => other,
+    };
+    let address = format!("{host}:{port}");
+    let socket_addr = address
+        .to_socket_addrs()
+        .map_err(|error| format!("invalid health probe address {address}: {error}"))?
+        .next()
+        .ok_or_else(|| format!("health probe address {address} did not resolve"))?;
+    let mut stream = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(3))
+        .map_err(|error| format!("health probe connect {address}: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| error.to_string())?;
+    let request = format!("GET /health HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("health probe write: {error}"))?;
+    let mut body = String::new();
+    stream
+        .read_to_string(&mut body)
+        .map_err(|error| format!("health probe read: {error}"))?;
+    let status_line = body.lines().next().unwrap_or("");
+    if status_line.contains(" 200 ") || status_line.ends_with(" 200") {
+        Ok(())
+    } else {
+        Err(format!("health probe unexpected response: {status_line}"))
+    }
 }
 
 #[cfg(test)]
@@ -81,5 +123,11 @@ mod tests {
         assert_eq!(health["peers"], 0);
         assert!(health["version"].is_string());
         assert!(!health["version"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_probe_local_health_connection_refused() {
+        let error = probe_local_health("127.0.0.1", 1).expect_err("nothing listens on port 1");
+        assert!(error.contains("health probe"));
     }
 }

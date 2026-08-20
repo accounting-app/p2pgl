@@ -1,3 +1,4 @@
 {
-    "ledgerPath": "test-ledger.bean"
+    "ledgerPath": "test-ledger.bean",
+    "graphiql": true
 }

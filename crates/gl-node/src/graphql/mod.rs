@@ -30,18 +30,39 @@ pub type SharedLedger = Arc<RwLock<LedgerService>>;
 /// The complete GraphQL schema type.
 pub type AppSchema = Schema<QueryRoot, MutationRoot, SubscriptionRoot>;
 
+/// Maximum selection-set depth (M-7).
+pub const GRAPHQL_MAX_DEPTH: usize = 16;
+
+/// Maximum query complexity (M-7).
+pub const GRAPHQL_MAX_COMPLEXITY: usize = 4096;
+
+fn schema_builder(
+    enable_introspection: bool,
+) -> async_graphql::SchemaBuilder<QueryRoot, MutationRoot, SubscriptionRoot> {
+    let mut builder = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
+        .limit_depth(GRAPHQL_MAX_DEPTH)
+        .limit_complexity(GRAPHQL_MAX_COMPLEXITY);
+    if !enable_introspection {
+        builder = builder.disable_introspection();
+    }
+    builder
+}
+
 /// Build the async-graphql schema with the live ledger service.
 ///
 /// Injects `SharedLedger`, `TransactionBroadcast`, `PeerRegistry`, and
 /// `SignatureProvider` into the schema data so resolvers can access them
 /// via `ctx.data_unchecked::<T>()`.
+///
+/// Introspection is enabled only when GraphiQL is on (loopback playground).
 pub fn build_schema_with_service(
     ledger: SharedLedger,
     broadcast: TransactionBroadcast,
     peer_registry: p2p::node::PeerRegistry,
     signer: std::sync::Arc<dyn security::signing::SignatureProvider>,
+    enable_introspection: bool,
 ) -> AppSchema {
-    Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
+    schema_builder(enable_introspection)
         .data(ledger)
         .data(broadcast)
         .data(peer_registry)
@@ -54,7 +75,7 @@ pub fn build_schema_with_service(
 /// Queries and mutations that need the ledger will return INTERNAL errors.
 #[cfg(test)]
 pub fn build_schema() -> AppSchema {
-    Schema::build(QueryRoot, MutationRoot, SubscriptionRoot).finish()
+    schema_builder(true).finish()
 }
 
 /// Handler for `POST /graphql` — execute a GraphQL request.
@@ -178,6 +199,7 @@ mod tests {
             broadcast,
             p2p::node::PeerRegistry::new(),
             std::sync::Arc::new(security::signing::NoopSignatureProvider),
+            true,
         );
 
         // Health should show 0 heads.
@@ -186,6 +208,27 @@ mod tests {
         let data = result.data.into_json().unwrap();
         assert_eq!(data["health"]["status"], "ok");
         assert_eq!(data["health"]["heads"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_introspection_disabled_when_graphiql_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let bean_path = dir.path().join("test.bean");
+        std::fs::write(&bean_path, "").unwrap();
+        let service = LedgerService::boot(&bean_path, "test-node".to_owned()).unwrap();
+        let schema = build_schema_with_service(
+            Arc::new(RwLock::new(service)),
+            TransactionBroadcast::new(),
+            p2p::node::PeerRegistry::new(),
+            std::sync::Arc::new(security::signing::NoopSignatureProvider),
+            false,
+        );
+        let result = schema.execute("{ __schema { queryType { name } } }").await;
+        let data = result.data.into_json().unwrap();
+        assert!(
+            data["__schema"].is_null(),
+            "introspection should be disabled; data={data:?}"
+        );
     }
 
     #[tokio::test]
@@ -201,6 +244,7 @@ mod tests {
             TransactionBroadcast::new(),
             p2p::node::PeerRegistry::new(),
             std::sync::Arc::new(security::signing::NoopSignatureProvider),
+            true,
         );
 
         let result = schema

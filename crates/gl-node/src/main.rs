@@ -3,17 +3,21 @@ mod config;
 mod graphql;
 mod health;
 mod p2p_service;
+mod rate_limit;
 
 use auth::AuthState;
 use config::NodeConfig;
 use graphql::broadcast::TransactionBroadcast;
 use graphql::{build_schema_with_service, graphiql_handler, graphql_handler, SharedLedger};
-use health::{health_handler, HealthState};
+use health::{health_handler, probe_local_health, HealthState};
+use rate_limit::RateLimiter;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
-use axum::{middleware, Router};
+use axum::{middleware, Extension, Router};
 use p2p::node::PeerRegistry;
 use p2p::orphan_buffer::OrphanBuffer;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -21,8 +25,67 @@ use tokio::signal;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
+/// Explicit GraphQL HTTP body cap (M-7). Axum's default is also 2 MiB.
+const GRAPHQL_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+enum CliAction {
+    Serve,
+    Version,
+    HealthCheck,
+    Usage(String),
+}
+
+fn parse_cli() -> CliAction {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        None => CliAction::Serve,
+        Some("--version") | Some("-V") => CliAction::Version,
+        Some("--health-check") => CliAction::HealthCheck,
+        Some("--help") | Some("-h") => {
+            CliAction::Usage("Usage: gl-node [--health-check | --version]".to_owned())
+        }
+        Some(other) => CliAction::Usage(format!(
+            "unknown argument: {other}\nUsage: gl-node [--health-check | --version]"
+        )),
+    }
+}
+
+fn run_health_check() -> ! {
+    let config_path =
+        std::env::var("GL_NODE_CONFIG").unwrap_or_else(|_| "gl-node.config.json".to_owned());
+    let config = match NodeConfig::load_from_path(&PathBuf::from(&config_path)) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("health-check: failed to load config: {error}");
+            std::process::exit(1);
+        }
+    };
+    match probe_local_health(&config.bind_address, config.port) {
+        Ok(()) => std::process::exit(0),
+        Err(error) => {
+            eprintln!("health-check: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    match parse_cli() {
+        CliAction::Version => {
+            println!("gl-node {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        CliAction::HealthCheck => {
+            run_health_check();
+        }
+        CliAction::Usage(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+        CliAction::Serve => {}
+    }
+
     // Initialize structured logging.
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -198,6 +261,7 @@ async fn main() {
         broadcast,
         peer_registry.clone(),
         signer,
+        config.graphiql_enabled(),
     );
 
     // Auth state for middleware (§3.8).
@@ -219,7 +283,8 @@ async fn main() {
         .layer(middleware::from_fn_with_state(
             auth_state,
             auth::auth_middleware,
-        ));
+        ))
+        .layer(middleware::from_fn(rate_limit::graphql_rate_limit));
 
     // Health state with live shared ledger + peer registry.
     let health_state = HealthState {
@@ -240,6 +305,8 @@ async fn main() {
         .route("/health", get(health_handler))
         .with_state(health_state)
         .merge(graphql_routes)
+        .layer(Extension(RateLimiter::graphql()))
+        .layer(DefaultBodyLimit::max(GRAPHQL_MAX_BODY_BYTES))
         .layer(config.cors_layer());
 
     // Bind and serve.
@@ -263,7 +330,11 @@ async fn main() {
     );
 
     // Serve with graceful shutdown on SIGTERM / SIGINT (§3.9).
-    let server = axum::serve(listener, application).with_graceful_shutdown(shutdown_signal());
+    let server = axum::serve(
+        listener,
+        application.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal());
 
     if let Err(error) = server.await {
         error!(%error, "server error");

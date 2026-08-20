@@ -15,6 +15,15 @@ pub const ANTI_ENTROPY_ALPN: &[u8] = b"openledger/anti-entropy/1";
 /// Maximum message size (16 MiB per §3.4.1).
 pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 
+/// Maximum `Supply.entries` in one message (H-2).
+pub const MAX_SUPPLY_ENTRIES: usize = 256;
+
+/// Maximum `Want.ids` in one message (H-2).
+pub const MAX_WANT_IDS: usize = 1024;
+
+/// Maximum `HaveHeads` id lists in one message (H-2).
+pub const MAX_HAVE_HEADS: usize = 4096;
+
 // ─── Message types ───────────────────────────────────────────────────────────
 
 /// A wire protocol message (§3.4.1).
@@ -119,6 +128,37 @@ impl WireMessage {
         }
     }
 
+    fn check_cardinality(&self) -> Result<(), WireError> {
+        match self {
+            WireMessage::Supply { entries, .. } if entries.len() > MAX_SUPPLY_ENTRIES => {
+                Err(WireError::BatchTooLarge {
+                    kind: "supply",
+                    count: entries.len(),
+                    max: MAX_SUPPLY_ENTRIES,
+                })
+            }
+            WireMessage::Want { ids, .. } if ids.len() > MAX_WANT_IDS => {
+                Err(WireError::BatchTooLarge {
+                    kind: "want",
+                    count: ids.len(),
+                    max: MAX_WANT_IDS,
+                })
+            }
+            WireMessage::HaveHeads {
+                head_txids,
+                directive_ids,
+                ..
+            } if head_txids.len() > MAX_HAVE_HEADS || directive_ids.len() > MAX_HAVE_HEADS => {
+                Err(WireError::BatchTooLarge {
+                    kind: "have_heads",
+                    count: head_txids.len().max(directive_ids.len()),
+                    max: MAX_HAVE_HEADS,
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Encode to CBOR bytes (without length prefix).
     pub fn to_cbor(&self) -> Result<Vec<u8>, String> {
         let mut buffer = Vec::new();
@@ -140,6 +180,7 @@ impl WireMessage {
         if message.version() != WIRE_VERSION {
             return Err(WireError::UnsupportedVersion(message.version()));
         }
+        message.check_cardinality()?;
         Ok(message)
     }
 
@@ -177,6 +218,11 @@ pub enum WireError {
     MessageTooLarge(usize),
     CborDecode(String),
     UnsupportedVersion(u64),
+    BatchTooLarge {
+        kind: &'static str,
+        count: usize,
+        max: usize,
+    },
 }
 
 impl std::fmt::Display for WireError {
@@ -189,6 +235,9 @@ impl std::fmt::Display for WireError {
             WireError::CborDecode(e) => write!(f, "CBOR decode error: {e}"),
             WireError::UnsupportedVersion(v) => {
                 write!(f, "Unsupported wire version: {v} (expected {WIRE_VERSION})")
+            }
+            WireError::BatchTooLarge { kind, count, max } => {
+                write!(f, "{kind} batch too large: {count} (max {max})")
             }
         }
     }
@@ -339,6 +388,25 @@ mod tests {
             WireMessage::decode_checked(&cbor).unwrap_err(),
             WireError::UnsupportedVersion(99)
         );
+    }
+
+    #[test]
+    fn test_decode_checked_rejects_oversized_supply_batch() {
+        let entries = vec![
+            SupplyEntry {
+                id: "x".to_owned(),
+                kind: DirectiveKind::Open,
+                economic_bean: "open".to_owned(),
+                envelope: BTreeMap::new(),
+            };
+            MAX_SUPPLY_ENTRIES + 1
+        ];
+        let msg = WireMessage::supply(entries);
+        let cbor = msg.to_cbor().unwrap();
+        assert!(matches!(
+            WireMessage::decode_checked(&cbor),
+            Err(WireError::BatchTooLarge { kind: "supply", .. })
+        ));
     }
 
     #[test]

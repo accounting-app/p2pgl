@@ -340,37 +340,33 @@ impl ReadModel {
         limit: usize,
         offset: usize,
     ) -> Vec<&IndexedTransaction> {
-        let filtered: Vec<&IndexedTransaction> = self
-            .transactions
-            .iter()
-            .filter(|indexed| {
-                // Date range filter.
-                if let Some(from) = from {
-                    if indexed.transaction.date < from {
-                        return false;
-                    }
+        let filtered = self.transactions.iter().filter(|indexed| {
+            // Date range filter.
+            if let Some(from) = from {
+                if indexed.transaction.date < from {
+                    return false;
                 }
-                if let Some(to) = to {
-                    if indexed.transaction.date > to {
-                        return false;
-                    }
+            }
+            if let Some(to) = to {
+                if indexed.transaction.date > to {
+                    return false;
                 }
-                // Account filter.
-                if let Some(account) = account {
-                    if !indexed
-                        .transaction
-                        .postings
-                        .iter()
-                        .any(|p| p.account == account)
-                    {
-                        return false;
-                    }
+            }
+            // Account filter.
+            if let Some(account) = account {
+                if !indexed
+                    .transaction
+                    .postings
+                    .iter()
+                    .any(|p| p.account == account)
+                {
+                    return false;
                 }
-                true
-            })
-            .collect();
+            }
+            true
+        });
 
-        filtered.into_iter().skip(offset).take(limit).collect()
+        filtered.skip(offset).take(limit).collect()
     }
 
     /// Look up a single transaction by txid.

@@ -2,12 +2,13 @@
     "ledgerPath": "/data/ledger.bean",
     "port": 3000,
     "bindAddress": "0.0.0.0",
+    "graphiql": false,
     "cors": {
         "allowedOrigins": []
     },
     "auth": {
         "enabled": true,
-        "apiKey": "change-me-docker-api-key"
+        "apiKey": ""
     },
     "signing": {
         "enabled": false

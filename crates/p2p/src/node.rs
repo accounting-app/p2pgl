@@ -39,31 +39,46 @@ impl PeerRegistry {
 
     /// Register or update a peer's state.
     pub fn upsert(&self, id: PeerId, heads: Vec<String>) {
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self
+            .peers
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         peers.insert(id.clone(), PeerState { id, heads });
     }
 
     /// Remove a peer.
     pub fn remove(&self, id: &str) {
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self
+            .peers
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         peers.remove(id);
     }
 
     /// Get all connected peers.
     pub fn list(&self) -> Vec<PeerState> {
-        let peers = self.peers.read().unwrap();
+        let peers = self
+            .peers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         peers.values().cloned().collect()
     }
 
     /// Number of connected peers.
     pub fn count(&self) -> usize {
-        let peers = self.peers.read().unwrap();
+        let peers = self
+            .peers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         peers.len()
     }
 
     /// Get all unique head txids across all peers.
     pub fn all_remote_heads(&self) -> HashSet<String> {
-        let peers = self.peers.read().unwrap();
+        let peers = self
+            .peers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         peers
             .values()
             .flat_map(|p| p.heads.iter().cloned())

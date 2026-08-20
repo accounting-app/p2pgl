@@ -1,7 +1,10 @@
 use axum::http::{header, HeaderName, HeaderValue, Method};
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use tower_http::cors::{AllowOrigin, CorsLayer};
+
+/// Documented sample key. Boot fails if this value is used (H-5).
+pub const FORBIDDEN_SAMPLE_API_KEY: &str = "change-me-docker-api-key";
 
 /// Top-level node configuration.
 ///
@@ -27,7 +30,7 @@ pub struct NodeConfig {
     #[serde(default = "default_external_file_edits")]
     pub external_file_edits: String,
 
-    /// Serve GraphiQL on `GET /graphql`. Default: `true`. Set `false` to hide it.
+    /// Serve GraphiQL on `GET /graphql`. Default: `false`. Loopback only.
     #[serde(default = "default_graphiql")]
     pub graphiql: bool,
 
@@ -143,7 +146,7 @@ fn default_external_file_edits() -> String {
 }
 
 fn default_graphiql() -> bool {
-    true
+    false
 }
 
 fn default_secret_key_path() -> String {
@@ -195,18 +198,21 @@ impl NodeConfig {
     /// Load configuration from the given path, applying defaults and validating.
     pub fn load_from_path(config_path: &PathBuf) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(config_path).map_err(ConfigError::FileRead)?;
-        let config: NodeConfig = serde_json::from_str(&content).map_err(ConfigError::Parse)?;
+        let mut config: NodeConfig = serde_json::from_str(&content).map_err(ConfigError::Parse)?;
+        if config.auth.api_key.is_empty() {
+            if let Ok(api_key) = std::env::var("GL_NODE_API_KEY") {
+                if !api_key.is_empty() {
+                    config.auth.api_key = api_key;
+                }
+            }
+        }
         config.validate()?;
         Ok(config)
     }
 
     /// Validate boot-time invariants per §3.11.
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.ledger_path.is_empty() {
-            return Err(ConfigError::Validation(
-                "ledgerPath is required and must not be empty".to_owned(),
-            ));
-        }
+        Self::validate_ledger_path(&self.ledger_path)?;
 
         match self.external_file_edits.as_str() {
             "enabled" | "disabled" => {}
@@ -217,9 +223,21 @@ impl NodeConfig {
             }
         }
 
+        if self.graphiql && self.binds_non_loopback() {
+            return Err(ConfigError::Validation(
+                "graphiql must be false when binding a non-loopback address".to_owned(),
+            ));
+        }
+
         if self.auth.enabled && self.auth.api_key.is_empty() {
             return Err(ConfigError::Validation(
                 "auth.apiKey is required when auth.enabled is true".to_owned(),
+            ));
+        }
+
+        if self.auth.enabled && self.auth.api_key == FORBIDDEN_SAMPLE_API_KEY {
+            return Err(ConfigError::Validation(
+                "auth.apiKey must not be the documented sample \"change-me-docker-api-key\"; set a unique key or GL_NODE_API_KEY".to_owned(),
             ));
         }
 
@@ -235,9 +253,9 @@ impl NodeConfig {
             {
                 return Err(ConfigError::Validation(error));
             }
-            if self.p2p.swarm_topic == default_swarm_topic() && self.binds_non_loopback() {
+            if self.p2p.swarm_topic == default_swarm_topic() {
                 return Err(ConfigError::Validation(
-                    "p2p.swarmTopic must not be the public default \"openledger/transactions\" when binding a non-loopback address".to_owned(),
+                    "p2p.swarmTopic must not be the public default \"openledger/transactions\" when p2p.enabled is true".to_owned(),
                 ));
             }
         }
@@ -291,6 +309,58 @@ impl NodeConfig {
                 HeaderName::from_static("x-api-key"),
             ])
     }
+
+    fn validate_ledger_path(ledger_path: &str) -> Result<(), ConfigError> {
+        if ledger_path.is_empty() {
+            return Err(ConfigError::Validation(
+                "ledgerPath is required and must not be empty".to_owned(),
+            ));
+        }
+        if ledger_path.contains('\0') {
+            return Err(ConfigError::Validation(
+                "ledgerPath must not contain NUL".to_owned(),
+            ));
+        }
+        let configured = Path::new(ledger_path);
+        if configured
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(ConfigError::Validation(
+                "ledgerPath must not contain \"..\"".to_owned(),
+            ));
+        }
+        let cwd = std::env::current_dir().map_err(|error| {
+            ConfigError::Validation(format!("failed to read working directory: {error}"))
+        })?;
+        let resolved = if configured.is_absolute() {
+            configured.to_path_buf()
+        } else {
+            cwd.join(configured)
+        };
+        let cwd_normalized = lexical_normalize(&cwd);
+        let resolved_normalized = lexical_normalize(&resolved);
+        if !resolved_normalized.starts_with(&cwd_normalized) {
+            return Err(ConfigError::Validation(
+                "ledgerPath must resolve under the process working directory".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 #[cfg(test)]
@@ -314,7 +384,7 @@ mod tests {
         assert_eq!(config.bind_address, "127.0.0.1");
         assert_eq!(config.port, 4000);
         assert_eq!(config.external_file_edits, "disabled");
-        assert!(config.graphiql, "GraphiQL on by default");
+        assert!(!config.graphiql, "GraphiQL off by default");
         assert!(config.cors.allowed_origins.is_empty());
         assert!(!config.auth.enabled);
         assert!(!config.signing.enabled);
@@ -357,8 +427,8 @@ mod tests {
         assert_eq!(config.p2p.bootstrap_endpoint_ids.len(), 2);
         assert_eq!(config.p2p.gossip_interval_milliseconds, 3000);
         assert!(
-            config.graphiql_enabled(),
-            "GraphiQL stays on for public bind unless flagged off"
+            !config.graphiql_enabled(),
+            "GraphiQL stays off on public bind unless explicitly enabled (which is rejected)"
         );
     }
 
@@ -424,6 +494,24 @@ mod tests {
     }
 
     #[test]
+    fn test_graphiql_true_rejected_on_public_bind() {
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "graphiql": true }"#,
+        );
+        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
+        assert!(result.is_err());
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(error_message.contains("graphiql"));
+    }
+
+    #[test]
+    fn test_graphiql_true_allowed_on_loopback() {
+        let file = write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean", "graphiql": true }"#);
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        assert!(config.graphiql_enabled());
+    }
+
+    #[test]
     fn test_invalid_bootstrap_endpoint_id_rejected() {
         let file = write_temp_config(
             r#"{ "ledgerPath": "./data/ledger.bean", "p2p": { "enabled": true, "bootstrapEndpointIds": ["not-an-id"], "swarmTopic": "my-org/ledger" } }"#,
@@ -446,11 +534,48 @@ mod tests {
     }
 
     #[test]
-    fn test_default_swarm_topic_allowed_on_loopback() {
+    fn test_default_swarm_topic_rejected_on_loopback() {
         let file = write_temp_config(
             r#"{ "ledgerPath": "./data/ledger.bean", "p2p": { "enabled": true } }"#,
         );
-        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
-        assert_eq!(config.p2p.swarm_topic, "openledger/transactions");
+        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
+        assert!(result.is_err());
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(error_message.contains("swarmTopic"));
+    }
+
+    #[test]
+    fn test_sample_api_key_rejected() {
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "auth": { "enabled": true, "apiKey": "change-me-docker-api-key" } }"#,
+        );
+        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
+        assert!(result.is_err());
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(error_message.contains("change-me-docker-api-key"));
+    }
+
+    #[test]
+    fn test_parent_dir_ledger_path_rejected() {
+        let file = write_temp_config(r#"{ "ledgerPath": "../outside.bean" }"#);
+        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
+        assert!(result.is_err());
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(error_message.contains("ledgerPath"));
+    }
+
+    #[test]
+    fn test_absolute_ledger_path_outside_cwd_rejected() {
+        let file = write_temp_config(r#"{ "ledgerPath": "/etc/passwd" }"#);
+        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
+        if std::env::current_dir()
+            .map(|cwd| cwd == std::path::Path::new("/"))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        assert!(result.is_err());
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(error_message.contains("ledgerPath"));
     }
 }
