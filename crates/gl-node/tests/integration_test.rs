@@ -4,9 +4,6 @@
 //! and execute real queries/mutations. This validates the entire read/write
 //! path: GraphQL → resolver → LedgerService → DAG → ReadModel → file.
 
-use std::sync::Arc;
-use tokio::sync::RwLock;
-
 use ledger::service::LedgerService;
 
 /// Helper: boot a ledger service from a temp directory.

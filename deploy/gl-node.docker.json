@@ -13,13 +13,17 @@
     "signing": {
         "enabled": false
     },
+    "tls": {
+        "mode": "terminated"
+    },
     "p2p": {
         "enabled": true,
         "secretKeyPath": "/data/identity.secret",
         "bootstrapEndpointIds": [],
         "gossipIntervalMilliseconds": 1000,
         "antiEntropyIntervalMilliseconds": 5000,
-        "swarmTopic": "openledger/docker-dev"
+        "swarmTopic": "openledger/docker-dev",
+        "relayMode": "disabled"
     },
     "externalFileEdits": "disabled"
 }

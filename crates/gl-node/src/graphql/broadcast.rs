@@ -65,9 +65,8 @@ impl Default for TransactionBroadcast {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graphql::scalars::{DateScalar, DecimalScalar, TransactionId};
+    use crate::graphql::scalars::{DateScalar, TransactionId};
     use chrono::NaiveDate;
-    use rust_decimal::Decimal;
 
     fn make_test_txn() -> Transaction {
         Transaction {

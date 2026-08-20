@@ -680,7 +680,7 @@ For `balanceSheet(at)`:
   - *Tamper-evidence* from content addressing and the Merkle-DAG (CT-8 / I8).
   - *Attribution:* unsigned → self-asserted author among trusted peers; signed → cryptographic proof (§3.8.1).
 
-- **Transport:** Iroh QUIC between peers; TLS on the public GraphQL endpoint (in-process or host-terminated).
+- **Transport:** Iroh QUIC between peers; TLS on the public GraphQL endpoint (host-terminated: `tls.mode = "terminated"`). In-process TLS is not implemented; a non-loopback HTTP bind fails boot unless `tls.mode` is `"terminated"`.
 
 #### 3.8.1 Signature scheme (when `signing.enabled`)
 
@@ -695,8 +695,8 @@ For `balanceSheet(at)`:
 ### 3.9 Deployment topology
 
 - One long-lived process per node (`gl-node`), each with a **persistent volume** for `.bean` + Iroh key material.
-- **Addressability:** public IP / IPv6 where available; otherwise Iroh relay + hole-punch (CAP-3).
-- **Discovery — static bootstrap + tickets (with optional relay).** Configured bootstrap `EndpointId`s (and optional connection tickets) suffice for small fixed meshes **and are the admission list for inbound `Supply`**. Relay / hole-punch are additive. Local-network convenience discovery may be used in development only; it does **not** bypass the allowlist.
+- **Addressability:** public IP / IPv6 where available; otherwise Iroh relay + hole-punch (CAP-3). Production meshes that must not traverse the public n0 relay set `p2p.relayMode` to `"disabled"` and ensure peers are directly dialable.
+- **Discovery — static bootstrap + tickets (with optional relay).** Configured bootstrap `EndpointId`s (and optional connection tickets) suffice for small fixed meshes **and are the admission list for inbound `Supply`**. Relay / hole-punch are additive via `p2p.relayMode = "n0"` (default). `p2p.relayMode = "disabled"` binds a direct-only endpoint (`presets::Minimal`). Local-network convenience discovery may be used in development only; it does **not** bypass the allowlist.
 - Container image: multi-stage Rust build → slim or distroless runtime; expose HTTP and the Iroh QUIC ports as required.
 - **Graceful shutdown:** on `SIGTERM` / `SIGINT`, the node (1) stops accepting new GraphQL requests, (2) completes in-flight requests (with a **10-second** drain timeout), (3) flushes any pending `.bean` write via the normal atomic temp-file + rename, (4) closes Iroh gossip/anti-entropy connections, and (5) exits. No data is lost because every accepted mutation has already been atomically persisted before its response was sent.
 
@@ -749,14 +749,16 @@ The architecture is **host-agnostic but not paradigm-agnostic**: it runs on any 
 | `auth.enabled` | boolean | `false` | Require `X-Api-Key` |
 | `auth.apiKey` | string | — | Required when `auth.enabled`. Empty values may be filled from env `GL_NODE_API_KEY`. The sample `change-me-docker-api-key` is rejected |
 | `signing.enabled` | boolean | `false` | §3.8.1 |
+| `tls.mode` | `"disabled"` \| `"terminated"` | `"disabled"` | GraphQL HTTP TLS policy. `"terminated"` means TLS at the host/proxy (in-process TLS is not implemented). Required when `bindAddress` is non-loopback |
 | `p2p.enabled` | boolean | `false` | Iroh mesh |
 | `p2p.secretKeyPath` | string | beside ledger | Persisted Iroh `SecretKey` |
 | `p2p.bootstrapEndpointIds` | string[] | `[]` | Allowlisted peer `EndpointId`s (hex). Empty = no inbound ALPN `Supply` |
 | `p2p.gossipIntervalMilliseconds` | number | `5000` | iroh-gossip announce cadence |
 | `p2p.antiEntropyIntervalMilliseconds` | number | `5000` | ALPN head-exchange cadence |
 | `p2p.swarmTopic` | string | `openledger/transactions` | TopicId preimage (§3.4.3). Required unique whenever `p2p.enabled` |
+| `p2p.relayMode` | `"n0"` \| `"disabled"` | `"n0"` | `"n0"` = public Iroh relays + discovery. `"disabled"` = direct addresses only (no public relay) |
 
-Unknown keys are rejected at boot (fail closed). When `auth.enabled` and `auth.apiKey` missing/empty → boot fail. The documented sample `change-me-docker-api-key` is rejected. `GL_NODE_API_KEY` fills an empty `auth.apiKey`. When `p2p.enabled` and secret key path unreadable → boot fail. When `p2p.enabled` and a `bootstrapEndpointIds` entry is not a valid `EndpointId` → boot fail. When `p2p.enabled` and `swarmTopic` is the public default → boot fail. When `graphiql` is true and the HTTP bind is non-loopback → boot fail. `ledgerPath` must not contain `..` and must resolve under the process working directory. The binary accepts `--version` and `--health-check` (`GET /health` against the configured bind/port; `0.0.0.0`/`::` are probed on loopback).
+Unknown keys are rejected at boot (fail closed). When `auth.enabled` and `auth.apiKey` missing/empty → boot fail. The documented sample `change-me-docker-api-key` is rejected. `GL_NODE_API_KEY` fills an empty `auth.apiKey`. When `p2p.enabled` and secret key path unreadable → boot fail. When `p2p.enabled` and a `bootstrapEndpointIds` entry is not a valid `EndpointId` → boot fail. When `p2p.enabled` and `swarmTopic` is the public default → boot fail. When `graphiql` is true and the HTTP bind is non-loopback → boot fail. When the HTTP bind is non-loopback and `tls.mode` is not `"terminated"` → boot fail. `p2p.relayMode` must be `"n0"` or `"disabled"`. `ledgerPath` must not contain `..` and must resolve under the process working directory. The binary accepts `--version` and `--health-check` (`GET /health` against the configured bind/port; `0.0.0.0`/`::` are probed on loopback).
 
 **Example:**
 
@@ -770,13 +772,15 @@ Unknown keys are rejected at boot (fail closed). When `auth.enabled` and `auth.a
   "cors": { "allowedOrigins": [] },
   "auth": { "enabled": false, "apiKey": "" },
   "signing": { "enabled": false },
+  "tls": { "mode": "disabled" },
   "p2p": {
     "enabled": false,
     "secretKeyPath": "./data/iroh.secret",
     "bootstrapEndpointIds": [],
     "gossipIntervalMilliseconds": 5000,
     "antiEntropyIntervalMilliseconds": 5000,
-    "swarmTopic": "openledger/transactions"
+    "swarmTopic": "openledger/transactions",
+    "relayMode": "n0"
   }
 }
 ```
@@ -851,7 +855,7 @@ Each milestone ends with passing tests for its acceptance criteria and is indepe
 
 **M6 — Deploy (§3.9)**
 - [ ] Release binary / multi-stage container; volume + QUIC/HTTP ports.
-- [ ] Multi-node smoke test; verify peer addressability (with and without relay).
+- [x] Multi-node smoke test; verify peer addressability (direct-only ALPN in CI; `p2p.relayMode=n0` for NAT).
 - *Done when:* a 3-node cluster converges in production-like topology.
 
 ---
@@ -873,6 +877,9 @@ cargo run -p gl-node
 cargo test
 cargo test -p ledger
 cargo test -p p2p
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo audit
 
 # 4. Release binary
 cargo build -p gl-node --release

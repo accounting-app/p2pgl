@@ -47,6 +47,10 @@ pub struct NodeConfig {
     #[allow(dead_code)] // Read when signing is wired (Phase 2).
     pub signing: SigningConfig,
 
+    /// TLS policy for the GraphQL HTTP bind (M-13).
+    #[serde(default)]
+    pub tls: TlsConfig,
+
     /// Peer-to-peer replication configuration.
     #[serde(default)]
     pub p2p: P2pConfig,
@@ -106,6 +110,29 @@ pub struct P2pConfig {
     /// TopicId preimage string (§3.4.3).
     #[serde(default = "default_swarm_topic")]
     pub swarm_topic: String,
+
+    /// Iroh relay/discovery profile: `"n0"` (public relays) or `"disabled"` (direct-only).
+    #[serde(default = "default_relay_mode")]
+    pub relay_mode: String,
+}
+
+/// TLS settings. In-process TLS is not implemented; production public bind
+/// requires a host terminator (`mode = "terminated"`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub struct TlsConfig {
+    /// `"disabled"` (loopback only) or `"terminated"` (TLS at the host/proxy).
+    #[serde(default = "default_tls_mode")]
+    pub mode: String,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_tls_mode(),
+        }
+    }
 }
 
 /// CORS settings. Empty allowlist means no `Access-Control-Allow-Origin` (same-origin only).
@@ -127,6 +154,7 @@ impl Default for P2pConfig {
             gossip_interval_milliseconds: default_gossip_interval(),
             anti_entropy_interval_milliseconds: default_anti_entropy_interval(),
             swarm_topic: default_swarm_topic(),
+            relay_mode: default_relay_mode(),
         }
     }
 }
@@ -163,6 +191,14 @@ fn default_anti_entropy_interval() -> u64 {
 
 fn default_swarm_topic() -> String {
     "openledger/transactions".to_owned()
+}
+
+fn default_relay_mode() -> String {
+    "n0".to_owned()
+}
+
+fn default_tls_mode() -> String {
+    "disabled".to_owned()
 }
 
 /// Errors that can occur during configuration loading or validation.
@@ -271,6 +307,30 @@ impl NodeConfig {
                     "cors.allowedOrigins contains invalid origin: {origin}"
                 )));
             }
+        }
+
+        match self.p2p.relay_mode.as_str() {
+            "n0" | "disabled" => {}
+            other => {
+                return Err(ConfigError::Validation(format!(
+                    "p2p.relayMode must be \"n0\" or \"disabled\", got \"{other}\""
+                )));
+            }
+        }
+
+        match self.tls.mode.as_str() {
+            "disabled" | "terminated" => {}
+            other => {
+                return Err(ConfigError::Validation(format!(
+                    "tls.mode must be \"disabled\" or \"terminated\", got \"{other}\""
+                )));
+            }
+        }
+
+        if self.binds_non_loopback() && self.tls.mode != "terminated" {
+            return Err(ConfigError::Validation(
+                "tls.mode must be \"terminated\" when binding a non-loopback address (TLS at the host or proxy; in-process TLS is not implemented)".to_owned(),
+            ));
         }
 
         Ok(())
@@ -389,6 +449,8 @@ mod tests {
         assert!(!config.auth.enabled);
         assert!(!config.signing.enabled);
         assert!(!config.p2p.enabled);
+        assert_eq!(config.tls.mode, "disabled");
+        assert_eq!(config.p2p.relay_mode, "n0");
     }
 
     #[test]
@@ -404,13 +466,15 @@ mod tests {
             "cors": {{ "allowedOrigins": ["http://localhost:8080"] }},
             "auth": {{ "enabled": true, "apiKey": "secret-key-123" }},
             "signing": {{ "enabled": true }},
+            "tls": {{ "mode": "terminated" }},
             "p2p": {{
                 "enabled": true,
                 "secretKeyPath": "./keys/iroh.secret",
                 "bootstrapEndpointIds": ["{peer_a}", "{peer_b}"],
                 "gossipIntervalMilliseconds": 3000,
                 "antiEntropyIntervalMilliseconds": 10000,
-                "swarmTopic": "my-org/ledger"
+                "swarmTopic": "my-org/ledger",
+                "relayMode": "disabled"
             }}
         }}"#
         );
@@ -426,6 +490,8 @@ mod tests {
         assert!(config.p2p.enabled);
         assert_eq!(config.p2p.bootstrap_endpoint_ids.len(), 2);
         assert_eq!(config.p2p.gossip_interval_milliseconds, 3000);
+        assert_eq!(config.tls.mode, "terminated");
+        assert_eq!(config.p2p.relay_mode, "disabled");
         assert!(
             !config.graphiql_enabled(),
             "GraphiQL stays off on public bind unless explicitly enabled (which is rejected)"
@@ -487,7 +553,7 @@ mod tests {
     #[test]
     fn test_graphiql_explicit_false_disables_playground() {
         let file = write_temp_config(
-            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "graphiql": false }"#,
+            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "graphiql": false, "tls": { "mode": "terminated" } }"#,
         );
         let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
         assert!(!config.graphiql_enabled());
@@ -577,5 +643,27 @@ mod tests {
         assert!(result.is_err());
         let error_message = format!("{}", result.unwrap_err());
         assert!(error_message.contains("ledgerPath"));
+    }
+
+    #[test]
+    fn test_public_bind_without_tls_rejected() {
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0" }"#,
+        );
+        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
+        assert!(result.is_err());
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(error_message.contains("tls.mode"));
+    }
+
+    #[test]
+    fn test_invalid_relay_mode_rejected() {
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "p2p": { "relayMode": "mdns" } }"#,
+        );
+        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
+        assert!(result.is_err());
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(error_message.contains("relayMode"));
     }
 }

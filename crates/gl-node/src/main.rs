@@ -290,6 +290,9 @@ async fn main() {
             "auth is disabled while binding a non-loopback address — GraphQL is unauthenticated"
         );
     }
+    if config.tls.mode == "terminated" {
+        info!("TLS assumed terminated at the host or reverse proxy (in-process TLS is not implemented)");
+    }
 
     // Build full application router.
     // /health is exempt from auth (§2.9).

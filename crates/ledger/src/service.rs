@@ -2308,7 +2308,7 @@ mod tests {
         std::fs::write(&path, &edited).unwrap();
 
         // Reconcile.
-        let result = svc.reconcile_file().unwrap();
+        svc.reconcile_file().unwrap();
 
         // The original is still in the DAG (append-only, C2).
         assert!(

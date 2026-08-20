@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn test_watcher_handle_cancel() {
-        let (handle, mut rx) = FileWatcherHandle::new();
+        let (handle, rx) = FileWatcherHandle::new();
         assert!(!*rx.borrow());
         handle.stop();
         assert!(rx.has_changed().unwrap());

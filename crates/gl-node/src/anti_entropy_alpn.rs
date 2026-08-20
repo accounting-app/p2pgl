@@ -98,15 +98,17 @@ async fn serve_anti_entropy(
 /// Fetch missing ids from an allowlisted peer (gossip Announce catch-up).
 pub async fn fetch_want(
     endpoint: &iroh::Endpoint,
-    peer: EndpointId,
+    peer: impl Into<iroh::EndpointAddr>,
     ids: Vec<String>,
     handler: &AntiEntropyHandler,
 ) {
+    let peer_addr = peer.into();
+    let peer = peer_addr.id;
     if ids.is_empty() || !handler.allowlist.admits(peer) {
         return;
     }
     let connection = match endpoint
-        .connect(peer, p2p::protocol::ANTI_ENTROPY_ALPN)
+        .connect(peer_addr, p2p::protocol::ANTI_ENTROPY_ALPN)
         .await
     {
         Ok(connection) => connection,
@@ -123,14 +125,16 @@ pub async fn fetch_want(
 /// Periodic head exchange with one allowlisted peer.
 pub async fn exchange_with_peer(
     endpoint: &iroh::Endpoint,
-    peer: EndpointId,
+    peer: impl Into<iroh::EndpointAddr>,
     handler: &AntiEntropyHandler,
 ) {
+    let peer_addr = peer.into();
+    let peer = peer_addr.id;
     if !handler.allowlist.admits(peer) {
         return;
     }
     let connection = match endpoint
-        .connect(peer, p2p::protocol::ANTI_ENTROPY_ALPN)
+        .connect(peer_addr, p2p::protocol::ANTI_ENTROPY_ALPN)
         .await
     {
         Ok(connection) => connection,
@@ -354,4 +358,189 @@ async fn read_message(recv: &mut RecvStream) -> Result<WireMessage, String> {
         .await
         .map_err(|error| error.to_string())?;
     WireMessage::decode_checked(&body).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    use chrono::NaiveDate;
+    use iroh::endpoint::presets;
+    use iroh::protocol::Router;
+    use iroh::{Endpoint, TransportAddr};
+    use ledger::model::{Amount, Flag};
+    use ledger::service::{LedgerService, PostingInput, TransactionInput};
+    use rust_decimal_macros::dec;
+
+    async fn bind_direct_endpoint() -> Endpoint {
+        Endpoint::builder(presets::Minimal)
+            .alpns(vec![p2p::protocol::ANTI_ENTROPY_ALPN.to_vec()])
+            .bind()
+            .await
+            .expect("bind direct-only Iroh endpoint")
+    }
+
+    async fn wait_until_dialable(endpoint: &Endpoint) {
+        for _ in 0..50 {
+            if endpoint.addr().addrs.iter().any(TransportAddr::is_ip) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!(
+            "endpoint {} never advertised an IP address: {:?}",
+            endpoint.id(),
+            endpoint.addr()
+        );
+    }
+
+    fn balanced_funding_input() -> TransactionInput {
+        TransactionInput {
+            date: NaiveDate::from_ymd_opt(2024, 1, 15).expect("valid date"),
+            flag: Flag::Complete,
+            payee: Some("Acme".to_owned()),
+            narration: Some("Funding".to_owned()),
+            tags: Vec::new(),
+            links: Vec::new(),
+            postings: vec![
+                PostingInput {
+                    account: "Assets:Cash".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(100),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                },
+                PostingInput {
+                    account: "Equity:Opening".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(-100),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                },
+            ],
+        }
+    }
+
+    fn make_handler(ledger: SharedLedger, allowlist: PeerAllowlist) -> AntiEntropyHandler {
+        AntiEntropyHandler {
+            ledger,
+            broadcast: TransactionBroadcast::new(),
+            orphan_buffer: Arc::new(RwLock::new(OrphanBuffer::new())),
+            allowlist,
+            signing_enabled: false,
+        }
+    }
+
+    /// R6 / SPEC M6: three direct-only endpoints converge over ALPN (no N0 relay).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn three_node_alpn_convergence() {
+        let endpoint_zero = bind_direct_endpoint().await;
+        let endpoint_one = bind_direct_endpoint().await;
+        let endpoint_two = bind_direct_endpoint().await;
+
+        wait_until_dialable(&endpoint_zero).await;
+        wait_until_dialable(&endpoint_one).await;
+        wait_until_dialable(&endpoint_two).await;
+
+        let addr_zero = endpoint_zero.addr();
+        let addr_one = endpoint_one.addr();
+        let id_zero = endpoint_zero.id();
+        let id_one = endpoint_one.id();
+        let id_two = endpoint_two.id();
+
+        let allow_zero = PeerAllowlist::parse(&[id_one.to_string(), id_two.to_string()])
+            .expect("allowlist zero");
+        let allow_one = PeerAllowlist::parse(&[id_zero.to_string(), id_two.to_string()])
+            .expect("allowlist one");
+        let allow_two = PeerAllowlist::parse(&[id_zero.to_string(), id_one.to_string()])
+            .expect("allowlist two");
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ledger_zero: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("zero.bean"), id_zero.to_string())
+                .expect("boot ledger zero"),
+        ));
+        let ledger_one: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("one.bean"), id_one.to_string())
+                .expect("boot ledger one"),
+        ));
+        let ledger_two: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("two.bean"), id_two.to_string())
+                .expect("boot ledger two"),
+        ));
+
+        {
+            let mut service = ledger_zero.write().await;
+            service
+                .open_account(
+                    "Assets:Cash".to_owned(),
+                    NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid date"),
+                    vec!["USD".to_owned()],
+                )
+                .expect("open cash");
+            service
+                .open_account(
+                    "Equity:Opening".to_owned(),
+                    NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid date"),
+                    Vec::new(),
+                )
+                .expect("open equity");
+            service
+                .append_transaction(balanced_funding_input())
+                .expect("append funding");
+        }
+        let source_count = ledger_zero.read().await.directive_count();
+        assert_eq!(
+            source_count, 3,
+            "source node should have two opens and one txn"
+        );
+
+        let handler_zero = make_handler(ledger_zero.clone(), allow_zero);
+        let handler_one = make_handler(ledger_one.clone(), allow_one);
+        let handler_two = make_handler(ledger_two.clone(), allow_two);
+
+        let router_zero = Router::builder(endpoint_zero.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler_zero.clone())
+            .spawn();
+        let router_one = Router::builder(endpoint_one.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler_one.clone())
+            .spawn();
+        let router_two = Router::builder(endpoint_two.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler_two.clone())
+            .spawn();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            exchange_with_peer(&endpoint_one, addr_zero.clone(), &handler_one).await;
+            exchange_with_peer(&endpoint_two, addr_one.clone(), &handler_two).await;
+            let count_one = ledger_one.read().await.directive_count();
+            let count_two = ledger_two.read().await.directive_count();
+            if count_one == source_count && count_two == source_count {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                let probe = endpoint_one
+                    .connect(addr_zero.clone(), p2p::protocol::ANTI_ENTROPY_ALPN)
+                    .await;
+                let _ = router_zero.shutdown().await;
+                let _ = router_one.shutdown().await;
+                let _ = router_two.shutdown().await;
+                panic!(
+                    "R6: three-node ALPN cluster did not converge: zero={source_count} one={count_one} two={count_two}; probe={probe:?}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        let _ = router_zero.shutdown().await;
+        let _ = router_one.shutdown().await;
+        let _ = router_two.shutdown().await;
+    }
 }

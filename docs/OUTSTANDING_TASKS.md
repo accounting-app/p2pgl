@@ -69,10 +69,7 @@ The spec requires both WebSocket (done) and SSE for `transactionAppended`. An SS
 
 ### R6. Multi-Node Convergence Integration Test (§4 M6)
 
-Spec M6 says *"Done when: a 3-node cluster converges in production-like topology."* CT-9/CT-12/CT-14 only run at the library level. A true E2E test needs 3 PeerNode instances with real Iroh endpoints verifying ledger convergence.
-
-**Files:** New `tests/convergence_test.rs`
-**Effort:** ~200 lines
+- [x] Three Iroh endpoints with `relayMode=disabled` and in-memory address lookup exchange ALPN HaveHeads/Want/Supply until ledgers match (`three_node_alpn_convergence` in `anti_entropy_alpn.rs`).
 
 ### R7. Performance Benchmark (§6)
 

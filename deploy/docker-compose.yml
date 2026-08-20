@@ -16,6 +16,9 @@
 #
 # GraphiQL is off. Set GL_NODE_API_KEY in the environment; the sample
 # "change-me-docker-api-key" is rejected at boot.
+# Bind is 0.0.0.0 with tls.mode=terminated — put a TLS terminator in front
+# of published ports. p2p.relayMode is disabled (same Docker bridge);
+# set "n0" only when peers must traverse NAT via public Iroh relays.
 
 services:
   node-0:

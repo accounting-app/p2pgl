@@ -39,11 +39,22 @@ pub async fn boot_p2p(
         "loaded Iroh secret key"
     );
 
-    // Build Iroh endpoint with N0 preset (includes relay + holepunching).
-    let endpoint = iroh::Endpoint::builder(presets::N0)
-        .secret_key(secret_key)
-        .bind()
-        .await?;
+    let builder = match config.relay_mode.as_str() {
+        "n0" => {
+            warn!("p2p.relayMode is n0 — endpoint uses public Iroh relays and discovery");
+            iroh::Endpoint::builder(presets::N0)
+        }
+        "disabled" => {
+            info!("p2p.relayMode is disabled — direct addresses only");
+            iroh::Endpoint::builder(presets::Minimal)
+        }
+        other => {
+            return Err(
+                format!("p2p.relayMode must be \"n0\" or \"disabled\", got \"{other}\"").into(),
+            );
+        }
+    };
+    let endpoint = builder.secret_key(secret_key).bind().await?;
 
     let node_id = endpoint.id();
     info!(
