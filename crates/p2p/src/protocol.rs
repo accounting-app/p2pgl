@@ -120,17 +120,31 @@ impl WireMessage {
     }
 
     /// Encode to CBOR bytes (without length prefix).
-    pub fn to_cbor(&self) -> Result<Vec<u8>, serde_cbor::Error> {
-        serde_cbor::to_vec(self)
+    pub fn to_cbor(&self) -> Result<Vec<u8>, String> {
+        let mut buffer = Vec::new();
+        ciborium::into_writer(self, &mut buffer).map_err(|error| error.to_string())?;
+        Ok(buffer)
     }
 
     /// Decode from CBOR bytes.
-    pub fn from_cbor(data: &[u8]) -> Result<Self, serde_cbor::Error> {
-        serde_cbor::from_slice(data)
+    pub fn from_cbor(data: &[u8]) -> Result<Self, String> {
+        ciborium::from_reader(data).map_err(|error| error.to_string())
+    }
+
+    /// Decode gossip/application CBOR with the same size and version gates as `from_wire` (H-7).
+    pub fn decode_checked(data: &[u8]) -> Result<Self, WireError> {
+        if data.len() > MAX_MESSAGE_SIZE as usize {
+            return Err(WireError::MessageTooLarge(data.len()));
+        }
+        let message = Self::from_cbor(data).map_err(WireError::CborDecode)?;
+        if message.version() != WIRE_VERSION {
+            return Err(WireError::UnsupportedVersion(message.version()));
+        }
+        Ok(message)
     }
 
     /// Encode with the length-prefixed wire format: `uint32_be || cbor_body`.
-    pub fn to_wire(&self) -> Result<Vec<u8>, serde_cbor::Error> {
+    pub fn to_wire(&self) -> Result<Vec<u8>, String> {
         let cbor = self.to_cbor()?;
         let len = cbor.len() as u32;
         let mut buf = Vec::with_capacity(4 + cbor.len());
@@ -151,12 +165,8 @@ impl WireMessage {
         if data.len() < 4 + len {
             return Err(WireError::InsufficientData);
         }
-        let msg =
-            Self::from_cbor(&data[4..4 + len]).map_err(|e| WireError::CborDecode(e.to_string()))?;
-        if msg.version() != WIRE_VERSION {
-            return Err(WireError::UnsupportedVersion(msg.version()));
-        }
-        Ok((msg, 4 + len))
+        let message = Self::decode_checked(&data[4..4 + len])?;
+        Ok((message, 4 + len))
     }
 }
 
@@ -306,6 +316,29 @@ mod tests {
         );
         assert_eq!(WireMessage::want(vec![]).version(), 1);
         assert_eq!(WireMessage::supply(vec![]).version(), 1);
+    }
+
+    #[test]
+    fn test_decode_checked_rejects_oversize() {
+        let oversized = vec![0u8; MAX_MESSAGE_SIZE as usize + 1];
+        assert!(matches!(
+            WireMessage::decode_checked(&oversized),
+            Err(WireError::MessageTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn test_decode_checked_rejects_unsupported_version() {
+        let msg = WireMessage::Announce {
+            v: 99,
+            id: "test".to_owned(),
+            kind: DirectiveKind::Transaction,
+        };
+        let cbor = msg.to_cbor().unwrap();
+        assert_eq!(
+            WireMessage::decode_checked(&cbor).unwrap_err(),
+            WireError::UnsupportedVersion(99)
+        );
     }
 
     #[test]

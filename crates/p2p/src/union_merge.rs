@@ -25,6 +25,8 @@ pub enum MergeError {
     EnvelopeMissing(String),
     /// Signature missing or invalid when signing is enabled (C-3 / §3.8.1).
     InvalidSignature(String),
+    /// Economic body or envelope exceeds §3.12 limits (M-4).
+    ResourceLimitExceeded(String),
     /// DAG cycle detected (I8).
     CycleDetected,
 }
@@ -44,6 +46,9 @@ impl std::fmt::Display for MergeError {
                 write!(f, "Missing required envelope field: {field}")
             }
             MergeError::InvalidSignature(reason) => write!(f, "Invalid signature: {reason}"),
+            MergeError::ResourceLimitExceeded(reason) => {
+                write!(f, "Resource limit exceeded: {reason}")
+            }
             MergeError::CycleDetected => write!(f, "DAG cycle detected (I8)"),
         }
     }
@@ -74,6 +79,14 @@ pub enum MergeResult {
 ///
 /// Returns the fully-assembled directive ready for DAG insertion.
 pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeError> {
+    if entry.economic_bean.len() > ledger::service::MAX_ECONOMIC_BEAN_LENGTH {
+        return Err(MergeError::ResourceLimitExceeded(format!(
+            "economic_bean is {} bytes (max {})",
+            entry.economic_bean.len(),
+            ledger::service::MAX_ECONOMIC_BEAN_LENGTH
+        )));
+    }
+
     // 1. Parse the economic body.
     let directives = parse_file(&entry.economic_bean).map_err(|errors| {
         let msgs: Vec<String> = errors.iter().map(|e| format!("{e:?}")).collect();
@@ -714,6 +727,16 @@ mod tests {
         assert!(matches!(
             verify_remote_signature(&directive, true),
             Err(MergeError::InvalidSignature(_))
+        ));
+    }
+
+    #[test]
+    fn test_oversized_economic_bean_rejected() {
+        let mut entry = make_valid_supply_entry();
+        entry.economic_bean = "x".repeat(ledger::service::MAX_ECONOMIC_BEAN_LENGTH + 1);
+        assert!(matches!(
+            validate_supply_entry(&entry),
+            Err(MergeError::ResourceLimitExceeded(_))
         ));
     }
 }

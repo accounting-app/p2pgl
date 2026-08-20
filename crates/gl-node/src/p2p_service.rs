@@ -164,6 +164,7 @@ pub fn spawn_gossip_loop(
                                     }
                                 }
                                 Ok(WireMessage::Supply { entries, .. }) => {
+                                    let delivered_from = msg.delivered_from.to_string();
                                     for entry in entries {
                                         match p2p::union_merge::validate_supply_entry(&entry) {
                                             Ok(directive) => {
@@ -175,6 +176,29 @@ pub fn spawn_gossip_loop(
                                                     continue;
                                                 }
                                                 let mut svc = shared_ledger.write().await;
+                                                let missing_parents = svc.missing_parent_ids(&directive);
+                                                if !missing_parents.is_empty() {
+                                                    let content_id =
+                                                        ledger::service::LedgerService::content_id(&directive);
+                                                    let mut buffer = orphan_buffer.write().await;
+                                                    if buffer.insert(
+                                                        content_id.clone(),
+                                                        directive,
+                                                        missing_parents,
+                                                        Some(delivered_from.clone()),
+                                                    ) {
+                                                        debug!(
+                                                            content_id = %content_id,
+                                                            "buffered remote directive with missing parents"
+                                                        );
+                                                    } else {
+                                                        warn!(
+                                                            content_id = %content_id,
+                                                            "orphan buffer full or per-peer quota exceeded"
+                                                        );
+                                                    }
+                                                    continue;
+                                                }
                                                 match svc.insert_remote_directive(directive.clone()) {
                                                     Ok(Some(content_id)) => {
                                                         info!(

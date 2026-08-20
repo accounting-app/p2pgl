@@ -7,7 +7,7 @@ rust-version.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_cbor = { workspace = true }
+ciborium = { workspace = true }
 sha2 = { workspace = true }
 bytes = { workspace = true }
 anyhow = { workspace = true }

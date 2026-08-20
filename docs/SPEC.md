@@ -360,7 +360,7 @@ Root `Cargo.toml` is a workspace. Client tooling is out of scope for this reposi
 `.bean` is the source of truth (C1), **and** we need content addressing for P2P merge. We reconcile this as follows:
 
 - On **boot**: if `ledgerPath` does not exist, create an empty file (the ledger starts with zero directives; the first `openAccount` / `appendTransaction` will be genesis). Then parse `.bean` → for each directive compute its content id (`txid` or `directiveId`) from the **economic** canonical form (§3.3.1) → rebuild the transaction DAG from **persisted envelope metadata** (parents, author, Lamport, signature) → build the read model. The file is authoritative; the DAG is derived and reproducible **without inventing parent edges**.
-- On **append/merge**: update the G-Set and DAG, then **re-render** the full ledger to `.bean` via the canonical serializer (C4) and write atomically (temp file + rename). Envelope metadata is written into the file with every directive that needs it.
+- On **append/merge**: update the G-Set and DAG, then **re-render** the full ledger to `.bean` via the canonical serializer (C4) and write atomically (sibling `.tmp` file, `fsync`, POSIX `rename`). Envelope metadata is written into the file with every directive that needs it.
 - Because serialization is deterministic, two peers with the same directive set produce **byte-identical** `.bean` (I7).
 
 This makes `.bean` simultaneously the durable truth *and* a clean replication artifact — effectively "git's content-addressed merge, automated."
@@ -547,7 +547,7 @@ CT-3 must assert this fixture’s `txid` matches.
 | `want` | `ids` ([string]) | Request missing |
 | `supply` | `entries` ([object]) | Each entry: `id`, `kind`, `economic_bean` (string, economic canonical text without envelope), `envelope` (map of `openledger-*` → string) |
 
-Peers MUST verify `id == hash(economic_bean)` before accept (§3.5).
+Peers MUST verify `id == hash(economic_bean)` before accept (§3.5). Gossip payloads (already framed by iroh-gossip) MUST still be rejected when larger than **16 MiB** or when `"v"` is not `1`.
 
 #### 3.4.2 Lamport clocks
 
@@ -570,7 +570,7 @@ The default preimage is **enumerable**. When `p2p.enabled` and the HTTP bind is 
 
 #### 3.4.4 Orphan buffer & cycles
 
-- If a remote transaction’s parents are missing: buffer up to **10_000** orphans or **1 hour** (whichever first); enqueue parent ids on `want`.
+- If a remote transaction’s parents are missing: buffer up to **10_000** orphans globally and **1_000** per delivering peer, or **1 hour** (whichever first); enqueue parent ids on `want`. Remote insert uses `require_parents` (missing parents are not admitted into the DAG).
 - On parent arrival: re-attempt insert.
 - Before insert: reject if adding the edge would create a cycle (I8); emit metric `cycle_rejected`.
 - Genesis (`parents` empty) accepted only if valid economically; multiple concurrent genesis roots are allowed when authored under empty heads.
@@ -602,7 +602,7 @@ On `openAccount` / `closeAccount` (and when adopting other non-transaction direc
 
 1. Verify content hash matches claimed `txid` / `directiveId` (I5).
 2. For transactions: enforce I1, I2, and I3 on the economic body. An unbalanced or account-invalid remote transaction is **rejected** and must not enter the G-Set (C3).
-3. Validate envelope shape (sorted parents, parseable Lamport, author present). Apply §3.4.4 for missing parents / cycles.
+3. Enforce §3.12 resource limits. Validate envelope shape (sorted parents, parseable Lamport, author present). Apply §3.4.4 for missing parents / cycles.
 4. If signing is enabled, verify `openledger-signature` per §3.8.1; if signing is disabled, unsigned entries are accepted.
 5. Skip GraphQL client auth (peer transport is separately authenticated via Iroh); never skip ledger invariants.
 
@@ -785,12 +785,13 @@ To bound memory and prevent abuse, the following limits are enforced on write. E
 
 | Limit | Default | Applies to |
 |-------|---------|------------|
-| Max postings per transaction | **1000** | `appendTransaction` input validation |
-| Max narration length | **10 000** UTF-8 bytes | `appendTransaction` |
-| Max payee length | **1 000** UTF-8 bytes | `appendTransaction` |
-| Max tags per transaction | **100** | `appendTransaction` |
-| Max links per transaction | **100** | `appendTransaction` |
-| Max metadata keys per directive | **100** | Any directive (parse + API) |
+| Max postings per transaction | **1000** | Local, remote, and reconcile |
+| Max narration length | **10 000** UTF-8 bytes | Local, remote, and reconcile |
+| Max payee length | **1 000** UTF-8 bytes | Local, remote, and reconcile |
+| Max tags per transaction | **100** | Local, remote, and reconcile |
+| Max links per transaction | **100** | Local, remote, and reconcile |
+| Max metadata keys per directive | **100** | Any directive (parse + API + remote + reconcile) |
+| Max economic body per supply entry | **1 048 576** UTF-8 bytes | Remote `economic_bean` |
 
 These limits are not configurable in V1. They exist as named constants in the codebase so they can be promoted to config keys later without a spec change.
 

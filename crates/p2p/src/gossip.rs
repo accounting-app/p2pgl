@@ -37,14 +37,17 @@ pub fn make_supply_entry(directive: &Directive) -> SupplyEntry {
 }
 
 /// Encode a gossip broadcast message as bytes (for iroh-gossip sender).
-pub fn encode_broadcast(msg: &WireMessage) -> Result<Bytes, serde_cbor::Error> {
+pub fn encode_broadcast(msg: &WireMessage) -> Result<Bytes, String> {
     let cbor = msg.to_cbor()?;
     Ok(Bytes::from(cbor))
 }
 
 /// Decode a gossip message from bytes (from iroh-gossip receiver).
+///
+/// Enforces the 16 MiB cap and `v == 1` (H-7). Gossip is already framed by
+/// iroh-gossip, so this is CBOR-only (no extra length prefix).
 pub fn decode_broadcast(data: &[u8]) -> Result<WireMessage, String> {
-    WireMessage::from_cbor(data).map_err(|e| format!("CBOR decode error: {e}"))
+    WireMessage::decode_checked(data).map_err(|error| error.to_string())
 }
 
 /// Extract envelope metadata from a directive.
@@ -171,5 +174,17 @@ mod tests {
             entry.id, computed_id,
             "Supply entry id must match hash of economic body"
         );
+    }
+
+    #[test]
+    fn test_decode_broadcast_rejects_unsupported_version() {
+        let msg = WireMessage::Announce {
+            v: 2,
+            id: "abc".to_owned(),
+            kind: DirectiveKind::Transaction,
+        };
+        let encoded = encode_broadcast(&msg).unwrap();
+        let error = decode_broadcast(&encoded).unwrap_err();
+        assert!(error.contains("Unsupported version") || error.contains("version"));
     }
 }

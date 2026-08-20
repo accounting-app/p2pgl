@@ -5,6 +5,7 @@
 
 use chrono::NaiveDate;
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::dag::{DagError, InsertResult, LedgerDag};
@@ -33,6 +34,104 @@ pub const MAX_TAGS_PER_TRANSACTION: usize = 100;
 pub const MAX_LINKS_PER_TRANSACTION: usize = 100;
 /// Maximum metadata keys per directive.
 pub const MAX_METADATA_KEYS_PER_DIRECTIVE: usize = 100;
+/// Maximum UTF-8 bytes of a remote `economic_bean` body (M-4).
+pub const MAX_ECONOMIC_BEAN_LENGTH: usize = 1_048_576;
+
+/// Write `content` via a sibling `.tmp` file, fsync, then POSIX rename (H-10 / CAP-1).
+fn persist_atomically(path: &Path, content: &str) -> Result<(), std::io::Error> {
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ledger path has no file name",
+        )
+    })?;
+    let temporary_path = path.with_file_name(format!("{}.tmp", file_name.to_string_lossy()));
+
+    {
+        let mut file = std::fs::File::create(&temporary_path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+    }
+
+    std::fs::rename(&temporary_path, path)?;
+
+    let directory = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    if let Ok(directory_file) = std::fs::File::open(directory) {
+        let _ = directory_file.sync_all();
+    }
+    Ok(())
+}
+
+/// §3.12 limits for any write path (local, remote, reconcile).
+pub fn enforce_resource_limits(directive: &Directive) -> Result<(), ServiceError> {
+    if directive.metadata().len() > MAX_METADATA_KEYS_PER_DIRECTIVE {
+        return Err(ServiceError::ResourceLimitExceeded {
+            message: format!(
+                "Too many metadata keys: {} (max {})",
+                directive.metadata().len(),
+                MAX_METADATA_KEYS_PER_DIRECTIVE
+            ),
+        });
+    }
+
+    let Directive::Transaction(transaction) = directive else {
+        return Ok(());
+    };
+
+    if transaction.postings.len() > MAX_POSTINGS_PER_TRANSACTION {
+        return Err(ServiceError::ResourceLimitExceeded {
+            message: format!(
+                "Too many postings: {} (max {})",
+                transaction.postings.len(),
+                MAX_POSTINGS_PER_TRANSACTION
+            ),
+        });
+    }
+    if let Some(ref narration) = transaction.narration {
+        if narration.len() > MAX_NARRATION_LENGTH {
+            return Err(ServiceError::ResourceLimitExceeded {
+                message: format!(
+                    "Narration too long: {} bytes (max {})",
+                    narration.len(),
+                    MAX_NARRATION_LENGTH
+                ),
+            });
+        }
+    }
+    if let Some(ref payee) = transaction.payee {
+        if payee.len() > MAX_PAYEE_LENGTH {
+            return Err(ServiceError::ResourceLimitExceeded {
+                message: format!(
+                    "Payee too long: {} bytes (max {})",
+                    payee.len(),
+                    MAX_PAYEE_LENGTH
+                ),
+            });
+        }
+    }
+    if transaction.tags.len() > MAX_TAGS_PER_TRANSACTION {
+        return Err(ServiceError::ResourceLimitExceeded {
+            message: format!(
+                "Too many tags: {} (max {})",
+                transaction.tags.len(),
+                MAX_TAGS_PER_TRANSACTION
+            ),
+        });
+    }
+    if transaction.links.len() > MAX_LINKS_PER_TRANSACTION {
+        return Err(ServiceError::ResourceLimitExceeded {
+            message: format!(
+                "Too many links: {} (max {})",
+                transaction.links.len(),
+                MAX_LINKS_PER_TRANSACTION
+            ),
+        });
+    }
+    Ok(())
+}
 
 // ─── Service error ───────────────────────────────────────────────────────────
 
@@ -580,7 +679,7 @@ impl LedgerService {
     fn persist(&self) -> Result<(), ServiceError> {
         let directives: Vec<Directive> = self.dag.directives().into_iter().cloned().collect();
         let content = full_file_serialize(&directives, &self.leading_comments);
-        std::fs::write(&self.file_path, content)?;
+        persist_atomically(&self.file_path, &content)?;
         Ok(())
     }
 
@@ -658,6 +757,10 @@ impl LedgerService {
             }
 
             // Validate transactions (I1–I3, I9).
+            if enforce_resource_limits(&directive).is_err() {
+                rejected += 1;
+                continue;
+            }
             if let Directive::Transaction(txn) = &directive {
                 match validate_transaction(txn, &self.accounts) {
                     Ok(validated) => {
@@ -810,6 +913,19 @@ impl LedgerService {
             .collect()
     }
 
+    /// Parent txids on `directive` that are not yet in the local DAG (§3.4.4).
+    pub fn missing_parent_ids(&self, directive: &Directive) -> Vec<String> {
+        let Directive::Transaction(transaction) = directive else {
+            return Vec::new();
+        };
+        transaction
+            .parent_ids()
+            .into_iter()
+            .filter(|parent_id| !parent_id.is_empty() && self.dag.get(parent_id).is_none())
+            .map(|parent_id| parent_id.to_owned())
+            .collect()
+    }
+
     /// Insert a validated remote directive into the ledger (P2P receive path).
     ///
     /// This method is the bridge between `p2p::union_merge::validate_supply_entry()`
@@ -833,6 +949,8 @@ impl LedgerService {
         if self.dag.get(&content_id).is_some() {
             return Ok(None);
         }
+
+        enforce_resource_limits(&directive)?;
 
         // Adopt Lamport clock (§3.4.2): lamport = max(local, remote) + 1.
         let metadata = match &directive {
@@ -864,7 +982,7 @@ impl LedgerService {
                     ..txn.clone()
                 };
                 let final_directive = Directive::Transaction(final_txn);
-                match self.dag.insert(final_directive.clone(), false)? {
+                match self.dag.insert(final_directive.clone(), true)? {
                     InsertResult::Inserted { content_id } => {
                         self.read_model.index_directive(&final_directive);
                         self.persist()?;
@@ -1824,6 +1942,110 @@ mod tests {
         let result = svc.append_transaction(input);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().error_code(), "RESOURCE_LIMIT_EXCEEDED");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_persist_writes_complete_file() {
+        let (mut svc, path) = setup_with_accounts();
+        svc.append_transaction(balanced_input()).unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("Assets:Cash"));
+        assert!(on_disk.contains("openledger-author"));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_remote_insert_rejects_missing_parent() {
+        let (mut svc, path) = setup_with_accounts();
+        svc.append_transaction(balanced_input()).unwrap();
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("openledger-author".to_owned(), "peer-remote".to_owned());
+        metadata.insert("openledger-lamport".to_owned(), "9".to_owned());
+        metadata.insert(
+            "openledger-parents".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        );
+        let remote = Directive::Transaction(Transaction {
+            date: make_date(2024, 1, 16),
+            flag: Flag::Complete,
+            payee: None,
+            narration: Some("orphan child".to_owned()),
+            tags: vec![],
+            links: vec![],
+            postings: vec![
+                Posting {
+                    account: "Assets:Cash".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(10),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+                Posting {
+                    account: "Equity:Opening".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(-10),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+            ],
+            metadata,
+        });
+
+        let missing = svc.missing_parent_ids(&remote);
+        assert_eq!(missing.len(), 1);
+        let error = svc.insert_remote_directive(remote).unwrap_err();
+        assert_eq!(error.error_code(), "MISSING_PARENT");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_remote_insert_rejects_oversized_narration() {
+        let (mut svc, path) = setup_with_accounts();
+        let mut metadata = BTreeMap::new();
+        metadata.insert("openledger-author".to_owned(), "peer-remote".to_owned());
+        metadata.insert("openledger-lamport".to_owned(), "1".to_owned());
+        metadata.insert("openledger-parents".to_owned(), String::new());
+        let remote = Directive::Transaction(Transaction {
+            date: make_date(2024, 1, 16),
+            flag: Flag::Complete,
+            payee: None,
+            narration: Some("x".repeat(MAX_NARRATION_LENGTH + 1)),
+            tags: vec![],
+            links: vec![],
+            postings: vec![
+                Posting {
+                    account: "Assets:Cash".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(10),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+                Posting {
+                    account: "Equity:Opening".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(-10),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+            ],
+            metadata,
+        });
+        let error = svc.insert_remote_directive(remote).unwrap_err();
+        assert_eq!(error.error_code(), "RESOURCE_LIMIT_EXCEEDED");
         std::fs::remove_file(path).ok();
     }
 
