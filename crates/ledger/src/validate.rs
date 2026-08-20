@@ -262,6 +262,9 @@ pub fn validate_transaction(
             message: format!("Both cost and price on posting to {account}"),
         },
         WeightError::ElisionInvalid { reason } => ValidationError::InvalidElision { reason },
+        WeightError::AmountOverflow { detail } => ValidationError::InvalidPosting {
+            message: format!("Amount overflow: {detail}"),
+        },
     })?;
 
     if elided_count > 1 {
@@ -293,6 +296,9 @@ pub fn validate_transaction(
             message: format!("Both cost and price on posting to {account}"),
         },
         WeightError::ElisionInvalid { reason } => ValidationError::InvalidElision { reason },
+        WeightError::AmountOverflow { detail } => ValidationError::InvalidPosting {
+            message: format!("Amount overflow: {detail}"),
+        },
     })?;
 
     let imbalances: Vec<CurrencyImbalance> = final_sums

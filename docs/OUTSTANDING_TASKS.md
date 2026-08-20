@@ -9,7 +9,7 @@ Ordered by fix priority. Each task lists the source finding, the change, the fil
 
 | # | Finding | Sev | Effort | Status |
 |---|---------|-----|--------|--------|
-| T1 | H1 — Decimal overflow panics | High | S | ☐ |
+| T1 | H1 — Decimal overflow panics | High | S | ☑ |
 | T2 | M3 — Lamport-clock overflow | Med | S | ☐ |
 | T3 | H3 — Author spoofable / signing off by default | High | M | ☐ |
 | T4 | H2 — Signature doesn't cover envelope | High | M | ☐ |
@@ -33,7 +33,7 @@ Effort: S = <½ day, M = ~1–2 days.
 
 ## Tier 1 — Ship before any public / multi-node deployment
 
-### ☐ T1 — Make ledger arithmetic overflow-safe (H1)
+### ☑ T1 — Make ledger arithmetic overflow-safe (H1)
 - **Change:** Replace `*`/`+` on `Decimal` with `checked_mul`/`checked_add` on every path that consumes parsed amounts; return a `WeightError`/validation error on overflow instead of panicking.
 - **Files:** `crates/ledger/src/weights.rs:54,72,100`, `crates/ledger/src/read_model.rs:148,419` (audit the whole crate for other bare `Decimal` `*`/`+`).
 - **Verify:** Add a unit test feeding two `79228162514264337593543950335 USD` postings and a `10 AAPL {792…335 USD}` cost posting; assert a clean `Err`, not a panic. Confirm `append_transaction`, `insert_remote_directive`, and `reconcile_file` all surface the error.

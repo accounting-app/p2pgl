@@ -32,12 +32,12 @@ pub fn posting_weight(posting: &Posting) -> Result<Option<Weight>, WeightError> 
 
     // Cost: NUMBER × COST_NUMBER in COST_CURRENCY (sign of NUMBER preserved).
     if let Some(ref cost) = posting.cost {
-        return Ok(Some(cost_weight(amount, cost)));
+        return Ok(Some(cost_weight(amount, cost)?));
     }
 
     // Price: @ or @@
     if let Some(ref price) = posting.price {
-        return Ok(Some(price_weight(amount, price)));
+        return Ok(Some(price_weight(amount, price)?));
     }
 
     // Plain: NUMBER in CURRENCY.
@@ -48,30 +48,61 @@ pub fn posting_weight(posting: &Posting) -> Result<Option<Weight>, WeightError> 
 }
 
 /// Cost weight: `NUMBER × COST_NUMBER` in `COST_CURRENCY`.
-fn cost_weight(amount: &Amount, cost: &CostSpec) -> Weight {
+///
+/// Returns `Err(WeightError::AmountOverflow)` if the product exceeds `Decimal`'s
+/// range, so untrusted amounts cannot panic the arithmetic.
+fn cost_weight(amount: &Amount, cost: &CostSpec) -> Result<Weight, WeightError> {
     match &cost.amount {
-        Some(cost_amount) => Weight {
-            amount: amount.number * cost_amount.number,
-            currency: cost_amount.currency.clone(),
-        },
+        Some(cost_amount) => {
+            let product =
+                amount
+                    .number
+                    .checked_mul(cost_amount.number)
+                    .ok_or_else(|| WeightError::AmountOverflow {
+                        detail: format!(
+                            "cost weight {} × {} overflows",
+                            amount.number, cost_amount.number
+                        ),
+                    })?;
+            Ok(Weight {
+                amount: product,
+                currency: cost_amount.currency.clone(),
+            })
+        }
         None => {
             // Empty cost `{}` — treat as the raw amount in its own currency.
-            Weight {
+            Ok(Weight {
                 amount: amount.number,
                 currency: amount.currency.clone(),
-            }
+            })
         }
     }
 }
 
 /// Price weight: `@ NUMBER × PRICE_NUMBER` in `PRICE_CURRENCY`,
 /// or `@@ TOTAL_NUMBER` in `TOTAL_CURRENCY`.
-fn price_weight(amount: &Amount, price: &PriceSpec) -> Weight {
+///
+/// Returns `Err(WeightError::AmountOverflow)` if the unit-price product exceeds
+/// `Decimal`'s range. (The total-price arm only negates/abs-es, which cannot
+/// overflow a sign-magnitude `Decimal`.)
+fn price_weight(amount: &Amount, price: &PriceSpec) -> Result<Weight, WeightError> {
     match price {
-        PriceSpec::Unit(price_amount) => Weight {
-            amount: amount.number * price_amount.number,
-            currency: price_amount.currency.clone(),
-        },
+        PriceSpec::Unit(price_amount) => {
+            let product =
+                amount
+                    .number
+                    .checked_mul(price_amount.number)
+                    .ok_or_else(|| WeightError::AmountOverflow {
+                        detail: format!(
+                            "price weight {} × {} overflows",
+                            amount.number, price_amount.number
+                        ),
+                    })?;
+            Ok(Weight {
+                amount: product,
+                currency: price_amount.currency.clone(),
+            })
+        }
         PriceSpec::Total(total_amount) => {
             // Sign of total follows sign of the posting amount.
             let signed = if amount.number.is_sign_negative() {
@@ -79,10 +110,10 @@ fn price_weight(amount: &Amount, price: &PriceSpec) -> Weight {
             } else {
                 total_amount.number.abs()
             };
-            Weight {
+            Ok(Weight {
                 amount: signed,
                 currency: total_amount.currency.clone(),
-            }
+            })
         }
     }
 }
@@ -97,7 +128,13 @@ pub fn sum_weights(postings: &[Posting]) -> Result<(HashMap<String, Decimal>, us
     for posting in postings {
         match posting_weight(posting)? {
             Some(weight) => {
-                *sums.entry(weight.currency).or_insert(Decimal::ZERO) += weight.amount;
+                let running = sums.entry(weight.currency).or_insert(Decimal::ZERO);
+                *running =
+                    running
+                        .checked_add(weight.amount)
+                        .ok_or_else(|| WeightError::AmountOverflow {
+                            detail: "per-currency weight sum overflows".to_owned(),
+                        })?;
             }
             None => {
                 elided_count += 1;
@@ -160,6 +197,8 @@ pub fn resolve_elided(sums: &HashMap<String, Decimal>) -> Result<Amount, WeightE
 pub enum WeightError {
     CostAndPriceOnSamePosting { account: String },
     ElisionInvalid { reason: String },
+    /// Weight arithmetic (multiply or sum) exceeded `Decimal`'s representable range.
+    AmountOverflow { detail: String },
 }
 
 impl std::fmt::Display for WeightError {
@@ -170,6 +209,9 @@ impl std::fmt::Display for WeightError {
             }
             WeightError::ElisionInvalid { reason } => {
                 write!(f, "Cannot resolve elided posting: {reason}")
+            }
+            WeightError::AmountOverflow { detail } => {
+                write!(f, "Amount arithmetic overflow: {detail}")
             }
         }
     }
@@ -386,6 +428,61 @@ mod tests {
         let (sums, _) = sum_weights(&postings).unwrap();
         let err = resolve_elided(&sums).unwrap_err();
         assert!(matches!(err, WeightError::ElisionInvalid { .. }));
+    }
+
+    #[test]
+    fn test_sum_weights_overflow_is_error_not_panic() {
+        // Two same-sign postings at Decimal::MAX overflow the per-currency sum.
+        // Must surface as a clean error, not a panic (H1 regression).
+        let postings = vec![
+            plain_posting("Assets:A", Decimal::MAX, "USD"),
+            plain_posting("Assets:B", Decimal::MAX, "USD"),
+        ];
+        let err = sum_weights(&postings).unwrap_err();
+        assert!(matches!(err, WeightError::AmountOverflow { .. }));
+    }
+
+    #[test]
+    fn test_cost_weight_overflow_is_error_not_panic() {
+        // 10 AAPL {Decimal::MAX USD} overflows the cost multiply (10 × MAX).
+        let posting = Posting {
+            account: "Assets:Stock".to_owned(),
+            amount: Some(Amount {
+                number: dec!(10),
+                currency: "AAPL".to_owned(),
+            }),
+            cost: Some(CostSpec {
+                amount: Some(Amount {
+                    number: Decimal::MAX,
+                    currency: "USD".to_owned(),
+                }),
+                date: None,
+            }),
+            price: None,
+            metadata: BTreeMap::new(),
+        };
+        let err = posting_weight(&posting).unwrap_err();
+        assert!(matches!(err, WeightError::AmountOverflow { .. }));
+    }
+
+    #[test]
+    fn test_unit_price_weight_overflow_is_error_not_panic() {
+        // 10 EUR @ Decimal::MAX USD overflows the price multiply.
+        let posting = Posting {
+            account: "Assets:Foreign".to_owned(),
+            amount: Some(Amount {
+                number: dec!(10),
+                currency: "EUR".to_owned(),
+            }),
+            cost: None,
+            price: Some(PriceSpec::Unit(Amount {
+                number: Decimal::MAX,
+                currency: "USD".to_owned(),
+            })),
+            metadata: BTreeMap::new(),
+        };
+        let err = posting_weight(&posting).unwrap_err();
+        assert!(matches!(err, WeightError::AmountOverflow { .. }));
     }
 
     #[test]
