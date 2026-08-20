@@ -10,7 +10,7 @@ Ordered by fix priority. Each task lists the source finding, the change, the fil
 | # | Finding | Sev | Effort | Status |
 |---|---------|-----|--------|--------|
 | T1 | H1 — Decimal overflow panics | High | S | ☑ |
-| T2 | M3 — Lamport-clock overflow | Med | S | ☐ |
+| T2 | M3 — Lamport-clock overflow | Med | S | ☑ |
 | T3 | H3 — Author spoofable / signing off by default | High | M | ☐ |
 | T4 | H2 — Signature doesn't cover envelope | High | M | ☐ |
 | T5 | M4 / L8 — Orphan memory exhaustion | Med | S | ☐ |
@@ -38,7 +38,7 @@ Effort: S = <½ day, M = ~1–2 days.
 - **Files:** `crates/ledger/src/weights.rs:54,72,100`, `crates/ledger/src/read_model.rs:148,419` (audit the whole crate for other bare `Decimal` `*`/`+`).
 - **Verify:** Add a unit test feeding two `79228162514264337593543950335 USD` postings and a `10 AAPL {792…335 USD}` cost posting; assert a clean `Err`, not a panic. Confirm `append_transaction`, `insert_remote_directive`, and `reconcile_file` all surface the error.
 
-### ☐ T2 — Bound the Lamport clock update (M3)
+### ☑ T2 — Bound the Lamport clock update (M3)
 - **Change:** Use `saturating_add(1)` and reject/clamp an out-of-range `openledger-lamport` in `validate_supply_entry` before it reaches the clock.
 - **Files:** `crates/ledger/src/service.rs:1080-1085`; validation in the supply-entry path (`anti_entropy_alpn.rs:267`).
 - **Verify:** Test a remote directive with `openledger-lamport = u64::MAX`; assert no panic (debug) and no wrap-to-zero (release).

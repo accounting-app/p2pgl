@@ -417,7 +417,11 @@ impl LedgerService {
             dag.insert((*directive).clone(), false)?;
         }
 
-        let lamport_clock = if max_lamport > 0 { max_lamport + 1 } else { 0 };
+        let lamport_clock = if max_lamport > 0 {
+            max_lamport.saturating_add(1)
+        } else {
+            0
+        };
 
         // Build the read model from all directives.
         let all_directives: Vec<Directive> = dag.directives().into_iter().cloned().collect();
@@ -750,7 +754,7 @@ impl LedgerService {
 
     /// Stamp transaction-level envelope metadata (parents + author + lamport).
     fn stamp_transaction_envelope(&mut self, metadata: &mut Metadata) {
-        self.lamport_clock += 1;
+        self.lamport_clock = self.lamport_clock.saturating_add(1);
         metadata.insert("openledger-author".to_owned(), self.author_id.clone());
         metadata.insert(
             "openledger-lamport".to_owned(),
@@ -765,7 +769,7 @@ impl LedgerService {
 
     /// Stamp non-transaction directive envelope (author + lamport, no parents).
     fn stamp_directive_envelope(&mut self, metadata: &mut Metadata) {
-        self.lamport_clock += 1;
+        self.lamport_clock = self.lamport_clock.saturating_add(1);
         metadata.insert("openledger-author".to_owned(), self.author_id.clone());
         metadata.insert(
             "openledger-lamport".to_owned(),
@@ -830,7 +834,7 @@ impl LedgerService {
                 if !metadata.contains_key("openledger-author") {
                     metadata.insert("openledger-author".to_owned(), self.author_id.clone());
                 }
-                self.lamport_clock += 1;
+                self.lamport_clock = self.lamport_clock.saturating_add(1);
                 metadata.insert(
                     "openledger-lamport".to_owned(),
                     self.lamport_clock.to_string(),
@@ -1081,7 +1085,9 @@ impl LedgerService {
             .get("openledger-lamport")
             .and_then(|v| v.parse::<u64>().ok())
         {
-            self.lamport_clock = self.lamport_clock.max(remote_lamport) + 1;
+            // Saturating: a malicious/garbage remote `openledger-lamport` (e.g. u64::MAX)
+            // must not panic (debug) or wrap to 0 (release) and corrupt causal ordering.
+            self.lamport_clock = self.lamport_clock.max(remote_lamport).saturating_add(1);
         }
 
         // Validate and insert based on directive type.
@@ -2067,6 +2073,59 @@ mod tests {
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert!(on_disk.contains("Assets:Cash"));
         assert!(on_disk.contains("openledger-author"));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_remote_lamport_u64_max_saturates_no_wrap() {
+        // M3 regression: a remote directive claiming openledger-lamport = u64::MAX
+        // must not panic (debug) or wrap the local Lamport clock to 0 (release).
+        let (mut svc, path) = setup_with_accounts();
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("openledger-author".to_owned(), "peer-remote".to_owned());
+        metadata.insert("openledger-lamport".to_owned(), u64::MAX.to_string());
+        metadata.insert("openledger-parents".to_owned(), String::new());
+        let remote = Directive::Transaction(Transaction {
+            date: make_date(2024, 1, 16),
+            flag: Flag::Complete,
+            payee: None,
+            narration: Some("max lamport".to_owned()),
+            tags: vec![],
+            links: vec![],
+            postings: vec![
+                Posting {
+                    account: "Assets:Cash".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(10),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+                Posting {
+                    account: "Equity:Opening".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(-10),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+            ],
+            metadata,
+        });
+
+        // Must not panic; clock saturates at u64::MAX, never wraps to 0.
+        svc.insert_remote_directive(remote).unwrap();
+        assert_eq!(svc.lamport_clock(), u64::MAX);
+
+        // A subsequent local append must also not panic on the saturating bump.
+        svc.append_transaction(balanced_input()).unwrap();
+        assert_eq!(svc.lamport_clock(), u64::MAX);
+
         std::fs::remove_file(path).ok();
     }
 
