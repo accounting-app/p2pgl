@@ -5,11 +5,14 @@
 //! the Lamport clock.
 
 use std::collections::BTreeMap;
+use std::str::FromStr;
 
+use iroh::EndpointId;
 use ledger::hash::compute_content_id;
 use ledger::model::*;
 use ledger::parse::parse_file;
 
+use crate::allowlist::PeerAllowlist;
 use crate::protocol::{DirectiveKind, SupplyEntry};
 
 /// Closed set of envelope keys accepted on remote `Supply` (§3.3.1).
@@ -190,6 +193,31 @@ pub fn verify_remote_signature(
     let is_transaction = matches!(directive, Directive::Transaction(_));
     security::signing::verify_signature(&content_id, signature, author, is_transaction)
         .map_err(|error| MergeError::InvalidSignature(error.to_string()))
+}
+
+/// Require `openledger-author` to be a bootstrap `EndpointId` (H-14).
+///
+/// ALPN write path: the connection peer is authenticated separately; this
+/// check stops a trusted replica from inserting directives claimed by a
+/// stranger.
+pub fn verify_author_allowlisted(
+    directive: &Directive,
+    allowlist: &PeerAllowlist,
+) -> Result<(), MergeError> {
+    let author = directive_metadata(directive)
+        .get("openledger-author")
+        .ok_or_else(|| MergeError::EnvelopeMissing("openledger-author".to_owned()))?;
+    let endpoint_id = EndpointId::from_str(author).map_err(|error| {
+        MergeError::InvalidEnvelope(format!(
+            "openledger-author is not a valid EndpointId: {error}"
+        ))
+    })?;
+    if !allowlist.admits(endpoint_id) {
+        return Err(MergeError::InvalidEnvelope(
+            "openledger-author is not on the peer allowlist".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Immutable envelope metadata on any directive.
@@ -764,6 +792,31 @@ mod tests {
             verify_remote_signature(&directive, true),
             Err(MergeError::InvalidSignature(_))
         ));
+    }
+
+    #[test]
+    fn test_author_not_on_allowlist_rejected() {
+        let entry = make_valid_supply_entry();
+        let directive = validate_supply_entry(&entry).unwrap();
+        let trusted = iroh::SecretKey::generate().public().to_string();
+        let allowlist = PeerAllowlist::parse(&[trusted]).unwrap();
+        let result = verify_author_allowlisted(&directive, &allowlist);
+        assert!(
+            matches!(result, Err(MergeError::InvalidEnvelope(_))),
+            "stranger author must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_author_on_allowlist_accepted() {
+        let trusted = iroh::SecretKey::generate().public().to_string();
+        let mut entry = make_valid_supply_entry();
+        entry
+            .envelope
+            .insert("openledger-author".to_owned(), trusted.clone());
+        let directive = validate_supply_entry(&entry).unwrap();
+        let allowlist = PeerAllowlist::parse(&[trusted]).unwrap();
+        assert!(verify_author_allowlisted(&directive, &allowlist).is_ok());
     }
 
     #[test]

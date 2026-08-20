@@ -1,8 +1,9 @@
-//! Peer admission for gossip `Supply` (C-4 / §3.9).
+//! Peer admission for ALPN ledger writes (C-4 / §3.9).
 //!
-//! Inbound ledger writes are accepted only from configured bootstrap
-//! `EndpointId`s. An empty allowlist admits nobody — P2P can still bind an
-//! identity, but remote `Supply` is dropped.
+//! Inbound ledger bodies are accepted only from configured bootstrap
+//! `EndpointId`s (QUIC remote) and only when `openledger-author` is also
+//! on that list. An empty allowlist admits nobody — P2P can still bind an
+//! identity, but remote `Supply` is refused.
 
 use std::collections::HashSet;
 use std::str::FromStr;

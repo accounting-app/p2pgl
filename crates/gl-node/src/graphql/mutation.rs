@@ -6,7 +6,7 @@ use super::inputs;
 use super::query::domain_txn_to_graphql;
 use super::scalars::DateScalar;
 use super::types::Transaction;
-use super::SharedLedger;
+use super::{GossipSender, SharedLedger};
 
 use ledger::model::{Amount, CostSpec, Flag, PriceSpec};
 use ledger::service::{PostingInput, TransactionInput};
@@ -103,6 +103,12 @@ impl MutationRoot {
             broadcast.publish(txn.clone());
         }
 
+        let to_gossip = svc.get_directive(&content_id).cloned();
+        drop(svc);
+        if let (Some(directive), Ok(sender)) = (to_gossip, ctx.data::<GossipSender>()) {
+            let _ = sender.send(directive).await;
+        }
+
         Ok(txn)
     }
 
@@ -132,6 +138,7 @@ impl MutationRoot {
                     .extend_with(|_, ext| ext.set("code", e.error_code()))
             })?;
 
+        gossip_if_present(ctx, &svc, &_content_id).await;
         Ok(true)
     }
 
@@ -160,6 +167,20 @@ impl MutationRoot {
                     .extend_with(|_, ext| ext.set("code", e.error_code()))
             })?;
 
+        gossip_if_present(ctx, &svc, &_content_id).await;
         Ok(true)
+    }
+}
+
+async fn gossip_if_present(
+    ctx: &Context<'_>,
+    svc: &ledger::service::LedgerService,
+    content_id: &str,
+) {
+    let Some(directive) = svc.get_directive(content_id).cloned() else {
+        return;
+    };
+    if let Ok(sender) = ctx.data::<GossipSender>() {
+        let _ = sender.send(directive).await;
     }
 }

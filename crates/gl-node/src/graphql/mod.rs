@@ -48,6 +48,9 @@ fn schema_builder(
     builder
 }
 
+/// Channel used to announce locally inserted directives on the gossip topic (R1).
+pub type GossipSender = tokio::sync::mpsc::Sender<ledger::model::Directive>;
+
 /// Build the async-graphql schema with the live ledger service.
 ///
 /// Injects `SharedLedger`, `TransactionBroadcast`, `PeerRegistry`, and
@@ -61,13 +64,17 @@ pub fn build_schema_with_service(
     peer_registry: p2p::node::PeerRegistry,
     signer: std::sync::Arc<dyn security::signing::SignatureProvider>,
     enable_introspection: bool,
+    gossip_sender: Option<GossipSender>,
 ) -> AppSchema {
-    schema_builder(enable_introspection)
+    let mut builder = schema_builder(enable_introspection)
         .data(ledger)
         .data(broadcast)
         .data(peer_registry)
-        .data(signer)
-        .finish()
+        .data(signer);
+    if let Some(sender) = gossip_sender {
+        builder = builder.data(sender);
+    }
+    builder.finish()
 }
 
 /// Build the schema without a ledger service (for tests / introspection only).
@@ -200,6 +207,7 @@ mod tests {
             p2p::node::PeerRegistry::new(),
             std::sync::Arc::new(security::signing::NoopSignatureProvider),
             true,
+            None,
         );
 
         // Health should show 0 heads.
@@ -222,6 +230,7 @@ mod tests {
             p2p::node::PeerRegistry::new(),
             std::sync::Arc::new(security::signing::NoopSignatureProvider),
             false,
+            None,
         );
         let result = schema.execute("{ __schema { queryType { name } } }").await;
         let data = result.data.into_json().unwrap();
@@ -245,6 +254,7 @@ mod tests {
             p2p::node::PeerRegistry::new(),
             std::sync::Arc::new(security::signing::NoopSignatureProvider),
             true,
+            None,
         );
 
         let result = schema

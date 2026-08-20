@@ -8,24 +8,21 @@
 #[cfg(unix)]
 use std::io::Write;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::endpoint::presets;
+use iroh::protocol::Router;
 use iroh::SecretKey;
-use tokio::sync::RwLock;
+use iroh_gossip::net::GOSSIP_ALPN;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
 
+use crate::anti_entropy_alpn::{exchange_with_peer, fetch_want, AntiEntropyHandler};
 use crate::config::P2pConfig;
-use crate::graphql::broadcast::TransactionBroadcast;
-use crate::graphql::query::domain_txn_to_graphql;
-use crate::graphql::SharedLedger;
 
 use p2p::allowlist::PeerAllowlist;
 use p2p::gossip::{decode_broadcast, encode_broadcast, make_announce};
 use p2p::node::{PeerNode, PeerNodeConfig};
-use p2p::orphan_buffer::OrphanBuffer;
 use p2p::protocol::WireMessage;
 
 /// Boot the P2P subsystem: load or create SecretKey, create Iroh endpoint.
@@ -76,26 +73,33 @@ pub async fn boot_p2p(
     Ok(node)
 }
 
+/// Route gossip and anti-entropy ALPNs. The returned `Router` must be kept alive.
+pub fn spawn_router(peer_node: &PeerNode, handler: AntiEntropyHandler) -> Router {
+    Router::builder(peer_node.endpoint().clone())
+        .accept(GOSSIP_ALPN, peer_node.gossip().clone())
+        .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler)
+        .spawn()
+}
+
 /// Spawn the gossip event loop as a background tokio task.
 ///
 /// Listens for incoming gossip messages and broadcasts local appends.
 /// Returns an `mpsc::Sender` that the mutation layer uses to notify
 /// about local appends that should be gossiped.
 ///
-/// Inbound `Supply` is applied only when `delivered_from` is on the peer
-/// allowlist (C-4). When `signing_enabled`, signatures are verified (C-3).
+/// Inbound gossip is Announce-only. `Supply` bodies are fetched over ALPN
+/// from an allowlisted peer (C-4). When `signing_enabled`, signatures are
+/// verified on the ALPN path (C-3 / H-14).
 pub fn spawn_gossip_loop(
     peer_node: &PeerNode,
-    shared_ledger: SharedLedger,
-    broadcast: TransactionBroadcast,
-    orphan_buffer: Arc<RwLock<OrphanBuffer>>,
-    signing_enabled: bool,
+    handler: AntiEntropyHandler,
 ) -> tokio::sync::mpsc::Sender<ledger::model::Directive> {
     let gossip = peer_node.gossip().clone();
     let topic_id = peer_node.topic_id();
     let registry = peer_node.registry.clone();
     let allowlist = peer_node.allowlist().clone();
     let bootstrap_peers = allowlist.bootstrap_peers();
+    let endpoint = peer_node.endpoint().clone();
 
     let (gossip_sender, mut gossip_receiver) =
         tokio::sync::mpsc::channel::<ledger::model::Directive>(256);
@@ -112,13 +116,11 @@ pub fn spawn_gossip_loop(
 
         let (sink, mut stream) = topic.split();
         if allowlist.is_empty() {
-            info!(
-                "gossip loop started — inbound Supply dropped (empty bootstrapEndpointIds allowlist)"
-            );
+            info!("gossip loop started — Announce only; ALPN Supply requires bootstrapEndpointIds");
         } else {
             info!(
                 admitted = allowlist.bootstrap_peers().len(),
-                "gossip loop started with peer allowlist"
+                "gossip loop started (Announce only; bodies over ALPN)"
             );
         }
 
@@ -156,81 +158,26 @@ pub fn spawn_gossip_loop(
                                 Ok(WireMessage::Announce { id, kind, .. }) => {
                                     debug!(id = %id, kind = ?kind, "received gossip announce");
                                     let have_it = {
-                                        let svc = shared_ledger.read().await;
+                                        let svc = handler.ledger.read().await;
                                         svc.get_directive(&id).is_some()
                                     };
                                     if !have_it {
-                                        debug!(id = %id, "directive not found locally — anti-entropy will catch up");
+                                        let endpoint = endpoint.clone();
+                                        let handler = handler.clone();
+                                        let peer = msg.delivered_from;
+                                        tokio::spawn(async move {
+                                            fetch_want(&endpoint, peer, vec![id], &handler).await;
+                                        });
                                     }
                                 }
-                                Ok(WireMessage::Supply { entries, .. }) => {
-                                    let delivered_from = msg.delivered_from.to_string();
-                                    for entry in entries {
-                                        match p2p::union_merge::validate_supply_entry(&entry) {
-                                            Ok(directive) => {
-                                                if let Err(error) = p2p::union_merge::verify_remote_signature(
-                                                    &directive,
-                                                    signing_enabled,
-                                                ) {
-                                                    warn!(%error, "rejected unsigned or invalid remote signature");
-                                                    continue;
-                                                }
-                                                let mut svc = shared_ledger.write().await;
-                                                let missing_parents = svc.missing_parent_ids(&directive);
-                                                if !missing_parents.is_empty() {
-                                                    let content_id =
-                                                        ledger::service::LedgerService::content_id(&directive);
-                                                    let mut buffer = orphan_buffer.write().await;
-                                                    if buffer.insert(
-                                                        content_id.clone(),
-                                                        directive,
-                                                        missing_parents,
-                                                        Some(delivered_from.clone()),
-                                                    ) {
-                                                        debug!(
-                                                            content_id = %content_id,
-                                                            "buffered remote directive with missing parents"
-                                                        );
-                                                    } else {
-                                                        warn!(
-                                                            content_id = %content_id,
-                                                            "orphan buffer full or per-peer quota exceeded"
-                                                        );
-                                                    }
-                                                    continue;
-                                                }
-                                                match svc.insert_remote_directive(directive.clone()) {
-                                                    Ok(Some(content_id)) => {
-                                                        info!(
-                                                            content_id = %content_id,
-                                                            "merged remote directive from gossip"
-                                                        );
-                                                        if let ledger::model::Directive::Transaction(ref txn) = directive {
-                                                            let graphql_txn = domain_txn_to_graphql(txn, &svc);
-                                                            broadcast.publish(graphql_txn);
-                                                        }
-                                                        drain_orphans(
-                                                            &orphan_buffer,
-                                                            &mut svc,
-                                                            &broadcast,
-                                                        ).await;
-                                                    }
-                                                    Ok(None) => {
-                                                        debug!("gossip supply entry was duplicate");
-                                                    }
-                                                    Err(error) => {
-                                                        warn!(%error, "rejected remote directive from gossip");
-                                                    }
-                                                }
-                                            }
-                                            Err(error) => {
-                                                warn!(%error, "invalid supply entry from gossip");
-                                            }
-                                        }
-                                    }
+                                Ok(WireMessage::Supply { .. }) => {
+                                    warn!(
+                                        from = %msg.delivered_from,
+                                        "ignoring gossip Supply; ledger writes are ALPN-only"
+                                    );
                                 }
                                 Ok(_) => {
-                                    debug!("received non-announce/supply gossip message");
+                                    debug!("received non-announce gossip message");
                                 }
                                 Err(error) => {
                                     warn!(%error, "failed to decode gossip message");
@@ -269,16 +216,13 @@ pub fn spawn_gossip_loop(
 
 /// Spawn the anti-entropy periodic exchange as a background tokio task.
 ///
-/// Every `anti_entropy_interval_ms`, exchanges heads with all connected peers
-/// to catch up on any directives missed by gossip.
-pub fn spawn_anti_entropy_loop(
-    peer_node: &PeerNode,
-    shared_ledger: SharedLedger,
-    _broadcast: TransactionBroadcast,
-    _orphan_buffer: Arc<RwLock<OrphanBuffer>>,
-) {
+/// Every `anti_entropy_interval_ms`, opens an ALPN session with each
+/// allowlisted connected peer and pulls missing directives.
+pub fn spawn_anti_entropy_loop(peer_node: &PeerNode, handler: AntiEntropyHandler) {
     let interval_ms = peer_node.config().anti_entropy_interval_ms;
     let registry = peer_node.registry.clone();
+    let endpoint = peer_node.endpoint().clone();
+    let allowlist = peer_node.allowlist().clone();
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
@@ -292,80 +236,17 @@ pub fn spawn_anti_entropy_loop(
                 continue;
             }
 
-            // Get local state snapshot.
-            let (local_heads, local_directive_ids) = {
-                let svc = shared_ledger.read().await;
-                (svc.head_txids(), svc.all_directive_ids())
-            };
-
             for peer in &peers {
-                let exchange = p2p::anti_entropy::head_exchange(
-                    &local_heads,
-                    &local_directive_ids,
-                    &peer.heads,
-                    &[], // Directive IDs come from the full exchange.
-                );
-
-                if exchange.is_synced {
-                    debug!(peer = %peer.id, "anti-entropy: already synced");
+                let Ok(peer_id) = peer.id.parse::<iroh::EndpointId>() else {
+                    continue;
+                };
+                if !allowlist.admits(peer_id) {
                     continue;
                 }
-
-                if !exchange.want_from_remote.is_empty() {
-                    debug!(
-                        peer = %peer.id,
-                        want_count = exchange.want_from_remote.len(),
-                        "anti-entropy: we need directives from peer"
-                    );
-                    // In a full ALPN implementation, we'd open a connection
-                    // to the peer and exchange Want/Supply messages here.
-                    // The gossip layer handles the common case; anti-entropy
-                    // is for catching stragglers.
-                }
+                exchange_with_peer(&endpoint, peer_id, &handler).await;
             }
         }
     });
-}
-
-/// Drain orphan buffer entries whose parents have now arrived.
-async fn drain_orphans(
-    orphan_buffer: &Arc<RwLock<OrphanBuffer>>,
-    service: &mut ledger::service::LedgerService,
-    broadcast: &TransactionBroadcast,
-) {
-    // Collect all content IDs currently in the DAG.
-    let dag_ids: std::collections::HashSet<String> = service.all_directive_ids();
-
-    let mut buffer = orphan_buffer.write().await;
-
-    // Try to resolve orphans whose parents are now present.
-    let mut resolved_any = true;
-    while resolved_any {
-        resolved_any = false;
-        let wanted = buffer.wanted_parent_ids();
-        for parent_id in wanted {
-            if dag_ids.contains(&parent_id) {
-                let freed = buffer.parent_arrived(&parent_id);
-                for entry in freed {
-                    match service.insert_remote_directive(entry.directive.clone()) {
-                        Ok(Some(content_id)) => {
-                            info!(content_id = %content_id, "resolved orphan directive");
-                            if let ledger::model::Directive::Transaction(ref txn) = entry.directive
-                            {
-                                let graphql_txn = domain_txn_to_graphql(txn, service);
-                                broadcast.publish(graphql_txn);
-                            }
-                            resolved_any = true;
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            warn!(%error, "rejected resolved orphan directive");
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// Load 32-byte secret key material from disk, refusing group/other-readable files.

@@ -1,3 +1,4 @@
+mod anti_entropy_alpn;
 mod auth;
 mod config;
 mod graphql;
@@ -157,9 +158,10 @@ async fn main() {
 
     // Peer registry — either from PeerNode (when P2P enabled) or empty default.
     let peer_registry: PeerRegistry;
+    let mut p2p_router = None;
 
     // Boot P2P if enabled (§3.4). Keep identity even when the allowlist is empty.
-    let _gossip_sender = if config.p2p.enabled {
+    let gossip_sender = if config.p2p.enabled {
         match p2p_service::boot_p2p(&config.p2p, &ledger_path).await {
             Ok(peer_node) => {
                 // Update ledger service author to Iroh EndpointId (§3.3.1).
@@ -171,31 +173,20 @@ async fn main() {
 
                 if peer_node.allowlist().is_empty() {
                     warn!(
-                        "p2p.bootstrapEndpointIds is empty — inbound gossip Supply will be dropped"
-                    );
-                }
-                if config.p2p.swarm_topic == p2p::topic::DEFAULT_SWARM_TOPIC {
-                    warn!(
-                        topic = %config.p2p.swarm_topic,
-                        "using the public default swarm topic; set a unique p2p.swarmTopic for this mesh"
+                        "p2p.bootstrapEndpointIds is empty — inbound ALPN Supply will be refused"
                     );
                 }
 
-                let sender = p2p_service::spawn_gossip_loop(
-                    &peer_node,
-                    shared_ledger.clone(),
-                    broadcast.clone(),
-                    orphan_buffer.clone(),
-                    config.signing.enabled,
-                );
-
-                p2p_service::spawn_anti_entropy_loop(
-                    &peer_node,
-                    shared_ledger.clone(),
-                    broadcast.clone(),
-                    orphan_buffer.clone(),
-                );
-
+                let handler = anti_entropy_alpn::AntiEntropyHandler {
+                    ledger: shared_ledger.clone(),
+                    broadcast: broadcast.clone(),
+                    orphan_buffer: orphan_buffer.clone(),
+                    allowlist: peer_node.allowlist().clone(),
+                    signing_enabled: config.signing.enabled,
+                };
+                p2p_router = Some(p2p_service::spawn_router(&peer_node, handler.clone()));
+                let sender = p2p_service::spawn_gossip_loop(&peer_node, handler.clone());
+                p2p_service::spawn_anti_entropy_loop(&peer_node, handler);
                 Some(sender)
             }
             Err(error) => {
@@ -262,6 +253,7 @@ async fn main() {
         peer_registry.clone(),
         signer,
         config.graphiql_enabled(),
+        gossip_sender,
     );
 
     // Auth state for middleware (§3.8).
@@ -344,6 +336,12 @@ async fn main() {
     // Stop file watcher if running.
     if let Some(handle) = file_watcher_handle {
         handle.abort();
+    }
+
+    if let Some(router) = p2p_router {
+        if let Err(error) = router.shutdown().await {
+            warn!(%error, "P2P router shutdown error");
+        }
     }
 
     info!("gl-node shut down gracefully");

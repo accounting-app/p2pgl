@@ -531,8 +531,8 @@ CT-3 must assert this fixture’s `txid` matches.
 
 - **Identity:** transactions are content-addressed (`txid`); other directives by `directiveId`. Transaction parents = the set of heads the author observed at write time → a Merkle-DAG. Genesis = empty parents (§2.3).
 - **G-Set union:** Merge = union of all directives keyed by `txid` / `directiveId`, deduped. Commutative for balances (I6) because each transaction is internally balanced (I1) and non-transaction directives are immutable facts.
-- **Gossip:** new ids (payload may be id-only or full envelope) via **iroh-gossip** on `TopicId` from §3.4.3.
-- **Anti-entropy:** on connect and every `p2p.antiEntropyIntervalMilliseconds`, peers exchange heads + non-transaction id digests over ALPN; lagging peer pulls until closed.
+- **Gossip:** **Announce only** (ids + kind) via **iroh-gossip** on `TopicId` from §3.4.3. Gossip `Supply` is ignored. Missing ids are fetched over ALPN from an allowlisted peer.
+- **Anti-entropy:** on connect and every `p2p.antiEntropyIntervalMilliseconds`, peers exchange heads + non-transaction id digests over ALPN `openledger/anti-entropy/1`; lagging peer pulls `Want`/`Supply` until closed. Inbound `Supply` is accepted only when the QUIC remote `EndpointId` is in `p2p.bootstrapEndpointIds` **and** `openledger-author` is on that same list.
 - **Display order:** topological sort of the **transaction** DAG, tie-broken by `(date, openledger-lamport, txid)`. Non-transaction directives interleave by §3.3.2 file order.
 - **No write blocks on peers.** Append locally and gossip; convergence on reconnect (FR-4 AC2).
 
@@ -568,7 +568,7 @@ TopicId        = first 32 bytes of SHA-256( topic_preimage )
 
 (Iroh `TopicId` is 32 bytes; use that digest directly.)
 
-The default preimage is **enumerable**. When `p2p.enabled`, boot **fails** unless `p2p.swarmTopic` is set to a unique, operator-chosen string (including loopback HTTP). Inbound `Supply` is accepted only from `p2p.bootstrapEndpointIds` regardless of topic.
+The default preimage is **enumerable**. When `p2p.enabled`, boot **fails** unless `p2p.swarmTopic` is set to a unique, operator-chosen string (including loopback HTTP). Inbound ledger `Supply` is accepted only over ALPN from `p2p.bootstrapEndpointIds`, and only when `openledger-author` is also on that list.
 
 #### 3.4.4 Orphan buffer & cycles
 
@@ -600,13 +600,13 @@ On `openAccount` / `closeAccount` (and when adopting other non-transaction direc
 2. Compute `directiveId` from the economic body; stamp envelope author / Lamport / optional signature **before** persist.
 3. Union into the G-Set → re-serialize → gossip.
 
-**Remote inserts (gossip / anti-entropy) — same acceptance laws as local writes:**
+**Remote inserts (ALPN anti-entropy) — same acceptance laws as local writes:**
 
 1. Verify content hash matches claimed `txid` / `directiveId` (I5).
 2. For transactions: enforce I1, I2, and I3 on the economic body. An unbalanced or account-invalid remote transaction is **rejected** and must not enter the G-Set (C3).
 3. Enforce §3.12 resource limits. Validate envelope shape (sorted parents, parseable Lamport, author present). Apply §3.4.4 for missing parents / cycles.
-4. If signing is enabled, verify `openledger-signature` per §3.8.1; if signing is disabled, unsigned entries are accepted.
-5. Skip GraphQL client auth (peer transport is separately authenticated via Iroh); never skip ledger invariants.
+4. Require `openledger-author` ∈ `p2p.bootstrapEndpointIds`. If signing is enabled, verify `openledger-signature` per §3.8.1; if signing is disabled, unsigned entries are accepted.
+5. Skip GraphQL client auth (peer transport is authenticated via the Iroh QUIC remote `EndpointId`); never skip ledger invariants.
 
 Duplicate id → no-op (idempotent G-Set add); first-accepted envelope wins (§3.3.1).
 
@@ -673,7 +673,7 @@ For `balanceSheet(at)`:
 - **Instance auth:** single-tenant → one instance-scoped API key (and optional mTLS later) on the GraphQL endpoint. Middleware from **M0** (disabled by default). Production Go/No-Go before public bind: `auth.enabled=true`, non-empty `auth.apiKey`, TLS terminated in-process or by the host (§3.9).
 - **API key header:** when `auth.enabled`, require header `X-Api-Key: <auth.apiKey>` on GraphQL HTTP, WebSocket upgrade, and SSE. Missing/mismatch → `UNAUTHORIZED` / HTTP 401. `GET /health` is exempt (§2.9).
 - **Peer identity:** Iroh `SecretKey` persisted on disk (CAP-4). Transactions carry `author` via `openledger-author` = `EndpointId` (lowercase hex of the Ed25519 public key — the same encoding used to verify signatures). Hand-adopted directives are stamped with the adopting node's identity.
-- **Peer admission:** `p2p.bootstrapEndpointIds` is the **allowlist** for inbound gossip `Supply`. Unknown `delivered_from` endpoints are ignored. An empty list admits **no** remote writes (the node may still bind an identity). Unsigned entries from allowlisted peers are accepted only when `signing.enabled` is false (§3.5 step 4).
+- **Peer admission:** `p2p.bootstrapEndpointIds` is the **allowlist** for inbound ALPN `Supply`. The QUIC remote `EndpointId` must be on the list, and `openledger-author` must also be on the list. Gossip `Supply` is ignored. An empty list admits **no** remote writes (the node may still bind an identity). Unsigned entries from allowlisted authors are accepted only when `signing.enabled` is false (§3.5 step 4).
 - **Non-repudiation — optional, pluggable.** Signing **off by default**. Trait `SignatureProvider` with `NoopSignatureProvider` and `PeerKeySignatureProvider`. Config `signing.enabled` selects. Signatures are envelope-only (§3.3.1).
 
   **Integrity vs attribution:**
@@ -751,7 +751,7 @@ The architecture is **host-agnostic but not paradigm-agnostic**: it runs on any 
 | `signing.enabled` | boolean | `false` | §3.8.1 |
 | `p2p.enabled` | boolean | `false` | Iroh mesh |
 | `p2p.secretKeyPath` | string | beside ledger | Persisted Iroh `SecretKey` |
-| `p2p.bootstrapEndpointIds` | string[] | `[]` | Allowlisted peer `EndpointId`s (hex). Empty = no inbound `Supply` |
+| `p2p.bootstrapEndpointIds` | string[] | `[]` | Allowlisted peer `EndpointId`s (hex). Empty = no inbound ALPN `Supply` |
 | `p2p.gossipIntervalMilliseconds` | number | `5000` | iroh-gossip announce cadence |
 | `p2p.antiEntropyIntervalMilliseconds` | number | `5000` | ALPN head-exchange cadence |
 | `p2p.swarmTopic` | string | `openledger/transactions` | TopicId preimage (§3.4.3). Required unique whenever `p2p.enabled` |
