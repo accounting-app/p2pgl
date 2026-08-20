@@ -36,9 +36,21 @@ pub const MAX_LINKS_PER_TRANSACTION: usize = 100;
 pub const MAX_METADATA_KEYS_PER_DIRECTIVE: usize = 100;
 /// Maximum UTF-8 bytes of a remote `economic_bean` body (M-4).
 pub const MAX_ECONOMIC_BEAN_LENGTH: usize = 1_048_576;
+/// Maximum ledger file size on boot, reconcile, and persist (§3.12).
+pub const MAX_LEDGER_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Write `content` via a sibling `.tmp` file, fsync, then POSIX rename (H-10 / CAP-1).
 fn persist_atomically(path: &Path, content: &str) -> Result<(), std::io::Error> {
+    if content.len() as u64 > MAX_LEDGER_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "ledger content is {} bytes (max {MAX_LEDGER_FILE_BYTES})",
+                content.len()
+            ),
+        ));
+    }
+
     let file_name = path.file_name().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -48,12 +60,35 @@ fn persist_atomically(path: &Path, content: &str) -> Result<(), std::io::Error> 
     let temporary_path = path.with_file_name(format!("{}.tmp", file_name.to_string_lossy()));
 
     {
-        let mut file = std::fs::File::create(&temporary_path)?;
-        file.write_all(content.as_bytes())?;
-        file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&temporary_path)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        {
+            let mut file = std::fs::File::create(&temporary_path)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+        }
     }
 
     std::fs::rename(&temporary_path, path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(path, permissions)?;
+    }
 
     let directory = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -63,6 +98,23 @@ fn persist_atomically(path: &Path, content: &str) -> Result<(), std::io::Error> 
         let _ = directory_file.sync_all();
     }
     Ok(())
+}
+
+fn read_ledger_file(path: &Path) -> Result<String, ServiceError> {
+    let length = std::fs::metadata(path)?.len();
+    if length > MAX_LEDGER_FILE_BYTES {
+        return Err(ServiceError::ResourceLimitExceeded {
+            message: format!("ledger file is {length} bytes (max {MAX_LEDGER_FILE_BYTES})"),
+        });
+    }
+    Ok(std::fs::read_to_string(path)?)
+}
+
+fn parent_txid_is_well_formed(parent_id: &str) -> bool {
+    parent_id.len() == 64
+        && parent_id
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
 }
 
 /// §3.12 limits for any write path (local, remote, reconcile).
@@ -309,13 +361,13 @@ impl LedgerService {
 
         // Read or create the file.
         let content = if file_path.exists() {
-            std::fs::read_to_string(&file_path)?
+            read_ledger_file(&file_path)?
         } else {
             // Create parent dirs + empty file (§3.3).
             if let Some(parent) = file_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&file_path, "")?;
+            persist_atomically(&file_path, "")?;
             String::new()
         };
 
@@ -390,6 +442,15 @@ impl LedgerService {
     /// stamps envelope metadata, inserts into DAG, and persists to file.
     /// Returns the `txid`.
     pub fn append_transaction(&mut self, input: TransactionInput) -> Result<String, ServiceError> {
+        self.append_transaction_signing(input, |_| None)
+    }
+
+    /// Append a transaction, attaching `openledger-signature` before the first persist (M-11).
+    pub fn append_transaction_signing(
+        &mut self,
+        input: TransactionInput,
+        sign: impl FnOnce(&str) -> Option<String>,
+    ) -> Result<String, ServiceError> {
         // §3.12: resource limit checks.
         if input.postings.len() > MAX_POSTINGS_PER_TRANSACTION {
             return Err(ServiceError::ResourceLimitExceeded {
@@ -513,6 +574,13 @@ impl LedgerService {
         // Stamp envelope metadata (§3.3.1, §3.4.2).
         self.stamp_transaction_envelope(&mut resolved.metadata);
 
+        let content_id = compute_content_id(&Directive::Transaction(resolved.clone()));
+        if let Some(signature_hex) = sign(&content_id) {
+            resolved
+                .metadata
+                .insert("openledger-signature".to_owned(), signature_hex);
+        }
+
         // Insert into DAG.
         let directive = Directive::Transaction(resolved);
         let content_id = match self.dag.insert(directive.clone(), false)? {
@@ -543,6 +611,17 @@ impl LedgerService {
         date: NaiveDate,
         currencies: Vec<String>,
     ) -> Result<String, ServiceError> {
+        self.open_account_signing(account, date, currencies, |_| None)
+    }
+
+    /// Open an account, attaching `openledger-signature` before the first persist (M-11).
+    pub fn open_account_signing(
+        &mut self,
+        account: String,
+        date: NaiveDate,
+        currencies: Vec<String>,
+        sign: impl FnOnce(&str) -> Option<String>,
+    ) -> Result<String, ServiceError> {
         validate_account_name(&account).map_err(|_| ServiceError::InvalidAccountName {
             account: account.clone(),
         })?;
@@ -563,12 +642,17 @@ impl LedgerService {
         let mut metadata = BTreeMap::new();
         self.stamp_directive_envelope(&mut metadata);
 
-        let open = Open {
+        let mut open = Open {
             date,
             account: account.clone(),
             currencies: currencies.clone(),
             metadata,
         };
+        let content_id = compute_content_id(&Directive::Open(open.clone()));
+        if let Some(signature_hex) = sign(&content_id) {
+            open.metadata
+                .insert("openledger-signature".to_owned(), signature_hex);
+        }
 
         // Insert into DAG.
         let directive = Directive::Open(open);
@@ -597,6 +681,16 @@ impl LedgerService {
         account: String,
         date: NaiveDate,
     ) -> Result<String, ServiceError> {
+        self.close_account_signing(account, date, |_| None)
+    }
+
+    /// Close an account, attaching `openledger-signature` before the first persist (M-11).
+    pub fn close_account_signing(
+        &mut self,
+        account: String,
+        date: NaiveDate,
+        sign: impl FnOnce(&str) -> Option<String>,
+    ) -> Result<String, ServiceError> {
         validate_account_name(&account).map_err(|_| ServiceError::InvalidAccountName {
             account: account.clone(),
         })?;
@@ -622,11 +716,17 @@ impl LedgerService {
         let mut metadata = BTreeMap::new();
         self.stamp_directive_envelope(&mut metadata);
 
-        let close = Close {
+        let mut close = Close {
             date,
             account: account.clone(),
             metadata,
         };
+        let content_id = compute_content_id(&Directive::Close(close.clone()));
+        if let Some(signature_hex) = sign(&content_id) {
+            close
+                .metadata
+                .insert("openledger-signature".to_owned(), signature_hex);
+        }
 
         // Insert into DAG.
         let directive = Directive::Close(close);
@@ -692,7 +792,7 @@ impl LedgerService {
     ///
     /// Returns the number of new directives adopted.
     pub fn reconcile_file(&mut self) -> Result<crate::file_watcher::ReconcileResult, ServiceError> {
-        let content = std::fs::read_to_string(&self.file_path)?;
+        let content = read_ledger_file(&self.file_path)?;
         let file_directives = parse_file(&content).map_err(ServiceError::Parse)?;
 
         let mut new_count = 0;
@@ -952,6 +1052,18 @@ impl LedgerService {
 
         enforce_resource_limits(&directive)?;
 
+        if let Directive::Transaction(transaction) = &directive {
+            for parent_id in transaction.parent_ids() {
+                if !parent_txid_is_well_formed(parent_id) {
+                    return Err(ServiceError::InvalidInput {
+                        message: format!(
+                            "openledger-parents entry must be a 64-character hex txid, got {parent_id}"
+                        ),
+                    });
+                }
+            }
+        }
+
         // Adopt Lamport clock (§3.4.2): lamport = max(local, remote) + 1.
         let metadata = match &directive {
             Directive::Transaction(txn) => &txn.metadata,
@@ -1032,10 +1144,13 @@ impl LedgerService {
 
     /// Stamp a signature onto a directive's metadata after insert (§3.8.1).
     ///
-    /// This is called by the mutation layer when signing is enabled. The
-    /// signature is stamped as `openledger-signature` metadata on the
-    /// already-inserted directive.
-    pub fn stamp_signature(&mut self, content_id: &str, signature_hex: &str) {
+    /// Prefer `append_transaction_signing` / `open_account_signing` /
+    /// `close_account_signing` so the first persist already includes the signature.
+    pub fn stamp_signature(
+        &mut self,
+        content_id: &str,
+        signature_hex: &str,
+    ) -> Result<(), ServiceError> {
         if let Some(directive) = self.dag.get_mut(content_id) {
             let metadata = match directive {
                 Directive::Transaction(txn) => &mut txn.metadata,
@@ -1050,9 +1165,9 @@ impl LedgerService {
                 Directive::Price(d) => &mut d.metadata,
             };
             metadata.insert("openledger-signature".to_owned(), signature_hex.to_owned());
-            // Re-persist so the signature is written to disk.
-            let _ = self.persist();
+            self.persist()?;
         }
+        Ok(())
     }
 }
 
@@ -2416,5 +2531,90 @@ mod tests {
 
         std::fs::remove_file(path_a).ok();
         std::fs::remove_file(path_b).ok();
+    }
+
+    #[test]
+    fn test_signature_is_on_disk_after_first_persist() {
+        let (mut svc, path) = setup_with_accounts();
+        let txid = svc
+            .append_transaction_signing(balanced_input(), |_| Some("aa".repeat(64)))
+            .unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            on_disk.contains("openledger-signature:"),
+            "signed append must persist signature on the first write"
+        );
+        assert!(svc.get_directive(&txid).is_some());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_remote_insert_rejects_malformed_parent_id() {
+        let (mut svc, path) = setup_with_accounts();
+        let mut metadata = BTreeMap::new();
+        metadata.insert("openledger-author".to_owned(), "peer-remote".to_owned());
+        metadata.insert("openledger-lamport".to_owned(), "1".to_owned());
+        metadata.insert("openledger-parents".to_owned(), "not-a-txid".to_owned());
+        let remote = Directive::Transaction(Transaction {
+            date: make_date(2024, 1, 16),
+            flag: Flag::Complete,
+            payee: None,
+            narration: Some("bad parent".to_owned()),
+            tags: vec![],
+            links: vec![],
+            postings: vec![
+                Posting {
+                    account: "Assets:Cash".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(10),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+                Posting {
+                    account: "Equity:Opening".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(-10),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+            ],
+            metadata,
+        });
+        let error = svc.insert_remote_directive(remote).unwrap_err();
+        assert_eq!(error.error_code(), "INVALID_INPUT");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_boot_rejects_oversized_ledger_file() {
+        let path = test_file_path();
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            file.set_len(MAX_LEDGER_FILE_BYTES + 1).unwrap();
+        }
+        let error = match LedgerService::boot(path.clone(), "test-peer".to_owned()) {
+            Ok(_) => panic!("oversized ledger file should not boot"),
+            Err(error) => error,
+        };
+        assert_eq!(error.error_code(), "RESOURCE_LIMIT_EXCEEDED");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_persisted_ledger_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (mut svc, path) = setup_with_accounts();
+        svc.append_transaction(balanced_input()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "persisted .bean must be 0600");
+        std::fs::remove_file(path).ok();
     }
 }

@@ -10,7 +10,15 @@ use ledger::hash::compute_content_id;
 use ledger::model::*;
 use ledger::parse::parse_file;
 
-use crate::protocol::SupplyEntry;
+use crate::protocol::{DirectiveKind, SupplyEntry};
+
+/// Closed set of envelope keys accepted on remote `Supply` (§3.3.1).
+const ALLOWED_ENVELOPE_KEYS: &[&str] = &[
+    "openledger-author",
+    "openledger-lamport",
+    "openledger-parents",
+    "openledger-signature",
+];
 
 /// Errors that can occur during merge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +37,8 @@ pub enum MergeError {
     ResourceLimitExceeded(String),
     /// DAG cycle detected (I8).
     CycleDetected,
+    /// Envelope key, control character, or kind mismatch (H-8).
+    InvalidEnvelope(String),
 }
 
 impl std::fmt::Display for MergeError {
@@ -50,6 +60,7 @@ impl std::fmt::Display for MergeError {
                 write!(f, "Resource limit exceeded: {reason}")
             }
             MergeError::CycleDetected => write!(f, "DAG cycle detected (I8)"),
+            MergeError::InvalidEnvelope(reason) => write!(f, "Invalid envelope: {reason}"),
         }
     }
 }
@@ -93,11 +104,19 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
         MergeError::ParseError(msgs.join("; "))
     })?;
 
-    if directives.is_empty() {
-        return Err(MergeError::ParseError("Empty economic body".to_owned()));
+    if directives.len() != 1 {
+        return Err(MergeError::ParseError(
+            "economic_bean must contain exactly one directive".to_owned(),
+        ));
     }
 
     let mut directive = directives.into_iter().next().unwrap();
+
+    if DirectiveKind::from_directive(&directive) != entry.kind {
+        return Err(MergeError::InvalidEnvelope(
+            "entry kind does not match economic body".to_owned(),
+        ));
+    }
 
     // 2. Verify content hash (I5): id == hash(economic_bean).
     let computed = compute_content_id(&directive);
@@ -107,6 +126,8 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
             computed,
         });
     }
+
+    validate_supply_envelope(&entry.envelope)?;
 
     // 3. Attach envelope metadata.
     let metadata = directive_metadata_mut(&mut directive);
@@ -126,6 +147,22 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
     }
 
     Ok(directive)
+}
+
+fn validate_supply_envelope(envelope: &BTreeMap<String, String>) -> Result<(), MergeError> {
+    for (key, value) in envelope {
+        if !ALLOWED_ENVELOPE_KEYS.contains(&key.as_str()) {
+            return Err(MergeError::InvalidEnvelope(format!(
+                "unsupported envelope key: {key}"
+            )));
+        }
+        if key.chars().any(char::is_control) || value.chars().any(char::is_control) {
+            return Err(MergeError::InvalidEnvelope(
+                "envelope key or value contains control characters".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Verify `openledger-signature` when signing is enabled (§3.5 step 4 / C-3).
@@ -237,7 +274,6 @@ fn directive_metadata_mut(directive: &mut Directive) -> &mut BTreeMap<String, St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::DirectiveKind;
     use ledger::hash::compute_content_id;
     use ledger::serialize::economic_canonical_serialize;
     use rust_decimal_macros::dec;
@@ -737,6 +773,53 @@ mod tests {
         assert!(matches!(
             validate_supply_entry(&entry),
             Err(MergeError::ResourceLimitExceeded(_))
+        ));
+    }
+
+    #[test]
+    fn test_unknown_envelope_key_rejected() {
+        let mut entry = make_valid_supply_entry();
+        entry.envelope.insert(
+            "evil\n2024-01-01 open Assets:Hacked".to_owned(),
+            "x".to_owned(),
+        );
+        assert!(matches!(
+            validate_supply_entry(&entry),
+            Err(MergeError::InvalidEnvelope(_))
+        ));
+    }
+
+    #[test]
+    fn test_envelope_control_character_rejected() {
+        let mut entry = make_valid_supply_entry();
+        entry
+            .envelope
+            .insert("openledger-author".to_owned(), "peer\n1".to_owned());
+        assert!(matches!(
+            validate_supply_entry(&entry),
+            Err(MergeError::InvalidEnvelope(_))
+        ));
+    }
+
+    #[test]
+    fn test_kind_mismatch_rejected() {
+        let mut entry = make_valid_supply_entry();
+        entry.kind = DirectiveKind::Open;
+        assert!(matches!(
+            validate_supply_entry(&entry),
+            Err(MergeError::InvalidEnvelope(_))
+        ));
+    }
+
+    #[test]
+    fn test_multi_directive_economic_bean_rejected() {
+        let mut entry = make_valid_supply_entry();
+        entry
+            .economic_bean
+            .push_str("\n2024-01-01 open Assets:Injected USD\n");
+        assert!(matches!(
+            validate_supply_entry(&entry),
+            Err(MergeError::ParseError(_) | MergeError::ContentHashMismatch { .. })
         ));
     }
 }

@@ -8,3 +8,6 @@
 *.swo
 *~
 .env
+*.secret
+identity.secret
+iroh.secret

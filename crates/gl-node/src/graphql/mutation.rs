@@ -73,19 +73,15 @@ impl MutationRoot {
         };
 
         let mut svc = ledger.write().await;
-        let content_id = svc.append_transaction(domain_input).map_err(|e| {
-            async_graphql::Error::new(e.to_string())
-                .extend_with(|_, ext| ext.set("code", e.error_code()))
-        })?;
-
-        // Sign the transaction if signing is enabled (§3.8.1).
-        if let Ok(signer) = ctx.data::<Arc<dyn SignatureProvider>>() {
-            if let Some(signature_hex) = signer.sign(&content_id, true) {
-                // Stamp the signature onto the persisted directive's metadata.
-                // This modifies the directive in-place in the DAG.
-                svc.stamp_signature(&content_id, &signature_hex);
-            }
-        }
+        let signer = ctx.data::<Arc<dyn SignatureProvider>>().ok().cloned();
+        let content_id = svc
+            .append_transaction_signing(domain_input, |id| {
+                signer.as_ref().and_then(|provider| provider.sign(id, true))
+            })
+            .map_err(|e| {
+                async_graphql::Error::new(e.to_string())
+                    .extend_with(|_, ext| ext.set("code", e.error_code()))
+            })?;
 
         // Look up the just-inserted transaction to return it.
         let txn = svc
@@ -124,18 +120,17 @@ impl MutationRoot {
         })?;
 
         let mut svc = ledger.write().await;
-        let content_id = svc
-            .open_account(name, date.0, currencies.unwrap_or_default())
+        let signer = ctx.data::<Arc<dyn SignatureProvider>>().ok().cloned();
+        let _content_id = svc
+            .open_account_signing(name, date.0, currencies.unwrap_or_default(), |id| {
+                signer
+                    .as_ref()
+                    .and_then(|provider| provider.sign(id, false))
+            })
             .map_err(|e| {
                 async_graphql::Error::new(e.to_string())
                     .extend_with(|_, ext| ext.set("code", e.error_code()))
             })?;
-
-        if let Ok(signer) = ctx.data::<Arc<dyn SignatureProvider>>() {
-            if let Some(signature_hex) = signer.sign(&content_id, false) {
-                svc.stamp_signature(&content_id, &signature_hex);
-            }
-        }
 
         Ok(true)
     }
@@ -153,16 +148,17 @@ impl MutationRoot {
         })?;
 
         let mut svc = ledger.write().await;
-        let content_id = svc.close_account(name, date.0).map_err(|e| {
-            async_graphql::Error::new(e.to_string())
-                .extend_with(|_, ext| ext.set("code", e.error_code()))
-        })?;
-
-        if let Ok(signer) = ctx.data::<Arc<dyn SignatureProvider>>() {
-            if let Some(signature_hex) = signer.sign(&content_id, false) {
-                svc.stamp_signature(&content_id, &signature_hex);
-            }
-        }
+        let signer = ctx.data::<Arc<dyn SignatureProvider>>().ok().cloned();
+        let _content_id = svc
+            .close_account_signing(name, date.0, |id| {
+                signer
+                    .as_ref()
+                    .and_then(|provider| provider.sign(id, false))
+            })
+            .map_err(|e| {
+                async_graphql::Error::new(e.to_string())
+                    .extend_with(|_, ext| ext.set("code", e.error_code()))
+            })?;
 
         Ok(true)
     }

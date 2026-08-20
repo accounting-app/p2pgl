@@ -387,6 +387,8 @@ This makes `.bean` simultaneously the durable truth *and* a clean replication ar
 
 **Reserved envelope keys (non-transaction directives):** `openledger-author`, `openledger-lamport`, and optional `openledger-signature`. Parents apply only to the **transaction DAG**.
 
+**Remote envelope closed set:** a `Supply` `envelope` map may contain **only** those reserved keys. Unknown keys, control characters in keys or values, and an `economic_bean` that is not exactly one directive whose `kind` matches the entry are rejected. Non-empty `openledger-parents` entries must each be a 64-character hex `txid`. Empty parents (genesis / concurrent root, I8) remain legal when the authoring node had zero heads.
+
 **Hash formulas:**
 
 ```
@@ -587,7 +589,7 @@ On `appendTransaction` (local client write):
 4. Sum weights per currency using decimals (I4).
 5. Reject if any currency's sum ≠ 0 (I1) with `UNBALANCED_TRANSACTION` (§2.8).
 6. Check account `open`/`close` validity (I3) and currency constraints (I9).
-7. Compute `txid` from the economic body only (§3.3.1). Set `openledger-parents` to current heads (empty iff genesis). Set `openledger-author` to local `EndpointId`, assign Lamport (§3.4.2), optionally sign (§3.8.1).
+7. Compute `txid` from the economic body only (§3.3.1). Set `openledger-parents` to current heads (empty iff genesis). Set `openledger-author` to local `EndpointId`, assign Lamport (§3.4.2), optionally sign (§3.8.1). If signing is enabled, attach `openledger-signature` **before** the first persist so the SoT is never written unsigned.
 8. Insert into DAG / G-Set → update read model → re-serialize `.bean` (including envelope) → gossip → publish subscription (to all subscribers, including for remote/adopted appends).
 
 **Genesis flow:** a fresh empty ledger has no accounts. The client must call `openAccount` before `appendTransaction` — I3 requires each posting's account to be open. The first `openAccount` on an empty ledger is the first directive; the first `appendTransaction` after that is the genesis transaction (empty parents).
@@ -595,7 +597,7 @@ On `appendTransaction` (local client write):
 On `openAccount` / `closeAccount` (and when adopting other non-transaction directives):
 
 1. Validate account lifecycle rules (FR-3).
-2. Compute `directiveId` from the economic body; stamp envelope author / Lamport / optional signature.
+2. Compute `directiveId` from the economic body; stamp envelope author / Lamport / optional signature **before** persist.
 3. Union into the G-Set → re-serialize → gossip.
 
 **Remote inserts (gossip / anti-entropy) — same acceptance laws as local writes:**
@@ -792,6 +794,7 @@ To bound memory and prevent abuse, the following limits are enforced on write. E
 | Max links per transaction | **100** | Local, remote, and reconcile |
 | Max metadata keys per directive | **100** | Any directive (parse + API + remote + reconcile) |
 | Max economic body per supply entry | **1 048 576** UTF-8 bytes | Remote `economic_bean` |
+| Max ledger file size | **67 108 864** UTF-8 bytes (64 MiB) | Boot, reconcile, and persist |
 
 These limits are not configurable in V1. They exist as named constants in the codebase so they can be promoted to config keys later without a spec change.
 
