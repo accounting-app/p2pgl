@@ -23,6 +23,21 @@ const ALLOWED_ENVELOPE_KEYS: &[&str] = &[
     "openledger-signature",
 ];
 
+/// Maximum byte length of any single envelope value (M-4 DoS bound).
+///
+/// The largest legitimate value is `openledger-parents` at
+/// `MAX_PARENTS × (64-hex + comma)` ≈ 16.6 KiB; 32 KiB leaves headroom while
+/// cheaply rejecting the ~16 MiB blobs that would otherwise be split into an
+/// enormous parent list.
+const MAX_ENVELOPE_VALUE_LEN: usize = 32 * 1024;
+
+/// Maximum number of parents in `openledger-parents`.
+///
+/// Each parent becomes a distinct `waiting_on` entry in the orphan buffer, so an
+/// unbounded list is a memory-exhaustion vector (M-4). Real DAG head counts are
+/// tiny (concurrent in-flight writers); 256 is generous.
+const MAX_PARENTS: usize = 256;
+
 /// Errors that can occur during merge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeError {
@@ -139,7 +154,7 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
     }
 
     // 4. Validate required envelope fields for transactions.
-    if let Directive::Transaction(_) = &directive {
+    if let Directive::Transaction(txn) = &directive {
         if !entry.envelope.contains_key("openledger-author") {
             return Err(MergeError::EnvelopeMissing("openledger-author".to_owned()));
         }
@@ -147,6 +162,17 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
             return Err(MergeError::EnvelopeMissing("openledger-lamport".to_owned()));
         }
         // openledger-parents may be empty string for genesis.
+
+        // Bound parent fan-in on the final (envelope-attached) directive (M-4):
+        // each parent becomes a `waiting_on` entry in the orphan buffer, so an
+        // unbounded list — whether supplied via the envelope or embedded in the
+        // economic body — is a memory-exhaustion vector.
+        let parent_count = txn.parent_ids().len();
+        if parent_count > MAX_PARENTS {
+            return Err(MergeError::ResourceLimitExceeded(format!(
+                "openledger-parents has {parent_count} entries (max {MAX_PARENTS})"
+            )));
+        }
     }
 
     Ok(directive)
@@ -157,6 +183,15 @@ fn validate_supply_envelope(envelope: &BTreeMap<String, String>) -> Result<(), M
         if !ALLOWED_ENVELOPE_KEYS.contains(&key.as_str()) {
             return Err(MergeError::InvalidEnvelope(format!(
                 "unsupported envelope key: {key}"
+            )));
+        }
+        // Reject oversized values before any downstream parsing (M-4). This
+        // caps the giant `openledger-parents` blobs cheaply, before the parent
+        // list is split/collected.
+        if value.len() > MAX_ENVELOPE_VALUE_LEN {
+            return Err(MergeError::ResourceLimitExceeded(format!(
+                "envelope value for {key} is {} bytes (max {MAX_ENVELOPE_VALUE_LEN})",
+                value.len()
             )));
         }
         if key.chars().any(char::is_control) || value.chars().any(char::is_control) {
@@ -507,6 +542,45 @@ mod tests {
         let directive = validate_supply_entry(&entry).unwrap();
         let parents = extract_parents(&directive);
         assert_eq!(parents, vec!["aaa111", "bbb222", "ccc333"]);
+    }
+
+    #[test]
+    fn test_validate_rejects_excessive_parents() {
+        // M-4 regression: a parent list over MAX_PARENTS (but under the value
+        // length cap) must be rejected before it reaches the orphan buffer.
+        let mut entry = make_valid_supply_entry();
+        let parent = "a".repeat(64);
+        let parents = std::iter::repeat_n(parent.as_str(), MAX_PARENTS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            parents.len() <= MAX_ENVELOPE_VALUE_LEN,
+            "test should hit the count cap, not the length cap"
+        );
+        entry
+            .envelope
+            .insert("openledger-parents".to_owned(), parents);
+        let err = validate_supply_entry(&entry).unwrap_err();
+        assert!(
+            matches!(err, MergeError::ResourceLimitExceeded(_)),
+            "expected ResourceLimitExceeded, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_oversized_envelope_value() {
+        // M-4 regression: an oversized envelope value is rejected cheaply by the
+        // length cap, before the parent list is split/collected.
+        let mut entry = make_valid_supply_entry();
+        entry.envelope.insert(
+            "openledger-parents".to_owned(),
+            "a".repeat(MAX_ENVELOPE_VALUE_LEN + 1),
+        );
+        let err = validate_supply_entry(&entry).unwrap_err();
+        assert!(
+            matches!(err, MergeError::ResourceLimitExceeded(_)),
+            "expected ResourceLimitExceeded, got {err:?}"
+        );
     }
 
     #[test]

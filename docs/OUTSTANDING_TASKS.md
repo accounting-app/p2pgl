@@ -13,8 +13,8 @@ Ordered by fix priority. Each task lists the source finding, the change, the fil
 | T2 | M3 — Lamport-clock overflow | Med | S | ☑ |
 | T3 | H3 — Author spoofable / signing off by default | High | M | ☑ |
 | T4 | H2 — Signature doesn't cover envelope | High | M | ☑ |
-| T5 | M4 / L8 — Orphan memory exhaustion | Med | S | ☐ |
-| T6 | M5 — Recursive DFS stack overflow | Med | S | ☐ |
+| T5 | M4 / L8 — Orphan memory exhaustion | Med | S | ☑ |
+| T6 | M5 — Recursive DFS stack overflow | Med | S | ☑ |
 | T7 | M1 — GraphQL resolver amplification | Med | S | ☐ |
 | T8 | M2 — Unauth mutations on public bind | Med | S | ☐ |
 | T9 | M6 — Quadratic DAG insertion | Med | M | ☐ |
@@ -58,12 +58,12 @@ Effort: S = <½ day, M = ~1–2 days.
 
 ## Tier 2 — DoS hardening (do before exposing to untrusted load)
 
-### ☐ T5 — Cap parent count and envelope value length (M4, L8)
+### ☑ T5 — Cap parent count and envelope value length (M4, L8)
 - **Change:** Enforce a max parent count and a max per-value byte length in `validate_supply_envelope`; consider lowering `MAX_ORPHANS_PER_PEER` / `MAX_ORPHAN_AGE` or making orphan memory a byte-budget rather than an entry count.
 - **Files:** `crates/p2p/src/union_merge.rs:155-169`, `crates/p2p/src/orphan_buffer.rs:14-19,84-89`, `crates/ledger/src/model.rs:92-102` (parent parsing).
 - **Verify:** Test that a `Supply` with a ~16 MiB `openledger-parents` blob is rejected before it reaches the orphan buffer; assert bounded `waiting_on` growth.
 
-### ☐ T6 — Convert cycle detection to an explicit stack (M5)
+### ☑ T6 — Convert cycle detection to an explicit stack (M5)
 - **Change:** Rewrite `detect_cycles` DFS iteratively (explicit work-stack) so DAG depth no longer maps to native stack frames.
 - **Files:** `crates/ledger/src/verify.rs:126-150`.
 - **Verify:** Test `verify_dag` on a single chain of ~1M transactions; assert it completes without stack overflow.

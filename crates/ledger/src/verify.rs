@@ -123,40 +123,50 @@ fn detect_cycles(dag: &LedgerDag) -> Vec<VerifyError> {
     let mut state: HashMap<&str, u8> = content_ids.iter().map(|id| (*id, 0u8)).collect();
     let mut errors = Vec::new();
 
-    fn dfs<'a>(
-        node: &'a str,
-        dag: &'a LedgerDag,
-        state: &mut HashMap<&'a str, u8>,
-        errors: &mut Vec<VerifyError>,
-    ) {
-        if let Some(&s) = state.get(node) {
-            if s == 2 {
-                return; // Already fully processed.
-            }
-            if s == 1 {
-                // Back edge = cycle.
-                errors.push(VerifyError::CycleDetected {
-                    txid: node.to_owned(),
-                });
-                return;
-            }
-        }
-
-        state.insert(node, 1); // Mark in-progress.
-
-        // Visit children (forward edges in the DAG).
-        if let Some(children) = dag.children_of(node) {
-            for child in children {
-                dfs(child, dag, state, errors);
-            }
-        }
-
-        state.insert(node, 2); // Mark done.
+    // Iterative DFS coloring with an explicit heap work-stack (M-5). The DAG
+    // depth is attacker-controlled (a long parent chain), so native recursion
+    // here could overflow the process stack — an unwind-proof crash. `Enter`
+    // colors a node in-progress and schedules its children; `Exit`, popped only
+    // after the node's whole subtree is done, colors it done. Encountering an
+    // in-progress node on `Enter` is a back edge = cycle.
+    enum Step<'a> {
+        Enter(&'a str),
+        Exit(&'a str),
     }
 
-    for &id in &content_ids {
-        if state.get(id) == Some(&0) {
-            dfs(id, dag, &mut state, &mut errors);
+    for &root in &content_ids {
+        if state.get(root) != Some(&0) {
+            continue;
+        }
+        let mut stack = vec![Step::Enter(root)];
+        while let Some(step) = stack.pop() {
+            match step {
+                Step::Enter(node) => {
+                    match state.get(node) {
+                        Some(&2) => continue, // Already fully processed.
+                        Some(&1) => {
+                            // Back edge = cycle.
+                            errors.push(VerifyError::CycleDetected {
+                                txid: node.to_owned(),
+                            });
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    state.insert(node, 1); // Mark in-progress.
+                    stack.push(Step::Exit(node));
+                    // Push children in reverse so they pop in forward order,
+                    // matching the previous recursive traversal.
+                    if let Some(children) = dag.children_of(node) {
+                        for child in children.iter().rev() {
+                            stack.push(Step::Enter(child));
+                        }
+                    }
+                }
+                Step::Exit(node) => {
+                    state.insert(node, 2); // Mark done.
+                }
+            }
         }
     }
 
@@ -252,6 +262,40 @@ mod tests {
         let report = verify_dag(&dag);
         assert!(report.ok);
         assert_eq!(report.nodes_checked, 2);
+    }
+
+    #[test]
+    fn test_detect_cycles_deep_chain_no_stack_overflow() {
+        // M-5 regression: a long parent chain must not overflow the process
+        // stack during cycle detection. The chain is built on the main thread,
+        // then verified on a thread with a deliberately small (96 KiB) stack —
+        // deep enough that the former recursive DFS would overflow, while the
+        // iterative version (heap work-stack) completes cleanly. Chain length is
+        // kept modest because building it goes through the O(n²) DAG insert (T9).
+        const CHAIN_LEN: usize = 1_500;
+        let mut dag = LedgerDag::new();
+        let mut parent = String::new();
+        for i in 0..CHAIN_LEN {
+            let txn = make_txn(make_date(2024, 1, 1), &format!("n{i}"), &parent);
+            parent = match dag.insert(txn, false).unwrap() {
+                crate::dag::InsertResult::Inserted { content_id } => content_id,
+                _ => panic!("expected insert"),
+            };
+        }
+
+        let report = std::thread::Builder::new()
+            .stack_size(96 * 1024)
+            .spawn(move || verify_dag(&dag))
+            .expect("spawn verify thread")
+            .join()
+            .expect("verify thread must not overflow the stack");
+
+        assert!(
+            report.ok,
+            "deep chain should verify cleanly: {:?}",
+            report.errors
+        );
+        assert_eq!(report.nodes_checked, CHAIN_LEN);
     }
 
     #[test]
