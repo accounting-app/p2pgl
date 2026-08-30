@@ -11,7 +11,7 @@
         "apiKey": ""
     },
     "signing": {
-        "enabled": false
+        "enabled": true
     },
     "tls": {
         "mode": "terminated"

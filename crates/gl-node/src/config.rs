@@ -294,6 +294,17 @@ impl NodeConfig {
                     "p2p.swarmTopic must not be the public default \"openledger/transactions\" when p2p.enabled is true".to_owned(),
                 ));
             }
+            // H3: with signing off, verify_remote_signature is a no-op and the only
+            // origin check is that openledger-author appears *somewhere* on the
+            // allowlist — never bound to the authenticated connection. A single
+            // compromised allowlisted peer could then forge directives attributed to
+            // any other peer. Require signing so remote directives carry a verifiable
+            // Ed25519 signature from the claimed author's key.
+            if !self.signing.enabled {
+                return Err(ConfigError::Validation(
+                    "signing.enabled must be true when p2p.enabled is true; unsigned remote directives allow author spoofing across the peer allowlist".to_owned(),
+                ));
+            }
         }
 
         for origin in &self.cors.allowed_origins {
@@ -608,6 +619,30 @@ mod tests {
         assert!(result.is_err());
         let error_message = format!("{}", result.unwrap_err());
         assert!(error_message.contains("swarmTopic"));
+    }
+
+    #[test]
+    fn test_p2p_without_signing_rejected() {
+        // H3: a valid P2P config (non-default swarm topic, valid bootstrap) must
+        // still be refused when signing is off, closing the author-spoofing hole.
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "p2p": { "enabled": true, "swarmTopic": "my-org/ledger" }, "signing": { "enabled": false } }"#,
+        );
+        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
+        assert!(result.is_err());
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(error_message.contains("signing.enabled must be true"));
+    }
+
+    #[test]
+    fn test_p2p_with_signing_accepted() {
+        // The same config with signing on must load.
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "p2p": { "enabled": true, "swarmTopic": "my-org/ledger" }, "signing": { "enabled": true } }"#,
+        );
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).unwrap();
+        assert!(config.p2p.enabled);
+        assert!(config.signing.enabled);
     }
 
     #[test]

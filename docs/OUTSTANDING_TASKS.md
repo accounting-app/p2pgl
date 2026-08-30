@@ -11,7 +11,7 @@ Ordered by fix priority. Each task lists the source finding, the change, the fil
 |---|---------|-----|--------|--------|
 | T1 | H1 — Decimal overflow panics | High | S | ☑ |
 | T2 | M3 — Lamport-clock overflow | Med | S | ☑ |
-| T3 | H3 — Author spoofable / signing off by default | High | M | ☐ |
+| T3 | H3 — Author spoofable / signing off by default | High | M | ☑ |
 | T4 | H2 — Signature doesn't cover envelope | High | M | ☐ |
 | T5 | M4 / L8 — Orphan memory exhaustion | Med | S | ☐ |
 | T6 | M5 — Recursive DFS stack overflow | Med | S | ☐ |
@@ -43,8 +43,9 @@ Effort: S = <½ day, M = ~1–2 days.
 - **Files:** `crates/ledger/src/service.rs:1080-1085`; validation in the supply-entry path (`anti_entropy_alpn.rs:267`).
 - **Verify:** Test a remote directive with `openledger-lamport = u64::MAX`; assert no panic (debug) and no wrap-to-zero (release).
 
-### ☐ T3 — Bind directive author to the authenticated peer / require signing under P2P (H3)
-- **Change:** Two parts — (a) at boot, refuse to start if `p2p.enabled && !signing.enabled` (or auto-enable signing); (b) verify the `openledger-author` matches the connection's authenticated `EndpointId`, not merely "somewhere on the allowlist."
+### ☑ T3 — Require signing under P2P (H3)
+- **Resolved via option (a) only.** Option (b) — bind `openledger-author` to the connection's `EndpointId` — was **rejected as incorrect for this architecture**: anti-entropy legitimately relays third-party authors' directives (`collect_supply`/Want/Supply), so requiring author == connection peer would break convergence. The cryptographic signature (required by this task + covered by T4) is the correct origin proof for relayed directives.
+- **Change:** Two parts — (a) at boot, refuse to start if `p2p.enabled && !signing.enabled` (or auto-enable signing); (b) ~~verify the `openledger-author` matches the connection's authenticated `EndpointId`~~ — NOT DONE (see above).
 - **Files:** `crates/gl-node/src/config.rs:450` (boot validation), `crates/p2p/src/union_merge.rs:180-221` (`verify_author_allowlisted`), `crates/gl-node/src/anti_entropy_alpn.rs:246`. Also flip `deploy/gl-node.docker.json` `signing.enabled` to `true` (**L1**).
 - **Verify:** Test that a directive whose `openledger-author` is a different allowlisted peer than the connection identity is rejected; test that boot fails when P2P is on and signing is off.
 
