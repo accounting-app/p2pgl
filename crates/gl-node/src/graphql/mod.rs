@@ -116,6 +116,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_complexity_limits_heavy_resolver_aliasing() {
+        // M-1 regression: aliasing an expensive resolver many times must be
+        // rejected by the complexity budget (before execution) rather than
+        // running thousands of full-ledger scans.
+        let schema = build_schema();
+        let mut query = String::from("{");
+        for i in 0..64 {
+            query.push_str(&format!(" a{i}: verify {{ ok }}"));
+        }
+        query.push('}');
+        let result = schema.execute(query).await;
+        assert!(
+            !result.errors.is_empty(),
+            "64 aliased verify calls should exceed the complexity budget"
+        );
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.to_lowercase().contains("complex")),
+            "expected a complexity error, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn test_complexity_allows_single_heavy_resolver() {
+        // A single heavy resolver stays well within the budget.
+        let schema = build_schema();
+        let result = schema.execute("{ verify { ok } }").await;
+        assert!(
+            result.errors.is_empty(),
+            "single verify should be allowed: {:?}",
+            result.errors
+        );
+    }
+
+    #[tokio::test]
     async fn test_health_query() {
         let schema = build_schema();
         let result = schema

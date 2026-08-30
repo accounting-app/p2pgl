@@ -15,7 +15,7 @@ Ordered by fix priority. Each task lists the source finding, the change, the fil
 | T4 | H2 — Signature doesn't cover envelope | High | M | ☑ |
 | T5 | M4 / L8 — Orphan memory exhaustion | Med | S | ☑ |
 | T6 | M5 — Recursive DFS stack overflow | Med | S | ☑ |
-| T7 | M1 — GraphQL resolver amplification | Med | S | ☐ |
+| T7 | M1 — GraphQL resolver amplification | Med | S | ☑ |
 | T8 | M2 — Unauth mutations on public bind | Med | S | ☐ |
 | T9 | M6 — Quadratic DAG insertion | Med | M | ☐ |
 | T10 | M7 — Unpinned CI actions | Med | S | ☐ |
@@ -68,7 +68,7 @@ Effort: S = <½ day, M = ~1–2 days.
 - **Files:** `crates/ledger/src/verify.rs:126-150`.
 - **Verify:** Test `verify_dag` on a single chain of ~1M transactions; assert it completes without stack overflow.
 
-### ☐ T7 — Weight expensive GraphQL resolvers (M1)
+### ☑ T7 — Weight expensive GraphQL resolvers (M1)
 - **Change:** Add `#[graphql(complexity = …)]` to `verify`, `trial_balance`, `balance_sheet`, `journal` reflecting real cost; re-tune the global complexity cap.
 - **Files:** `crates/gl-node/src/graphql/mod.rs:34-44`, `crates/gl-node/src/graphql/query.rs:207-223`.
 - **Verify:** Test that a ~4000-alias `verify` query is rejected by the complexity limiter.

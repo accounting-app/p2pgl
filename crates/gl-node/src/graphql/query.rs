@@ -11,6 +11,14 @@ use super::SharedLedger;
 /// Maximum `journal` page size accepted from GraphQL (H-2).
 const MAX_JOURNAL_LIMIT: i32 = 10_000;
 
+/// Complexity weight for resolvers that scan the whole ledger/DAG under the read
+/// lock (M-1). Every GraphQL field defaults to a weight of 1, so without this a
+/// single request could alias a heavyweight resolver thousands of times within
+/// the depth limit (e.g. `{ a: verify{ok} b: verify{ok} … }`) and pin CPU. At
+/// this weight the 4096 complexity budget admits at most 8 such scans per
+/// request, while still leaving room for one of every report in a dashboard call.
+const HEAVY_RESOLVER_COMPLEXITY: usize = 512;
+
 /// GraphQL query root. Resolvers pull from `SharedLedger` when available,
 /// fall back to empty defaults for introspection-only schemas.
 pub struct QueryRoot;
@@ -18,6 +26,7 @@ pub struct QueryRoot;
 #[Object]
 impl QueryRoot {
     /// Trial balance at a given date (FR-2 AC1).
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
     async fn trial_balance(&self, ctx: &Context<'_>, at: DateScalar) -> TrialBalance {
         if let Ok(ledger) = ctx.data::<SharedLedger>() {
             let svc = ledger.read().await;
@@ -47,6 +56,7 @@ impl QueryRoot {
     }
 
     /// Balance sheet at a given date (FR-2 AC2).
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
     async fn balance_sheet(&self, ctx: &Context<'_>, at: DateScalar) -> BalanceSheet {
         if let Ok(ledger) = ctx.data::<SharedLedger>() {
             let svc = ledger.read().await;
@@ -86,6 +96,7 @@ impl QueryRoot {
     }
 
     /// Income statement for a date range (FR-2 AC3).
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
     async fn income_statement(
         &self,
         ctx: &Context<'_>,
@@ -139,6 +150,7 @@ impl QueryRoot {
     }
 
     /// Journal of transactions, optionally filtered (FR-2 AC4).
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
     async fn journal(
         &self,
         ctx: &Context<'_>,
@@ -204,6 +216,7 @@ impl QueryRoot {
     }
 
     /// Verify DAG integrity (FR-5 AC1).
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
     async fn verify(&self, ctx: &Context<'_>) -> VerifyResult {
         if let Ok(ledger) = ctx.data::<SharedLedger>() {
             let svc = ledger.read().await;
