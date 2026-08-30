@@ -18,7 +18,7 @@ Ordered by fix priority. Each task lists the source finding, the change, the fil
 | T7 | M1 — GraphQL resolver amplification | Med | S | ☑ |
 | T8 | M2 — Unauth mutations on public bind | Med | S | ☑ |
 | T9 | M6 — Quadratic DAG insertion | Med | M | ☑ |
-| T10 | M7 — Unpinned CI actions | Med | S | ☐ |
+| T10 | M7 — Unpinned CI actions | Med | S | ☑ |
 | T11 | L2 — Signature domain omits mesh id | Low | S | ☐ |
 | T12 | L3 — Path leak in GraphQL errors | Low | S | ☐ |
 | T13 | L6 — Temp-file symlink follow | Low | S | ☐ |
@@ -87,7 +87,7 @@ Effort: S = <½ day, M = ~1–2 days.
 
 ## Tier 3 — CI / hardening / lower-severity
 
-### ☐ T10 — Pin CI actions to commit SHAs (M7)
+### ☑ T10 — Pin CI actions to commit SHAs (M7)
 - **Files:** `.github/workflows/ci.yml:15,18,30` — pin `dtolnay/rust-toolchain`, `Swatinem/rust-cache`, `rustsec/audit-check` to full SHAs.
 - **Verify:** CI still green; refs are 40-hex SHAs.
 
