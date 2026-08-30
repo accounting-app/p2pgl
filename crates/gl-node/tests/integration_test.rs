@@ -343,13 +343,18 @@ fn test_signing_roundtrip() {
     use security::signing::{PeerKeySignatureProvider, SignatureProvider};
 
     let provider = PeerKeySignatureProvider::generate();
-    let content_id = "abc123";
-    let sig = provider.sign(content_id, true).unwrap();
+    let message = security::signing::SignableMessage {
+        content_id: "abc123",
+        is_transaction: true,
+        parents: "",
+        lamport: "1",
+    };
+    let sig = provider.sign(&message).unwrap();
 
-    let result = provider.verify(content_id, &sig, &provider.public_key_hex());
+    let result = provider.verify(&message, &sig, &provider.public_key_hex());
     assert!(result.is_ok());
 
     let other = PeerKeySignatureProvider::generate();
-    let result = provider.verify(content_id, &sig, &other.public_key_hex());
+    let result = provider.verify(&message, &sig, &other.public_key_hex());
     assert!(result.is_err());
 }

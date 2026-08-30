@@ -191,8 +191,24 @@ pub fn verify_remote_signature(
 
     let content_id = compute_content_id(directive);
     let is_transaction = matches!(directive, Directive::Transaction(_));
-    security::signing::verify_signature(&content_id, signature, author, is_transaction)
-        .map_err(|error| MergeError::InvalidSignature(error.to_string()))
+    let parents = metadata
+        .get("openledger-parents")
+        .map(String::as_str)
+        .unwrap_or("");
+    let lamport = metadata
+        .get("openledger-lamport")
+        .ok_or_else(|| MergeError::EnvelopeMissing("openledger-lamport".to_owned()))?;
+    security::signing::verify_signature(
+        &security::signing::SignableMessage {
+            content_id: &content_id,
+            is_transaction,
+            parents,
+            lamport,
+        },
+        signature,
+        author,
+    )
+    .map_err(|error| MergeError::InvalidSignature(error.to_string()))
 }
 
 /// Require `openledger-author` to be a bootstrap `EndpointId` (H-14).
@@ -353,6 +369,32 @@ mod tests {
                 ("openledger-parents".to_owned(), "".to_owned()),
             ]),
         }
+    }
+
+    fn sign_supply_entry(
+        provider: &security::signing::PeerKeySignatureProvider,
+        entry: &SupplyEntry,
+    ) -> String {
+        use security::signing::{SignableMessage, SignatureProvider};
+        let is_transaction = entry.kind == DirectiveKind::Transaction;
+        let parents = entry
+            .envelope
+            .get("openledger-parents")
+            .map(String::as_str)
+            .unwrap_or("");
+        let lamport = entry
+            .envelope
+            .get("openledger-lamport")
+            .map(String::as_str)
+            .unwrap_or("");
+        provider
+            .sign(&SignableMessage {
+                content_id: &entry.id,
+                is_transaction,
+                parents,
+                lamport,
+            })
+            .unwrap()
     }
 
     #[test]
@@ -755,12 +797,12 @@ mod tests {
 
     #[test]
     fn test_valid_signature_accepted_when_signing_enabled() {
-        use security::signing::{PeerKeySignatureProvider, SignatureProvider};
+        use security::signing::PeerKeySignatureProvider;
 
         let provider = PeerKeySignatureProvider::generate();
         let mut entry = make_valid_supply_entry();
         let author = provider.public_key_hex();
-        let signature = provider.sign(&entry.id, true).unwrap();
+        let signature = sign_supply_entry(&provider, &entry);
         entry
             .envelope
             .insert("openledger-author".to_owned(), author);
@@ -774,12 +816,12 @@ mod tests {
 
     #[test]
     fn test_forged_signature_rejected_when_signing_enabled() {
-        use security::signing::{PeerKeySignatureProvider, SignatureProvider};
+        use security::signing::PeerKeySignatureProvider;
 
         let author = PeerKeySignatureProvider::generate();
         let attacker = PeerKeySignatureProvider::generate();
         let mut entry = make_valid_supply_entry();
-        let forged = attacker.sign(&entry.id, true).unwrap();
+        let forged = sign_supply_entry(&attacker, &entry);
         entry
             .envelope
             .insert("openledger-author".to_owned(), author.public_key_hex());
@@ -792,6 +834,61 @@ mod tests {
             verify_remote_signature(&directive, true),
             Err(MergeError::InvalidSignature(_))
         ));
+    }
+
+    #[test]
+    fn test_rewritten_parents_fail_signature_verification() {
+        use security::signing::PeerKeySignatureProvider;
+
+        let provider = PeerKeySignatureProvider::generate();
+        let mut entry = make_valid_supply_entry();
+        let signature = sign_supply_entry(&provider, &entry);
+        entry
+            .envelope
+            .insert("openledger-author".to_owned(), provider.public_key_hex());
+        entry
+            .envelope
+            .insert("openledger-signature".to_owned(), signature);
+        entry.envelope.insert(
+            "openledger-parents".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        );
+
+        let directive = validate_supply_entry(&entry).unwrap();
+        assert!(
+            matches!(
+                verify_remote_signature(&directive, true),
+                Err(MergeError::InvalidSignature(_))
+            ),
+            "rewritten parents must fail verification while content hash still matches"
+        );
+    }
+
+    #[test]
+    fn test_rewritten_lamport_fail_signature_verification() {
+        use security::signing::PeerKeySignatureProvider;
+
+        let provider = PeerKeySignatureProvider::generate();
+        let mut entry = make_valid_supply_entry();
+        let signature = sign_supply_entry(&provider, &entry);
+        entry
+            .envelope
+            .insert("openledger-author".to_owned(), provider.public_key_hex());
+        entry
+            .envelope
+            .insert("openledger-signature".to_owned(), signature);
+        entry
+            .envelope
+            .insert("openledger-lamport".to_owned(), "999".to_owned());
+
+        let directive = validate_supply_entry(&entry).unwrap();
+        assert!(
+            matches!(
+                verify_remote_signature(&directive, true),
+                Err(MergeError::InvalidSignature(_))
+            ),
+            "rewritten lamport must fail verification while content hash still matches"
+        );
     }
 
     #[test]

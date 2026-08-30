@@ -143,7 +143,9 @@ impl ReadModel {
                         .account_balances
                         .entry(posting.account.clone())
                         .or_default();
-                    let running = balances.entry(amount.currency.clone()).or_insert(Decimal::ZERO);
+                    let running = balances
+                        .entry(amount.currency.clone())
+                        .or_insert(Decimal::ZERO);
                     *running = running.saturating_add(amount.number);
                 }
             }
@@ -249,16 +251,14 @@ impl ReadModel {
                 "Income" => {
                     for (currency, &amount) in currency_balances {
                         // Income is stored as negative (credit); negate to get positive contribution.
-                        let running =
-                            net_income.entry(currency.clone()).or_insert(Decimal::ZERO);
+                        let running = net_income.entry(currency.clone()).or_insert(Decimal::ZERO);
                         *running = running.saturating_sub(amount);
                     }
                 }
                 "Expenses" => {
                     for (currency, &amount) in currency_balances {
                         // Expenses are stored as positive (debit); subtract from net income.
-                        let running =
-                            net_income.entry(currency.clone()).or_insert(Decimal::ZERO);
+                        let running = net_income.entry(currency.clone()).or_insert(Decimal::ZERO);
                         *running = running.saturating_sub(amount);
                     }
                 }

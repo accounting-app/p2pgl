@@ -10,7 +10,7 @@ use super::{GossipSender, SharedLedger};
 
 use ledger::model::{Amount, CostSpec, Flag, PriceSpec};
 use ledger::service::{PostingInput, TransactionInput};
-use security::signing::SignatureProvider;
+use security::signing::{SignableMessage, SignatureProvider};
 
 /// GraphQL mutation root. All mutations acquire a write lock on `SharedLedger`.
 pub struct MutationRoot;
@@ -75,8 +75,15 @@ impl MutationRoot {
         let mut svc = ledger.write().await;
         let signer = ctx.data::<Arc<dyn SignatureProvider>>().ok().cloned();
         let content_id = svc
-            .append_transaction_signing(domain_input, |id| {
-                signer.as_ref().and_then(|provider| provider.sign(id, true))
+            .append_transaction_signing(domain_input, |id, parents, lamport| {
+                signer.as_ref().and_then(|provider| {
+                    provider.sign(&SignableMessage {
+                        content_id: id,
+                        is_transaction: true,
+                        parents,
+                        lamport,
+                    })
+                })
             })
             .map_err(|e| {
                 async_graphql::Error::new(e.to_string())
@@ -128,11 +135,21 @@ impl MutationRoot {
         let mut svc = ledger.write().await;
         let signer = ctx.data::<Arc<dyn SignatureProvider>>().ok().cloned();
         let _content_id = svc
-            .open_account_signing(name, date.0, currencies.unwrap_or_default(), |id| {
-                signer
-                    .as_ref()
-                    .and_then(|provider| provider.sign(id, false))
-            })
+            .open_account_signing(
+                name,
+                date.0,
+                currencies.unwrap_or_default(),
+                |id, parents, lamport| {
+                    signer.as_ref().and_then(|provider| {
+                        provider.sign(&SignableMessage {
+                            content_id: id,
+                            is_transaction: false,
+                            parents,
+                            lamport,
+                        })
+                    })
+                },
+            )
             .map_err(|e| {
                 async_graphql::Error::new(e.to_string())
                     .extend_with(|_, ext| ext.set("code", e.error_code()))
@@ -157,10 +174,15 @@ impl MutationRoot {
         let mut svc = ledger.write().await;
         let signer = ctx.data::<Arc<dyn SignatureProvider>>().ok().cloned();
         let _content_id = svc
-            .close_account_signing(name, date.0, |id| {
-                signer
-                    .as_ref()
-                    .and_then(|provider| provider.sign(id, false))
+            .close_account_signing(name, date.0, |id, parents, lamport| {
+                signer.as_ref().and_then(|provider| {
+                    provider.sign(&SignableMessage {
+                        content_id: id,
+                        is_transaction: false,
+                        parents,
+                        lamport,
+                    })
+                })
             })
             .map_err(|e| {
                 async_graphql::Error::new(e.to_string())

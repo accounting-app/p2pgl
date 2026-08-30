@@ -6,23 +6,43 @@
 
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 
-/// Domain-separated message prefix (§3.8.1).
-const SIG_PREFIX: &str = "openledger-sig-v1";
+/// Domain-separated message prefix (§3.8.1 / H2).
+///
+/// v1 covered only kind + content id. v2 also covers envelope parents and
+/// Lamport so a relay cannot rewrite causal order under a valid signature.
+const SIG_PREFIX: &str = "openledger-sig-v2";
+
+/// Fields covered by an `openledger-sig-v2` signature.
+///
+/// `content_id` is the economic hash (I5). `parents` and `lamport` are
+/// envelope values excluded from that hash, so they must be in the signed
+/// message (H2). Use the canonical stored strings: sorted comma-joined
+/// parent hex (empty for genesis / non-transactions) and the decimal
+/// `openledger-lamport` value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignableMessage<'a> {
+    /// Economic content id (64-char hex).
+    pub content_id: &'a str,
+    /// Selects `txid` vs `directiveId` in the domain prefix.
+    pub is_transaction: bool,
+    /// Canonical `openledger-parents` value.
+    pub parents: &'a str,
+    /// Canonical `openledger-lamport` value.
+    pub lamport: &'a str,
+}
 
 /// Trait for signing and verifying directives.
 ///
 /// Implementations are selected by `signing.enabled` config.
 pub trait SignatureProvider: Send + Sync {
-    /// Sign a content ID. Returns hex-encoded signature or None if signing disabled.
-    ///
-    /// `is_transaction` selects the §3.8.1 domain prefix (`txid` vs `directiveId`).
-    fn sign(&self, content_id: &str, is_transaction: bool) -> Option<String>;
+    /// Sign a directive. Returns hex-encoded signature or None if signing disabled.
+    fn sign(&self, message: &SignableMessage<'_>) -> Option<String>;
 
-    /// Verify a signature against a content ID and author public key (hex).
+    /// Verify a signature against a signable message and author public key (hex).
     /// Returns Ok(()) if valid, Err with reason if invalid.
     fn verify(
         &self,
-        content_id: &str,
+        message: &SignableMessage<'_>,
         signature_hex: &str,
         author_public_key_hex: &str,
     ) -> Result<(), SignatureError>;
@@ -59,15 +79,20 @@ impl std::error::Error for SignatureError {}
 
 /// Build the domain-separated message for signing (§3.8.1).
 ///
-/// Format: `openledger-sig-v1|txid|<64-hex-id>` (for transactions)
-///         `openledger-sig-v1|directiveId|<64-hex-id>` (for other directives)
-pub fn build_sign_message(content_id: &str, is_transaction: bool) -> String {
-    let kind = if is_transaction {
+/// Format:
+/// `openledger-sig-v2|{txid|directiveId}|{content_id}|parents|{parents}|lamport|{lamport}`
+pub fn build_sign_message(message: &SignableMessage<'_>) -> String {
+    let kind = if message.is_transaction {
         "txid"
     } else {
         "directiveId"
     };
-    format!("{SIG_PREFIX}|{kind}|{content_id}")
+    format!(
+        "{SIG_PREFIX}|{kind}|{content_id}|parents|{parents}|lamport|{lamport}",
+        content_id = message.content_id,
+        parents = message.parents,
+        lamport = message.lamport,
+    )
 }
 
 // ─── Noop provider ───────────────────────────────────────────────────────────
@@ -76,13 +101,13 @@ pub fn build_sign_message(content_id: &str, is_transaction: bool) -> String {
 pub struct NoopSignatureProvider;
 
 impl SignatureProvider for NoopSignatureProvider {
-    fn sign(&self, _content_id: &str, _is_transaction: bool) -> Option<String> {
+    fn sign(&self, _message: &SignableMessage<'_>) -> Option<String> {
         None // No signature when disabled.
     }
 
     fn verify(
         &self,
-        _content_id: &str,
+        _message: &SignableMessage<'_>,
         _signature_hex: &str,
         _author_public_key_hex: &str,
     ) -> Result<(), SignatureError> {
@@ -128,19 +153,19 @@ impl PeerKeySignatureProvider {
 }
 
 impl SignatureProvider for PeerKeySignatureProvider {
-    fn sign(&self, content_id: &str, is_transaction: bool) -> Option<String> {
-        let message = build_sign_message(content_id, is_transaction);
-        let signature = self.signing_key.sign(message.as_bytes());
+    fn sign(&self, message: &SignableMessage<'_>) -> Option<String> {
+        let encoded = build_sign_message(message);
+        let signature = self.signing_key.sign(encoded.as_bytes());
         Some(hex::encode(signature.to_bytes()))
     }
 
     fn verify(
         &self,
-        content_id: &str,
+        message: &SignableMessage<'_>,
         signature_hex: &str,
         author_public_key_hex: &str,
     ) -> Result<(), SignatureError> {
-        verify_signature(content_id, signature_hex, author_public_key_hex, true)
+        verify_signature(message, signature_hex, author_public_key_hex)
     }
 
     fn is_enabled(&self) -> bool {
@@ -150,12 +175,11 @@ impl SignatureProvider for PeerKeySignatureProvider {
 
 /// Standalone verification function — usable without a provider instance.
 ///
-/// `is_transaction` must match the domain used when signing (§3.8.1).
+/// Envelope fields on `message` must match those used when signing (§3.8.1).
 pub fn verify_signature(
-    content_id: &str,
+    message: &SignableMessage<'_>,
     signature_hex: &str,
     author_public_key_hex: &str,
-    is_transaction: bool,
 ) -> Result<(), SignatureError> {
     // Decode signature.
     let sig_bytes = hex::decode(signature_hex)
@@ -176,9 +200,9 @@ pub fn verify_signature(
     let verifying_key = VerifyingKey::from_bytes(&pk_array)
         .map_err(|e| SignatureError::InvalidPublicKey(e.to_string()))?;
 
-    let message = build_sign_message(content_id, is_transaction);
+    let encoded = build_sign_message(message);
     verifying_key
-        .verify(message.as_bytes(), &signature)
+        .verify(encoded.as_bytes(), &signature)
         .map_err(|e| SignatureError::InvalidSignature(e.to_string()))
 }
 
@@ -188,28 +212,40 @@ pub fn verify_signature(
 mod tests {
     use super::*;
 
+    fn sample_message<'a>(content_id: &'a str, is_transaction: bool) -> SignableMessage<'a> {
+        SignableMessage {
+            content_id,
+            is_transaction,
+            parents: "",
+            lamport: "1",
+        }
+    }
+
     #[test]
     fn test_noop_provider_returns_none() {
         let provider = NoopSignatureProvider;
         assert!(!provider.is_enabled());
-        assert!(provider.sign("abc", true).is_none());
+        assert!(provider.sign(&sample_message("abc", true)).is_none());
     }
 
     #[test]
     fn test_noop_verify_always_ok() {
         let provider = NoopSignatureProvider;
-        let result = provider.verify("abc", "deadbeef", "pubkey");
+        let result = provider.verify(&sample_message("abc", true), "deadbeef", "pubkey");
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_peer_key_sign_and_verify() {
         let provider = PeerKeySignatureProvider::generate();
-        let content_id = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let message = sample_message(
+            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            true,
+        );
 
         assert!(provider.is_enabled());
 
-        let sig = provider.sign(content_id, true).unwrap();
+        let sig = provider.sign(&message).unwrap();
         assert_eq!(
             sig.len(),
             128,
@@ -217,16 +253,21 @@ mod tests {
         );
 
         // Verify with the provider's own public key.
-        let result = provider.verify(content_id, &sig, &provider.public_key_hex());
+        let result = provider.verify(&message, &sig, &provider.public_key_hex());
         assert!(result.is_ok(), "Signature should verify: {result:?}");
     }
 
     #[test]
     fn test_verify_wrong_content_id() {
         let provider = PeerKeySignatureProvider::generate();
-        let sig = provider.sign("original_content_id", true).unwrap();
+        let original = sample_message("original_content_id", true);
+        let sig = provider.sign(&original).unwrap();
 
-        let result = provider.verify("different_content_id", &sig, &provider.public_key_hex());
+        let result = provider.verify(
+            &sample_message("different_content_id", true),
+            &sig,
+            &provider.public_key_hex(),
+        );
         assert!(
             matches!(result, Err(SignatureError::InvalidSignature(_))),
             "Wrong content ID should fail"
@@ -237,12 +278,12 @@ mod tests {
     fn test_verify_wrong_key() {
         let provider1 = PeerKeySignatureProvider::generate();
         let provider2 = PeerKeySignatureProvider::generate();
-        let content_id = "test123";
+        let message = sample_message("test123", true);
 
-        let sig = provider1.sign(content_id, true).unwrap();
+        let sig = provider1.sign(&message).unwrap();
 
         // Verify with a different key should fail.
-        let result = provider1.verify(content_id, &sig, &provider2.public_key_hex());
+        let result = provider1.verify(&message, &sig, &provider2.public_key_hex());
         assert!(
             matches!(result, Err(SignatureError::InvalidSignature(_))),
             "Wrong key should fail"
@@ -252,26 +293,79 @@ mod tests {
     #[test]
     fn test_verify_bad_hex() {
         let provider = PeerKeySignatureProvider::generate();
-        let result = provider.verify("id", "not-hex!", &provider.public_key_hex());
+        let result = provider.verify(
+            &sample_message("id", true),
+            "not-hex!",
+            &provider.public_key_hex(),
+        );
         assert!(matches!(result, Err(SignatureError::HexDecodeError(_))));
     }
 
     #[test]
     fn test_verify_bad_public_key() {
-        let result = verify_signature("id", &hex::encode([0u8; 64]), "deadbeef", true);
+        let result = verify_signature(
+            &sample_message("id", true),
+            &hex::encode([0u8; 64]),
+            "deadbeef",
+        );
         assert!(matches!(result, Err(SignatureError::InvalidPublicKey(_))));
     }
 
     #[test]
     fn test_build_sign_message_transaction() {
-        let msg = build_sign_message("abc123", true);
-        assert_eq!(msg, "openledger-sig-v1|txid|abc123");
+        let msg = build_sign_message(&sample_message("abc123", true));
+        assert_eq!(msg, "openledger-sig-v2|txid|abc123|parents||lamport|1");
     }
 
     #[test]
     fn test_build_sign_message_directive() {
-        let msg = build_sign_message("abc123", false);
-        assert_eq!(msg, "openledger-sig-v1|directiveId|abc123");
+        let msg = build_sign_message(&sample_message("abc123", false));
+        assert_eq!(
+            msg,
+            "openledger-sig-v2|directiveId|abc123|parents||lamport|1"
+        );
+    }
+
+    #[test]
+    fn test_tampered_parents_fails_verification() {
+        let provider = PeerKeySignatureProvider::generate();
+        let original = SignableMessage {
+            content_id: "same-economic-id",
+            is_transaction: true,
+            parents: "",
+            lamport: "5",
+        };
+        let sig = provider.sign(&original).unwrap();
+        let tampered = SignableMessage {
+            parents: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ..original
+        };
+        let result = provider.verify(&tampered, &sig, &provider.public_key_hex());
+        assert!(
+            matches!(result, Err(SignatureError::InvalidSignature(_))),
+            "rewritten parents must fail verification"
+        );
+    }
+
+    #[test]
+    fn test_tampered_lamport_fails_verification() {
+        let provider = PeerKeySignatureProvider::generate();
+        let original = SignableMessage {
+            content_id: "same-economic-id",
+            is_transaction: true,
+            parents: "",
+            lamport: "5",
+        };
+        let sig = provider.sign(&original).unwrap();
+        let tampered = SignableMessage {
+            lamport: "999",
+            ..original
+        };
+        let result = provider.verify(&tampered, &sig, &provider.public_key_hex());
+        assert!(
+            matches!(result, Err(SignatureError::InvalidSignature(_))),
+            "rewritten lamport must fail verification"
+        );
     }
 
     #[test]
@@ -285,10 +379,10 @@ mod tests {
     #[test]
     fn test_standalone_verify() {
         let provider = PeerKeySignatureProvider::generate();
-        let content_id = "standalone_test";
-        let sig = provider.sign(content_id, true).unwrap();
+        let message = sample_message("standalone_test", true);
+        let sig = provider.sign(&message).unwrap();
 
-        let result = verify_signature(content_id, &sig, &provider.public_key_hex(), true);
+        let result = verify_signature(&message, &sig, &provider.public_key_hex());
         assert!(result.is_ok());
     }
 
@@ -335,9 +429,17 @@ mod tests {
         };
         let txid_unsigned = compute_content_id(&Directive::Transaction(txn_unsigned.clone()));
 
-        // Same transaction WITH envelope metadata (signing on).
+        // Same transaction WITH envelope metadata (signing on). The v2 signed
+        // message covers parents + lamport; those fields still must not enter
+        // the economic hash (I5 / CT-10). Hash and signed message are different scopes.
         let provider = PeerKeySignatureProvider::generate();
-        let sig = provider.sign(&txid_unsigned, true).unwrap();
+        let signable = SignableMessage {
+            content_id: &txid_unsigned,
+            is_transaction: true,
+            parents: "",
+            lamport: "42",
+        };
+        let sig = provider.sign(&signable).unwrap();
         let mut signed_metadata = BTreeMap::new();
         signed_metadata.insert("openledger-author".to_owned(), "test-peer".to_owned());
         signed_metadata.insert("openledger-lamport".to_owned(), "42".to_owned());
@@ -356,27 +458,33 @@ mod tests {
             txid_unsigned, txid_signed,
             "Toggling signing must not change txid (envelope excluded from hash)"
         );
+        assert!(
+            provider
+                .verify(&signable, &sig, &provider.public_key_hex())
+                .is_ok(),
+            "signature over envelope must still verify"
+        );
     }
 
     #[test]
     fn ct10_verify_accepts_valid_signature() {
         let provider = PeerKeySignatureProvider::generate();
-        let content_id = "ct10_valid";
-        let sig = provider.sign(content_id, true).unwrap();
+        let message = sample_message("ct10_valid", true);
+        let sig = provider.sign(&message).unwrap();
 
-        let result = provider.verify(content_id, &sig, &provider.public_key_hex());
+        let result = provider.verify(&message, &sig, &provider.public_key_hex());
         assert!(result.is_ok(), "Valid signature must be accepted");
     }
 
     #[test]
     fn ct10_verify_rejects_forged_signature() {
         let provider = PeerKeySignatureProvider::generate();
-        let content_id = "ct10_forged";
-        let sig = provider.sign(content_id, true).unwrap();
+        let message = sample_message("ct10_forged", true);
+        let sig = provider.sign(&message).unwrap();
 
         // Forge by using a different key's public key.
         let attacker = PeerKeySignatureProvider::generate();
-        let result = provider.verify(content_id, &sig, &attacker.public_key_hex());
+        let result = provider.verify(&message, &sig, &attacker.public_key_hex());
         assert!(result.is_err(), "Forged signature must be rejected");
     }
 
@@ -384,17 +492,21 @@ mod tests {
     fn test_directive_signature_does_not_verify_as_transaction() {
         let provider = PeerKeySignatureProvider::generate();
         let content_id = "kind-mismatch";
-        let directive_sig = provider.sign(content_id, false).unwrap();
-        let result = verify_signature(content_id, &directive_sig, &provider.public_key_hex(), true);
+        let directive_message = sample_message(content_id, false);
+        let directive_sig = provider.sign(&directive_message).unwrap();
+        let result = verify_signature(
+            &sample_message(content_id, true),
+            &directive_sig,
+            &provider.public_key_hex(),
+        );
         assert!(
             matches!(result, Err(SignatureError::InvalidSignature(_))),
             "txid domain must not accept a directiveId signature"
         );
         let result = verify_signature(
-            content_id,
+            &directive_message,
             &directive_sig,
             &provider.public_key_hex(),
-            false,
         );
         assert!(result.is_ok());
     }
@@ -403,6 +515,10 @@ mod tests {
     fn ct10_noop_provider_leaves_txid_unaffected() {
         let noop = NoopSignatureProvider;
         assert!(!noop.is_enabled());
-        assert_eq!(noop.sign("any-id", true), None, "Noop should return None");
+        assert_eq!(
+            noop.sign(&sample_message("any-id", true)),
+            None,
+            "Noop should return None"
+        );
     }
 }

@@ -12,7 +12,7 @@ Ordered by fix priority. Each task lists the source finding, the change, the fil
 | T1 | H1 — Decimal overflow panics | High | S | ☑ |
 | T2 | M3 — Lamport-clock overflow | Med | S | ☑ |
 | T3 | H3 — Author spoofable / signing off by default | High | M | ☑ |
-| T4 | H2 — Signature doesn't cover envelope | High | M | ☐ |
+| T4 | H2 — Signature doesn't cover envelope | High | M | ☑ |
 | T5 | M4 / L8 — Orphan memory exhaustion | Med | S | ☐ |
 | T6 | M5 — Recursive DFS stack overflow | Med | S | ☐ |
 | T7 | M1 — GraphQL resolver amplification | Med | S | ☐ |
@@ -49,11 +49,10 @@ Effort: S = <½ day, M = ~1–2 days.
 - **Files:** `crates/gl-node/src/config.rs:450` (boot validation), `crates/p2p/src/union_merge.rs:180-221` (`verify_author_allowlisted`), `crates/gl-node/src/anti_entropy_alpn.rs:246`. Also flip `deploy/gl-node.docker.json` `signing.enabled` to `true` (**L1**).
 - **Verify:** Test that a directive whose `openledger-author` is a different allowlisted peer than the connection identity is rejected; test that boot fails when P2P is on and signing is off.
 
-### ☐ T4 — Extend signature coverage to the envelope (H2)
-- **Change:** Include `openledger-parents` and `openledger-lamport` (canonically serialized) in the signed message. Bump the domain prefix (`openledger-sig-v2`) and update verification; keep v1 verify only if backward compat is required during rollout.
-- **Files:** `crates/security/src/signing.rs:64-71` (`build_sign_message`), `crates/p2p/src/union_merge.rs:135-139,192-195`.
-- **Verify:** Test that rewriting `parents` or `lamport` on a validly-signed directive now fails verification. Update the CT-10 test that asserts envelope keys stay out of the *content hash* — the hash and the signed message are now intentionally different scopes.
-- **Note:** Sequence T4 with T3 — a signing-domain bump is a wire-format change; coordinate the mesh upgrade.
+### ☑ T4 — Extend signature coverage to the envelope (H2)
+- **Change:** Include `openledger-parents` and `openledger-lamport` (canonically serialized) in the signed message. Domain prefix is `openledger-sig-v2`. v1 signatures are not accepted (mesh upgrade together with T3).
+- **Files:** `crates/security/src/signing.rs` (`SignableMessage` / `build_sign_message`), `crates/p2p/src/union_merge.rs` (`verify_remote_signature`), ledger sign-before-persist callbacks, GraphQL mutations.
+- **Verify:** Rewriting `parents` or `lamport` on a validly-signed directive fails verification. CT-10 still asserts envelope keys stay out of the *content hash* — the hash and the signed message are different scopes.
 
 ---
 

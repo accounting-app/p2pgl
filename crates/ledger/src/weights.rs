@@ -54,16 +54,15 @@ pub fn posting_weight(posting: &Posting) -> Result<Option<Weight>, WeightError> 
 fn cost_weight(amount: &Amount, cost: &CostSpec) -> Result<Weight, WeightError> {
     match &cost.amount {
         Some(cost_amount) => {
-            let product =
-                amount
-                    .number
-                    .checked_mul(cost_amount.number)
-                    .ok_or_else(|| WeightError::AmountOverflow {
-                        detail: format!(
-                            "cost weight {} × {} overflows",
-                            amount.number, cost_amount.number
-                        ),
-                    })?;
+            let product = amount
+                .number
+                .checked_mul(cost_amount.number)
+                .ok_or_else(|| WeightError::AmountOverflow {
+                    detail: format!(
+                        "cost weight {} × {} overflows",
+                        amount.number, cost_amount.number
+                    ),
+                })?;
             Ok(Weight {
                 amount: product,
                 currency: cost_amount.currency.clone(),
@@ -88,16 +87,15 @@ fn cost_weight(amount: &Amount, cost: &CostSpec) -> Result<Weight, WeightError> 
 fn price_weight(amount: &Amount, price: &PriceSpec) -> Result<Weight, WeightError> {
     match price {
         PriceSpec::Unit(price_amount) => {
-            let product =
-                amount
-                    .number
-                    .checked_mul(price_amount.number)
-                    .ok_or_else(|| WeightError::AmountOverflow {
-                        detail: format!(
-                            "price weight {} × {} overflows",
-                            amount.number, price_amount.number
-                        ),
-                    })?;
+            let product = amount
+                .number
+                .checked_mul(price_amount.number)
+                .ok_or_else(|| WeightError::AmountOverflow {
+                    detail: format!(
+                        "price weight {} × {} overflows",
+                        amount.number, price_amount.number
+                    ),
+                })?;
             Ok(Weight {
                 amount: product,
                 currency: price_amount.currency.clone(),
@@ -129,12 +127,11 @@ pub fn sum_weights(postings: &[Posting]) -> Result<(HashMap<String, Decimal>, us
         match posting_weight(posting)? {
             Some(weight) => {
                 let running = sums.entry(weight.currency).or_insert(Decimal::ZERO);
-                *running =
-                    running
-                        .checked_add(weight.amount)
-                        .ok_or_else(|| WeightError::AmountOverflow {
-                            detail: "per-currency weight sum overflows".to_owned(),
-                        })?;
+                *running = running.checked_add(weight.amount).ok_or_else(|| {
+                    WeightError::AmountOverflow {
+                        detail: "per-currency weight sum overflows".to_owned(),
+                    }
+                })?;
             }
             None => {
                 elided_count += 1;
@@ -195,10 +192,16 @@ pub fn resolve_elided(sums: &HashMap<String, Decimal>) -> Result<Amount, WeightE
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WeightError {
-    CostAndPriceOnSamePosting { account: String },
-    ElisionInvalid { reason: String },
+    CostAndPriceOnSamePosting {
+        account: String,
+    },
+    ElisionInvalid {
+        reason: String,
+    },
     /// Weight arithmetic (multiply or sum) exceeded `Decimal`'s representable range.
-    AmountOverflow { detail: String },
+    AmountOverflow {
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for WeightError {

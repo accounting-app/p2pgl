@@ -446,14 +446,14 @@ impl LedgerService {
     /// stamps envelope metadata, inserts into DAG, and persists to file.
     /// Returns the `txid`.
     pub fn append_transaction(&mut self, input: TransactionInput) -> Result<String, ServiceError> {
-        self.append_transaction_signing(input, |_| None)
+        self.append_transaction_signing(input, |_, _, _| None)
     }
 
     /// Append a transaction, attaching `openledger-signature` before the first persist (M-11).
     pub fn append_transaction_signing(
         &mut self,
         input: TransactionInput,
-        sign: impl FnOnce(&str) -> Option<String>,
+        sign: impl FnOnce(&str, &str, &str) -> Option<String>,
     ) -> Result<String, ServiceError> {
         // §3.12: resource limit checks.
         if input.postings.len() > MAX_POSTINGS_PER_TRANSACTION {
@@ -579,7 +579,8 @@ impl LedgerService {
         self.stamp_transaction_envelope(&mut resolved.metadata);
 
         let content_id = compute_content_id(&Directive::Transaction(resolved.clone()));
-        if let Some(signature_hex) = sign(&content_id) {
+        let (parents, lamport) = Self::envelope_parents_and_lamport(&resolved.metadata);
+        if let Some(signature_hex) = sign(&content_id, parents, lamport) {
             resolved
                 .metadata
                 .insert("openledger-signature".to_owned(), signature_hex);
@@ -615,7 +616,7 @@ impl LedgerService {
         date: NaiveDate,
         currencies: Vec<String>,
     ) -> Result<String, ServiceError> {
-        self.open_account_signing(account, date, currencies, |_| None)
+        self.open_account_signing(account, date, currencies, |_, _, _| None)
     }
 
     /// Open an account, attaching `openledger-signature` before the first persist (M-11).
@@ -624,7 +625,7 @@ impl LedgerService {
         account: String,
         date: NaiveDate,
         currencies: Vec<String>,
-        sign: impl FnOnce(&str) -> Option<String>,
+        sign: impl FnOnce(&str, &str, &str) -> Option<String>,
     ) -> Result<String, ServiceError> {
         validate_account_name(&account).map_err(|_| ServiceError::InvalidAccountName {
             account: account.clone(),
@@ -653,7 +654,8 @@ impl LedgerService {
             metadata,
         };
         let content_id = compute_content_id(&Directive::Open(open.clone()));
-        if let Some(signature_hex) = sign(&content_id) {
+        let (parents, lamport) = Self::envelope_parents_and_lamport(&open.metadata);
+        if let Some(signature_hex) = sign(&content_id, parents, lamport) {
             open.metadata
                 .insert("openledger-signature".to_owned(), signature_hex);
         }
@@ -685,7 +687,7 @@ impl LedgerService {
         account: String,
         date: NaiveDate,
     ) -> Result<String, ServiceError> {
-        self.close_account_signing(account, date, |_| None)
+        self.close_account_signing(account, date, |_, _, _| None)
     }
 
     /// Close an account, attaching `openledger-signature` before the first persist (M-11).
@@ -693,7 +695,7 @@ impl LedgerService {
         &mut self,
         account: String,
         date: NaiveDate,
-        sign: impl FnOnce(&str) -> Option<String>,
+        sign: impl FnOnce(&str, &str, &str) -> Option<String>,
     ) -> Result<String, ServiceError> {
         validate_account_name(&account).map_err(|_| ServiceError::InvalidAccountName {
             account: account.clone(),
@@ -726,7 +728,8 @@ impl LedgerService {
             metadata,
         };
         let content_id = compute_content_id(&Directive::Close(close.clone()));
-        if let Some(signature_hex) = sign(&content_id) {
+        let (parents, lamport) = Self::envelope_parents_and_lamport(&close.metadata);
+        if let Some(signature_hex) = sign(&content_id, parents, lamport) {
             close
                 .metadata
                 .insert("openledger-signature".to_owned(), signature_hex);
@@ -775,6 +778,19 @@ impl LedgerService {
             "openledger-lamport".to_owned(),
             self.lamport_clock.to_string(),
         );
+    }
+
+    fn envelope_parents_and_lamport(metadata: &Metadata) -> (&str, &str) {
+        (
+            metadata
+                .get("openledger-parents")
+                .map(String::as_str)
+                .unwrap_or(""),
+            metadata
+                .get("openledger-lamport")
+                .map(String::as_str)
+                .unwrap_or(""),
+        )
     }
 
     // ── Persistence ──────────────────────────────────────────────────────
@@ -2596,7 +2612,7 @@ mod tests {
     fn test_signature_is_on_disk_after_first_persist() {
         let (mut svc, path) = setup_with_accounts();
         let txid = svc
-            .append_transaction_signing(balanced_input(), |_| Some("aa".repeat(64)))
+            .append_transaction_signing(balanced_input(), |_, _, _| Some("aa".repeat(64)))
             .unwrap();
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert!(
