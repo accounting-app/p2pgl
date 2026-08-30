@@ -284,12 +284,8 @@ async fn main() {
         peer_registry,
     };
 
-    if !config.auth.enabled && config.binds_non_loopback() {
-        warn!(
-            bind_address = %config.bind_address,
-            "auth is disabled while binding a non-loopback address — GraphQL is unauthenticated"
-        );
-    }
+    // A non-loopback bind with auth disabled is rejected at config validation
+    // (M-2), so by this point a public bind always has auth enabled.
     if config.tls.mode == "terminated" {
         info!("TLS assumed terminated at the host or reverse proxy (in-process TLS is not implemented)");
     }

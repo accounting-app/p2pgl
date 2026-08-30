@@ -344,6 +344,16 @@ impl NodeConfig {
             ));
         }
 
+        // M-2: fail closed. A non-loopback bind with auth disabled serves
+        // unauthenticated GraphQL — including the appendTransaction/openAccount/
+        // closeAccount mutations — to the whole network. Refuse to boot rather
+        // than only warning.
+        if self.binds_non_loopback() && !self.auth.enabled {
+            return Err(ConfigError::Validation(
+                "auth.enabled must be true when binding a non-loopback address; an unauthenticated public bind exposes writable GraphQL mutations".to_owned(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -563,11 +573,45 @@ mod tests {
 
     #[test]
     fn test_graphiql_explicit_false_disables_playground() {
+        // A public bind now requires auth (M-2), so include it here.
         let file = write_temp_config(
-            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "graphiql": false, "tls": { "mode": "terminated" } }"#,
+            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "graphiql": false, "tls": { "mode": "terminated" }, "auth": { "enabled": true, "apiKey": "secret-key-123" } }"#,
         );
         let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
         assert!(!config.graphiql_enabled());
+    }
+
+    #[test]
+    fn test_public_bind_without_auth_rejected() {
+        // M-2: a non-loopback bind with auth off must fail closed, even when TLS
+        // is terminated (otherwise an unauthenticated writable ledger is served).
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "tls": { "mode": "terminated" } }"#,
+        );
+        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
+        assert!(result.is_err());
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(error_message.contains("auth.enabled must be true"));
+    }
+
+    #[test]
+    fn test_public_bind_with_auth_accepted() {
+        // The same public bind loads once auth is enabled.
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "tls": { "mode": "terminated" }, "auth": { "enabled": true, "apiKey": "secret-key-123" } }"#,
+        );
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        assert!(config.binds_non_loopback());
+        assert!(config.auth.enabled);
+    }
+
+    #[test]
+    fn test_loopback_bind_without_auth_still_allowed() {
+        // Loopback dev binds remain permissive without auth.
+        let file = write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean" }"#);
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        assert!(!config.binds_non_loopback());
+        assert!(!config.auth.enabled);
     }
 
     #[test]

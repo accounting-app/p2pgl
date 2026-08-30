@@ -16,7 +16,7 @@ Ordered by fix priority. Each task lists the source finding, the change, the fil
 | T5 | M4 / L8 — Orphan memory exhaustion | Med | S | ☑ |
 | T6 | M5 — Recursive DFS stack overflow | Med | S | ☑ |
 | T7 | M1 — GraphQL resolver amplification | Med | S | ☑ |
-| T8 | M2 — Unauth mutations on public bind | Med | S | ☐ |
+| T8 | M2 — Unauth mutations on public bind | Med | S | ☑ |
 | T9 | M6 — Quadratic DAG insertion | Med | M | ☐ |
 | T10 | M7 — Unpinned CI actions | Med | S | ☐ |
 | T11 | L2 — Signature domain omits mesh id | Low | S | ☐ |
@@ -73,7 +73,7 @@ Effort: S = <½ day, M = ~1–2 days.
 - **Files:** `crates/gl-node/src/graphql/mod.rs:34-44`, `crates/gl-node/src/graphql/query.rs:207-223`.
 - **Verify:** Test that a ~4000-alias `verify` query is rejected by the complexity limiter.
 
-### ☐ T8 — Fail closed on public bind without auth (M2)
+### ☑ T8 — Fail closed on public bind without auth (M2)
 - **Change:** In `validate()`, make auth-disabled + non-loopback bind a hard error, not a warning.
 - **Files:** `crates/gl-node/src/main.rs:287-292`, `crates/gl-node/src/config.rs:250-336`.
 - **Verify:** Test that `bindAddress: "0.0.0.0"` with `auth.enabled = false` refuses to boot.
