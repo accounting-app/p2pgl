@@ -17,7 +17,7 @@ Ordered by fix priority. Each task lists the source finding, the change, the fil
 | T6 | M5 — Recursive DFS stack overflow | Med | S | ☑ |
 | T7 | M1 — GraphQL resolver amplification | Med | S | ☑ |
 | T8 | M2 — Unauth mutations on public bind | Med | S | ☑ |
-| T9 | M6 — Quadratic DAG insertion | Med | M | ☐ |
+| T9 | M6 — Quadratic DAG insertion | Med | M | ☑ |
 | T10 | M7 — Unpinned CI actions | Med | S | ☐ |
 | T11 | L2 — Signature domain omits mesh id | Low | S | ☐ |
 | T12 | L3 — Path leak in GraphQL errors | Low | S | ☐ |
@@ -78,7 +78,7 @@ Effort: S = <½ day, M = ~1–2 days.
 - **Files:** `crates/gl-node/src/main.rs:287-292`, `crates/gl-node/src/config.rs:250-336`.
 - **Verify:** Test that `bindAddress: "0.0.0.0"` with `auth.enabled = false` refuses to boot.
 
-### ☐ T9 — Bound DAG insertion cost (M6)
+### ☑ T9 — Bound DAG insertion cost (M6)
 - **Change:** Memoize ancestor reachability (or cap chain depth) so `would_create_cycle` is not O(N) per insert.
 - **Files:** `crates/ledger/src/dag.rs:122,162`.
 - **Verify:** Benchmark loading a 100k chained-transaction ledger; confirm sub-quadratic scaling.

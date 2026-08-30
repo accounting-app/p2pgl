@@ -32,6 +32,11 @@ pub struct LedgerDag {
     heads: HashSet<String>,
     /// Insertion order (for deterministic iteration).
     insertion_order: Vec<String>,
+    /// Every content ID referenced as a parent by some node (whether or not that
+    /// parent exists yet). Lets `would_create_cycle` skip the ancestor walk when
+    /// the new node's content hash is referenced by nothing — the common
+    /// forward-append case (I8 / M-6).
+    referenced_parent_ids: HashSet<String>,
 }
 
 /// Result of inserting a directive into the DAG.
@@ -76,6 +81,7 @@ impl LedgerDag {
             nodes: HashMap::new(),
             heads: HashSet::new(),
             insertion_order: Vec::new(),
+            referenced_parent_ids: HashSet::new(),
         }
     }
 
@@ -145,6 +151,7 @@ impl LedgerDag {
             // Parents are no longer heads (they now have a child).
             for parent_id in &parents {
                 if !parent_id.is_empty() {
+                    self.referenced_parent_ids.insert(parent_id.clone());
                     self.heads.remove(parent_id);
                     if let Some(parent_node) = self.nodes.get_mut(parent_id) {
                         parent_node.children.push(content_id.clone());
@@ -160,6 +167,17 @@ impl LedgerDag {
     ///
     /// A cycle exists if `new_id` is already an ancestor of `parent_id`.
     fn would_create_cycle(&self, new_id: &str, parent_id: &str) -> bool {
+        // Fast path (M-6): the ancestor walk only ever visits `parent_id` itself
+        // and content IDs that appear as parent-pointers in the DAG. So `new_id`
+        // — a freshly computed content hash — can only be found if it equals
+        // `parent_id` or is already referenced as a parent by some node. When it
+        // is neither (the common forward-append case) no cycle is possible, so we
+        // skip the walk: a chained insert stays O(1) instead of O(depth), and a
+        // bulk load is O(n) instead of O(n²).
+        if new_id != parent_id && !self.referenced_parent_ids.contains(new_id) {
+            return false;
+        }
+
         // Walk ancestors of parent_id; if we find new_id, it's a cycle.
         let mut visited = HashSet::new();
         let mut stack = vec![parent_id.to_string()];
@@ -269,6 +287,7 @@ impl LedgerDag {
         // Update parent→child edges.
         for parent_id in &parents {
             if !parent_id.is_empty() {
+                self.referenced_parent_ids.insert(parent_id.clone());
                 self.heads.remove(parent_id);
                 if let Some(parent_node) = self.nodes.get_mut(parent_id) {
                     parent_node.children.push(fake_id.clone());
@@ -345,6 +364,50 @@ mod tests {
             currencies: vec!["USD".to_owned()],
             metadata: BTreeMap::new(),
         })
+    }
+
+    #[test]
+    fn test_cycle_still_detected_after_fast_path() {
+        // M-6 regression: the O(1) fast-path short-circuit must not cause a false
+        // negative. A directive whose content hash is *already referenced* as a
+        // parent (an out-of-order / crafted case) must still be rejected as a
+        // cycle — the fast path only skips the walk for hashes nothing points to.
+        let mut dag = LedgerDag::new();
+
+        // The directive we will eventually insert; its content id is `h`.
+        let d = make_txn("cycle-node", &["PID"]);
+        let h = compute_content_id(&d);
+
+        // Pre-insert a node "PID" that references `h` as a parent, making `h` an
+        // ancestor of "PID". Inserting `d` (id `h`, parent "PID") then closes the
+        // cycle h -> PID -> h.
+        dag.insert_with_fake_id("PID".to_owned(), make_txn("parent-node", &[]), vec![h.clone()]);
+
+        let result = dag.insert(d, false);
+        assert!(
+            matches!(result, Err(DagError::CycleDetected { .. })),
+            "expected CycleDetected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_forward_chain_takes_fast_path() {
+        // The common case: a plain forward chain never trips the cycle check and
+        // inserts cleanly (the fast path returns false for each fresh hash).
+        let mut dag = LedgerDag::new();
+        let mut parent = String::new();
+        for i in 0..64 {
+            let txn = if parent.is_empty() {
+                make_txn(&format!("n{i}"), &[])
+            } else {
+                make_txn(&format!("n{i}"), &[parent.as_str()])
+            };
+            parent = match dag.insert(txn, false).unwrap() {
+                InsertResult::Inserted { content_id } => content_id,
+                other => panic!("expected insert, got {other:?}"),
+            };
+        }
+        assert_eq!(dag.len(), 64);
     }
 
     // ── Basic insert ─────────────────────────────────────────────────────
