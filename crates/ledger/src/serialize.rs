@@ -131,8 +131,12 @@ fn serialize_transaction(output: &mut String, txn: &Transaction, include_envelop
             write!(output, " {}", quote_string(narration)).unwrap();
         }
         (Some(payee), None) => {
-            // Payee without narration: emit as narration-only (Beancount convention).
-            write!(output, " {}", quote_string(payee)).unwrap();
+            // Payee without narration: emit an explicit empty narration slot so
+            // this does not collide with a narration-only transaction carrying
+            // the same string (L5). `"payee" ""` re-parses to payee + empty
+            // narration, which serializes back to the same bytes (hash-stable);
+            // the two are the same transaction, so that is correct.
+            write!(output, " {} {}", quote_string(payee), quote_string("")).unwrap();
         }
         (None, None) => {}
     }
@@ -423,6 +427,75 @@ mod tests {
         assert!(
             line.starts_with(&expected_prefix),
             "long account must have at least 2-space gap"
+        );
+    }
+
+    // ── Payee/narration injectivity (L5) ─────────────────────────────────
+
+    fn balanced_txn(payee: Option<&str>, narration: Option<&str>) -> Directive {
+        Directive::Transaction(Transaction {
+            date: make_date(2024, 1, 15),
+            flag: Flag::Complete,
+            payee: payee.map(str::to_owned),
+            narration: narration.map(str::to_owned),
+            tags: vec![],
+            links: vec![],
+            postings: vec![
+                Posting {
+                    account: "Assets:Cash".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(100),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+                Posting {
+                    account: "Equity:Opening".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(-100),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+            ],
+            metadata: BTreeMap::new(),
+        })
+    }
+
+    #[test]
+    fn test_payee_only_distinct_from_narration_only() {
+        // L5 regression: a payee-only transaction must not hash-collide with a
+        // narration-only transaction carrying the same string.
+        use crate::hash::compute_content_id;
+        let payee_only = balanced_txn(Some("Acme"), None);
+        let narration_only = balanced_txn(None, Some("Acme"));
+        assert_ne!(
+            compute_content_id(&payee_only),
+            compute_content_id(&narration_only),
+            "payee-only and narration-only with the same string must have distinct txids"
+        );
+    }
+
+    #[test]
+    fn test_payee_only_hash_stable_across_reparse() {
+        // The `"payee" ""` form round-trips: re-parsing and re-serializing must
+        // produce the same content id (payee + empty narration is the same
+        // transaction as payee-only).
+        use crate::hash::compute_content_id;
+        let payee_only = balanced_txn(Some("Acme"), None);
+        let id_before = compute_content_id(&payee_only);
+
+        let body = economic_canonical_serialize(&payee_only);
+        let reparsed = parse_file(&body).expect("payee-only body must re-parse");
+        assert_eq!(reparsed.len(), 1);
+        assert_eq!(
+            compute_content_id(&reparsed[0]),
+            id_before,
+            "content id must be stable across a persist/reload round-trip"
         );
     }
 

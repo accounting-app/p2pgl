@@ -22,7 +22,7 @@ Ordered by fix priority. Each task lists the source finding, the change, the fil
 | T11 | L2 — Signature domain omits mesh id | Low | S | ☑ |
 | T12 | L3 — Path leak in GraphQL errors | Low | S | ☑ |
 | T13 | L6 — Temp-file symlink follow | Low | S | ☑ |
-| T14 | L5 — Non-injective txid serialization | Low | S | ☐ |
+| T14 | L5 — Non-injective txid serialization | Low | S | ☑ |
 | T15 | L4 — API-key length timing | Low | S | ☐ |
 | T16 | L7 — File-watcher missed change | Low | S | ☐ |
 | T17 | Add `overflow-checks` + fuzz/panic regression harness | — | M | ☐ |
@@ -103,7 +103,7 @@ Effort: S = <½ day, M = ~1–2 days.
 - **Change:** Add `.custom_flags(O_EXCL)` (or create-new semantics) when opening `<name>.tmp` so a pre-planted symlink isn't followed.
 - **Files:** `crates/ledger/src/service.rs:66-71`.
 
-### ☐ T14 — Make txid serialization injective (L5)
+### ☑ T14 — Make txid serialization injective (L5)
 - **Change:** Distinguish payee-only vs narration-only in the canonical form (e.g. always emit both slots with explicit empties).
 - **Files:** `crates/ledger/src/serialize.rs:133-136`.
 - **Verify:** Test that the two transactions hash to different txids.
