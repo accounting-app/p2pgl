@@ -60,24 +60,31 @@ fn persist_atomically(path: &Path, content: &str) -> Result<(), std::io::Error> 
     let temporary_path = path.with_file_name(format!("{}.tmp", file_name.to_string_lossy()));
 
     {
+        let mut options = std::fs::OpenOptions::new();
+        // `create_new` sets O_CREAT|O_EXCL, which refuses to open (and therefore
+        // to follow) a pre-planted `<name>.tmp` symlink — closing the symlink
+        // race where the next persist would truncate the link's target.
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&temporary_path)?;
-            file.write_all(content.as_bytes())?;
-            file.sync_all()?;
+            options.mode(0o600);
         }
-        #[cfg(not(unix))]
-        {
-            let mut file = std::fs::File::create(&temporary_path)?;
-            file.write_all(content.as_bytes())?;
-            file.sync_all()?;
-        }
+        // A leftover temp from a previously crashed persist is unlinked once and
+        // retried. `remove_file` unlinks the entry itself (never a symlink's
+        // target); if a symlink is re-planted in the race window, the retry's
+        // O_EXCL create fails again and the persist errors out rather than
+        // writing through the link.
+        let mut file = match options.open(&temporary_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::fs::remove_file(&temporary_path)?;
+                options.open(&temporary_path)?
+            }
+            Err(error) => return Err(error),
+        };
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
     }
 
     std::fs::rename(&temporary_path, path)?;
@@ -2691,5 +2698,35 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "persisted .bean must be 0600");
         std::fs::remove_file(path).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_persist_does_not_follow_tmp_symlink() {
+        // L6 regression: a pre-planted `<name>.tmp` symlink must not be followed,
+        // so a persist cannot truncate/overwrite the link's target.
+        let ledger_path = test_file_path();
+        let file_name = ledger_path.file_name().unwrap().to_string_lossy().into_owned();
+        let tmp_path = ledger_path.with_file_name(format!("{file_name}.tmp"));
+        let victim_path = ledger_path.with_extension("victim");
+
+        std::fs::write(&victim_path, "SENSITIVE").unwrap();
+        std::os::unix::fs::symlink(&victim_path, &tmp_path).unwrap();
+
+        persist_atomically(&ledger_path, "ledger contents\n").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&victim_path).unwrap(),
+            "SENSITIVE",
+            "persist must not write through a pre-planted .tmp symlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ledger_path).unwrap(),
+            "ledger contents\n"
+        );
+
+        std::fs::remove_file(&ledger_path).ok();
+        std::fs::remove_file(&victim_path).ok();
+        std::fs::remove_file(&tmp_path).ok();
     }
 }

@@ -21,7 +21,7 @@ Ordered by fix priority. Each task lists the source finding, the change, the fil
 | T10 | M7 — Unpinned CI actions | Med | S | ☑ |
 | T11 | L2 — Signature domain omits mesh id | Low | S | ☑ |
 | T12 | L3 — Path leak in GraphQL errors | Low | S | ☑ |
-| T13 | L6 — Temp-file symlink follow | Low | S | ☐ |
+| T13 | L6 — Temp-file symlink follow | Low | S | ☑ |
 | T14 | L5 — Non-injective txid serialization | Low | S | ☐ |
 | T15 | L4 — API-key length timing | Low | S | ☐ |
 | T16 | L7 — File-watcher missed change | Low | S | ☐ |
@@ -99,7 +99,7 @@ Effort: S = <½ day, M = ~1–2 days.
 - **Change:** Map `ServiceError::Io` to a generic client message; log the detailed error server-side only.
 - **Files:** `crates/gl-node/src/graphql/mutation.rs:81-84,136-139,165-168`.
 
-### ☐ T13 — Open persist temp file with `O_EXCL` (L6)
+### ☑ T13 — Open persist temp file with `O_EXCL` (L6)
 - **Change:** Add `.custom_flags(O_EXCL)` (or create-new semantics) when opening `<name>.tmp` so a pre-planted symlink isn't followed.
 - **Files:** `crates/ledger/src/service.rs:66-71`.
 
