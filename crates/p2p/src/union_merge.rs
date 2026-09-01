@@ -207,10 +207,12 @@ fn validate_supply_envelope(envelope: &BTreeMap<String, String>) -> Result<(), M
 ///
 /// Signing off: unsigned entries are accepted. Signing on: missing or invalid
 /// signatures are rejected. The author's public key is `openledger-author`
-/// (Iroh `EndpointId` hex).
+/// (Iroh `EndpointId` hex). `mesh_id` is the verifying node's own mesh identity
+/// (swarm topic); a signature made for a different mesh will not verify (L2).
 pub fn verify_remote_signature(
     directive: &Directive,
     signing_enabled: bool,
+    mesh_id: &str,
 ) -> Result<(), MergeError> {
     if !signing_enabled {
         return Ok(());
@@ -242,6 +244,7 @@ pub fn verify_remote_signature(
         },
         signature,
         author,
+        mesh_id,
     )
     .map_err(|error| MergeError::InvalidSignature(error.to_string()))
 }
@@ -855,14 +858,14 @@ mod tests {
     fn test_unsigned_accepted_when_signing_disabled() {
         let entry = make_valid_supply_entry();
         let directive = validate_supply_entry(&entry).unwrap();
-        assert!(verify_remote_signature(&directive, false).is_ok());
+        assert!(verify_remote_signature(&directive, false, "").is_ok());
     }
 
     #[test]
     fn test_unsigned_rejected_when_signing_enabled() {
         let entry = make_valid_supply_entry();
         let directive = validate_supply_entry(&entry).unwrap();
-        let result = verify_remote_signature(&directive, true);
+        let result = verify_remote_signature(&directive, true, "");
         assert!(matches!(
             result,
             Err(MergeError::EnvelopeMissing(ref field)) if field == "openledger-signature"
@@ -885,7 +888,7 @@ mod tests {
             .insert("openledger-signature".to_owned(), signature);
 
         let directive = validate_supply_entry(&entry).unwrap();
-        assert!(verify_remote_signature(&directive, true).is_ok());
+        assert!(verify_remote_signature(&directive, true, "").is_ok());
     }
 
     #[test]
@@ -905,7 +908,7 @@ mod tests {
 
         let directive = validate_supply_entry(&entry).unwrap();
         assert!(matches!(
-            verify_remote_signature(&directive, true),
+            verify_remote_signature(&directive, true, ""),
             Err(MergeError::InvalidSignature(_))
         ));
     }
@@ -931,7 +934,7 @@ mod tests {
         let directive = validate_supply_entry(&entry).unwrap();
         assert!(
             matches!(
-                verify_remote_signature(&directive, true),
+                verify_remote_signature(&directive, true, ""),
                 Err(MergeError::InvalidSignature(_))
             ),
             "rewritten parents must fail verification while content hash still matches"
@@ -958,7 +961,7 @@ mod tests {
         let directive = validate_supply_entry(&entry).unwrap();
         assert!(
             matches!(
-                verify_remote_signature(&directive, true),
+                verify_remote_signature(&directive, true, ""),
                 Err(MergeError::InvalidSignature(_))
             ),
             "rewritten lamport must fail verification while content hash still matches"

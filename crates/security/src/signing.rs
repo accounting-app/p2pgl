@@ -8,9 +8,11 @@ use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 
 /// Domain-separated message prefix (§3.8.1 / H2).
 ///
-/// v1 covered only kind + content id. v2 also covers envelope parents and
-/// Lamport so a relay cannot rewrite causal order under a valid signature.
-const SIG_PREFIX: &str = "openledger-sig-v2";
+/// v1 covered only kind + content id. v2 added envelope parents and Lamport so a
+/// relay cannot rewrite causal order under a valid signature. v3 also binds the
+/// mesh/ledger identity (swarm topic) so a directive signed for one mesh cannot
+/// be replayed into another where the same key is allowlisted (L2).
+const SIG_PREFIX: &str = "openledger-sig-v3";
 
 /// Fields covered by an `openledger-sig-v2` signature.
 ///
@@ -79,16 +81,21 @@ impl std::error::Error for SignatureError {}
 
 /// Build the domain-separated message for signing (§3.8.1).
 ///
+/// `mesh_id` is the node's mesh/ledger identity (the swarm topic). It is bound
+/// into the signature but not carried in the directive: a verifier reconstructs
+/// the message with its *own* mesh id, so a signature made for another mesh fails
+/// to verify (L2). Signing/verifying nodes on the same mesh share the value.
+///
 /// Format:
-/// `openledger-sig-v2|{txid|directiveId}|{content_id}|parents|{parents}|lamport|{lamport}`
-pub fn build_sign_message(message: &SignableMessage<'_>) -> String {
+/// `openledger-sig-v3|{txid|directiveId}|{content_id}|parents|{parents}|lamport|{lamport}|mesh|{mesh_id}`
+pub fn build_sign_message(message: &SignableMessage<'_>, mesh_id: &str) -> String {
     let kind = if message.is_transaction {
         "txid"
     } else {
         "directiveId"
     };
     format!(
-        "{SIG_PREFIX}|{kind}|{content_id}|parents|{parents}|lamport|{lamport}",
+        "{SIG_PREFIX}|{kind}|{content_id}|parents|{parents}|lamport|{lamport}|mesh|{mesh_id}",
         content_id = message.content_id,
         parents = message.parents,
         lamport = message.lamport,
@@ -125,25 +132,36 @@ impl SignatureProvider for NoopSignatureProvider {
 /// Ed25519 signing using the node's Iroh key (§3.8.1).
 pub struct PeerKeySignatureProvider {
     signing_key: SigningKey,
+    /// Mesh/ledger identity (swarm topic) bound into every signature (L2).
+    mesh_id: String,
 }
 
 impl PeerKeySignatureProvider {
-    /// Create from an Ed25519 signing key.
-    pub fn new(signing_key: SigningKey) -> Self {
-        PeerKeySignatureProvider { signing_key }
+    /// Create from an Ed25519 signing key and the node's mesh id (swarm topic).
+    pub fn new(signing_key: SigningKey, mesh_id: String) -> Self {
+        PeerKeySignatureProvider {
+            signing_key,
+            mesh_id,
+        }
     }
 
-    /// Create from raw secret key bytes (32 bytes).
-    pub fn from_bytes(secret_key_bytes: &[u8; 32]) -> Self {
+    /// Create from raw secret key bytes (32 bytes) and the node's mesh id.
+    pub fn from_bytes(secret_key_bytes: &[u8; 32], mesh_id: String) -> Self {
         let signing_key = SigningKey::from_bytes(secret_key_bytes);
-        PeerKeySignatureProvider { signing_key }
+        PeerKeySignatureProvider {
+            signing_key,
+            mesh_id,
+        }
     }
 
-    /// Generate a new random key pair (for testing).
+    /// Generate a new random key pair with an empty mesh id (for testing).
     pub fn generate() -> Self {
         let mut rng = rand::thread_rng();
         let signing_key = SigningKey::generate(&mut rng);
-        PeerKeySignatureProvider { signing_key }
+        PeerKeySignatureProvider {
+            signing_key,
+            mesh_id: String::new(),
+        }
     }
 
     /// The public key (hex-encoded, for `openledger-author`).
@@ -154,7 +172,7 @@ impl PeerKeySignatureProvider {
 
 impl SignatureProvider for PeerKeySignatureProvider {
     fn sign(&self, message: &SignableMessage<'_>) -> Option<String> {
-        let encoded = build_sign_message(message);
+        let encoded = build_sign_message(message, &self.mesh_id);
         let signature = self.signing_key.sign(encoded.as_bytes());
         Some(hex::encode(signature.to_bytes()))
     }
@@ -165,7 +183,7 @@ impl SignatureProvider for PeerKeySignatureProvider {
         signature_hex: &str,
         author_public_key_hex: &str,
     ) -> Result<(), SignatureError> {
-        verify_signature(message, signature_hex, author_public_key_hex)
+        verify_signature(message, signature_hex, author_public_key_hex, &self.mesh_id)
     }
 
     fn is_enabled(&self) -> bool {
@@ -175,11 +193,13 @@ impl SignatureProvider for PeerKeySignatureProvider {
 
 /// Standalone verification function — usable without a provider instance.
 ///
-/// Envelope fields on `message` must match those used when signing (§3.8.1).
+/// Envelope fields on `message` and `mesh_id` must match those used when
+/// signing (§3.8.1 / L2).
 pub fn verify_signature(
     message: &SignableMessage<'_>,
     signature_hex: &str,
     author_public_key_hex: &str,
+    mesh_id: &str,
 ) -> Result<(), SignatureError> {
     // Decode signature.
     let sig_bytes = hex::decode(signature_hex)
@@ -200,7 +220,7 @@ pub fn verify_signature(
     let verifying_key = VerifyingKey::from_bytes(&pk_array)
         .map_err(|e| SignatureError::InvalidPublicKey(e.to_string()))?;
 
-    let encoded = build_sign_message(message);
+    let encoded = build_sign_message(message, mesh_id);
     verifying_key
         .verify(encoded.as_bytes(), &signature)
         .map_err(|e| SignatureError::InvalidSignature(e.to_string()))
@@ -307,23 +327,46 @@ mod tests {
             &sample_message("id", true),
             &hex::encode([0u8; 64]),
             "deadbeef",
+            "",
         );
         assert!(matches!(result, Err(SignatureError::InvalidPublicKey(_))));
     }
 
     #[test]
     fn test_build_sign_message_transaction() {
-        let msg = build_sign_message(&sample_message("abc123", true));
-        assert_eq!(msg, "openledger-sig-v2|txid|abc123|parents||lamport|1");
+        let msg = build_sign_message(&sample_message("abc123", true), "my-org/ledger");
+        assert_eq!(
+            msg,
+            "openledger-sig-v3|txid|abc123|parents||lamport|1|mesh|my-org/ledger"
+        );
     }
 
     #[test]
     fn test_build_sign_message_directive() {
-        let msg = build_sign_message(&sample_message("abc123", false));
+        let msg = build_sign_message(&sample_message("abc123", false), "my-org/ledger");
         assert_eq!(
             msg,
-            "openledger-sig-v2|directiveId|abc123|parents||lamport|1"
+            "openledger-sig-v3|directiveId|abc123|parents||lamport|1|mesh|my-org/ledger"
         );
+    }
+
+    #[test]
+    fn test_mesh_mismatch_fails_verification() {
+        // L2 regression: a signature made for mesh A must not verify against mesh
+        // B, blocking cross-mesh replay when the same key is allowlisted on both.
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let pk_hex = hex::encode(signing_key.verifying_key().as_bytes());
+        let provider_a = PeerKeySignatureProvider::new(signing_key, "mesh-A".to_owned());
+        let message = sample_message("cross-mesh", true);
+        let sig = provider_a.sign(&message).unwrap();
+
+        // Same key, same message, different mesh → must fail.
+        assert!(matches!(
+            verify_signature(&message, &sig, &pk_hex, "mesh-B"),
+            Err(SignatureError::InvalidSignature(_))
+        ));
+        // Correct mesh still verifies.
+        assert!(verify_signature(&message, &sig, &pk_hex, "mesh-A").is_ok());
     }
 
     #[test]
@@ -382,7 +425,7 @@ mod tests {
         let message = sample_message("standalone_test", true);
         let sig = provider.sign(&message).unwrap();
 
-        let result = verify_signature(&message, &sig, &provider.public_key_hex());
+        let result = verify_signature(&message, &sig, &provider.public_key_hex(), "");
         assert!(result.is_ok());
     }
 
@@ -498,6 +541,7 @@ mod tests {
             &sample_message(content_id, true),
             &directive_sig,
             &provider.public_key_hex(),
+            "",
         );
         assert!(
             matches!(result, Err(SignatureError::InvalidSignature(_))),
@@ -507,6 +551,7 @@ mod tests {
             &directive_message,
             &directive_sig,
             &provider.public_key_hex(),
+            "",
         );
         assert!(result.is_ok());
     }

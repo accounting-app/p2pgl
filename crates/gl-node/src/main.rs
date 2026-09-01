@@ -183,6 +183,7 @@ async fn main() {
                     orphan_buffer: orphan_buffer.clone(),
                     allowlist: peer_node.allowlist().clone(),
                     signing_enabled: config.signing.enabled,
+                    swarm_topic: config.p2p.swarm_topic.clone(),
                 };
                 p2p_router = Some(p2p_service::spawn_router(&peer_node, handler.clone()));
                 let sender = p2p_service::spawn_gossip_loop(&peer_node, handler.clone());
@@ -351,7 +352,12 @@ fn build_signature_provider(config: &NodeConfig) -> Arc<dyn security::signing::S
         let key_path = std::path::Path::new(&config.p2p.secret_key_path);
         match p2p_service::read_secret_key_bytes(key_path) {
             Ok(key_bytes) => {
-                let provider = security::signing::PeerKeySignatureProvider::from_bytes(&key_bytes);
+                // Bind signatures to this node's mesh identity (swarm topic) so
+                // they cannot be replayed into another mesh (L2).
+                let provider = security::signing::PeerKeySignatureProvider::from_bytes(
+                    &key_bytes,
+                    config.p2p.swarm_topic.clone(),
+                );
                 info!(public_key = %provider.public_key_hex(), "signing enabled");
                 Arc::new(provider)
             }

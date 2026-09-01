@@ -19,7 +19,7 @@ Ordered by fix priority. Each task lists the source finding, the change, the fil
 | T8 | M2 — Unauth mutations on public bind | Med | S | ☑ |
 | T9 | M6 — Quadratic DAG insertion | Med | M | ☑ |
 | T10 | M7 — Unpinned CI actions | Med | S | ☑ |
-| T11 | L2 — Signature domain omits mesh id | Low | S | ☐ |
+| T11 | L2 — Signature domain omits mesh id | Low | S | ☑ |
 | T12 | L3 — Path leak in GraphQL errors | Low | S | ☐ |
 | T13 | L6 — Temp-file symlink follow | Low | S | ☐ |
 | T14 | L5 — Non-injective txid serialization | Low | S | ☐ |
@@ -91,7 +91,7 @@ Effort: S = <½ day, M = ~1–2 days.
 - **Files:** `.github/workflows/ci.yml:15,18,30` — pin `dtolnay/rust-toolchain`, `Swatinem/rust-cache`, `rustsec/audit-check` to full SHAs.
 - **Verify:** CI still green; refs are 40-hex SHAs.
 
-### ☐ T11 — Bind signature domain to mesh/ledger identity (L2)
+### ☑ T11 — Bind signature domain to mesh/ledger identity (L2)
 - **Change:** Add the swarm topic / mesh id into the signed message so directives can't be replayed across meshes. Fold into the T4 domain bump.
 - **Files:** `crates/security/src/signing.rs:64-71`.
 

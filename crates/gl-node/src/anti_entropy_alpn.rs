@@ -30,6 +30,8 @@ pub struct AntiEntropyHandler {
     pub orphan_buffer: Arc<RwLock<OrphanBuffer>>,
     pub allowlist: PeerAllowlist,
     pub signing_enabled: bool,
+    /// This node's mesh identity (swarm topic), bound into signature checks (L2).
+    pub swarm_topic: String,
 }
 
 impl std::fmt::Debug for AntiEntropyHandler {
@@ -243,7 +245,9 @@ async fn apply_supply_entries(
                     warn!(%error, peer = %remote, "rejected ALPN supply: author not allowlisted");
                     continue;
                 }
-                if let Err(error) = verify_remote_signature(&directive, handler.signing_enabled) {
+                if let Err(error) =
+                    verify_remote_signature(&directive, handler.signing_enabled, &handler.swarm_topic)
+                {
                     warn!(%error, peer = %remote, "rejected ALPN supply: signature");
                     continue;
                 }
@@ -277,6 +281,7 @@ async fn apply_supply_entries(
                             &handler.broadcast,
                             handler.signing_enabled,
                             &handler.allowlist,
+                            &handler.swarm_topic,
                         )
                         .await;
                     }
@@ -296,6 +301,7 @@ pub async fn drain_orphans(
     broadcast: &TransactionBroadcast,
     signing_enabled: bool,
     allowlist: &PeerAllowlist,
+    mesh_id: &str,
 ) {
     let mut dag_ids = service.all_directive_ids();
     let mut buffer = orphan_buffer.write().await;
@@ -311,7 +317,9 @@ pub async fn drain_orphans(
                         warn!(%error, "rejected resolved orphan: author");
                         continue;
                     }
-                    if let Err(error) = verify_remote_signature(&entry.directive, signing_enabled) {
+                    if let Err(error) =
+                        verify_remote_signature(&entry.directive, signing_enabled, mesh_id)
+                    {
                         warn!(%error, "rejected resolved orphan: signature");
                         continue;
                     }
@@ -433,6 +441,7 @@ mod tests {
             orphan_buffer: Arc::new(RwLock::new(OrphanBuffer::new())),
             allowlist,
             signing_enabled: false,
+            swarm_topic: String::new(),
         }
     }
 
