@@ -9,7 +9,7 @@ use super::types::Transaction;
 use super::{GossipSender, SharedLedger};
 
 use ledger::model::{Amount, CostSpec, Flag, PriceSpec};
-use ledger::service::{PostingInput, TransactionInput};
+use ledger::service::{PostingInput, ServiceError, TransactionInput};
 use security::signing::{SignableMessage, SignatureProvider};
 
 /// GraphQL mutation root. All mutations acquire a write lock on `SharedLedger`.
@@ -85,10 +85,7 @@ impl MutationRoot {
                     })
                 })
             })
-            .map_err(|e| {
-                async_graphql::Error::new(e.to_string())
-                    .extend_with(|_, ext| ext.set("code", e.error_code()))
-            })?;
+            .map_err(service_error_to_graphql)?;
 
         // Look up the just-inserted transaction to return it.
         let txn = svc
@@ -150,10 +147,7 @@ impl MutationRoot {
                     })
                 },
             )
-            .map_err(|e| {
-                async_graphql::Error::new(e.to_string())
-                    .extend_with(|_, ext| ext.set("code", e.error_code()))
-            })?;
+            .map_err(service_error_to_graphql)?;
 
         gossip_if_present(ctx, &svc, &_content_id).await;
         Ok(true)
@@ -184,14 +178,30 @@ impl MutationRoot {
                     })
                 })
             })
-            .map_err(|e| {
-                async_graphql::Error::new(e.to_string())
-                    .extend_with(|_, ext| ext.set("code", e.error_code()))
-            })?;
+            .map_err(service_error_to_graphql)?;
 
         gossip_if_present(ctx, &svc, &_content_id).await;
         Ok(true)
     }
+}
+
+/// Convert a `ServiceError` into a client-facing GraphQL error.
+///
+/// `Io` errors can embed filesystem paths and OS details (L3), so they are
+/// collapsed to a generic message and the underlying error is logged
+/// server-side only. Other variants carry no sensitive data and are surfaced
+/// as-is to help API callers correct their request. The machine-readable `code`
+/// is preserved in every case.
+fn service_error_to_graphql(error: ServiceError) -> async_graphql::Error {
+    let code = error.error_code();
+    let message = match &error {
+        ServiceError::Io(io_error) => {
+            tracing::error!(%io_error, "ledger I/O error serving mutation");
+            "internal storage error".to_owned()
+        }
+        _ => error.to_string(),
+    };
+    async_graphql::Error::new(message).extend_with(|_, ext| ext.set("code", code))
 }
 
 async fn gossip_if_present(
@@ -204,5 +214,38 @@ async fn gossip_if_present(
     };
     if let Ok(sender) = ctx.data::<GossipSender>() {
         let _ = sender.send(directive).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn test_io_error_message_is_generic_and_hides_path() {
+        // L3 regression: an I/O error must not surface the on-disk path to the
+        // GraphQL caller.
+        let secret_path = "/srv/private/ledger.bean.tmp";
+        let error = ServiceError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{secret_path}: permission denied"),
+        ));
+        let gql = service_error_to_graphql(error);
+        assert_eq!(gql.message, "internal storage error");
+        assert!(
+            !gql.message.contains(secret_path),
+            "GraphQL error must not leak the filesystem path"
+        );
+    }
+
+    #[test]
+    fn test_non_io_error_message_is_preserved() {
+        // Non-I/O errors carry no sensitive data and stay actionable for callers.
+        let error = ServiceError::InvalidInput {
+            message: "both cost and price on posting".to_owned(),
+        };
+        let gql = service_error_to_graphql(error);
+        assert_eq!(gql.message, "both cost and price on posting");
     }
 }

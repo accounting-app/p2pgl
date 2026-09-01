@@ -20,7 +20,7 @@ Ordered by fix priority. Each task lists the source finding, the change, the fil
 | T9 | M6 — Quadratic DAG insertion | Med | M | ☑ |
 | T10 | M7 — Unpinned CI actions | Med | S | ☑ |
 | T11 | L2 — Signature domain omits mesh id | Low | S | ☑ |
-| T12 | L3 — Path leak in GraphQL errors | Low | S | ☐ |
+| T12 | L3 — Path leak in GraphQL errors | Low | S | ☑ |
 | T13 | L6 — Temp-file symlink follow | Low | S | ☐ |
 | T14 | L5 — Non-injective txid serialization | Low | S | ☐ |
 | T15 | L4 — API-key length timing | Low | S | ☐ |
@@ -95,7 +95,7 @@ Effort: S = <½ day, M = ~1–2 days.
 - **Change:** Add the swarm topic / mesh id into the signed message so directives can't be replayed across meshes. Fold into the T4 domain bump.
 - **Files:** `crates/security/src/signing.rs:64-71`.
 
-### ☐ T12 — Stop leaking filesystem paths in GraphQL errors (L3)
+### ☑ T12 — Stop leaking filesystem paths in GraphQL errors (L3)
 - **Change:** Map `ServiceError::Io` to a generic client message; log the detailed error server-side only.
 - **Files:** `crates/gl-node/src/graphql/mutation.rs:81-84,136-139,165-168`.
 
