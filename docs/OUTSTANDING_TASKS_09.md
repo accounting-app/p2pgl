@@ -13,7 +13,7 @@ Already closed before this backlog — do not re-do: 09/01 **M-01** (strict inbo
 
 | # | Findings addressed | Sev | Effort | Status |
 |---|---|---|---|---|
-| T18 | H-02 — sync senders violate receive caps (mesh wedge) | High | S–M | ☐ |
+| T18 | H-02 — sync senders violate receive caps (mesh wedge) | High | S–M | ☑ |
 | T19 | H-05 + H-01 — ineffective body limit; CSRF/DNS rebinding | High | S | ☐ |
 | T20 | H-04 — signed-year dates brick boot | High | S | ☐ |
 | T21 | H-03 + H-06 + L-26 + L-29 — remote-body canonicalization | High | S–M | ☐ |
@@ -45,7 +45,8 @@ H-01→T19 · H-02→T18 · H-03→T21 · H-04→T20 · H-05→T19 · H-06→T21
 
 ## Tier 1 — ship-blockers (fix before any multi-node or exposed deployment)
 
-### ☐ T18 — Send-side protocol caps + chunking (H-02)
+### ☑ T18 — Send-side protocol caps + chunking (H-02)
+> **Done 2026-09-02 (in working tree, not yet committed).** Supply replies truncated to ≤256 entries / 15 MiB budget with a client re-Want progress loop; HaveHeads paginated via an additive `more` flag (client accumulation capped at 1M ids against malicious streaming); Want chunks tightened to 256; `to_wire()` now errors past 16 MiB. Property tests assert every sender page/frame decodes under the receive caps; `two_node_catchup_beyond_caps` (1,500 directives) proves end-to-end convergence and was shown to fail against the pre-fix senders; `two_node_catchup_beyond_have_heads_cap` (4,300, exercises pagination) passes in ~102 s but is `#[ignore]`d until T27 removes the O(N²) per-insert persist — run it manually or nightly. `three_node_alpn_convergence` de-flaked (network-test mutex, readiness waits, 60 s deadline).
 - **Why first:** the mesh wedges itself with no attacker once any ledger exceeds 4,096 directives or any node falls >256 behind. Ship-blocker.
 - **Change:** three send sites must respect the receive caps they are decoded under: (1) chunk Supply replies to ≤ `MAX_SUPPLY_ENTRIES` (256) entries per `WireMessage`; (2) budget frames to ≤ `MAX_MESSAGE_SIZE` (16 MiB) — check in `to_wire()` or size-aware batching in `collect_supply`; (3) paginate or digest-summarize `make_have_heads` to ≤ `MAX_HAVE_HEADS` (4096) — windowed exchange or heads-plus-digest.
 - **Files:** [anti_entropy_alpn.rs:84-87,223-233](../crates/gl-node/src/anti_entropy_alpn.rs#L84-L87), [anti_entropy.rs:42-52](../crates/p2p/src/anti_entropy.rs#L42-L52), [protocol.rs:188-195](../crates/p2p/src/protocol.rs#L188-L195).
@@ -87,7 +88,7 @@ H-01→T19 · H-02→T18 · H-03→T21 · H-04→T20 · H-05→T19 · H-06→T21
 - **Verify:** flood of unique announce ids → tasks and dials stay bounded; duplicate announces of one id cause one fetch; repeated bad ids are negative-cached.
 
 ### ☐ T24 — Session timeouts + concurrent peer exchanges (M-06)
-- **Change:** `tokio::time::timeout` around every connect/read/write in the ALPN session paths; run per-peer anti-entropy exchanges concurrently (bounded) instead of the serial loop where one tarpit peer stalls all replication.
+- **Change:** `tokio::time::timeout` around every connect/read/write in the ALPN session paths; run per-peer anti-entropy exchanges concurrently (bounded) instead of the serial loop where one tarpit peer stalls all replication. Also add a per-connection request budget to `serve_anti_entropy` (T18 review note: one stream can still issue unlimited HaveHeads/Want rounds — each now cheap, but unbudgeted).
 - **Files:** [anti_entropy_alpn.rs:350-371](../crates/gl-node/src/anti_entropy_alpn.rs#L350-L371) and session loops, [p2p_service.rs:250-258](../crates/gl-node/src/p2p_service.rs#L250-L258).
 - **Verify:** a peer that accepts and never responds is timed out and does not delay other peers' sync round.
 

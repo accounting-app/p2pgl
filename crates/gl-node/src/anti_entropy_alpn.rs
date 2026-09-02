@@ -4,6 +4,7 @@
 //! peer whose QUIC `EndpointId` is the connection remote. `openledger-author`
 //! must also be on the same allowlist (H-14).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -19,8 +20,15 @@ use crate::graphql::SharedLedger;
 use p2p::allowlist::PeerAllowlist;
 use p2p::gossip::make_supply_entry;
 use p2p::orphan_buffer::OrphanBuffer;
-use p2p::protocol::{WireMessage, MAX_MESSAGE_SIZE, MAX_WANT_IDS};
+use p2p::protocol::{WireMessage, MAX_MESSAGE_SIZE, MAX_SUPPLY_ENTRIES};
 use p2p::union_merge::{validate_supply_entry, verify_author_allowlisted, verify_remote_signature};
+
+/// Cap on ids accumulated across one peer's paginated `HaveHeads` advert (H-02).
+///
+/// Pagination lets an honest peer advertise a ledger of any size, but it also
+/// lets a malicious one stream pages forever. A million ids is far past any
+/// ledger the 64 MiB file cap permits, so honest peers never approach it.
+const MAX_ACCUMULATED_HAVE_HEADS: usize = 1_048_576;
 
 /// Shared handler registered on `openledger/anti-entropy/1`.
 #[derive(Clone)]
@@ -77,13 +85,22 @@ async fn serve_anti_entropy(
             Err(error) => return Err(error),
         };
         match message {
+            // A non-final page of the peer's advert (H-02): its content is not
+            // used — we always answer with our own full state — so wait for the
+            // final page and reply exactly once per advert, keeping the session
+            // lockstep.
+            WireMessage::HaveHeads { more: true, .. } => {}
             WireMessage::HaveHeads { .. } => {
-                let reply = local_have_heads(&handler.ledger).await;
-                write_message(&mut send, &reply).await?;
+                for page in local_have_heads_pages(&handler.ledger).await {
+                    write_message(&mut send, &page).await?;
+                }
             }
             WireMessage::Want { ids, .. } => {
+                // One Supply per Want, trimmed to what the requester can decode
+                // (H-02); it re-Wants any tail we could not fit.
                 let entries = collect_supply(&handler.ledger, &ids).await;
-                write_message(&mut send, &WireMessage::supply(entries)).await?;
+                let reply = p2p::anti_entropy::truncate_supply(entries);
+                write_message(&mut send, &reply).await?;
             }
             WireMessage::Supply { entries, .. } => {
                 apply_supply_entries(handler, entries, remote).await;
@@ -160,16 +177,8 @@ async fn run_want_session(
         .open_bi()
         .await
         .map_err(|error| error.to_string())?;
-    for chunk in ids.chunks(MAX_WANT_IDS) {
-        write_message(&mut send, &WireMessage::want(chunk.to_vec())).await?;
-        match read_message(&mut recv).await? {
-            WireMessage::Supply { entries, .. } => {
-                apply_supply_entries(handler, entries, remote).await;
-            }
-            other => {
-                warn!(peer = %remote, ?other, "expected Supply on want session");
-            }
-        }
+    for chunk in ids.chunks(MAX_SUPPLY_ENTRIES) {
+        fetch_want_chunk(&mut send, &mut recv, chunk, handler, remote).await?;
     }
     let _ = send.finish();
     Ok(())
@@ -184,15 +193,10 @@ async fn run_head_exchange(
         .open_bi()
         .await
         .map_err(|error| error.to_string())?;
-    write_message(&mut send, &local_have_heads(&handler.ledger).await).await?;
-    let WireMessage::HaveHeads {
-        head_txids,
-        directive_ids,
-        ..
-    } = read_message(&mut recv).await?
-    else {
-        return Err("expected HaveHeads from peer".to_owned());
-    };
+    for page in local_have_heads_pages(&handler.ledger).await {
+        write_message(&mut send, &page).await?;
+    }
+    let (head_txids, directive_ids) = read_have_heads_advert(&mut recv, remote).await?;
     let want = {
         let svc = handler.ledger.read().await;
         p2p::anti_entropy::compute_want(
@@ -202,27 +206,92 @@ async fn run_head_exchange(
             &directive_ids,
         )
     };
-    for chunk in want.chunks(MAX_WANT_IDS) {
-        if chunk.is_empty() {
-            continue;
-        }
-        write_message(&mut send, &WireMessage::want(chunk.to_vec())).await?;
-        match read_message(&mut recv).await? {
-            WireMessage::Supply { entries, .. } => {
-                apply_supply_entries(handler, entries, remote).await;
-            }
-            other => {
-                warn!(peer = %remote, ?other, "expected Supply after Want");
-            }
-        }
+    for chunk in want.chunks(MAX_SUPPLY_ENTRIES) {
+        fetch_want_chunk(&mut send, &mut recv, chunk, handler, remote).await?;
     }
     let _ = send.finish();
     Ok(())
 }
 
-async fn local_have_heads(ledger: &SharedLedger) -> WireMessage {
+/// Read one peer's `HaveHeads` advert, following `more` pages (H-02).
+///
+/// Returns the accumulated head txids and directive ids.
+async fn read_have_heads_advert(
+    recv: &mut RecvStream,
+    remote: EndpointId,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut head_txids: Vec<String> = Vec::new();
+    let mut directive_ids: Vec<String> = Vec::new();
+    loop {
+        let WireMessage::HaveHeads {
+            head_txids: page_heads,
+            directive_ids: page_directives,
+            more,
+            ..
+        } = read_message(recv).await?
+        else {
+            return Err("expected HaveHeads from peer".to_owned());
+        };
+        head_txids.extend(page_heads);
+        directive_ids.extend(page_directives);
+        if head_txids.len() > MAX_ACCUMULATED_HAVE_HEADS
+            || directive_ids.len() > MAX_ACCUMULATED_HAVE_HEADS
+        {
+            return Err(format!(
+                "peer {remote} advertised more than {MAX_ACCUMULATED_HAVE_HEADS} ids"
+            ));
+        }
+        if !more {
+            return Ok((head_txids, directive_ids));
+        }
+    }
+}
+
+/// Request one chunk of ids and drain the peer's replies (H-02).
+///
+/// A `Supply` may be a strict prefix of what was asked — the peer trims to its
+/// frame budget — so re-`Want` whatever did not arrive until a round makes no
+/// progress. Progress is measured against the ids the peer *served*, not the
+/// ones we accepted: an entry we reject as invalid must end the loop, not spin
+/// it forever.
+async fn fetch_want_chunk(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    chunk: &[String],
+    handler: &AntiEntropyHandler,
+    remote: EndpointId,
+) -> Result<(), String> {
+    let mut remaining: Vec<String> = chunk.to_vec();
+    while !remaining.is_empty() {
+        write_message(send, &WireMessage::want(remaining.clone())).await?;
+        let entries = match read_message(recv).await? {
+            WireMessage::Supply { entries, .. } => entries,
+            other => {
+                warn!(peer = %remote, ?other, "expected Supply after Want");
+                return Ok(());
+            }
+        };
+        let served: HashSet<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+        let next: Vec<String> = remaining
+            .iter()
+            .filter(|id| !served.contains(id.as_str()))
+            .cloned()
+            .collect();
+        let stalled = next.len() == remaining.len();
+        apply_supply_entries(handler, entries, remote).await;
+        if stalled {
+            // The peer served none of what we asked for: it does not have them,
+            // or the reply was empty. Another round would ask the same thing.
+            return Ok(());
+        }
+        remaining = next;
+    }
+    Ok(())
+}
+
+async fn local_have_heads_pages(ledger: &SharedLedger) -> Vec<WireMessage> {
     let svc = ledger.read().await;
-    p2p::anti_entropy::make_have_heads(&svc.head_txids(), &svc.all_directive_ids())
+    p2p::anti_entropy::paginate_have_heads(&svc.head_txids(), &svc.all_directive_ids())
 }
 
 async fn collect_supply(ledger: &SharedLedger, ids: &[String]) -> Vec<p2p::protocol::SupplyEntry> {
@@ -373,6 +442,7 @@ async fn read_message(recv: &mut RecvStream) -> Result<WireMessage, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::LazyLock;
     use std::time::Duration;
 
     use chrono::NaiveDate;
@@ -382,6 +452,15 @@ mod tests {
     use ledger::model::{Amount, Flag};
     use ledger::service::{LedgerService, PostingInput, TransactionInput};
     use rust_decimal_macros::dec;
+
+    /// Serializes the network tests in this module.
+    ///
+    /// They each bind several real QUIC endpoints and converge on wall-clock
+    /// deadlines; run concurrently under `cargo test` they starve one another's
+    /// runtimes and the deadlines flake. Every network test below holds this
+    /// for its whole body.
+    static NET_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     async fn bind_direct_endpoint() -> Endpoint {
         Endpoint::builder(presets::Minimal)
@@ -450,16 +529,12 @@ mod tests {
     /// R6 / SPEC M6: three direct-only endpoints converge over ALPN (no N0 relay).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn three_node_alpn_convergence() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
         let endpoint_zero = bind_direct_endpoint().await;
         let endpoint_one = bind_direct_endpoint().await;
         let endpoint_two = bind_direct_endpoint().await;
 
-        wait_until_dialable(&endpoint_zero).await;
-        wait_until_dialable(&endpoint_one).await;
-        wait_until_dialable(&endpoint_two).await;
-
-        let addr_zero = endpoint_zero.addr();
-        let addr_one = endpoint_one.addr();
         let id_zero = endpoint_zero.id();
         let id_one = endpoint_one.id();
         let id_two = endpoint_two.id();
@@ -525,9 +600,17 @@ mod tests {
             .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler_two.clone())
             .spawn();
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Wait for real addresses instead of a fixed sleep: on a loaded machine
+        // 200 ms is not always enough for the endpoints to advertise an IP, and
+        // the first dial then fails for a reason the retry loop cannot see.
+        wait_until_dialable(&endpoint_zero).await;
+        wait_until_dialable(&endpoint_one).await;
+        wait_until_dialable(&endpoint_two).await;
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let addr_zero = endpoint_zero.addr();
+        let addr_one = endpoint_one.addr();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         loop {
             exchange_with_peer(&endpoint_one, addr_zero.clone(), &handler_one).await;
             exchange_with_peer(&endpoint_two, addr_one.clone(), &handler_two).await;
@@ -553,5 +636,107 @@ mod tests {
         let _ = router_zero.shutdown().await;
         let _ = router_one.shutdown().await;
         let _ = router_two.shutdown().await;
+    }
+
+    /// Write a `.bean` file holding `count` distinct `open` directives.
+    ///
+    /// Built as text so the source node can boot a large ledger in one shot;
+    /// `openledger-author` is required on the receive path (H-14), and is not
+    /// part of the economic body, so every directive still hashes distinctly by
+    /// its account name alone.
+    fn write_open_directive_ledger(path: &std::path::Path, count: usize, author: &str) {
+        use std::fmt::Write as _;
+
+        let mut content = String::new();
+        for index in 0..count {
+            writeln!(content, "2024-01-01 open Assets:Acct{index:05}").expect("write to String");
+            writeln!(content, "  openledger-author: \"{author}\"").expect("write to String");
+            content.push('\n');
+        }
+        std::fs::write(path, content).expect("write source ledger");
+    }
+
+    /// One-way catch-up of a ledger too big for a single frame of any kind.
+    ///
+    /// The source serves; the sink starts empty and pulls until it matches.
+    async fn run_catchup_beyond_caps(directive_count: usize, timeout: Duration) {
+        let endpoint_source = bind_direct_endpoint().await;
+        let endpoint_sink = bind_direct_endpoint().await;
+
+        let id_source = endpoint_source.id();
+        let id_sink = endpoint_sink.id();
+
+        let allow_source = PeerAllowlist::parse(&[id_sink.to_string()]).expect("allowlist source");
+        let allow_sink = PeerAllowlist::parse(&[id_source.to_string()]).expect("allowlist sink");
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let source_path = temp_dir.path().join("source.bean");
+        write_open_directive_ledger(&source_path, directive_count, &id_source.to_string());
+
+        let ledger_source: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(source_path, id_source.to_string()).expect("boot source ledger"),
+        ));
+        let ledger_sink: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("sink.bean"), id_sink.to_string())
+                .expect("boot sink ledger"),
+        ));
+
+        let source_count = ledger_source.read().await.directive_count();
+        assert_eq!(source_count, directive_count, "source ledger boot count");
+        assert_eq!(
+            ledger_sink.read().await.directive_count(),
+            0,
+            "sink starts empty"
+        );
+
+        let handler_source = make_handler(ledger_source.clone(), allow_source);
+        let handler_sink = make_handler(ledger_sink.clone(), allow_sink);
+
+        let router_source = Router::builder(endpoint_source.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler_source.clone())
+            .spawn();
+
+        wait_until_dialable(&endpoint_source).await;
+        wait_until_dialable(&endpoint_sink).await;
+        let addr_source = endpoint_source.addr();
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            exchange_with_peer(&endpoint_sink, addr_source.clone(), &handler_sink).await;
+            let count = ledger_sink.read().await.directive_count();
+            if count == source_count {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                let _ = router_source.shutdown().await;
+                panic!("H-02: sink never caught up: source={source_count} sink={count}");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let _ = router_source.shutdown().await;
+    }
+
+    /// H-02: 1_500 directives is past both the 256-entry `Supply` cap and the
+    /// 1_024-id `Want` cap, so the pre-fix senders wedge here — the server
+    /// answered a 1_024-id `Want` with one oversized `Supply` that the client's
+    /// own `decode_checked` then rejected, forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_node_catchup_beyond_caps() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+        run_catchup_beyond_caps(1_500, Duration::from_secs(180)).await;
+    }
+
+    /// H-02: 4_300 directives additionally crosses `MAX_HAVE_HEADS` (4_096), so
+    /// the head advert itself has to paginate.
+    ///
+    /// Ignored by default because the receiving side re-serializes and fsyncs
+    /// the whole `.bean` file on every single insert, making catch-up O(N²) IO.
+    /// That cost is T27's to fix, not this test's; run it manually or nightly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "slow: run manually / nightly"]
+    async fn two_node_catchup_beyond_have_heads_cap() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+        run_catchup_beyond_caps(4_300, Duration::from_secs(900)).await;
     }
 }

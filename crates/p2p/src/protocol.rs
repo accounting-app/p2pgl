@@ -24,6 +24,14 @@ pub const MAX_WANT_IDS: usize = 1024;
 /// Maximum `HaveHeads` id lists in one message (H-2).
 pub const MAX_HAVE_HEADS: usize = 4096;
 
+/// Sender-side byte budget for one `Supply` frame (H-02).
+///
+/// `MAX_SUPPLY_ENTRIES` alone does not bound the frame: 256 entries with a
+/// 1 MiB `economic_bean` each is far past `MAX_MESSAGE_SIZE`. Senders fill a
+/// `Supply` up to this budget, leaving 1 MiB of headroom under the 16 MiB
+/// receive cap for CBOR framing overhead.
+pub const SUPPLY_FRAME_BUDGET_BYTES: usize = 15 * 1024 * 1024;
+
 // ─── Message types ───────────────────────────────────────────────────────────
 
 /// A wire protocol message (§3.4.1).
@@ -45,6 +53,13 @@ pub enum WireMessage {
         head_txids: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         directive_ids: Vec<String>,
+        /// More pages of this advert follow (H-02). A ledger with more than
+        /// `MAX_HAVE_HEADS` ids cannot be advertised in one frame, so the
+        /// advert is paginated. Absent on the wire when `false`, and defaulted
+        /// to `false` on decode, so both directions stay compatible with peers
+        /// that predate the field.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        more: bool,
     },
 
     /// Request missing directives by ID.
@@ -93,12 +108,24 @@ impl WireMessage {
         }
     }
 
-    /// Create a have_heads message.
+    /// Create a have_heads message (single, final page).
     pub fn have_heads(head_txids: Vec<String>, directive_ids: Vec<String>) -> Self {
+        Self::have_heads_page(head_txids, directive_ids, false)
+    }
+
+    /// Create one page of a paginated have_heads advert (H-02).
+    ///
+    /// `more` is `true` on every page but the last.
+    pub fn have_heads_page(
+        head_txids: Vec<String>,
+        directive_ids: Vec<String>,
+        more: bool,
+    ) -> Self {
         WireMessage::HaveHeads {
             v: WIRE_VERSION,
             head_txids,
             directive_ids,
+            more,
         }
     }
 
@@ -185,8 +212,19 @@ impl WireMessage {
     }
 
     /// Encode with the length-prefixed wire format: `uint32_be || cbor_body`.
+    ///
+    /// Fails rather than emitting a frame every conforming receiver must reject
+    /// (H-02). Senders are expected to stay under budget by construction — see
+    /// `SUPPLY_FRAME_BUDGET_BYTES` and `anti_entropy::paginate_have_heads` —
+    /// so this is a backstop, not the primary bound.
     pub fn to_wire(&self) -> Result<Vec<u8>, String> {
         let cbor = self.to_cbor()?;
+        if cbor.len() > MAX_MESSAGE_SIZE as usize {
+            return Err(format!(
+                "wire message is {} bytes (max {MAX_MESSAGE_SIZE})",
+                cbor.len()
+            ));
+        }
         let len = cbor.len() as u32;
         let mut buf = Vec::with_capacity(4 + cbor.len());
         buf.extend_from_slice(&len.to_be_bytes());
@@ -407,6 +445,39 @@ mod tests {
             WireMessage::decode_checked(&cbor),
             Err(WireError::BatchTooLarge { kind: "supply", .. })
         ));
+    }
+
+    /// H-02: `more` is omitted when false, so a paginating peer stays readable
+    /// by one that predates the field (and vice versa: it defaults to false).
+    #[test]
+    fn test_have_heads_more_is_wire_compatible() {
+        let msg = WireMessage::have_heads(vec!["tx1".to_owned()], vec!["dir1".to_owned()]);
+        let cbor = msg.to_cbor().unwrap();
+        assert!(
+            !cbor.windows(4).any(|window| window == b"more"),
+            "more: false must not appear on the wire"
+        );
+        assert_eq!(WireMessage::decode_checked(&cbor).unwrap(), msg);
+
+        let paged =
+            WireMessage::have_heads_page(vec!["tx1".to_owned()], vec!["dir1".to_owned()], true);
+        let cbor = paged.to_cbor().unwrap();
+        assert_eq!(WireMessage::decode_checked(&cbor).unwrap(), paged);
+    }
+
+    /// H-02: `to_wire` refuses a frame that every receiver would reject.
+    #[test]
+    fn test_to_wire_rejects_oversized_frame() {
+        let entries: Vec<SupplyEntry> = (0..17)
+            .map(|index| SupplyEntry {
+                id: format!("{index:064x}"),
+                kind: DirectiveKind::Open,
+                economic_bean: "x".repeat(1024 * 1024),
+                envelope: BTreeMap::new(),
+            })
+            .collect();
+        let error = WireMessage::supply(entries).to_wire().unwrap_err();
+        assert!(error.contains("max"), "unexpected error: {error}");
     }
 
     #[test]
