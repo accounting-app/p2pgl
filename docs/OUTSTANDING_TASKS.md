@@ -23,7 +23,7 @@ Ordered by fix priority. Each task lists the source finding, the change, the fil
 | T12 | L3 — Path leak in GraphQL errors | Low | S | ☑ |
 | T13 | L6 — Temp-file symlink follow | Low | S | ☑ |
 | T14 | L5 — Non-injective txid serialization | Low | S | ☑ |
-| T15 | L4 — API-key length timing | Low | S | ☐ |
+| T15 | L4 — API-key length timing | Low | S | ☑ |
 | T16 | L7 — File-watcher missed change | Low | S | ☐ |
 | T17 | Add `overflow-checks` + fuzz/panic regression harness | — | M | ☐ |
 
@@ -108,7 +108,7 @@ Effort: S = <½ day, M = ~1–2 days.
 - **Files:** `crates/ledger/src/serialize.rs:133-136`.
 - **Verify:** Test that the two transactions hash to different txids.
 
-### ☐ T15 — Remove API-key length timing side-channel (L4)
+### ☑ T15 — Remove API-key length timing side-channel (L4)
 - **Change:** Compare against a fixed-length hash of the key (e.g. compare SHA-256 digests) so response time is independent of guess length.
 - **Files:** `crates/gl-node/src/auth.rs:58-66`.
 

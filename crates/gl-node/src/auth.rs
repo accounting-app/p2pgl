@@ -4,6 +4,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 /// Shared auth state for the middleware layer.
@@ -53,16 +54,18 @@ pub async fn auth_middleware(
 
 /// Constant-time API key comparison (C-1).
 ///
-/// Length mismatches still perform a dummy compare so the failure path is not a
-/// pure short-circuit on the first differing byte of the secret.
+/// Both keys are reduced to fixed-length SHA-256 digests before the constant-time
+/// compare, so there is no length-mismatch branch: the comparison time is
+/// independent of key length and the secret's length does not leak through timing.
+/// (Hashing the provided key takes time proportional to *its* length, which the
+/// attacker already controls and knows; the secret's length stays hidden.)
 fn api_key_matches(provided: &str, expected: &str) -> bool {
-    let provided_bytes = provided.as_bytes();
-    let expected_bytes = expected.as_bytes();
-    if provided_bytes.len() != expected_bytes.len() {
-        let _ = expected_bytes.ct_eq(expected_bytes);
-        return false;
-    }
-    provided_bytes.ct_eq(expected_bytes).into()
+    let provided_digest = Sha256::digest(provided.as_bytes());
+    let expected_digest = Sha256::digest(expected.as_bytes());
+    provided_digest
+        .as_slice()
+        .ct_eq(expected_digest.as_slice())
+        .into()
 }
 
 #[cfg(test)]
@@ -154,5 +157,12 @@ mod tests {
     fn test_api_key_matches_rejects_length_mismatch() {
         assert!(!api_key_matches("short", "test-secret"));
         assert!(!api_key_matches("test-secret-extra", "test-secret"));
+    }
+
+    #[test]
+    fn test_api_key_matches_rejects_same_length_wrong_key() {
+        // Same length as the secret but wrong value — exercises the digest
+        // compare path (both are 11 bytes).
+        assert!(!api_key_matches("test-secreX", "test-secret"));
     }
 }
