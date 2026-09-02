@@ -9,6 +9,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
+
 /// Configuration for the file watcher.
 #[derive(Debug, Clone)]
 pub struct FileWatcherConfig {
@@ -33,7 +35,7 @@ impl Default for FileWatcherConfig {
 /// File change detection result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileChangeKind {
-    /// File was modified (size or mtime changed).
+    /// File was modified (content hash, size, or mtime changed).
     Modified,
     /// File was created (didn't exist before).
     Created,
@@ -50,19 +52,39 @@ pub struct FileState {
     pub size: Option<u64>,
     /// Last known modification time.
     pub modified: Option<std::time::SystemTime>,
+    /// SHA-256 of the file contents, when the file exists and was readable.
+    ///
+    /// This is the authoritative change signal: an edit that preserves both
+    /// size and mtime (e.g. an in-place rewrite within one coarse mtime tick)
+    /// still changes the hash, so it is not misclassified as `Unchanged` (L7).
+    pub content_hash: Option<[u8; 32]>,
 }
 
 impl FileState {
-    /// Create from a file path. Returns `None` if the file doesn't exist.
+    /// Create from a file path. Absent size/hash mean the file doesn't exist
+    /// (or could not be read).
     pub fn from_path(path: &Path) -> Self {
-        match std::fs::metadata(path) {
-            Ok(meta) => FileState {
-                size: Some(meta.len()),
-                modified: meta.modified().ok(),
-            },
+        let modified = std::fs::metadata(path)
+            .ok()
+            .and_then(|meta| meta.modified().ok());
+        // Read once and derive both size and hash from the same bytes so they
+        // stay consistent. The ledger file is size-capped and this path is only
+        // active when external edits are enabled, so the per-poll read is bounded.
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let digest = Sha256::digest(&bytes);
+                let mut content_hash = [0u8; 32];
+                content_hash.copy_from_slice(&digest);
+                FileState {
+                    size: Some(bytes.len() as u64),
+                    modified,
+                    content_hash: Some(content_hash),
+                }
+            }
             Err(_) => FileState {
                 size: None,
                 modified: None,
+                content_hash: None,
             },
         }
     }
@@ -74,6 +96,20 @@ impl FileState {
             (Some(_), None) => FileChangeKind::Created,
             (None, Some(_)) => FileChangeKind::Deleted,
             (Some(new_size), Some(old_size)) => {
+                // When both content hashes are known, they are authoritative:
+                // equal hash means the bytes are identical regardless of size or
+                // mtime; a differing hash is a modification even if size and
+                // mtime are unchanged (L7).
+                if let (Some(new_hash), Some(old_hash)) =
+                    (&self.content_hash, &previous.content_hash)
+                {
+                    return if new_hash == old_hash {
+                        FileChangeKind::Unchanged
+                    } else {
+                        FileChangeKind::Modified
+                    };
+                }
+                // Fallback (a hash was unavailable): size + mtime.
                 if new_size != old_size {
                     return FileChangeKind::Modified;
                 }
@@ -145,6 +181,7 @@ mod tests {
         let state = FileState {
             size: Some(100),
             modified: None,
+            content_hash: None,
         };
         assert_eq!(state.detect_change(&state), FileChangeKind::Unchanged);
     }
@@ -154,10 +191,12 @@ mod tests {
         let old = FileState {
             size: None,
             modified: None,
+            content_hash: None,
         };
         let new = FileState {
             size: Some(100),
             modified: None,
+            content_hash: None,
         };
         assert_eq!(new.detect_change(&old), FileChangeKind::Created);
     }
@@ -167,10 +206,12 @@ mod tests {
         let old = FileState {
             size: Some(100),
             modified: None,
+            content_hash: None,
         };
         let new = FileState {
             size: None,
             modified: None,
+            content_hash: None,
         };
         assert_eq!(new.detect_change(&old), FileChangeKind::Deleted);
     }
@@ -180,10 +221,12 @@ mod tests {
         let old = FileState {
             size: Some(100),
             modified: None,
+            content_hash: None,
         };
         let new = FileState {
             size: Some(200),
             modified: None,
+            content_hash: None,
         };
         assert_eq!(new.detect_change(&old), FileChangeKind::Modified);
     }
@@ -196,12 +239,70 @@ mod tests {
         let old = FileState {
             size: Some(100),
             modified: Some(t1),
+            content_hash: None,
         };
         let new = FileState {
             size: Some(100),
             modified: Some(t2),
+            content_hash: None,
         };
         assert_eq!(new.detect_change(&old), FileChangeKind::Modified);
+    }
+
+    #[test]
+    fn test_detect_change_same_size_and_mtime_but_different_content() {
+        // L7 regression: an in-place edit that preserves both size and mtime
+        // (same coarse tick) must still be detected via the content hash.
+        use std::time::SystemTime;
+        let now = SystemTime::now();
+        let old = FileState {
+            size: Some(100),
+            modified: Some(now),
+            content_hash: Some([1u8; 32]),
+        };
+        let new = FileState {
+            size: Some(100),
+            modified: Some(now),
+            content_hash: Some([2u8; 32]),
+        };
+        assert_eq!(new.detect_change(&old), FileChangeKind::Modified);
+    }
+
+    #[test]
+    fn test_detect_change_identical_content_is_unchanged() {
+        // Identical hash means identical bytes — unchanged even if mtime moved.
+        use std::time::{Duration, SystemTime};
+        let t1 = SystemTime::now();
+        let old = FileState {
+            size: Some(100),
+            modified: Some(t1),
+            content_hash: Some([9u8; 32]),
+        };
+        let new = FileState {
+            size: Some(100),
+            modified: Some(t1 + Duration::from_secs(5)),
+            content_hash: Some([9u8; 32]),
+        };
+        assert_eq!(new.detect_change(&old), FileChangeKind::Unchanged);
+    }
+
+    #[test]
+    fn test_from_path_detects_same_length_rewrite() {
+        // End-to-end: overwrite a file with same-length different content and
+        // confirm the state comparison flags a modification.
+        let path = std::env::temp_dir().join(format!(
+            "openledger-watcher-{}.bean",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "AAAA").unwrap();
+        let before = FileState::from_path(&path);
+        std::fs::write(&path, "BBBB").unwrap(); // same length, different bytes
+        let after = FileState::from_path(&path);
+        assert_eq!(after.detect_change(&before), FileChangeKind::Modified);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

@@ -24,7 +24,7 @@ Ordered by fix priority. Each task lists the source finding, the change, the fil
 | T13 | L6 — Temp-file symlink follow | Low | S | ☑ |
 | T14 | L5 — Non-injective txid serialization | Low | S | ☑ |
 | T15 | L4 — API-key length timing | Low | S | ☑ |
-| T16 | L7 — File-watcher missed change | Low | S | ☐ |
+| T16 | L7 — File-watcher missed change | Low | S | ☑ |
 | T17 | Add `overflow-checks` + fuzz/panic regression harness | — | M | ☐ |
 
 Effort: S = <½ day, M = ~1–2 days.
@@ -112,7 +112,7 @@ Effort: S = <½ day, M = ~1–2 days.
 - **Change:** Compare against a fixed-length hash of the key (e.g. compare SHA-256 digests) so response time is independent of guess length.
 - **Files:** `crates/gl-node/src/auth.rs:58-66`.
 
-### ☐ T16 — Harden file-watcher change detection (L7)
+### ☑ T16 — Harden file-watcher change detection (L7)
 - **Change:** Add a content hash (or nanosecond mtime + inode) to `detect_change` so same-size, same-second edits aren't missed.
 - **Files:** `crates/ledger/src/file_watcher.rs:76-88`. Low priority while `external_edits_enabled` defaults false.
 
