@@ -397,8 +397,10 @@ mod tests {
     fn test_iroh_endpoint_id_matches_dalek_public_key_hex() {
         let secret = SecretKey::generate();
         let iroh_hex = secret.public().to_string();
-        let dalek =
-            security::signing::PeerKeySignatureProvider::from_bytes(&secret.to_bytes(), String::new());
+        let dalek = security::signing::PeerKeySignatureProvider::from_bytes(
+            &secret.to_bytes(),
+            String::new(),
+        );
         assert_eq!(
             iroh_hex,
             dalek.public_key_hex(),

@@ -381,7 +381,11 @@ mod tests {
         // Pre-insert a node "PID" that references `h` as a parent, making `h` an
         // ancestor of "PID". Inserting `d` (id `h`, parent "PID") then closes the
         // cycle h -> PID -> h.
-        dag.insert_with_fake_id("PID".to_owned(), make_txn("parent-node", &[]), vec![h.clone()]);
+        dag.insert_with_fake_id(
+            "PID".to_owned(),
+            make_txn("parent-node", &[]),
+            vec![h.clone()],
+        );
 
         let result = dag.insert(d, false);
         assert!(

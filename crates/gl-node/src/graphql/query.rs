@@ -11,13 +11,7 @@ use super::SharedLedger;
 /// Maximum `journal` page size accepted from GraphQL (H-2).
 const MAX_JOURNAL_LIMIT: i32 = 10_000;
 
-/// Complexity weight for resolvers that scan the whole ledger/DAG under the read
-/// lock (M-1). Every GraphQL field defaults to a weight of 1, so without this a
-/// single request could alias a heavyweight resolver thousands of times within
-/// the depth limit (e.g. `{ a: verify{ok} b: verify{ok} … }`) and pin CPU. At
-/// this weight the 4096 complexity budget admits at most 8 such scans per
-/// request, while still leaving room for one of every report in a dashboard call.
-const HEAVY_RESOLVER_COMPLEXITY: usize = 512;
+use super::HEAVY_RESOLVER_COMPLEXITY;
 
 /// GraphQL query root. Resolvers pull from `SharedLedger` when available,
 /// fall back to empty defaults for introspection-only schemas.
@@ -190,6 +184,13 @@ impl QueryRoot {
     }
 
     /// Look up an account's balances.
+    ///
+    /// With `at` set this replays every transaction (`balances_at`) — a full
+    /// ledger scan — so it carries the heavy weight in that form only; the
+    /// current-balance lookup stays cheap for legitimate multi-account batches.
+    #[graphql(
+        complexity = "if at.is_some() { HEAVY_RESOLVER_COMPLEXITY } else { 1 + child_complexity }"
+    )]
     async fn account(
         &self,
         ctx: &Context<'_>,

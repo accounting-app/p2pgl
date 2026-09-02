@@ -14,7 +14,7 @@ use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 /// be replayed into another where the same key is allowlisted (L2).
 const SIG_PREFIX: &str = "openledger-sig-v3";
 
-/// Fields covered by an `openledger-sig-v2` signature.
+/// Fields covered by an `openledger-sig-v3` signature.
 ///
 /// `content_id` is the economic hash (I5). `parents` and `lamport` are
 /// envelope values excluded from that hash, so they must be in the signed

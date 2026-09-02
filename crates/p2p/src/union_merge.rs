@@ -38,6 +38,17 @@ const MAX_ENVELOPE_VALUE_LEN: usize = 32 * 1024;
 /// tiny (concurrent in-flight writers); 256 is generous.
 const MAX_PARENTS: usize = 256;
 
+/// Maximum accepted remote `openledger-lamport` value (0820-M3 completion).
+///
+/// The clock update saturates, so without an inbound bound a single peer
+/// sending `u64::MAX` would pin every replica's clock at the saturation point
+/// forever, degenerating Lamport ordering to all-ties. Legitimate clocks track
+/// mesh event counts (the 64 MiB file cap bounds directives to well under a
+/// million), so 2^53 is absurd headroom for honest traffic while keeping
+/// `u64::MAX` unreachable — from this cap the clock would need 2^63 further
+/// single-step increments to saturate.
+const MAX_REMOTE_LAMPORT: u64 = 1 << 53;
+
 /// Errors that can occur during merge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeError {
@@ -167,10 +178,42 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
         // each parent becomes a `waiting_on` entry in the orphan buffer, so an
         // unbounded list — whether supplied via the envelope or embedded in the
         // economic body — is a memory-exhaustion vector.
-        let parent_count = txn.parent_ids().len();
-        if parent_count > MAX_PARENTS {
+        let parent_ids = txn.parent_ids();
+        if parent_ids.len() > MAX_PARENTS {
             return Err(MergeError::ResourceLimitExceeded(format!(
-                "openledger-parents has {parent_count} entries (max {MAX_PARENTS})"
+                "openledger-parents has {} entries (max {MAX_PARENTS})",
+                parent_ids.len()
+            )));
+        }
+
+        // Every parent must be a well-formed 64-hex txid (0820-L8/M-05). The
+        // DAG insert enforces this anyway, but checking here — before the
+        // orphan buffer — stops a directive waiting on garbage parents that can
+        // never arrive from squatting buffer space for the full TTL.
+        for parent_id in &parent_ids {
+            if parent_id.len() != 64 || !parent_id.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(MergeError::InvalidEnvelope(
+                    "openledger-parents contains a malformed txid".to_owned(),
+                ));
+            }
+        }
+
+        // Strict inbound Lamport validation (0820-M3 completion): the value must
+        // be a plain decimal u64 within the plausibility cap. Without this, a
+        // garbage string is silently persisted verbatim, and a huge value pins
+        // every replica's saturating clock permanently.
+        let lamport = txn
+            .metadata
+            .get("openledger-lamport")
+            .expect("checked present above");
+        let lamport_ok = !lamport.is_empty()
+            && lamport.bytes().all(|b| b.is_ascii_digit())
+            && lamport
+                .parse::<u64>()
+                .is_ok_and(|value| value <= MAX_REMOTE_LAMPORT);
+        if !lamport_ok {
+            return Err(MergeError::InvalidEnvelope(format!(
+                "openledger-lamport must be a decimal u64 ≤ {MAX_REMOTE_LAMPORT}"
             )));
         }
     }
@@ -537,14 +580,74 @@ mod tests {
 
     #[test]
     fn test_extract_parents_multiple() {
+        // Parents must be well-formed 64-hex txids (enforced pre-buffer).
+        let parent_a = "a".repeat(64);
+        let parent_b = "b".repeat(64);
+        let parent_c = "c".repeat(64);
         let mut entry = make_valid_supply_entry();
         entry.envelope.insert(
             "openledger-parents".to_owned(),
-            "aaa111,bbb222,ccc333".to_owned(),
+            format!("{parent_a},{parent_b},{parent_c}"),
         );
         let directive = validate_supply_entry(&entry).unwrap();
         let parents = extract_parents(&directive);
-        assert_eq!(parents, vec!["aaa111", "bbb222", "ccc333"]);
+        assert_eq!(parents, vec![parent_a, parent_b, parent_c]);
+    }
+
+    #[test]
+    fn test_validate_rejects_malformed_parent_txid() {
+        // 0820-L8 completion: garbage parents must be rejected before the
+        // orphan buffer, not an hour after.
+        let mut entry = make_valid_supply_entry();
+        entry
+            .envelope
+            .insert("openledger-parents".to_owned(), "not-a-txid".to_owned());
+        let err = validate_supply_entry(&entry).unwrap_err();
+        assert!(
+            matches!(err, MergeError::InvalidEnvelope(_)),
+            "expected InvalidEnvelope, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_lamport_u64_max() {
+        // 0820-M3 completion: a saturating-clock pin at u64::MAX must be
+        // rejected at the door.
+        let mut entry = make_valid_supply_entry();
+        entry
+            .envelope
+            .insert("openledger-lamport".to_owned(), u64::MAX.to_string());
+        let err = validate_supply_entry(&entry).unwrap_err();
+        assert!(
+            matches!(err, MergeError::InvalidEnvelope(_)),
+            "expected InvalidEnvelope, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_non_numeric_lamport() {
+        let mut entry = make_valid_supply_entry();
+        for bad in ["", "garbage", "+5", "-1", "5.0", "1e9"] {
+            entry
+                .envelope
+                .insert("openledger-lamport".to_owned(), bad.to_owned());
+            assert!(
+                matches!(
+                    validate_supply_entry(&entry),
+                    Err(MergeError::InvalidEnvelope(_))
+                ),
+                "lamport {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_plain_decimal_lamport() {
+        let mut entry = make_valid_supply_entry();
+        entry
+            .envelope
+            .insert("openledger-lamport".to_owned(), "123456".to_owned());
+        assert!(validate_supply_entry(&entry).is_ok());
     }
 
     #[test]

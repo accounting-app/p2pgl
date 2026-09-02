@@ -36,6 +36,15 @@ pub const GRAPHQL_MAX_DEPTH: usize = 16;
 /// Maximum query complexity (M-7).
 pub const GRAPHQL_MAX_COMPLEXITY: usize = 4096;
 
+/// Complexity weight for fields that scan the whole ledger/DAG under a lock, or
+/// rewrite and fsync the whole ledger file (M-1). Every GraphQL field defaults
+/// to a weight of 1, so without this a single request could alias a heavyweight
+/// field thousands of times within the depth limit (e.g. `{ a: verify{ok}
+/// b: verify{ok} … }`) and pin CPU — or batch thousands of mutations. At this
+/// weight the 4096 budget admits at most 8 such fields per request, while still
+/// leaving room for one of every report in a dashboard call.
+pub(crate) const HEAVY_RESOLVER_COMPLEXITY: usize = 512;
+
 fn schema_builder(
     enable_introspection: bool,
 ) -> async_graphql::SchemaBuilder<QueryRoot, MutationRoot, SubscriptionRoot> {
@@ -137,6 +146,73 @@ mod tests {
                 .iter()
                 .any(|e| e.message.to_lowercase().contains("complex")),
             "expected a complexity error, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn test_complexity_limits_mutation_alias_batching() {
+        // 0820-M1 completion (M-03): mutations rewrite + fsync the whole ledger
+        // file, so alias batching must be budget-limited too.
+        let schema = build_schema();
+        let mut query = String::from("mutation {");
+        for i in 0..16 {
+            query.push_str(&format!(
+                " a{i}: openAccount(name: \"Assets:X\", date: \"2024-01-01\")"
+            ));
+        }
+        query.push('}');
+        let result = schema.execute(query).await;
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.to_lowercase().contains("complex")),
+            "16 aliased mutations should exceed the complexity budget, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn test_complexity_limits_account_at_aliasing() {
+        // 0820-M1 completion (M-02): `account(at:)` replays the whole ledger, so
+        // aliasing it must be budget-limited like the other heavy resolvers.
+        let schema = build_schema();
+        let mut query = String::from("{");
+        for i in 0..16 {
+            query.push_str(&format!(
+                " a{i}: account(name: \"Assets:X\", at: \"2024-01-01\") {{ account }}"
+            ));
+        }
+        query.push('}');
+        let result = schema.execute(query).await;
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.to_lowercase().contains("complex")),
+            "16 aliased account(at:) calls should exceed the complexity budget, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn test_complexity_allows_account_lookups_without_at() {
+        // Current-balance lookups stay cheap: batching accounts WITHOUT `at`
+        // must not trip the budget.
+        let schema = build_schema();
+        let mut query = String::from("{");
+        for i in 0..16 {
+            query.push_str(&format!(" a{i}: account(name: \"Assets:X\") {{ account }}"));
+        }
+        query.push('}');
+        let result = schema.execute(query).await;
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.message.to_lowercase().contains("complex")),
+            "account lookups without `at` should stay under the budget: {:?}",
             result.errors
         );
     }

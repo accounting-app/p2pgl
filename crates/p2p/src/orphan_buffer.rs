@@ -15,6 +15,15 @@ pub const MAX_ORPHANS: usize = 10_000;
 /// Maximum orphans attributed to a single peer (M-3).
 pub const MAX_ORPHANS_PER_PEER: usize = 1_000;
 
+/// Maximum total bytes of buffered orphan bodies (0820-L8).
+///
+/// Entry counts alone let one peer pin ~1 GiB (1,000 × 1 MiB max-size bodies)
+/// for the full TTL. Sizing the buffer bounds resident memory regardless of
+/// how large individual directives are.
+pub const MAX_ORPHAN_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum bytes of buffered orphan bodies attributed to a single peer.
+pub const MAX_ORPHAN_BYTES_PER_PEER: usize = 16 * 1024 * 1024;
+
 /// Maximum age for an orphan entry.
 pub const MAX_ORPHAN_AGE: Duration = Duration::from_secs(3600); // 1 hour
 
@@ -31,6 +40,8 @@ pub struct OrphanEntry {
     pub buffered_at: Instant,
     /// Gossip sender that delivered this orphan, when known.
     pub from_peer: Option<String>,
+    /// Serialized size of the economic body, counted against the byte budgets.
+    size_bytes: usize,
 }
 
 /// The orphan buffer.
@@ -42,6 +53,14 @@ pub struct OrphanBuffer {
     waiting_on: HashMap<String, HashSet<String>>,
     /// Count of buffered orphans per delivering peer.
     peer_counts: HashMap<String, usize>,
+    /// Buffered body bytes per delivering peer (0820-L8).
+    peer_bytes: HashMap<String, usize>,
+    /// Total buffered body bytes.
+    total_bytes: usize,
+    /// Global byte budget (`MAX_ORPHAN_BYTES`; overridable in tests).
+    max_bytes: usize,
+    /// Per-peer byte budget (`MAX_ORPHAN_BYTES_PER_PEER`; overridable in tests).
+    max_bytes_per_peer: usize,
 }
 
 impl OrphanBuffer {
@@ -50,10 +69,25 @@ impl OrphanBuffer {
             entries: HashMap::new(),
             waiting_on: HashMap::new(),
             peer_counts: HashMap::new(),
+            peer_bytes: HashMap::new(),
+            total_bytes: 0,
+            max_bytes: MAX_ORPHAN_BYTES,
+            max_bytes_per_peer: MAX_ORPHAN_BYTES_PER_PEER,
         }
     }
 
-    /// Buffer an orphan. Returns false if the global or per-peer buffer is full.
+    /// Test-only constructor with small byte budgets.
+    #[cfg(test)]
+    fn with_byte_budgets(max_bytes: usize, max_bytes_per_peer: usize) -> Self {
+        OrphanBuffer {
+            max_bytes,
+            max_bytes_per_peer,
+            ..Self::new()
+        }
+    }
+
+    /// Buffer an orphan. Returns false if a global or per-peer budget
+    /// (entry count or bytes) is exhausted.
     pub fn insert(
         &mut self,
         id: String,
@@ -68,9 +102,20 @@ impl OrphanBuffer {
             return false;
         }
 
+        // Byte budgets (0820-L8): entry counts alone let one peer pin ~1 GiB of
+        // max-size bodies for the TTL; size the buffer as well.
+        let size_bytes = ledger::serialize::economic_canonical_serialize(&directive).len();
+        if self.total_bytes.saturating_add(size_bytes) > self.max_bytes {
+            return false;
+        }
+
         if let Some(ref peer_id) = from_peer {
             let count = self.peer_counts.get(peer_id).copied().unwrap_or(0);
             if count >= MAX_ORPHANS_PER_PEER {
+                return false;
+            }
+            let bytes = self.peer_bytes.get(peer_id).copied().unwrap_or(0);
+            if bytes.saturating_add(size_bytes) > self.max_bytes_per_peer {
                 return false;
             }
         }
@@ -90,7 +135,9 @@ impl OrphanBuffer {
 
         if let Some(ref peer_id) = from_peer {
             *self.peer_counts.entry(peer_id.clone()).or_insert(0) += 1;
+            *self.peer_bytes.entry(peer_id.clone()).or_insert(0) += size_bytes;
         }
+        self.total_bytes += size_bytes;
 
         self.entries.insert(
             id.clone(),
@@ -100,6 +147,7 @@ impl OrphanBuffer {
                 missing_parents,
                 buffered_at: Instant::now(),
                 from_peer,
+                size_bytes,
             },
         );
 
@@ -118,7 +166,7 @@ impl OrphanBuffer {
 
                     if entry.missing_parents.is_empty() {
                         if let Some(entry) = self.entries.remove(&orphan_id) {
-                            self.decrement_peer_count(entry.from_peer.as_deref());
+                            self.release_entry_accounting(&entry);
                             resolved.push(entry);
                         }
                     }
@@ -159,8 +207,10 @@ impl OrphanBuffer {
         }
     }
 
-    fn decrement_peer_count(&mut self, peer_id: Option<&str>) {
-        let Some(peer_id) = peer_id else {
+    /// Release count and byte accounting for a removed entry.
+    fn release_entry_accounting(&mut self, entry: &OrphanEntry) {
+        self.total_bytes = self.total_bytes.saturating_sub(entry.size_bytes);
+        let Some(peer_id) = entry.from_peer.as_deref() else {
             return;
         };
         if let Some(count) = self.peer_counts.get_mut(peer_id) {
@@ -169,12 +219,18 @@ impl OrphanBuffer {
                 self.peer_counts.remove(peer_id);
             }
         }
+        if let Some(bytes) = self.peer_bytes.get_mut(peer_id) {
+            *bytes = bytes.saturating_sub(entry.size_bytes);
+            if *bytes == 0 {
+                self.peer_bytes.remove(peer_id);
+            }
+        }
     }
 
     /// Remove an orphan by ID and clean up reverse index.
     fn remove(&mut self, id: &str) {
         if let Some(entry) = self.entries.remove(id) {
-            self.decrement_peer_count(entry.from_peer.as_deref());
+            self.release_entry_accounting(&entry);
             for parent in &entry.missing_parents {
                 if let Some(set) = self.waiting_on.get_mut(parent) {
                     set.remove(id);
@@ -341,6 +397,77 @@ mod tests {
         // Should not panic on unknown parent.
         let resolved = buf.parent_arrived("unknown");
         assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn test_per_peer_byte_budget() {
+        // 0820-L8: a peer's buffered bytes are bounded, not just its entry count.
+        let entry_size =
+            ledger::serialize::economic_canonical_serialize(&make_directive("sizer")).len();
+        // Budget fits exactly two entries for one peer, plenty globally.
+        let mut buf = OrphanBuffer::with_byte_budgets(entry_size * 10, entry_size * 2);
+        let peer = Some("peer-a".to_owned());
+        assert!(buf.insert(
+            "id1".to_owned(),
+            make_directive("sizer"),
+            vec!["p".to_owned()],
+            peer.clone(),
+        ));
+        assert!(buf.insert(
+            "id2".to_owned(),
+            make_directive("sizer"),
+            vec!["p".to_owned()],
+            peer.clone(),
+        ));
+        // Third entry exceeds the peer's byte budget.
+        assert!(!buf.insert(
+            "id3".to_owned(),
+            make_directive("sizer"),
+            vec!["p".to_owned()],
+            peer.clone(),
+        ));
+        // A different peer still has budget.
+        assert!(buf.insert(
+            "id4".to_owned(),
+            make_directive("sizer"),
+            vec!["p".to_owned()],
+            Some("peer-b".to_owned()),
+        ));
+        // Resolving releases the bytes: peer-a can buffer again.
+        let resolved = buf.parent_arrived("p");
+        assert_eq!(resolved.len(), 3);
+        assert!(buf.insert(
+            "id5".to_owned(),
+            make_directive("sizer"),
+            vec!["p2".to_owned()],
+            peer,
+        ));
+    }
+
+    #[test]
+    fn test_global_byte_budget() {
+        let entry_size =
+            ledger::serialize::economic_canonical_serialize(&make_directive("sizer")).len();
+        // Global budget fits two entries regardless of peer attribution.
+        let mut buf = OrphanBuffer::with_byte_budgets(entry_size * 2, entry_size * 10);
+        assert!(buf.insert(
+            "id1".to_owned(),
+            make_directive("sizer"),
+            vec!["p".to_owned()],
+            Some("peer-a".to_owned()),
+        ));
+        assert!(buf.insert(
+            "id2".to_owned(),
+            make_directive("sizer"),
+            vec!["p".to_owned()],
+            Some("peer-b".to_owned()),
+        ));
+        assert!(!buf.insert(
+            "id3".to_owned(),
+            make_directive("sizer"),
+            vec!["p".to_owned()],
+            Some("peer-c".to_owned()),
+        ));
     }
 
     #[test]

@@ -245,9 +245,11 @@ async fn apply_supply_entries(
                     warn!(%error, peer = %remote, "rejected ALPN supply: author not allowlisted");
                     continue;
                 }
-                if let Err(error) =
-                    verify_remote_signature(&directive, handler.signing_enabled, &handler.swarm_topic)
-                {
+                if let Err(error) = verify_remote_signature(
+                    &directive,
+                    handler.signing_enabled,
+                    &handler.swarm_topic,
+                ) {
                     warn!(%error, peer = %remote, "rejected ALPN supply: signature");
                     continue;
                 }

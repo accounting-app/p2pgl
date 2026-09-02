@@ -50,7 +50,7 @@ Effort: S = <½ day, M = ~1–2 days.
 - **Verify:** Test that a directive whose `openledger-author` is a different allowlisted peer than the connection identity is rejected; test that boot fails when P2P is on and signing is off.
 
 ### ☑ T4 — Extend signature coverage to the envelope (H2)
-- **Change:** Include `openledger-parents` and `openledger-lamport` (canonically serialized) in the signed message. Domain prefix is `openledger-sig-v2`. v1 signatures are not accepted (mesh upgrade together with T3).
+- **Change:** Include `openledger-parents` and `openledger-lamport` (canonically serialized) in the signed message. Domain prefix was bumped to `openledger-sig-v2`, then to `v3` when T11 added the mesh id. Older signatures are not accepted (mesh upgrade together with T3).
 - **Files:** `crates/security/src/signing.rs` (`SignableMessage` / `build_sign_message`), `crates/p2p/src/union_merge.rs` (`verify_remote_signature`), ledger sign-before-persist callbacks, GraphQL mutations.
 - **Verify:** Rewriting `parents` or `lamport` on a validly-signed directive fails verification. CT-10 still asserts envelope keys stay out of the *content hash* — the hash and the signed message are different scopes.
 
@@ -122,6 +122,24 @@ Effort: S = <½ day, M = ~1–2 days.
 - **Verify:** Fuzzer runs clean; overflow-checks build passes the existing test suite.
 
 ---
+
+## 0820 residual close-out (2026-09-01)
+
+The 2026-09-01 follow-up audit ([SECURITY_AUDIT_0901.md](../SECURITY_AUDIT_0901.md)) verified the
+tasks above and flagged three residuals against the 0820 findings; all three are now closed:
+
+- ☑ **T2/M3 residual (0901-M-01)** — inbound `openledger-lamport` is now validated in
+  `validate_supply_entry`: strict decimal-u64 only, capped at `MAX_REMOTE_LAMPORT` (2^53),
+  so a peer can no longer pin every replica's saturating clock at `u64::MAX` or persist
+  garbage lamport strings.
+- ☑ **T7/M1 residual (0901-M-02/M-03)** — `account(name, at:)` now carries the heavy
+  complexity weight when `at` is set (full-ledger replay), and all three mutations are
+  weighted 512, capping alias batching at 8 per request.
+- ☑ **T5/L8 residual (0901-M-05)** — the orphan buffer is now byte-budgeted
+  (64 MiB global / 16 MiB per peer) in addition to entry counts, and parent txids must be
+  well-formed 64-hex before buffering, so garbage-parent orphans never occupy the TTL.
+
+New findings from the 0901 audit (H-01…H-04, M-02…M-11, L-01…L-18) are tracked separately.
 
 ## Suggested sequencing
 1. **T1, T2** first — smallest changes, remove the cheapest remote crash/DoS.

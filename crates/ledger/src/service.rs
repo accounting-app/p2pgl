@@ -2706,7 +2706,11 @@ mod tests {
         // L6 regression: a pre-planted `<name>.tmp` symlink must not be followed,
         // so a persist cannot truncate/overwrite the link's target.
         let ledger_path = test_file_path();
-        let file_name = ledger_path.file_name().unwrap().to_string_lossy().into_owned();
+        let file_name = ledger_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let tmp_path = ledger_path.with_file_name(format!("{file_name}.tmp"));
         let victim_path = ledger_path.with_extension("victim");
 

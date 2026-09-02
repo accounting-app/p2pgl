@@ -6,7 +6,7 @@ use super::inputs;
 use super::query::domain_txn_to_graphql;
 use super::scalars::DateScalar;
 use super::types::Transaction;
-use super::{GossipSender, SharedLedger};
+use super::{GossipSender, SharedLedger, HEAVY_RESOLVER_COMPLEXITY};
 
 use ledger::model::{Amount, CostSpec, Flag, PriceSpec};
 use ledger::service::{PostingInput, ServiceError, TransactionInput};
@@ -18,6 +18,9 @@ pub struct MutationRoot;
 #[Object]
 impl MutationRoot {
     /// Append a balanced journal entry (FR-1, enforces I1–I3).
+    // Each mutation rewrites and fsyncs the whole ledger file, so alias
+    // batching must be budget-limited like the heavy read resolvers (M-1/M-03).
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
     async fn append_transaction(
         &self,
         ctx: &Context<'_>,
@@ -117,6 +120,9 @@ impl MutationRoot {
     }
 
     /// Open an account (FR-3 AC1).
+    // Each mutation rewrites and fsyncs the whole ledger file, so alias
+    // batching must be budget-limited like the heavy read resolvers (M-1/M-03).
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
     async fn open_account(
         &self,
         ctx: &Context<'_>,
@@ -154,6 +160,9 @@ impl MutationRoot {
     }
 
     /// Close an account (FR-3 AC2).
+    // Each mutation rewrites and fsyncs the whole ledger file, so alias
+    // batching must be budget-limited like the heavy read resolvers (M-1/M-03).
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
     async fn close_account(
         &self,
         ctx: &Context<'_>,
