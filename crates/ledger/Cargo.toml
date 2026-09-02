@@ -16,3 +16,4 @@ workspace = true
 
 [dev-dependencies]
 rust_decimal_macros = "1"
+proptest = "1"

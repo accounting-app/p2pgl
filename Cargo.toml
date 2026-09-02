@@ -34,3 +34,11 @@ tower-http = { version = "0.6", features = ["cors"] }
 
 [workspace.lints.clippy]
 all = { level = "deny" }
+
+# Defense-in-depth (T17): keep integer overflow checks on in release builds
+# (the Docker image builds --release), so a silent wrap becomes a loud panic.
+# The untrusted-input arithmetic paths already use checked/saturating ops
+# (T1 weights, T2 Lamport clock), so this should not fire in normal operation —
+# if it ever does, it has caught a real bug rather than corrupting state.
+[profile.release]
+overflow-checks = true

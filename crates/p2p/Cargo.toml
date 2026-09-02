@@ -22,6 +22,7 @@ security = { path = "../security" }
 [dev-dependencies]
 rust_decimal = { workspace = true }
 rust_decimal_macros = "1"
+proptest = "1"
 
 [lints]
 workspace = true

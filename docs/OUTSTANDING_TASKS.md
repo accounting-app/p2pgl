@@ -25,7 +25,7 @@ Ordered by fix priority. Each task lists the source finding, the change, the fil
 | T14 | L5 — Non-injective txid serialization | Low | S | ☑ |
 | T15 | L4 — API-key length timing | Low | S | ☑ |
 | T16 | L7 — File-watcher missed change | Low | S | ☑ |
-| T17 | Add `overflow-checks` + fuzz/panic regression harness | — | M | ☐ |
+| T17 | Add `overflow-checks` + fuzz/panic regression harness | — | M | ☑ |
 
 Effort: S = <½ day, M = ~1–2 days.
 
@@ -116,7 +116,7 @@ Effort: S = <½ day, M = ~1–2 days.
 - **Change:** Add a content hash (or nanosecond mtime + inode) to `detect_change` so same-size, same-second edits aren't missed.
 - **Files:** `crates/ledger/src/file_watcher.rs:76-88`. Low priority while `external_edits_enabled` defaults false.
 
-### ☐ T17 — Defense-in-depth: overflow-checks + panic regression harness
+### ☑ T17 — Defense-in-depth: overflow-checks + panic regression harness
 - **Change:** Add `[profile.release] overflow-checks = true` to `Cargo.toml` (turns silent wraps into panics), then ensure T1/T2 mean those panics are unreachable. Add a fuzz/property harness feeding malformed `.bean` and CBOR supply entries to the parser and merge paths.
 - **Files:** `Cargo.toml`, new fuzz target under `crates/ledger`.
 - **Verify:** Fuzzer runs clean; overflow-checks build passes the existing test suite.
