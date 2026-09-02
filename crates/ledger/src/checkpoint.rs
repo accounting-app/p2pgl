@@ -71,8 +71,11 @@ pub fn generate_pad_transaction(
         .and_then(|entry| entry.balances.get(currency).copied())
         .unwrap_or(Decimal::ZERO);
 
-    // Step 2: delta = target - current.
-    let delta = target_amount - current;
+    // Step 2: delta = target - current. Checked (H1): both operands can sit
+    // near ±Decimal::MAX (the balance amount is caller-supplied and the read
+    // model saturates), and a bare `-` panics on overflow. An overflowing
+    // delta means an absurd assertion; synthesize no pad rather than panic.
+    let delta = target_amount.checked_sub(current)?;
 
     // Step 3: if delta = 0, no pad transaction.
     if delta == Decimal::ZERO {

@@ -165,7 +165,7 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
     }
 
     // 4. Validate required envelope fields for transactions.
-    if let Directive::Transaction(txn) = &directive {
+    if let Directive::Transaction(_) = &directive {
         if !entry.envelope.contains_key("openledger-author") {
             return Err(MergeError::EnvelopeMissing("openledger-author".to_owned()));
         }
@@ -173,12 +173,25 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
             return Err(MergeError::EnvelopeMissing("openledger-lamport".to_owned()));
         }
         // openledger-parents may be empty string for genesis.
+    }
 
-        // Bound parent fan-in on the final (envelope-attached) directive (M-4):
-        // each parent becomes a `waiting_on` entry in the orphan buffer, so an
-        // unbounded list — whether supplied via the envelope or embedded in the
-        // economic body — is a memory-exhaustion vector.
-        let parent_ids = txn.parent_ids();
+    // 5. Strict envelope value validation — for every directive kind carrying
+    // these keys, not just transactions: `insert_remote_directive` adopts the
+    // Lamport clock from every kind's metadata, so a bound enforced only on
+    // transactions is bypassable with a signed `open`/`note`/… directive
+    // (0820-M3 completion). Checked on the merged metadata so body-embedded
+    // values are covered as well as envelope-supplied ones.
+    let metadata = directive_metadata(&directive);
+
+    if let Some(parents_value) = metadata.get("openledger-parents") {
+        // Bound parent fan-in (M-4): each parent becomes a `waiting_on` entry
+        // in the orphan buffer, so an unbounded list is a memory-exhaustion
+        // vector. Split identically to `Transaction::parent_ids`.
+        let parent_ids: Vec<&str> = parents_value
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect();
         if parent_ids.len() > MAX_PARENTS {
             return Err(MergeError::ResourceLimitExceeded(format!(
                 "openledger-parents has {} entries (max {MAX_PARENTS})",
@@ -197,15 +210,13 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
                 ));
             }
         }
+    }
 
+    if let Some(lamport) = metadata.get("openledger-lamport") {
         // Strict inbound Lamport validation (0820-M3 completion): the value must
         // be a plain decimal u64 within the plausibility cap. Without this, a
         // garbage string is silently persisted verbatim, and a huge value pins
         // every replica's saturating clock permanently.
-        let lamport = txn
-            .metadata
-            .get("openledger-lamport")
-            .expect("checked present above");
         let lamport_ok = !lamport.is_empty()
             && lamport.bytes().all(|b| b.is_ascii_digit())
             && lamport
@@ -648,6 +659,60 @@ mod tests {
             .envelope
             .insert("openledger-lamport".to_owned(), "123456".to_owned());
         assert!(validate_supply_entry(&entry).is_ok());
+    }
+
+    fn make_open_supply_entry() -> SupplyEntry {
+        let directive = Directive::Open(Open {
+            date: chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+            account: "Assets:Cash".to_owned(),
+            currencies: vec![],
+            metadata: BTreeMap::new(),
+        });
+        SupplyEntry {
+            id: compute_content_id(&directive),
+            kind: DirectiveKind::Open,
+            economic_bean: economic_canonical_serialize(&directive),
+            envelope: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_validate_bounds_lamport_on_non_transaction_directives() {
+        // The Lamport clock is adopted from EVERY directive kind's metadata, so
+        // the strict bound must apply beyond transactions — otherwise a signed
+        // `open` with u64::MAX pins every replica's clock (0820-M3 completion).
+        let mut entry = make_open_supply_entry();
+        for bad in [u64::MAX.to_string(), "garbage".to_owned(), "+5".to_owned()] {
+            entry
+                .envelope
+                .insert("openledger-lamport".to_owned(), bad.clone());
+            assert!(
+                matches!(
+                    validate_supply_entry(&entry),
+                    Err(MergeError::InvalidEnvelope(_))
+                ),
+                "non-transaction lamport {bad:?} must be rejected"
+            );
+        }
+        entry
+            .envelope
+            .insert("openledger-lamport".to_owned(), "42".to_owned());
+        assert!(validate_supply_entry(&entry).is_ok());
+    }
+
+    #[test]
+    fn test_validate_bounds_parents_on_non_transaction_directives() {
+        let mut entry = make_open_supply_entry();
+        entry
+            .envelope
+            .insert("openledger-parents".to_owned(), "not-a-txid".to_owned());
+        assert!(
+            matches!(
+                validate_supply_entry(&entry),
+                Err(MergeError::InvalidEnvelope(_))
+            ),
+            "malformed parents on a non-transaction directive must be rejected"
+        );
     }
 
     #[test]

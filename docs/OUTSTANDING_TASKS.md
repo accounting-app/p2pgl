@@ -131,7 +131,12 @@ tasks above and flagged three residuals against the 0820 findings; all three are
 - ☑ **T2/M3 residual (0901-M-01)** — inbound `openledger-lamport` is now validated in
   `validate_supply_entry`: strict decimal-u64 only, capped at `MAX_REMOTE_LAMPORT` (2^53),
   so a peer can no longer pin every replica's saturating clock at `u64::MAX` or persist
-  garbage lamport strings.
+  garbage lamport strings. The 2026-09-02 verification pass extended this (and the parents
+  well-formedness check) to **all** directive kinds — the clock is adopted from every kind's
+  metadata, so the original transaction-only check was bypassable via a signed `open`/`note`.
+- ☑ **T1/H1 latent remnant** — the unchecked `Decimal` subtraction in `checkpoint.rs`
+  (dead code today, remotely reachable once checkpoint evaluation is wired) is now
+  `checked_sub` (2026-09-02).
 - ☑ **T7/M1 residual (0901-M-02/M-03)** — `account(name, at:)` now carries the heavy
   complexity weight when `at` is set (full-ledger replay), and all three mutations are
   weighted 512, capping alias batching at 8 per request.
