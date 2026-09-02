@@ -3,7 +3,7 @@
 //! Ties together parser, serializer, DAG, validation, and file persistence.
 //! This is the single entry point for all ledger mutations.
 
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -192,6 +192,47 @@ pub fn enforce_resource_limits(directive: &Directive) -> Result<(), ServiceError
     Ok(())
 }
 
+// ─── Date range (H-04) ───────────────────────────────────────────────────────
+
+/// Smallest year the `.bean` file grammar can express.
+pub const MIN_LEDGER_YEAR: i32 = 1;
+/// Largest year the `.bean` file grammar can express.
+pub const MAX_LEDGER_YEAR: i32 = 9999;
+
+/// Reject a date the ledger file grammar could never read back (H-04).
+///
+/// `read_date` in `crate::parse` requires exactly four leading ASCII digits, but
+/// `chrono` formats every year outside `0..=9999` with an explicit sign
+/// (`+10000-01-01`, `-0001-01-01`). Serializing such a date therefore writes a
+/// `.bean` file that no later [`LedgerService::boot`] can parse — a permanent
+/// brick. The GraphQL `Date` scalar is the reachable injection point and clamps
+/// first; this is the same guarantee for direct callers of the library API.
+fn validate_ledger_date(date: NaiveDate) -> Result<(), ServiceError> {
+    if (MIN_LEDGER_YEAR..=MAX_LEDGER_YEAR).contains(&date.year()) {
+        Ok(())
+    } else {
+        Err(ServiceError::DateOutOfRange { date })
+    }
+}
+
+/// Check every date a directive will serialize (H-04).
+///
+/// That is the directive's own date plus, for transactions, each posting's cost
+/// date — cost dates are written with the same `%Y-%m-%d` format and brick the
+/// file in exactly the same way.
+pub fn validate_directive_dates(directive: &Directive) -> Result<(), ServiceError> {
+    validate_ledger_date(directive.date())?;
+
+    if let Directive::Transaction(transaction) = directive {
+        for posting in &transaction.postings {
+            if let Some(cost_date) = posting.cost.as_ref().and_then(|cost| cost.date) {
+                validate_ledger_date(cost_date)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 // ─── Service error ───────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -225,6 +266,8 @@ pub enum ServiceError {
     InvalidLink { link: String },
     /// Payee/narration contains control characters (H-8).
     InvalidInput { message: String },
+    /// H-04: a date outside the range the `.bean` file grammar can re-parse.
+    DateOutOfRange { date: NaiveDate },
 }
 
 impl std::fmt::Display for ServiceError {
@@ -270,6 +313,12 @@ impl std::fmt::Display for ServiceError {
             ServiceError::InvalidTag { tag } => write!(f, "Invalid tag: {tag}"),
             ServiceError::InvalidLink { link } => write!(f, "Invalid link: {link}"),
             ServiceError::InvalidInput { message } => write!(f, "{message}"),
+            ServiceError::DateOutOfRange { date } => {
+                write!(
+                    f,
+                    "date '{date}' is outside the supported range 0001-01-01..9999-12-31"
+                )
+            }
         }
     }
 }
@@ -294,6 +343,7 @@ impl ServiceError {
             ServiceError::InvalidTag { .. } => "INVALID_TAG",
             ServiceError::InvalidLink { .. } => "INVALID_LINK",
             ServiceError::InvalidInput { .. } => "INVALID_INPUT",
+            ServiceError::DateOutOfRange { .. } => "DATE_OUT_OF_RANGE",
         }
     }
 }
@@ -462,6 +512,10 @@ impl LedgerService {
         input: TransactionInput,
         sign: impl FnOnce(&str, &str, &str) -> Option<String>,
     ) -> Result<String, ServiceError> {
+        // H-04: a date the file grammar cannot read back would brick the next
+        // boot, so refuse it before anything is built, stamped, or persisted.
+        validate_ledger_date(input.date)?;
+
         // §3.12: resource limit checks.
         if input.postings.len() > MAX_POSTINGS_PER_TRANSACTION {
             return Err(ServiceError::ResourceLimitExceeded {
@@ -545,6 +599,10 @@ impl LedgerService {
                             currency: cost_amount.currency.clone(),
                         }
                     })?;
+                }
+                // H-04: cost dates serialize as `%Y-%m-%d` too.
+                if let Some(cost_date) = cost.date {
+                    validate_ledger_date(cost_date)?;
                 }
             }
             if let Some(ref price) = posting.price {
@@ -637,6 +695,8 @@ impl LedgerService {
         validate_account_name(&account).map_err(|_| ServiceError::InvalidAccountName {
             account: account.clone(),
         })?;
+        // H-04: refuse an unrepresentable date before any state change.
+        validate_ledger_date(date)?;
         for currency in &currencies {
             validate_currency(currency).map_err(|_| ServiceError::InvalidCurrency {
                 currency: currency.clone(),
@@ -707,6 +767,8 @@ impl LedgerService {
         validate_account_name(&account).map_err(|_| ServiceError::InvalidAccountName {
             account: account.clone(),
         })?;
+        // H-04: refuse an unrepresentable date before any state change.
+        validate_ledger_date(date)?;
 
         // Must be currently open.
         if !self.accounts.is_open(&account) {
@@ -832,6 +894,16 @@ impl LedgerService {
             // Check if already in DAG (G-Set dedup).
             if self.dag.get(&content_id).is_some() {
                 dup_count += 1;
+                continue;
+            }
+
+            // H-04: never adopt a directive whose date the file grammar cannot
+            // read back — the next persist would brick every later boot. Checked
+            // before the envelope stamp so a rejection cannot move the Lamport
+            // clock either. `read_date` cannot currently yield such a year, so
+            // this is a guard against future parser or format changes.
+            if validate_directive_dates(&directive).is_err() {
+                rejected += 1;
                 continue;
             }
 
@@ -1078,6 +1150,8 @@ impl LedgerService {
         }
 
         enforce_resource_limits(&directive)?;
+        // H-04: reject before the Lamport clock is adopted or the DAG touched.
+        validate_directive_dates(&directive)?;
 
         if let Directive::Transaction(transaction) = &directive {
             for parent_id in transaction.parent_ids() {
@@ -2732,5 +2806,107 @@ mod tests {
         std::fs::remove_file(&ledger_path).ok();
         std::fs::remove_file(&victim_path).ok();
         std::fs::remove_file(&tmp_path).ok();
+    }
+
+    // ── H-04: dates the file grammar cannot read back ────────────────────
+
+    #[test]
+    fn test_append_transaction_rejects_out_of_range_year() {
+        // A year outside 0001..=9999 serializes with a sign (`+10000-01-01`),
+        // which `read_date` refuses — persisting one bricks every later boot.
+        let (mut svc, path) = setup_with_accounts();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let mut input = balanced_input();
+        input.date = make_date(10000, 1, 1);
+        let error = svc.append_transaction(input).unwrap_err();
+        assert_eq!(error.error_code(), "DATE_OUT_OF_RANGE");
+        assert!(
+            error.to_string().contains("+10000-01-01"),
+            "message should name the offending date: {error}"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a rejected date must not reach the file"
+        );
+        LedgerService::boot(path.clone(), "test-peer".to_owned())
+            .expect("ledger must still boot after the rejection");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_append_transaction_rejects_out_of_range_cost_date() {
+        // Cost dates are serialized as `%Y-%m-%d` too, so they brick the same way.
+        let (mut svc, path) = setup_with_accounts();
+        let mut input = balanced_input();
+        input.postings[0].cost = Some(CostSpec {
+            amount: Some(Amount {
+                number: dec!(1),
+                currency: "USD".to_owned(),
+            }),
+            date: Some(make_date(-1, 1, 1)),
+        });
+        let error = svc.append_transaction(input).unwrap_err();
+        assert_eq!(error.error_code(), "DATE_OUT_OF_RANGE");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_open_and_close_account_reject_out_of_range_year() {
+        let (mut svc, path) = setup_with_accounts();
+
+        let error = svc
+            .open_account("Assets:Vault".to_owned(), make_date(0, 1, 1), vec![])
+            .unwrap_err();
+        assert_eq!(error.error_code(), "DATE_OUT_OF_RANGE");
+
+        let error = svc
+            .close_account("Assets:Cash".to_owned(), make_date(10000, 1, 1))
+            .unwrap_err();
+        assert_eq!(error.error_code(), "DATE_OUT_OF_RANGE");
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_remote_insert_rejects_out_of_range_year() {
+        let (mut svc, path) = setup_with_accounts();
+        let lamport_before = svc.lamport_clock();
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("openledger-author".to_owned(), "peer-remote".to_owned());
+        metadata.insert("openledger-lamport".to_owned(), "42".to_owned());
+        let remote = Directive::Open(Open {
+            date: make_date(10000, 1, 1),
+            account: "Assets:Remote".to_owned(),
+            currencies: vec![],
+            metadata,
+        });
+
+        let error = svc.insert_remote_directive(remote).unwrap_err();
+        assert_eq!(error.error_code(), "DATE_OUT_OF_RANGE");
+        assert_eq!(
+            svc.lamport_clock(),
+            lamport_before,
+            "a rejected directive must not adopt the remote Lamport clock"
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_boundary_years_persist_and_reboot() {
+        // The first and last dates the grammar can round-trip must still work.
+        let (mut svc, path) = boot_empty();
+        svc.open_account("Assets:First".to_owned(), make_date(1, 1, 1), vec![])
+            .unwrap();
+        svc.open_account("Assets:Last".to_owned(), make_date(9999, 12, 31), vec![])
+            .unwrap();
+        drop(svc);
+
+        let rebooted = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert_eq!(rebooted.directive_count(), 2);
+        std::fs::remove_file(path).ok();
     }
 }

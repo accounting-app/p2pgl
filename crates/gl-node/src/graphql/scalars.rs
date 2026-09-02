@@ -1,7 +1,12 @@
 use async_graphql::{InputValueError, InputValueResult, Scalar, ScalarType, Value};
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use rust_decimal::Decimal;
 use std::str::FromStr;
+
+/// Smallest year the ledger's `.bean` file grammar can express (H-04).
+const MIN_LEDGER_YEAR: i32 = 1;
+/// Largest year the ledger's `.bean` file grammar can express (H-04).
+const MAX_LEDGER_YEAR: i32 = 9999;
 
 /// ISO-8601 calendar date scalar (`YYYY-MM-DD`).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -9,11 +14,26 @@ pub struct DateScalar(pub NaiveDate);
 
 #[Scalar(name = "Date")]
 impl ScalarType for DateScalar {
+    /// Parse a wire date, rejecting years the ledger file can never re-parse.
+    ///
+    /// (H-04) `chrono`'s `%Y` accepts an explicitly signed year of unlimited
+    /// width — `"+10000-01-01"`, `"-0001-01-01"` — and its formatter emits that
+    /// sign back for every year outside `0..=9999`. The ledger's own file
+    /// grammar (`read_date` in `ledger::parse`) requires exactly four leading
+    /// ASCII digits, so a signed year that reaches the serializer produces a
+    /// `.bean` file no later `LedgerService::boot` can parse: one accepted
+    /// mutation permanently bricks the node. Clamp at the API edge, before the
+    /// date can ever be persisted.
     fn parse(value: Value) -> InputValueResult<Self> {
         match &value {
             Value::String(date_string) => {
                 let date = NaiveDate::parse_from_str(date_string, "%Y-%m-%d")
                     .map_err(|_| InputValueError::custom("Invalid date, expected YYYY-MM-DD"))?;
+                if !(MIN_LEDGER_YEAR..=MAX_LEDGER_YEAR).contains(&date.year()) {
+                    return Err(InputValueError::custom(
+                        "date year must be between 0001 and 9999",
+                    ));
+                }
                 Ok(DateScalar(date))
             }
             _ => Err(InputValueError::expected_type(value)),
@@ -94,6 +114,32 @@ mod tests {
     fn test_date_scalar_rejects_invalid() {
         let result = DateScalar::parse(Value::String("2024-13-01".to_owned()));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_date_scalar_rejects_out_of_range_years() {
+        // H-04: chrono accepts a signed year of any width, and re-emits the
+        // sign — the ledger's file grammar can never read one back, so a single
+        // accepted value would brick the node at its next boot. `10000-01-01`
+        // (5 digits, unsigned) is rejected by chrono itself; assert the scalar
+        // refuses it either way so the guarantee does not rest on chrono.
+        for date_string in ["+10000-01-01", "-0001-01-01", "0000-01-01", "10000-01-01"] {
+            let result = DateScalar::parse(Value::String(date_string.to_owned()));
+            assert!(
+                result.is_err(),
+                "expected {date_string} to be rejected as out of range"
+            );
+        }
+    }
+
+    #[test]
+    fn test_date_scalar_accepts_range_boundaries() {
+        // The first and last dates the `.bean` grammar can round-trip.
+        for date_string in ["0001-01-01", "9999-12-31"] {
+            let parsed = DateScalar::parse(Value::String(date_string.to_owned()))
+                .unwrap_or_else(|_| panic!("expected {date_string} to be accepted"));
+            assert_eq!(parsed.to_value(), Value::String(date_string.to_owned()));
+        }
     }
 
     #[test]

@@ -393,4 +393,106 @@ mod tests {
             result.errors
         );
     }
+
+    #[tokio::test]
+    async fn test_append_transaction_rejects_out_of_range_year() {
+        // H-04 regression: chrono's `%Y` accepts `+10000-01-01` and re-emits the
+        // sign, but the ledger's own file grammar requires four leading ASCII
+        // digits. Persisting one such date would leave a `.bean` file that no
+        // later boot can parse — one authorized mutation bricks the node. The
+        // mutation must be refused and the file left untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let bean_path = dir.path().join("test.bean");
+        std::fs::write(&bean_path, "").unwrap();
+
+        let service = LedgerService::boot(&bean_path, "test-node".to_owned()).unwrap();
+        let schema = build_schema_with_service(
+            Arc::new(RwLock::new(service)),
+            TransactionBroadcast::new(),
+            p2p::node::PeerRegistry::new(),
+            std::sync::Arc::new(security::signing::NoopSignatureProvider),
+            true,
+            None,
+        );
+
+        // Open the accounts first, so the append is refused for its date and
+        // nothing else — otherwise the lifecycle check (I3) would mask the bug.
+        for name in ["Assets:Cash", "Equity:Opening"] {
+            let opened = schema
+                .execute(format!(
+                    r#"mutation {{ openAccount(name: "{name}", date: "2024-01-01") }}"#
+                ))
+                .await;
+            assert!(opened.errors.is_empty(), "errors: {:?}", opened.errors);
+        }
+        let before = std::fs::read_to_string(&bean_path).unwrap();
+
+        let result = schema
+            .execute(
+                r#"
+                mutation {
+                    appendTransaction(input: {
+                        date: "+10000-01-01"
+                        flag: "*"
+                        postings: [
+                            { account: "Assets:Cash", amount: { number: "1", currency: "USD" } },
+                            { account: "Equity:Opening", amount: { number: "-1", currency: "USD" } }
+                        ]
+                    }) { txid }
+                }
+                "#,
+            )
+            .await;
+
+        assert!(
+            !result.errors.is_empty(),
+            "a year outside 0001..=9999 must be rejected"
+        );
+        let message = result.errors[0].message.to_lowercase();
+        assert!(
+            message.contains("date") || message.contains("year"),
+            "expected a date/year error, got: {:?}",
+            result.errors
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&bean_path).unwrap(),
+            before,
+            "the rejected date must never reach the ledger file"
+        );
+        LedgerService::boot(&bean_path, "test-node".to_owned())
+            .expect("the ledger must still boot — the brick never happened");
+    }
+
+    #[tokio::test]
+    async fn test_open_account_accepts_last_supported_date() {
+        // The other side of H-04: the last date the file grammar can round-trip
+        // stays usable, and the file it writes re-boots cleanly.
+        let dir = tempfile::tempdir().unwrap();
+        let bean_path = dir.path().join("test.bean");
+        std::fs::write(&bean_path, "").unwrap();
+
+        let service = LedgerService::boot(&bean_path, "test-node".to_owned()).unwrap();
+        let schema = build_schema_with_service(
+            Arc::new(RwLock::new(service)),
+            TransactionBroadcast::new(),
+            p2p::node::PeerRegistry::new(),
+            std::sync::Arc::new(security::signing::NoopSignatureProvider),
+            true,
+            None,
+        );
+
+        let result = schema
+            .execute(r#"mutation { openAccount(name: "Assets:Cash", date: "9999-12-31") }"#)
+            .await;
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let on_disk = std::fs::read_to_string(&bean_path).unwrap();
+        assert!(
+            on_disk.starts_with("9999-12-31 open Assets:Cash"),
+            "unexpected ledger file: {on_disk:?}"
+        );
+        let rebooted = LedgerService::boot(&bean_path, "test-node".to_owned()).unwrap();
+        assert_eq!(rebooted.directive_count(), 1);
+    }
 }

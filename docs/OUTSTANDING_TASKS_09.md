@@ -15,7 +15,7 @@ Already closed before this backlog — do not re-do: 09/01 **M-01** (strict inbo
 |---|---|---|---|---|
 | T18 | H-02 — sync senders violate receive caps (mesh wedge) | High | S–M | ☑ |
 | T19 | H-05 + H-01 — ineffective body limit; CSRF/DNS rebinding | High | S | ☑ |
-| T20 | H-04 — signed-year dates brick boot | High | S | ☐ |
+| T20 | H-04 — signed-year dates brick boot | High | S | ☑ |
 | T21 | H-03 + H-06 + L-26 + L-29 — remote-body canonicalization | High | S–M | ☐ |
 | T22 | M-13 — no HTTP timeouts/connection cap (slowloris) | Med | S–M | ☐ |
 | T23 | M-12 + M-07 — gossip origin auth; announce flood | Med | M | ☐ |
@@ -60,7 +60,8 @@ H-01→T19 · H-02→T18 · H-03→T21 · H-04→T20 · H-05→T19 · H-06→T21
 - **Files:** [main.rs:296-302](../crates/gl-node/src/main.rs#L296-L302), [graphql/mod.rs:98-103](../crates/gl-node/src/graphql/mod.rs#L98-L103), [config.rs](../crates/gl-node/src/config.rs).
 - **Verify:** >2 MiB POST → 413; `text/plain` POST → rejected; wrong/absent `Host` → rejected; cross-origin `no-cors` fetch reproduction no longer mutates; existing GraphiQL + legitimate JSON clients still work.
 
-### ☐ T20 — Date range validation (H-04)
+### ☑ T20 — Date range validation (H-04)
+> **Done 2026-09-02 (in working tree, not yet committed).** `DateScalar::parse` rejects years outside 1..=9999 (the reachable injection point — chrono accepts signed years the ledger's 4-digit `read_date` can never re-parse); defense-in-depth `validate_ledger_date`/`validate_directive_dates` (incl. cost-spec dates) on append/open/close/remote-insert/reconcile, all before any state change; new `DATE_OUT_OF_RANGE` error surfaces through the GraphQL choke point. Property tests: valid-domain serialize→parse round-trip through the real serializer/parser, and the brick demonstrated (out-of-range dates serialize to unparseable text). Year 0 verified as the one non-bricking out-of-range year — still rejected, documented. Two-layer bug-catch proof: scalar removed → service check still blocks; both removed → mutation succeeds and reboot fails with the exact H-04 parse error. Note: remote/reconcile checks are currently unreachable (parser can't produce such dates) — they guard future format changes. Boot intentionally left unvalidated (a check there would itself be a brick path).
 - **Change:** reject years outside 1..=9999 in `DateScalar::parse`; defense-in-depth range check in `service.rs` on append/open/close/remote-insert/reconcile (chrono `%Y` accepts signed years the ledger's own `read_date` can never re-parse — one accepted write bricks every subsequent boot).
 - **Files:** [scalars.rs:12-21](../crates/gl-node/src/graphql/scalars.rs#L12-L21), [service.rs](../crates/ledger/src/service.rs).
 - **Verify:** serialize→parse round-trip property test over the full `NaiveDate` domain; `appendTransaction(date:"+10000-01-01")` and `-0001-01-01` rejected on every path; node with a pre-existing healthy file boots unchanged.
