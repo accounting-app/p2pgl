@@ -1,5 +1,9 @@
 # Outstanding Security Tasks
 
+> **Superseded (2026-09-02):** all 17 tasks below are done and verified. The current
+> remediation backlog (T18–T41, covering the open 09/01 and 09/02 findings) lives in
+> [OUTSTANDING_TASKS_09.md](OUTSTANDING_TASKS_09.md).
+
 Remediation backlog for the findings in [CLAUDE_SECURITY_AUDIT_0820.md](CLAUDE_SECURITY_AUDIT_0820.md).
 Ordered by fix priority. Each task lists the source finding, the change, the files, and how to verify.
 
