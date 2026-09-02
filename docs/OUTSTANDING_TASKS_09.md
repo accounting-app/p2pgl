@@ -14,7 +14,7 @@ Already closed before this backlog — do not re-do: 09/01 **M-01** (strict inbo
 | # | Findings addressed | Sev | Effort | Status |
 |---|---|---|---|---|
 | T18 | H-02 — sync senders violate receive caps (mesh wedge) | High | S–M | ☑ |
-| T19 | H-05 + H-01 — ineffective body limit; CSRF/DNS rebinding | High | S | ☐ |
+| T19 | H-05 + H-01 — ineffective body limit; CSRF/DNS rebinding | High | S | ☑ |
 | T20 | H-04 — signed-year dates brick boot | High | S | ☐ |
 | T21 | H-03 + H-06 + L-26 + L-29 — remote-body canonicalization | High | S–M | ☐ |
 | T22 | M-13 — no HTTP timeouts/connection cap (slowloris) | Med | S–M | ☐ |
@@ -52,7 +52,8 @@ H-01→T19 · H-02→T18 · H-03→T21 · H-04→T20 · H-05→T19 · H-06→T21
 - **Files:** [anti_entropy_alpn.rs:84-87,223-233](../crates/gl-node/src/anti_entropy_alpn.rs#L84-L87), [anti_entropy.rs:42-52](../crates/p2p/src/anti_entropy.rs#L42-L52), [protocol.rs:188-195](../crates/p2p/src/protocol.rs#L188-L195).
 - **Verify:** property test — every encodable outbound message decodes under the receive caps; integration test syncing a node 5,000+ directives behind to convergence; a >4,096-directive ledger still completes head exchange. Fix the flaky `three_node_alpn_convergence` (fails under suite parallelism, passes isolated) in the same change so the convergence signal is trustworthy.
 
-### ☐ T19 — Real HTTP body limit + cross-origin hardening (H-05, H-01)
+### ☑ T19 — Real HTTP body limit + cross-origin hardening (H-05, H-01)
+> **Done 2026-09-02 (in working tree, not yet committed).** `RequestBodyLimitLayer` replaces the ineffective `DefaultBodyLimit` (comment now warns why); new `request_guard` middleware on the GraphQL routes enforces Host (DNS rebinding), `application/json`-only POST Content-Type (simple-request CSRF + multipart), and Origin (CORS allowlist OR same-origin, **port-aware** — a page on `localhost:3000` is not the node on `:4000`; `Origin: null` rejected). New top-level `allowedHosts` config; non-loopback binds must populate it (fail-closed, like the existing public-bind auth/TLS rules) — `deploy/gl-node.docker.json` updated accordingly. Router assembly factored into `build_application` so 16 router-level tests exercise the real wiring; the 413 test was proven to fail with the old layer swapped back in. Deferred by decision: auto-generated loopback API key (H-01 item d). Follow-up in T38: README public-bind examples need `allowedHosts`.
 - **Change:**
   (a) **H-05:** add `tower_http::limit::RequestBodyLimitLayer::new(GRAPHQL_MAX_BODY_BYTES)` (tower-http is already a dependency) — `DefaultBodyLimit` is opt-in and `async-graphql-axum` bypasses it (runtime-verified: 8 MiB POST → 200). The wrapping layer fails the extractor's stream read past the cap and also covers multipart. Correct the false comment on `GRAPHQL_MAX_BODY_BYTES`.
   (b) **H-01:** reject `POST /graphql` unless `Content-Type` is `application/json` (kills the `text/plain` CORS simple-request CSRF); validate `Host` against the bind address and `Origin` against the CORS allowlist (kills DNS rebinding); consider generating and requiring an API key even on loopback binds by default.
@@ -175,6 +176,7 @@ H-01→T19 · H-02→T18 · H-03→T21 · H-04→T20 · H-05→T19 · H-06→T21
 - **L-03:** [deploy/docker-compose.yml](../deploy/docker-compose.yml) — publish as `"127.0.0.1:3000:3000"` (not all interfaces with `tls.mode:"terminated"` and no terminator in the stack); per-node `GL_NODE_API_KEY` values instead of one shared key.
 - **L-10:** [Dockerfile](../Dockerfile) — pin base images by digest; build with `cargo build --release --locked`.
 - **Config hygiene (0902 informational, promoted here):** make `GL_NODE_API_KEY` env take precedence over a non-empty file value (or warn when both set — silent stale-key wins today, [config.rs:238-244](../crates/gl-node/src/config.rs#L238-L244)); warn when the config file carrying an API key is group/other-readable.
+- **T19 follow-up:** README's public-bind example configs must gain `allowedHosts` (now boot-required on non-loopback binds); document the new field.
 - **Verify:** compose stack unreachable from off-host; image rebuild is digest-stable and lock-enforced; env-rotation test uses the env key.
 
 ### ☐ T39 — Orphan-buffer & mesh-identity batch (L-20, L-23, registry heads)

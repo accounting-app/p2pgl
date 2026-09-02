@@ -6,6 +6,9 @@
     "cors": {
         "allowedOrigins": []
     },
+    "allowedHosts": [
+        "localhost"
+    ],
     "auth": {
         "enabled": true,
         "apiKey": ""

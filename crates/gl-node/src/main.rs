@@ -5,15 +5,18 @@ mod graphql;
 mod health;
 mod p2p_service;
 mod rate_limit;
+mod request_guard;
 
 use auth::AuthState;
 use config::NodeConfig;
 use graphql::broadcast::TransactionBroadcast;
-use graphql::{build_schema_with_service, graphiql_handler, graphql_handler, SharedLedger};
+use graphql::{
+    build_schema_with_service, graphiql_handler, graphql_handler, AppSchema, SharedLedger,
+};
 use health::{health_handler, probe_local_health, HealthState};
 use rate_limit::RateLimiter;
+use request_guard::RequestGuardState;
 
-use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::{middleware, Extension, Router};
 use p2p::node::PeerRegistry;
@@ -24,9 +27,18 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::RwLock;
+use tower_http::cors::CorsLayer;
+use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{error, info, warn};
 
-/// Explicit GraphQL HTTP body cap (M-7). Axum's default is also 2 MiB.
+/// Explicit GraphQL HTTP body cap (M-7), enforced by `RequestBodyLimitLayer`,
+/// which wraps the request body itself: an oversized payload is refused with
+/// 413 instead of being buffered into RAM (H-05).
+///
+/// Never reintroduce `axum::extract::DefaultBodyLimit` as the sole limit. It is
+/// opt-in — it only inserts an extension that cooperating extractors consult —
+/// and async-graphql's `GraphQLRequest` extractor reads the raw body stream via
+/// `into_data_stream()`, so the cap never binds and bodies buffer unbounded.
 const GRAPHQL_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 enum CliAction {
@@ -263,26 +275,16 @@ async fn main() {
         api_key: config.auth.api_key.clone(),
     };
 
-    // GraphQL routes — POST always; GraphiQL on GET only when enabled.
-    let graphql_router = if config.graphiql_enabled() {
-        info!("GraphiQL enabled on GET /graphql");
-        Router::new().route("/graphql", get(graphiql_handler).post(graphql_handler))
-    } else {
-        info!("GraphiQL disabled — POST /graphql only");
-        Router::new().route("/graphql", post(graphql_handler))
-    };
-    let graphql_routes = graphql_router
-        .with_state(schema)
-        .layer(middleware::from_fn_with_state(
-            auth_state,
-            auth::auth_middleware,
-        ))
-        .layer(middleware::from_fn(rate_limit::graphql_rate_limit));
-
     // Health state with live shared ledger + peer registry.
     let health_state = HealthState {
         ledger: shared_ledger,
         peer_registry,
+    };
+
+    // Host / Content-Type / Origin guard state (H-01).
+    let guard_state = RequestGuardState {
+        allowed_hosts: Arc::new(config.allowed_host_set()),
+        allowed_origins: Arc::new(config.cors.allowed_origins.iter().cloned().collect()),
     };
 
     // A non-loopback bind with auth disabled is rejected at config validation
@@ -291,15 +293,14 @@ async fn main() {
         info!("TLS assumed terminated at the host or reverse proxy (in-process TLS is not implemented)");
     }
 
-    // Build full application router.
-    // /health is exempt from auth (§2.9).
-    let application = Router::new()
-        .route("/health", get(health_handler))
-        .with_state(health_state)
-        .merge(graphql_routes)
-        .layer(Extension(RateLimiter::graphql()))
-        .layer(DefaultBodyLimit::max(GRAPHQL_MAX_BODY_BYTES))
-        .layer(config.cors_layer());
+    let application = build_application(
+        schema,
+        auth_state,
+        health_state,
+        guard_state,
+        config.cors_layer(),
+        config.graphiql_enabled(),
+    );
 
     // Bind and serve.
     let bind_address = format!("{}:{}", config.bind_address, config.port);
@@ -345,6 +346,50 @@ async fn main() {
     }
 
     info!("gl-node shut down gracefully");
+}
+
+/// Assemble the full application router.
+///
+/// Layer order, outermost first: CORS, body limit (H-05), rate-limiter
+/// extension, then — on the GraphQL routes only — the request guard (H-01),
+/// the rate limiter and auth. The guard is outermost among those so a rejected
+/// Host, Content-Type or Origin never reaches the limiter or the schema.
+/// `/health` stays outside the guard and outside auth (§2.9).
+pub(crate) fn build_application(
+    schema: AppSchema,
+    auth_state: AuthState,
+    health_state: HealthState,
+    guard_state: RequestGuardState,
+    cors: CorsLayer,
+    graphiql: bool,
+) -> Router {
+    // GraphQL routes — POST always; GraphiQL on GET only when enabled.
+    let graphql_router = if graphiql {
+        info!("GraphiQL enabled on GET /graphql");
+        Router::new().route("/graphql", get(graphiql_handler).post(graphql_handler))
+    } else {
+        info!("GraphiQL disabled — POST /graphql only");
+        Router::new().route("/graphql", post(graphql_handler))
+    };
+    let graphql_routes = graphql_router
+        .with_state(schema)
+        .layer(middleware::from_fn_with_state(
+            auth_state,
+            auth::auth_middleware,
+        ))
+        .layer(middleware::from_fn(rate_limit::graphql_rate_limit))
+        .layer(middleware::from_fn_with_state(
+            guard_state,
+            request_guard::request_guard,
+        ));
+
+    Router::new()
+        .route("/health", get(health_handler))
+        .with_state(health_state)
+        .merge(graphql_routes)
+        .layer(Extension(RateLimiter::graphql()))
+        .layer(RequestBodyLimitLayer::new(GRAPHQL_MAX_BODY_BYTES))
+        .layer(cors)
 }
 
 fn build_signature_provider(config: &NodeConfig) -> Arc<dyn security::signing::SignatureProvider> {

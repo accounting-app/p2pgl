@@ -38,6 +38,12 @@ pub struct NodeConfig {
     #[serde(default)]
     pub cors: CorsConfig,
 
+    /// Extra `Host` header values the request guard accepts (H-01), beyond the
+    /// built-in loopback set (`localhost`, `127.0.0.1`, `::1`) and the bind
+    /// address. Hostnames or IP literals only — no scheme, no port.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+
     /// Authentication configuration.
     #[serde(default)]
     pub auth: AuthConfig,
@@ -320,6 +326,29 @@ impl NodeConfig {
             }
         }
 
+        for host in &self.allowed_hosts {
+            if host.is_empty() {
+                return Err(ConfigError::Validation(
+                    "allowedHosts must not contain empty entries".to_owned(),
+                ));
+            }
+            if host.contains("://") {
+                return Err(ConfigError::Validation(format!(
+                    "allowedHosts entries are hostnames or IP literals without a scheme or port, got \"{host}\""
+                )));
+            }
+            if host.contains('/') || host.chars().any(char::is_whitespace) {
+                return Err(ConfigError::Validation(format!(
+                    "allowedHosts entries must not contain \"/\" or whitespace, got \"{host}\""
+                )));
+            }
+            if HeaderValue::from_str(host).is_err() {
+                return Err(ConfigError::Validation(format!(
+                    "allowedHosts contains invalid host: {host}"
+                )));
+            }
+        }
+
         match self.p2p.relay_mode.as_str() {
             "n0" | "disabled" => {}
             other => {
@@ -354,6 +383,16 @@ impl NodeConfig {
             ));
         }
 
+        // H-01: fail closed. The request guard only admits the built-in loopback
+        // hosts plus the bind address, so on a non-loopback bind the operator
+        // must say which hostname(s)/IP(s) clients use — otherwise every request
+        // through a proxy or DNS name is rejected with 403 at runtime.
+        if self.binds_non_loopback() && self.allowed_hosts.is_empty() {
+            return Err(ConfigError::Validation(
+                "allowedHosts must list the hostname(s) or IP(s) clients use to reach this node when binding a non-loopback address; otherwise the Host guard rejects every request".to_owned(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -368,6 +407,28 @@ impl NodeConfig {
     /// Whether to serve GraphiQL on `GET /graphql`.
     pub fn graphiql_enabled(&self) -> bool {
         self.graphiql
+    }
+
+    /// Host values the request guard accepts, lowercased and portless (H-01).
+    ///
+    /// Loopback names are always accepted, the configured bind address is added
+    /// unless it is a wildcard, and `allowedHosts` supplies the rest.
+    pub fn allowed_host_set(&self) -> std::collections::HashSet<String> {
+        let mut hosts: std::collections::HashSet<String> = ["localhost", "127.0.0.1", "::1"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        match self.bind_address.as_str() {
+            // Wildcard binds name no host a client could send.
+            "0.0.0.0" | "::" | "" => {}
+            bind_address => {
+                hosts.insert(bind_address.to_ascii_lowercase());
+            }
+        }
+        for host in &self.allowed_hosts {
+            hosts.insert(host.to_ascii_lowercase());
+        }
+        hosts
     }
 
     /// Restrictive CORS: empty allowlist denies cross-origin browser access (H-1).
@@ -485,6 +546,7 @@ mod tests {
             "port": 8080,
             "externalFileEdits": "disabled",
             "cors": {{ "allowedOrigins": ["http://localhost:8080"] }},
+            "allowedHosts": ["ledger.example.com"],
             "auth": {{ "enabled": true, "apiKey": "secret-key-123" }},
             "signing": {{ "enabled": true }},
             "tls": {{ "mode": "terminated" }},
@@ -505,6 +567,7 @@ mod tests {
         assert_eq!(config.port, 8080);
         assert_eq!(config.external_file_edits, "disabled");
         assert_eq!(config.cors.allowed_origins, vec!["http://localhost:8080"]);
+        assert_eq!(config.allowed_hosts, vec!["ledger.example.com"]);
         assert!(config.auth.enabled);
         assert_eq!(config.auth.api_key, "secret-key-123");
         assert!(config.signing.enabled);
@@ -575,7 +638,7 @@ mod tests {
     fn test_graphiql_explicit_false_disables_playground() {
         // A public bind now requires auth (M-2), so include it here.
         let file = write_temp_config(
-            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "graphiql": false, "tls": { "mode": "terminated" }, "auth": { "enabled": true, "apiKey": "secret-key-123" } }"#,
+            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "graphiql": false, "tls": { "mode": "terminated" }, "auth": { "enabled": true, "apiKey": "secret-key-123" }, "allowedHosts": ["ledger.example.com"] }"#,
         );
         let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
         assert!(!config.graphiql_enabled());
@@ -596,9 +659,10 @@ mod tests {
 
     #[test]
     fn test_public_bind_with_auth_accepted() {
-        // The same public bind loads once auth is enabled.
+        // The same public bind loads once auth is enabled (and the Host
+        // allowlist is populated, per H-01).
         let file = write_temp_config(
-            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "tls": { "mode": "terminated" }, "auth": { "enabled": true, "apiKey": "secret-key-123" } }"#,
+            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "tls": { "mode": "terminated" }, "auth": { "enabled": true, "apiKey": "secret-key-123" }, "allowedHosts": ["ledger.example.com"] }"#,
         );
         let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
         assert!(config.binds_non_loopback());
@@ -733,6 +797,114 @@ mod tests {
         assert!(result.is_err());
         let error_message = format!("{}", result.unwrap_err());
         assert!(error_message.contains("tls.mode"));
+    }
+
+    #[test]
+    fn test_allowed_hosts_defaults_to_empty() {
+        let file = write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean" }"#);
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        assert!(config.allowed_hosts.is_empty());
+    }
+
+    #[test]
+    fn test_allowed_hosts_accepted() {
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "allowedHosts": ["ledger.example.com", "10.0.0.7"] }"#,
+        );
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        assert_eq!(config.allowed_hosts, vec!["ledger.example.com", "10.0.0.7"]);
+    }
+
+    #[test]
+    fn test_allowed_hosts_with_scheme_rejected() {
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "allowedHosts": ["https://x"] }"#,
+        );
+        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
+        assert!(result.is_err());
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(error_message.contains("without a scheme or port"));
+    }
+
+    #[test]
+    fn test_allowed_hosts_with_slash_rejected() {
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "allowedHosts": ["example.com/graphql"] }"#,
+        );
+        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
+        assert!(result.is_err());
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(error_message.contains("allowedHosts"));
+    }
+
+    #[test]
+    fn test_allowed_hosts_empty_entry_rejected() {
+        let file =
+            write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean", "allowedHosts": [""] }"#);
+        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
+        assert!(result.is_err());
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(error_message.contains("empty entries"));
+    }
+
+    #[test]
+    fn test_public_bind_without_allowed_hosts_rejected() {
+        // H-01: a non-loopback bind with no Host allowlist would 403 every
+        // request, so it must fail closed at boot instead.
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "tls": { "mode": "terminated" }, "auth": { "enabled": true, "apiKey": "secret-key-123" } }"#,
+        );
+        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
+        assert!(result.is_err());
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(error_message.contains("allowedHosts must list the hostname(s)"));
+    }
+
+    #[test]
+    fn test_public_bind_with_allowed_hosts_accepted() {
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "tls": { "mode": "terminated" }, "auth": { "enabled": true, "apiKey": "secret-key-123" }, "allowedHosts": ["ledger.example.com"] }"#,
+        );
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        assert_eq!(config.allowed_hosts, vec!["ledger.example.com"]);
+    }
+
+    #[test]
+    fn test_allowed_host_set_default_loopback() {
+        let file = write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean" }"#);
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        let hosts = config.allowed_host_set();
+        assert!(hosts.contains("localhost"));
+        assert!(hosts.contains("127.0.0.1"));
+        assert!(hosts.contains("::1"));
+    }
+
+    #[test]
+    fn test_allowed_host_set_includes_bind_address_and_entries() {
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "127.0.0.1", "allowedHosts": ["Ledger.Example.COM"] }"#,
+        );
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        let hosts = config.allowed_host_set();
+        assert!(hosts.contains("127.0.0.1"));
+        assert!(
+            hosts.contains("ledger.example.com"),
+            "allowedHosts entries are lowercased: {hosts:?}"
+        );
+    }
+
+    #[test]
+    fn test_allowed_host_set_omits_wildcard_bind() {
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "tls": { "mode": "terminated" }, "auth": { "enabled": true, "apiKey": "secret-key-123" }, "allowedHosts": ["ledger.example.com"] }"#,
+        );
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        let hosts = config.allowed_host_set();
+        assert!(
+            !hosts.contains("0.0.0.0"),
+            "a wildcard bind names no host a client could send: {hosts:?}"
+        );
+        assert!(hosts.contains("ledger.example.com"));
     }
 
     #[test]
