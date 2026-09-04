@@ -27,16 +27,22 @@ pub fn compute_want(
     remote_head_txids: &[String],
     remote_directive_ids: &[String],
 ) -> Vec<String> {
+    // L-21: every head txid is also a directive id, so a missing head is
+    // advertised in both `remote_head_txids` and `remote_directive_ids` and would
+    // be wanted twice; a list that repeats an id doubles up the same way. Dedup
+    // the output — preserving first-occurrence order — so each missing id is
+    // requested (and later served + re-validated by the peer) exactly once.
     let mut want = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
 
     for txid in remote_head_txids {
-        if !local_txids.contains(txid) {
+        if !local_txids.contains(txid) && seen.insert(txid.clone()) {
             want.push(txid.clone());
         }
     }
 
     for id in remote_directive_ids {
-        if !local_directive_ids.contains(id) {
+        if !local_directive_ids.contains(id) && seen.insert(id.clone()) {
             want.push(id.clone());
         }
     }
@@ -316,6 +322,32 @@ mod tests {
             &["dir1".to_owned(), "dir2".to_owned()],
         );
         assert_eq!(want, vec!["dir2"]);
+    }
+
+    #[test]
+    fn test_compute_want_dedups_head_also_in_directives() {
+        // L-21: every head txid is also a directive id, so a missing head is
+        // advertised in both lists. It must be wanted EXACTLY once.
+        let want = compute_want(
+            &HashSet::new(),
+            &HashSet::new(),
+            &["tx1".to_owned()],
+            &["tx1".to_owned(), "dir2".to_owned()],
+        );
+        assert_eq!(want, vec!["tx1", "dir2"], "the shared id collapses to one");
+    }
+
+    #[test]
+    fn test_compute_want_dedups_within_list() {
+        // A single list that repeats an id collapses to one want too, in
+        // first-occurrence order.
+        let want = compute_want(
+            &HashSet::new(),
+            &HashSet::new(),
+            &["tx1".to_owned(), "tx1".to_owned(), "tx2".to_owned()],
+            &["dir1".to_owned(), "dir1".to_owned()],
+        );
+        assert_eq!(want, vec!["tx1", "tx2", "dir1"]);
     }
 
     #[test]

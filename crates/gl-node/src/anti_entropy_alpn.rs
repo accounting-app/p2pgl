@@ -344,22 +344,76 @@ async fn local_have_heads_pages(ledger: &SharedLedger) -> Vec<WireMessage> {
 
 async fn collect_supply(ledger: &SharedLedger, ids: &[String]) -> Vec<p2p::protocol::SupplyEntry> {
     let svc = ledger.read().await;
+    // L-21: a Want may list the same id more than once (every missing head is
+    // also a directive id upstream, so `compute_want` used to want it twice).
+    // Serve each distinct id at most once — preserving first-occurrence order —
+    // so the requester does not re-validate the same body per copy. Composes
+    // with `truncate_supply` (T18), which trims the deduped batch to the frame.
+    let mut seen: HashSet<&str> = HashSet::new();
     ids.iter()
+        .filter(|id| seen.insert(id.as_str()))
         .filter_map(|id| svc.get_directive(id).map(make_supply_entry))
         .collect()
+}
+
+/// Tally of what `apply_supply_entries` did with one `Supply` batch (M-14).
+///
+/// Every entry lands in exactly one bucket, so the fields partition the batch.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SupplyOutcome {
+    /// M-14 fast path: `entry.id` was already in the DAG, so validation was skipped.
+    pub skipped_present: usize,
+    /// Validated and newly merged into the DAG.
+    pub merged: usize,
+    /// Parents missing; took the orphan-buffer path.
+    pub buffered: usize,
+    /// `insert_remote_directive` returned `Ok(None)` (present at insert time).
+    pub duplicate: usize,
+    /// Invalid body / author / signature / insert error.
+    pub rejected: usize,
 }
 
 async fn apply_supply_entries(
     handler: &AntiEntropyHandler,
     entries: Vec<p2p::protocol::SupplyEntry>,
     remote: EndpointId,
-) {
+) -> SupplyOutcome {
     let from_peer = remote.to_string();
+    let mut outcome = SupplyOutcome::default();
     for entry in entries {
+        // M-14: dedup BEFORE validate. `validate_supply_entry` parses up to 1 MiB
+        // of beancount, re-serializes, hashes, and Ed25519-verifies every entry
+        // before anything checks whether `entry.id` is already in the DAG — the
+        // G-Set dedup only happens later inside `insert_remote_directive`. So an
+        // allowlisted peer can replay the same Supply in a loop, paying full
+        // parse+verify per entry to change nothing.
+        //
+        // Skipping validation for an id we already hold is state-preserving:
+        // `entry.id` is content-addressed and is re-checked authoritatively under
+        // the write lock by `insert_remote_directive`, which returns `Ok(None)`
+        // for a present id without overwriting. A forged entry claiming a present
+        // id either (a) hashes to that id — it IS that content, a genuine
+        // duplicate — or (b) does not, in which case `validate_supply_entry` would
+        // reject it. In case (b) the entry is discarded whether we skip it here or
+        // reject it below, so it is never stored either way. Thus this fast path
+        // changes no state; it only avoids wasted CPU and a log line. The read
+        // guard is a temporary dropped at the end of this statement, so no lock is
+        // held into validation.
+        if handler
+            .ledger
+            .read()
+            .await
+            .get_directive(&entry.id)
+            .is_some()
+        {
+            outcome.skipped_present += 1;
+            continue;
+        }
         match validate_supply_entry(&entry) {
             Ok(directive) => {
                 if let Err(error) = verify_author_allowlisted(&directive, &handler.allowlist) {
                     warn!(%error, peer = %remote, "rejected ALPN supply: author not allowlisted");
+                    outcome.rejected += 1;
                     continue;
                 }
                 if let Err(error) = verify_remote_signature(
@@ -368,6 +422,7 @@ async fn apply_supply_entries(
                     &handler.swarm_topic,
                 ) {
                     warn!(%error, peer = %remote, "rejected ALPN supply: signature");
+                    outcome.rejected += 1;
                     continue;
                 }
                 let mut svc = handler.ledger.write().await;
@@ -385,11 +440,13 @@ async fn apply_supply_entries(
                     } else {
                         warn!(content_id = %content_id, "orphan buffer full or per-peer quota exceeded");
                     }
+                    outcome.buffered += 1;
                     continue;
                 }
                 match svc.insert_remote_directive(directive.clone()) {
                     Ok(Some(content_id)) => {
                         info!(content_id = %content_id, peer = %remote, "merged remote directive from ALPN");
+                        outcome.merged += 1;
                         if let ledger::model::Directive::Transaction(ref txn) = directive {
                             let graphql_txn = domain_txn_to_graphql(txn, &svc);
                             handler.broadcast.publish(graphql_txn);
@@ -404,13 +461,32 @@ async fn apply_supply_entries(
                         )
                         .await;
                     }
-                    Ok(None) => debug!("ALPN supply entry was duplicate"),
-                    Err(error) => warn!(%error, "rejected remote directive from ALPN"),
+                    Ok(None) => {
+                        debug!("ALPN supply entry was duplicate");
+                        outcome.duplicate += 1;
+                    }
+                    Err(error) => {
+                        warn!(%error, "rejected remote directive from ALPN");
+                        outcome.rejected += 1;
+                    }
                 }
             }
-            Err(error) => warn!(%error, "invalid ALPN supply entry"),
+            Err(error) => {
+                warn!(%error, "invalid ALPN supply entry");
+                outcome.rejected += 1;
+            }
         }
     }
+    debug!(
+        peer = %remote,
+        skipped_present = outcome.skipped_present,
+        merged = outcome.merged,
+        buffered = outcome.buffered,
+        duplicate = outcome.duplicate,
+        rejected = outcome.rejected,
+        "applied ALPN supply batch"
+    );
+    outcome
 }
 
 /// Drain orphans whose parents have arrived. Re-checks signature and author.
@@ -1076,5 +1152,125 @@ mod tests {
         }
 
         let _ = router_source.shutdown().await;
+    }
+
+    /// L-21: a `Want` listing the same id N times yields exactly ONE `SupplyEntry`.
+    #[tokio::test]
+    async fn collect_supply_dedups_repeated_ids() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ledger: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("led.bean"), "author".to_owned())
+                .expect("boot ledger"),
+        ));
+        let id = {
+            let mut svc = ledger.write().await;
+            svc.open_account(
+                "Assets:Cash".to_owned(),
+                NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid date"),
+                vec!["USD".to_owned()],
+            )
+            .expect("open account")
+        };
+
+        let entries = collect_supply(&ledger, &[id.clone(), id.clone(), id.clone()]).await;
+        assert_eq!(
+            entries.len(),
+            1,
+            "one directive → one entry, however many copies the Want listed"
+        );
+        assert_eq!(entries[0].id, id);
+    }
+
+    /// M-14: an entry whose id is already in the DAG is skipped BEFORE
+    /// `validate_supply_entry`, even when its body would fail validation.
+    #[tokio::test]
+    async fn apply_supply_entries_skips_present_id_without_validating() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ledger: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("led.bean"), "author".to_owned())
+                .expect("boot ledger"),
+        ));
+        let present_id = {
+            let mut svc = ledger.write().await;
+            svc.open_account(
+                "Assets:Cash".to_owned(),
+                NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid date"),
+                vec!["USD".to_owned()],
+            )
+            .expect("open account")
+        };
+        assert_eq!(ledger.read().await.directive_count(), 1);
+
+        // Same id (D's kind is Open), but a body that WOULD fail
+        // `validate_supply_entry`. With the fast path this is never parsed
+        // (skipped_present); without it, it reaches validate and is counted
+        // rejected instead.
+        let entry = p2p::protocol::SupplyEntry {
+            id: present_id.clone(),
+            kind: p2p::protocol::DirectiveKind::Open,
+            economic_bean: "this is not valid beancount".to_owned(),
+            envelope: std::collections::BTreeMap::new(),
+        };
+
+        let handler = make_handler(
+            ledger.clone(),
+            PeerAllowlist::parse(&[]).expect("allowlist"),
+        );
+        let remote = iroh::SecretKey::generate().public();
+        let outcome = apply_supply_entries(&handler, vec![entry], remote).await;
+
+        assert_eq!(
+            outcome.skipped_present, 1,
+            "a present id must take the M-14 fast path"
+        );
+        assert_eq!(outcome.merged, 0);
+        assert_eq!(
+            outcome.rejected, 0,
+            "the garbage body must never reach validation"
+        );
+
+        // Ledger unchanged: still exactly D.
+        let svc = ledger.read().await;
+        assert_eq!(svc.directive_count(), 1);
+        assert!(svc.get_directive(&present_id).is_some());
+    }
+
+    /// M-14 does not over-skip: a genuinely new, valid entry still merges.
+    #[tokio::test]
+    async fn apply_supply_entries_merges_genuinely_new_entry() {
+        let author = iroh::SecretKey::generate().public();
+        let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        // A source ledger authored by `author`: its `open` is stamped with
+        // `openledger-author` = an allowlisted id, so the served entry passes
+        // `verify_author_allowlisted`.
+        let mut source = LedgerService::boot(temp_dir.path().join("src.bean"), author.to_string())
+            .expect("boot source");
+        let open_id = source
+            .open_account(
+                "Assets:Cash".to_owned(),
+                NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid date"),
+                vec!["USD".to_owned()],
+            )
+            .expect("open account");
+        let entry = make_supply_entry(source.get_directive(&open_id).expect("directive present"));
+
+        // A sink ledger that has never seen this id.
+        let sink: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("sink.bean"), "sink".to_owned())
+                .expect("boot sink"),
+        ));
+        let handler = make_handler(sink.clone(), allow);
+        let remote = iroh::SecretKey::generate().public();
+
+        let outcome = apply_supply_entries(&handler, vec![entry], remote).await;
+        assert_eq!(
+            outcome.skipped_present, 0,
+            "a genuinely new id must NOT be skipped by the fast path"
+        );
+        assert_eq!(outcome.merged, 1, "a new valid entry must merge");
+        assert_eq!(outcome.rejected, 0);
+        assert_eq!(sink.read().await.directive_count(), 1);
     }
 }
