@@ -198,6 +198,8 @@ async fn main() {
                     allowlist: peer_node.allowlist().clone(),
                     signing_enabled: config.signing.enabled,
                     swarm_topic: config.p2p.swarm_topic.clone(),
+                    // Generous defaults; a config surface follows in T38 (M-06).
+                    timeouts: anti_entropy_alpn::AntiEntropyTimeouts::default(),
                 };
                 p2p_router = Some(p2p_service::spawn_router(&peer_node, handler.clone()));
                 let sender = p2p_service::spawn_gossip_loop(&peer_node, handler.clone());

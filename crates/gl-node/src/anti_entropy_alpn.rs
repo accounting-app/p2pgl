@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler};
@@ -30,6 +31,31 @@ use p2p::union_merge::{validate_supply_entry, verify_author_allowlisted, verify_
 /// ledger the 64 MiB file cap permits, so honest peers never approach it.
 const MAX_ACCUMULATED_HAVE_HEADS: usize = 1_048_576;
 
+/// Per-operation timeouts for ALPN anti-entropy sessions (M-06).
+///
+/// Without these a peer that accepts a connection and then never sends stalls
+/// the session — and, before the loop was made concurrent, all replication.
+///
+/// The defaults are deliberately generous: a full 16 MiB Supply frame transfers
+/// well within 30s on any real link, and a read timeout only fires when a peer
+/// genuinely stalls. These will get a config surface later (T38).
+#[derive(Clone, Copy, Debug)]
+pub struct AntiEntropyTimeouts {
+    /// Cap on establishing a QUIC connection to a peer.
+    pub connect: Duration,
+    /// Cap on a single frame read or write.
+    pub io: Duration,
+}
+
+impl Default for AntiEntropyTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(10),
+            io: Duration::from_secs(30),
+        }
+    }
+}
+
 /// Shared handler registered on `openledger/anti-entropy/1`.
 #[derive(Clone)]
 pub struct AntiEntropyHandler {
@@ -40,6 +66,8 @@ pub struct AntiEntropyHandler {
     pub signing_enabled: bool,
     /// This node's mesh identity (swarm topic), bound into signature checks (L2).
     pub swarm_topic: String,
+    /// Per-operation connect and I/O timeouts (M-06).
+    pub timeouts: AntiEntropyTimeouts,
 }
 
 impl std::fmt::Debug for AntiEntropyHandler {
@@ -78,8 +106,9 @@ async fn serve_anti_entropy(
         .accept_bi()
         .await
         .map_err(|error| error.to_string())?;
+    let io_timeout = handler.timeouts.io;
     loop {
-        let message = match read_message(&mut recv).await {
+        let message = match read_message(&mut recv, io_timeout).await {
             Ok(message) => message,
             Err(error) if error.contains("early eof") || error.contains("closed") => break,
             Err(error) => return Err(error),
@@ -92,7 +121,7 @@ async fn serve_anti_entropy(
             WireMessage::HaveHeads { more: true, .. } => {}
             WireMessage::HaveHeads { .. } => {
                 for page in local_have_heads_pages(&handler.ledger).await {
-                    write_message(&mut send, &page).await?;
+                    write_message(&mut send, &page, io_timeout).await?;
                 }
             }
             WireMessage::Want { ids, .. } => {
@@ -100,7 +129,7 @@ async fn serve_anti_entropy(
                 // (H-02); it re-Wants any tail we could not fit.
                 let entries = collect_supply(&handler.ledger, &ids).await;
                 let reply = p2p::anti_entropy::truncate_supply(entries);
-                write_message(&mut send, &reply).await?;
+                write_message(&mut send, &reply, io_timeout).await?;
             }
             WireMessage::Supply { entries, .. } => {
                 apply_supply_entries(handler, entries, remote).await;
@@ -126,13 +155,19 @@ pub async fn fetch_want(
     if ids.is_empty() || !handler.allowlist.admits(peer) {
         return;
     }
-    let connection = match endpoint
-        .connect(peer_addr, p2p::protocol::ANTI_ENTROPY_ALPN)
-        .await
+    let connection = match tokio::time::timeout(
+        handler.timeouts.connect,
+        endpoint.connect(peer_addr, p2p::protocol::ANTI_ENTROPY_ALPN),
+    )
+    .await
     {
-        Ok(connection) => connection,
-        Err(error) => {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(error)) => {
             warn!(peer = %peer, %error, "anti-entropy connect failed");
+            return;
+        }
+        Err(_elapsed) => {
+            warn!(peer = %peer, "anti-entropy connect timed out");
             return;
         }
     };
@@ -152,13 +187,19 @@ pub async fn exchange_with_peer(
     if !handler.allowlist.admits(peer) {
         return;
     }
-    let connection = match endpoint
-        .connect(peer_addr, p2p::protocol::ANTI_ENTROPY_ALPN)
-        .await
+    let connection = match tokio::time::timeout(
+        handler.timeouts.connect,
+        endpoint.connect(peer_addr, p2p::protocol::ANTI_ENTROPY_ALPN),
+    )
+    .await
     {
-        Ok(connection) => connection,
-        Err(error) => {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(error)) => {
             debug!(peer = %peer, %error, "anti-entropy exchange connect failed");
+            return;
+        }
+        Err(_elapsed) => {
+            debug!(peer = %peer, "anti-entropy exchange connect timed out");
             return;
         }
     };
@@ -194,9 +235,10 @@ async fn run_head_exchange(
         .await
         .map_err(|error| error.to_string())?;
     for page in local_have_heads_pages(&handler.ledger).await {
-        write_message(&mut send, &page).await?;
+        write_message(&mut send, &page, handler.timeouts.io).await?;
     }
-    let (head_txids, directive_ids) = read_have_heads_advert(&mut recv, remote).await?;
+    let (head_txids, directive_ids) =
+        read_have_heads_advert(&mut recv, remote, handler.timeouts.io).await?;
     let want = {
         let svc = handler.ledger.read().await;
         p2p::anti_entropy::compute_want(
@@ -219,6 +261,7 @@ async fn run_head_exchange(
 async fn read_have_heads_advert(
     recv: &mut RecvStream,
     remote: EndpointId,
+    io_timeout: Duration,
 ) -> Result<(Vec<String>, Vec<String>), String> {
     let mut head_txids: Vec<String> = Vec::new();
     let mut directive_ids: Vec<String> = Vec::new();
@@ -228,7 +271,7 @@ async fn read_have_heads_advert(
             directive_ids: page_directives,
             more,
             ..
-        } = read_message(recv).await?
+        } = read_message(recv, io_timeout).await?
         else {
             return Err("expected HaveHeads from peer".to_owned());
         };
@@ -263,8 +306,13 @@ async fn fetch_want_chunk(
 ) -> Result<(), String> {
     let mut remaining: Vec<String> = chunk.to_vec();
     while !remaining.is_empty() {
-        write_message(send, &WireMessage::want(remaining.clone())).await?;
-        let entries = match read_message(recv).await? {
+        write_message(
+            send,
+            &WireMessage::want(remaining.clone()),
+            handler.timeouts.io,
+        )
+        .await?;
+        let entries = match read_message(recv, handler.timeouts.io).await? {
             WireMessage::Supply { entries, .. } => entries,
             other => {
                 warn!(peer = %remote, ?other, "expected Supply after Want");
@@ -416,26 +464,38 @@ pub async fn drain_orphans(
     }
 }
 
-async fn write_message(send: &mut SendStream, message: &WireMessage) -> Result<(), String> {
+async fn write_message(
+    send: &mut SendStream,
+    message: &WireMessage,
+    io_timeout: Duration,
+) -> Result<(), String> {
     let bytes = message.to_wire()?;
-    send.write_all(&bytes)
-        .await
-        .map_err(|error| error.to_string())
+    match tokio::time::timeout(io_timeout, send.write_all(&bytes)).await {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        // A stalled write is a torn-down session, not a clean shutdown, so this
+        // error string deliberately avoids "early eof"/"closed" (M-06).
+        Err(_elapsed) => Err("anti-entropy write timed out".to_owned()),
+    }
 }
 
-async fn read_message(recv: &mut RecvStream) -> Result<WireMessage, String> {
+async fn read_message(recv: &mut RecvStream, io_timeout: Duration) -> Result<WireMessage, String> {
     let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf)
-        .await
-        .map_err(|error| format!("early eof: {error}"))?;
+    match tokio::time::timeout(io_timeout, recv.read_exact(&mut len_buf)).await {
+        Ok(result) => result.map_err(|error| format!("early eof: {error}"))?,
+        // A stalled read is a torn-down session, not a clean shutdown. The error
+        // string must NOT contain "early eof"/"closed": `serve_anti_entropy`
+        // matches those to break cleanly, and a timeout is a real error (M-06).
+        Err(_elapsed) => return Err("anti-entropy read timed out".to_owned()),
+    }
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_MESSAGE_SIZE as usize {
         return Err(format!("anti-entropy frame too large: {len}"));
     }
     let mut body = vec![0u8; len];
-    recv.read_exact(&mut body)
-        .await
-        .map_err(|error| error.to_string())?;
+    match tokio::time::timeout(io_timeout, recv.read_exact(&mut body)).await {
+        Ok(result) => result.map_err(|error| error.to_string())?,
+        Err(_elapsed) => return Err("anti-entropy read timed out".to_owned()),
+    }
     WireMessage::decode_checked(&body).map_err(|error| error.to_string())
 }
 
@@ -516,6 +576,14 @@ mod tests {
     }
 
     fn make_handler(ledger: SharedLedger, allowlist: PeerAllowlist) -> AntiEntropyHandler {
+        make_handler_with_timeouts(ledger, allowlist, AntiEntropyTimeouts::default())
+    }
+
+    fn make_handler_with_timeouts(
+        ledger: SharedLedger,
+        allowlist: PeerAllowlist,
+        timeouts: AntiEntropyTimeouts,
+    ) -> AntiEntropyHandler {
         AntiEntropyHandler {
             ledger,
             broadcast: TransactionBroadcast::new(),
@@ -523,6 +591,7 @@ mod tests {
             allowlist,
             signing_enabled: false,
             swarm_topic: String::new(),
+            timeouts,
         }
     }
 
@@ -738,5 +807,274 @@ mod tests {
     async fn two_node_catchup_beyond_have_heads_cap() {
         let _serialized = NET_TEST_LOCK.lock().await;
         run_catchup_beyond_caps(4_300, Duration::from_secs(900)).await;
+    }
+
+    /// Short timeouts so the M-06 tests trip their read caps in milliseconds.
+    fn short_timeouts() -> AntiEntropyTimeouts {
+        AntiEntropyTimeouts {
+            connect: Duration::from_millis(500),
+            io: Duration::from_millis(500),
+        }
+    }
+
+    /// Seed `ledger` with two `open`s and one balanced transaction (3 directives).
+    async fn seed_funding_ledger(ledger: &SharedLedger) -> usize {
+        let mut service = ledger.write().await;
+        service
+            .open_account(
+                "Assets:Cash".to_owned(),
+                NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid date"),
+                vec!["USD".to_owned()],
+            )
+            .expect("open cash");
+        service
+            .open_account(
+                "Equity:Opening".to_owned(),
+                NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid date"),
+                Vec::new(),
+            )
+            .expect("open equity");
+        service
+            .append_transaction(balanced_funding_input())
+            .expect("append funding");
+        service.directive_count()
+    }
+
+    /// An ALPN server that accepts a connection and then never replies — the
+    /// M-06 stall vector. Used to prove the client's per-frame read timeout
+    /// fires instead of the session hanging forever.
+    #[derive(Debug, Clone)]
+    struct TarpitHandler;
+
+    impl ProtocolHandler for TarpitHandler {
+        async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+            // Accept the client's bi-stream, then hang forever without ever
+            // replying: the client must tear the session down on its own timer.
+            let _streams = connection.accept_bi().await;
+            std::future::pending::<Result<(), AcceptError>>().await
+        }
+    }
+
+    /// M-06 core vector: a peer that accepts a connection and then never replies
+    /// (a "tarpit") must not hang the client. The per-frame read timeout tears
+    /// the session down; `exchange_with_peer` RETURNS well within a generous
+    /// bound. The assertion is that the OUTER guard timeout does NOT fire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tarpit_peer_read_times_out() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_client = bind_direct_endpoint().await;
+        let endpoint_tarpit = bind_direct_endpoint().await;
+
+        let id_client = endpoint_client.id();
+        let id_tarpit = endpoint_tarpit.id();
+
+        let router_tarpit = Router::builder(endpoint_tarpit.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, TarpitHandler)
+            .spawn();
+
+        let allow_client =
+            PeerAllowlist::parse(&[id_tarpit.to_string()]).expect("allowlist client");
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ledger_client: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("client.bean"), id_client.to_string())
+                .expect("boot client ledger"),
+        ));
+
+        let handler_client =
+            make_handler_with_timeouts(ledger_client, allow_client, short_timeouts());
+
+        wait_until_dialable(&endpoint_client).await;
+        wait_until_dialable(&endpoint_tarpit).await;
+        let addr_tarpit = endpoint_tarpit.addr();
+
+        // 4×io is a generous bound: the exchange should return at ~io (500 ms)
+        // once the read against the silent peer times out.
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(2_000),
+            exchange_with_peer(&endpoint_client, addr_tarpit, &handler_client),
+        )
+        .await;
+
+        let _ = router_tarpit.shutdown().await;
+        assert!(
+            outcome.is_ok(),
+            "M-06: exchange_with_peer hung against a tarpit peer instead of timing out"
+        );
+    }
+
+    /// M-06 money test: one healthy peer + one tarpit, exchanged CONCURRENTLY
+    /// (the pattern `spawn_anti_entropy_loop` now uses). The healthy peer's
+    /// directives must still be pulled despite the tarpit, and the whole tick
+    /// must finish within a bounded time — proving a hung peer no longer blocks
+    /// a healthy one, which it did when the loop awaited each exchange inline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hung_peer_does_not_block_healthy_peer() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_client = bind_direct_endpoint().await;
+        let endpoint_source = bind_direct_endpoint().await;
+        let endpoint_tarpit = bind_direct_endpoint().await;
+
+        let id_client = endpoint_client.id();
+        let id_source = endpoint_source.id();
+        let id_tarpit = endpoint_tarpit.id();
+
+        // Seed the healthy source with independent `open`s (no parent chain), so
+        // one exchange round transfers and applies the whole set with no orphan
+        // buffering — the single-tick convergence here is deterministic, unlike a
+        // transaction that depends on its parents arriving first.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let source_path = temp_dir.path().join("source.bean");
+        write_open_directive_ledger(&source_path, 5, &id_source.to_string());
+        let ledger_source: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(source_path, id_source.to_string()).expect("boot source ledger"),
+        ));
+        let source_count = ledger_source.read().await.directive_count();
+        assert_eq!(source_count, 5, "seed: five independent opens");
+
+        let allow_source =
+            PeerAllowlist::parse(&[id_client.to_string()]).expect("allowlist source");
+        let handler_source = make_handler(ledger_source.clone(), allow_source);
+        let router_source = Router::builder(endpoint_source.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler_source.clone())
+            .spawn();
+
+        let router_tarpit = Router::builder(endpoint_tarpit.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, TarpitHandler)
+            .spawn();
+
+        let allow_client = PeerAllowlist::parse(&[id_source.to_string(), id_tarpit.to_string()])
+            .expect("allowlist client");
+        let ledger_client: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("client.bean"), id_client.to_string())
+                .expect("boot client ledger"),
+        ));
+        let handler_client =
+            make_handler_with_timeouts(ledger_client.clone(), allow_client, short_timeouts());
+
+        wait_until_dialable(&endpoint_client).await;
+        wait_until_dialable(&endpoint_source).await;
+        wait_until_dialable(&endpoint_tarpit).await;
+
+        let addr_source = endpoint_source.addr();
+        let addr_tarpit = endpoint_tarpit.addr();
+
+        // Each tick runs BOTH peers' exchanges concurrently, exactly as
+        // `spawn_anti_entropy_loop` now does: spawn into a JoinSet and drain
+        // before the next tick (M-06). Driving the drain pattern directly avoids
+        // standing up a PeerNode/registry while exercising the isolation
+        // property. If a hung peer blocked a healthy one (the pre-fix serial
+        // loop), a single drain would exceed its bound and the client would
+        // never converge.
+        let run_concurrent_tick = || {
+            let addr_source = addr_source.clone();
+            let addr_tarpit = addr_tarpit.clone();
+            let endpoint_client = endpoint_client.clone();
+            let handler_client = handler_client.clone();
+            async move {
+                let mut set = tokio::task::JoinSet::new();
+                for addr in [addr_source, addr_tarpit] {
+                    let endpoint = endpoint_client.clone();
+                    let handler = handler_client.clone();
+                    set.spawn(async move {
+                        exchange_with_peer(&endpoint, addr, &handler).await;
+                    });
+                }
+                while set.join_next().await.is_some() {}
+            }
+        };
+
+        // Converge with the healthy peer despite the tarpit. Every tick is bounded
+        // by the tarpit's ~io read timeout (500 ms), so both the per-tick guard
+        // and the overall deadline are generous multiples of that (M-06).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let count_client = loop {
+            let tick_started = tokio::time::Instant::now();
+            let tick_outcome =
+                tokio::time::timeout(Duration::from_millis(2_000), run_concurrent_tick()).await;
+            assert!(
+                tick_outcome.is_ok(),
+                "M-06: a concurrent tick exceeded 4x io ({:?}) — the tarpit blocked the drain",
+                tick_started.elapsed()
+            );
+
+            let count = ledger_client.read().await.directive_count();
+            if count == source_count {
+                break count;
+            }
+            if tokio::time::Instant::now() > deadline {
+                break count;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+
+        let _ = router_source.shutdown().await;
+        let _ = router_tarpit.shutdown().await;
+
+        assert_eq!(
+            count_client, source_count,
+            "M-06: healthy peer's directives were not pulled despite the tarpit"
+        );
+    }
+
+    /// M-06 guard: the timeouts must not break a legitimate transfer. Two real
+    /// handlers on SHORT timeouts still converge — proving the caps are not so
+    /// tight that they trip on a normal exchange.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn happy_path_short_timeouts_converges() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_client = bind_direct_endpoint().await;
+        let endpoint_source = bind_direct_endpoint().await;
+
+        let id_client = endpoint_client.id();
+        let id_source = endpoint_source.id();
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ledger_source: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("source.bean"), id_source.to_string())
+                .expect("boot source ledger"),
+        ));
+        let source_count = seed_funding_ledger(&ledger_source).await;
+
+        let allow_source =
+            PeerAllowlist::parse(&[id_client.to_string()]).expect("allowlist source");
+        let allow_client =
+            PeerAllowlist::parse(&[id_source.to_string()]).expect("allowlist client");
+
+        let ledger_client: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("client.bean"), id_client.to_string())
+                .expect("boot client ledger"),
+        ));
+
+        let handler_source =
+            make_handler_with_timeouts(ledger_source.clone(), allow_source, short_timeouts());
+        let handler_client =
+            make_handler_with_timeouts(ledger_client.clone(), allow_client, short_timeouts());
+
+        let router_source = Router::builder(endpoint_source.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler_source.clone())
+            .spawn();
+
+        wait_until_dialable(&endpoint_client).await;
+        wait_until_dialable(&endpoint_source).await;
+        let addr_source = endpoint_source.addr();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            exchange_with_peer(&endpoint_client, addr_source.clone(), &handler_client).await;
+            if ledger_client.read().await.directive_count() == source_count {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                let _ = router_source.shutdown().await;
+                panic!("M-06 happy path: client did not converge under short timeouts");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let _ = router_source.shutdown().await;
     }
 }

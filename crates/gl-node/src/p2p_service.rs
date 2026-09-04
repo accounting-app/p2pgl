@@ -288,6 +288,12 @@ pub fn spawn_anti_entropy_loop(peer_node: &PeerNode, handler: AntiEntropyHandler
                 continue;
             }
 
+            // Run every peer's exchange concurrently (M-06): a peer that accepts
+            // a connection and then stalls must not block replication with the
+            // healthy peers, as it did when this loop awaited each exchange
+            // inline. Each spawned exchange is itself bounded by the connect and
+            // I/O timeouts on the handler, so the drain below cannot hang.
+            let mut set = tokio::task::JoinSet::new();
             for peer in &peers {
                 let Ok(peer_id) = peer.id.parse::<iroh::EndpointId>() else {
                     continue;
@@ -295,8 +301,16 @@ pub fn spawn_anti_entropy_loop(peer_node: &PeerNode, handler: AntiEntropyHandler
                 if !allowlist.admits(peer_id) {
                     continue;
                 }
-                exchange_with_peer(&endpoint, peer_id, &handler).await;
+                let endpoint = endpoint.clone();
+                let handler = handler.clone();
+                set.spawn(async move {
+                    exchange_with_peer(&endpoint, peer_id, &handler).await;
+                });
             }
+
+            // Drain this tick's exchanges before the next tick so ticks do not
+            // pile up. Bounded by the per-exchange timeouts above (M-06).
+            while set.join_next().await.is_some() {}
         }
     });
 }

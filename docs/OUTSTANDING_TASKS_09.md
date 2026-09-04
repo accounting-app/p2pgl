@@ -19,7 +19,7 @@ Already closed before this backlog — do not re-do: 09/01 **M-01** (strict inbo
 | T21 | H-03 + H-06 + L-26 + L-29 — remote-body canonicalization | High | S–M | ☑ |
 | T22 | M-13 — no HTTP timeouts/connection cap (slowloris) | Med | S–M | ☑ |
 | T23 | M-12 + M-07 — gossip origin auth; announce flood | Med | M | ☑ |
-| T24 | M-06 — no P2P I/O timeouts; serial sync loop | Med | S | ☐ |
+| T24 | M-06 — no P2P I/O timeouts; serial sync loop | Med | S | ☑ |
 | T25 | M-14 + L-21 — validate-before-dedup; duplicate ids | Med | S | ☐ |
 | T26 | M-16 + L-19 — post-decode CBOR caps; connection bounds | Med | M | ☐ |
 | T27 | M-15 + L-13 — O(M×N) persist under write lock | Med | M | ☐ |
@@ -37,6 +37,7 @@ Already closed before this backlog — do not re-do: 09/01 **M-01** (strict inbo
 | T39 | L-20, L-23 + registry heads — orphan/mesh-identity batch | Low | S–M | ☐ |
 | T40 | L-01, L-02, L-07, L-09, L-11, L-14, L-15, L-16, L-18 — carryover Lows sweep | Low | M | ☐ |
 | T41 | Informational/hygiene sweep | Info | S | ☐ |
+| T42 | Per-peer ALPN connection reuse (optimization; from T23/T24) | Low | M | ☐ |
 
 Coverage check — every open register entry (0902 §7) maps to exactly one task:
 H-01→T19 · H-02→T18 · H-03→T21 · H-04→T20 · H-05→T19 · H-06→T21 · M-04→T34 · M-06→T24 · M-07→T23 · M-08→T32 · M-09→T29 · M-10→T33 · M-11→T28 · M-12→T23 · M-13→T22 · M-14→T25 · M-15→T27 · M-16→T26 · M-17→T30 · M-18→T31 · L-01/02/07/09/11/14/15/16/18→T40 · L-03/10→T38 · L-04/05/08→T36 · L-12→T35 · L-13→T27 · L-17→T35 · L-19→T26 · L-20→T39 · L-21→T25 · L-22→T35 · L-23→T39 · L-24→T34 · L-25→T37 · L-26→T21 · L-27→T37 · L-28→T35 · L-29→T21 · L-30→T35 · L-31/32→T36 · L-06 (latent)→T33/T21 note.
@@ -92,8 +93,9 @@ H-01→T19 · H-02→T18 · H-03→T21 · H-04→T20 · H-05→T19 · H-06→T21
 - **Files:** [fetch_coordinator.rs](../crates/gl-node/src/fetch_coordinator.rs) (new), [p2p_service.rs](../crates/gl-node/src/p2p_service.rs), [main.rs](../crates/gl-node/src/main.rs).
 - **Verify:** ✅ flood of unique announce ids → live guards capped at 16; 1000 duplicate begins → exactly 1 proceed; failed fetches negative-cached until TTL; cache never exceeds capacity.
 
-### ☐ T24 — Session timeouts + concurrent peer exchanges (M-06)
-- **Change:** `tokio::time::timeout` around every connect/read/write in the ALPN session paths; run per-peer anti-entropy exchanges concurrently (bounded) instead of the serial loop where one tarpit peer stalls all replication. Also add a per-connection request budget to `serve_anti_entropy` (T18 review note: one stream can still issue unlimited HaveHeads/Want rounds — each now cheap, but unbudgeted). **From T23:** reuse one ALPN connection per peer instead of dialing per fetch/exchange — `fetch_want` and `exchange_with_peer` both `endpoint.connect(...)` fresh each call; a per-peer connection cache (with re-dial on drop) removes the dial churn the T23 semaphore currently only bounds.
+### ☑ T24 — Session timeouts + concurrent peer exchanges (M-06)
+> **Done 2026-09-04 (in working tree, not yet committed).** `AntiEntropyTimeouts { connect: 10s, io: 30s }` added to `AntiEntropyHandler` (test-overridable, config-ready per T38); connect wrapped at both dial sites; per-frame I/O timeout inside `read_message`/`write_message` — timeout error strings deliberately avoid `"early eof"`/`"closed"` so a stall is a torn-down session, not a clean break. Anti-entropy loop now runs per-peer exchanges concurrently via `JoinSet`, drained each tick and bounded by the per-exchange timeouts. Money test `hung_peer_does_not_block_healthy_peer`: a real seeded peer converges despite a concurrent tarpit; bug-catch proof shows removing the read timeout makes the harness detect the hang. **Two items were re-scoped OUT of this task** (see below): connection-reuse and the per-connection request budget.
+- **Scoping note:** the per-connection request budget for `serve_anti_entropy` moved to **T26** (it is only meaningful alongside an ALPN connection cap); connection-reuse-per-peer moved to the new **T42** (pure optimization — no security value once T23's semaphore caps dials and T24 adds timeouts/concurrency).
 - **Files:** [anti_entropy_alpn.rs:350-371](../crates/gl-node/src/anti_entropy_alpn.rs#L350-L371) and session loops, [p2p_service.rs:250-258](../crates/gl-node/src/p2p_service.rs#L250-L258).
 - **Verify:** a peer that accepts and never responds is timed out and does not delay other peers' sync round.
 
@@ -103,7 +105,7 @@ H-01→T19 · H-02→T18 · H-03→T21 · H-04→T20 · H-05→T19 · H-06→T21
 - **Verify:** test — replaying a Supply of known ids performs no signature verifications; a Want with repeated ids yields one entry per id.
 
 ### ☐ T26 — Pre-decode frame sanity + connection caps (M-16, L-19)
-- **Change:** cardinality caps currently run **after** full CBOR decode, and the internally-tagged enum buffers through serde `Content` (~0.5–1 GiB transient per 16 MiB Want/HaveHeads frame). Add a cheap pre-decode structural check (scan CBOR array headers) or a much smaller frame cap for non-Supply message types; cap concurrent inbound ALPN connections per peer (iroh's Router spawns unbounded tasks); read bodies into incrementally-grown buffers instead of pre-allocating the full length-prefix claim (L-19: stalled streams pin 16 MiB each).
+- **Change:** cardinality caps currently run **after** full CBOR decode, and the internally-tagged enum buffers through serde `Content` (~0.5–1 GiB transient per 16 MiB Want/HaveHeads frame). Add a cheap pre-decode structural check (scan CBOR array headers) or a much smaller frame cap for non-Supply message types; cap concurrent inbound ALPN connections per peer (iroh's Router spawns unbounded tasks); read bodies into incrementally-grown buffers instead of pre-allocating the full length-prefix claim (L-19: stalled streams pin 16 MiB each). **From T24:** add a per-connection request budget to `serve_anti_entropy` — one stream can still issue unlimited HaveHeads/Want rounds (each cheap after T18, each frame now I/O-timeout-bounded after T24, but the message loop is uncapped); a generous cap that a full legitimate catch-up won't hit belongs here alongside the per-peer connection cap.
 - **Files:** [protocol.rs:31,175-185](../crates/p2p/src/protocol.rs#L175-L185), [anti_entropy_alpn.rs:357-371](../crates/gl-node/src/anti_entropy_alpn.rs#L357-L371), router setup in [p2p_service.rs:88-93](../crates/gl-node/src/p2p_service.rs#L88-L93).
 - **Verify:** a 16 MiB frame claiming millions of ids is rejected without GiB-scale allocation (assert peak RSS in test); >N concurrent connections from one peer are refused; a stalled stream holds only a small buffer.
 
@@ -206,6 +208,11 @@ H-01→T19 · H-02→T18 · H-03→T21 · H-04→T20 · H-05→T19 · H-06→T21
 ### ☐ T41 — Informational/hygiene sweep
 Small items from both reports' informational sections, batched. Added from T22 review: replace the module-local network-test locks (`anti_entropy_alpn.rs`, `http_server.rs`) with one workspace-shared lock or a `cargo nextest`/test-group config — the QUIC convergence test still flakes when other modules' network tests overlap it under load. add `persist-credentials: false` to CI checkout; remove committed `.DS_Store` files and gitignore them; redacting `Debug` impls for `AuthState`/`NodeConfig`; remove the unused `rand` dep in gl-node and vestigial `libssl-dev` in the builder image; delete or align production-dead code (`head_exchange`, `filter_supply_requests`, `extract_parents`/`extract_lamport`); retry gossip `subscribe` instead of exiting the loop permanently; replace string-match EOF classification in `serve_anti_entropy` with typed error handling; assert on `to_wire`'s u32 length cast; document the unsigned-pre-P2P-directives migration; consider a derived signing subkey (vs sharing the QUIC identity key); keep an eye on the `lru`/`h2` advisories via the existing CI `cargo audit`.
 - **Verify:** CI green; `git status` clean of `.DS_Store`; `cargo udeps`/build confirm removals; grep shows no `data_unchecked` outside gated subscription code.
+
+### ☐ T42 — Per-peer ALPN connection reuse (optimization; from T23/T24)
+- **Change:** `fetch_want` and `exchange_with_peer` open a fresh `endpoint.connect(...)` on every gossip fetch and every anti-entropy tick. A per-peer connection cache (reused across both call sites, re-dialed on drop/error, liveness-checked) removes the repeated QUIC handshake cost.
+- **Priority:** low — **not a security fix.** T23's fetch semaphore bounds concurrent dials and T24 added connect/I-O timeouts + concurrency, so the flood and stall vectors are already closed; this is pure handshake-overhead reduction. Carries real lifecycle risk (shared mutable connection state across the gossip and anti-entropy paths, re-dial races), so it is deliberately isolated from the security tasks.
+- **Verify:** repeated fetches/exchanges to one peer reuse a single connection; a dropped connection transparently re-dials; concurrent fetch + exchange to the same peer do not corrupt shared state.
 
 ---
 
