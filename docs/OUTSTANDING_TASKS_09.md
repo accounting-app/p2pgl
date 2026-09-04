@@ -17,7 +17,7 @@ Already closed before this backlog — do not re-do: 09/01 **M-01** (strict inbo
 | T19 | H-05 + H-01 — ineffective body limit; CSRF/DNS rebinding | High | S | ☑ |
 | T20 | H-04 — signed-year dates brick boot | High | S | ☑ |
 | T21 | H-03 + H-06 + L-26 + L-29 — remote-body canonicalization | High | S–M | ☑ |
-| T22 | M-13 — no HTTP timeouts/connection cap (slowloris) | Med | S–M | ☐ |
+| T22 | M-13 — no HTTP timeouts/connection cap (slowloris) | Med | S–M | ☑ |
 | T23 | M-12 + M-07 — gossip origin auth; announce flood | Med | M | ☐ |
 | T24 | M-06 — no P2P I/O timeouts; serial sync loop | Med | S | ☐ |
 | T25 | M-14 + L-21 — validate-before-dedup; duplicate ids | Med | S | ☐ |
@@ -76,7 +76,8 @@ H-01→T19 · H-02→T18 · H-03→T21 · H-04→T20 · H-05→T19 · H-06→T21
 - **Files:** [union_merge.rs](../crates/p2p/src/union_merge.rs) (validate path :150-258), [service.rs:120-125](../crates/ledger/src/service.rs#L120-L125), reconcile path [service.rs:821-955](../crates/ledger/src/service.rs#L821-L955).
 - **Verify:** regression tests per rejected class — elided-posting SupplyEntry; body-embedded `openledger-x` at directive and at posting level; ESC/NUL in a remote narration; uppercase-hex parent. Hand-edited file with a stray `openledger-` key: reconcile rejects rather than adopts.
 
-### ☐ T22 — HTTP server timeouts + connection bounds (M-13)
+### ☑ T22 — HTTP server timeouts + connection bounds (M-13)
+> **Done 2026-09-04 (in working tree, not yet committed).** New `http_server::serve_hardened` replaces `axum::serve`: header-read timeout 30s with the mandatory `TokioTimer` (vendored-hyper fact: without a timer even hyper's default timeout is a silent no-op — `axum::serve` ships exactly that), per-head re-arming bounds idle keep-alive; h2 keep-alive probes; request `TimeoutLayer` (408, 30s — also the first wall-clock bound GraphQL execution has had, closing a 09/01 informational); permit-then-accept semaphore cap (1024) so floods stay in the kernel backlog; bounded 10s graceful drain. `ConnectInfo` preserved for the rate limiter (tested). 8 tests at short timeouts cover all four attack shapes + controls; bug-catch proof: against plain `axum::serve` the 4 attack tests fail while the 4 controls pass. Follow-ups: settings config surface → T38; workspace-shared network-test lock → T41.
 - **Change:** `axum::serve` imposes no header-read/keep-alive/request timeouts and no connection ceiling — slowloris works pre-auth and pre-rate-limit even on a hardened public bind. Drive connections through hyper-util's builder with explicit `header_read_timeout` and keep-alive timeouts; add a request `TimeoutLayer` (also closes the "no per-request GraphQL execution timeout" informational); bound concurrent connections (semaphore in the accept loop or `tower::limit::ConcurrencyLimit`). Document that the mandated TLS-terminating proxy must enforce the same.
 - **Files:** [main.rs:325-329](../crates/gl-node/src/main.rs#L325-L329).
 - **Verify:** slowloris harness — stalled-header, stalled-body, and idle-keep-alive connections are dropped on their timeouts; connection count plateaus at the configured cap; normal request latency unaffected.
@@ -179,6 +180,7 @@ H-01→T19 · H-02→T18 · H-03→T21 · H-04→T20 · H-05→T19 · H-06→T21
 - **L-10:** [Dockerfile](../Dockerfile) — pin base images by digest; build with `cargo build --release --locked`.
 - **Config hygiene (0902 informational, promoted here):** make `GL_NODE_API_KEY` env take precedence over a non-empty file value (or warn when both set — silent stale-key wins today, [config.rs:238-244](../crates/gl-node/src/config.rs#L238-L244)); warn when the config file carrying an API key is group/other-readable.
 - **T19 follow-up:** README's public-bind example configs must gain `allowedHosts` (now boot-required on non-loopback binds); document the new field.
+- **T22 follow-up:** expose `HttpServerSettings` (header/request timeouts, connection cap — currently hardcoded defaults at the call site) through config for per-deployment tuning; document that the TLS-terminating proxy must enforce equivalent limits.
 - **Verify:** compose stack unreachable from off-host; image rebuild is digest-stable and lock-enforced; env-rotation test uses the env key.
 
 ### ☐ T39 — Orphan-buffer & mesh-identity batch (L-20, L-23, registry heads)
@@ -201,7 +203,7 @@ H-01→T19 · H-02→T18 · H-03→T21 · H-04→T20 · H-05→T19 · H-06→T21
 - **Verify:** one regression test per item (oversized local append rejected; strict-verify tamper test; unauthenticated `/health` on public bind is minimal; reconcile-with-signing round-trips to peers; adversarial-file boot time bounded; injectivity property test over the posting model; zero-cost posting rejected; gossip-channel-full test doesn't block mutations).
 
 ### ☐ T41 — Informational/hygiene sweep
-Small items from both reports' informational sections, batched: add `persist-credentials: false` to CI checkout; remove committed `.DS_Store` files and gitignore them; redacting `Debug` impls for `AuthState`/`NodeConfig`; remove the unused `rand` dep in gl-node and vestigial `libssl-dev` in the builder image; delete or align production-dead code (`head_exchange`, `filter_supply_requests`, `extract_parents`/`extract_lamport`); retry gossip `subscribe` instead of exiting the loop permanently; replace string-match EOF classification in `serve_anti_entropy` with typed error handling; assert on `to_wire`'s u32 length cast; document the unsigned-pre-P2P-directives migration; consider a derived signing subkey (vs sharing the QUIC identity key); keep an eye on the `lru`/`h2` advisories via the existing CI `cargo audit`.
+Small items from both reports' informational sections, batched. Added from T22 review: replace the module-local network-test locks (`anti_entropy_alpn.rs`, `http_server.rs`) with one workspace-shared lock or a `cargo nextest`/test-group config — the QUIC convergence test still flakes when other modules' network tests overlap it under load. add `persist-credentials: false` to CI checkout; remove committed `.DS_Store` files and gitignore them; redacting `Debug` impls for `AuthState`/`NodeConfig`; remove the unused `rand` dep in gl-node and vestigial `libssl-dev` in the builder image; delete or align production-dead code (`head_exchange`, `filter_supply_requests`, `extract_parents`/`extract_lamport`); retry gossip `subscribe` instead of exiting the loop permanently; replace string-match EOF classification in `serve_anti_entropy` with typed error handling; assert on `to_wire`'s u32 length cast; document the unsigned-pre-P2P-directives migration; consider a derived signing subkey (vs sharing the QUIC identity key); keep an eye on the `lru`/`h2` advisories via the existing CI `cargo audit`.
 - **Verify:** CI green; `git status` clean of `.DS_Store`; `cargo udeps`/build confirm removals; grep shows no `data_unchecked` outside gated subscription code.
 
 ---

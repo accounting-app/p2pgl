@@ -3,6 +3,7 @@ mod auth;
 mod config;
 mod graphql;
 mod health;
+mod http_server;
 mod p2p_service;
 mod rate_limit;
 mod request_guard;
@@ -14,6 +15,7 @@ use graphql::{
     build_schema_with_service, graphiql_handler, graphql_handler, AppSchema, SharedLedger,
 };
 use health::{health_handler, probe_local_health, HealthState};
+use http_server::HttpServerSettings;
 use rate_limit::RateLimiter;
 use request_guard::RequestGuardState;
 
@@ -21,7 +23,6 @@ use axum::routing::{get, post};
 use axum::{middleware, Extension, Router};
 use p2p::node::PeerRegistry;
 use p2p::orphan_buffer::OrphanBuffer;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -322,12 +323,14 @@ async fn main() {
         "gl-node starting"
     );
 
-    // Serve with graceful shutdown on SIGTERM / SIGINT (§3.9).
-    let server = axum::serve(
+    // Serve with graceful shutdown on SIGTERM / SIGINT (§3.9), under the
+    // connection-level limits `axum::serve` never applied (M-13).
+    let server = http_server::serve_hardened(
         listener,
-        application.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal());
+        application,
+        HttpServerSettings::default(),
+        shutdown_signal(),
+    );
 
     if let Err(error) = server.await {
         error!(%error, "server error");
@@ -419,8 +422,8 @@ fn build_signature_provider(config: &NodeConfig) -> Arc<dyn security::signing::S
 
 /// Wait for SIGTERM or SIGINT (§3.9 graceful shutdown).
 ///
-/// On signal, returns to let axum drain in-flight requests.
-/// Axum's `with_graceful_shutdown` handles the drain period.
+/// On signal, returns to let the serve loop drain in-flight requests.
+/// `http_server::serve_hardened` handles the (bounded) drain period.
 async fn shutdown_signal() {
     let control_c = async {
         signal::ctrl_c()

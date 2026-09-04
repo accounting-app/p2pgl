@@ -24,7 +24,15 @@ async-graphql-axum = "7"
 chrono = { workspace = true }
 tokio-stream = { workspace = true, features = ["sync"] }
 rust_decimal = { workspace = true }
-tower-http = { workspace = true, features = ["limit"] }
+tower-http = { workspace = true, features = ["limit", "timeout"] }
+tower = { version = "0.5", features = ["util"] }
+hyper-util = { version = "0.1", features = [
+    "server",
+    "server-auto",
+    "server-graceful",
+    "service",
+    "tokio",
+] }
 iroh = { workspace = true }
 iroh-gossip = { workspace = true }
 hex = "0.4"
@@ -34,7 +42,6 @@ sha2 = { workspace = true }
 
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
 rust_decimal_macros = "1"
