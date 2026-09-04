@@ -1,6 +1,7 @@
 mod anti_entropy_alpn;
 mod auth;
 mod config;
+mod fetch_coordinator;
 mod graphql;
 mod health;
 mod http_server;

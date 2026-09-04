@@ -8,6 +8,7 @@
 #[cfg(unix)]
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::endpoint::presets;
@@ -19,6 +20,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::anti_entropy_alpn::{exchange_with_peer, fetch_want, AntiEntropyHandler};
 use crate::config::P2pConfig;
+use crate::fetch_coordinator::FetchCoordinator;
 
 use p2p::allowlist::PeerAllowlist;
 use p2p::gossip::{decode_broadcast, encode_broadcast, make_announce};
@@ -135,6 +137,12 @@ pub fn spawn_gossip_loop(
             );
         }
 
+        // Bounds the fetches that untrusted gossip announces can trigger
+        // (M-07 / M-12): concurrency cap, in-flight dedup, and a negative cache
+        // for ids that fail or are not yet available. Anti-entropy remains the
+        // correctness backstop, so a dropped hint never loses data.
+        let coordinator = Arc::new(FetchCoordinator::with_defaults());
+
         loop {
             tokio::select! {
                 // Handle outgoing: local directives to broadcast.
@@ -157,10 +165,23 @@ pub fn spawn_gossip_loop(
                 Some(event) = stream.next() => {
                     match event {
                         Ok(iroh_gossip::api::Event::Received(msg)) => {
-                            if !allowlist.admits(msg.delivered_from) {
+                            // `delivered_from` is the peer that RELAYED this
+                            // message to us (the last hop), NOT its origin
+                            // (M-12): plumtree forwards every first-seen message
+                            // to neighbors, so a relayed announce carries an
+                            // allowlisted relay's id regardless of who authored
+                            // it. `admits(relay)` is therefore only a cheap
+                            // first-hop filter against DIRECT strangers — it is
+                            // NOT origin authentication. Gossip content is an
+                            // untrusted hint; the real security boundary is the
+                            // ALPN fetch path (author-allowlist + signature),
+                            // which is unchanged. Below we merely bound the work
+                            // any hint can trigger (M-07).
+                            let relay = msg.delivered_from;
+                            if !allowlist.admits(relay) {
                                 debug!(
-                                    from = %msg.delivered_from,
-                                    "dropping gossip from endpoint not on bootstrap allowlist"
+                                    relay = %relay,
+                                    "dropping gossip relayed by endpoint not on bootstrap allowlist"
                                 );
                                 continue;
                             }
@@ -173,17 +194,37 @@ pub fn spawn_gossip_loop(
                                         svc.get_directive(&id).is_some()
                                     };
                                     if !have_it {
+                                        // Untrusted hint: bound the fetch it
+                                        // triggers (M-07). Drop the hint if the
+                                        // id is in flight, recently failed, or
+                                        // the concurrency cap is saturated.
+                                        let Some(mut guard) = coordinator.try_begin(&id) else {
+                                            debug!(id = %id, "skipping announce fetch: in-flight, recently failed, or fetch limit reached (M-07)");
+                                            continue;
+                                        };
                                         let endpoint = endpoint.clone();
                                         let handler = handler.clone();
-                                        let peer = msg.delivered_from;
+                                        let fetch_id = id.clone();
+                                        // `relay` is the EndpointId we fetch
+                                        // from; it is `Copy`, so the `move`
+                                        // block copies it in.
                                         tokio::spawn(async move {
-                                            fetch_want(&endpoint, peer, vec![id], &handler).await;
+                                            fetch_want(&endpoint, relay, vec![fetch_id.clone()], &handler).await;
+                                            // Success = we actually have it now;
+                                            // otherwise the guard's Drop
+                                            // negative-caches the id so a
+                                            // re-announce flood cannot re-trigger
+                                            // a fetch every round.
+                                            if handler.ledger.read().await.get_directive(&fetch_id).is_some() {
+                                                guard.mark_succeeded();
+                                            }
+                                            drop(guard);
                                         });
                                     }
                                 }
                                 Ok(WireMessage::Supply { .. }) => {
                                     warn!(
-                                        from = %msg.delivered_from,
+                                        relay = %relay,
                                         "ignoring gossip Supply; ledger writes are ALPN-only"
                                     );
                                 }

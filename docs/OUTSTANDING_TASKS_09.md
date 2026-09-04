@@ -18,7 +18,7 @@ Already closed before this backlog — do not re-do: 09/01 **M-01** (strict inbo
 | T20 | H-04 — signed-year dates brick boot | High | S | ☑ |
 | T21 | H-03 + H-06 + L-26 + L-29 — remote-body canonicalization | High | S–M | ☑ |
 | T22 | M-13 — no HTTP timeouts/connection cap (slowloris) | Med | S–M | ☑ |
-| T23 | M-12 + M-07 — gossip origin auth; announce flood | Med | M | ☐ |
+| T23 | M-12 + M-07 — gossip origin auth; announce flood | Med | M | ☑ |
 | T24 | M-06 — no P2P I/O timeouts; serial sync loop | Med | S | ☐ |
 | T25 | M-14 + L-21 — validate-before-dedup; duplicate ids | Med | S | ☐ |
 | T26 | M-16 + L-19 — post-decode CBOR caps; connection bounds | Med | M | ☐ |
@@ -86,13 +86,14 @@ H-01→T19 · H-02→T18 · H-03→T21 · H-04→T20 · H-05→T19 · H-06→T21
 
 ## Tier 2 — P2P robustness (one compromised or slow peer must not stall or OOM the mesh)
 
-### ☐ T23 — Treat gossip as untrusted hints (M-12, M-07)
-- **Change:** `allowlist.admits(msg.delivered_from)` authenticates only the previous hop — iroh-gossip's plumtree relays first-seen messages before the application filter runs, so strangers on the topic reach every node ≥2 hops away wearing an allowlisted relay's id. Stop treating it as origin authentication (log `delivered_from` as "relay"). Then harden the announce→fetch path for unauthenticated load: in-flight announce-id dedup, negative cache for ids that failed to fetch/validate, bounded fetch semaphore, reuse one ALPN connection per peer instead of dialing per announce.
-- **Files:** [p2p_service.rs:160-183](../crates/gl-node/src/p2p_service.rs#L160-L183), [anti_entropy_alpn.rs:112-121](../crates/gl-node/src/anti_entropy_alpn.rs#L112-L121).
-- **Verify:** flood of unique announce ids → tasks and dials stay bounded; duplicate announces of one id cause one fetch; repeated bad ids are negative-cached.
+### ☑ T23 — Treat gossip as untrusted hints (M-12, M-07)
+> **Done 2026-09-04 (in working tree, not yet committed).** New network-free `FetchCoordinator` (in-flight dedup, TTL negative cache capped at 4096 ids, `try_acquire_owned` concurrency semaphore of 16 — acquired synchronously so a saturated coordinator drops the hint rather than parking a task) gates the gossip announce→fetch path. `delivered_from` relabeled `relay` with an honest comment: `admits(relay)` is a cheap first-hop filter against direct strangers, NOT origin authentication (M-12) — gossip content is an untrusted hint and the real gate stays the signature-verified ALPN fetch. Anti-entropy remains the correctness backstop, so a dropped/negative-cached hint never loses data. 7 coordinator unit tests incl. 1000-duplicate→1-proceed and cap-of-16 saturation. **Connection-reuse-per-peer deferred to T24** (efficiency once concurrency is capped; belongs with the connection-lifecycle rework).
+- **Change (as built):** `allowlist.admits(msg.delivered_from)` authenticates only the previous hop — iroh-gossip's plumtree relays first-seen messages before the application filter runs, so strangers on the topic reach every node ≥2 hops away wearing an allowlisted relay's id. Now framed as a first-hop filter only; announce→fetch bounded by in-flight dedup, negative cache, and a fetch semaphore.
+- **Files:** [fetch_coordinator.rs](../crates/gl-node/src/fetch_coordinator.rs) (new), [p2p_service.rs](../crates/gl-node/src/p2p_service.rs), [main.rs](../crates/gl-node/src/main.rs).
+- **Verify:** ✅ flood of unique announce ids → live guards capped at 16; 1000 duplicate begins → exactly 1 proceed; failed fetches negative-cached until TTL; cache never exceeds capacity.
 
 ### ☐ T24 — Session timeouts + concurrent peer exchanges (M-06)
-- **Change:** `tokio::time::timeout` around every connect/read/write in the ALPN session paths; run per-peer anti-entropy exchanges concurrently (bounded) instead of the serial loop where one tarpit peer stalls all replication. Also add a per-connection request budget to `serve_anti_entropy` (T18 review note: one stream can still issue unlimited HaveHeads/Want rounds — each now cheap, but unbudgeted).
+- **Change:** `tokio::time::timeout` around every connect/read/write in the ALPN session paths; run per-peer anti-entropy exchanges concurrently (bounded) instead of the serial loop where one tarpit peer stalls all replication. Also add a per-connection request budget to `serve_anti_entropy` (T18 review note: one stream can still issue unlimited HaveHeads/Want rounds — each now cheap, but unbudgeted). **From T23:** reuse one ALPN connection per peer instead of dialing per fetch/exchange — `fetch_want` and `exchange_with_peer` both `endpoint.connect(...)` fresh each call; a per-peer connection cache (with re-dial on drop) removes the dial churn the T23 semaphore currently only bounds.
 - **Files:** [anti_entropy_alpn.rs:350-371](../crates/gl-node/src/anti_entropy_alpn.rs#L350-L371) and session loops, [p2p_service.rs:250-258](../crates/gl-node/src/p2p_service.rs#L250-L258).
 - **Verify:** a peer that accepts and never responds is timed out and does not delay other peers' sync round.
 
