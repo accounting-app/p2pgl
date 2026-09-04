@@ -16,12 +16,10 @@ use crate::allowlist::PeerAllowlist;
 use crate::protocol::{DirectiveKind, SupplyEntry};
 
 /// Closed set of envelope keys accepted on remote `Supply` (§3.3.1).
-const ALLOWED_ENVELOPE_KEYS: &[&str] = &[
-    "openledger-author",
-    "openledger-lamport",
-    "openledger-parents",
-    "openledger-signature",
-];
+///
+/// Aliases the ledger's stamping set rather than repeating it, so the keys this
+/// side accepts can never drift from the keys the writer produces (H-06).
+const ALLOWED_ENVELOPE_KEYS: &[&str] = ledger::service::ENVELOPE_KEYS;
 
 /// Maximum byte length of any single envelope value (M-4 DoS bound).
 ///
@@ -68,6 +66,12 @@ pub enum MergeError {
     CycleDetected,
     /// Envelope key, control character, or kind mismatch (H-8).
     InvalidEnvelope(String),
+    /// The economic body carries an `openledger-*` metadata key (H-06).
+    BodyEnvelopeKey(String),
+    /// A string in the economic body contains control characters (L-26).
+    BodyControlCharacter(String),
+    /// A transaction body arrived with an elided posting amount (H-03).
+    ElidedPosting,
 }
 
 impl std::fmt::Display for MergeError {
@@ -90,6 +94,16 @@ impl std::fmt::Display for MergeError {
             }
             MergeError::CycleDetected => write!(f, "DAG cycle detected (I8)"),
             MergeError::InvalidEnvelope(reason) => write!(f, "Invalid envelope: {reason}"),
+            MergeError::BodyEnvelopeKey(reason) => {
+                write!(f, "Envelope key in economic body: {reason}")
+            }
+            MergeError::BodyControlCharacter(reason) => {
+                write!(f, "Control character in economic body: {reason}")
+            }
+            MergeError::ElidedPosting => write!(
+                f,
+                "Elided posting in economic body: remote bodies must arrive with every posting amount resolved"
+            ),
         }
     }
 }
@@ -158,13 +172,43 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
 
     validate_supply_envelope(&entry.envelope)?;
 
-    // 3. Attach envelope metadata.
+    // 3. Canonicalize the wire body, on the freshly parsed directive and BEFORE
+    // the envelope merge below. The ordering is load-bearing: once the envelope
+    // has been merged into the directive's metadata, a body-smuggled
+    // `openledger-signature`/`openledger-author` is indistinguishable from the
+    // legitimately merged one, so an allowed *name* would slip through. An
+    // honest wire body carries no `openledger-*` key at all — the canonical
+    // serializer that produces it strips every one.
+    if let Directive::Transaction(transaction) = &directive {
+        // H-03: the id is checked against the as-sent body, but
+        // `insert_remote_directive` stores the *resolved* postings — so an
+        // elided body would be accepted under one id and stored (and re-hashed)
+        // under another. That directive can never propagate: its signature is
+        // bound to the accepted id, so every other node rejects it, leaving
+        // permanent replica divergence and perpetual re-Want churn. Honest
+        // senders always ship resolved postings.
+        if ledger::service::elided_posting_count(transaction) > 0 {
+            return Err(MergeError::ElidedPosting);
+        }
+    }
+    // H-06: the content hash strips every `openledger-*` key, so one smuggled
+    // in the body is validated by nothing, persists into the victim's `.bean`,
+    // and is promoted back into the envelope on re-serve — where the next hop's
+    // closed-set check rejects the directive forever.
+    ledger::service::validate_body_envelope_keys(&directive, &[])
+        .map_err(|error| MergeError::BodyEnvelopeKey(error.to_string()))?;
+    // L-26: `reject_control_characters` guards the local API only; without this
+    // an ESC/NUL/TAB in a remote body reaches every replica's file.
+    ledger::service::validate_body_strings(&directive)
+        .map_err(|error| MergeError::BodyControlCharacter(error.to_string()))?;
+
+    // 4. Attach envelope metadata.
     let metadata = directive_metadata_mut(&mut directive);
     for (key, value) in &entry.envelope {
         metadata.insert(key.clone(), value.clone());
     }
 
-    // 4. Validate required envelope fields for transactions.
+    // 5. Validate required envelope fields for transactions.
     if let Directive::Transaction(_) = &directive {
         if !entry.envelope.contains_key("openledger-author") {
             return Err(MergeError::EnvelopeMissing("openledger-author".to_owned()));
@@ -175,7 +219,7 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
         // openledger-parents may be empty string for genesis.
     }
 
-    // 5. Strict envelope value validation — for every directive kind carrying
+    // 6. Strict envelope value validation — for every directive kind carrying
     // these keys, not just transactions: `insert_remote_directive` adopts the
     // Lamport clock from every kind's metadata, so a bound enforced only on
     // transactions is bypassable with a signed `open`/`note`/… directive
@@ -199,14 +243,22 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
             )));
         }
 
-        // Every parent must be a well-formed 64-hex txid (0820-L8/M-05). The
-        // DAG insert enforces this anyway, but checking here — before the
-        // orphan buffer — stops a directive waiting on garbage parents that can
-        // never arrive from squatting buffer space for the full TTL.
+        // Every parent must be a well-formed 64-lowercase-hex txid
+        // (0820-L8/M-05, L-29). The DAG insert enforces this anyway, but
+        // checking here — before the orphan buffer — stops a directive waiting
+        // on garbage parents that can never arrive from squatting buffer space
+        // for the full TTL. Uppercase is garbage too: stored ids are always
+        // lowercase and lookups exact, so an uppercased spelling of a real txid
+        // would pass a case-insensitive check and then never resolve.
         for parent_id in &parent_ids {
-            if parent_id.len() != 64 || !parent_id.chars().all(|c| c.is_ascii_hexdigit()) {
+            if parent_id.len() != 64
+                || !parent_id
+                    .chars()
+                    .all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+            {
                 return Err(MergeError::InvalidEnvelope(
-                    "openledger-parents contains a malformed txid".to_owned(),
+                    "openledger-parents contains a malformed txid (expected 64 lowercase hex characters)"
+                        .to_owned(),
                 ));
             }
         }
@@ -1216,5 +1268,269 @@ mod tests {
             validate_supply_entry(&entry),
             Err(MergeError::ParseError(_) | MergeError::ContentHashMismatch { .. })
         ));
+    }
+
+    // ── T21: wire body canonicalization (H-03 / H-06 / L-26 / L-29) ─────
+
+    fn sample_transaction(narration: &str, elide_second_amount: bool) -> Transaction {
+        Transaction {
+            date: chrono::NaiveDate::from_ymd_opt(2024, 1, 15).unwrap(),
+            flag: Flag::Complete,
+            payee: Some("Acme Corp".to_owned()),
+            narration: Some(narration.to_owned()),
+            tags: vec![],
+            links: vec![],
+            postings: vec![
+                Posting {
+                    account: "Assets:Cash".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(100),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+                Posting {
+                    account: "Equity:Opening".to_owned(),
+                    amount: if elide_second_amount {
+                        None
+                    } else {
+                        Some(Amount {
+                            number: dec!(-100),
+                            currency: "USD".to_owned(),
+                        })
+                    },
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+            ],
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    /// Wrap a hostile body in the entry an attacker would actually ship.
+    ///
+    /// The id is the hash of the body exactly as sent, so the I5 content-hash
+    /// check passes by construction — these attacks live entirely inside what
+    /// the hash covers (or, for `openledger-*` keys, inside what it strips).
+    fn entry_for_body(kind: DirectiveKind, economic_bean: String) -> SupplyEntry {
+        let parsed = parse_file(&economic_bean)
+            .expect("attack body must parse")
+            .into_iter()
+            .next()
+            .expect("attack body must hold exactly one directive");
+        SupplyEntry {
+            id: compute_content_id(&parsed),
+            kind,
+            economic_bean,
+            envelope: BTreeMap::from([
+                ("openledger-author".to_owned(), "peer-1".to_owned()),
+                ("openledger-lamport".to_owned(), "5".to_owned()),
+                ("openledger-parents".to_owned(), "".to_owned()),
+            ]),
+        }
+    }
+
+    /// Splice a metadata line in directly below the transaction header, where
+    /// `parse_transaction_body` reads it as directive-level metadata.
+    fn with_directive_metadata_line(body: &str, metadata_line: &str) -> String {
+        let mut lines: Vec<String> = body.lines().map(str::to_owned).collect();
+        lines.insert(1, format!("  {metadata_line}"));
+        format!("{}\n", lines.join("\n"))
+    }
+
+    /// Append a metadata line below the last posting, where the parser attaches
+    /// it to that posting.
+    fn with_posting_metadata_line(body: &str, metadata_line: &str) -> String {
+        format!("{body}    {metadata_line}\n")
+    }
+
+    #[test]
+    fn test_validate_rejects_elided_posting_in_body() {
+        // H-03: the id is checked against the as-sent (elided) body, but the
+        // insert stores the *resolved* postings — so this entry would be
+        // accepted under one id and stored under another, never to propagate.
+        let directive = Directive::Transaction(sample_transaction("Elided", true));
+        let entry = entry_for_body(
+            DirectiveKind::Transaction,
+            economic_canonical_serialize(&directive),
+        );
+        assert_eq!(
+            entry.id,
+            compute_content_id(&directive),
+            "the elided body hashes to exactly the id shipped with it"
+        );
+
+        let error = validate_supply_entry(&entry).unwrap_err();
+        assert!(
+            matches!(error, MergeError::ElidedPosting),
+            "expected ElidedPosting, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_directive_level_body_envelope_key() {
+        // H-06: the content hash strips `openledger-*`, so the smuggled key
+        // rides along invisibly — the id still matches the clean body.
+        let clean = Directive::Transaction(sample_transaction("Smuggled", false));
+        let body = with_directive_metadata_line(
+            &economic_canonical_serialize(&clean),
+            "openledger-x: \"y\"",
+        );
+        let entry = entry_for_body(DirectiveKind::Transaction, body);
+        assert_eq!(
+            entry.id,
+            compute_content_id(&clean),
+            "the smuggled key is invisible to the content hash"
+        );
+
+        let error = validate_supply_entry(&entry).unwrap_err();
+        assert!(
+            matches!(error, MergeError::BodyEnvelopeKey(ref reason) if reason.contains("openledger-x")),
+            "expected BodyEnvelopeKey naming the key, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_posting_level_body_envelope_key() {
+        // A metadata line written after a posting binds to that posting —
+        // `extract_envelope` promotes it on re-serve just the same.
+        let clean = Directive::Transaction(sample_transaction("Smuggled", false));
+        let body = with_posting_metadata_line(
+            &economic_canonical_serialize(&clean),
+            "openledger-x: \"y\"",
+        );
+        let entry = entry_for_body(DirectiveKind::Transaction, body);
+
+        let error = validate_supply_entry(&entry).unwrap_err();
+        assert!(
+            matches!(error, MergeError::BodyEnvelopeKey(_)),
+            "expected BodyEnvelopeKey, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_body_smuggled_allowed_envelope_name() {
+        // The check runs *before* the envelope merge for exactly this case: an
+        // allowed key *name* in the body is still a forgery, and after the
+        // merge it would be indistinguishable from the real envelope value.
+        let clean = Directive::Transaction(sample_transaction("Smuggled", false));
+        for metadata_line in [
+            "openledger-author: \"attacker\"",
+            "openledger-signature: \"deadbeef\"",
+        ] {
+            let body =
+                with_directive_metadata_line(&economic_canonical_serialize(&clean), metadata_line);
+            let entry = entry_for_body(DirectiveKind::Transaction, body);
+            let error = validate_supply_entry(&entry).unwrap_err();
+            assert!(
+                matches!(error, MergeError::BodyEnvelopeKey(_)),
+                "body {metadata_line:?} must be rejected, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_control_characters_in_body() {
+        // L-26: `reject_control_characters` guards the local API only; an ESC
+        // or NUL accepted here is written verbatim into every replica's file.
+        for narration in ["wipe\u{1b}[2J screen", "nul\u{0}terminated"] {
+            let directive = Directive::Transaction(sample_transaction(narration, false));
+            let entry = entry_for_body(
+                DirectiveKind::Transaction,
+                economic_canonical_serialize(&directive),
+            );
+            let error = validate_supply_entry(&entry).unwrap_err();
+            assert!(
+                matches!(error, MergeError::BodyControlCharacter(_)),
+                "narration {narration:?} must be rejected, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_uppercase_hex_parent() {
+        // L-29: stored ids are lowercase and lookups are exact, so an uppercase
+        // spelling of a real txid validates and then never resolves — a
+        // TTL-long orphan and perpetual re-Want churn.
+        let real_parent =
+            compute_content_id(&Directive::Transaction(sample_transaction("parent", false)));
+        let uppercase = real_parent.to_ascii_uppercase();
+        assert_ne!(real_parent, uppercase, "fixture must contain hex letters");
+
+        let mut entry = make_valid_supply_entry();
+        entry
+            .envelope
+            .insert("openledger-parents".to_owned(), uppercase);
+        let error = validate_supply_entry(&entry).unwrap_err();
+        assert!(
+            matches!(error, MergeError::InvalidEnvelope(_)),
+            "expected InvalidEnvelope, got {error:?}"
+        );
+
+        entry
+            .envelope
+            .insert("openledger-parents".to_owned(), real_parent);
+        assert!(
+            validate_supply_entry(&entry).is_ok(),
+            "the lowercase form of the same txid must still be accepted"
+        );
+    }
+
+    #[test]
+    fn test_make_supply_entry_output_is_accepted() {
+        // No over-rejection: an entry built by our own serve path from a
+        // properly stamped directive still validates.
+        let mut txn = sample_transaction("Honest", false);
+        txn.metadata
+            .insert("openledger-author".to_owned(), "peer-1".to_owned());
+        txn.metadata
+            .insert("openledger-lamport".to_owned(), "7".to_owned());
+        txn.metadata
+            .insert("openledger-parents".to_owned(), "".to_owned());
+        txn.metadata
+            .insert("openledger-signature".to_owned(), "ab".repeat(64));
+
+        let entry = crate::gossip::make_supply_entry(&Directive::Transaction(txn));
+        let result = validate_supply_entry(&entry);
+        assert!(result.is_ok(), "honest entry must pass: {result:?}");
+    }
+
+    #[test]
+    fn test_body_smuggled_key_poisons_the_next_hop_on_re_serve() {
+        // H-06 mechanism test — the livelock the ingest check above prevents.
+        //
+        // Bypass ingest (the public path now refuses this) and build the
+        // directive exactly as a victim's DAG would hold it after accepting a
+        // body-smuggled key, then re-serve it the way the victim would.
+        let mut txn = sample_transaction("Poisoned", false);
+        txn.metadata
+            .insert("openledger-author".to_owned(), "peer-1".to_owned());
+        txn.metadata
+            .insert("openledger-lamport".to_owned(), "5".to_owned());
+        txn.metadata
+            .insert("openledger-parents".to_owned(), "".to_owned());
+        txn.metadata
+            .insert("openledger-poison".to_owned(), "x".to_owned());
+
+        let entry = crate::gossip::make_supply_entry(&Directive::Transaction(txn));
+
+        // `extract_envelope` promotes every `openledger-*` metadata key, so the
+        // body key is now an envelope key on the wire...
+        assert_eq!(
+            entry.envelope.get("openledger-poison"),
+            Some(&"x".to_owned()),
+            "re-serve promotes the smuggled body key into the envelope"
+        );
+
+        // ...where the next hop's closed-set check rejects the whole directive,
+        // every time it is offered, forever.
+        let error = validate_supply_entry(&entry).unwrap_err();
+        assert!(
+            matches!(error, MergeError::InvalidEnvelope(ref reason) if reason.contains("openledger-poison")),
+            "expected the unsupported-envelope-key rejection, got {error:?}"
+        );
     }
 }

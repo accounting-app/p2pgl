@@ -16,7 +16,7 @@ Already closed before this backlog — do not re-do: 09/01 **M-01** (strict inbo
 | T18 | H-02 — sync senders violate receive caps (mesh wedge) | High | S–M | ☑ |
 | T19 | H-05 + H-01 — ineffective body limit; CSRF/DNS rebinding | High | S | ☑ |
 | T20 | H-04 — signed-year dates brick boot | High | S | ☑ |
-| T21 | H-03 + H-06 + L-26 + L-29 — remote-body canonicalization | High | S–M | ☐ |
+| T21 | H-03 + H-06 + L-26 + L-29 — remote-body canonicalization | High | S–M | ☑ |
 | T22 | M-13 — no HTTP timeouts/connection cap (slowloris) | Med | S–M | ☐ |
 | T23 | M-12 + M-07 — gossip origin auth; announce flood | Med | M | ☐ |
 | T24 | M-06 — no P2P I/O timeouts; serial sync loop | Med | S | ☐ |
@@ -66,7 +66,8 @@ H-01→T19 · H-02→T18 · H-03→T21 · H-04→T20 · H-05→T19 · H-06→T21
 - **Files:** [scalars.rs:12-21](../crates/gl-node/src/graphql/scalars.rs#L12-L21), [service.rs](../crates/ledger/src/service.rs).
 - **Verify:** serialize→parse round-trip property test over the full `NaiveDate` domain; `appendTransaction(date:"+10000-01-01")` and `-0001-01-01` rejected on every path; node with a pre-existing healthy file boots unchanged.
 
-### ☐ T21 — Remote-body canonicalization pass (H-03, H-06, L-26, L-29)
+### ☑ T21 — Remote-body canonicalization pass (H-03, H-06, L-26, L-29)
+> **Done 2026-09-04 (in working tree, not yet committed).** Wire path (`validate_supply_entry`): elided postings rejected (H-03), any body-carried `openledger-*` key rejected — checked on the parsed body **before** the envelope merge, so smuggled allowed-name keys can't hide (H-06); control-char sweep over every body string (L-26); parents lowercase-only (L-29, both sites). Defense-in-depth at `insert_remote_directive` (four merged envelope keys allowed at directive level, nothing else, nothing at posting level) and `reconcile_file` (unknown/posting-level keys rejected into the `rejected` tally; hand-file elision deliberately still legal). `ENVELOPE_KEYS` now single-sourced in ledger with p2p aliasing it. Bug-catch proofs ran the real mechanisms: H-03 id shift (stored ≠ accepted id) and H-06 next-hop poisoning (smuggled key promoted on re-serve, rejected downstream). Boot intentionally unvalidated (brick-path rule). Follow-ups: reconcile rejection diagnostics → T35; serve-side `extract_envelope` filter → T40.
 - **Change:** one validation pass in `validate_supply_entry` (and mirrored on the reconcile path), run before signature verification:
   1. **H-03:** reject any entry whose `economic_bean` parses with `elided_count != 0` (honest senders always ship resolved postings; elision resolution shifts the content id after the id/signature checks).
   2. **H-06:** reject any body-parsed `openledger-*` metadata key at directive **or posting** level — the envelope is the only legal carrier (the content hash strips these keys, so they are validated by nothing, persist as hash-invisible bytes, and get promoted into the envelope on re-serve where the next hop rejects the directive forever).
@@ -196,6 +197,7 @@ H-01→T19 · H-02→T18 · H-03→T21 · H-04→T20 · H-05→T19 · H-06→T21
 - **L-15:** close the latent serializer injectivity holes (posting with `amount: None` + `cost`/`price: Some`; `CostSpec{amount:None,date:Some}`) with explicit rejection or distinct serialization ([serialize.rs:175-215](../crates/ledger/src/serialize.rs#L175-L215)).
 - **L-16:** reject zero/negative cost and price numbers (unit-minting via `{0 USD}`) ([weights.rs:54-117](../crates/ledger/src/weights.rs#L54-L117)).
 - **L-18:** drop the ledger write lock before gossiping in `openAccount`/`closeAccount`, matching `appendTransaction` ([mutation.rs:158,192](../crates/gl-node/src/graphql/mutation.rs#L158)).
+- **T21 follow-up (belt-and-braces):** filter `extract_envelope` in gossip.rs to `ENVELOPE_KEYS` on the serve side — ingest checks make promotion of stray keys unreachable today, but the serve side should not promote arbitrary `openledger-*` keys on principle.
 - **Verify:** one regression test per item (oversized local append rejected; strict-verify tamper test; unauthenticated `/health` on public bind is minimal; reconcile-with-signing round-trips to peers; adversarial-file boot time bounded; injectivity property test over the posting model; zero-cost posting rejected; gossip-channel-full test doesn't block mutations).
 
 ### ☐ T41 — Informational/hygiene sweep
