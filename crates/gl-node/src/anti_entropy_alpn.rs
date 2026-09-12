@@ -14,6 +14,7 @@ use iroh::EndpointId;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::connection_limiter::{AntiEntropyLimits, ConnectionLimiter};
 use crate::graphql::broadcast::TransactionBroadcast;
 use crate::graphql::query::domain_txn_to_graphql;
 use crate::graphql::SharedLedger;
@@ -30,6 +31,22 @@ use p2p::union_merge::{validate_supply_entry, verify_author_allowlisted, verify_
 /// lets a malicious one stream pages forever. A million ids is far past any
 /// ledger the 64 MiB file cap permits, so honest peers never approach it.
 const MAX_ACCUMULATED_HAVE_HEADS: usize = 1_048_576;
+
+/// Byte cap for any inbound frame that is not a `Supply` (M-16).
+///
+/// Only `Supply` legitimately reaches multi-MiB. The largest `HaveHeads` page
+/// is ~4096 + 4096 ids × ~66 B ≈ 540 KiB, a full `Want` is ≤ ~68 KiB, and an
+/// `Announce` is tiny. 1 MiB leaves generous headroom for all of those while
+/// letting `read_message` reject a bloated `Want`/`HaveHeads` vector from a
+/// ~13-byte peek — before allocating its body or letting serde's
+/// internally-tagged decode buffer ~16.7M ids into a `Content` tree.
+const NON_SUPPLY_FRAME_CAP: usize = 1024 * 1024;
+
+/// Chunk size for the incremental body read (L-19).
+///
+/// The body is appended chunk by chunk so a stalled stream pins only the bytes
+/// actually received, never `vec![0u8; len]` reserved up front.
+const READ_CHUNK: usize = 64 * 1024;
 
 /// Per-operation timeouts for ALPN anti-entropy sessions (M-06).
 ///
@@ -68,6 +85,14 @@ pub struct AntiEntropyHandler {
     pub swarm_topic: String,
     /// Per-operation connect and I/O timeouts (M-06).
     pub timeouts: AntiEntropyTimeouts,
+    /// Inbound connection + per-connection request limits (M-16, T24).
+    ///
+    /// `limits` and `limiter` are built from the same [`AntiEntropyLimits`] at
+    /// construction; the loop reads `limits.max_requests_per_connection` while
+    /// `accept` enforces the connection caps through the shared `limiter`.
+    pub limits: AntiEntropyLimits,
+    /// Shared connection admission control (M-16); clones share one budget.
+    pub limiter: ConnectionLimiter,
 }
 
 impl std::fmt::Debug for AntiEntropyHandler {
@@ -89,6 +114,18 @@ impl ProtocolHandler for AntiEntropyHandler {
                 "anti-entropy peer not allowlisted",
             )));
         }
+        // M-16: bound concurrent inbound connections, globally and per peer.
+        // The guard is held for the whole serve duration; its `Drop` releases
+        // the global permit and decrements the per-peer count. Rejecting closes
+        // the connection with a distinct code, matching the not-allowlisted
+        // branch's shape (warn, close, return `Err`).
+        let Some(_connection_guard) = self.limiter.try_acquire(remote) else {
+            warn!(peer = %remote, "rejecting anti-entropy connection: inbound connection limit reached");
+            connection.close(2u32.into(), b"connection-limit");
+            return Err(AcceptError::from_err(std::io::Error::other(
+                "anti-entropy inbound connection limit reached",
+            )));
+        };
         if let Err(error) = serve_anti_entropy(self, connection, remote).await {
             warn!(peer = %remote, %error, "anti-entropy inbound session failed");
             return Err(AcceptError::from_err(std::io::Error::other(error)));
@@ -107,12 +144,26 @@ async fn serve_anti_entropy(
         .await
         .map_err(|error| error.to_string())?;
     let io_timeout = handler.timeouts.io;
+    // T24: bound how many messages one connection may issue. This is a backstop
+    // against an infinite/absurd flood on a single stream, not a tight limit —
+    // the default (100_000) is far past any legitimate catch-up. A peer cut off
+    // here can simply reconnect and anti-entropy resumes (it is idempotent).
+    let mut requests_handled: usize = 0;
     loop {
+        if requests_handled >= handler.limits.max_requests_per_connection {
+            warn!(
+                peer = %remote,
+                limit = handler.limits.max_requests_per_connection,
+                "anti-entropy request budget exhausted; closing connection"
+            );
+            break;
+        }
         let message = match read_message(&mut recv, io_timeout).await {
             Ok(message) => message,
             Err(error) if error.contains("early eof") || error.contains("closed") => break,
             Err(error) => return Err(error),
         };
+        requests_handled += 1;
         match message {
             // A non-final page of the peer's advert (H-02): its content is not
             // used — we always answer with our own full state — so wait for the
@@ -554,24 +605,128 @@ async fn write_message(
     }
 }
 
+/// Decide, from a frame's length and leading peek bytes alone, whether it can be
+/// rejected without reading or buffering the rest (M-16).
+///
+/// `peek` is the frame's leading bytes: the CBOR map header at `peek[0]` (whose
+/// value depends on the variant's field count) followed by the `"type"` map
+/// entry. Because serde emits the internal tag first (see
+/// `protocol::SUPPLY_TYPE_DISCRIMINATOR`), a genuine `Supply` carries the Supply
+/// discriminator at `peek[1..]`; anything else there is a `Want`/`HaveHeads`/
+/// `Announce`, and if it is also over `NON_SUPPLY_FRAME_CAP` it is a bloated
+/// vector we refuse before allocating its body.
+///
+/// A frame within the cap is never rejectable here (only `Supply` legitimately
+/// exceeds it). A frame over the cap whose peek is too short to hold the
+/// discriminator is rejectable — it cannot be a well-formed `Supply`.
+fn frame_is_rejectable(len: usize, peek: &[u8]) -> bool {
+    if len <= NON_SUPPLY_FRAME_CAP {
+        return false;
+    }
+    let discriminator = p2p::protocol::SUPPLY_TYPE_DISCRIMINATOR;
+    // Skip the map header byte at peek[0]; compare the "type" entry that follows.
+    peek.get(1..1 + discriminator.len()) != Some(discriminator)
+}
+
+/// "Read exactly `buf.len()` bytes" abstraction (M-16, L-19).
+///
+/// Lets `read_frame`'s framing logic be exercised by an in-memory reader in
+/// tests while production reads from an iroh [`RecvStream`] via its inherent
+/// `read_exact` — deliberately NOT tokio's `AsyncReadExt::read_exact`, whose
+/// `AsyncRead` impl on `RecvStream` does not drive the QUIC stream the way the
+/// inherent method does.
+trait ExactReader {
+    fn read_exact_bytes(
+        &mut self,
+        buf: &mut [u8],
+    ) -> impl std::future::Future<Output = Result<(), String>>;
+}
+
+impl ExactReader for RecvStream {
+    async fn read_exact_bytes(&mut self, buf: &mut [u8]) -> Result<(), String> {
+        self.read_exact(buf)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
 async fn read_message(recv: &mut RecvStream, io_timeout: Duration) -> Result<WireMessage, String> {
+    read_frame(recv, io_timeout).await
+}
+
+/// Read one length-prefixed CBOR frame, applying the M-16 oversized-frame gate
+/// and the L-19 incremental body read.
+///
+/// Generic over [`ExactReader`] so the framing logic is unit-testable with an
+/// in-memory reader; production always passes an iroh [`RecvStream`].
+///
+/// RESIDUAL M-16 limitation: a frame that *does* open with the `Supply`
+/// discriminator but then carries millions of fake entries still flows into
+/// `decode_checked`, where serde's internally-tagged decode `Content`-buffers
+/// the whole value before `MAX_SUPPLY_ENTRIES` can reject it (the cardinality
+/// cap only applies after buffering). That residual is bounded by the byte cap
+/// (`MAX_MESSAGE_SIZE`, 16 MiB), by the connection cap (`ConnectionLimiter`,
+/// which bounds how many such decodes run at once), and by the fact that this
+/// path is allowlisted-only. Full closure — an element-count scan of the CBOR,
+/// or an externally-tagged wire format that reads the tag without buffering —
+/// is deferred and tracked separately.
+async fn read_frame<R>(recv: &mut R, io_timeout: Duration) -> Result<WireMessage, String>
+where
+    R: ExactReader,
+{
+    // 1. Length prefix. A clean end-of-stream surfaces here as "early eof",
+    //    which `serve_anti_entropy` matches to break the loop cleanly (M-06).
+    //    A stalled read is a torn-down session: its error string must NOT
+    //    contain "early eof"/"closed", so a timeout stays a real error.
     let mut len_buf = [0u8; 4];
-    match tokio::time::timeout(io_timeout, recv.read_exact(&mut len_buf)).await {
-        Ok(result) => result.map_err(|error| format!("early eof: {error}"))?,
-        // A stalled read is a torn-down session, not a clean shutdown. The error
-        // string must NOT contain "early eof"/"closed": `serve_anti_entropy`
-        // matches those to break cleanly, and a timeout is a real error (M-06).
+    match tokio::time::timeout(io_timeout, recv.read_exact_bytes(&mut len_buf)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(format!("early eof: {error}")),
         Err(_elapsed) => return Err("anti-entropy read timed out".to_owned()),
     }
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_MESSAGE_SIZE as usize {
         return Err(format!("anti-entropy frame too large: {len}"));
     }
-    let mut body = vec![0u8; len];
-    match tokio::time::timeout(io_timeout, recv.read_exact(&mut body)).await {
-        Ok(result) => result.map_err(|error| error.to_string())?,
-        Err(_elapsed) => return Err("anti-entropy read timed out".to_owned()),
+
+    // 2. Oversized-frame gate (M-16). Only `Supply` legitimately exceeds
+    //    NON_SUPPLY_FRAME_CAP. For an oversized frame, peek just the map header
+    //    byte + the "type" entry: if it is not the `Supply` discriminator,
+    //    reject now — WITHOUT reading or allocating the remaining `len` bytes.
+    //    This tears down a ~670 MiB `Want`/`HaveHeads` vector after ~13 bytes.
+    let discriminator = p2p::protocol::SUPPLY_TYPE_DISCRIMINATOR;
+    let peek_len = 1 + discriminator.len();
+    let mut body: Vec<u8> = Vec::new();
+    if len > NON_SUPPLY_FRAME_CAP {
+        let mut peek = vec![0u8; peek_len];
+        match tokio::time::timeout(io_timeout, recv.read_exact_bytes(&mut peek)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(_elapsed) => return Err("anti-entropy read timed out".to_owned()),
+        }
+        if frame_is_rejectable(len, &peek) {
+            return Err(format!("oversized non-supply frame: {len} bytes"));
+        }
+        // Claims to be `Supply`: carry the peeked bytes forward as the body head.
+        body = peek;
     }
+
+    // 3. Incremental body read (L-19): grow the buffer chunk by chunk so a
+    //    stalled stream pins only the bytes actually received — never `len`
+    //    bytes reserved up front. Each chunk read is bounded by the I/O timeout.
+    while body.len() < len {
+        let want = (len - body.len()).min(READ_CHUNK);
+        let mut chunk = vec![0u8; want];
+        match tokio::time::timeout(io_timeout, recv.read_exact_bytes(&mut chunk)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(_elapsed) => return Err("anti-entropy read timed out".to_owned()),
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    // 4. Size + version + cardinality gates (H-7). Even a frame that passed the
+    //    `Supply` discriminator gate is still bounded here.
     WireMessage::decode_checked(&body).map_err(|error| error.to_string())
 }
 
@@ -660,6 +815,23 @@ mod tests {
         allowlist: PeerAllowlist,
         timeouts: AntiEntropyTimeouts,
     ) -> AntiEntropyHandler {
+        make_handler_full(ledger, allowlist, timeouts, AntiEntropyLimits::default())
+    }
+
+    fn make_handler_with_limits(
+        ledger: SharedLedger,
+        allowlist: PeerAllowlist,
+        limits: AntiEntropyLimits,
+    ) -> AntiEntropyHandler {
+        make_handler_full(ledger, allowlist, AntiEntropyTimeouts::default(), limits)
+    }
+
+    fn make_handler_full(
+        ledger: SharedLedger,
+        allowlist: PeerAllowlist,
+        timeouts: AntiEntropyTimeouts,
+        limits: AntiEntropyLimits,
+    ) -> AntiEntropyHandler {
         AntiEntropyHandler {
             ledger,
             broadcast: TransactionBroadcast::new(),
@@ -668,6 +840,132 @@ mod tests {
             signing_enabled: false,
             swarm_topic: String::new(),
             timeouts,
+            limits,
+            limiter: ConnectionLimiter::new(limits),
+        }
+    }
+
+    // ─── M-16 / L-19 read_frame gate (deterministic, no network) ───────────
+
+    /// In-memory [`ExactReader`] over a byte slice. `read_frame` reading past the
+    /// slice fails like an early EOF — which lets the oversized-frame test prove
+    /// the gate fires WITHOUT the (absent) body ever being present to read.
+    struct SliceReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+    }
+
+    impl ExactReader for SliceReader<'_> {
+        async fn read_exact_bytes(&mut self, buf: &mut [u8]) -> Result<(), String> {
+            let end = self.pos + buf.len();
+            if end > self.data.len() {
+                return Err("early eof: slice reader exhausted".to_owned());
+            }
+            buf.copy_from_slice(&self.data[self.pos..end]);
+            self.pos = end;
+            Ok(())
+        }
+    }
+
+    fn slice_reader(data: &[u8]) -> SliceReader<'_> {
+        SliceReader { data, pos: 0 }
+    }
+
+    /// B: the pure oversized-frame decision. Within the cap nothing is
+    /// rejectable; over the cap only a non-`Supply` (or a peek too short to be a
+    /// well-formed `Supply`) is.
+    #[test]
+    fn frame_is_rejectable_gate() {
+        let discriminator = p2p::protocol::SUPPLY_TYPE_DISCRIMINATOR;
+        let mut supply_peek = vec![0xA3u8];
+        supply_peek.extend_from_slice(discriminator);
+        let want_peek = WireMessage::want(vec!["x".to_owned()]).to_cbor().unwrap();
+
+        let over = NON_SUPPLY_FRAME_CAP + 1;
+
+        // Within the cap: never rejectable here, whatever the content.
+        assert!(!frame_is_rejectable(NON_SUPPLY_FRAME_CAP, &want_peek));
+        assert!(!frame_is_rejectable(NON_SUPPLY_FRAME_CAP, &supply_peek));
+        // Over the cap + non-supply discriminator: rejectable.
+        assert!(frame_is_rejectable(over, &want_peek));
+        // Over the cap + Supply discriminator: NOT rejectable (a real big Supply).
+        assert!(!frame_is_rejectable(over, &supply_peek));
+        // Over the cap + peek too short to hold the discriminator: rejectable.
+        assert!(frame_is_rejectable(over, &[0xA3]));
+    }
+
+    /// B / L-19: an oversized frame whose head is NOT the `Supply` discriminator
+    /// is rejected from the ~13-byte peek — `read_frame` returns the rejection
+    /// error and never even attempts to read the claimed multi-MiB body (which
+    /// is absent from the slice, so an attempt would surface a different error).
+    #[tokio::test]
+    async fn read_frame_rejects_oversized_non_supply_without_reading_body() {
+        // Frame a Want-shaped CBOR head with a length prefix claiming a ~2 MiB
+        // body (> NON_SUPPLY_FRAME_CAP). The body itself is never provided.
+        let want_head = WireMessage::want(vec!["x".to_owned()]).to_cbor().unwrap();
+        let claimed_len = (NON_SUPPLY_FRAME_CAP + 1_000_000) as u32;
+        let mut framed = claimed_len.to_be_bytes().to_vec();
+        framed.extend_from_slice(&want_head);
+
+        let mut reader = slice_reader(&framed);
+        let error = read_frame(&mut reader, Duration::from_secs(1))
+            .await
+            .expect_err("oversized non-supply frame must be rejected");
+        assert!(
+            error.contains("oversized non-supply"),
+            "expected the oversized-frame gate to fire, got: {error}"
+        );
+    }
+
+    /// B: a genuine `Supply` larger than the non-supply cap (but within
+    /// `MAX_MESSAGE_SIZE` and `MAX_SUPPLY_ENTRIES`) is accepted — no false
+    /// rejection — exercising the peek-carry-forward + chunked body read.
+    #[tokio::test]
+    async fn read_frame_accepts_genuine_large_supply() {
+        let entries: Vec<p2p::protocol::SupplyEntry> = (0..12)
+            .map(|index| p2p::protocol::SupplyEntry {
+                id: format!("{index:064x}"),
+                kind: p2p::protocol::DirectiveKind::Open,
+                economic_bean: "x".repeat(120 * 1024),
+                envelope: std::collections::BTreeMap::new(),
+            })
+            .collect();
+        let message = WireMessage::supply(entries);
+        let wire = message.to_wire().expect("frame large supply");
+        let body_len = wire.len() - 4;
+        assert!(
+            body_len > NON_SUPPLY_FRAME_CAP,
+            "test frame must exceed the non-supply cap: {body_len}"
+        );
+        assert!(
+            body_len <= MAX_MESSAGE_SIZE as usize,
+            "and stay within 16 MiB"
+        );
+
+        let mut reader = slice_reader(&wire);
+        let decoded = read_frame(&mut reader, Duration::from_secs(5))
+            .await
+            .expect("a genuine large Supply must be accepted");
+        assert_eq!(decoded, message, "round-trip mismatch on large Supply");
+    }
+
+    /// Small frames of every variant still round-trip through the incremental
+    /// (`len <= cap`, no peek) read path.
+    #[tokio::test]
+    async fn read_frame_roundtrips_small_frames() {
+        let messages = [
+            WireMessage::want(vec!["a".to_owned(), "b".to_owned()]),
+            WireMessage::have_heads(vec!["tx".to_owned()], vec!["dir".to_owned()]),
+            WireMessage::announce("id".to_owned(), p2p::protocol::DirectiveKind::Open),
+            WireMessage::supply(vec![]),
+        ];
+        for message in messages {
+            let wire = message.to_wire().expect("frame");
+            let mut reader = slice_reader(&wire);
+            let decoded = read_frame(&mut reader, Duration::from_secs(2))
+                .await
+                .expect("read small frame");
+            assert_eq!(decoded, message);
         }
     }
 
@@ -1272,5 +1570,299 @@ mod tests {
         assert_eq!(outcome.merged, 1, "a new valid entry must merge");
         assert_eq!(outcome.rejected, 0);
         assert_eq!(sink.read().await.directive_count(), 1);
+    }
+
+    // ─── M-16 / T24 connection + request limits (network) ───────────────────
+
+    /// Dial the anti-entropy ALPN with a generous per-attempt timeout (matching
+    /// the default connect timeout the convergence tests rely on), retrying a
+    /// few times. Panics if no dial succeeds. A short per-attempt timeout is
+    /// wrong here: cancelling a dial that merely needs a little longer and
+    /// retrying never lets one complete.
+    async fn connect_retry(endpoint: &Endpoint, addr: iroh::EndpointAddr) -> Connection {
+        let mut last_error = String::new();
+        for _ in 0..3 {
+            match tokio::time::timeout(
+                Duration::from_secs(10),
+                endpoint.connect(addr.clone(), p2p::protocol::ANTI_ENTROPY_ALPN),
+            )
+            .await
+            {
+                Ok(Ok(conn)) => return conn,
+                Ok(Err(error)) => last_error = error.to_string(),
+                Err(_elapsed) => last_error = "connect timed out".to_owned(),
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        panic!("connect_retry: no dial succeeded ({last_error})");
+    }
+
+    /// Open a connection and put the server into its read loop (holding its
+    /// `ConnectionGuard`), returning the live handles so the caller keeps it
+    /// open. A non-final `HaveHeads` page draws no reply but keeps the server
+    /// looping on the next read.
+    async fn open_and_hold(
+        endpoint: &Endpoint,
+        addr: iroh::EndpointAddr,
+    ) -> (Connection, SendStream, RecvStream) {
+        let conn = connect_retry(endpoint, addr).await;
+        let (mut send, recv) = conn.open_bi().await.expect("open_bi");
+        write_message(
+            &mut send,
+            &WireMessage::have_heads_page(vec!["tx".to_owned()], vec![], true),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("write have_heads page");
+        (conn, send, recv)
+    }
+
+    /// One refusal probe against `addr`. Returns `Some(true)` when the peer is
+    /// refused (the handler closed it or the exchange never completes),
+    /// `Some(false)` when it is admitted (a `HaveHeads` reply comes back), and
+    /// `None` when the dial timed out transiently (inconclusive — retry).
+    async fn probe_refused(endpoint: &Endpoint, addr: iroh::EndpointAddr) -> Option<bool> {
+        let conn = match tokio::time::timeout(
+            Duration::from_secs(10),
+            endpoint.connect(addr, p2p::protocol::ANTI_ENTROPY_ALPN),
+        )
+        .await
+        {
+            Ok(Ok(conn)) => conn,
+            // A dial that errors (closed/reset) is a refusal; one that times out
+            // is a transient stall we cannot conclude from.
+            Ok(Err(_)) => return Some(true),
+            Err(_) => return None,
+        };
+        // Admitted sessions answer a final `HaveHeads` with the server's advert;
+        // a refused connection is closed, so open_bi / write / read fails.
+        let exchanged = async {
+            let (mut send, mut recv) = conn.open_bi().await.ok()?;
+            write_message(
+                &mut send,
+                &WireMessage::have_heads(vec!["tx".to_owned()], vec![]),
+                Duration::from_secs(2),
+            )
+            .await
+            .ok()?;
+            read_message(&mut recv, Duration::from_secs(2)).await.ok()
+        }
+        .await;
+        Some(exchanged.is_none())
+    }
+
+    /// A (integration smoke test): a server capped at 2 connections per peer
+    /// refuses a 3rd concurrent connection from the same client. The
+    /// deterministic coverage is in `connection_limiter`'s unit tests; this
+    /// proves the cap is wired into `ProtocolHandler::accept`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn per_peer_connection_cap_refuses_third_connection() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_server = bind_direct_endpoint().await;
+        let endpoint_client = bind_direct_endpoint().await;
+
+        let id_server = endpoint_server.id();
+        let id_client = endpoint_client.id();
+
+        let allow_server =
+            PeerAllowlist::parse(&[id_client.to_string()]).expect("allowlist server");
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ledger_server: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("server.bean"), id_server.to_string())
+                .expect("boot server ledger"),
+        ));
+
+        // Per-peer cap of 2; default (generous) I/O timeouts so the first two
+        // guards stay held (the server's read blocks well past this test) while
+        // we probe the third slot.
+        let limits = AntiEntropyLimits {
+            max_total_connections: 256,
+            max_connections_per_peer: 2,
+            max_requests_per_connection: 100_000,
+        };
+        let handler_server = make_handler_with_limits(ledger_server, allow_server, limits);
+        let router_server = Router::builder(endpoint_server.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler_server.clone())
+            .spawn();
+
+        wait_until_dialable(&endpoint_server).await;
+        wait_until_dialable(&endpoint_client).await;
+        let addr_server = endpoint_server.addr();
+
+        // Establish and hold two connections; connectivity is proven here (these
+        // panic if the path never comes up), so a later refusal is the cap, not
+        // a dead network.
+        let held_one = open_and_hold(&endpoint_client, addr_server.clone()).await;
+        let held_two = open_and_hold(&endpoint_client, addr_server.clone()).await;
+
+        // Let the server accept both and enter their read loops (guards held).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // The 3rd slot must be refused. Retry only transient dial stalls
+        // (`None`); a conclusive admit (`Some(false)`) means the cap is broken.
+        let mut refused = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while tokio::time::Instant::now() < deadline {
+            match probe_refused(&endpoint_client, addr_server.clone()).await {
+                Some(result) => {
+                    refused = result;
+                    break;
+                }
+                None => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+
+        // Hold the first two open through the probe so their guards were live the
+        // whole time.
+        drop(held_one);
+        drop(held_two);
+        let _ = router_server.shutdown().await;
+
+        assert!(
+            refused,
+            "M-16: the per-peer cap did not refuse the 3rd concurrent connection"
+        );
+    }
+
+    /// C (integration): a connection budgeted for 3 requests answers exactly 3
+    /// and then closes, even though the client sends 5. The 4th read on the
+    /// client side then fails (the server finished its send side).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn request_budget_closes_connection_after_limit() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_server = bind_direct_endpoint().await;
+        let endpoint_client = bind_direct_endpoint().await;
+
+        let id_server = endpoint_server.id();
+        let id_client = endpoint_client.id();
+
+        let allow_server =
+            PeerAllowlist::parse(&[id_client.to_string()]).expect("allowlist server");
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ledger_server: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("server.bean"), id_server.to_string())
+                .expect("boot server ledger"),
+        ));
+
+        let limits = AntiEntropyLimits {
+            max_total_connections: 256,
+            max_connections_per_peer: 32,
+            max_requests_per_connection: 3,
+        };
+        let handler_server = make_handler_with_limits(ledger_server, allow_server, limits);
+        let router_server = Router::builder(endpoint_server.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler_server.clone())
+            .spawn();
+
+        wait_until_dialable(&endpoint_server).await;
+        wait_until_dialable(&endpoint_client).await;
+        let addr_server = endpoint_server.addr();
+
+        let conn = connect_retry(&endpoint_client, addr_server.clone()).await;
+        let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
+
+        // Send 5 Wants for an unknown id, interleaving each with its reply (the
+        // protocol's own request/response cadence). Each Want draws exactly one
+        // (empty) Supply reply while the budget lasts; once the server hits its
+        // 3-request budget it closes, and the next read fails.
+        let mut replies = 0;
+        for _ in 0..5 {
+            if write_message(
+                &mut send,
+                &WireMessage::want(vec!["nope".to_owned()]),
+                Duration::from_secs(5),
+            )
+            .await
+            .is_err()
+            {
+                break;
+            }
+            match read_message(&mut recv, Duration::from_secs(5)).await {
+                Ok(WireMessage::Supply { .. }) => replies += 1,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        let _ = router_server.shutdown().await;
+
+        // The budget is a hard ceiling: the server breaks at the 4th message, so
+        // the client can NEVER see more than 3 replies (without the budget it
+        // would see all 5). The 3rd reply races the server's post-budget
+        // connection close and may be truncated, so 2 or 3 both prove the cap —
+        // the point is it stopped well short of 5.
+        assert!(
+            (2..=3).contains(&replies),
+            "T24: server must answer at most the 3-request budget then close, got {replies}"
+        );
+    }
+
+    /// Guard: small connection limits must not break a legitimate exchange. Two
+    /// real handlers on tight caps (per-peer 4, total 8) still converge — the
+    /// caps bound runaways, not honest traffic. Uses default (generous) timeouts
+    /// like `three_node_alpn_convergence`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn happy_path_small_limits_converges() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_client = bind_direct_endpoint().await;
+        let endpoint_source = bind_direct_endpoint().await;
+
+        let id_client = endpoint_client.id();
+        let id_source = endpoint_source.id();
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ledger_source: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("source.bean"), id_source.to_string())
+                .expect("boot source ledger"),
+        ));
+        let source_count = seed_funding_ledger(&ledger_source).await;
+
+        let allow_source =
+            PeerAllowlist::parse(&[id_client.to_string()]).expect("allowlist source");
+        let allow_client =
+            PeerAllowlist::parse(&[id_source.to_string()]).expect("allowlist client");
+
+        let ledger_client: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("client.bean"), id_client.to_string())
+                .expect("boot client ledger"),
+        ));
+
+        // Tight connection caps, generous request budget (a catch-up needs many
+        // messages on one stream but only a handful of concurrent connections).
+        let limits = AntiEntropyLimits {
+            max_total_connections: 8,
+            max_connections_per_peer: 4,
+            max_requests_per_connection: 100_000,
+        };
+        let handler_source = make_handler_with_limits(ledger_source.clone(), allow_source, limits);
+        let handler_client = make_handler_with_limits(ledger_client.clone(), allow_client, limits);
+
+        let router_source = Router::builder(endpoint_source.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler_source.clone())
+            .spawn();
+
+        wait_until_dialable(&endpoint_client).await;
+        wait_until_dialable(&endpoint_source).await;
+        let addr_source = endpoint_source.addr();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            exchange_with_peer(&endpoint_client, addr_source.clone(), &handler_client).await;
+            if ledger_client.read().await.directive_count() == source_count {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                let _ = router_source.shutdown().await;
+                panic!("small limits broke a legitimate exchange: client did not converge");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let _ = router_source.shutdown().await;
     }
 }

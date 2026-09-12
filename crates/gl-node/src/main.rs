@@ -1,6 +1,7 @@
 mod anti_entropy_alpn;
 mod auth;
 mod config;
+mod connection_limiter;
 mod fetch_coordinator;
 mod graphql;
 mod health;
@@ -191,6 +192,8 @@ async fn main() {
                     );
                 }
 
+                // Generous defaults; a config surface follows in T38 (M-06, M-16).
+                let limits = connection_limiter::AntiEntropyLimits::default();
                 let handler = anti_entropy_alpn::AntiEntropyHandler {
                     ledger: shared_ledger.clone(),
                     broadcast: broadcast.clone(),
@@ -198,8 +201,9 @@ async fn main() {
                     allowlist: peer_node.allowlist().clone(),
                     signing_enabled: config.signing.enabled,
                     swarm_topic: config.p2p.swarm_topic.clone(),
-                    // Generous defaults; a config surface follows in T38 (M-06).
                     timeouts: anti_entropy_alpn::AntiEntropyTimeouts::default(),
+                    limits,
+                    limiter: connection_limiter::ConnectionLimiter::new(limits),
                 };
                 p2p_router = Some(p2p_service::spawn_router(&peer_node, handler.clone()));
                 let sender = p2p_service::spawn_gossip_loop(&peer_node, handler.clone());

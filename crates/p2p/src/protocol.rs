@@ -32,6 +32,26 @@ pub const MAX_HAVE_HEADS: usize = 4096;
 /// receive cap for CBOR framing overhead.
 pub const SUPPLY_FRAME_BUDGET_BYTES: usize = 15 * 1024 * 1024;
 
+/// CBOR bytes of the `"type": "supply"` map entry that opens a serialized
+/// `Supply` frame (M-16).
+///
+/// `WireMessage` is `#[serde(tag = "type")]` (internally tagged), so serde
+/// emits the tag as the FIRST map entry and ciborium encodes each variant as a
+/// definite-length map. A `Supply` therefore starts with a one-byte map header
+/// (`0xA3` for its 3 fields) immediately followed by these 12 bytes:
+/// `text(4) "type"` (`0x64 74 79 70 65`) then `text(6) "supply"`
+/// (`0x66 73 75 70 70 6c 79`). The map header byte is intentionally excluded so
+/// the discriminator does not depend on a variant's field count — the reader
+/// skips byte 0 and compares from byte 1.
+///
+/// This lets `read_message` (see `anti_entropy_alpn`) recognise a genuine
+/// `Supply` from a ~13-byte peek and reject an oversized non-`Supply` frame
+/// before allocating or `Content`-buffering its body. The coupling to serde's
+/// tag-first, definite-length-map encoding is pinned by
+/// `supply_discriminator_pins_wire_format`: if the encoding ever drifts, that
+/// test fails loudly.
+pub const SUPPLY_TYPE_DISCRIMINATOR: &[u8] = b"\x64type\x66supply";
+
 // ─── Message types ───────────────────────────────────────────────────────────
 
 /// A wire protocol message (§3.4.1).
@@ -478,6 +498,53 @@ mod tests {
             .collect();
         let error = WireMessage::supply(entries).to_wire().unwrap_err();
         assert!(error.contains("max"), "unexpected error: {error}");
+    }
+
+    /// M-16: pins the coupling between serde's tag-first, definite-length-map
+    /// encoding and `SUPPLY_TYPE_DISCRIMINATOR`. A genuine `Supply` frame carries
+    /// the discriminator at byte offset `[1..]` (skipping the map header byte);
+    /// every other variant must NOT match at that offset, so the oversized-frame
+    /// gate in `read_message` can only ever fast-path a real `Supply`. If the
+    /// wire encoding drifts (tag no longer first, indefinite-length map, renamed
+    /// variant), this test fails rather than silently defeating the M-16 guard.
+    #[test]
+    fn supply_discriminator_pins_wire_format() {
+        let discriminator = SUPPLY_TYPE_DISCRIMINATOR;
+        let range = 1..1 + discriminator.len();
+
+        // A real Supply (with an entry, to exercise the populated shape) matches.
+        let supply = WireMessage::supply(vec![SupplyEntry {
+            id: "id".to_owned(),
+            kind: DirectiveKind::Open,
+            economic_bean: "2024-01-01 open Assets:Cash".to_owned(),
+            envelope: BTreeMap::new(),
+        }]);
+        let supply_cbor = supply.to_cbor().unwrap();
+        assert_eq!(
+            &supply_cbor[range.clone()],
+            discriminator,
+            "Supply frame must carry the discriminator at [1..] (map header at [0])"
+        );
+        // An empty Supply matches too — the discriminator is independent of the
+        // entry vector.
+        let empty_supply = WireMessage::supply(vec![]).to_cbor().unwrap();
+        assert_eq!(&empty_supply[range.clone()], discriminator);
+
+        // No non-Supply variant may match at the same offset.
+        let non_supply = [
+            WireMessage::want(vec!["id".to_owned()]),
+            WireMessage::have_heads(vec!["tx".to_owned()], vec!["dir".to_owned()]),
+            WireMessage::have_heads_page(vec!["tx".to_owned()], vec![], true),
+            WireMessage::announce("id".to_owned(), DirectiveKind::Transaction),
+        ];
+        for message in non_supply {
+            let cbor = message.to_cbor().unwrap();
+            assert_ne!(
+                &cbor[range.clone()],
+                discriminator,
+                "non-Supply variant unexpectedly matched the Supply discriminator: {message:?}"
+            );
+        }
     }
 
     #[test]
