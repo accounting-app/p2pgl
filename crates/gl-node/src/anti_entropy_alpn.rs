@@ -789,8 +789,11 @@ where
     WireMessage::decode_checked(&body).map_err(|error| error.to_string())
 }
 
+/// Test-only scaffolding. `pub(crate)` so the `p2p_service` network tests can
+/// reuse the endpoint/handler/ledger helpers instead of duplicating them; the
+/// module is `#[cfg(test)]`, so nothing here exists in a real build.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::LazyLock;
     use std::time::Duration;
@@ -809,10 +812,10 @@ mod tests {
     /// deadlines; run concurrently under `cargo test` they starve one another's
     /// runtimes and the deadlines flake. Every network test below holds this
     /// for its whole body.
-    static NET_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    pub(crate) static NET_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
         LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-    async fn bind_direct_endpoint() -> Endpoint {
+    pub(crate) async fn bind_direct_endpoint() -> Endpoint {
         Endpoint::builder(presets::Minimal)
             .alpns(vec![p2p::protocol::ANTI_ENTROPY_ALPN.to_vec()])
             .bind()
@@ -820,7 +823,7 @@ mod tests {
             .expect("bind direct-only Iroh endpoint")
     }
 
-    async fn wait_until_dialable(endpoint: &Endpoint) {
+    pub(crate) async fn wait_until_dialable(endpoint: &Endpoint) {
         for _ in 0..50 {
             if endpoint.addr().addrs.iter().any(TransportAddr::is_ip) {
                 return;
@@ -865,11 +868,14 @@ mod tests {
         }
     }
 
-    fn make_handler(ledger: SharedLedger, allowlist: PeerAllowlist) -> AntiEntropyHandler {
+    pub(crate) fn make_handler(
+        ledger: SharedLedger,
+        allowlist: PeerAllowlist,
+    ) -> AntiEntropyHandler {
         make_handler_with_timeouts(ledger, allowlist, AntiEntropyTimeouts::default())
     }
 
-    fn make_handler_with_timeouts(
+    pub(crate) fn make_handler_with_timeouts(
         ledger: SharedLedger,
         allowlist: PeerAllowlist,
         timeouts: AntiEntropyTimeouts,
@@ -1146,7 +1152,7 @@ mod tests {
     /// `openledger-author` is required on the receive path (H-14), and is not
     /// part of the economic body, so every directive still hashes distinctly by
     /// its account name alone.
-    fn write_open_directive_ledger(path: &std::path::Path, count: usize, author: &str) {
+    pub(crate) fn write_open_directive_ledger(path: &std::path::Path, count: usize, author: &str) {
         use std::fmt::Write as _;
 
         let mut content = String::new();

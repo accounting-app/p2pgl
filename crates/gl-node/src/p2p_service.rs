@@ -269,10 +269,9 @@ pub fn spawn_gossip_loop(
 /// Spawn the anti-entropy periodic exchange as a background tokio task.
 ///
 /// Every `anti_entropy_interval_ms`, opens an ALPN session with each
-/// allowlisted connected peer and pulls missing directives.
+/// configured bootstrap peer and pulls missing directives.
 pub fn spawn_anti_entropy_loop(peer_node: &PeerNode, handler: AntiEntropyHandler) {
     let interval_ms = peer_node.config().anti_entropy_interval_ms;
-    let registry = peer_node.registry.clone();
     let endpoint = peer_node.endpoint().clone();
     let allowlist = peer_node.allowlist().clone();
 
@@ -283,8 +282,35 @@ pub fn spawn_anti_entropy_loop(peer_node: &PeerNode, handler: AntiEntropyHandler
         loop {
             interval.tick().await;
 
-            let peers = registry.list();
-            if peers.is_empty() {
+            // Targets come from the ALLOWLIST, not from the live peer registry
+            // (M-11). The registry is filled exclusively by allowlist-gated
+            // gossip `NeighborUp` events and drained by `NeighborDown`, but
+            // gossip overlay membership is open: anyone holding the swarm-topic
+            // string plus one member id can join the topic and occupy a node's
+            // neighbor slots. An eclipsed node therefore had an EMPTY registry,
+            // the `is_empty()` guard skipped every tick, and replication stopped
+            // silently and permanently — with no peer left to pull from, nothing
+            // could ever repopulate the registry either.
+            //
+            // The registry is now irrelevant for target selection, because the
+            // union it was meant to contribute to is redundant: `NeighborUp` only
+            // ever inserts admitted peers, so registry ⊆ allowlist, and
+            // `bootstrap_peers()` returns the ENTIRE admitted set (the allowlist
+            // IS the configured `bootstrapEndpointIds`). "Live neighbors ∪
+            // bootstrap ids" is therefore just the allowlist, so iterating it
+            // directly is a superset of the old behaviour and cannot be starved
+            // by overlay membership. It also removes the parse and `admits`
+            // re-check below: these are already-parsed, already-admitted
+            // `EndpointId`s. The registry itself stays — the GraphQL peer
+            // listing reads it as live-neighbor state.
+            //
+            // Cost when a bootstrap peer is offline: one connect attempt per
+            // tick, bounded by the T24 connect timeout (10s default), run
+            // concurrently in the `JoinSet` below and drained before the next
+            // tick — so an unreachable peer cannot make ticks pile up.
+            let targets = allowlist.bootstrap_peers();
+            if targets.is_empty() {
+                // No bootstrap peers configured: nothing to sync with.
                 continue;
             }
 
@@ -294,13 +320,7 @@ pub fn spawn_anti_entropy_loop(peer_node: &PeerNode, handler: AntiEntropyHandler
             // inline. Each spawned exchange is itself bounded by the connect and
             // I/O timeouts on the handler, so the drain below cannot hang.
             let mut set = tokio::task::JoinSet::new();
-            for peer in &peers {
-                let Ok(peer_id) = peer.id.parse::<iroh::EndpointId>() else {
-                    continue;
-                };
-                if !allowlist.admits(peer_id) {
-                    continue;
-                }
+            for peer_id in targets {
                 let endpoint = endpoint.clone();
                 let handler = handler.clone();
                 set.spawn(async move {
@@ -396,6 +416,147 @@ fn write_secret_key_file(path: &Path, hex_key: &str) -> Result<(), Box<dyn std::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use iroh::address_lookup::memory::MemoryLookup;
+    use tokio::sync::RwLock;
+
+    use crate::anti_entropy_alpn::tests::{
+        bind_direct_endpoint, make_handler, make_handler_with_timeouts, wait_until_dialable,
+        write_open_directive_ledger, NET_TEST_LOCK,
+    };
+    use crate::anti_entropy_alpn::AntiEntropyTimeouts;
+    use crate::graphql::SharedLedger;
+
+    /// M-11: an ECLIPSED node — zero gossip neighbors, empty peer registry —
+    /// must still replicate from its configured `bootstrapEndpointIds`.
+    ///
+    /// This drives the real `spawn_anti_entropy_loop`. The client never joins a
+    /// gossip topic, so no `NeighborUp` ever fires and `registry` stays empty
+    /// for the whole test — exactly the state Sybil neighbors produce when they
+    /// occupy every gossip slot. Before the fix the loop's `peers.is_empty()`
+    /// guard skipped every tick here and the client never converged.
+    ///
+    /// The client endpoint carries a `MemoryLookup` address lookup pre-loaded
+    /// with the server's `EndpointAddr`, so the loop's bare-`EndpointId` dial
+    /// resolves without a relay or a discovery service (direct-only, like the
+    /// rest of the network tests).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn eclipsed_node_still_syncs_from_bootstrap_peers() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_server = bind_direct_endpoint().await;
+        let server_id = endpoint_server.id();
+
+        let address_lookup = MemoryLookup::new();
+        let endpoint_client = iroh::Endpoint::builder(presets::Minimal)
+            .alpns(vec![p2p::protocol::ANTI_ENTROPY_ALPN.to_vec()])
+            .address_lookup(address_lookup.clone())
+            .bind()
+            .await
+            .expect("bind client endpoint with memory address lookup");
+        let client_id = endpoint_client.id();
+
+        let allow_server =
+            PeerAllowlist::parse(&[client_id.to_string()]).expect("server allowlist");
+        let allow_client =
+            PeerAllowlist::parse(&[server_id.to_string()]).expect("client allowlist");
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server_path = temp_dir.path().join("server.bean");
+        write_open_directive_ledger(&server_path, 5, &server_id.to_string());
+
+        let ledger_server: SharedLedger = Arc::new(RwLock::new(
+            ledger::service::LedgerService::boot(server_path, server_id.to_string())
+                .expect("boot server ledger"),
+        ));
+        let ledger_client: SharedLedger = Arc::new(RwLock::new(
+            ledger::service::LedgerService::boot(
+                temp_dir.path().join("client.bean"),
+                client_id.to_string(),
+            )
+            .expect("boot client ledger"),
+        ));
+
+        let source_count = ledger_server.read().await.directive_count();
+        assert_eq!(source_count, 5, "server ledger boot count");
+        assert_eq!(
+            ledger_client.read().await.directive_count(),
+            0,
+            "client starts empty"
+        );
+
+        let handler_server = make_handler(ledger_server.clone(), allow_server);
+        // Short timeouts so a dial that cannot resolve fails fast and the next
+        // tick retries, instead of parking the test behind the 10s default.
+        let handler_client = make_handler_with_timeouts(
+            ledger_client.clone(),
+            allow_client.clone(),
+            AntiEntropyTimeouts {
+                connect: Duration::from_secs(2),
+                io: Duration::from_secs(5),
+            },
+        );
+
+        let router_server = Router::builder(endpoint_server.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler_server)
+            .spawn();
+
+        wait_until_dialable(&endpoint_server).await;
+        wait_until_dialable(&endpoint_client).await;
+
+        // Teach the client where the server lives. The loop itself only ever
+        // holds the bare `EndpointId` from the allowlist.
+        address_lookup.add_endpoint_info(endpoint_server.addr());
+
+        // A gossip handle that never subscribes to anything: no topic, no
+        // neighbors, no `NeighborUp` — the registry cannot be populated.
+        let gossip_client = iroh_gossip::net::Gossip::builder().spawn(endpoint_client.clone());
+        let client_node = PeerNode::new(
+            endpoint_client,
+            gossip_client,
+            PeerNodeConfig {
+                swarm_topic: "openledger/m11-eclipse".to_owned(),
+                bootstrap_peers: vec![server_id.to_string()],
+                anti_entropy_interval_ms: 200,
+            },
+            allow_client,
+        );
+        assert_eq!(
+            client_node.peer_count(),
+            0,
+            "M-11 precondition: the eclipsed node has no gossip neighbors"
+        );
+
+        spawn_anti_entropy_loop(&client_node, handler_client);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let count = ledger_client.read().await.directive_count();
+            if count == source_count {
+                break;
+            }
+            assert_eq!(
+                client_node.peer_count(),
+                0,
+                "the registry must stay empty: the sync has to come from the allowlist alone"
+            );
+            if tokio::time::Instant::now() > deadline {
+                let _ = router_server.shutdown().await;
+                panic!(
+                    "M-11: eclipsed node never synced from its bootstrap peer: server={source_count} client={count}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        assert_eq!(
+            client_node.peer_count(),
+            0,
+            "the registry must stay empty: the sync has to come from the allowlist alone"
+        );
+
+        let _ = router_server.shutdown().await;
+    }
 
     #[test]
     fn test_load_or_create_secret_key_creates_new() {
