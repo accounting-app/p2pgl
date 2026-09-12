@@ -7,6 +7,7 @@ use chrono::{Datelike, NaiveDate};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use tracing::error;
 
 use crate::dag::{DagError, InsertResult, LedgerDag};
 use crate::error::ParseError;
@@ -855,8 +856,8 @@ impl LedgerService {
         // Update read model incrementally.
         self.read_model.index_directive(&directive);
 
-        // Persist to file.
-        self.persist()?;
+        // Persist to file (L-13: reload from disk if the persist fails).
+        self.persist_or_reload()?;
 
         Ok(content_id)
     }
@@ -930,8 +931,8 @@ impl LedgerService {
             .open_account(&account, date, &currencies)
             .map_err(ServiceError::Validation)?;
 
-        // Persist.
-        self.persist()?;
+        // Persist (L-13: reload from disk if the persist fails).
+        self.persist_or_reload()?;
 
         Ok(content_id)
     }
@@ -1007,8 +1008,8 @@ impl LedgerService {
             .close_account(&account, date)
             .map_err(ServiceError::Validation)?;
 
-        // Persist.
-        self.persist()?;
+        // Persist (L-13: reload from disk if the persist fails).
+        self.persist_or_reload()?;
 
         Ok(content_id)
     }
@@ -1061,11 +1062,61 @@ impl LedgerService {
     // ── Persistence ──────────────────────────────────────────────────────
 
     /// Serialize the full ledger to the `.bean` file.
+    ///
+    /// The 64 MiB `MAX_LEDGER_FILE_BYTES` cap is still checked inside
+    /// `persist_atomically` (which also performs the atomic temp+rename), so a
+    /// persist can fail either at the cap or on any IO error. Callers on a
+    /// mutation path must therefore route through [`Self::persist_or_reload`],
+    /// not this raw serialize+write, so that a failed persist never leaves
+    /// in-memory state ahead of disk (L-13).
     fn persist(&self) -> Result<(), ServiceError> {
         let directives: Vec<Directive> = self.dag.directives().into_iter().cloned().collect();
         let content = full_file_serialize(&directives, &self.leading_comments);
         persist_atomically(&self.file_path, &content)?;
         Ok(())
+    }
+
+    /// Persist the ledger, restoring memory==disk if the persist fails (L-13).
+    ///
+    /// The 64 MiB cap and every IO error are surfaced by [`Self::persist`] only
+    /// *after* the in-memory DAG has already been mutated by the caller. A
+    /// failed persist would therefore leave memory ahead of disk: reads would
+    /// serve directives that are not on disk, and the next boot would silently
+    /// drop them.
+    ///
+    /// Because [`persist_atomically`] writes to a sibling `.tmp` and then
+    /// renames, a failed persist leaves the previous `.bean` file fully intact —
+    /// it is the last good, fully consistent state. So on failure we discard the
+    /// unpersisted in-memory mutations by reconstructing the entire service from
+    /// that on-disk file via [`Self::boot`] (which fully derives dag, account
+    /// state, read model, Lamport clock, and leading comments from the file plus
+    /// the author id — the service holds no other, non-derived state). The
+    /// original persist error is always returned; the batch that could not be
+    /// written is dropped from memory and anti-entropy simply re-pulls it later.
+    ///
+    /// If the reload *itself* fails (e.g. the file became unreadable), memory is
+    /// left as-is and a combined error is logged — there is no better on-disk
+    /// state to fall back to — but the original persist error is still returned.
+    pub fn persist_or_reload(&mut self) -> Result<(), ServiceError> {
+        let persist_error = match self.persist() {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+
+        match LedgerService::boot(self.file_path.clone(), self.author_id.clone()) {
+            Ok(reloaded) => {
+                *self = reloaded;
+            }
+            Err(reload_error) => {
+                error!(
+                    %persist_error,
+                    %reload_error,
+                    "ledger persist failed AND reload-from-disk failed; in-memory state may be ahead of disk (L-13)"
+                );
+            }
+        }
+
+        Err(persist_error)
     }
 
     /// Reconcile external edits to the `.bean` file (§3.3, CT-12).
@@ -1225,9 +1276,9 @@ impl LedgerService {
             }
         }
 
-        // Re-persist in canonical form.
+        // Re-persist in canonical form (L-13: reload from disk if it fails).
         if new_count > 0 {
-            self.persist()?;
+            self.persist_or_reload()?;
         }
 
         Ok(crate::file_watcher::ReconcileResult {
@@ -1336,20 +1387,48 @@ impl LedgerService {
             .collect()
     }
 
-    /// Insert a validated remote directive into the ledger (P2P receive path).
+    /// Insert a validated remote directive into the ledger, persisting after it
+    /// (P2P receive path, single-insert semantics).
     ///
-    /// This method is the bridge between `p2p::union_merge::validate_supply_entry()`
-    /// (which validates wire format, content hash, and envelope) and the ledger's
-    /// internal state. It:
+    /// This is [`Self::stage_remote_directive`] followed by a persist: it merges
+    /// the directive into memory and, only if that changed state, writes the
+    /// whole `.bean` file. A failed write reloads from disk (L-13), so a caller
+    /// can treat one insert as an atomic memory+disk step.
+    ///
+    /// For catch-up of many entries, prefer staging the whole batch with
+    /// [`Self::stage_remote_directive`] and persisting once with
+    /// [`Self::persist_or_reload`] — persisting per entry is the O(M×N) cost
+    /// M-15 removes.
+    ///
+    /// Returns `Ok(Some(content_id))` if inserted, `Ok(None)` if duplicate, or `Err` if rejected.
+    pub fn insert_remote_directive(
+        &mut self,
+        directive: Directive,
+    ) -> Result<Option<String>, ServiceError> {
+        let result = self.stage_remote_directive(directive)?;
+        if result.is_some() {
+            self.persist_or_reload()?;
+        }
+        Ok(result)
+    }
+
+    /// Stage a validated remote directive into in-memory state — NO persist.
+    ///
+    /// This is the in-memory commit half of the P2P receive path: the bridge
+    /// between `p2p::union_merge::validate_supply_entry()` (which validates wire
+    /// format, content hash, and envelope) and the ledger's internal state. It:
     ///
     /// 1. Adopts the Lamport clock (§3.4.2)
     /// 2. For transactions: validates I1, I2, I3 against local account state
     /// 3. Inserts into DAG (G-Set dedup handles idempotency)
     /// 4. Updates the read model incrementally
-    /// 5. Re-serializes the `.bean` file
+    ///
+    /// It does NOT touch the file. The caller is responsible for persisting once
+    /// the desired set of directives is staged, via [`Self::persist_or_reload`]
+    /// (M-15: one persist per batch, not one per entry).
     ///
     /// Returns `Ok(Some(content_id))` if inserted, `Ok(None)` if duplicate, or `Err` if rejected.
-    pub fn insert_remote_directive(
+    pub fn stage_remote_directive(
         &mut self,
         directive: Directive,
     ) -> Result<Option<String>, ServiceError> {
@@ -1429,7 +1508,6 @@ impl LedgerService {
                 match self.dag.insert(final_directive.clone(), true)? {
                     InsertResult::Inserted { content_id } => {
                         self.read_model.index_directive(&final_directive);
-                        self.persist()?;
                         Ok(Some(content_id))
                     }
                     InsertResult::Duplicate { .. } => Ok(None),
@@ -1443,7 +1521,6 @@ impl LedgerService {
                 match self.dag.insert(directive.clone(), false)? {
                     InsertResult::Inserted { content_id } => {
                         self.read_model.index_directive(&directive);
-                        self.persist()?;
                         Ok(Some(content_id))
                     }
                     InsertResult::Duplicate { .. } => Ok(None),
@@ -1454,7 +1531,6 @@ impl LedgerService {
                 match self.dag.insert(directive.clone(), false)? {
                     InsertResult::Inserted { content_id } => {
                         self.read_model.index_directive(&directive);
-                        self.persist()?;
                         Ok(Some(content_id))
                     }
                     InsertResult::Duplicate { .. } => Ok(None),
@@ -1465,7 +1541,6 @@ impl LedgerService {
                 match self.dag.insert(directive.clone(), false)? {
                     InsertResult::Inserted { content_id } => {
                         self.read_model.index_directive(&directive);
-                        self.persist()?;
                         Ok(Some(content_id))
                     }
                     InsertResult::Duplicate { .. } => Ok(None),
@@ -1497,7 +1572,9 @@ impl LedgerService {
                 Directive::Price(d) => &mut d.metadata,
             };
             metadata.insert(ENVELOPE_KEY_SIGNATURE.to_owned(), signature_hex.to_owned());
-            self.persist()?;
+            // L-13: reload from disk if the persist fails, so the in-memory
+            // signature stamp never gets ahead of the on-disk file.
+            self.persist_or_reload()?;
         }
         Ok(())
     }
@@ -3551,5 +3628,149 @@ mod tests {
         assert_eq!(result.new_directives, 1, "hand-written elision is adopted");
         assert_eq!(result.rejected, 0);
         std::fs::remove_file(path).ok();
+    }
+
+    // ── T27 / L-13: staging vs. persist, and reload-restores-consistency ──
+
+    #[test]
+    fn test_stage_remote_directive_does_not_persist() {
+        // `stage_remote_directive` is the in-memory commit only: it must land in
+        // memory but leave the on-disk file untouched (the caller persists once).
+        let (mut svc, path) = setup_with_accounts();
+        let on_disk_before = std::fs::read_to_string(&path).unwrap();
+
+        let directive = Directive::Transaction(remote_transaction("staged only", false));
+        let content_id = compute_content_id(&directive);
+        let staged = svc.stage_remote_directive(directive).unwrap();
+        assert_eq!(staged.as_deref(), Some(content_id.as_str()));
+        assert!(
+            svc.get_directive(&content_id).is_some(),
+            "staged directive is in memory (memory ahead of disk)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            on_disk_before,
+            "stage must NOT write the file"
+        );
+
+        // The wrapper `insert_remote_directive` = stage + persist, so it DOES
+        // write the file (single-insert semantics preserved for existing callers).
+        let directive2 = Directive::Transaction(remote_transaction("staged then persisted", false));
+        let content_id2 = compute_content_id(&directive2);
+        svc.insert_remote_directive(directive2).unwrap();
+        let on_disk_after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            on_disk_after.contains("staged then persisted"),
+            "insert_remote_directive must persist"
+        );
+        // The first (staged-only) directive is now on disk too, because the
+        // second insert's persist writes the whole current DAG snapshot.
+        assert!(
+            on_disk_after.contains("staged only"),
+            "the earlier staged directive is captured by the later persist"
+        );
+        assert!(svc.get_directive(&content_id2).is_some());
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_reload_from_disk_drops_unpersisted_directive() {
+        // L-13: staging puts memory ahead of disk; reconstructing from the
+        // on-disk file (exactly what `persist_or_reload` does on a failed
+        // persist) drops the un-persisted directive, restoring memory==disk.
+        let (mut svc, path) = setup_with_accounts();
+        let persisted_count = svc.directive_count();
+
+        let directive = Directive::Transaction(remote_transaction("memory only", false));
+        let content_id = compute_content_id(&directive);
+        svc.stage_remote_directive(directive).unwrap();
+        assert!(svc.get_directive(&content_id).is_some());
+
+        // Reconstruct from disk — the staged directive was never written.
+        let reloaded = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert!(
+            reloaded.get_directive(&content_id).is_none(),
+            "L-13: reload from disk drops the un-persisted directive"
+        );
+        assert_eq!(
+            reloaded.directive_count(),
+            persisted_count,
+            "reloaded state matches exactly what is on disk"
+        );
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_persist_or_reload_failure_rolls_back_to_disk() {
+        // L-13 end-to-end: force `persist` to fail (revoke write on the parent
+        // directory so the sibling `.tmp` cannot be created), and assert that
+        // `persist_or_reload` (a) returns the persist error and (b) reloads from
+        // disk so the un-persisted directive is gone and the file is intact.
+        use std::os::unix::fs::PermissionsExt;
+
+        // A dedicated subdirectory so revoking write touches nothing shared.
+        let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("openledger-l13-{ts}-{count}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ledger.bean");
+
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.open_account(
+            "Assets:Cash".to_owned(),
+            make_date(2024, 1, 1),
+            vec!["USD".to_owned()],
+        )
+        .unwrap();
+        svc.open_account("Equity:Opening".to_owned(), make_date(2024, 1, 1), vec![])
+            .unwrap();
+        let on_disk_before = std::fs::read_to_string(&path).unwrap();
+        let count_before = svc.directive_count();
+
+        // Stage a new directive WITHOUT persisting: memory is now ahead of disk.
+        let directive = Directive::Transaction(remote_transaction("rolled back", false));
+        let content_id = compute_content_id(&directive);
+        svc.stage_remote_directive(directive).unwrap();
+        assert!(svc.get_directive(&content_id).is_some());
+        assert_eq!(svc.directive_count(), count_before + 1);
+
+        // Revoke write on the directory so creating `<name>.tmp` fails (EACCES).
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o500);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        let result = svc.persist_or_reload();
+
+        // Restore write BEFORE asserting so cleanup always runs.
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        assert!(
+            result.is_err(),
+            "persist into a read-only directory must fail"
+        );
+        assert!(
+            svc.get_directive(&content_id).is_none(),
+            "L-13: the failed persist reloaded from disk, dropping the staged directive"
+        );
+        assert_eq!(
+            svc.directive_count(),
+            count_before,
+            "memory is back to the persisted set"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            on_disk_before,
+            "the atomic temp+rename left the on-disk file fully intact"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

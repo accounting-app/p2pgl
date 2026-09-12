@@ -424,6 +424,17 @@ pub(crate) struct SupplyOutcome {
     pub rejected: usize,
 }
 
+/// Apply one `Supply` batch: validate off the lock, then stage + persist once.
+///
+/// M-15: the previous shape took the ledger write lock and ran a full-file
+/// `full_file_serialize` + `sync_all` fsync once PER entry (and again per
+/// resolved orphan). Catch-up of M directives on an N-directive ledger was then
+/// O(M×N) serializations + fsyncs, all under the write lock — the gossip loop
+/// blocked on `ledger.read()`, its channel filled, and GraphQL mutations
+/// blocked. This is now two phases: phase 1 does all the expensive parse/verify
+/// work with NO write lock; phase 2 takes the write lock exactly once, stages
+/// the whole batch in memory, drains any orphans it unblocks, and persists a
+/// single time for the batch + drained orphans.
 async fn apply_supply_entries(
     handler: &AntiEntropyHandler,
     entries: Vec<p2p::protocol::SupplyEntry>,
@@ -431,25 +442,31 @@ async fn apply_supply_entries(
 ) -> SupplyOutcome {
     let from_peer = remote.to_string();
     let mut outcome = SupplyOutcome::default();
+
+    // ── Phase 1: validate off the ledger write lock (M-15) ──────────────
+    //
+    // Parsing, re-serializing, hashing, and Ed25519-verifying every entry is
+    // the expensive work, and none of it needs the write lock. Staging it here
+    // means the whole batch takes the write lock exactly once, in phase 2.
+    let mut staged: Vec<ledger::model::Directive> = Vec::new();
     for entry in entries {
         // M-14: dedup BEFORE validate. `validate_supply_entry` parses up to 1 MiB
         // of beancount, re-serializes, hashes, and Ed25519-verifies every entry
         // before anything checks whether `entry.id` is already in the DAG — the
-        // G-Set dedup only happens later inside `insert_remote_directive`. So an
-        // allowlisted peer can replay the same Supply in a loop, paying full
-        // parse+verify per entry to change nothing.
+        // G-Set dedup only happens later under the write lock. So an allowlisted
+        // peer can replay the same Supply in a loop, paying full parse+verify per
+        // entry to change nothing.
         //
         // Skipping validation for an id we already hold is state-preserving:
         // `entry.id` is content-addressed and is re-checked authoritatively under
-        // the write lock by `insert_remote_directive`, which returns `Ok(None)`
-        // for a present id without overwriting. A forged entry claiming a present
-        // id either (a) hashes to that id — it IS that content, a genuine
-        // duplicate — or (b) does not, in which case `validate_supply_entry` would
-        // reject it. In case (b) the entry is discarded whether we skip it here or
-        // reject it below, so it is never stored either way. Thus this fast path
-        // changes no state; it only avoids wasted CPU and a log line. The read
-        // guard is a temporary dropped at the end of this statement, so no lock is
-        // held into validation.
+        // the write lock in phase 2, which returns `Ok(None)` for a present id
+        // without overwriting. A forged entry claiming a present id either (a)
+        // hashes to that id — it IS that content, a genuine duplicate — or (b)
+        // does not, in which case `validate_supply_entry` would reject it. In case
+        // (b) the entry is discarded whether we skip it here or reject it below,
+        // so it is never stored either way. Thus this fast path changes no state;
+        // it only avoids wasted CPU and a log line. The read guard is a temporary
+        // dropped at the end of this statement, so no lock is held into validation.
         if handler
             .ledger
             .read()
@@ -476,51 +493,9 @@ async fn apply_supply_entries(
                     outcome.rejected += 1;
                     continue;
                 }
-                let mut svc = handler.ledger.write().await;
-                let missing_parents = svc.missing_parent_ids(&directive);
-                if !missing_parents.is_empty() {
-                    let content_id = ledger::service::LedgerService::content_id(&directive);
-                    let mut buffer = handler.orphan_buffer.write().await;
-                    if buffer.insert(
-                        content_id.clone(),
-                        directive,
-                        missing_parents,
-                        Some(from_peer.clone()),
-                    ) {
-                        debug!(content_id = %content_id, "buffered ALPN directive with missing parents");
-                    } else {
-                        warn!(content_id = %content_id, "orphan buffer full or per-peer quota exceeded");
-                    }
-                    outcome.buffered += 1;
-                    continue;
-                }
-                match svc.insert_remote_directive(directive.clone()) {
-                    Ok(Some(content_id)) => {
-                        info!(content_id = %content_id, peer = %remote, "merged remote directive from ALPN");
-                        outcome.merged += 1;
-                        if let ledger::model::Directive::Transaction(ref txn) = directive {
-                            let graphql_txn = domain_txn_to_graphql(txn, &svc);
-                            handler.broadcast.publish(graphql_txn);
-                        }
-                        drain_orphans(
-                            &handler.orphan_buffer,
-                            &mut svc,
-                            &handler.broadcast,
-                            handler.signing_enabled,
-                            &handler.allowlist,
-                            &handler.swarm_topic,
-                        )
-                        .await;
-                    }
-                    Ok(None) => {
-                        debug!("ALPN supply entry was duplicate");
-                        outcome.duplicate += 1;
-                    }
-                    Err(error) => {
-                        warn!(%error, "rejected remote directive from ALPN");
-                        outcome.rejected += 1;
-                    }
-                }
+                // Preserve arrival order so an open/parent earlier in the batch is
+                // visible to a later child's checks in phase 2.
+                staged.push(directive);
             }
             Err(error) => {
                 warn!(%error, "invalid ALPN supply entry");
@@ -528,6 +503,85 @@ async fn apply_supply_entries(
             }
         }
     }
+
+    // ── Phase 2: one ledger write lock for the whole batch (M-15) ───────
+    //
+    // Lock-ordering discipline is unchanged: the ledger write lock is taken
+    // first and held across the batch; the orphan_buffer lock is only ever
+    // acquired under it (here and inside `drain_orphans`).
+    if !staged.is_empty() {
+        let mut svc = handler.ledger.write().await;
+        let mut inserted_any = false;
+        for directive in staged {
+            // Re-check dedup authoritatively under the write lock: an id may have
+            // arrived earlier in this same batch, or via a drained orphan.
+            let content_id = ledger::service::LedgerService::content_id(&directive);
+            if svc.get_directive(&content_id).is_some() {
+                outcome.duplicate += 1;
+                continue;
+            }
+            let missing_parents = svc.missing_parent_ids(&directive);
+            if !missing_parents.is_empty() {
+                let mut buffer = handler.orphan_buffer.write().await;
+                if buffer.insert(
+                    content_id.clone(),
+                    directive,
+                    missing_parents,
+                    Some(from_peer.clone()),
+                ) {
+                    debug!(content_id = %content_id, "buffered ALPN directive with missing parents");
+                } else {
+                    warn!(content_id = %content_id, "orphan buffer full or per-peer quota exceeded");
+                }
+                outcome.buffered += 1;
+                continue;
+            }
+            // Stage into memory only (NO persist) — persist happens once below.
+            match svc.stage_remote_directive(directive.clone()) {
+                Ok(Some(content_id)) => {
+                    info!(content_id = %content_id, peer = %remote, "merged remote directive from ALPN");
+                    outcome.merged += 1;
+                    inserted_any = true;
+                    if let ledger::model::Directive::Transaction(ref txn) = directive {
+                        let graphql_txn = domain_txn_to_graphql(txn, &svc);
+                        handler.broadcast.publish(graphql_txn);
+                    }
+                }
+                Ok(None) => {
+                    debug!("ALPN supply entry was duplicate");
+                    outcome.duplicate += 1;
+                }
+                Err(error) => {
+                    warn!(%error, "rejected remote directive from ALPN");
+                    outcome.rejected += 1;
+                }
+            }
+        }
+
+        if inserted_any {
+            // Drain orphans this batch unblocked, then persist ONCE for the whole
+            // batch plus the drained orphans (M-15). `drain_orphans` now stages
+            // (no persist), so this single `persist_or_reload` covers everything.
+            drain_orphans(
+                &handler.orphan_buffer,
+                &mut svc,
+                &handler.broadcast,
+                handler.signing_enabled,
+                &handler.allowlist,
+                &handler.swarm_topic,
+            )
+            .await;
+            if let Err(error) = svc.persist_or_reload() {
+                // L-13: `persist_or_reload` already reloaded from disk, so the
+                // batch is rolled back in memory (memory==disk again) and
+                // anti-entropy will re-pull it. The tallies above describe what
+                // was attempted, not what is stored; we return them without
+                // panicking.
+                warn!(%error, peer = %remote, "failed to persist ALPN supply batch; rolled back in memory, will re-pull");
+            }
+        }
+    }
+
     debug!(
         peer = %remote,
         skipped_present = outcome.skipped_present,
@@ -541,6 +595,11 @@ async fn apply_supply_entries(
 }
 
 /// Drain orphans whose parents have arrived. Re-checks signature and author.
+///
+/// M-15: this STAGES each resolved orphan into memory only (no persist per
+/// orphan). The caller persists once, after the drain, covering the whole batch
+/// plus every orphan resolved here. The incremental `dag_ids` set is cloned once
+/// per drain call (which is now once per batch, not once per entry).
 pub async fn drain_orphans(
     orphan_buffer: &Arc<RwLock<OrphanBuffer>>,
     service: &mut ledger::service::LedgerService,
@@ -569,7 +628,7 @@ pub async fn drain_orphans(
                         warn!(%error, "rejected resolved orphan: signature");
                         continue;
                     }
-                    match service.insert_remote_directive(entry.directive.clone()) {
+                    match service.stage_remote_directive(entry.directive.clone()) {
                         Ok(Some(content_id)) => {
                             info!(content_id = %content_id, "resolved orphan directive");
                             dag_ids.insert(content_id);
@@ -1173,14 +1232,16 @@ mod tests {
     /// H-02: 4_300 directives additionally crosses `MAX_HAVE_HEADS` (4_096), so
     /// the head advert itself has to paginate.
     ///
-    /// Ignored by default because the receiving side re-serializes and fsyncs
-    /// the whole `.bean` file on every single insert, making catch-up O(N²) IO.
-    /// That cost is T27's to fix, not this test's; run it manually or nightly.
+    /// Formerly `#[ignore]`d: the receiving side re-serialized and fsynced the
+    /// whole `.bean` file on every single insert, making catch-up O(M×N) IO
+    /// (~102 s here). T27 (M-15) batches the persist — one full-file write per
+    /// Supply batch instead of one per entry — so this now completes in ~2 s and
+    /// runs as regular suite coverage. The 180 s deadline is a generous CI
+    /// safety net, not the expected runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "slow: run manually / nightly"]
     async fn two_node_catchup_beyond_have_heads_cap() {
         let _serialized = NET_TEST_LOCK.lock().await;
-        run_catchup_beyond_caps(4_300, Duration::from_secs(900)).await;
+        run_catchup_beyond_caps(4_300, Duration::from_secs(180)).await;
     }
 
     /// Short timeouts so the M-06 tests trip their read caps in milliseconds.
@@ -1864,5 +1925,270 @@ mod tests {
         }
 
         let _ = router_source.shutdown().await;
+    }
+
+    // ─── T27: batched apply_supply_entries (M-15) ────────────────────────
+
+    /// Content ids of a `.bean`-authored source ledger's directives, plus the
+    /// live source, so a test can turn any of them into a `SupplyEntry`.
+    struct SeededSource {
+        source: LedgerService,
+        open_cash: String,
+        open_equity: String,
+        open_food: String,
+        txn1: String,
+        txn2: String,
+    }
+
+    /// Seed a source ledger authored by `author` with 3 opens and 2 balanced
+    /// transactions; `txn2` references `txn1` as its DAG parent.
+    fn seed_mixed_source(dir: &std::path::Path, author: &str) -> SeededSource {
+        let mut source =
+            LedgerService::boot(dir.join("source.bean"), author.to_owned()).expect("boot source");
+        let day = NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid date");
+        let open_cash = source
+            .open_account("Assets:Cash".to_owned(), day, vec!["USD".to_owned()])
+            .expect("open cash");
+        let open_equity = source
+            .open_account("Equity:Opening".to_owned(), day, Vec::new())
+            .expect("open equity");
+        let open_food = source
+            .open_account("Expenses:Food".to_owned(), day, vec!["USD".to_owned()])
+            .expect("open food");
+        let txn1 = source
+            .append_transaction(balanced_funding_input())
+            .expect("append txn1");
+        let txn2 = source
+            .append_transaction(TransactionInput {
+                date: NaiveDate::from_ymd_opt(2024, 1, 20).expect("valid date"),
+                flag: Flag::Complete,
+                payee: Some("Cafe".to_owned()),
+                narration: Some("Lunch".to_owned()),
+                tags: Vec::new(),
+                links: Vec::new(),
+                postings: vec![
+                    PostingInput {
+                        account: "Expenses:Food".to_owned(),
+                        amount: Some(Amount {
+                            number: dec!(25),
+                            currency: "USD".to_owned(),
+                        }),
+                        cost: None,
+                        price: None,
+                    },
+                    PostingInput {
+                        account: "Assets:Cash".to_owned(),
+                        amount: Some(Amount {
+                            number: dec!(-25),
+                            currency: "USD".to_owned(),
+                        }),
+                        cost: None,
+                        price: None,
+                    },
+                ],
+            })
+            .expect("append txn2");
+        SeededSource {
+            source,
+            open_cash,
+            open_equity,
+            open_food,
+            txn1,
+            txn2,
+        }
+    }
+
+    fn entry_for(source: &LedgerService, id: &str) -> p2p::protocol::SupplyEntry {
+        make_supply_entry(source.get_directive(id).expect("directive present"))
+    }
+
+    /// T27 KEY TEST — determinism/equivalence. Applying the same set of
+    /// directives via the BATCHED `apply_supply_entries` path and via the
+    /// per-entry `insert_remote_directive` path must yield BYTE-IDENTICAL
+    /// `.bean` files and the same directive-id set. This proves batching the
+    /// persist (M-15) changed nothing observable: `full_file_serialize` sorts
+    /// and serializes each directive independently, so the on-disk snapshot is
+    /// the same however many persists produced it.
+    #[tokio::test]
+    async fn batch_path_is_byte_identical_to_per_entry_path() {
+        let author = iroh::SecretKey::generate().public();
+        let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+
+        let seeded = seed_mixed_source(temp_dir.path(), &author.to_string());
+
+        // A realistic mix: opens shuffled among themselves (independent), with
+        // both transactions after their parents (so the per-entry path, which
+        // has no orphan buffer, can also insert every one).
+        let ordered_ids = [
+            &seeded.open_food,
+            &seeded.open_cash,
+            &seeded.open_equity,
+            &seeded.txn1,
+            &seeded.txn2,
+        ];
+        let entries: Vec<p2p::protocol::SupplyEntry> = ordered_ids
+            .iter()
+            .map(|id| entry_for(&seeded.source, id))
+            .collect();
+
+        // ── Batch path: one Supply, one persist. ──
+        let batch_path = temp_dir.path().join("batch.bean");
+        let batch_ledger: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(batch_path.clone(), "sink".to_owned()).expect("boot batch"),
+        ));
+        let batch_handler = make_handler(batch_ledger.clone(), allow.clone());
+        let remote = iroh::SecretKey::generate().public();
+        let outcome = apply_supply_entries(&batch_handler, entries.clone(), remote).await;
+        assert_eq!(outcome.merged, 5, "all five directives merge in one batch");
+        assert_eq!(
+            outcome.buffered, 0,
+            "no orphan buffering: parents precede children"
+        );
+        assert_eq!(outcome.duplicate, 0);
+        assert_eq!(outcome.rejected, 0);
+
+        // ── Per-entry path: insert_remote_directive one at a time (persist each). ──
+        let per_entry_path = temp_dir.path().join("per_entry.bean");
+        let per_entry_ledger: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(per_entry_path.clone(), "sink".to_owned()).expect("boot per-entry"),
+        ));
+        {
+            let mut svc = per_entry_ledger.write().await;
+            for entry in &entries {
+                let directive = validate_supply_entry(entry).expect("valid entry");
+                svc.insert_remote_directive(directive).expect("insert");
+            }
+        }
+
+        let batch_bytes = std::fs::read(&batch_path).expect("read batch file");
+        let per_entry_bytes = std::fs::read(&per_entry_path).expect("read per-entry file");
+        assert_eq!(
+            batch_bytes, per_entry_bytes,
+            "batched and per-entry .bean files must be byte-identical"
+        );
+
+        let batch_ids = batch_ledger.read().await.all_directive_ids();
+        let per_entry_ids = per_entry_ledger.read().await.all_directive_ids();
+        assert_eq!(
+            batch_ids, per_entry_ids,
+            "batched and per-entry directive-id sets must match"
+        );
+        assert_eq!(batch_ids.len(), 5);
+    }
+
+    /// T27: intra-batch dependency — an open followed by a transaction on that
+    /// account, both in one batch, both merge (the open staged earlier is
+    /// visible to the transaction's validation).
+    #[tokio::test]
+    async fn batch_open_then_txn_on_that_account_both_merge() {
+        let author = iroh::SecretKey::generate().public();
+        let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+
+        let seeded = seed_mixed_source(temp_dir.path(), &author.to_string());
+        // opens + txn1 (genesis), all in one batch, opens before the txn.
+        let entries = vec![
+            entry_for(&seeded.source, &seeded.open_cash),
+            entry_for(&seeded.source, &seeded.open_equity),
+            entry_for(&seeded.source, &seeded.txn1),
+        ];
+
+        let sink: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("sink.bean"), "sink".to_owned())
+                .expect("boot sink"),
+        ));
+        let handler = make_handler(sink.clone(), allow);
+        let remote = iroh::SecretKey::generate().public();
+
+        let outcome = apply_supply_entries(&handler, entries, remote).await;
+        assert_eq!(
+            outcome.merged, 3,
+            "open + open + txn all merge in one batch"
+        );
+        assert_eq!(outcome.buffered, 0);
+        assert_eq!(outcome.rejected, 0);
+        assert_eq!(sink.read().await.directive_count(), 3);
+        assert!(sink.read().await.get_directive(&seeded.txn1).is_some());
+    }
+
+    /// T27: a transaction whose DAG parent appears LATER in the same batch is
+    /// orphan-buffered when first seen, then resolved by the single post-batch
+    /// drain — so the final state still contains it.
+    #[tokio::test]
+    async fn batch_child_before_parent_resolves_via_drain() {
+        let author = iroh::SecretKey::generate().public();
+        let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+
+        let seeded = seed_mixed_source(temp_dir.path(), &author.to_string());
+        // txn2 (child of txn1) arrives BEFORE txn1 in the batch.
+        let entries = vec![
+            entry_for(&seeded.source, &seeded.open_cash),
+            entry_for(&seeded.source, &seeded.open_equity),
+            entry_for(&seeded.source, &seeded.open_food),
+            entry_for(&seeded.source, &seeded.txn2),
+            entry_for(&seeded.source, &seeded.txn1),
+        ];
+
+        let sink: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("sink.bean"), "sink".to_owned())
+                .expect("boot sink"),
+        ));
+        let handler = make_handler(sink.clone(), allow);
+        let remote = iroh::SecretKey::generate().public();
+
+        let outcome = apply_supply_entries(&handler, entries, remote).await;
+        // txn2 is buffered on first sight; the 3 opens + txn1 merge directly.
+        assert_eq!(outcome.merged, 4, "3 opens + txn1 merge directly");
+        assert_eq!(
+            outcome.buffered, 1,
+            "txn2 is buffered until its parent arrives"
+        );
+        assert_eq!(outcome.rejected, 0);
+
+        // The post-batch drain resolved txn2, so the final state has all five.
+        let svc = sink.read().await;
+        assert_eq!(
+            svc.directive_count(),
+            5,
+            "the drain resolved the buffered child; final state has all five"
+        );
+        assert!(
+            svc.get_directive(&seeded.txn2).is_some(),
+            "the once-buffered child is present after the drain"
+        );
+    }
+
+    /// T27: a duplicate entry within one batch is tallied `duplicate`, not
+    /// `merged`, and lands only once.
+    #[tokio::test]
+    async fn batch_duplicate_entry_tallies_duplicate() {
+        let author = iroh::SecretKey::generate().public();
+        let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+
+        let seeded = seed_mixed_source(temp_dir.path(), &author.to_string());
+        // The same open twice in one batch.
+        let entries = vec![
+            entry_for(&seeded.source, &seeded.open_cash),
+            entry_for(&seeded.source, &seeded.open_cash),
+        ];
+
+        let sink: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("sink.bean"), "sink".to_owned())
+                .expect("boot sink"),
+        ));
+        let handler = make_handler(sink.clone(), allow);
+        let remote = iroh::SecretKey::generate().public();
+
+        let outcome = apply_supply_entries(&handler, entries, remote).await;
+        assert_eq!(outcome.merged, 1, "the first copy merges");
+        assert_eq!(
+            outcome.duplicate, 1,
+            "the second copy is a duplicate, not a merge"
+        );
+        assert_eq!(outcome.rejected, 0);
+        assert_eq!(sink.read().await.directive_count(), 1);
     }
 }
