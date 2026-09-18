@@ -1,6 +1,7 @@
 // Ledger crate — parse, serialize, hash, DAG, validate, service, read model,
 // verify, checkpoint, file watcher.
 
+pub mod accounts;
 pub mod checkpoint;
 pub mod dag;
 pub mod error;

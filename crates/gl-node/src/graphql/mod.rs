@@ -332,6 +332,143 @@ mod tests {
         assert_eq!(data["health"]["heads"], 0);
     }
 
+    /// Boot a schema over a temp ledger holding exactly `bean` (M-08 tests).
+    fn schema_over_ledger(bean: &str) -> (tempfile::TempDir, AppSchema) {
+        let (dir, _ledger, schema) = schema_and_ledger_over(bean);
+        (dir, schema)
+    }
+
+    /// As [`schema_over_ledger`], but also hands back the `SharedLedger` so a
+    /// test can drive the P2P receive path behind the schema's back (M-10).
+    fn schema_and_ledger_over(bean: &str) -> (tempfile::TempDir, SharedLedger, AppSchema) {
+        let dir = tempfile::tempdir().unwrap();
+        let bean_path = dir.path().join("test.bean");
+        std::fs::write(&bean_path, bean).unwrap();
+        let service = LedgerService::boot(&bean_path, "test-node".to_owned()).unwrap();
+        let ledger: SharedLedger = Arc::new(RwLock::new(service));
+        let schema = build_schema_with_service(
+            Arc::clone(&ledger),
+            TransactionBroadcast::new(),
+            p2p::node::PeerRegistry::new(),
+            std::sync::Arc::new(security::signing::NoopSignatureProvider),
+            true,
+            None,
+        );
+        (dir, ledger, schema)
+    }
+
+    /// A ledger whose single `balance` directive claims `asserted` for
+    /// `Assets:Cash` on 2024-02-01, where the real balance is 1000.00 USD.
+    fn ledger_asserting(asserted: &str) -> String {
+        format!(
+            "2024-01-01 open Assets:Cash USD\n\
+             2024-01-01 open Equity:Opening USD\n\
+             \n\
+             2024-01-15 * \"Deposit\"\n  \
+               openledger-author: \"test\"\n  \
+               openledger-lamport: \"1\"\n  \
+               openledger-parents: \"\"\n  \
+               Assets:Cash                                      1000.00 USD\n  \
+               Equity:Opening                                  -1000.00 USD\n\
+             \n\
+             2024-02-01 balance Assets:Cash {asserted} USD\n"
+        )
+    }
+
+    const VERIFY_QUERY: &str = r"
+        { verify {
+            ok
+            nodesChecked
+            errors
+            balanceAssertions {
+                evaluated passed failed ok
+                failures { account date expected actual currency }
+            }
+        } }
+    ";
+
+    #[tokio::test]
+    async fn test_verify_surfaces_failing_balance_assertion() {
+        // M-08 regression: `balance` directives reach the file through the
+        // unvalidated catch-all — from a local edit or from an allowlisted peer
+        // over gossip — and used to be stored and never evaluated, so a false
+        // claim read as verified. `verify` must now report it, with the figures
+        // that expose the lie.
+        let (_dir, schema) = schema_over_ledger(&ledger_asserting("999.00"));
+
+        let result = schema.execute(VERIFY_QUERY).await;
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let data = result.data.into_json().unwrap();
+        let assertions = &data["verify"]["balanceAssertions"];
+
+        assert_eq!(assertions["evaluated"], 1);
+        assert_eq!(assertions["passed"], 0);
+        assert_eq!(assertions["failed"], 1);
+        assert_eq!(assertions["ok"], false);
+
+        let failures = assertions["failures"].as_array().unwrap();
+        assert_eq!(failures.len(), 1, "expected one failure: {failures:?}");
+        let failure = &failures[0];
+        assert_eq!(failure["account"], "Assets:Cash");
+        assert_eq!(failure["date"], "2024-02-01");
+        assert_eq!(failure["currency"], "USD");
+        assert_eq!(
+            decimal(&failure["expected"]),
+            rust_decimal_macros::dec!(999),
+            "the claim in the file"
+        );
+        assert_eq!(
+            decimal(&failure["actual"]),
+            rust_decimal_macros::dec!(1000),
+            "what the ledger actually holds"
+        );
+
+        // The structural verdict is untouched: a false claim is not DAG
+        // corruption, so a peer cannot redden every node by gossiping one.
+        assert_eq!(data["verify"]["ok"], true, "structural checks: {data:?}");
+        assert_eq!(data["verify"]["errors"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_verify_reports_passing_balance_assertion() {
+        let (_dir, schema) = schema_over_ledger(&ledger_asserting("1000.00"));
+
+        let result = schema.execute(VERIFY_QUERY).await;
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let data = result.data.into_json().unwrap();
+        let assertions = &data["verify"]["balanceAssertions"];
+
+        assert_eq!(assertions["evaluated"], 1);
+        assert_eq!(assertions["passed"], 1);
+        assert_eq!(assertions["failed"], 0);
+        assert_eq!(assertions["ok"], true);
+        assert!(assertions["failures"].as_array().unwrap().is_empty());
+        assert_eq!(data["verify"]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn test_verify_reports_no_assertions_for_a_ledger_without_any() {
+        // An empty summary means "nothing claimed", not "nothing checked".
+        let (_dir, schema) = schema_over_ledger("2024-01-01 open Assets:Cash USD\n");
+
+        let result = schema.execute(VERIFY_QUERY).await;
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let data = result.data.into_json().unwrap();
+        let assertions = &data["verify"]["balanceAssertions"];
+        assert_eq!(assertions["evaluated"], 0);
+        assert_eq!(assertions["ok"], true);
+        assert!(assertions["failures"].as_array().unwrap().is_empty());
+    }
+
+    /// Read a `Decimal` GraphQL scalar (a string on the wire, I4) from JSON.
+    fn decimal(value: &serde_json::Value) -> rust_decimal::Decimal {
+        value
+            .as_str()
+            .unwrap_or_else(|| panic!("Decimal must be a string on the wire: {value:?}"))
+            .parse()
+            .expect("valid decimal")
+    }
+
     #[tokio::test]
     async fn test_introspection_disabled_when_graphiql_off() {
         let dir = tempfile::tempdir().unwrap();
@@ -494,5 +631,201 @@ mod tests {
         );
         let rebooted = LedgerService::boot(&bean_path, "test-node".to_owned()).unwrap();
         assert_eq!(rebooted.directive_count(), 1);
+    }
+
+    // ── T33: `alreadyExisted` on appendTransaction (M-10, interim) ───────
+
+    /// Accounts for the M-10 rent scenario — the recurring, predictable body a
+    /// squatter can guess.
+    const RENT_ACCOUNTS: &str = "2024-01-01 open Assets:Cash USD\n\
+                                 2024-01-01 open Expenses:Rent USD\n";
+
+    /// The victim's genuine monthly rent entry, as a GraphQL mutation.
+    const RENT_MUTATION: &str = r#"
+        mutation {
+            appendTransaction(input: {
+                date: "2024-02-01"
+                flag: "*"
+                payee: "Landlord"
+                narration: "February rent"
+                postings: [
+                    { account: "Expenses:Rent", amount: { number: "1500.00", currency: "USD" } },
+                    { account: "Assets:Cash", amount: { number: "-1500.00", currency: "USD" } }
+                ]
+            }) { txid author alreadyExisted }
+        }
+    "#;
+
+    /// The same economic body, wearing another peer's envelope — what a
+    /// squatter gossips onto the mesh before the victim writes it.
+    fn rent_transaction_authored_by(author: &str) -> ledger::model::Directive {
+        use ledger::model::{Amount, Flag, Posting, Transaction};
+        use std::collections::BTreeMap;
+
+        let posting = |account: &str, number: rust_decimal::Decimal| Posting {
+            account: account.to_owned(),
+            amount: Some(Amount {
+                number,
+                currency: "USD".to_owned(),
+            }),
+            cost: None,
+            price: None,
+            metadata: BTreeMap::new(),
+        };
+        let mut metadata = BTreeMap::new();
+        metadata.insert("openledger-author".to_owned(), author.to_owned());
+        metadata.insert("openledger-lamport".to_owned(), "3".to_owned());
+        metadata.insert("openledger-parents".to_owned(), String::new());
+
+        ledger::model::Directive::Transaction(Transaction {
+            date: chrono::NaiveDate::from_ymd_opt(2024, 2, 1).unwrap(),
+            flag: Flag::Complete,
+            payee: Some("Landlord".to_owned()),
+            narration: Some("February rent".to_owned()),
+            tags: vec![],
+            links: vec![],
+            postings: vec![
+                posting("Expenses:Rent", rust_decimal_macros::dec!(1500.00)),
+                posting("Assets:Cash", rust_decimal_macros::dec!(-1500.00)),
+            ],
+            metadata,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_append_transaction_reports_already_existed() {
+        // M-10 (interim): appends are idempotent by economic content, so the
+        // second call records nothing. It used to answer exactly like the
+        // first — a txid and no errors — leaving the caller unable to tell that
+        // its entry had been collapsed into an earlier identical one. The
+        // payload must now carry that verdict on both calls.
+        let (_dir, schema) = schema_over_ledger(RENT_ACCOUNTS);
+
+        let first = schema.execute(RENT_MUTATION).await;
+        assert!(first.errors.is_empty(), "errors: {:?}", first.errors);
+        let first = first.data.into_json().unwrap();
+        assert_eq!(
+            first["appendTransaction"]["alreadyExisted"], false,
+            "the first append really inserts: {first:?}"
+        );
+
+        let second = schema.execute(RENT_MUTATION).await;
+        assert!(second.errors.is_empty(), "errors: {:?}", second.errors);
+        let second = second.data.into_json().unwrap();
+        assert_eq!(
+            second["appendTransaction"]["alreadyExisted"], true,
+            "an identical body records nothing new: {second:?}"
+        );
+        assert_eq!(
+            second["appendTransaction"]["txid"], first["appendTransaction"]["txid"],
+            "same economic body → same txid"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_append_transaction_reports_a_body_a_peer_squatted_first() {
+        // M-10 proper: the content hash excludes every `openledger-*` key, so a
+        // peer that can predict a recurring body (rent, salary) publishes it
+        // under ITS OWN author/signature first. The victim's genuine append
+        // then resolves as a duplicate and the mesh keeps crediting the
+        // squatter — and the caller used to see nothing but success.
+        let (_dir, ledger, schema) = schema_and_ledger_over(RENT_ACCOUNTS);
+
+        // The squatter's copy arrives over the P2P receive path.
+        ledger
+            .write()
+            .await
+            .insert_remote_directive(rent_transaction_authored_by("peer-squatter"))
+            .unwrap()
+            .expect("the squatter's entry is new to this node");
+
+        let result = schema.execute(RENT_MUTATION).await;
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let data = result.data.into_json().unwrap();
+        assert_eq!(
+            data["appendTransaction"]["alreadyExisted"], true,
+            "the squatter got there first: {data:?}"
+        );
+        // The warning is warranted: the envelope on record is not the caller's.
+        assert_eq!(
+            data["appendTransaction"]["author"], "peer-squatter",
+            "the mesh still attributes the event to the squatter: {data:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_append_transaction_payload_keeps_its_existing_fields() {
+        // The M-10 signal is additive: `alreadyExisted` joins the payload, and
+        // every field clients already select off `appendTransaction` still
+        // resolves in the same shape.
+        let (_dir, schema) = schema_over_ledger(RENT_ACCOUNTS);
+
+        let result = schema
+            .execute(
+                r#"
+                mutation {
+                    appendTransaction(input: {
+                        date: "2024-02-01"
+                        flag: "*"
+                        payee: "Landlord"
+                        narration: "February rent"
+                        postings: [
+                            { account: "Expenses:Rent", amount: { number: "1500.00", currency: "USD" } },
+                            { account: "Assets:Cash", amount: { number: "-1500.00", currency: "USD" } }
+                        ]
+                    }) {
+                        txid date flag payee narration tags links author signature parents
+                        postings {
+                            account
+                            amount { number currency }
+                            cost { number currency }
+                            price { number currency }
+                        }
+                    }
+                }
+                "#,
+            )
+            .await;
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let txn = &result.data.into_json().unwrap()["appendTransaction"];
+        assert_eq!(txn["txid"].as_str().unwrap().len(), 64);
+        assert_eq!(txn["date"], "2024-02-01");
+        assert_eq!(txn["flag"], "*");
+        assert_eq!(txn["payee"], "Landlord");
+        assert_eq!(txn["author"], "test-node");
+        assert_eq!(txn["postings"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_append_transaction_payload_declares_already_existed() {
+        // Schema-level: the field is non-null Boolean, so a client can rely on
+        // it being present on every successful append.
+        let schema = build_schema();
+        let result = schema
+            .execute(
+                r#"{ __type(name: "AppendedTransaction") {
+                        fields { name type { kind ofType { name } } }
+                   } }"#,
+            )
+            .await;
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let data = result.data.into_json().unwrap();
+        let fields = data["__type"]["fields"].as_array().unwrap();
+
+        let already_existed = fields
+            .iter()
+            .find(|field| field["name"] == "alreadyExisted")
+            .unwrap_or_else(|| panic!("appendTransaction payload must expose it: {fields:?}"));
+        assert_eq!(already_existed["type"]["kind"], "NON_NULL");
+        assert_eq!(already_existed["type"]["ofType"]["name"], "Boolean");
+
+        // …alongside — not instead of — the transaction fields it flattens in.
+        let names: Vec<&str> = fields
+            .iter()
+            .map(|field| field["name"].as_str().unwrap())
+            .collect();
+        for name in ["txid", "date", "flag", "postings", "author", "parents"] {
+            assert!(names.contains(&name), "payload lost {name}: {names:?}");
+        }
     }
 }

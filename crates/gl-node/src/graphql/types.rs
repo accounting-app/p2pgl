@@ -38,6 +38,36 @@ pub struct Transaction {
     pub parents: Vec<TransactionId>,
 }
 
+/// The payload of the `appendTransaction` mutation (M-10).
+///
+/// Every field of [`Transaction`] is flattened in, so selections written
+/// against the old payload keep working unchanged; `alreadyExisted` is the
+/// added interim M-10 signal.
+#[derive(SimpleObject, Debug, Clone)]
+pub struct AppendedTransaction {
+    /// The transaction as the ledger holds it — freshly inserted, or the entry
+    /// that was already there when `alreadyExisted` is `true` (note that its
+    /// `author` and `signature` are then the *earlier* writer's, not yours).
+    #[graphql(flatten)]
+    pub transaction: Transaction,
+    /// `true` means this exact economic content was **already in the ledger**
+    /// — possibly appended by another author — and **nothing new was
+    /// recorded** by this call (M-10).
+    ///
+    /// The content hash covers the economic body only; author, parents,
+    /// Lamport clock and signature are excluded. So an append whose body
+    /// already exists is a silent no-op that leaves the first writer's
+    /// envelope in place, and the mesh attributes the event to them.
+    ///
+    /// Callers SHOULD treat `true` as a **warning**, not a success: this event
+    /// may have been collapsed with an earlier identical one (two identical
+    /// same-day coffees become a single posting), or squatted by a peer that
+    /// predicted the content (recurring rent, salary) and published it first.
+    /// Distinguish a genuinely distinct event by varying the body — a link, a
+    /// tag, or a more specific narration.
+    pub already_existed: bool,
+}
+
 /// An account and its balances (one per currency).
 #[derive(SimpleObject, Debug, Clone)]
 pub struct AccountBalance {
@@ -81,12 +111,53 @@ pub struct IncomeStatement {
     pub net: Vec<Amount>,
 }
 
+/// A `balance` assertion that did not hold (§3.6, M-08).
+#[derive(SimpleObject, Debug, Clone)]
+pub struct BalanceAssertionFailure {
+    /// The asserted account.
+    pub account: String,
+    /// The date the assertion is made for.
+    pub date: DateScalar,
+    /// The amount the `balance` directive claims.
+    pub expected: DecimalScalar,
+    /// The amount the ledger actually holds on that date.
+    pub actual: DecimalScalar,
+    /// The currency both figures are in.
+    pub currency: String,
+}
+
+/// Outcome of evaluating the ledger's `balance` assertions (§3.6, M-08).
+///
+/// A `balance` directive asserts that an account holds an amount of one
+/// currency on a date. Evaluation is read-only: failures are reported here and
+/// never reject a transaction or alter a balance, and `pad` directives are not
+/// synthesized into the balances an assertion is compared against.
+#[derive(SimpleObject, Debug, Clone)]
+pub struct BalanceAssertionReport {
+    /// How many `balance` directives were evaluated.
+    pub evaluated: i32,
+    /// How many of them held.
+    pub passed: i32,
+    /// How many of them did not.
+    pub failed: i32,
+    /// Whether every evaluated assertion held.
+    pub ok: bool,
+    /// The assertions that did not hold, with expected vs actual.
+    pub failures: Vec<BalanceAssertionFailure>,
+}
+
 /// Result of the `verify` query — DAG integrity check.
 #[derive(SimpleObject, Debug, Clone)]
 pub struct VerifyResult {
+    /// Structural integrity only: content hashes (I5), parent links (I8), and
+    /// acyclicity. A failed balance assertion does **not** clear this flag —
+    /// it is a writer's claim, not DAG corruption — so clients that care about
+    /// assertions must also read `balanceAssertions`.
     pub ok: bool,
     pub nodes_checked: i32,
     pub errors: Vec<String>,
+    /// Balance assertions evaluated during this verification (§3.6, M-08).
+    pub balance_assertions: BalanceAssertionReport,
 }
 
 /// Node health status (matches REST `/health` per §2.9).

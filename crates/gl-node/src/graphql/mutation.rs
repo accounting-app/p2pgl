@@ -5,7 +5,7 @@ use super::broadcast::TransactionBroadcast;
 use super::inputs;
 use super::query::domain_txn_to_graphql;
 use super::scalars::DateScalar;
-use super::types::Transaction;
+use super::types::AppendedTransaction;
 use super::{GossipSender, SharedLedger, HEAVY_RESOLVER_COMPLEXITY};
 
 use ledger::model::{Amount, CostSpec, Flag, PriceSpec};
@@ -18,6 +18,10 @@ pub struct MutationRoot;
 #[Object]
 impl MutationRoot {
     /// Append a balanced journal entry (FR-1, enforces I1–I3).
+    ///
+    /// Appends are idempotent by economic content (FR-1 AC4), so a body the
+    /// ledger already holds records nothing new. Check `alreadyExisted` on the
+    /// payload to tell that case apart from a fresh insert (M-10).
     // Each mutation rewrites and fsyncs the whole ledger file, so alias
     // batching must be budget-limited like the heavy read resolvers (M-1/M-03).
     #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
@@ -25,7 +29,7 @@ impl MutationRoot {
         &self,
         ctx: &Context<'_>,
         input: inputs::TransactionInput,
-    ) -> Result<Transaction> {
+    ) -> Result<AppendedTransaction> {
         let ledger = ctx.data::<SharedLedger>().map_err(|_| {
             async_graphql::Error::new("Ledger service not initialized")
                 .extend_with(|_, ext| ext.set("code", "INTERNAL"))
@@ -77,7 +81,10 @@ impl MutationRoot {
 
         let mut svc = ledger.write().await;
         let signer = ctx.data::<Arc<dyn SignatureProvider>>().ok().cloned();
-        let content_id = svc
+        // M-10: the service tells us whether this body was already in the DAG.
+        // It is the only party that can — re-checking here would be a
+        // get-then-append race — and the answer rides out on `alreadyExisted`.
+        let outcome = svc
             .append_transaction_signing(domain_input, |id, parents, lamport| {
                 signer.as_ref().and_then(|provider| {
                     provider.sign(&SignableMessage {
@@ -89,6 +96,7 @@ impl MutationRoot {
                 })
             })
             .map_err(service_error_to_graphql)?;
+        let content_id = outcome.txid;
 
         // Look up the just-inserted transaction to return it.
         let txn = svc
@@ -116,7 +124,10 @@ impl MutationRoot {
             let _ = sender.send(directive).await;
         }
 
-        Ok(txn)
+        Ok(AppendedTransaction {
+            transaction: txn,
+            already_existed: outcome.already_existed,
+        })
     }
 
     /// Open an account (FR-3 AC1).

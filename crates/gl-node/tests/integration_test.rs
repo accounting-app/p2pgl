@@ -71,7 +71,7 @@ fn test_empty_boot_then_open_and_append() {
             },
         ],
     };
-    let txid = svc.append_transaction(input).unwrap();
+    let txid = svc.append_transaction(input).unwrap().txid;
     assert!(!txid.is_empty());
     assert_eq!(svc.directive_count(), 3);
     assert_eq!(svc.head_count(), 1);
@@ -108,7 +108,7 @@ fn test_fixture_boot_has_correct_state() {
 #[test]
 fn test_verify_after_boot() {
     let (_dir, svc) = boot_fixture_ledger();
-    let report = ledger::verify::verify_dag(svc.dag());
+    let report = ledger::verify::verify_dag(svc.dag(), svc.read_model());
     assert!(report.nodes_checked > 0);
 
     assert!(!report
@@ -167,9 +167,9 @@ fn test_idempotent_transaction_insert() {
         ],
     };
 
-    let txid1 = svc.append_transaction(make_input()).unwrap();
+    let txid1 = svc.append_transaction(make_input()).unwrap().txid;
     let count_after_first = svc.directive_count();
-    let txid2 = svc.append_transaction(make_input()).unwrap();
+    let txid2 = svc.append_transaction(make_input()).unwrap().txid;
     assert_eq!(txid1, txid2, "Same content → same txid (I4/I5)");
     assert_eq!(svc.directive_count(), count_after_first);
 }
@@ -258,7 +258,8 @@ fn test_reboot_preserves_state() {
                     },
                 ],
             })
-            .unwrap();
+            .unwrap()
+            .txid;
     }
 
     let svc2 = LedgerService::boot(&bean_path, "test".to_owned()).unwrap();

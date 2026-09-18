@@ -76,6 +76,15 @@ fn persist_atomically(path: &Path, content: &str) -> Result<(), std::io::Error> 
         // target); if a symlink is re-planted in the race window, the retry's
         // O_EXCL create fails again and the persist errors out rather than
         // writing through the link.
+        //
+        // Whose temp is it? Under `gl-node`, which holds an exclusive
+        // inter-process lock on the ledger for the life of the process
+        // (M-17/T30, `gl-node/src/ledger_lock.rs`), no sibling process can be
+        // mid-persist on this file — so the temp found here is always our own
+        // crashed leftover and unlinking it is safe. Library users that call the
+        // service directly without taking that lock keep the pre-T30 exposure:
+        // a concurrent process's in-flight temp could be deleted here. Take the
+        // same lock if you run more than one writer on a ledger.
         let mut file = match options.open(&temporary_path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -581,6 +590,26 @@ pub struct PostingInput {
     pub price: Option<PriceSpec>,
 }
 
+/// What a local append actually did (§3.5 write path, M-10 interim signal).
+///
+/// The content id hashes the economic body only — every `openledger-*` envelope
+/// key (author, parents, lamport, signature) is excluded — so an append whose
+/// body is already in the DAG is a no-op that keeps the *existing* entry's
+/// envelope. That entry may have been authored by another peer, which is the
+/// M-10 authorship-squatting shape; it may equally be a legitimately distinct
+/// but identical event (two identical same-day coffees) collapsed into one
+/// posting. Either way the caller must be able to tell the two apart from a
+/// fresh insert, so the append path reports it instead of returning the
+/// pre-existing txid as if it had just been created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendOutcome {
+    /// The transaction's content id — newly inserted, or the pre-existing one.
+    pub txid: String,
+    /// `true` when this exact economic body was already in the ledger and
+    /// nothing new was recorded.
+    pub already_existed: bool,
+}
+
 // ─── Ledger service ──────────────────────────────────────────────────────────
 
 /// The unified ledger service — owns DAG, account state, and file persistence.
@@ -644,26 +673,38 @@ impl LedgerService {
         let mut max_lamport: u64 = 0;
 
         for directive in &sorted {
-            match directive {
-                Directive::Open(open) => {
-                    // Ignore errors on boot (file may have duplicate opens from merges).
-                    let _ = accounts.open_account(&open.account, open.date, &open.currencies);
-                }
-                Directive::Close(close) => {
-                    let _ = accounts.close_account(&close.account, close.date);
-                }
-                _ => {}
+            // Track max Lamport across all directives (M-18).
+            //
+            // `stamp_directive_envelope` stamps `openledger-lamport` on opens
+            // and closes too, so scanning transactions alone lets a restart
+            // resume *below* the highest value already persisted — the next
+            // mutation would then sign and persist a duplicate
+            // `(author, lamport)` pair and move the clock backwards relative
+            // to history.
+            if let Some(lamport) = directive.lamport_clock() {
+                max_lamport = max_lamport.max(lamport);
             }
 
-            // Track max Lamport across all directives.
-            if let Directive::Transaction(txn) = directive {
-                if let Some(lamport) = txn.lamport_clock() {
-                    max_lamport = max_lamport.max(lamport);
+            // Insert into DAG (lenient mode: parents may not be present yet),
+            // then record any lifecycle event it carries under the content id
+            // the DAG just assigned (M-09).
+            //
+            // Boot deliberately applies NO lifecycle policy: no already-open
+            // rejection, no backdated-close guard. The account state has to be a
+            // pure function of the persisted directive set, so that a node which
+            // boots from the file and a node which ingested the same directives
+            // one at a time agree exactly. A guard here would also reintroduce
+            // the order dependence M-09 is about — boot's `sorted` order is the
+            // canonical one, not the order the directives were accepted in —
+            // and could brick boot on a file the node itself wrote.
+            match dag.insert((*directive).clone(), false)? {
+                InsertResult::Inserted { content_id } => {
+                    accounts.record_lifecycle(directive, &content_id);
                 }
+                // A duplicate body is the same directive: its event is already
+                // recorded, under the same content id.
+                InsertResult::Duplicate { .. } => {}
             }
-
-            // Insert into DAG (lenient mode: parents may not be present yet).
-            dag.insert((*directive).clone(), false)?;
         }
 
         let lamport_clock = if max_lamport > 0 {
@@ -693,8 +734,12 @@ impl LedgerService {
     ///
     /// Validates I1 (balance), I2 (elision), I3 (lifecycle), I9 (currency),
     /// stamps envelope metadata, inserts into DAG, and persists to file.
-    /// Returns the `txid`.
-    pub fn append_transaction(&mut self, input: TransactionInput) -> Result<String, ServiceError> {
+    /// Returns the `txid` together with whether the body was already present
+    /// ([`AppendOutcome`], M-10).
+    pub fn append_transaction(
+        &mut self,
+        input: TransactionInput,
+    ) -> Result<AppendOutcome, ServiceError> {
         self.append_transaction_signing(input, |_, _, _| None)
     }
 
@@ -703,7 +748,7 @@ impl LedgerService {
         &mut self,
         input: TransactionInput,
         sign: impl FnOnce(&str, &str, &str) -> Option<String>,
-    ) -> Result<String, ServiceError> {
+    ) -> Result<AppendOutcome, ServiceError> {
         // H-04: a date the file grammar cannot read back would brick the next
         // boot, so refuse it before anything is built, stamped, or persisted.
         validate_ledger_date(input.date)?;
@@ -848,8 +893,15 @@ impl LedgerService {
         let content_id = match self.dag.insert(directive.clone(), false)? {
             InsertResult::Inserted { content_id } => content_id,
             InsertResult::Duplicate { content_id } => {
-                // FR-1 AC4: idempotent by content. Return existing txid.
-                return Ok(content_id);
+                // FR-1 AC4: idempotent by content. Nothing is inserted, nothing
+                // is persisted, and the envelope just stamped above is thrown
+                // away — the entry that stays is whichever one landed first,
+                // with *its* author and signature. M-10: say so rather than
+                // handing the caller a pre-existing txid that looks fresh.
+                return Ok(AppendOutcome {
+                    txid: content_id,
+                    already_existed: true,
+                });
             }
         };
 
@@ -859,7 +911,10 @@ impl LedgerService {
         // Persist to file (L-13: reload from disk if the persist fails).
         self.persist_or_reload()?;
 
-        Ok(content_id)
+        Ok(AppendOutcome {
+            txid: content_id,
+            already_existed: false,
+        })
     }
 
     /// Open a new account (FR-3 AC1).
@@ -921,15 +976,15 @@ impl LedgerService {
 
         // Insert into DAG.
         let directive = Directive::Open(open);
-        let content_id = match self.dag.insert(directive, false)? {
+        let content_id = match self.dag.insert(directive.clone(), false)? {
             InsertResult::Inserted { content_id } => content_id,
             InsertResult::Duplicate { content_id } => return Ok(content_id),
         };
 
-        // Update account state.
-        self.accounts
-            .open_account(&account, date, &currencies)
-            .map_err(ServiceError::Validation)?;
+        // Update account state (M-09): record the event under the content id
+        // and envelope the DAG just stored, so that this node's live state and
+        // its state after a reboot from the same file are identical.
+        self.accounts.record_lifecycle(&directive, &content_id);
 
         // Persist (L-13: reload from disk if the persist fails).
         self.persist_or_reload()?;
@@ -998,15 +1053,13 @@ impl LedgerService {
 
         // Insert into DAG.
         let directive = Directive::Close(close);
-        let content_id = match self.dag.insert(directive, false)? {
+        let content_id = match self.dag.insert(directive.clone(), false)? {
             InsertResult::Inserted { content_id } => content_id,
             InsertResult::Duplicate { content_id } => return Ok(content_id),
         };
 
-        // Update account state.
-        self.accounts
-            .close_account(&account, date)
-            .map_err(ServiceError::Validation)?;
+        // Update account state (M-09) — see `open_account_signing`.
+        self.accounts.record_lifecycle(&directive, &content_id);
 
         // Persist (L-13: reload from disk if the persist fails).
         self.persist_or_reload()?;
@@ -1249,20 +1302,22 @@ impl LedgerService {
                     }
                 }
             } else {
-                // Non-transaction directives: register account state + insert.
-                match &directive {
-                    Directive::Open(open) => {
-                        let _ =
-                            self.accounts
-                                .open_account(&open.account, open.date, &open.currencies);
+                // M-09: a hand-added `close` goes through the same
+                // no-later-transactions rule as the local API and the peer
+                // ingest path, rather than being applied unconditionally with
+                // the error swallowed. It lands in the `rejected` tally like
+                // every other refused adoption.
+                if let Directive::Close(close) = &directive {
+                    if self.reject_backdated_close(close).is_err() {
+                        rejected += 1;
+                        continue;
                     }
-                    Directive::Close(close) => {
-                        let _ = self.accounts.close_account(&close.account, close.date);
-                    }
-                    _ => {}
                 }
+                // Non-transaction directives: insert, then record any lifecycle
+                // event under the content id the DAG assigned (M-09).
                 match self.dag.insert(directive.clone(), false) {
                     Ok(InsertResult::Inserted { .. }) => {
+                        self.accounts.record_lifecycle(&directive, &content_id);
                         self.read_model.index_directive(&directive);
                         new_count += 1;
                     }
@@ -1289,6 +1344,48 @@ impl LedgerService {
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────
+
+    /// Apply the local "no later transactions" close rule to an INGESTED
+    /// `close` — from a peer or from a hand edit (M-09).
+    ///
+    /// Without this, one allowlisted peer's `close Assets:Cash` dated 1970 was
+    /// applied unconditionally (`let _ =`) on every replica, and from then on
+    /// every local append to that account failed I3 forever: a write-DoS on the
+    /// whole mesh, from a single directive, with no way to undo it. The local
+    /// close path has always refused to close an account out from under its own
+    /// transactions ([`ServiceError::AccountHasLaterTransactions`]); a remote
+    /// close is held to the same rule, with the same error code, and is not
+    /// inserted into the DAG when it fails.
+    ///
+    /// ## Residual — honest statement of what this does NOT prove
+    ///
+    /// This is a DoS mitigation, not a convergence proof. The rule is evaluated
+    /// against the transactions this node holds AT INGEST TIME, and two nodes
+    /// can hold different transaction sets at that moment. Concretely: a close
+    /// dated 2024-03-01 that arrives at node A before any 2024-06-01
+    /// transaction on that account is accepted there, while node B — which
+    /// already had that transaction — rejects the same close. The two nodes
+    /// then hold DIFFERENT DIRECTIVE SETS, and nothing here closes that gap.
+    ///
+    /// What the M-09 event model does guarantee is the other half: for a GIVEN
+    /// directive set, every node derives the same account state regardless of
+    /// arrival order. Directive-set divergence is possible; state divergence for
+    /// a fixed set is not. (Note also that a transaction rejected under I3 is
+    /// never in the DAG, so it does not feed back into this rule — only
+    /// ACCEPTED transactions can refuse a close.)
+    ///
+    /// Boot does not apply this rule: see the comment at the boot loop.
+    fn reject_backdated_close(&self, close: &Close) -> Result<(), ServiceError> {
+        if let Some(latest) = self.latest_posting_date(&close.account) {
+            if latest > close.date {
+                return Err(ServiceError::AccountHasLaterTransactions {
+                    account: close.account.clone(),
+                    latest_date: latest,
+                });
+            }
+        }
+        Ok(())
+    }
 
     /// Find the latest transaction date referencing a given account.
     fn latest_posting_date(&self, account: &str) -> Option<NaiveDate> {
@@ -1513,13 +1610,16 @@ impl LedgerService {
                     InsertResult::Duplicate { .. } => Ok(None),
                 }
             }
-            Directive::Open(open) => {
-                // Register account state.
-                let _ = self
-                    .accounts
-                    .open_account(&open.account, open.date, &open.currencies);
+            Directive::Open(_) => {
+                // M-09: a remote `open` is DATA. It is not applied to a mutable
+                // flag that the arrival order could decide — it joins the
+                // account's lifecycle event set at its own deterministic
+                // position, and every query folds the set. Conflicting opens
+                // and closes therefore resolve identically on every replica, so
+                // there is no error left to swallow with `let _ =`.
                 match self.dag.insert(directive.clone(), false)? {
                     InsertResult::Inserted { content_id } => {
+                        self.accounts.record_lifecycle(&directive, &content_id);
                         self.read_model.index_directive(&directive);
                         Ok(Some(content_id))
                     }
@@ -1527,9 +1627,14 @@ impl LedgerService {
                 }
             }
             Directive::Close(close) => {
-                let _ = self.accounts.close_account(&close.account, close.date);
+                // M-09: the one lifecycle directive that is NOT accepted as
+                // plain data — a close that predates transactions already on
+                // the account is the write-DoS, and is rejected here (and so
+                // never reaches the DAG or the event set).
+                self.reject_backdated_close(close)?;
                 match self.dag.insert(directive.clone(), false)? {
                     InsertResult::Inserted { content_id } => {
+                        self.accounts.record_lifecycle(&directive, &content_id);
                         self.read_model.index_directive(&directive);
                         Ok(Some(content_id))
                     }
@@ -1823,7 +1928,7 @@ mod tests {
     #[test]
     fn test_append_balanced_transaction() {
         let (mut svc, path) = setup_with_accounts();
-        let txid = svc.append_transaction(balanced_input()).unwrap();
+        let txid = svc.append_transaction(balanced_input()).unwrap().txid;
         assert_eq!(txid.len(), 64);
         assert_eq!(svc.head_count(), 1);
         std::fs::remove_file(path).ok();
@@ -1927,7 +2032,7 @@ mod tests {
                 },
             ],
         };
-        let txid = svc.append_transaction(input).unwrap();
+        let txid = svc.append_transaction(input).unwrap().txid;
         assert_eq!(txid.len(), 64);
         std::fs::remove_file(path).ok();
     }
@@ -1935,7 +2040,7 @@ mod tests {
     #[test]
     fn test_append_idempotent_by_content() {
         let (mut svc, path) = setup_with_accounts();
-        let txid1 = svc.append_transaction(balanced_input()).unwrap();
+        let txid1 = svc.append_transaction(balanced_input()).unwrap().txid;
 
         // Same economic body again → same txid (G-Set dedup).
         // Note: envelope differs (different parents/lamport), but economic body is same.
@@ -1948,8 +2053,106 @@ mod tests {
         // But the Directive objects have different metadata, so they're different objects
         // being inserted into the DAG. The DAG deduplicates by content_id.
         // So the second insert should return Duplicate.
-        let txid2 = svc.append_transaction(balanced_input()).unwrap();
+        let txid2 = svc.append_transaction(balanced_input()).unwrap().txid;
         assert_eq!(txid1, txid2, "Same economic body → same txid");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_append_reports_whether_the_body_was_already_there() {
+        // M-10 (interim): idempotency by content used to be indistinguishable
+        // from a fresh insert — both just returned a txid — so a caller whose
+        // entry was collapsed into an earlier identical one, or squatted by a
+        // peer that published the body first, saw plain success. The append
+        // path must now say which of the two happened.
+        let (mut svc, path) = setup_with_accounts();
+
+        let first = svc.append_transaction(balanced_input()).unwrap();
+        assert!(!first.already_existed, "the first append is a real insert");
+        assert_eq!(first.txid.len(), 64);
+        let count_after_first = svc.directive_count();
+        let file_after_first = std::fs::read_to_string(&path).unwrap();
+
+        let second = svc.append_transaction(balanced_input()).unwrap();
+        assert!(
+            second.already_existed,
+            "an identical economic body records nothing new"
+        );
+        assert_eq!(second.txid, first.txid, "same body → same txid");
+
+        // Nothing new was recorded: no DAG growth and no file growth.
+        assert_eq!(svc.directive_count(), count_after_first);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            file_after_first,
+            "a duplicate append must not touch the ledger file"
+        );
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_append_of_a_body_a_peer_published_first_reports_already_existed() {
+        // M-10, the squatting shape itself: the content hash excludes every
+        // `openledger-*` key, so a peer that predicts a recurring body can
+        // publish it under ITS OWN author/signature first. The victim's genuine
+        // append then resolves as a duplicate and the mesh keeps attributing
+        // the event to the squatter. The append must surface that.
+        let (mut svc, path) = setup_with_accounts();
+
+        // The squatter's envelope over the body `balanced_input()` resolves to.
+        let mut metadata = BTreeMap::new();
+        metadata.insert("openledger-author".to_owned(), "peer-squatter".to_owned());
+        metadata.insert("openledger-lamport".to_owned(), "7".to_owned());
+        metadata.insert("openledger-parents".to_owned(), String::new());
+        let squatted = Directive::Transaction(Transaction {
+            date: make_date(2024, 1, 15),
+            flag: Flag::Complete,
+            payee: Some("Acme".to_owned()),
+            narration: Some("Funding".to_owned()),
+            tags: vec![],
+            links: vec![],
+            postings: vec![
+                Posting {
+                    account: "Assets:Cash".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(100),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+                Posting {
+                    account: "Equity:Opening".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(-100),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+            ],
+            metadata,
+        });
+        let squatted_txid = svc.insert_remote_directive(squatted).unwrap().unwrap();
+
+        // The victim now appends its own genuine, identical entry.
+        let outcome = svc.append_transaction(balanced_input()).unwrap();
+        assert!(
+            outcome.already_existed,
+            "the peer got there first — nothing new was recorded"
+        );
+        assert_eq!(outcome.txid, squatted_txid);
+
+        // And the envelope that stands is still the squatter's: this is what
+        // the caller must be warned about, since the interim fix cannot undo it.
+        let Some(Directive::Transaction(stored)) = svc.get_directive(&outcome.txid) else {
+            panic!("expected the squatted transaction");
+        };
+        assert_eq!(stored.author(), Some("peer-squatter"));
+
         std::fs::remove_file(path).ok();
     }
 
@@ -2001,12 +2204,119 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    /// Assert no `(author, lamport)` pair is stamped twice (M-18).
+    fn assert_lamport_pairs_unique(pairs: &[(String, u64)], when: &str) {
+        let mut seen = std::collections::BTreeSet::new();
+        for pair in pairs {
+            assert!(
+                seen.insert(pair.clone()),
+                "duplicate (author, lamport) pair persisted {when}: {pair:?} in {pairs:?}"
+            );
+        }
+    }
+
+    /// Every `(author, lamport)` pair stamped in the file, in parse order (M-18).
+    fn stamped_lamport_pairs(path: &Path) -> Vec<(String, u64)> {
+        let content = std::fs::read_to_string(path).unwrap();
+        parse_file(&content)
+            .unwrap()
+            .iter()
+            .filter_map(|directive| {
+                let author = directive.metadata().get(ENVELOPE_KEY_AUTHOR)?.clone();
+                Some((author, directive.lamport_clock()?))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_boot_lamport_reads_non_transaction_directives() {
+        // M-18 regression: the highest lamport sits on an `open`. Scanning only
+        // transactions resumed the clock at 4 — below the 9 already on disk.
+        let path = test_file_path();
+        std::fs::write(
+            &path,
+            "2024-01-01 open Assets:Cash USD\n\
+             \x20 openledger-author: \"local\"\n\
+             \x20 openledger-lamport: \"1\"\n\n\
+             2024-01-01 open Equity:Opening\n\
+             \x20 openledger-author: \"local\"\n\
+             \x20 openledger-lamport: \"2\"\n\n\
+             2024-02-01 * \"Deposit\"\n\
+             \x20 openledger-author: \"local\"\n\
+             \x20 openledger-lamport: \"3\"\n\
+             \x20 openledger-parents: \"\"\n\
+             \x20 Assets:Cash                                      100 USD\n\
+             \x20 Equity:Opening                                   -100 USD\n\n\
+             2026-07-01 open Assets:Bank\n\
+             \x20 openledger-author: \"local\"\n\
+             \x20 openledger-lamport: \"9\"\n",
+        )
+        .unwrap();
+
+        let svc = LedgerService::boot(path.clone(), "local".to_owned()).unwrap();
+        assert!(
+            svc.lamport_clock() > 9,
+            "boot must resume above the highest stamped lamport (9 on an open), got {}",
+            svc.lamport_clock()
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_restart_round_trip_never_reissues_a_lamport() {
+        // M-18 verify: the highest lamport lands on a non-transaction directive
+        // — the opens below are stamped after the transaction — so a restart
+        // that only scanned transactions handed the next mutation an already
+        // used `(author, lamport)` pair. Two opens, because boot resumes at
+        // `max + 1`: one open past the last transaction is still covered by
+        // that cushion, and only the second lands on a re-issued value.
+        let (mut svc, path) = setup_with_accounts();
+        svc.append_transaction(balanced_input()).unwrap();
+        svc.open_account("Assets:Bank".to_owned(), make_date(2024, 2, 1), vec![])
+            .unwrap();
+        svc.open_account(
+            "Assets:Cash:Petty".to_owned(),
+            make_date(2024, 2, 1),
+            vec![],
+        )
+        .unwrap();
+        drop(svc);
+
+        let before = stamped_lamport_pairs(&path);
+        let highest_before = before.iter().map(|(_, lamport)| *lamport).max().unwrap();
+        assert_lamport_pairs_unique(&before, "before the restart");
+
+        // Restart from the file.
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert!(
+            svc.lamport_clock() >= highest_before,
+            "(a) reboot must not regress the clock below the persisted maximum \
+             ({highest_before}), got {}",
+            svc.lamport_clock()
+        );
+
+        // (b) the post-reboot mutation must stamp strictly above everything on disk.
+        let id = svc
+            .open_account("Assets:Brokerage".to_owned(), make_date(2024, 3, 1), vec![])
+            .unwrap();
+        let stamped = svc.get_directive(&id).unwrap().lamport_clock().unwrap();
+        assert!(
+            stamped > highest_before,
+            "post-restart mutation stamped {stamped}, which does not exceed the \
+             highest lamport already persisted ({highest_before})"
+        );
+
+        // No `(author, lamport)` pair is ever persisted twice.
+        assert_lamport_pairs_unique(&stamped_lamport_pairs(&path), "after the restart");
+        std::fs::remove_file(path).ok();
+    }
+
     #[test]
     fn test_genesis_has_empty_parents() {
         let (mut svc, path) = setup_with_accounts();
         assert_eq!(svc.head_count(), 0); // Only opens, no transaction heads.
 
-        let txid = svc.append_transaction(balanced_input()).unwrap();
+        let txid = svc.append_transaction(balanced_input()).unwrap().txid;
         let directive = svc.get_directive(&txid).unwrap();
         if let Directive::Transaction(txn) = directive {
             assert!(
@@ -2022,7 +2332,7 @@ mod tests {
     #[test]
     fn test_second_txn_references_first_as_parent() {
         let (mut svc, path) = setup_with_accounts();
-        let txid1 = svc.append_transaction(balanced_input()).unwrap();
+        let txid1 = svc.append_transaction(balanced_input()).unwrap().txid;
 
         let input2 = TransactionInput {
             date: make_date(2024, 1, 20),
@@ -2052,7 +2362,7 @@ mod tests {
                 },
             ],
         };
-        let txid2 = svc.append_transaction(input2).unwrap();
+        let txid2 = svc.append_transaction(input2).unwrap().txid;
 
         let directive = svc.get_directive(&txid2).unwrap();
         if let Directive::Transaction(txn) = directive {
@@ -2220,7 +2530,7 @@ mod tests {
         assert_eq!(svc.directive_count(), 2);
 
         // Step 2: Genesis transaction.
-        let txid = svc.append_transaction(balanced_input()).unwrap();
+        let txid = svc.append_transaction(balanced_input()).unwrap().txid;
         assert_eq!(svc.directive_count(), 3);
         assert_eq!(svc.head_count(), 1);
 
@@ -2532,6 +2842,171 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    // ── T29 / M-09: deterministic account lifecycle ──────────────────────
+
+    fn remote_envelope(lamport: u64) -> Metadata {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("openledger-author".to_owned(), "peer-remote".to_owned());
+        metadata.insert("openledger-lamport".to_owned(), lamport.to_string());
+        metadata
+    }
+
+    fn remote_close(account: &str, date: NaiveDate, lamport: u64) -> Directive {
+        Directive::Close(Close {
+            date,
+            account: account.to_owned(),
+            metadata: remote_envelope(lamport),
+        })
+    }
+
+    fn remote_open(account: &str, date: NaiveDate, lamport: u64) -> Directive {
+        Directive::Open(Open {
+            date,
+            account: account.to_owned(),
+            currencies: Vec::new(),
+            metadata: remote_envelope(lamport),
+        })
+    }
+
+    /// M-09 write-DoS: one allowlisted peer's backdated `close` used to be
+    /// applied unconditionally (`let _ =`), shutting the account on every
+    /// replica and failing every later local append to it.
+    #[test]
+    fn test_remote_backdated_close_is_rejected() {
+        let (mut svc, path) = setup_with_accounts();
+        svc.append_transaction(balanced_input()).unwrap(); // 2024-01-15
+
+        let poison = remote_close("Assets:Cash", make_date(1970, 1, 1), 9);
+        let poison_id = LedgerService::content_id(&poison);
+        let error = svc.stage_remote_directive(poison).unwrap_err();
+        assert_eq!(error.error_code(), "ACCOUNT_HAS_LATER_TRANSACTIONS");
+        assert!(
+            svc.get_directive(&poison_id).is_none(),
+            "a rejected close must not reach the DAG"
+        );
+        assert!(svc.accounts().is_open("Assets:Cash"));
+
+        // The consequence that mattered: local writes still work.
+        let mut later = balanced_input();
+        later.date = make_date(2024, 2, 1);
+        later.narration = Some("after the poison close".to_owned());
+        svc.append_transaction(later)
+            .expect("local append must still succeed");
+
+        std::fs::remove_file(path).ok();
+    }
+
+    /// A remote close that does not predate the account's transactions is still
+    /// accepted — the guard is targeted, not a blanket refusal.
+    #[test]
+    fn test_remote_forward_dated_close_is_accepted() {
+        let (mut svc, path) = setup_with_accounts();
+        svc.append_transaction(balanced_input()).unwrap(); // 2024-01-15
+
+        let close = remote_close("Assets:Cash", make_date(2024, 6, 1), 9);
+        assert!(svc.stage_remote_directive(close).unwrap().is_some());
+        assert!(!svc.accounts().is_open("Assets:Cash"));
+        assert!(
+            svc.accounts()
+                .is_open_at("Assets:Cash", make_date(2024, 1, 15)),
+            "the close does not retroactively invalidate the earlier transaction"
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    /// The core M-09 invariant at the service level: staging the same lifecycle
+    /// directives in opposite orders gives the same state — and the same state
+    /// again after a reboot, which rebuilds it from the file alone.
+    #[test]
+    fn test_lifecycle_state_is_order_insensitive_and_survives_reboot() {
+        let forward = [
+            remote_open("Assets:Vault", make_date(2024, 1, 1), 1),
+            remote_close("Assets:Vault", make_date(2024, 2, 1), 2),
+            remote_open("Assets:Vault", make_date(2024, 3, 1), 3),
+            remote_close("Assets:Vault", make_date(2024, 4, 1), 4),
+        ];
+        let probes = [
+            make_date(2024, 1, 15),
+            make_date(2024, 2, 15),
+            make_date(2024, 3, 15),
+            make_date(2024, 4, 15),
+        ];
+
+        let mut snapshots = Vec::new();
+        let mut files = Vec::new();
+        let mut paths = Vec::new();
+        for reversed in [false, true] {
+            let (mut svc, path) = boot_empty();
+            let mut order: Vec<&Directive> = forward.iter().collect();
+            if reversed {
+                order.reverse();
+            }
+            for directive in order {
+                svc.stage_remote_directive(directive.clone()).unwrap();
+            }
+            svc.persist_or_reload().unwrap();
+
+            let live: Vec<bool> = probes
+                .iter()
+                .map(|probe| svc.accounts().is_open_at("Assets:Vault", *probe))
+                .chain(std::iter::once(svc.accounts().is_open("Assets:Vault")))
+                .collect();
+
+            // Reboot: the state must be a pure function of the persisted set.
+            let rebooted = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+            let after_reboot: Vec<bool> = probes
+                .iter()
+                .map(|probe| rebooted.accounts().is_open_at("Assets:Vault", *probe))
+                .chain(std::iter::once(rebooted.accounts().is_open("Assets:Vault")))
+                .collect();
+            assert_eq!(
+                live, after_reboot,
+                "reboot must reproduce the live lifecycle state"
+            );
+
+            files.push(std::fs::read(&path).unwrap());
+            snapshots.push(live);
+            paths.push(path);
+        }
+
+        assert_eq!(
+            snapshots[0], snapshots[1],
+            "arrival order must not change the lifecycle state"
+        );
+        assert_eq!(
+            files[0], files[1],
+            "arrival order must not change the persisted bytes"
+        );
+        assert_eq!(
+            snapshots[0],
+            vec![true, false, true, false, false],
+            "open/closed/open/closed, and closed at the end"
+        );
+
+        for path in paths {
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    /// A hand-edited file adding a backdated `close` is rejected by reconcile
+    /// for the same reason a peer's is — the finding named both paths.
+    #[test]
+    fn test_reconcile_rejects_backdated_close() {
+        let (mut svc, path) = setup_with_accounts();
+        svc.append_transaction(balanced_input()).unwrap(); // 2024-01-15
+
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str("\n1970-01-01 close Assets:Cash\n");
+        std::fs::write(&path, &content).unwrap();
+
+        let result = svc.reconcile_file().unwrap();
+        assert_eq!(result.new_directives, 0);
+        assert_eq!(result.rejected, 1, "the backdated close is refused");
+        assert!(svc.accounts().is_open("Assets:Cash"));
+
+        std::fs::remove_file(path).ok();
+    }
+
     #[test]
     fn test_remote_insert_rejects_missing_parent() {
         let (mut svc, path) = setup_with_accounts();
@@ -2761,7 +3236,7 @@ mod tests {
             .unwrap();
 
         // Append a transaction via API.
-        let txid = svc.append_transaction(balanced_input()).unwrap();
+        let txid = svc.append_transaction(balanced_input()).unwrap().txid;
         let count_before = svc.directive_count();
 
         // Simulate hand-editing the narration → changes txid.
@@ -2799,7 +3274,7 @@ mod tests {
         .unwrap();
         svc.open_account("Equity:Opening".to_owned(), make_date(2024, 1, 1), vec![])
             .unwrap();
-        let txid = svc.append_transaction(balanced_input()).unwrap();
+        let txid = svc.append_transaction(balanced_input()).unwrap().txid;
         let count_before = svc.directive_count();
 
         // Simulate hand-deleting: remove the transaction lines from file.
@@ -2894,7 +3369,7 @@ mod tests {
                 },
             ],
         };
-        let txid_alpha = node_a.append_transaction(input_alpha).unwrap();
+        let txid_alpha = node_a.append_transaction(input_alpha).unwrap().txid;
 
         let input_beta = TransactionInput {
             date: make_date(2024, 2, 15),
@@ -2924,7 +3399,7 @@ mod tests {
                 },
             ],
         };
-        let txid_beta = node_b.append_transaction(input_beta).unwrap();
+        let txid_beta = node_b.append_transaction(input_beta).unwrap().txid;
 
         // Verify divergence.
         assert_eq!(node_a.directive_count(), 3);
@@ -3000,7 +3475,8 @@ mod tests {
         let (mut svc, path) = setup_with_accounts();
         let txid = svc
             .append_transaction_signing(balanced_input(), |_, _, _| Some("aa".repeat(64)))
-            .unwrap();
+            .unwrap()
+            .txid;
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert!(
             on_disk.contains("openledger-signature:"),

@@ -248,6 +248,19 @@ impl Directive {
         }
     }
 
+    /// The `openledger-lamport` clock value, for any directive kind (M-18).
+    ///
+    /// Envelope stamping applies `openledger-lamport` to opens and closes as
+    /// well as transactions, so every reader of the clock — boot included —
+    /// has to look at all kinds, not just [`Directive::Transaction`]. Parsing
+    /// is deliberately as tolerant as [`Transaction::lamport_clock`]: a
+    /// missing or unparsable value is `None`, never an error.
+    pub fn lamport_clock(&self) -> Option<u64> {
+        self.metadata()
+            .get("openledger-lamport")
+            .and_then(|s| s.parse().ok())
+    }
+
     /// The type priority for canonical ordering (§3.3.2).
     pub fn type_priority(&self) -> u8 {
         match self {

@@ -4,10 +4,17 @@
 
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
-use std::collections::HashMap;
 
 use crate::model::*;
 use crate::weights::{resolve_elided, sum_weights, WeightError};
+
+/// Account lifecycle state (M-09).
+///
+/// Re-exported here because `ledger::validate::AccountState` is the path every
+/// caller — including other crates — already uses; the implementation moved to
+/// [`crate::accounts`] when it was re-backed by an order-insensitive event
+/// model.
+pub use crate::accounts::AccountState;
 
 // ─── Error types ─────────────────────────────────────────────────────────────
 
@@ -102,147 +109,6 @@ impl ValidationError {
     }
 }
 
-// ─── Account state tracker ──────────────────────────────────────────────────
-
-/// Tracks the open/close state and currency constraints for all accounts.
-#[derive(Debug, Clone, Default)]
-pub struct AccountState {
-    /// `account → (open_date, allowed_currencies)`. Empty Vec = any currency.
-    accounts: HashMap<String, AccountInfo>,
-}
-
-#[derive(Debug, Clone)]
-struct AccountInfo {
-    open_date: NaiveDate,
-    /// Empty Vec means any currency is accepted.
-    currencies: Vec<String>,
-    /// `None` if still open; `Some(date)` if closed.
-    close_date: Option<NaiveDate>,
-}
-
-impl AccountState {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Register an account opening. Returns error if already open.
-    pub fn open_account(
-        &mut self,
-        account: &str,
-        date: NaiveDate,
-        currencies: &[String],
-    ) -> Result<(), ValidationError> {
-        if let Some(existing) = self.accounts.get(account) {
-            if existing.close_date.is_none() {
-                return Err(ValidationError::AccountNotOpen {
-                    account: account.to_owned(),
-                    date,
-                });
-            }
-            // Re-opening after close is allowed — update the entry.
-        }
-        self.accounts.insert(
-            account.to_owned(),
-            AccountInfo {
-                open_date: date,
-                currencies: currencies.to_vec(),
-                close_date: None,
-            },
-        );
-        Ok(())
-    }
-
-    /// Register an account closing.
-    pub fn close_account(&mut self, account: &str, date: NaiveDate) -> Result<(), ValidationError> {
-        match self.accounts.get_mut(account) {
-            Some(info) => {
-                info.close_date = Some(date);
-                Ok(())
-            }
-            None => Err(ValidationError::AccountNotOpen {
-                account: account.to_owned(),
-                date,
-            }),
-        }
-    }
-
-    /// Check I3: account must be open at the given date.
-    ///
-    /// An account is valid if:
-    /// - An `open` directive exists with date ≤ transaction date.
-    /// - No `close` directive exists with date **strictly before** the transaction date.
-    ///   (Same-day close is allowed because close has sort priority 9.)
-    pub fn check_account_open(
-        &self,
-        account: &str,
-        date: NaiveDate,
-    ) -> Result<(), ValidationError> {
-        let info = self
-            .accounts
-            .get(account)
-            .ok_or_else(|| ValidationError::AccountNotOpen {
-                account: account.to_owned(),
-                date,
-            })?;
-
-        if info.open_date > date {
-            return Err(ValidationError::AccountNotOpen {
-                account: account.to_owned(),
-                date,
-            });
-        }
-
-        if let Some(close_date) = info.close_date {
-            if close_date < date {
-                return Err(ValidationError::AccountClosed {
-                    account: account.to_owned(),
-                    close_date,
-                    transaction_date: date,
-                });
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Check I9: posting currency must be in the account's allowed list (if constrained).
-    pub fn check_currency_constraint(
-        &self,
-        account: &str,
-        currency: &str,
-    ) -> Result<(), ValidationError> {
-        if let Some(info) = self.accounts.get(account) {
-            if !info.currencies.is_empty() && !info.currencies.iter().any(|c| c == currency) {
-                return Err(ValidationError::AccountCurrencyMismatch {
-                    account: account.to_owned(),
-                    currency: currency.to_owned(),
-                    allowed: info.currencies.clone(),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    /// Returns true if the account is known (has been opened at any point).
-    pub fn is_known(&self, account: &str) -> bool {
-        self.accounts.contains_key(account)
-    }
-
-    /// Returns the currency constraint list for an account (empty = any currency).
-    pub fn currencies(&self, account: &str) -> Option<&[String]> {
-        self.accounts
-            .get(account)
-            .map(|info| info.currencies.as_slice())
-    }
-
-    /// Returns true if the account is currently open (opened and not yet closed).
-    pub fn is_open(&self, account: &str) -> bool {
-        self.accounts
-            .get(account)
-            .is_some_and(|info| info.close_date.is_none())
-    }
-}
-
 // ─── Transaction validation ─────────────────────────────────────────────────
 
 /// Validate a transaction against I1 (balance), I2 (elision), I3 (account lifecycle),
@@ -315,11 +181,18 @@ pub fn validate_transaction(
     }
 
     // ── I3 + I9: account lifecycle and currency constraints ─────────────
+    //
+    // Both checks are answered at the TRANSACTION's date (M-09): the `open` in
+    // force on that date is the one that admits the posting, so it is also the
+    // one whose currency list constrains it. Asking I9 about the account's
+    // latest `open` instead would let a later re-open with a different currency
+    // list retroactively invalidate transactions I3 had already admitted under
+    // the earlier one.
     for posting in &txn.postings {
         accounts.check_account_open(&posting.account, txn.date)?;
 
         if let Some(ref amount) = posting.amount {
-            accounts.check_currency_constraint(&posting.account, &amount.currency)?;
+            accounts.check_currency_constraint_at(&posting.account, &amount.currency, txn.date)?;
         }
     }
 

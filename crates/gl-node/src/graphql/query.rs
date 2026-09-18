@@ -3,8 +3,9 @@ use rust_decimal::Decimal;
 
 use super::scalars::{DateScalar, DecimalScalar, TransactionId};
 use super::types::{
-    AccountBalance, Amount, BalanceSheet, HealthStatus, IncomeStatement, Peer, Posting,
-    Transaction, TrialBalance, TrialBalanceRow, VerifyResult,
+    AccountBalance, Amount, BalanceAssertionFailure, BalanceAssertionReport, BalanceSheet,
+    HealthStatus, IncomeStatement, Peer, Posting, Transaction, TrialBalance, TrialBalanceRow,
+    VerifyResult,
 };
 use super::SharedLedger;
 
@@ -216,22 +217,32 @@ impl QueryRoot {
         None
     }
 
-    /// Verify DAG integrity (FR-5 AC1).
+    /// Verify DAG integrity and balance assertions (FR-5 AC1, §3.6).
+    ///
+    /// `ok`/`errors` cover the structural checks — content hashes (I5), parent
+    /// links (I8), acyclicity. `balanceAssertions` reports every `balance`
+    /// directive in the ledger evaluated against the read model (M-08): before
+    /// this wiring those directives were stored and never checked, so a false
+    /// claim — hand-edited or gossiped in by an allowlisted peer — read as
+    /// verified. Evaluation is read-only: a failing assertion is surfaced, not
+    /// used to reject or adjust anything, and it does not clear `ok`.
     #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
     async fn verify(&self, ctx: &Context<'_>) -> VerifyResult {
         if let Ok(ledger) = ctx.data::<SharedLedger>() {
             let svc = ledger.read().await;
-            let report = ledger::verify::verify_dag(svc.dag());
+            let report = ledger::verify::verify_dag(svc.dag(), svc.read_model());
             VerifyResult {
                 ok: report.ok,
                 nodes_checked: report.nodes_checked as i32,
                 errors: report.errors.iter().map(|e| e.to_string()).collect(),
+                balance_assertions: assertion_report(&report.assertions),
             }
         } else {
             VerifyResult {
                 ok: true,
                 nodes_checked: 0,
                 errors: Vec::new(),
+                balance_assertions: assertion_report(&Default::default()),
             }
         }
     }
@@ -271,6 +282,30 @@ impl QueryRoot {
         } else {
             Vec::new()
         }
+    }
+}
+
+/// Convert the ledger's balance-assertion summary to its GraphQL shape (M-08).
+///
+/// Only the failures carry per-assertion detail; the counts cover the rest, so
+/// a client can alert on `failed` without pulling the whole list.
+fn assertion_report(summary: &ledger::verify::BalanceAssertionSummary) -> BalanceAssertionReport {
+    BalanceAssertionReport {
+        evaluated: summary.evaluated as i32,
+        passed: summary.passed() as i32,
+        failed: summary.failures.len() as i32,
+        ok: summary.ok(),
+        failures: summary
+            .failures
+            .iter()
+            .map(|failure| BalanceAssertionFailure {
+                account: failure.account.clone(),
+                date: DateScalar(failure.date),
+                expected: DecimalScalar(failure.expected),
+                actual: DecimalScalar(failure.actual),
+                currency: failure.currency.clone(),
+            })
+            .collect(),
     }
 }
 

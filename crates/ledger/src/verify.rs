@@ -4,9 +4,14 @@
 //! - Every `txid` matches its content hash (I5).
 //! - Every parent link resolves to a known node (I8).
 //! - No cycles exist in the transaction DAG.
+//!
+//! It also evaluates every `balance` assertion in the ledger against the read
+//! model (§3.6, M-08) and reports the results alongside the structural errors.
 
+use crate::checkpoint::{evaluate_all_assertions, AssertionResult};
 use crate::dag::LedgerDag;
 use crate::hash::compute_content_id;
+use crate::read_model::ReadModel;
 
 /// A single verification error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,15 +54,45 @@ impl std::fmt::Display for VerifyError {
 
 impl std::error::Error for VerifyError {}
 
+/// Outcome of evaluating the ledger's `balance` assertions (§3.6, M-08).
+#[derive(Debug, Clone, Default)]
+pub struct BalanceAssertionSummary {
+    /// How many `balance` directives were evaluated.
+    pub evaluated: usize,
+    /// The assertions that did **not** hold, with expected vs actual.
+    pub failures: Vec<AssertionResult>,
+}
+
+impl BalanceAssertionSummary {
+    /// How many assertions held.
+    pub fn passed(&self) -> usize {
+        self.evaluated.saturating_sub(self.failures.len())
+    }
+
+    /// Whether every evaluated assertion held (vacuously true when there are none).
+    pub fn ok(&self) -> bool {
+        self.failures.is_empty()
+    }
+}
+
 /// Result of a full DAG verification.
 #[derive(Debug, Clone)]
 pub struct VerifyReport {
-    /// Whether the DAG passed all checks.
+    /// Whether the DAG passed all *structural* checks (hashes, parents, cycles).
+    ///
+    /// Balance-assertion failures deliberately do **not** clear this flag: an
+    /// assertion is an author's claim about a balance, and any writer — a peer
+    /// on the allowlist included — can seed a false one. Letting a remote claim
+    /// flip the integrity verdict would hand that peer a red `verify` on every
+    /// node. Callers that care about assertions read [`Self::assertions`],
+    /// which reports the claims that did not hold.
     pub ok: bool,
     /// Number of nodes checked.
     pub nodes_checked: usize,
     /// Any errors found.
     pub errors: Vec<VerifyError>,
+    /// Balance assertions evaluated during this verification (§3.6).
+    pub assertions: BalanceAssertionSummary,
 }
 
 /// Walk the DAG and verify all integrity constraints (FR-5 AC1).
@@ -66,7 +101,20 @@ pub struct VerifyReport {
 /// 1. Content hash of every directive matches its stored ID (I5).
 /// 2. Every transaction's parent links resolve to known nodes (I8).
 /// 3. The DAG is acyclic.
-pub fn verify_dag(dag: &LedgerDag) -> VerifyReport {
+/// 4. Every `balance` directive holds against `read_model` (§3.6, M-08).
+///
+/// Check 4 is **read-only reporting**. Each `balance` directive asserts that an
+/// account holds a given amount of one currency on a date (transactions dated
+/// on or before it — beancount asserts at the *start* of the day instead; see
+/// [`crate::checkpoint::evaluate_balance_assertion`]). Failures are recorded in
+/// [`VerifyReport::assertions`]; nothing is rejected, no state is touched, and
+/// `pad` directives are not synthesized into balances — a gap a `pad` was meant
+/// to cover still reports as a failing assertion.
+///
+/// `read_model` must be the model built from the same directives as `dag`
+/// (`LedgerService` keeps the two in step), otherwise the assertion results
+/// describe a ledger that does not exist.
+pub fn verify_dag(dag: &LedgerDag, read_model: &ReadModel) -> VerifyReport {
     let mut errors = Vec::new();
     let mut nodes_checked = 0;
 
@@ -104,10 +152,20 @@ pub fn verify_dag(dag: &LedgerDag) -> VerifyReport {
     let cycle_errors = detect_cycles(dag);
     errors.extend(cycle_errors);
 
+    // 4. Balance assertions (§3.6, M-08). Evaluated over the DAG's own
+    // directives — the borrowed view, so no clone of the ledger — and reported
+    // separately from the structural errors above.
+    let results = evaluate_all_assertions(dag.directives(), read_model);
+    let assertions = BalanceAssertionSummary {
+        evaluated: results.len(),
+        failures: results.into_iter().filter(|result| !result.ok).collect(),
+    };
+
     VerifyReport {
         ok: errors.is_empty(),
         nodes_checked,
         errors,
+        assertions,
     }
 }
 
@@ -180,11 +238,56 @@ mod tests {
     use super::*;
     use crate::model::*;
     use chrono::NaiveDate;
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use std::collections::BTreeMap;
 
     fn make_date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    /// Build the read model that matches a DAG, the way `LedgerService::boot` does.
+    fn read_model_for(dag: &LedgerDag) -> ReadModel {
+        let directives: Vec<Directive> = dag.directives().into_iter().cloned().collect();
+        ReadModel::build(&directives)
+    }
+
+    fn make_balance(date: NaiveDate, account: &str, number: Decimal, currency: &str) -> Directive {
+        Directive::Balance(Balance {
+            date,
+            account: account.to_owned(),
+            amount: Amount {
+                number,
+                currency: currency.to_owned(),
+            },
+            metadata: BTreeMap::new(),
+        })
+    }
+
+    /// A transaction with arbitrary `(account, amount)` postings, all in USD.
+    fn make_txn_with(date: NaiveDate, narration: &str, postings: &[(&str, Decimal)]) -> Directive {
+        Directive::Transaction(Transaction {
+            date,
+            flag: Flag::Complete,
+            payee: None,
+            narration: Some(narration.to_owned()),
+            tags: vec![],
+            links: vec![],
+            postings: postings
+                .iter()
+                .map(|(account, number)| Posting {
+                    account: (*account).to_owned(),
+                    amount: Some(Amount {
+                        number: *number,
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                })
+                .collect(),
+            metadata: BTreeMap::new(),
+        })
     }
 
     fn make_txn(date: NaiveDate, narration: &str, parents: &str) -> Directive {
@@ -229,7 +332,7 @@ mod tests {
     #[test]
     fn test_verify_empty_dag() {
         let dag = LedgerDag::new();
-        let report = verify_dag(&dag);
+        let report = verify_dag(&dag, &read_model_for(&dag));
         assert!(report.ok);
         assert_eq!(report.nodes_checked, 0);
         assert!(report.errors.is_empty());
@@ -241,7 +344,7 @@ mod tests {
         let txn = make_txn(make_date(2024, 1, 1), "Genesis", "");
         dag.insert(txn, false).unwrap();
 
-        let report = verify_dag(&dag);
+        let report = verify_dag(&dag, &read_model_for(&dag));
         assert!(report.ok);
         assert_eq!(report.nodes_checked, 1);
     }
@@ -259,7 +362,7 @@ mod tests {
         let t2 = make_txn(make_date(2024, 1, 2), "Second", &id1);
         dag.insert(t2, false).unwrap();
 
-        let report = verify_dag(&dag);
+        let report = verify_dag(&dag, &read_model_for(&dag));
         assert!(report.ok);
         assert_eq!(report.nodes_checked, 2);
     }
@@ -283,9 +386,12 @@ mod tests {
             };
         }
 
+        // Build the read model up front so the small-stack thread runs the
+        // traversal under test and nothing else.
+        let read_model = read_model_for(&dag);
         let report = std::thread::Builder::new()
             .stack_size(96 * 1024)
-            .spawn(move || verify_dag(&dag))
+            .spawn(move || verify_dag(&dag, &read_model))
             .expect("spawn verify thread")
             .join()
             .expect("verify thread must not overflow the stack");
@@ -305,7 +411,7 @@ mod tests {
         dag.insert(txn, false).unwrap();
 
         // All content hashes should match in a properly constructed DAG.
-        let report = verify_dag(&dag);
+        let report = verify_dag(&dag, &read_model_for(&dag));
         assert!(
             report.ok,
             "Content hashes should match: {:?}",
@@ -328,7 +434,7 @@ mod tests {
         let txn = make_txn(make_date(2024, 1, 2), "Test", "");
         dag.insert(txn, false).unwrap();
 
-        let report = verify_dag(&dag);
+        let report = verify_dag(&dag, &read_model_for(&dag));
         assert!(report.ok);
         assert_eq!(report.nodes_checked, 2);
     }
@@ -344,7 +450,7 @@ mod tests {
             dag.insert(d, false).unwrap();
         }
 
-        let report = verify_dag(&dag);
+        let report = verify_dag(&dag, &read_model_for(&dag));
         assert!(report.nodes_checked > 0);
 
         // The fixture has a pre-baked parent hash in its second transaction
@@ -396,7 +502,7 @@ mod tests {
             vec![], // genesis
         );
 
-        let report = verify_dag(&dag);
+        let report = verify_dag(&dag, &read_model_for(&dag));
         assert!(!report.ok, "Should detect tamper");
         assert!(
             report.errors.iter().any(|e| matches!(
@@ -425,7 +531,7 @@ mod tests {
         let dangling_parent = "bbbb000000000000000000000000000000000000000000000000000000000000";
         dag.insert_with_fake_id(t2_real_id, t2, vec![id1, dangling_parent.to_owned()]);
 
-        let report = verify_dag(&dag);
+        let report = verify_dag(&dag, &read_model_for(&dag));
         assert!(!report.ok, "Should detect dangling parent");
         assert!(
             report.errors.iter().any(|e| matches!(
@@ -434,6 +540,186 @@ mod tests {
                 if parent == dangling_parent
             )),
             "Should report missing parent for dangling link: {:?}",
+            report.errors
+        );
+    }
+
+    // ── M-08: balance assertions are evaluated and surfaced ──────────────
+
+    #[test]
+    fn m08_verify_reports_passing_assertion() {
+        // `make_txn` posts +100 USD to Assets:Cash; the assertion agrees.
+        let mut dag = LedgerDag::new();
+        dag.insert(make_txn(make_date(2024, 1, 1), "Genesis", ""), false)
+            .unwrap();
+        dag.insert(
+            make_balance(make_date(2024, 2, 1), "Assets:Cash", dec!(100), "USD"),
+            false,
+        )
+        .unwrap();
+
+        let report = verify_dag(&dag, &read_model_for(&dag));
+        assert!(
+            report.ok,
+            "structural checks should pass: {:?}",
+            report.errors
+        );
+        assert_eq!(report.assertions.evaluated, 1);
+        assert_eq!(report.assertions.passed(), 1);
+        assert!(
+            report.assertions.ok(),
+            "a true assertion must not be reported as a failure: {:?}",
+            report.assertions.failures
+        );
+    }
+
+    #[test]
+    fn m08_verify_surfaces_failing_assertion() {
+        // M-08 regression: before the wiring, a `balance` directive was
+        // persisted by the unvalidated catch-all and never evaluated — a false
+        // claim (from a file edit or an allowlisted peer) verified clean.
+        let mut dag = LedgerDag::new();
+        dag.insert(make_txn(make_date(2024, 1, 1), "Genesis", ""), false)
+            .unwrap();
+        dag.insert(
+            make_balance(make_date(2024, 2, 1), "Assets:Cash", dec!(999), "USD"),
+            false,
+        )
+        .unwrap();
+
+        let report = verify_dag(&dag, &read_model_for(&dag));
+        assert_eq!(report.assertions.evaluated, 1);
+        assert_eq!(report.assertions.passed(), 0);
+        assert!(!report.assertions.ok());
+
+        let failure = &report.assertions.failures[0];
+        assert_eq!(failure.account, "Assets:Cash");
+        assert_eq!(failure.date, make_date(2024, 2, 1));
+        assert_eq!(failure.expected, dec!(999));
+        assert_eq!(failure.actual, dec!(100));
+        assert_eq!(failure.currency, "USD");
+        assert!(!failure.ok);
+
+        // The structural verdict is unaffected: a false claim by some writer is
+        // not DAG corruption, and must not let that writer redden every node.
+        assert!(
+            report.ok,
+            "a failing assertion must not flip the structural verdict: {:?}",
+            report.errors
+        );
+        assert!(report.errors.is_empty());
+    }
+
+    #[test]
+    fn m08_verify_reports_every_assertion_in_the_ledger() {
+        let mut dag = LedgerDag::new();
+        dag.insert(make_txn(make_date(2024, 1, 1), "Genesis", ""), false)
+            .unwrap();
+        for (number, account) in [
+            (dec!(100), "Assets:Cash"),     // true
+            (dec!(1), "Assets:Cash"),       // false
+            (dec!(0), "Assets:Unknown"),    // true (no postings → zero)
+            (dec!(-100), "Equity:Opening"), // true
+            (dec!(100), "Equity:Opening"),  // false (sign flipped)
+        ] {
+            dag.insert(
+                make_balance(make_date(2024, 2, 1), account, number, "USD"),
+                false,
+            )
+            .unwrap();
+        }
+
+        let report = verify_dag(&dag, &read_model_for(&dag));
+        assert_eq!(report.assertions.evaluated, 5);
+        assert_eq!(report.assertions.failures.len(), 2);
+        assert_eq!(report.assertions.passed(), 3);
+    }
+
+    #[test]
+    fn m08_pad_directive_is_not_synthesized_into_balances() {
+        // A `pad` names a source account to absorb the gap an assertion leaves.
+        // Evaluation is read-only reporting: the pad is not applied, so the
+        // assertion it was meant to cover still reports as failing.
+        let mut dag = LedgerDag::new();
+        dag.insert(make_txn(make_date(2024, 1, 1), "Genesis", ""), false)
+            .unwrap();
+        dag.insert(
+            Directive::Pad(Pad {
+                date: make_date(2024, 1, 15),
+                account: "Assets:Cash".to_owned(),
+                source_account: "Equity:Opening".to_owned(),
+                metadata: BTreeMap::new(),
+            }),
+            false,
+        )
+        .unwrap();
+        dag.insert(
+            make_balance(make_date(2024, 2, 1), "Assets:Cash", dec!(500), "USD"),
+            false,
+        )
+        .unwrap();
+
+        let report = verify_dag(&dag, &read_model_for(&dag));
+        assert_eq!(
+            report.assertions.evaluated, 1,
+            "the pad itself is not an assertion"
+        );
+        assert_eq!(report.assertions.failures.len(), 1);
+        assert_eq!(report.assertions.failures[0].actual, dec!(100));
+    }
+
+    #[test]
+    fn m08_extreme_assertion_values_report_cleanly() {
+        // H1/T1: the read model saturates and the assertion amount is
+        // caller-supplied, so both sides can sit at the Decimal extremes. The
+        // comparison must report a plain failure rather than panicking, on a
+        // build with overflow checks on (the release profile enables them).
+        let mut dag = LedgerDag::new();
+        dag.insert(
+            make_txn_with(
+                make_date(2024, 1, 1),
+                "Extreme",
+                &[
+                    ("Assets:Cash", Decimal::MAX),
+                    ("Equity:Opening", Decimal::MIN),
+                ],
+            ),
+            false,
+        )
+        .unwrap();
+        // A second saturating posting pushes the running balance past MAX.
+        dag.insert(
+            make_txn_with(
+                make_date(2024, 1, 2),
+                "Extreme again",
+                &[
+                    ("Assets:Cash", Decimal::MAX),
+                    ("Equity:Opening", Decimal::MIN),
+                ],
+            ),
+            false,
+        )
+        .unwrap();
+        for (account, number) in [
+            ("Assets:Cash", Decimal::MIN),
+            ("Assets:Cash", Decimal::MAX),
+            ("Equity:Opening", Decimal::MAX),
+        ] {
+            dag.insert(
+                make_balance(make_date(2024, 3, 1), account, number, "USD"),
+                false,
+            )
+            .unwrap();
+        }
+
+        let report = verify_dag(&dag, &read_model_for(&dag));
+        assert_eq!(report.assertions.evaluated, 3);
+        // Assets:Cash saturates at MAX, so only the MAX claim on it holds.
+        assert_eq!(report.assertions.passed(), 1);
+        assert_eq!(report.assertions.failures.len(), 2);
+        assert!(
+            report.ok,
+            "extremes are not DAG corruption: {:?}",
             report.errors
         );
     }

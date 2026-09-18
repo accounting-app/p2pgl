@@ -11,3 +11,4 @@
 *.secret
 identity.secret
 iroh.secret
+*.bean.lock

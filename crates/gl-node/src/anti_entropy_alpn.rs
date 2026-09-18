@@ -19,6 +19,7 @@ use crate::graphql::broadcast::TransactionBroadcast;
 use crate::graphql::query::domain_txn_to_graphql;
 use crate::graphql::SharedLedger;
 
+use ledger::validate::ValidationError;
 use p2p::allowlist::PeerAllowlist;
 use p2p::gossip::make_supply_entry;
 use p2p::orphan_buffer::OrphanBuffer;
@@ -416,7 +417,8 @@ pub(crate) struct SupplyOutcome {
     pub skipped_present: usize,
     /// Validated and newly merged into the DAG.
     pub merged: usize,
-    /// Parents missing; took the orphan-buffer path.
+    /// Parents missing, or an account not open at the entry's date (M-09);
+    /// took the orphan-buffer path.
     pub buffered: usize,
     /// `insert_remote_directive` returned `Ok(None)` (present at insert time).
     pub duplicate: usize,
@@ -552,8 +554,32 @@ async fn apply_supply_entries(
                     outcome.duplicate += 1;
                 }
                 Err(error) => {
-                    warn!(%error, "rejected remote directive from ALPN");
-                    outcome.rejected += 1;
+                    // M-09: a transaction turned away only because an account
+                    // it posts to is not open at its date is not invalid — the
+                    // `open` may simply be later in this peer's arrival order.
+                    // Buffer it exactly like a parent-missing entry and let the
+                    // post-batch drain retry it when that `open` lands. Any
+                    // other rejection is a real one.
+                    match account_wait_target(&error) {
+                        Some(account) => {
+                            let mut buffer = handler.orphan_buffer.write().await;
+                            if buffer.insert_awaiting_accounts(
+                                content_id.clone(),
+                                directive,
+                                vec![account.clone()],
+                                Some(from_peer.clone()),
+                            ) {
+                                debug!(content_id = %content_id, %account, "buffered ALPN directive awaiting an open");
+                            } else {
+                                warn!(content_id = %content_id, "orphan buffer full or per-peer quota exceeded");
+                            }
+                            outcome.buffered += 1;
+                        }
+                        None => {
+                            warn!(%error, "rejected remote directive from ALPN");
+                            outcome.rejected += 1;
+                        }
+                    }
                 }
             }
         }
@@ -594,12 +620,122 @@ async fn apply_supply_entries(
     outcome
 }
 
-/// Drain orphans whose parents have arrived. Re-checks signature and author.
+/// The re-validation context a freed orphan is put back through.
+///
+/// Bundled so [`restage_freed_entry`] stays inside clippy's argument budget.
+struct DrainContext<'a> {
+    broadcast: &'a TransactionBroadcast,
+    signing_enabled: bool,
+    allowlist: &'a PeerAllowlist,
+    mesh_id: &'a str,
+}
+
+/// The account a rejected remote directive is waiting on, when the rejection
+/// was purely an account-lifecycle verdict (M-09).
+///
+/// All three variants are answers to the SAME deterministic query — "which
+/// `open` is in force for this account at this date, and what does it allow" —
+/// and all three can be flipped by an `open` for that account arriving later:
+///
+/// * `AccountNotOpen` — no lifecycle event in force at the date yet;
+/// * `AccountClosed` — a `close` decides at the date, which a later-dated
+///   `open` can supersede;
+/// * `AccountCurrencyMismatch` — the constraint list comes from the `open` in
+///   force at the date, so a not-yet-seen `open` can be the one that allows it.
+///
+/// Everything else (unbalanced, elided, malformed, resource limits, the
+/// backdated-close guard) is a verdict on the directive itself and stays a
+/// rejection.
+fn account_wait_target(error: &ledger::service::ServiceError) -> Option<String> {
+    let ledger::service::ServiceError::Validation(validation) = error else {
+        return None;
+    };
+    match validation {
+        ValidationError::AccountNotOpen { account, .. }
+        | ValidationError::AccountClosed { account, .. }
+        | ValidationError::AccountCurrencyMismatch { account, .. } => Some(account.clone()),
+        _ => None,
+    }
+}
+
+/// What became of one freed orphan put back through validation.
+enum Restaged {
+    /// Merged into the DAG.
+    Staged,
+    /// Still blocked; back in the buffer waiting on this account (M-09).
+    Rebuffered { account: String },
+    /// Not in the buffer and not in the DAG.
+    Dropped,
+}
+
+/// Re-validate one freed orphan and stage it.
+///
+/// A freed entry that is still blocked on an account lifecycle query goes back
+/// into the buffer under its NEW blocking account (M-09) rather than being
+/// dropped — a transaction can post to several accounts, and validation reports
+/// only the first one that fails, so one release can uncover the next.
+fn restage_freed_entry(
+    buffer: &mut OrphanBuffer,
+    service: &mut ledger::service::LedgerService,
+    context: &DrainContext<'_>,
+    entry: p2p::orphan_buffer::OrphanEntry,
+    dag_ids: &mut HashSet<String>,
+) -> Restaged {
+    if let Err(error) = verify_author_allowlisted(&entry.directive, context.allowlist) {
+        warn!(%error, "rejected resolved orphan: author");
+        return Restaged::Dropped;
+    }
+    if let Err(error) =
+        verify_remote_signature(&entry.directive, context.signing_enabled, context.mesh_id)
+    {
+        warn!(%error, "rejected resolved orphan: signature");
+        return Restaged::Dropped;
+    }
+    match service.stage_remote_directive(entry.directive.clone()) {
+        Ok(Some(content_id)) => {
+            info!(content_id = %content_id, "resolved orphan directive");
+            dag_ids.insert(content_id);
+            if let ledger::model::Directive::Transaction(ref txn) = entry.directive {
+                let graphql_txn = domain_txn_to_graphql(txn, service);
+                context.broadcast.publish(graphql_txn);
+            }
+            Restaged::Staged
+        }
+        Ok(None) => Restaged::Dropped,
+        Err(error) => {
+            let Some(account) = account_wait_target(&error) else {
+                warn!(%error, "rejected resolved orphan directive");
+                return Restaged::Dropped;
+            };
+            if buffer.insert_awaiting_accounts(
+                entry.id.clone(),
+                entry.directive,
+                vec![account.clone()],
+                entry.from_peer,
+            ) {
+                debug!(content_id = %entry.id, %account, "re-buffered orphan awaiting an open");
+                Restaged::Rebuffered { account }
+            } else {
+                warn!(content_id = %entry.id, "orphan buffer full; dropped re-buffered entry");
+                Restaged::Dropped
+            }
+        }
+    }
+}
+
+/// Drain orphans whose parents have arrived, or whose account is now open
+/// (M-09). Re-checks signature and author.
 ///
 /// M-15: this STAGES each resolved orphan into memory only (no persist per
 /// orphan). The caller persists once, after the drain, covering the whole batch
 /// plus every orphan resolved here. The incremental `dag_ids` set is cloned once
 /// per drain call (which is now once per batch, not once per entry).
+///
+/// The loop terminates. Another pass runs only on real progress, which is
+/// either (a) a directive staged — monotone in a DAG this call grows only by
+/// staging — or (b) a buffered entry moving to a blocking account it has not
+/// been tried against yet in this call, which `attempted` counts at most once
+/// per (entry, account) pair.
 pub async fn drain_orphans(
     orphan_buffer: &Arc<RwLock<OrphanBuffer>>,
     service: &mut ledger::service::LedgerService,
@@ -608,45 +744,60 @@ pub async fn drain_orphans(
     allowlist: &PeerAllowlist,
     mesh_id: &str,
 ) {
+    let context = DrainContext {
+        broadcast,
+        signing_enabled,
+        allowlist,
+        mesh_id,
+    };
     let mut dag_ids = service.all_directive_ids();
     let mut buffer = orphan_buffer.write().await;
+    let mut attempted: HashSet<(String, String)> = HashSet::new();
     let mut resolved_any = true;
     while resolved_any {
         resolved_any = false;
-        let wanted = buffer.wanted_parent_ids();
-        for parent_id in wanted {
-            if dag_ids.contains(&parent_id) {
-                let freed = buffer.parent_arrived(&parent_id);
-                for entry in freed {
-                    if let Err(error) = verify_author_allowlisted(&entry.directive, allowlist) {
-                        warn!(%error, "rejected resolved orphan: author");
-                        continue;
-                    }
-                    if let Err(error) =
-                        verify_remote_signature(&entry.directive, signing_enabled, mesh_id)
-                    {
-                        warn!(%error, "rejected resolved orphan: signature");
-                        continue;
-                    }
-                    match service.stage_remote_directive(entry.directive.clone()) {
-                        Ok(Some(content_id)) => {
-                            info!(content_id = %content_id, "resolved orphan directive");
-                            dag_ids.insert(content_id);
-                            if let ledger::model::Directive::Transaction(ref txn) = entry.directive
-                            {
-                                let graphql_txn = domain_txn_to_graphql(txn, service);
-                                broadcast.publish(graphql_txn);
-                            }
-                            resolved_any = true;
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            warn!(%error, "rejected resolved orphan directive");
-                        }
-                    }
-                }
+
+        for parent_id in buffer.wanted_parent_ids() {
+            if !dag_ids.contains(&parent_id) {
+                continue;
+            }
+            for entry in buffer.parent_arrived(&parent_id) {
+                let entry_id = entry.id.clone();
+                let outcome =
+                    restage_freed_entry(&mut buffer, service, &context, entry, &mut dag_ids);
+                resolved_any |= made_progress(outcome, entry_id, &mut attempted);
             }
         }
+
+        // M-09: an `open` for a waited-on account may have landed in this
+        // batch, or via an orphan resolved just above.
+        for account in buffer.wanted_accounts() {
+            if !service.accounts().has_open(&account) {
+                continue;
+            }
+            for entry in buffer.account_opened(&account) {
+                let entry_id = entry.id.clone();
+                let outcome =
+                    restage_freed_entry(&mut buffer, service, &context, entry, &mut dag_ids);
+                resolved_any |= made_progress(outcome, entry_id, &mut attempted);
+            }
+        }
+    }
+}
+
+/// Whether a restage attempt justifies another drain pass. See [`drain_orphans`].
+fn made_progress(
+    outcome: Restaged,
+    entry_id: String,
+    attempted: &mut HashSet<(String, String)>,
+) -> bool {
+    match outcome {
+        Restaged::Staged => true,
+        // A new (entry, blocking account) pair means the release uncovered a
+        // different unmet dependency — worth one more pass. A pair already seen
+        // means the entry is going in circles, and does not.
+        Restaged::Rebuffered { account } => attempted.insert((entry_id, account)),
+        Restaged::Dropped => false,
     }
 }
 
@@ -1963,7 +2114,8 @@ pub(crate) mod tests {
             .expect("open food");
         let txn1 = source
             .append_transaction(balanced_funding_input())
-            .expect("append txn1");
+            .expect("append txn1")
+            .txid;
         let txn2 = source
             .append_transaction(TransactionInput {
                 date: NaiveDate::from_ymd_opt(2024, 1, 20).expect("valid date"),
@@ -1993,7 +2145,8 @@ pub(crate) mod tests {
                     },
                 ],
             })
-            .expect("append txn2");
+            .expect("append txn2")
+            .txid;
         SeededSource {
             source,
             open_cash,
@@ -2196,5 +2349,428 @@ pub(crate) mod tests {
         );
         assert_eq!(outcome.rejected, 0);
         assert_eq!(sink.read().await.directive_count(), 1);
+    }
+
+    // ─── T29 / M-09 — deterministic account lifecycle ─────────────────────
+
+    /// A balanced `account`/`Equity:Opening` transaction.
+    fn lifecycle_txn(
+        account: &str,
+        on: NaiveDate,
+        amount: rust_decimal::Decimal,
+    ) -> TransactionInput {
+        TransactionInput {
+            date: on,
+            flag: Flag::Complete,
+            payee: Some("Acme".to_owned()),
+            narration: Some(format!("{account} {on}")),
+            tags: Vec::new(),
+            links: Vec::new(),
+            postings: vec![
+                PostingInput {
+                    account: account.to_owned(),
+                    amount: Some(Amount {
+                        number: amount,
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                },
+                PostingInput {
+                    account: "Equity:Opening".to_owned(),
+                    amount: Some(Amount {
+                        number: -amount,
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                },
+            ],
+        }
+    }
+
+    fn day(month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2024, month, day).expect("valid date")
+    }
+
+    /// The M-09 permutation fixture, built entirely through the LOCAL write API
+    /// so every directive in it is one an honest node would actually produce.
+    ///
+    /// It covers each shape the finding names:
+    /// * `Assets:Cash` — opened, transacted, closed, then re-opened and
+    ///   re-closed: TWO conflicting open/close pairs on one account, each with
+    ///   its own date and its own Lamport stamp.
+    /// * `Assets:Bank` — a second account interleaved with the first, with its
+    ///   own transaction between its open and its close.
+    /// * `Equity:Opening` — open for the whole window, posted to by both
+    ///   transactions.
+    /// * The transactions are the ones whose `open` can arrive LATER: an
+    ///   `open` is never a DAG head (see `LedgerDag::insert`), so it is never a
+    ///   transaction's parent, and the orphan buffer's parent index cannot help
+    ///   here. That is precisely the M-09 gap.
+    ///
+    /// Every `close` is dated at or after every transaction on its account, so
+    /// the backdated-close guard can never fire — which keeps this set free of
+    /// the documented directive-set residual and lets the test demand an
+    /// IDENTICAL accepted set from every order.
+    fn seed_lifecycle_source(dir: &std::path::Path, author: &str) -> (LedgerService, Vec<String>) {
+        let mut source = LedgerService::boot(dir.join("lifecycle-source.bean"), author.to_owned())
+            .expect("boot lifecycle source");
+        // Creation order IS the canonical (date, type-priority) order.
+        let ids = vec![
+            source
+                .open_account("Equity:Opening".to_owned(), day(1, 1), Vec::new())
+                .expect("open equity"),
+            source
+                .open_account("Assets:Cash".to_owned(), day(1, 1), vec!["USD".to_owned()])
+                .expect("open cash"),
+            source
+                .open_account("Assets:Bank".to_owned(), day(1, 1), vec!["USD".to_owned()])
+                .expect("open bank"),
+            source
+                .append_transaction(lifecycle_txn("Assets:Cash", day(1, 15), dec!(100)))
+                .expect("cash txn")
+                .txid,
+            source
+                .close_account("Assets:Cash".to_owned(), day(2, 1))
+                .expect("close cash"),
+            source
+                .open_account("Assets:Cash".to_owned(), day(3, 1), vec!["USD".to_owned()])
+                .expect("re-open cash"),
+            source
+                .close_account("Assets:Cash".to_owned(), day(4, 1))
+                .expect("re-close cash"),
+            source
+                .append_transaction(lifecycle_txn("Assets:Bank", day(6, 1), dec!(250)))
+                .expect("bank txn")
+                .txid,
+            source
+                .close_account("Assets:Bank".to_owned(), day(12, 31))
+                .expect("close bank"),
+        ];
+
+        (source, ids)
+    }
+
+    /// Everything a replica must agree on, whatever order it saw the set in.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ConvergedState {
+        directive_ids: Vec<String>,
+        /// `(account, probe date, open?)` over a probe grid, plus the account's
+        /// "currently open" verdict at the sentinel date `9999-12-31`.
+        lifecycle: Vec<(String, NaiveDate, bool)>,
+        balances: Vec<(String, Option<ledger::read_model::AccountBalanceEntry>)>,
+        file_bytes: Vec<u8>,
+    }
+
+    const PROBE_ACCOUNTS: [&str; 3] = ["Assets:Cash", "Assets:Bank", "Equity:Opening"];
+
+    async fn converged_state(ledger: &SharedLedger, path: &std::path::Path) -> ConvergedState {
+        let svc = ledger.read().await;
+        let mut directive_ids: Vec<String> = svc.all_directive_ids().into_iter().collect();
+        directive_ids.sort();
+
+        let mut lifecycle = Vec::new();
+        let mut balances = Vec::new();
+        for account in PROBE_ACCOUNTS {
+            for month in 1..=12u32 {
+                let probe = day(month, 10);
+                lifecycle.push((
+                    account.to_owned(),
+                    probe,
+                    svc.accounts().is_open_at(account, probe),
+                ));
+            }
+            // The date-free "currently open" verdict the local guards ask for.
+            lifecycle.push((
+                account.to_owned(),
+                NaiveDate::from_ymd_opt(9999, 12, 31).expect("sentinel"),
+                svc.accounts().is_open(account),
+            ));
+            balances.push((
+                account.to_owned(),
+                svc.read_model().account_balance(account, None),
+            ));
+        }
+
+        ConvergedState {
+            directive_ids,
+            lifecycle,
+            balances,
+            file_bytes: std::fs::read(path).expect("read sink file"),
+        }
+    }
+
+    /// Apply one arrival order through the real remote path and snapshot it.
+    async fn apply_order(
+        dir: &std::path::Path,
+        label: &str,
+        allow: &PeerAllowlist,
+        entries: Vec<p2p::protocol::SupplyEntry>,
+    ) -> ConvergedState {
+        let path = dir.join(format!("sink-{label}.bean"));
+        let sink: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(path.clone(), "sink".to_owned()).expect("boot sink"),
+        ));
+        let handler = make_handler(sink.clone(), allow.clone());
+        let remote = iroh::SecretKey::generate().public();
+        apply_supply_entries(&handler, entries, remote).await;
+        converged_state(&sink, &path).await
+    }
+
+    /// Deterministic xorshift64* — a seeded shuffle with no extra dependency,
+    /// so a failing permutation is reproducible from the seed alone.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn next_below(&mut self, bound: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % bound as u64) as usize
+        }
+
+        fn shuffle<T>(&mut self, items: &mut [T]) {
+            for index in (1..items.len()).rev() {
+                let other = self.next_below(index + 1);
+                items.swap(index, other);
+            }
+        }
+    }
+
+    /// T29 MONEY TEST (M-09) — permutation convergence.
+    ///
+    /// The same directive set, delivered through the real remote path
+    /// (`apply_supply_entries`: validate → stage → buffer → drain → one
+    /// persist) in many different arrival orders, must leave every replica with
+    /// the same accepted directive set, the same account lifecycle verdicts at
+    /// every probe date, the same balances, and a BYTE-IDENTICAL `.bean` file.
+    ///
+    /// Before T29 this failed: a transaction whose account's `open` had not
+    /// arrived yet was rejected outright and never retried (the orphan buffer
+    /// only ever waited on parents, and an `open` is never a parent), so the
+    /// accepted set depended on arrival order and stayed different forever.
+    #[tokio::test]
+    async fn lifecycle_converges_under_every_arrival_order() {
+        let author = iroh::SecretKey::generate().public();
+        let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+
+        let (source, ids) = seed_lifecycle_source(temp_dir.path(), &author.to_string());
+        let sorted: Vec<p2p::protocol::SupplyEntry> =
+            ids.iter().map(|id| entry_for(&source, id)).collect();
+        assert_eq!(sorted.len(), 9, "the fixture shape is what the test claims");
+
+        // The canonical (creation) order is the reference every other order
+        // must match.
+        let reference = apply_order(temp_dir.path(), "sorted", &allow, sorted.clone()).await;
+        assert_eq!(
+            reference.directive_ids.len(),
+            9,
+            "the reference order must accept the whole set"
+        );
+
+        let mut orders: Vec<(String, Vec<p2p::protocol::SupplyEntry>)> = Vec::new();
+        let mut reversed = sorted.clone();
+        reversed.reverse();
+        orders.push(("reversed".to_owned(), reversed));
+        // 64 seeded shuffles: 9! = 362,880 orders is too many to enumerate, and
+        // the seeds make any failure reproducible.
+        for seed in 1..=64u64 {
+            let mut shuffled = sorted.clone();
+            Xorshift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1).shuffle(&mut shuffled);
+            orders.push((format!("seed-{seed}"), shuffled));
+        }
+
+        for (label, entries) in orders {
+            let state = apply_order(temp_dir.path(), &label, &allow, entries).await;
+            assert_eq!(
+                state.directive_ids, reference.directive_ids,
+                "order {label}: accepted directive set diverged"
+            );
+            assert_eq!(
+                state.lifecycle, reference.lifecycle,
+                "order {label}: account lifecycle state diverged"
+            );
+            assert_eq!(
+                state.balances, reference.balances,
+                "order {label}: balances diverged"
+            );
+            assert_eq!(
+                state.file_bytes, reference.file_bytes,
+                "order {label}: persisted .bean file is not byte-identical"
+            );
+        }
+    }
+
+    /// T29 (M-09) — a transaction whose account `open` arrives LATER in the
+    /// batch is buffered, then drained to ACCEPTANCE by the post-batch drain.
+    ///
+    /// An `open` is never a DAG head, so it is never a transaction's parent:
+    /// before T29 nothing buffered this entry and it was rejected outright.
+    #[tokio::test]
+    async fn txn_before_its_account_open_is_buffered_then_drained() {
+        let author = iroh::SecretKey::generate().public();
+        let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+
+        let seeded = seed_mixed_source(temp_dir.path(), &author.to_string());
+        // The genesis transaction first, its accounts' opens after it.
+        let entries = vec![
+            entry_for(&seeded.source, &seeded.txn1),
+            entry_for(&seeded.source, &seeded.open_cash),
+            entry_for(&seeded.source, &seeded.open_equity),
+        ];
+
+        let sink_path = temp_dir.path().join("sink.bean");
+        let sink: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(sink_path, "sink".to_owned()).expect("boot sink"),
+        ));
+        let handler = make_handler(sink.clone(), allow);
+        let remote = iroh::SecretKey::generate().public();
+
+        let outcome = apply_supply_entries(&handler, entries, remote).await;
+        assert_eq!(
+            outcome.buffered, 1,
+            "the transaction waits for its account's open, it is not rejected"
+        );
+        assert_eq!(outcome.rejected, 0, "nothing is rejected");
+        assert_eq!(outcome.merged, 2, "the two opens merge directly");
+
+        let svc = sink.read().await;
+        assert!(
+            svc.get_directive(&seeded.txn1).is_some(),
+            "the drain accepted the once-buffered transaction"
+        );
+        assert_eq!(svc.directive_count(), 3);
+        assert!(
+            handler.orphan_buffer.read().await.is_empty(),
+            "nothing is left waiting"
+        );
+    }
+
+    /// T29 (M-09) — the write-DoS. A remote `close` dated before transactions
+    /// already on that account is REJECTED, and local appends keep working.
+    ///
+    /// Before T29 the close was applied unconditionally with its error
+    /// swallowed (`let _ =`), which shut the account on every replica and made
+    /// every subsequent local append to it fail forever.
+    #[tokio::test]
+    async fn backdated_remote_close_is_rejected_and_appends_keep_working() {
+        let author = iroh::SecretKey::generate().public();
+        let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+
+        // The victim: opens + a 2024-01-15 transaction on Assets:Cash.
+        let seeded = seed_mixed_source(temp_dir.path(), &author.to_string());
+        let sink_path = temp_dir.path().join("sink.bean");
+        let sink: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(sink_path, "sink".to_owned()).expect("boot sink"),
+        ));
+        let handler = make_handler(sink.clone(), allow);
+        let remote = iroh::SecretKey::generate().public();
+        let seeded_entries = vec![
+            entry_for(&seeded.source, &seeded.open_cash),
+            entry_for(&seeded.source, &seeded.open_equity),
+            entry_for(&seeded.source, &seeded.open_food),
+            entry_for(&seeded.source, &seeded.txn1),
+        ];
+        assert_eq!(
+            apply_supply_entries(&handler, seeded_entries, remote)
+                .await
+                .merged,
+            4
+        );
+
+        // The attacker: a node holding no transactions can legitimately close
+        // Assets:Cash at 1970-01-01 through its own local API — that is what
+        // makes this reachable with one allowlisted peer and no forgery.
+        let mut attacker =
+            LedgerService::boot(temp_dir.path().join("attacker.bean"), author.to_string())
+                .expect("boot attacker");
+        attacker
+            .open_account(
+                "Assets:Cash".to_owned(),
+                NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid date"),
+                vec!["USD".to_owned()],
+            )
+            .expect("attacker opens cash");
+        let poison = attacker
+            .close_account(
+                "Assets:Cash".to_owned(),
+                NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid date"),
+            )
+            .expect("attacker's own close is legal on its own ledger");
+
+        let outcome =
+            apply_supply_entries(&handler, vec![entry_for(&attacker, &poison)], remote).await;
+        assert_eq!(outcome.rejected, 1, "the backdated close is rejected");
+        assert_eq!(outcome.merged, 0);
+        assert_eq!(outcome.buffered, 0, "a bad close is not buffered for retry");
+
+        let mut svc = sink.write().await;
+        assert!(
+            svc.get_directive(&poison).is_none(),
+            "the rejected close never reaches the DAG"
+        );
+        assert!(
+            svc.accounts().is_open("Assets:Cash"),
+            "the account is still open"
+        );
+        // The M-09 consequence that mattered: local writes still work.
+        svc.append_transaction(lifecycle_txn(
+            "Assets:Cash",
+            NaiveDate::from_ymd_opt(2024, 2, 1).expect("valid date"),
+            dec!(42),
+        ))
+        .expect("local append after the poison close must still succeed");
+    }
+
+    /// T29 (M-09) — a remote close that does NOT predate the account's
+    /// transactions is still accepted. The guard is targeted, not a blanket
+    /// refusal of remote closes.
+    #[tokio::test]
+    async fn forward_dated_remote_close_is_accepted() {
+        let author = iroh::SecretKey::generate().public();
+        let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+
+        let mut source =
+            LedgerService::boot(temp_dir.path().join("source.bean"), author.to_string())
+                .expect("boot source");
+        let open_equity = source
+            .open_account("Equity:Opening".to_owned(), day(1, 1), Vec::new())
+            .expect("open equity");
+        let open_cash = source
+            .open_account("Assets:Cash".to_owned(), day(1, 1), vec!["USD".to_owned()])
+            .expect("open cash");
+        let txn = source
+            .append_transaction(lifecycle_txn("Assets:Cash", day(1, 15), dec!(100)))
+            .expect("txn")
+            .txid;
+        let close = source
+            .close_account("Assets:Cash".to_owned(), day(6, 1))
+            .expect("close cash");
+
+        let sink: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("sink.bean"), "sink".to_owned())
+                .expect("boot sink"),
+        ));
+        let handler = make_handler(sink.clone(), allow);
+        let remote = iroh::SecretKey::generate().public();
+        let entries = [&open_equity, &open_cash, &txn, &close]
+            .iter()
+            .map(|id| entry_for(&source, id))
+            .collect();
+
+        let outcome = apply_supply_entries(&handler, entries, remote).await;
+        assert_eq!(outcome.merged, 4, "a well-dated close merges");
+        assert_eq!(outcome.rejected, 0);
+        let svc = sink.read().await;
+        assert!(!svc.accounts().is_open("Assets:Cash"));
+        assert!(
+            svc.accounts().is_open_at("Assets:Cash", day(1, 15)),
+            "the close does not retroactively invalidate the earlier transaction"
+        );
     }
 }

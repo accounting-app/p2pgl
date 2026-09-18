@@ -6,6 +6,7 @@ mod fetch_coordinator;
 mod graphql;
 mod health;
 mod http_server;
+mod ledger_lock;
 mod p2p_service;
 mod rate_limit;
 mod request_guard;
@@ -135,6 +136,30 @@ async fn main() {
             }
         }
     }
+
+    // Claim the ledger for this process before touching it (M-17). Two nodes on
+    // one .bean hold independent DAGs and rewrite the whole file per persist, so
+    // the later writer silently discards the other's directives — fail closed
+    // instead. The guard is bound for the whole of `main`: dropping it, or the
+    // process dying, releases the lock, so a crash never wedges the ledger.
+    //
+    // Deliberately here and not inside `LedgerService::boot`: `persist_or_reload`
+    // recovers from a failed persist by re-booting the same path, and an
+    // flock-style lock conflicts across descriptors even within one process, so
+    // a boot-level lock would refuse its own reload. See `ledger_lock` for the
+    // full rationale. Taken before the empty-.bean creation below so even that
+    // first write is serialized.
+    let _ledger_lock = match ledger_lock::acquire(&ledger_path) {
+        Ok(guard) => {
+            info!(lock = %guard.path().display(), "ledger lock acquired");
+            guard
+        }
+        Err(error) => {
+            error!(%error, "failed to lock ledger file — aborting");
+            std::process::exit(1);
+        }
+    };
+
     if !ledger_path.exists() {
         info!(path = %ledger_path.display(), "ledger file not found — creating empty .bean");
         if let Err(error) = std::fs::write(&ledger_path, "") {
@@ -301,13 +326,33 @@ async fn main() {
         info!("TLS assumed terminated at the host or reverse proxy (in-process TLS is not implemented)");
     }
 
-    let application = build_application(
+    // Rate limiter keyed on the real client (M-04). With no trusted proxy the
+    // key is the TCP peer, which behind a terminator is the proxy itself — one
+    // bucket for every client at once — so say so loudly rather than silently
+    // rate-limiting the whole internet as a single caller.
+    let trusted_proxies = config.trusted_proxy_set();
+    if trusted_proxies.is_empty() {
+        if config.tls.mode == "terminated" {
+            warn!(
+                "trustedProxies is empty while tls.mode is \"terminated\" — every client behind the proxy shares one rate-limit bucket (M-04); list the proxy address(es) in trustedProxies"
+            );
+        }
+    } else {
+        info!(
+            proxies = trusted_proxies.len(),
+            "X-Forwarded-For trusted from configured reverse proxies (rightmost untrusted entry wins)"
+        );
+    }
+    let rate_limiter = RateLimiter::graphql().with_trusted_proxies(trusted_proxies);
+
+    let application = build_application_with_limiter(
         schema,
         auth_state,
         health_state,
         guard_state,
         config.cors_layer(),
         config.graphiql_enabled(),
+        rate_limiter,
     );
 
     // Bind and serve.
@@ -358,13 +403,13 @@ async fn main() {
     info!("gl-node shut down gracefully");
 }
 
-/// Assemble the full application router.
+/// Assemble the application with a default limiter (no trusted proxies).
 ///
-/// Layer order, outermost first: CORS, body limit (H-05), rate-limiter
-/// extension, then — on the GraphQL routes only — the request guard (H-01),
-/// the rate limiter and auth. The guard is outermost among those so a rejected
-/// Host, Content-Type or Origin never reaches the limiter or the schema.
-/// `/health` stays outside the guard and outside auth (§2.9).
+/// Test-only entry point kept at the pre-M-04 arity so the router-level tests in
+/// `request_guard` and `http_server` keep assembling the *real* router;
+/// production goes through [`build_application_with_limiter`] with the limiter
+/// built from `trustedProxies`.
+#[cfg(test)]
 pub(crate) fn build_application(
     schema: AppSchema,
     auth_state: AuthState,
@@ -372,6 +417,36 @@ pub(crate) fn build_application(
     guard_state: RequestGuardState,
     cors: CorsLayer,
     graphiql: bool,
+) -> Router {
+    build_application_with_limiter(
+        schema,
+        auth_state,
+        health_state,
+        guard_state,
+        cors,
+        graphiql,
+        RateLimiter::graphql(),
+    )
+}
+
+/// Assemble the full application router.
+///
+/// Layer order, outermost first: CORS, body limit (H-05), rate-limiter
+/// extension, then — on the GraphQL routes only — the request guard (H-01),
+/// the rate limiter and auth. The guard is outermost among those so a rejected
+/// Host, Content-Type or Origin never reaches the limiter or the schema.
+/// `/health` stays outside the guard and outside auth (§2.9).
+///
+/// `limiter` carries the trusted-proxy set, so how a client is identified is a
+/// boot-time decision rather than a per-request one (M-04).
+pub(crate) fn build_application_with_limiter(
+    schema: AppSchema,
+    auth_state: AuthState,
+    health_state: HealthState,
+    guard_state: RequestGuardState,
+    cors: CorsLayer,
+    graphiql: bool,
+    limiter: RateLimiter,
 ) -> Router {
     // GraphQL routes — POST always; GraphiQL on GET only when enabled.
     let graphql_router = if graphiql {
@@ -397,7 +472,7 @@ pub(crate) fn build_application(
         .route("/health", get(health_handler))
         .with_state(health_state)
         .merge(graphql_routes)
-        .layer(Extension(RateLimiter::graphql()))
+        .layer(Extension(limiter))
         .layer(RequestBodyLimitLayer::new(GRAPHQL_MAX_BODY_BYTES))
         .layer(cors)
 }

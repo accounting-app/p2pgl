@@ -1,3 +1,10 @@
+# Run each of these in its own shell. Every config below points at a DIFFERENT
+# ledgerPath (test-ledger.bean, test-ledger-0/1/2.bean) on purpose: a node takes
+# an exclusive lock on its ledger at startup (M-17), because two nodes sharing
+# one .bean each rewrite the whole file and silently discard the other's
+# directives. Pointing two configs at one path now fails closed at startup with
+# a message naming the file — that is the fix working, not a bug.
+
 GL_NODE_CONFIG="./config/gl-node.json" cargo run -p gl-node
 
 GL_NODE_CONFIG="./config/gl-node.peer-0.json" cargo run -p gl-node

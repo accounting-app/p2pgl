@@ -1,4 +1,4 @@
 {
-    "ledgerPath": "test-ledger.bean",
+    "ledgerPath": "test-ledger-0.bean",
     "port": 5000
 }

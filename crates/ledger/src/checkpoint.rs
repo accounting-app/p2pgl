@@ -1,8 +1,17 @@
 //! Balance assertions and pad generation (§3.6).
 //!
-//! - Balance assertions are evaluated at quiescent checkpoint boundaries.
-//! - Pad directives generate deterministic transactions to reconcile balances.
-//! - Failed assertions are reported, never used to reject transactions.
+//! - Balance assertions are evaluated by [`crate::verify::verify_dag`] over the
+//!   whole directive set, and surfaced through the GraphQL `verify` query
+//!   (M-08). Before that wiring, `balance` directives were persisted by the
+//!   unvalidated catch-all and never evaluated, so the file format advertised
+//!   an integrity check that did nothing.
+//! - Failed assertions are reported, never used to reject transactions (§3.6),
+//!   and never used to mutate state: a `balance` line is an author's claim, and
+//!   a claim from an allowlisted peer is no more authoritative than any other.
+//! - Pad synthesis ([`generate_pad_transaction`] / [`generate_all_pads`]) is
+//!   deliberately **not** wired into the verify path: it invents transactions,
+//!   which is a state change rather than a report. Assertion evaluation
+//!   therefore ignores pads entirely.
 
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
@@ -30,8 +39,18 @@ pub struct AssertionResult {
 
 /// Evaluate a balance assertion against the read model.
 ///
-/// Per §3.6: assertions are informational — failed ones are reported, never
-/// used to reject transactions.
+/// Semantics (and how they differ from beancount):
+/// - A `balance` directive asserts that `account` holds exactly
+///   `amount.number` of `amount.currency` **on** `date` — the read model sums
+///   every transaction with `date <= the assertion date` (see
+///   `ReadModel::balances_at`). Beancount instead asserts the balance at the
+///   *start* of the day, before that day's postings; an assertion dated the
+///   same day as a posting therefore evaluates differently here.
+/// - Only the asserted currency is compared; other currencies held by the
+///   account are ignored. An account with no postings reads as `0`, so
+///   `balance Assets:Unknown 0 USD` passes.
+/// - Evaluation is **read-only reporting**: per §3.6 a failed assertion is
+///   surfaced (see `crate::verify`), never used to reject or mutate anything.
 pub fn evaluate_balance_assertion(balance: &Balance, read_model: &ReadModel) -> AssertionResult {
     let actual = read_model
         .account_balance(&balance.account, Some(balance.date))
@@ -117,15 +136,25 @@ pub fn generate_pad_transaction(
     })
 }
 
-/// Evaluate all balance assertions in a set of directives.
+/// Evaluate every balance assertion in a set of directives (§3.6).
 ///
-/// Returns the assertion results for reporting.
-pub fn evaluate_all_assertions(
-    directives: &[Directive],
-    read_model: &ReadModel,
-) -> Vec<AssertionResult> {
+/// One [`AssertionResult`] per `balance` directive, in directive order, with
+/// the per-assertion semantics documented on [`evaluate_balance_assertion`].
+/// Directives of other kinds — `pad` included — are skipped: pads are never
+/// synthesized into the read model here, so an assertion whose gap a `pad`
+/// directive is meant to cover still reports as a failure.
+///
+/// Read-only: nothing is mutated and nothing is rejected. The caller
+/// ([`crate::verify::verify_dag`]) reports the results.
+///
+/// Takes any iterator of directive references so the DAG's borrowed view
+/// (`LedgerDag::directives()`) can be evaluated without cloning the ledger.
+pub fn evaluate_all_assertions<'a, I>(directives: I, read_model: &ReadModel) -> Vec<AssertionResult>
+where
+    I: IntoIterator<Item = &'a Directive>,
+{
     directives
-        .iter()
+        .into_iter()
         .filter_map(|d| {
             if let Directive::Balance(b) = d {
                 Some(evaluate_balance_assertion(b, read_model))
@@ -406,6 +435,57 @@ mod tests {
 
         let txn = generate_pad_transaction(&pad, &balance, &model);
         assert!(txn.is_none(), "No pad needed when delta = 0");
+    }
+
+    #[test]
+    fn test_pad_generation_extreme_values_no_panic() {
+        // H1: both operands of the delta can sit at the Decimal extremes — the
+        // read model saturates and the asserted amount is caller-supplied — so
+        // the subtraction must be checked. An overflowing delta means an absurd
+        // assertion: synthesize nothing rather than panic.
+        let directives = vec![make_txn(
+            make_date(2024, 1, 15),
+            "Saturated",
+            vec![
+                ("Assets:Cash", Decimal::MIN, "USD"),
+                ("Equity:Opening", Decimal::MAX, "USD"),
+            ],
+        )];
+        let model = ReadModel::build(&directives);
+
+        let pad = Pad {
+            date: make_date(2024, 1, 1),
+            account: "Assets:Cash".to_owned(),
+            source_account: "Equity:Opening".to_owned(),
+            metadata: BTreeMap::new(),
+        };
+        let balance = Balance {
+            date: make_date(2024, 2, 1),
+            account: "Assets:Cash".to_owned(),
+            amount: Amount {
+                number: Decimal::MAX,
+                currency: "USD".to_owned(),
+            },
+            metadata: BTreeMap::new(),
+        };
+
+        // MAX − MIN overflows: no pad, no panic.
+        assert!(generate_pad_transaction(&pad, &balance, &model).is_none());
+
+        // Same through the whole-ledger entry point, with the pad and balance
+        // present so the pairing actually reaches the subtraction.
+        let with_pad = [
+            directives[0].clone(),
+            Directive::Pad(pad.clone()),
+            Directive::Balance(balance.clone()),
+        ];
+        assert!(generate_all_pads(&with_pad, &model).is_empty());
+
+        // The assertion itself still evaluates — reporting never overflows.
+        let result = evaluate_balance_assertion(&balance, &model);
+        assert!(!result.ok);
+        assert_eq!(result.actual, Decimal::MIN);
+        assert_eq!(result.expected, Decimal::MAX);
     }
 
     // ── Evaluate all assertions ──────────────────────────────────────────

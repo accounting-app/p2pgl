@@ -1,9 +1,20 @@
 //! Orphan buffer (§3.4.4).
 //!
-//! Buffers transactions whose parent txids are not yet in the local DAG.
+//! Buffers transactions that cannot be applied yet:
+//! - their parent txids are not in the local DAG, or
+//! - an account they post to is not open at their date (M-09).
+//!
 //! - Max 10,000 entries or 1 hour TTL, whichever first.
-//! - On parent arrival, re-attempt insert.
+//! - On parent arrival — or on an `open` for a waited-on account — re-attempt
+//!   the insert.
 //! - Emits `want` for missing parent IDs.
+//!
+//! Both wait reasons share ONE buffer, and therefore one set of budgets: the
+//! global and per-peer entry counts, the global and per-peer byte budgets
+//! (0820-L8) and the TTL. A separate account-wait buffer would have doubled the
+//! resident-memory ceiling a peer can pin and would have needed every one of
+//! those budgets re-implemented — a fresh M-05 for the price of avoiding one
+//! extra index.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -36,12 +47,21 @@ pub struct OrphanEntry {
     pub directive: Directive,
     /// The parent txids that are currently missing.
     pub missing_parents: Vec<String>,
+    /// Accounts whose `open` this entry is waiting for (M-09).
+    pub missing_accounts: Vec<String>,
     /// When this orphan was first buffered.
     pub buffered_at: Instant,
     /// Gossip sender that delivered this orphan, when known.
     pub from_peer: Option<String>,
     /// Serialized size of the economic body, counted against the byte budgets.
     size_bytes: usize,
+}
+
+impl OrphanEntry {
+    /// Whether every reason this entry was buffered has been resolved.
+    fn is_ready(&self) -> bool {
+        self.missing_parents.is_empty() && self.missing_accounts.is_empty()
+    }
 }
 
 /// The orphan buffer.
@@ -51,6 +71,8 @@ pub struct OrphanBuffer {
     entries: HashMap<String, OrphanEntry>,
     /// Reverse index: parent_id → [orphan_id]. For fast lookup on parent arrival.
     waiting_on: HashMap<String, HashSet<String>>,
+    /// Reverse index: account → [orphan_id], for lookup on `open` arrival (M-09).
+    waiting_on_account: HashMap<String, HashSet<String>>,
     /// Count of buffered orphans per delivering peer.
     peer_counts: HashMap<String, usize>,
     /// Buffered body bytes per delivering peer (0820-L8).
@@ -68,6 +90,7 @@ impl OrphanBuffer {
         OrphanBuffer {
             entries: HashMap::new(),
             waiting_on: HashMap::new(),
+            waiting_on_account: HashMap::new(),
             peer_counts: HashMap::new(),
             peer_bytes: HashMap::new(),
             total_bytes: 0,
@@ -86,13 +109,39 @@ impl OrphanBuffer {
         }
     }
 
-    /// Buffer an orphan. Returns false if a global or per-peer budget
-    /// (entry count or bytes) is exhausted.
+    /// Buffer an orphan waiting for missing parents. Returns false if a global
+    /// or per-peer budget (entry count or bytes) is exhausted.
     pub fn insert(
         &mut self,
         id: String,
         directive: Directive,
         missing_parents: Vec<String>,
+        from_peer: Option<String>,
+    ) -> bool {
+        self.insert_waiting(id, directive, missing_parents, Vec::new(), from_peer)
+    }
+
+    /// Buffer an orphan waiting for an `open` on each of `missing_accounts`
+    /// (M-09). Same budgets and TTL as the parent-wait path.
+    pub fn insert_awaiting_accounts(
+        &mut self,
+        id: String,
+        directive: Directive,
+        missing_accounts: Vec<String>,
+        from_peer: Option<String>,
+    ) -> bool {
+        self.insert_waiting(id, directive, Vec::new(), missing_accounts, from_peer)
+    }
+
+    /// Buffer an orphan waiting on any mix of parents and accounts. Returns
+    /// false if a global or per-peer budget (entry count or bytes) is
+    /// exhausted.
+    pub fn insert_waiting(
+        &mut self,
+        id: String,
+        directive: Directive,
+        missing_parents: Vec<String>,
+        missing_accounts: Vec<String>,
         from_peer: Option<String>,
     ) -> bool {
         // Evict expired entries first.
@@ -125,10 +174,16 @@ impl OrphanBuffer {
             return true;
         }
 
-        // Build reverse index.
+        // Build reverse indexes.
         for parent in &missing_parents {
             self.waiting_on
                 .entry(parent.clone())
+                .or_default()
+                .insert(id.clone());
+        }
+        for account in &missing_accounts {
+            self.waiting_on_account
+                .entry(account.clone())
                 .or_default()
                 .insert(id.clone());
         }
@@ -145,6 +200,7 @@ impl OrphanBuffer {
                 id,
                 directive,
                 missing_parents,
+                missing_accounts,
                 buffered_at: Instant::now(),
                 from_peer,
                 size_bytes,
@@ -155,31 +211,63 @@ impl OrphanBuffer {
     }
 
     /// Notify the buffer that a parent ID has arrived.
-    /// Returns any orphans that now have all parents resolved.
+    /// Returns any orphans that are now fully resolved.
     pub fn parent_arrived(&mut self, parent_id: &str) -> Vec<OrphanEntry> {
+        let Some(orphan_ids) = self.waiting_on.remove(parent_id) else {
+            return Vec::new();
+        };
+        self.release_resolved(orphan_ids, |entry| {
+            entry.missing_parents.retain(|p| p != parent_id)
+        })
+    }
+
+    /// Notify the buffer that an `open` for `account` is now in the DAG (M-09).
+    /// Returns any orphans that are now fully resolved.
+    pub fn account_opened(&mut self, account: &str) -> Vec<OrphanEntry> {
+        let Some(orphan_ids) = self.waiting_on_account.remove(account) else {
+            return Vec::new();
+        };
+        self.release_resolved(orphan_ids, |entry| {
+            entry.missing_accounts.retain(|a| a != account)
+        })
+    }
+
+    /// Drop one wait reason from each named entry and hand back those that are
+    /// now ready. An entry blocked on several reasons stays until the last one
+    /// clears.
+    fn release_resolved(
+        &mut self,
+        orphan_ids: HashSet<String>,
+        mut clear_reason: impl FnMut(&mut OrphanEntry),
+    ) -> Vec<OrphanEntry> {
         let mut resolved = Vec::new();
-
-        if let Some(orphan_ids) = self.waiting_on.remove(parent_id) {
-            for orphan_id in orphan_ids {
-                if let Some(entry) = self.entries.get_mut(&orphan_id) {
-                    entry.missing_parents.retain(|p| p != parent_id);
-
-                    if entry.missing_parents.is_empty() {
-                        if let Some(entry) = self.entries.remove(&orphan_id) {
-                            self.release_entry_accounting(&entry);
-                            resolved.push(entry);
-                        }
-                    }
-                }
+        for orphan_id in orphan_ids {
+            let Some(entry) = self.entries.get_mut(&orphan_id) else {
+                continue;
+            };
+            clear_reason(entry);
+            if !entry.is_ready() {
+                continue;
+            }
+            if let Some(entry) = self.entries.remove(&orphan_id) {
+                self.release_entry_accounting(&entry);
+                resolved.push(entry);
             }
         }
-
         resolved
     }
 
     /// Get all parent IDs we're still waiting on (for `want` messages).
     pub fn wanted_parent_ids(&self) -> HashSet<String> {
         self.waiting_on.keys().cloned().collect()
+    }
+
+    /// Get all accounts whose `open` some buffered entry is waiting for (M-09).
+    ///
+    /// Deliberately NOT part of [`Self::wanted_parent_ids`]: these are account
+    /// names, not content ids, and must never be put on the wire as `want`s.
+    pub fn wanted_accounts(&self) -> HashSet<String> {
+        self.waiting_on_account.keys().cloned().collect()
     }
 
     /// Number of buffered orphans.
@@ -227,7 +315,7 @@ impl OrphanBuffer {
         }
     }
 
-    /// Remove an orphan by ID and clean up reverse index.
+    /// Remove an orphan by ID and clean up both reverse indexes.
     fn remove(&mut self, id: &str) {
         if let Some(entry) = self.entries.remove(id) {
             self.release_entry_accounting(&entry);
@@ -236,6 +324,14 @@ impl OrphanBuffer {
                     set.remove(id);
                     if set.is_empty() {
                         self.waiting_on.remove(parent);
+                    }
+                }
+            }
+            for account in &entry.missing_accounts {
+                if let Some(set) = self.waiting_on_account.get_mut(account) {
+                    set.remove(id);
+                    if set.is_empty() {
+                        self.waiting_on_account.remove(account);
                     }
                 }
             }
@@ -397,6 +493,90 @@ mod tests {
         // Should not panic on unknown parent.
         let resolved = buf.parent_arrived("unknown");
         assert!(resolved.is_empty());
+    }
+
+    // ── M-09 account waiters ─────────────────────────────────────────────
+
+    #[test]
+    fn test_account_opened_resolves_waiter() {
+        let mut buf = OrphanBuffer::new();
+        assert!(buf.insert_awaiting_accounts(
+            "id1".to_owned(),
+            make_directive("waiting-on-open"),
+            vec!["Assets:Cash".to_owned()],
+            None,
+        ));
+        assert_eq!(buf.wanted_accounts().len(), 1);
+        assert!(
+            buf.wanted_parent_ids().is_empty(),
+            "account names must never leak into `want` ids"
+        );
+
+        assert!(buf.account_opened("Other:Account").is_empty());
+        let resolved = buf.account_opened("Assets:Cash");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].id, "id1");
+        assert!(buf.is_empty());
+        assert!(buf.wanted_accounts().is_empty());
+    }
+
+    #[test]
+    fn test_entry_waiting_on_both_needs_both() {
+        let mut buf = OrphanBuffer::new();
+        buf.insert_waiting(
+            "id1".to_owned(),
+            make_directive("both"),
+            vec!["p1".to_owned()],
+            vec!["Assets:Cash".to_owned()],
+            None,
+        );
+
+        assert!(
+            buf.account_opened("Assets:Cash").is_empty(),
+            "still waiting on the parent"
+        );
+        assert_eq!(buf.len(), 1);
+        let resolved = buf.parent_arrived("p1");
+        assert_eq!(resolved.len(), 1);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_account_waiters_share_the_orphan_budgets() {
+        // M-09 waiters are charged the same byte budget as parent waiters —
+        // they are not a second, unbudgeted buffer.
+        let entry_size =
+            ledger::serialize::economic_canonical_serialize(&make_directive("sizer")).len();
+        let mut buf = OrphanBuffer::with_byte_budgets(entry_size * 2, entry_size * 10);
+        assert!(buf.insert(
+            "id1".to_owned(),
+            make_directive("sizer"),
+            vec!["p".to_owned()],
+            Some("peer-a".to_owned()),
+        ));
+        assert!(buf.insert_awaiting_accounts(
+            "id2".to_owned(),
+            make_directive("sizer"),
+            vec!["Assets:Cash".to_owned()],
+            Some("peer-b".to_owned()),
+        ));
+        assert!(
+            !buf.insert_awaiting_accounts(
+                "id3".to_owned(),
+                make_directive("sizer"),
+                vec!["Assets:Cash".to_owned()],
+                Some("peer-c".to_owned()),
+            ),
+            "the account waiter shares the global byte budget"
+        );
+        // Resolving an account waiter releases its bytes again.
+        assert_eq!(buf.account_opened("Assets:Cash").len(), 1);
+        assert!(buf.insert_awaiting_accounts(
+            "id4".to_owned(),
+            make_directive("sizer"),
+            vec!["Assets:Cash".to_owned()],
+            Some("peer-c".to_owned()),
+        ));
     }
 
     #[test]

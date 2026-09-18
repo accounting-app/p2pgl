@@ -1,5 +1,6 @@
 use axum::http::{header, HeaderName, HeaderValue, Method};
 use serde::Deserialize;
+use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -43,6 +44,24 @@ pub struct NodeConfig {
     /// address. Hostnames or IP literals only — no scheme, no port.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+
+    /// IP addresses of the reverse proxies whose `X-Forwarded-For` is trusted
+    /// (M-04). IP literals only — no hostnames, ports or CIDR ranges.
+    ///
+    /// A public bind must terminate TLS at a proxy (`tls.mode = "terminated"`),
+    /// and behind a proxy every request arrives from the same socket address:
+    /// without this list the whole internet shares one rate-limit bucket and a
+    /// single client starves everyone else. When the TCP peer is one of these
+    /// addresses, the client is identified instead by the **rightmost
+    /// `X-Forwarded-For` entry that is not itself a trusted proxy** — the
+    /// standard anti-spoof parse. Each proxy appends what it saw, so entries to
+    /// the left of that one were supplied by the client and are ignored.
+    ///
+    /// Empty (the default) means no `X-Forwarded-For` is trusted at all and
+    /// every client is keyed by its TCP peer address: fail-closed, and
+    /// identical to the pre-M-04 behavior.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 
     /// Authentication configuration.
     #[serde(default)]
@@ -349,6 +368,18 @@ impl NodeConfig {
             }
         }
 
+        // M-04: a trusted proxy entry that does not parse would be silently
+        // dropped from the trust set, leaving the operator believing
+        // `X-Forwarded-For` is honoured while every client still shares the
+        // proxy's single bucket. Refuse to boot instead.
+        for proxy in &self.trusted_proxies {
+            if proxy.parse::<IpAddr>().is_err() {
+                return Err(ConfigError::Validation(format!(
+                    "trustedProxies entries must be IP literals without a port or prefix length, got \"{proxy}\""
+                )));
+            }
+        }
+
         match self.p2p.relay_mode.as_str() {
             "n0" | "disabled" => {}
             other => {
@@ -429,6 +460,16 @@ impl NodeConfig {
             hosts.insert(host.to_ascii_lowercase());
         }
         hosts
+    }
+
+    /// Reverse-proxy addresses whose `X-Forwarded-For` the rate limiter trusts (M-04).
+    ///
+    /// Every entry is checked at boot, so nothing is dropped here in practice.
+    pub fn trusted_proxy_set(&self) -> std::collections::HashSet<IpAddr> {
+        self.trusted_proxies
+            .iter()
+            .filter_map(|proxy| proxy.parse::<IpAddr>().ok())
+            .collect()
     }
 
     /// Restrictive CORS: empty allowlist denies cross-origin browser access (H-1).
@@ -547,6 +588,7 @@ mod tests {
             "externalFileEdits": "disabled",
             "cors": {{ "allowedOrigins": ["http://localhost:8080"] }},
             "allowedHosts": ["ledger.example.com"],
+            "trustedProxies": ["10.0.0.1"],
             "auth": {{ "enabled": true, "apiKey": "secret-key-123" }},
             "signing": {{ "enabled": true }},
             "tls": {{ "mode": "terminated" }},
@@ -568,6 +610,7 @@ mod tests {
         assert_eq!(config.external_file_edits, "disabled");
         assert_eq!(config.cors.allowed_origins, vec!["http://localhost:8080"]);
         assert_eq!(config.allowed_hosts, vec!["ledger.example.com"]);
+        assert_eq!(config.trusted_proxies, vec!["10.0.0.1"]);
         assert!(config.auth.enabled);
         assert_eq!(config.auth.api_key, "secret-key-123");
         assert!(config.signing.enabled);
@@ -905,6 +948,68 @@ mod tests {
             "a wildcard bind names no host a client could send: {hosts:?}"
         );
         assert!(hosts.contains("ledger.example.com"));
+    }
+
+    // — trustedProxies (M-04) —
+
+    #[test]
+    fn test_trusted_proxies_defaults_to_empty() {
+        // Fail closed: with no entry, X-Forwarded-For is trusted from nobody.
+        let file = write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean" }"#);
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        assert!(config.trusted_proxies.is_empty());
+        assert!(config.trusted_proxy_set().is_empty());
+    }
+
+    #[test]
+    fn test_trusted_proxies_accepted() {
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "trustedProxies": ["10.0.0.1", "2001:db8::1"] }"#,
+        );
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        assert_eq!(config.trusted_proxies, vec!["10.0.0.1", "2001:db8::1"]);
+        let trusted = config.trusted_proxy_set();
+        assert_eq!(trusted.len(), 2);
+        assert!(trusted.contains(&"10.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(trusted.contains(&"2001:db8::1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn test_invalid_trusted_proxy_rejected() {
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "trustedProxies": ["not-an-ip"] }"#,
+        );
+        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
+        assert!(result.is_err());
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(
+            error_message.contains("trustedProxies") && error_message.contains("not-an-ip"),
+            "error should name the key and the offending entry: {error_message}"
+        );
+    }
+
+    #[test]
+    fn test_trusted_proxy_with_port_rejected() {
+        // A "host:port" entry never matches a peer address, so it would trust
+        // nothing while looking configured.
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "trustedProxies": ["10.0.0.1:8080"] }"#,
+        );
+        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
+        assert!(result.is_err());
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(error_message.contains("trustedProxies"));
+    }
+
+    #[test]
+    fn test_trusted_proxy_cidr_rejected() {
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "trustedProxies": ["10.0.0.0/8"] }"#,
+        );
+        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
+        assert!(result.is_err());
+        let error_message = format!("{}", result.unwrap_err());
+        assert!(error_message.contains("trustedProxies"));
     }
 
     #[test]
