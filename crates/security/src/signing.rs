@@ -4,14 +4,22 @@
 //! - `NoopSignatureProvider` — signing disabled (default).
 //! - `PeerKeySignatureProvider` — Ed25519 signing using the node's key.
 
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+// `Verifier` is deliberately not imported: verification goes through
+// `VerifyingKey::verify_strict`, an inherent method, so the permissive trait
+// method cannot be reached by accident (L-07).
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 
 /// Domain-separated message prefix (§3.8.1 / H2).
 ///
 /// v1 covered only kind + content id. v2 added envelope parents and Lamport so a
 /// relay cannot rewrite causal order under a valid signature. v3 also binds the
-/// mesh/ledger identity (swarm topic) so a directive signed for one mesh cannot
-/// be replayed into another where the same key is allowlisted (L2).
+/// mesh/ledger identity so a directive signed for one mesh cannot be replayed
+/// into another where the same key is allowlisted (L2).
+///
+/// The prefix is unchanged by L-23: v3 always bound *a* mesh id, and all that
+/// changed is which configured value the caller resolves it from (`p2p.meshId`
+/// when set, `p2p.swarmTopic` otherwise). A deployment that adopts no mesh id
+/// therefore keeps producing and accepting byte-identical signed messages.
 const SIG_PREFIX: &str = "openledger-sig-v3";
 
 /// Fields covered by an `openledger-sig-v3` signature.
@@ -81,10 +89,17 @@ impl std::error::Error for SignatureError {}
 
 /// Build the domain-separated message for signing (§3.8.1).
 ///
-/// `mesh_id` is the node's mesh/ledger identity (the swarm topic). It is bound
-/// into the signature but not carried in the directive: a verifier reconstructs
-/// the message with its *own* mesh id, so a signature made for another mesh fails
-/// to verify (L2). Signing/verifying nodes on the same mesh share the value.
+/// `mesh_id` is the node's mesh/ledger identity. It is bound into the signature
+/// but not carried in the directive: a verifier reconstructs the message with
+/// its *own* mesh id, so a signature made for another mesh fails to verify (L2).
+/// Signing/verifying nodes on the same mesh share the value.
+///
+/// L-23: this is deliberately an opaque string chosen by the caller, not the
+/// gossip swarm topic. Deriving it from the topic made "can join this overlay"
+/// and "is this mesh" the same claim, so two meshes that picked the same custom
+/// topic accepted each other's directives. `gl-node` resolves it from
+/// `p2p.meshId`, falling back to `p2p.swarmTopic` so a deployment that adopts
+/// no mesh id can still verify the signatures it has already persisted.
 ///
 /// Format:
 /// `openledger-sig-v3|{txid|directiveId}|{content_id}|parents|{parents}|lamport|{lamport}|mesh|{mesh_id}`
@@ -132,12 +147,13 @@ impl SignatureProvider for NoopSignatureProvider {
 /// Ed25519 signing using the node's Iroh key (§3.8.1).
 pub struct PeerKeySignatureProvider {
     signing_key: SigningKey,
-    /// Mesh/ledger identity (swarm topic) bound into every signature (L2).
+    /// Mesh/ledger identity bound into every signature (L2, L-23). Resolved by
+    /// the caller — see [`build_sign_message`].
     mesh_id: String,
 }
 
 impl PeerKeySignatureProvider {
-    /// Create from an Ed25519 signing key and the node's mesh id (swarm topic).
+    /// Create from an Ed25519 signing key and the node's resolved mesh id.
     pub fn new(signing_key: SigningKey, mesh_id: String) -> Self {
         PeerKeySignatureProvider {
             signing_key,
@@ -221,8 +237,17 @@ pub fn verify_signature(
         .map_err(|e| SignatureError::InvalidPublicKey(e.to_string()))?;
 
     let encoded = build_sign_message(message, mesh_id);
+    // `verify_strict`, not `verify` (L-07). The permissive check is the
+    // cofactorless equation alone, which accepts a signature whose `R` — or
+    // whose *author key* — is a small-order point, and such a pair verifies
+    // against **every** message: `A = R = identity, s = 0` satisfies it for any
+    // content id, parents, lamport and mesh. Strict verification additionally
+    // refuses small-order `A`/`R` and non-canonical encodings, so a signature is
+    // bound to the one message it was made over. Nothing legitimate is lost —
+    // keys produced by `SigningKey`/Iroh are never small-order, and a real
+    // signature's `R` is not either.
     verifying_key
-        .verify(encoded.as_bytes(), &signature)
+        .verify_strict(encoded.as_bytes(), &signature)
         .map_err(|e| SignatureError::InvalidSignature(e.to_string()))
 }
 
@@ -409,6 +434,73 @@ mod tests {
             matches!(result, Err(SignatureError::InvalidSignature(_))),
             "rewritten lamport must fail verification"
         );
+    }
+
+    // ── L-07: strict verification ───────────────────────────────────────
+
+    /// The Ed25519 identity point, compressed: y = 1, sign bit clear. Order 1,
+    /// so it is small-order by definition.
+    fn identity_point_hex() -> String {
+        format!("01{}", "00".repeat(31))
+    }
+
+    #[test]
+    fn test_small_order_universal_forgery_is_rejected() {
+        // L-07 regression, and the reason `verify_strict` is not cosmetic.
+        //
+        // The permissive check is only the cofactorless equation
+        // `R == [s]B - [k]A`. Take the identity point I for both the author key
+        // A and the signature's R, and s = 0: `[0]B - [k]I == I == R` holds for
+        // *every* k, i.e. for every message. So one fixed 64-byte blob verifies
+        // against any content id / parents / lamport / mesh under a key an
+        // attacker publishes as `openledger-author` — a universal forgery, not a
+        // malleation of some existing signature.
+        //
+        // `verify_strict` refuses small-order A and R, so the blob verifies
+        // against nothing.
+        let identity = identity_point_hex();
+        let forged_signature = format!("{identity}{}", "00".repeat(32)); // R = I, s = 0
+
+        for content_id in ["anything-at-all", "a-completely-different-directive"] {
+            let result = verify_signature(
+                &sample_message(content_id, true),
+                &forged_signature,
+                &identity,
+                "mesh-A",
+            );
+            assert!(
+                matches!(result, Err(SignatureError::InvalidSignature(_))),
+                "small-order universal forgery must be refused for {content_id}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_strict_verification_still_accepts_real_signatures() {
+        // The other half of L-07: strictness must not cost us any honest
+        // signature. Round-trip a batch of freshly generated keys over both
+        // domain kinds and a populated envelope.
+        for i in 0..32u8 {
+            let provider = PeerKeySignatureProvider::new(
+                SigningKey::from_bytes(&[i; 32]),
+                "mesh-round-trip".to_owned(),
+            );
+            for is_transaction in [true, false] {
+                let message = SignableMessage {
+                    content_id: "3f1c0a2b3f1c0a2b3f1c0a2b3f1c0a2b3f1c0a2b3f1c0a2b3f1c0a2b3f1c0a2b",
+                    is_transaction,
+                    parents: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    lamport: "12345",
+                };
+                let sig = provider.sign(&message).unwrap();
+                assert!(
+                    provider
+                        .verify(&message, &sig, &provider.public_key_hex())
+                        .is_ok(),
+                    "strict verification must accept an honestly produced signature"
+                );
+            }
+        }
     }
 
     #[test]
