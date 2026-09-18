@@ -31,10 +31,12 @@ const MAX_ENVELOPE_VALUE_LEN: usize = 32 * 1024;
 
 /// Maximum number of parents in `openledger-parents`.
 ///
-/// Each parent becomes a distinct `waiting_on` entry in the orphan buffer, so an
-/// unbounded list is a memory-exhaustion vector (M-4). Real DAG head counts are
-/// tiny (concurrent in-flight writers); 256 is generous.
-const MAX_PARENTS: usize = 256;
+/// Aliases the ledger's constant rather than repeating the number, so the wire
+/// path and the file path cannot drift apart about the fan-in cap — the same
+/// rule (and the same reason) as [`ALLOWED_ENVELOPE_KEYS`]. The cap lived here
+/// alone until T41, which is why it applied to arriving `Supply` entries and
+/// not to a hand-written file.
+use ledger::service::MAX_PARENTS;
 
 /// Maximum accepted remote `openledger-lamport` value (0820-M3 completion).
 ///
@@ -315,6 +317,39 @@ fn validate_supply_envelope(envelope: &BTreeMap<String, String>) -> Result<(), M
 /// signatures are rejected. The author's public key is `openledger-author`
 /// (Iroh `EndpointId` hex). `mesh_id` is the verifying node's own mesh identity
 /// (swarm topic); a signature made for a different mesh will not verify (L2).
+///
+/// ## Migration: directives written before signing was turned on (T41)
+///
+/// There is no migration, and this is where that becomes visible. A directive
+/// is signed once, by its author, at the moment it is first written
+/// (`append_transaction_signing` and friends stamp the signature before the
+/// first persist, M-11). A node that ran with `signing.enabled: false` — or
+/// with `p2p.enabled: false`, which is the common case, since config validation
+/// forces signing on whenever P2P is — has a `.bean` full of directives with no
+/// `openledger-signature`, and turning signing on later does not and cannot
+/// change that: the signature covers the content id, so only the *original
+/// author* could produce one, and a node re-signing another author's history
+/// would be manufacturing provenance.
+///
+/// The practical consequence, stated plainly so it is not discovered in
+/// production: **pre-signing history does not replicate to a signing mesh.** It
+/// is rejected here, one `MergeError::EnvelopeMissing` per directive, on every
+/// peer with signing enabled. The node holding it keeps serving it and keeps
+/// being refused.
+///
+/// The three options, none of which this code takes on its own:
+///
+/// * Bring the whole mesh up with signing on from the first directive. This is
+///   the supported path and what the shipped configs do.
+/// * Enable signing at a point where the pre-signing history is disposable
+///   (a dev ledger) and start the mesh from a fresh file.
+/// * Re-author the history through the local API on one node, which produces
+///   NEW directives with new ids under that node's authorship. That is an
+///   honest re-statement, not a migration, and the old ids never become valid.
+///
+/// A fourth option — a signed "attestation" directive by which one node vouches
+/// for a batch of unsigned ancestors — would be a content-format change and
+/// belongs with the coordinated bump that closes M-10/L-06, not here.
 pub fn verify_remote_signature(
     directive: &Directive,
     signing_enabled: bool,
@@ -381,7 +416,7 @@ pub fn verify_author_allowlisted(
 }
 
 /// Immutable envelope metadata on any directive.
-fn directive_metadata(directive: &Directive) -> &BTreeMap<String, String> {
+pub(crate) fn directive_metadata(directive: &Directive) -> &BTreeMap<String, String> {
     match directive {
         Directive::Transaction(d) => &d.metadata,
         Directive::Open(d) => &d.metadata,
@@ -393,51 +428,6 @@ fn directive_metadata(directive: &Directive) -> &BTreeMap<String, String> {
         Directive::Document(d) => &d.metadata,
         Directive::Event(d) => &d.metadata,
         Directive::Price(d) => &d.metadata,
-    }
-}
-
-/// Extract the Lamport clock value from a directive's metadata.
-pub fn extract_lamport(directive: &Directive) -> Option<u64> {
-    if let Directive::Transaction(txn) = directive {
-        txn.lamport_clock()
-    } else {
-        let metadata = match directive {
-            Directive::Open(d) => &d.metadata,
-            Directive::Close(d) => &d.metadata,
-            Directive::Commodity(d) => &d.metadata,
-            Directive::Pad(d) => &d.metadata,
-            Directive::Balance(d) => &d.metadata,
-            Directive::Note(d) => &d.metadata,
-            Directive::Document(d) => &d.metadata,
-            Directive::Event(d) => &d.metadata,
-            Directive::Price(d) => &d.metadata,
-            Directive::Transaction(_) => unreachable!(),
-        };
-        metadata
-            .get("openledger-lamport")
-            .and_then(|v| v.parse().ok())
-    }
-}
-
-/// Extract the parent txids from a directive's metadata.
-pub fn extract_parents(directive: &Directive) -> Vec<String> {
-    let metadata = match directive {
-        Directive::Transaction(txn) => &txn.metadata,
-        Directive::Open(d) => &d.metadata,
-        Directive::Close(d) => &d.metadata,
-        Directive::Commodity(d) => &d.metadata,
-        Directive::Pad(d) => &d.metadata,
-        Directive::Balance(d) => &d.metadata,
-        Directive::Note(d) => &d.metadata,
-        Directive::Document(d) => &d.metadata,
-        Directive::Event(d) => &d.metadata,
-        Directive::Price(d) => &d.metadata,
-    };
-
-    match metadata.get("openledger-parents") {
-        Some(v) if v.is_empty() => vec![],
-        Some(v) => v.split(',').map(|s| s.trim().to_owned()).collect(),
-        None => vec![],
     }
 }
 
@@ -623,38 +613,6 @@ mod tests {
 
         let result = validate_supply_entry(&entry);
         assert!(matches!(result, Err(MergeError::ParseError(_))));
-    }
-
-    #[test]
-    fn test_extract_lamport() {
-        let entry = make_valid_supply_entry();
-        let directive = validate_supply_entry(&entry).unwrap();
-        let lamport = extract_lamport(&directive);
-        assert_eq!(lamport, Some(5));
-    }
-
-    #[test]
-    fn test_extract_parents_empty() {
-        let entry = make_valid_supply_entry();
-        let directive = validate_supply_entry(&entry).unwrap();
-        let parents = extract_parents(&directive);
-        assert!(parents.is_empty(), "Genesis has empty parents");
-    }
-
-    #[test]
-    fn test_extract_parents_multiple() {
-        // Parents must be well-formed 64-hex txids (enforced pre-buffer).
-        let parent_a = "a".repeat(64);
-        let parent_b = "b".repeat(64);
-        let parent_c = "c".repeat(64);
-        let mut entry = make_valid_supply_entry();
-        entry.envelope.insert(
-            "openledger-parents".to_owned(),
-            format!("{parent_a},{parent_b},{parent_c}"),
-        );
-        let directive = validate_supply_entry(&entry).unwrap();
-        let parents = extract_parents(&directive);
-        assert_eq!(parents, vec![parent_a, parent_b, parent_c]);
     }
 
     #[test]
@@ -1451,6 +1409,127 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_mixed_script_account_in_body() {
+        // L-25: `Assets:Cаsh` (Cyrillic а, U+0430) used to parse as an account
+        // distinct from — and pixel-identical to — `Assets:Cash`, so a peer
+        // could plant a confusable account in every replica's `.bean` file and
+        // in every trial balance drawn from it. The wire path re-parses the
+        // canonical body through `parse_file`, so the parser's ASCII-only rule
+        // covers the mesh as well as the disk.
+        let mut txn = sample_transaction("Homoglyph", false);
+        txn.postings[0].account = "Assets:C\u{0430}sh".to_owned();
+        let directive = Directive::Transaction(txn);
+
+        // The account name is inside what the content hash covers, so the
+        // entry's I5 check passes by construction: only the charset rule
+        // rejects it.
+        let clean = Directive::Transaction(sample_transaction("Homoglyph", false));
+        assert_ne!(
+            compute_content_id(&directive),
+            compute_content_id(&clean),
+            "the confusable account must be part of the hashed body"
+        );
+
+        let entry = SupplyEntry {
+            id: compute_content_id(&directive),
+            kind: DirectiveKind::Transaction,
+            economic_bean: economic_canonical_serialize(&directive),
+            envelope: BTreeMap::from([
+                ("openledger-author".to_owned(), "peer-1".to_owned()),
+                ("openledger-lamport".to_owned(), "5".to_owned()),
+                ("openledger-parents".to_owned(), "".to_owned()),
+            ]),
+        };
+
+        let error = validate_supply_entry(&entry).unwrap_err();
+        assert!(
+            matches!(error, MergeError::ParseError(ref reason) if reason.contains("U+0430")),
+            "expected a ParseError naming the offending character, got {error:?}"
+        );
+
+        // Control: the all-ASCII spelling of the same entry is still accepted.
+        assert!(validate_supply_entry(&entry_for_body(
+            DirectiveKind::Transaction,
+            economic_canonical_serialize(&clean),
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_cost_in_body() {
+        // L-16: `{0 USD}` weighs zero whatever the posting says, so a peer can
+        // mint an arbitrary commodity position in a transaction that balances
+        // perfectly under I1. Like L-25, the wire path inherits the rule for
+        // free because `validate_supply_entry` re-parses the canonical body
+        // through `parse_file` before anything else runs.
+        let mut txn = sample_transaction("Minting", false);
+        txn.postings[0].amount = Some(Amount {
+            number: dec!(10_000_000),
+            currency: "AAPL".to_owned(),
+        });
+        txn.postings[0].cost = Some(ledger::model::CostSpec {
+            amount: Some(Amount {
+                number: dec!(0),
+                currency: "USD".to_owned(),
+            }),
+            date: None,
+        });
+        txn.postings[1].amount = Some(Amount {
+            number: dec!(0),
+            currency: "USD".to_owned(),
+        });
+        let directive = Directive::Transaction(txn);
+
+        // The cost is inside what the content hash covers, so the entry's I5
+        // check passes by construction: only the L-16 rule rejects it.
+        let entry = SupplyEntry {
+            id: compute_content_id(&directive),
+            kind: DirectiveKind::Transaction,
+            economic_bean: economic_canonical_serialize(&directive),
+            envelope: BTreeMap::from([
+                ("openledger-author".to_owned(), "peer-1".to_owned()),
+                ("openledger-lamport".to_owned(), "5".to_owned()),
+                ("openledger-parents".to_owned(), "".to_owned()),
+            ]),
+        };
+        assert!(
+            entry.economic_bean.contains("{0 USD}"),
+            "fixture must actually ship a zero cost: {}",
+            entry.economic_bean
+        );
+
+        let error = validate_supply_entry(&entry).unwrap_err();
+        assert!(
+            matches!(error, MergeError::ParseError(ref reason)
+                if reason.contains("Cost must be greater than zero")),
+            "expected a ParseError naming the rule, got {error:?}"
+        );
+
+        // Control: the same shape at an honest rate is still accepted.
+        let mut honest = sample_transaction("Minting", false);
+        honest.postings[0].amount = Some(Amount {
+            number: dec!(10),
+            currency: "AAPL".to_owned(),
+        });
+        honest.postings[0].cost = Some(ledger::model::CostSpec {
+            amount: Some(Amount {
+                number: dec!(150),
+                currency: "USD".to_owned(),
+            }),
+            date: None,
+        });
+        honest.postings[1].amount = Some(Amount {
+            number: dec!(-1500),
+            currency: "USD".to_owned(),
+        });
+        assert!(validate_supply_entry(&entry_for_body(
+            DirectiveKind::Transaction,
+            economic_canonical_serialize(&Directive::Transaction(honest)),
+        ))
+        .is_ok());
+    }
+
+    #[test]
     fn test_validate_rejects_uppercase_hex_parent() {
         // L-29: stored ids are lowercase and lookups are exact, so an uppercase
         // spelling of a real txid validates and then never resolves — a
@@ -1498,13 +1577,283 @@ mod tests {
         assert!(result.is_ok(), "honest entry must pass: {result:?}");
     }
 
+    // ── L-11: a hand edit adopted at reconcile must replicate ────────────
+
+    const RECONCILE_MESH: &str = "mesh-for-reconcile";
+
+    fn temp_bean_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("openledger-l11-{tag}-{nanos}.bean"))
+    }
+
+    /// A booted service whose reconcile signs with `key_seed`'s key, authored by
+    /// that key — i.e. a node exactly as `main` wires one when signing is on.
+    fn signing_service(
+        path: &std::path::Path,
+        key_seed: u8,
+    ) -> (
+        ledger::service::LedgerService,
+        std::sync::Arc<security::signing::PeerKeySignatureProvider>,
+    ) {
+        let provider =
+            std::sync::Arc::new(security::signing::PeerKeySignatureProvider::from_bytes(
+                &[key_seed; 32],
+                RECONCILE_MESH.to_owned(),
+            ));
+        let mut service =
+            ledger::service::LedgerService::boot(path, provider.public_key_hex()).unwrap();
+        let for_signer = std::sync::Arc::clone(&provider);
+        service.set_signer(std::sync::Arc::new(
+            move |content_id: &str, is_transaction: bool, parents: &str, lamport: &str| {
+                use security::signing::SignatureProvider;
+                for_signer.sign(&security::signing::SignableMessage {
+                    content_id,
+                    is_transaction,
+                    parents,
+                    lamport,
+                })
+            },
+        ));
+        (service, provider)
+    }
+
+    /// Two open accounts plus a hand-appended, envelope-less transaction —
+    /// exactly what a human adding a line in an editor produces.
+    const HAND_EDIT: &str = "\n2024-01-15 * \"Corner Shop\" \"Coffee\"\n  \
+                             Expenses:Food                                        4.50 USD\n  \
+                             Assets:Cash                                         -4.50 USD\n";
+
+    /// Run the FULL remote receive-path validation on a directive, the way a
+    /// peer would after this node served it.
+    fn peer_would_accept(directive: &Directive) -> Result<(), MergeError> {
+        let entry = crate::gossip::make_supply_entry(directive);
+        let parsed = validate_supply_entry(&entry)?;
+        verify_remote_signature(&parsed, true, RECONCILE_MESH)
+    }
+
     #[test]
-    fn test_body_smuggled_key_poisons_the_next_hop_on_re_serve() {
-        // H-06 mechanism test — the livelock the ingest check above prevents.
-        //
-        // Bypass ingest (the public path now refuses this) and build the
-        // directive exactly as a victim's DAG would hold it after accepting a
-        // body-smuggled key, then re-serve it the way the victim would.
+    fn test_reconcile_signs_hand_edits_so_peers_accept_them() {
+        // L-11: with signing on, an adopted hand edit used to carry no
+        // signature at all. It was in this node's DAG, in its `.bean`, in every
+        // report — and every peer refused it forever, silently. Split-brain by
+        // text editor.
+        let path = temp_bean_path("signed");
+        let (mut service, provider) = signing_service(&path, 11);
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        service
+            .open_account("Expenses:Food".to_owned(), date, vec![])
+            .unwrap();
+        service
+            .open_account("Assets:Cash".to_owned(), date, vec![])
+            .unwrap();
+        let before = service.directive_count();
+
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str(HAND_EDIT);
+        std::fs::write(&path, &content).unwrap();
+
+        let result = service.reconcile_file().unwrap();
+        assert_eq!(result.new_directives, 1, "the hand edit must be adopted");
+        assert_eq!(result.rejected, 0);
+        assert_eq!(service.directive_count(), before + 1);
+
+        let adopted = service
+            .dag()
+            .directives()
+            .into_iter()
+            .find(|d| matches!(d, Directive::Transaction(_)))
+            .expect("the adopted transaction")
+            .clone();
+
+        // It is ours, and it is signed.
+        let metadata = directive_metadata(&adopted);
+        assert_eq!(
+            metadata.get("openledger-author"),
+            Some(&provider.public_key_hex()),
+            "operator input is a local append: this node is the author"
+        );
+        assert!(metadata.contains_key("openledger-signature"));
+
+        // And — the point of the whole item — a peer running the real receive
+        // path accepts it.
+        assert!(
+            peer_would_accept(&adopted).is_ok(),
+            "a peer must accept the adopted entry: {:?}",
+            peer_would_accept(&adopted)
+        );
+
+        // The signature is over the id the DAG actually stores it under.
+        assert!(service
+            .get_directive(&compute_content_id(&adopted))
+            .is_some());
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_reconcile_signs_an_adopted_hand_edit_with_an_elided_posting() {
+        // The sharp edge of "sign what will be stored": I2 resolves the elided
+        // amount, so the STORED body hashes differently from the parsed one. A
+        // signature over the pre-resolution id verifies nowhere.
+        let path = temp_bean_path("elided");
+        let (mut service, _provider) = signing_service(&path, 12);
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        service
+            .open_account("Expenses:Food".to_owned(), date, vec![])
+            .unwrap();
+        service
+            .open_account("Assets:Cash".to_owned(), date, vec![])
+            .unwrap();
+
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str(
+            "\n2024-01-15 * \"Corner Shop\" \"Elided coffee\"\n  \
+             Expenses:Food                                        4.50 USD\n  \
+             Assets:Cash\n",
+        );
+        std::fs::write(&path, &content).unwrap();
+
+        assert_eq!(service.reconcile_file().unwrap().new_directives, 1);
+        let adopted = service
+            .dag()
+            .directives()
+            .into_iter()
+            .find(|d| matches!(d, Directive::Transaction(_)))
+            .expect("the adopted transaction")
+            .clone();
+
+        assert!(
+            peer_would_accept(&adopted).is_ok(),
+            "signature must cover the RESOLVED body: {:?}",
+            peer_would_accept(&adopted)
+        );
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_reconcile_leaves_an_already_signed_entry_untouched() {
+        // An entry that arrived from a peer (or round-tripped through our own
+        // file) keeps its own author and its own signature — re-signing would
+        // destroy a valid one and claim someone else's write.
+        let path = temp_bean_path("preserved");
+        let (mut service, _provider) = signing_service(&path, 13);
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        service
+            .open_account("Expenses:Food".to_owned(), date, vec![])
+            .unwrap();
+        service
+            .open_account("Assets:Cash".to_owned(), date, vec![])
+            .unwrap();
+
+        // Build a peer's signed directive the way that peer would.
+        let peer = security::signing::PeerKeySignatureProvider::from_bytes(
+            &[99u8; 32],
+            RECONCILE_MESH.to_owned(),
+        );
+        let mut txn = sample_transaction("Peer entry", false);
+        txn.postings[0].account = "Expenses:Food".to_owned();
+        txn.postings[1].account = "Assets:Cash".to_owned();
+        txn.metadata
+            .insert("openledger-author".to_owned(), peer.public_key_hex());
+        txn.metadata
+            .insert("openledger-lamport".to_owned(), "77".to_owned());
+        txn.metadata
+            .insert("openledger-parents".to_owned(), String::new());
+        let directive = Directive::Transaction(txn.clone());
+        use security::signing::SignatureProvider;
+        let signature = peer
+            .sign(&security::signing::SignableMessage {
+                content_id: &compute_content_id(&directive),
+                is_transaction: true,
+                parents: "",
+                lamport: "77",
+            })
+            .unwrap();
+        txn.metadata
+            .insert("openledger-signature".to_owned(), signature.clone());
+
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push('\n');
+        content.push_str(&ledger::serialize::full_file_serialize(
+            &[Directive::Transaction(txn)],
+            &[],
+        ));
+        std::fs::write(&path, &content).unwrap();
+
+        assert_eq!(service.reconcile_file().unwrap().new_directives, 1);
+        let adopted = service
+            .dag()
+            .directives()
+            .into_iter()
+            .find(|d| matches!(d, Directive::Transaction(_)))
+            .expect("the adopted transaction")
+            .clone();
+
+        let metadata = directive_metadata(&adopted);
+        assert_eq!(
+            metadata.get("openledger-author"),
+            Some(&peer.public_key_hex()),
+            "the peer's authorship must survive adoption"
+        );
+        assert_eq!(metadata.get("openledger-signature"), Some(&signature));
+        assert_eq!(metadata.get("openledger-lamport"), Some(&"77".to_owned()));
+        assert!(peer_would_accept(&adopted).is_ok());
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_reconcile_without_a_signer_is_unchanged() {
+        // Signing disabled: no signer is installed, adoption is byte-for-byte
+        // what it was, and nothing claims a signature it does not have.
+        let path = temp_bean_path("unsigned");
+        let mut service =
+            ledger::service::LedgerService::boot(&path, "plain-node".to_owned()).unwrap();
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        service
+            .open_account("Expenses:Food".to_owned(), date, vec![])
+            .unwrap();
+        service
+            .open_account("Assets:Cash".to_owned(), date, vec![])
+            .unwrap();
+
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str(HAND_EDIT);
+        std::fs::write(&path, &content).unwrap();
+
+        assert_eq!(service.reconcile_file().unwrap().new_directives, 1);
+        let adopted = service
+            .dag()
+            .directives()
+            .into_iter()
+            .find(|d| matches!(d, Directive::Transaction(_)))
+            .expect("the adopted transaction")
+            .clone();
+        let metadata = directive_metadata(&adopted);
+        assert_eq!(
+            metadata.get("openledger-author"),
+            Some(&"plain-node".to_owned())
+        );
+        assert!(
+            !metadata.contains_key("openledger-signature"),
+            "nothing may be signed when no signer is installed"
+        );
+        // With signing off the same entry is accepted by a peer anyway.
+        let entry = crate::gossip::make_supply_entry(&adopted);
+        let parsed = validate_supply_entry(&entry).unwrap();
+        assert!(verify_remote_signature(&parsed, false, RECONCILE_MESH).is_ok());
+
+        std::fs::remove_file(path).ok();
+    }
+
+    /// A directive exactly as a victim's DAG would hold it if a body-smuggled
+    /// `openledger-*` key had ever been accepted. Built directly, because the
+    /// public ingest path refuses it (H-06).
+    fn poisoned_directive() -> Directive {
         let mut txn = sample_transaction("Poisoned", false);
         txn.metadata
             .insert("openledger-author".to_owned(), "peer-1".to_owned());
@@ -1513,23 +1862,63 @@ mod tests {
         txn.metadata
             .insert("openledger-parents".to_owned(), "".to_owned());
         txn.metadata
-            .insert("openledger-poison".to_owned(), "x".to_owned());
+            .insert("openledger-custom".to_owned(), "x".to_owned());
+        Directive::Transaction(txn)
+    }
 
-        let entry = crate::gossip::make_supply_entry(&Directive::Transaction(txn));
+    #[test]
+    fn test_serve_side_does_not_promote_a_stray_openledger_key() {
+        // T21 follow-up: `extract_envelope` now filters to the closed
+        // `ENVELOPE_KEYS` set rather than to the `openledger-` prefix, so the
+        // serve side cannot hand the next hop a key nobody validated — even
+        // from a DAG that (impossibly, today) holds one.
+        let entry = crate::gossip::make_supply_entry(&poisoned_directive());
 
-        // `extract_envelope` promotes every `openledger-*` metadata key, so the
-        // body key is now an envelope key on the wire...
-        assert_eq!(
-            entry.envelope.get("openledger-poison"),
-            Some(&"x".to_owned()),
-            "re-serve promotes the smuggled body key into the envelope"
+        assert!(
+            !entry.envelope.contains_key("openledger-custom"),
+            "a stray body key must not be promoted into the outbound envelope: {:?}",
+            entry.envelope
         );
+        // The four real envelope keys still ride out, unchanged.
+        assert_eq!(
+            entry
+                .envelope
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "openledger-author",
+                "openledger-lamport",
+                "openledger-parents"
+            ],
+        );
+        // And what we serve is accepted by the next hop, rather than rejected
+        // forever — which is the whole point of not promoting it.
+        assert!(
+            validate_supply_entry(&entry).is_ok(),
+            "the filtered entry must pass the receiving side: {:?}",
+            validate_supply_entry(&entry)
+        );
+    }
 
-        // ...where the next hop's closed-set check rejects the whole directive,
-        // every time it is offered, forever.
+    #[test]
+    fn test_body_smuggled_key_poisons_the_next_hop_on_re_serve() {
+        // H-06 mechanism test — the livelock the ingest check prevents, and the
+        // reason the serve-side filter above is worth having as well.
+        //
+        // Promotion is what used to happen; reconstruct it by hand (the real
+        // serve path no longer does it) and show where it led.
+        let directive = poisoned_directive();
+        let mut entry = crate::gossip::make_supply_entry(&directive);
+        entry
+            .envelope
+            .insert("openledger-custom".to_owned(), "x".to_owned());
+
+        // The next hop's closed-set check rejects the whole directive, every
+        // time it is offered, forever.
         let error = validate_supply_entry(&entry).unwrap_err();
         assert!(
-            matches!(error, MergeError::InvalidEnvelope(ref reason) if reason.contains("openledger-poison")),
+            matches!(error, MergeError::InvalidEnvelope(ref reason) if reason.contains("openledger-custom")),
             "expected the unsupported-envelope-key rejection, got {error:?}"
         );
     }

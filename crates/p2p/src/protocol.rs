@@ -245,7 +245,21 @@ impl WireMessage {
                 cbor.len()
             ));
         }
-        let len = cbor.len() as u32;
+        // T41: the cast is explicit about why it cannot lose bits, instead of
+        // an `as u32` that silently would. `MAX_MESSAGE_SIZE` is 16 MiB and the
+        // check immediately above has already refused anything larger, so the
+        // conversion is unreachable-on-failure — but a truncating `as` here
+        // would be the worst possible bug to reintroduce: the length prefix
+        // would name a fraction of the body, and the receiver would decode a
+        // short frame and then resynchronize on the remaining bytes as if they
+        // were the next frame. Two things keep that unreachable today — the
+        // byte check above, and `MAX_MESSAGE_SIZE` being typed `u32` — and
+        // `try_into` states the dependency so that relaxing either one is a
+        // loud local panic rather than a silent protocol desync.
+        let len: u32 = cbor
+            .len()
+            .try_into()
+            .expect("frame length fits u32: MAX_MESSAGE_SIZE (16 MiB) is checked above");
         let mut buf = Vec::with_capacity(4 + cbor.len());
         buf.extend_from_slice(&len.to_be_bytes());
         buf.extend_from_slice(&cbor);

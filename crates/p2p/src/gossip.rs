@@ -25,7 +25,7 @@ pub fn make_supply_entry(directive: &Directive) -> SupplyEntry {
     let kind = DirectiveKind::from_directive(directive);
     let economic_bean = economic_canonical_serialize(directive);
 
-    // Extract envelope metadata (openledger-* keys).
+    // Extract envelope metadata (the closed `ENVELOPE_KEYS` set, T21 follow-up).
     let envelope = extract_envelope(directive);
 
     SupplyEntry {
@@ -50,7 +50,22 @@ pub fn decode_broadcast(data: &[u8]) -> Result<WireMessage, String> {
     WireMessage::decode_checked(data).map_err(|error| error.to_string())
 }
 
-/// Extract envelope metadata from a directive.
+/// Extract envelope metadata from a directive, for the wire.
+///
+/// Filtered to [`ledger::service::ENVELOPE_KEYS`] — the same closed set every
+/// ingest path enforces — rather than to the `openledger-` prefix (T21
+/// follow-up). Promotion of a stray key is already unreachable: H-06's
+/// `validate_body_envelope_keys` runs on the local append path, on reconcile and
+/// on both halves of the remote path, so no directive holding one can reach a
+/// DAG in the first place, and `test_body_smuggled_key_poisons_the_next_hop_on_re_serve`
+/// pins what would happen if one did.
+///
+/// This is belt-and-braces on principle: the serve side is where a directive
+/// stops being our problem and becomes the next hop's, and "whatever happens to
+/// carry the prefix" is the wrong rule to apply at that boundary. Reading the
+/// closed set from `ledger` rather than restating it here also means the wire
+/// set cannot drift from the stamped set — the same single-sourcing
+/// `ALLOWED_ENVELOPE_KEYS` already uses on the receive side.
 fn extract_envelope(directive: &Directive) -> BTreeMap<String, String> {
     let metadata = match directive {
         Directive::Transaction(txn) => &txn.metadata,
@@ -67,8 +82,8 @@ fn extract_envelope(directive: &Directive) -> BTreeMap<String, String> {
 
     metadata
         .iter()
-        .filter(|(k, _)| k.starts_with("openledger-"))
-        .map(|(k, v)| (k.clone(), v.clone()))
+        .filter(|(key, _)| ledger::service::ENVELOPE_KEYS.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
 }
 
