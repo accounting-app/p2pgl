@@ -36,9 +36,9 @@ hyper-util = { version = "0.1", features = [
 iroh = { workspace = true }
 iroh-gossip = { workspace = true }
 hex = "0.4"
-rand = "0.8"
 subtle = "2"
 sha2 = { workspace = true }
+zeroize = { workspace = true }
 
 
 [dev-dependencies]

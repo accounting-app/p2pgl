@@ -1443,7 +1443,6 @@ dependencies = [
  "iroh-gossip",
  "ledger",
  "p2p",
- "rand 0.8.7",
  "rust_decimal",
  "rust_decimal_macros",
  "security",
@@ -1458,6 +1457,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -2278,6 +2278,7 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -31,6 +31,10 @@ bytes = "1"
 ciborium = "0.2"
 anyhow = "1"
 tower-http = { version = "0.6", features = ["cors"] }
+# Best-effort wiping of secret-key intermediates (L-04). Already in the tree as
+# a transitive dependency of ed25519-dalek / iroh; declared here so gl-node can
+# use `Zeroizing` on the hex string and byte buffers it parses the node key from.
+zeroize = "1"
 
 [workspace.lints.clippy]
 all = { level = "deny" }
