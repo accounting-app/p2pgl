@@ -78,6 +78,16 @@ pub struct ReadModel {
     txid_index: HashMap<String, usize>,
     /// Postings index: `account → [txid]`.
     account_postings: HashMap<String, Vec<String>>,
+    /// Latest transaction date per account: `account → max(txn.date)`.
+    ///
+    /// Maintained incrementally so the FR-3 AC2 close rule ("no transactions
+    /// after the close date") is an O(1) lookup instead of a full-DAG scan on
+    /// every local and ingested `close`. A monotone max over the same set
+    /// `account_postings` indexes, so it is order-insensitive and needs no
+    /// rebuild: every path that puts a transaction into the DAG also calls
+    /// [`Self::index_directive`], and the DAG is grow-only (nothing is ever
+    /// removed), so the index cannot go stale in either direction.
+    latest_posting_dates: HashMap<String, NaiveDate>,
 }
 
 impl ReadModel {
@@ -88,6 +98,7 @@ impl ReadModel {
             transactions: Vec::new(),
             txid_index: HashMap::new(),
             account_postings: HashMap::new(),
+            latest_posting_dates: HashMap::new(),
         };
 
         // Sort directives by canonical order for consistent processing.
@@ -150,12 +161,17 @@ impl ReadModel {
                 }
             }
 
-            // Index by account.
+            // Index by account, and carry the per-account latest transaction
+            // date forward with it (see `latest_posting_dates`).
             for posting in &txn.postings {
                 self.account_postings
                     .entry(posting.account.clone())
                     .or_default()
                     .push(txid.clone());
+                self.latest_posting_dates
+                    .entry(posting.account.clone())
+                    .and_modify(|latest| *latest = (*latest).max(txn.date))
+                    .or_insert(txn.date);
             }
 
             // Store the transaction.
@@ -404,6 +420,15 @@ impl ReadModel {
     /// Number of indexed transactions.
     pub fn transaction_count(&self) -> usize {
         self.transactions.len()
+    }
+
+    /// The latest date of any transaction with a posting on `account`.
+    ///
+    /// `None` when the account has never been posted to. Backed by the
+    /// [`latest_posting_dates`](Self::latest_posting_dates) index, so this is a
+    /// hash lookup rather than a scan of every transaction.
+    pub fn latest_posting_date(&self, account: &str) -> Option<NaiveDate> {
+        self.latest_posting_dates.get(account).copied()
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────

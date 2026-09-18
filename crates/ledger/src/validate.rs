@@ -131,6 +131,12 @@ pub fn validate_transaction(
         WeightError::AmountOverflow { detail } => ValidationError::InvalidPosting {
             message: format!("Amount overflow: {detail}"),
         },
+        // L-16: a `{0 USD}` or negative rate mints/destroys units through I1.
+        // L-15: a shape two distinct directives would serialize identically to.
+        other @ (WeightError::NonPositiveCostOrPrice { .. }
+        | WeightError::IndistinguishablePostingShape { .. }) => ValidationError::InvalidPosting {
+            message: other.to_string(),
+        },
     })?;
 
     if elided_count > 1 {
@@ -164,6 +170,12 @@ pub fn validate_transaction(
         WeightError::ElisionInvalid { reason } => ValidationError::InvalidElision { reason },
         WeightError::AmountOverflow { detail } => ValidationError::InvalidPosting {
             message: format!("Amount overflow: {detail}"),
+        },
+        // L-16: a `{0 USD}` or negative rate mints/destroys units through I1.
+        // L-15: a shape two distinct directives would serialize identically to.
+        other @ (WeightError::NonPositiveCostOrPrice { .. }
+        | WeightError::IndistinguishablePostingShape { .. }) => ValidationError::InvalidPosting {
+            message: other.to_string(),
         },
     })?;
 
@@ -539,14 +551,17 @@ mod tests {
             )
             .unwrap();
 
+        // Queried at a date the `open` is in force on, which is the only form
+        // the validation paths use (T41 removed the date-free variant).
+        let at = make_date(2024, 6, 1);
         assert!(state
-            .check_currency_constraint("Assets:Cash", "USD")
+            .check_currency_constraint_at("Assets:Cash", "USD", at)
             .is_ok());
         assert!(state
-            .check_currency_constraint("Assets:Cash", "EUR")
+            .check_currency_constraint_at("Assets:Cash", "EUR", at)
             .is_ok());
         assert!(state
-            .check_currency_constraint("Assets:Cash", "GBP")
+            .check_currency_constraint_at("Assets:Cash", "GBP", at)
             .is_err());
     }
 

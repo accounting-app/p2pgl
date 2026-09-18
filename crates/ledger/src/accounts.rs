@@ -291,22 +291,14 @@ impl AccountState {
         }
     }
 
-    /// Check I9 against the account's CURRENT constraint list.
-    ///
-    /// Prefer [`Self::check_currency_constraint_at`] on validation paths: the
-    /// constraint that governs a transaction is the one carried by the `open`
-    /// in force at the transaction's date, which is the same event I3 was
-    /// checked against. This date-free form answers for the account's latest
-    /// `open` and is kept for callers that have no date in hand.
-    pub fn check_currency_constraint(
-        &self,
-        account: &str,
-        currency: &str,
-    ) -> Result<(), ValidationError> {
-        Self::enforce_currencies(account, currency, self.currencies(account))
-    }
-
     /// Check I9 against the constraint list in force on `date`.
+    ///
+    /// The only I9 entry point, deliberately. A date-free variant answering for
+    /// the account's *latest* `open` existed alongside this one and was removed
+    /// (T41): nothing on any validation path called it, and the constraint that
+    /// governs a transaction is the one carried by the `open` in force at the
+    /// transaction's date — the same event I3 is checked against (M-09). A
+    /// caller with no date in hand would have been asking the wrong question.
     pub fn check_currency_constraint_at(
         &self,
         account: &str,

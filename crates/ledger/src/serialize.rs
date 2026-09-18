@@ -379,6 +379,151 @@ mod tests {
         NaiveDate::from_ymd_opt(year, month, day).unwrap()
     }
 
+    // ── L-15: the two injectivity holes, demonstrated ────────────────────
+    //
+    // These are MECHANISM tests, not regressions: they pin that the serializer
+    // still collapses both shapes, which is exactly why L-15 is closed by
+    // REJECTING them at every ingress rather than by changing the emitted
+    // bytes. The serialized form is the content-hash input, so a new spelling
+    // for `{}`-with-a-date or for an elided-posting-with-a-cost would change
+    // the id of nothing (both shapes are now unreachable) while risking the id
+    // of everything. See `service::validate_posting_annotations`.
+
+    fn elided(account: &str, cost: Option<CostSpec>, price: Option<PriceSpec>) -> Posting {
+        Posting {
+            account: account.to_owned(),
+            amount: None,
+            cost,
+            price,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_l15_elided_posting_swallows_its_cost_and_price() {
+        // (a) The whole `{...}`/`@` block sits inside `if let Some(amount)`, so
+        // an elided posting emits its account name and nothing else — three
+        // materially different postings, one line of output.
+        let bare = elided("Assets:Stock", None, None);
+        let with_cost = elided(
+            "Assets:Stock",
+            Some(CostSpec {
+                amount: Some(Amount {
+                    number: dec!(150),
+                    currency: "USD".to_owned(),
+                }),
+                date: None,
+            }),
+            None,
+        );
+        let with_price = elided(
+            "Assets:Stock",
+            None,
+            Some(PriceSpec::Unit(Amount {
+                number: dec!(1.10),
+                currency: "USD".to_owned(),
+            })),
+        );
+        assert_ne!(bare, with_cost);
+        assert_ne!(bare, with_price);
+
+        let render = |posting: &Posting| {
+            let mut output = String::new();
+            serialize_posting(&mut output, posting, false);
+            output
+        };
+        assert_eq!(render(&bare), "  Assets:Stock\n");
+        assert_eq!(
+            render(&bare),
+            render(&with_cost),
+            "distinct postings must not share a serialization"
+        );
+        assert_eq!(render(&bare), render(&with_price));
+    }
+
+    #[test]
+    fn test_l15_empty_cost_swallows_its_date() {
+        // (b) `cost.date` is written inside `if let Some(cost_amount)`, so an
+        // amount-less `CostSpec` drops its date and emits a bare `{}`.
+        let dated = Posting {
+            account: "Assets:Stock".to_owned(),
+            amount: Some(Amount {
+                number: dec!(10),
+                currency: "AAPL".to_owned(),
+            }),
+            cost: Some(CostSpec {
+                amount: None,
+                date: Some(make_date(2020, 3, 4)),
+            }),
+            price: None,
+            metadata: BTreeMap::new(),
+        };
+        let undated = Posting {
+            cost: Some(CostSpec {
+                amount: None,
+                date: None,
+            }),
+            ..dated.clone()
+        };
+        assert_ne!(dated, undated);
+
+        let render = |posting: &Posting| {
+            let mut output = String::new();
+            serialize_posting(&mut output, posting, false);
+            output
+        };
+        assert!(render(&dated).contains(" {}"));
+        assert!(
+            !render(&dated).contains("2020-03-04"),
+            "the date is silently dropped"
+        );
+        assert_eq!(render(&dated), render(&undated));
+    }
+
+    #[test]
+    fn test_l15_collapsed_shapes_share_a_content_id() {
+        // Why the holes matter: `compute_content_id` hashes the serialized
+        // economic form, so two distinct directives get ONE id. In a G-Set DAG
+        // keyed by that id the second arrival is a no-op "duplicate", and a
+        // signature made over one body authenticates the other.
+        let base = Transaction {
+            date: make_date(2024, 1, 15),
+            flag: Flag::Complete,
+            payee: None,
+            narration: Some("Collision".to_owned()),
+            tags: vec![],
+            links: vec![],
+            postings: vec![
+                Posting {
+                    account: "Assets:Cash".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(100),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+                elided("Equity:Opening", None, None),
+            ],
+            metadata: BTreeMap::new(),
+        };
+        let mut annotated = base.clone();
+        annotated.postings[1].cost = Some(CostSpec {
+            amount: Some(Amount {
+                number: dec!(150),
+                currency: "USD".to_owned(),
+            }),
+            date: None,
+        });
+        assert_ne!(base, annotated);
+        assert_eq!(
+            crate::hash::compute_content_id(&Directive::Transaction(base)),
+            crate::hash::compute_content_id(&Directive::Transaction(annotated)),
+            "two distinct transactions must not share a content id"
+        );
+    }
+
     // ── Column 52 alignment ──────────────────────────────────────────────
 
     #[test]

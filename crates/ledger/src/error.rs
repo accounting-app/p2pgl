@@ -32,6 +32,8 @@ pub enum ParseErrorKind {
     UnterminatedString,
     /// A non-string metadata value was encountered (§3.3.2: strings only).
     InvalidMetadataValue,
+    /// A metadata key did not match `[a-z][a-zA-Z0-9_-]*` — ASCII only (T41).
+    InvalidMetadataKey,
     /// A tag did not match `#[a-zA-Z0-9_-]+`.
     InvalidTag,
     /// A link did not match `^[a-zA-Z0-9_-]+`.
