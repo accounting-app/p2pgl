@@ -1,9 +1,16 @@
 # Run each of these in its own shell. Every config below points at a DIFFERENT
 # ledgerPath (test-ledger.bean, test-ledger-0/1/2.bean) on purpose: a node takes
-# an exclusive lock on its ledger at startup (M-17), because two nodes sharing
-# one .bean each rewrite the whole file and silently discard the other's
-# directives. Pointing two configs at one path now fails closed at startup with
-# a message naming the file — that is the fix working, not a bug.
+# an exclusive lock on a "<ledgerPath>.lock" sidecar at startup (M-17), because
+# two nodes sharing one .bean each rewrite the whole file and silently discard
+# the other's directives. Pointing two configs at one path now fails closed at
+# startup with a message naming the file — that is the fix working, not a bug.
+# The lock is released by the OS when the process dies, so a crashed node does
+# not leave the path wedged; the stray "*.bean.lock" file is gitignored.
+#
+# The lock excludes other gl-node processes, NOT text editors. Do not hand-edit
+# a .bean file while the node that owns it is running — stop it, edit, restart.
+# See the README's "Editing the .bean file by hand" for why the adopt-before-
+# persist mitigation is not a substitute for that.
 
 GL_NODE_CONFIG="./config/gl-node.json" cargo run -p gl-node
 
