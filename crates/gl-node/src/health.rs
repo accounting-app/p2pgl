@@ -10,12 +10,20 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 /// Response body for `GET /health` (§2.9).
+///
+/// The three detail fields are optional so the same type can serialize both
+/// shapes L-09 needs: the full body, and a bare `{"status":"ok"}` with the
+/// detail keys **absent** rather than null/zero — an absent key cannot be
+/// mistaken for "this node has no peers".
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: String,
-    pub heads: u64,
-    pub peers: u64,
-    pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heads: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peers: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// Shared state for the health endpoint.
@@ -23,19 +31,63 @@ pub struct HealthResponse {
 pub struct HealthState {
     pub ledger: Arc<RwLock<ledger::service::LedgerService>>,
     pub peer_registry: p2p::node::PeerRegistry,
+    /// True when the HTTP listener is bound to a non-loopback address (L-09).
+    ///
+    /// Keyed on the **bind**, not on the client address, deliberately: behind
+    /// the TLS terminator `tls.mode: "terminated"` assumes, the peer address is
+    /// the proxy's and a client-address rule would hand every remote caller the
+    /// loopback treatment. `binds_non_loopback()` is the same predicate config
+    /// validation uses for the graphiql/auth/allowedHosts rules, so one
+    /// deployment cannot be "public" for one check and private for another.
+    pub public_bind: bool,
+    /// The API-key state, so a public bind can still serve full detail to an
+    /// authenticated operator (L-09).
+    pub auth: crate::auth::AuthState,
 }
 
 /// Handler for `GET /health`.
 ///
-/// Exempt from auth even when `auth.enabled` (§2.9).
-/// Returns live head and peer counts from the ledger and peer registry.
-pub async fn health_handler(State(state): State<HealthState>) -> impl IntoResponse {
+/// Exempt from auth even when `auth.enabled` (§2.9) — it must answer `200` to an
+/// unauthenticated prober, which is all the Docker `HEALTHCHECK` and
+/// [`probe_local_health`] read. What it answers *with* depends on the bind
+/// (L-09):
+///
+/// * **loopback bind** — full detail, unauthenticated. This matches the
+///   loopback-trust precedent already in the config rules (GraphiQL is allowed
+///   only on a loopback bind, and auth may be off only there), and it keeps the
+///   endpoint useful for the operator running `curl localhost:3000/health`.
+/// * **non-loopback bind** — `{"status":"ok"}` and nothing else, unless the
+///   request carries a valid `X-Api-Key`. Version, head count and peer count are
+///   reconnaissance: the version names the exact build to look up advisories
+///   for, and heads/peers report mesh size and write activity to anyone who can
+///   reach the port.
+///
+/// The unauthenticated-public branch is the only one reachable with auth off on
+/// a public bind, because config validation (M-2) refuses that combination at
+/// boot — so there is no "public, auth disabled, full detail" case to handle.
+pub async fn health_handler(
+    State(state): State<HealthState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let detailed = !state.public_bind || state.auth.request_is_authenticated(&headers);
+    if !detailed {
+        return (
+            StatusCode::OK,
+            Json(HealthResponse {
+                status: "ok".to_owned(),
+                heads: None,
+                peers: None,
+                version: None,
+            }),
+        );
+    }
+
     let svc = state.ledger.read().await;
     let response = HealthResponse {
         status: "ok".to_owned(),
-        heads: svc.head_count() as u64,
-        peers: state.peer_registry.count() as u64,
-        version: env!("CARGO_PKG_VERSION").to_owned(),
+        heads: Some(svc.head_count() as u64),
+        peers: Some(state.peer_registry.count() as u64),
+        version: Some(env!("CARGO_PKG_VERSION").to_owned()),
     };
     (StatusCode::OK, Json(response))
 }
@@ -100,6 +152,11 @@ mod tests {
         let state = HealthState {
             ledger: Arc::new(RwLock::new(service)),
             peer_registry: p2p::node::PeerRegistry::new(),
+            public_bind: false,
+            auth: crate::auth::AuthState {
+                enabled: false,
+                api_key: String::new(),
+            },
         };
 
         let application = Router::new()
@@ -123,6 +180,104 @@ mod tests {
         assert_eq!(health["peers"], 0);
         assert!(health["version"].is_string());
         assert!(!health["version"].as_str().unwrap().is_empty());
+    }
+
+    // ── L-09: detail is disclosed by bind, and by key on a public bind ───
+
+    /// A `/health` router over a one-directive ledger, with the L-09 knobs.
+    fn health_app(public_bind: bool, api_key: &str) -> (tempfile::TempDir, Router) {
+        let dir = tempfile::tempdir().unwrap();
+        let bean_path = dir.path().join("test.bean");
+        std::fs::write(&bean_path, "2024-01-01 open Assets:Cash USD\n").unwrap();
+        let service =
+            ledger::service::LedgerService::boot(&bean_path, "test-node".to_owned()).unwrap();
+        let state = HealthState {
+            ledger: Arc::new(RwLock::new(service)),
+            peer_registry: p2p::node::PeerRegistry::new(),
+            public_bind,
+            auth: crate::auth::AuthState {
+                enabled: !api_key.is_empty(),
+                api_key: api_key.to_owned(),
+            },
+        };
+        let router = Router::new()
+            .route("/health", get(health_handler))
+            .with_state(state);
+        (dir, router)
+    }
+
+    async fn health_body(router: Router, api_key: Option<&str>) -> serde_json::Value {
+        let mut builder = Request::builder().uri("/health");
+        if let Some(key) = api_key {
+            builder = builder.header("x-api-key", key);
+        }
+        let response = router
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        // Every branch is a 200 — the Docker HEALTHCHECK reads nothing else.
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).expect("valid JSON")
+    }
+
+    #[tokio::test]
+    async fn test_public_bind_unauthenticated_health_is_minimal() {
+        // L-09: version/heads/peers are reconnaissance for anyone who can reach
+        // the port — the build to look up advisories for, plus mesh size and
+        // write activity. On a public bind an unauthenticated caller gets the
+        // liveness answer and nothing else.
+        let (_dir, router) = health_app(true, "a-real-api-key-at-least-16-bytes");
+        let body = health_body(router, None).await;
+
+        assert_eq!(body["status"], "ok");
+        let object = body.as_object().expect("a JSON object");
+        assert_eq!(
+            object.keys().collect::<Vec<_>>(),
+            vec!["status"],
+            "no detail key may be present, not even as null: {body}"
+        );
+        for key in ["version", "heads", "peers"] {
+            assert!(!object.contains_key(key), "{key} must be absent: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_public_bind_with_valid_key_gets_full_health() {
+        // The operator is not locked out of their own node: the same key that
+        // opens `/graphql` opens the detail here, through the same check.
+        let key = "a-real-api-key-at-least-16-bytes";
+        let (_dir, router) = health_app(true, key);
+        let body = health_body(router, Some(key)).await;
+
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["heads"], 0); // one `open`, no transactions
+        assert_eq!(body["peers"], 0);
+        assert!(body["version"].as_str().is_some_and(|v| !v.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn test_public_bind_with_wrong_key_is_minimal() {
+        let (_dir, router) = health_app(true, "a-real-api-key-at-least-16-bytes");
+        let body = health_body(router, Some("not-the-key")).await;
+        assert_eq!(
+            body.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["status"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_loopback_bind_serves_full_health_unauthenticated() {
+        // The loopback-trust precedent this codebase already follows for
+        // GraphiQL and for `auth.enabled`: a node reachable only from the host
+        // stays fully informative to `curl localhost:3000/health`.
+        let (_dir, router) = health_app(false, "");
+        let body = health_body(router, None).await;
+
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["heads"], 0);
+        assert_eq!(body["peers"], 0);
+        assert!(body["version"].as_str().is_some_and(|v| !v.is_empty()));
     }
 
     #[test]

@@ -170,9 +170,16 @@ pub struct HealthStatus {
     pub version: String,
 }
 
-/// A connected peer and its advertised heads.
+/// A currently-connected peer.
+///
+/// Carried an `heads: [TxId!]!` field until the 0902 informational finding:
+/// nothing ever wrote a head into the registry behind it, so the field reported
+/// an empty list on every healthy mesh and read as "this peer has no history".
+/// Head exchange happens over the anti-entropy ALPN session, which never
+/// touches the peer registry, so the field was removed rather than papered
+/// over — a client that needs remote heads needs a resolver backed by that
+/// exchange, not this one returning `[]`.
 #[derive(SimpleObject, Debug, Clone)]
 pub struct Peer {
     pub id: String,
-    pub heads: Vec<TransactionId>,
 }

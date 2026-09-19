@@ -8,10 +8,71 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 /// Shared auth state for the middleware layer.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AuthState {
     pub enabled: bool,
     pub api_key: String,
+}
+
+/// Hand-written so the API key is never printed (T41).
+///
+/// The derived `Debug` printed `api_key` in the clear, and this type is reachable
+/// from axum's `State` extractor — so the key landed in any `{:?}` of the router
+/// state, in a panic message, and in the failure output of every test that
+/// asserted on auth. That last one is how it was noticed: a proof run in T36
+/// printed a live-shaped key to the terminal. A `Debug` impl is the one place a
+/// secret leaks without anyone choosing to log it.
+///
+/// `enabled` stays visible — it is policy, not a credential, and it is the field
+/// anyone actually debugs.
+impl std::fmt::Debug for AuthState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthState")
+            .field("enabled", &self.enabled)
+            .field("api_key", &redact(&self.api_key))
+            .finish()
+    }
+}
+
+/// Render a secret as a non-reversible summary for `Debug` output (T41).
+///
+/// Length plus a 4-character prefix, matching the shape T39 chose for the mesh-id
+/// boot log: enough to tell "unset" from "set" and to match two values against
+/// each other while triaging, never enough to replay. Short values get no prefix
+/// at all — four characters of a six-character key is most of the key.
+pub(crate) fn redact(secret: &str) -> String {
+    if secret.is_empty() {
+        return "<unset>".to_owned();
+    }
+    let length = secret.len();
+    if length < 12 {
+        return format!("<redacted, {length} bytes>");
+    }
+    let prefix: String = secret.chars().take(4).collect();
+    format!("<redacted, {length} bytes, starts {prefix}…>")
+}
+
+impl AuthState {
+    /// Does this request carry a valid `X-Api-Key`? (§3.8)
+    ///
+    /// This is the single decision [`auth_middleware`] makes, factored out so
+    /// `/health` can ask the same question (L-09). Health is deliberately *not*
+    /// behind the middleware — it must answer `200` to an unauthenticated
+    /// prober — so it needs the check without the 401, and it must not grow a
+    /// second, subtly different key comparison to get it.
+    ///
+    /// Note this answers "carries a valid key", not "is allowed through":
+    /// `enabled` is the middleware's policy, not part of the credential check.
+    /// With auth disabled there is no key to match, so this is `false`, and the
+    /// health handler's loopback branch is what keeps a local node informative.
+    pub fn request_is_authenticated(&self, headers: &axum::http::HeaderMap) -> bool {
+        self.enabled
+            && headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|key| api_key_matches(key, &self.api_key))
+    }
 }
 
 /// Axum middleware that enforces `X-Api-Key` on protected routes (§3.8).
@@ -33,14 +94,9 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
-    let api_key_header = request
-        .headers()
-        .get("x-api-key")
-        .and_then(|value| value.to_str().ok());
-
-    match api_key_header {
-        Some(key) if api_key_matches(key, &auth_state.api_key) => next.run(request).await,
-        _ => {
+    match auth_state.request_is_authenticated(request.headers()) {
+        true => next.run(request).await,
+        false => {
             let error_body = json!({
                 "errors": [{
                     "message": "Missing or invalid API key",
@@ -81,6 +137,51 @@ mod tests {
 
     async fn ok_handler() -> &'static str {
         "ok"
+    }
+
+    /// T41: the derived `Debug` printed `api_key` verbatim. `AuthState` is axum
+    /// router state, so that value reached any `{:?}` of the state, every panic
+    /// message carrying it, and the failure output of every auth test — which is
+    /// where it was actually spotted.
+    #[test]
+    fn debug_output_never_contains_the_api_key() {
+        let secret = "s3cr3t-key-value-0123456789abcdef";
+        let rendered = format!(
+            "{:?}",
+            AuthState {
+                enabled: true,
+                api_key: secret.to_owned(),
+            }
+        );
+        assert!(
+            !rendered.contains(secret),
+            "the key must not appear in Debug output: {rendered}"
+        );
+        // Still useful for triage: policy, length, and a short prefix.
+        assert!(rendered.contains("enabled: true"), "{rendered}");
+        assert!(rendered.contains("33 bytes"), "{rendered}");
+
+        // A short key gets no prefix at all — four characters of a six-character
+        // key is most of the key.
+        let short = format!(
+            "{:?}",
+            AuthState {
+                enabled: true,
+                api_key: "abcdef".to_owned(),
+            }
+        );
+        assert!(!short.contains("abcd"), "{short}");
+
+        // And an unset key says so rather than showing an empty string, which
+        // reads as "redacted" and is the opposite of the truth.
+        let unset = format!(
+            "{:?}",
+            AuthState {
+                enabled: false,
+                api_key: String::new(),
+            }
+        );
+        assert!(unset.contains("<unset>"), "{unset}");
     }
 
     fn build_app(auth_state: AuthState) -> Router {

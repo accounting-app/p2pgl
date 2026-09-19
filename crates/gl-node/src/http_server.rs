@@ -66,7 +66,11 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Connection-level limits applied by [`serve_hardened`] (M-13).
-#[derive(Clone, Copy, Debug)]
+///
+/// Populated from the optional `http` config section; see
+/// `NodeConfig::http_server_settings`. [`Default`] is the single source of the
+/// shipped values, so an absent config section and this struct cannot disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HttpServerSettings {
     /// Time a client gets to send a complete request head. Re-armed per head,
     /// so it doubles as the idle keep-alive bound.
@@ -240,21 +244,16 @@ mod tests {
     use axum::extract::ConnectInfo;
     use axum::routing::{get, post};
     use std::io::Write;
-    use std::sync::LazyLock;
     use tempfile::NamedTempFile;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
     use tokio::sync::RwLock;
     use tower_http::cors::CorsLayer;
 
-    /// Serializes the network tests in this module.
-    ///
-    /// They bind real listeners and assert on wall-clock deadlines measured in
-    /// hundreds of milliseconds; run concurrently under `cargo test` they
-    /// starve one another's runtimes and the deadlines flake. Every test below
-    /// holds this for its whole body.
-    static NET_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
-        LazyLock::new(|| tokio::sync::Mutex::new(()));
+    /// The crate-wide network-test lock (T41): these bind real listeners and
+    /// assert on wall-clock deadlines measured in hundreds of milliseconds, so
+    /// they must exclude the QUIC convergence tests too, not just each other.
+    use crate::test_support::NET_TEST_LOCK;
 
     const HEADER_TIMEOUT: Duration = Duration::from_millis(300);
     const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
@@ -706,6 +705,11 @@ mod tests {
             HealthState {
                 ledger: shared,
                 peer_registry,
+                public_bind: false,
+                auth: AuthState {
+                    enabled: false,
+                    api_key: String::new(),
+                },
             },
             RequestGuardState {
                 allowed_hosts: Arc::new(config.allowed_host_set()),

@@ -310,6 +310,11 @@ mod tests {
             HealthState {
                 ledger: shared,
                 peer_registry,
+                public_bind: false,
+                auth: AuthState {
+                    enabled: false,
+                    api_key: String::new(),
+                },
             },
             state,
             CorsLayer::new(),

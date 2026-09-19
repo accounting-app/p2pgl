@@ -674,6 +674,11 @@ mod tests {
             crate::health::HealthState {
                 ledger: shared,
                 peer_registry,
+                public_bind: false,
+                auth: crate::auth::AuthState {
+                    enabled: false,
+                    api_key: String::new(),
+                },
             },
             crate::request_guard::RequestGuardState {
                 allowed_hosts: Arc::new(

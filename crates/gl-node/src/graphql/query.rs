@@ -268,16 +268,16 @@ impl QueryRoot {
         }
     }
 
-    /// Connected peers and their heads (FR-6 AC2).
+    /// Currently-connected peers (FR-6 AC2).
+    ///
+    /// Membership only: the per-peer `heads` list this used to return was
+    /// always empty (see [`Peer`]).
     async fn peers(&self, ctx: &Context<'_>) -> Vec<Peer> {
         if let Ok(registry) = ctx.data::<p2p::node::PeerRegistry>() {
             registry
                 .list()
                 .into_iter()
-                .map(|p| Peer {
-                    id: p.id,
-                    heads: p.heads.into_iter().map(TransactionId).collect(),
-                })
+                .map(|peer| Peer { id: peer.id })
                 .collect()
         } else {
             Vec::new()

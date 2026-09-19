@@ -10,6 +10,8 @@ mod ledger_lock;
 mod p2p_service;
 mod rate_limit;
 mod request_guard;
+#[cfg(test)]
+mod test_support;
 
 use auth::AuthState;
 use config::NodeConfig;
@@ -18,7 +20,6 @@ use graphql::{
     build_schema_with_service, graphiql_handler, graphql_handler, AppSchema, SharedLedger,
 };
 use health::{health_handler, probe_local_health, HealthState};
-use http_server::HttpServerSettings;
 use rate_limit::RateLimiter;
 use request_guard::RequestGuardState;
 
@@ -64,6 +65,22 @@ fn parse_cli() -> CliAction {
         Some(other) => CliAction::Usage(format!(
             "unknown argument: {other}\nUsage: gl-node [--health-check | --version]"
         )),
+    }
+}
+
+/// Create the ledger file's parent directory if it is missing (§3.3).
+///
+/// Directories only. The `.bean` file is created by `LedgerService::boot` on the
+/// ledger crate's hardened path (temp file at 0600 → fsync → rename), which is
+/// the whole point of L-31: whoever creates the file decides its permissions,
+/// and that decision belongs to the crate that owns the format, not to the
+/// process umask.
+fn ensure_ledger_parent_directory(ledger_path: &std::path::Path) -> std::io::Result<()> {
+    match ledger_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() && !parent.exists() => {
+            std::fs::create_dir_all(parent)
+        }
+        _ => Ok(()),
     }
 }
 
@@ -126,15 +143,12 @@ async fn main() {
         }
     };
 
-    // Ensure ledger file parent directory exists; create empty .bean if missing (§3.3).
+    // Ensure the ledger file's parent directory exists (§3.3). The `.bean` file
+    // itself is deliberately NOT created here — see below.
     let ledger_path = PathBuf::from(&config.ledger_path);
-    if let Some(parent_directory) = ledger_path.parent() {
-        if !parent_directory.as_os_str().is_empty() && !parent_directory.exists() {
-            if let Err(error) = std::fs::create_dir_all(parent_directory) {
-                error!(%error, path = %parent_directory.display(), "failed to create ledger directory");
-                std::process::exit(1);
-            }
-        }
+    if let Err(error) = ensure_ledger_parent_directory(&ledger_path) {
+        error!(%error, path = %ledger_path.display(), "failed to create ledger directory");
+        std::process::exit(1);
     }
 
     // Claim the ledger for this process before touching it (M-17). Two nodes on
@@ -147,8 +161,8 @@ async fn main() {
     // recovers from a failed persist by re-booting the same path, and an
     // flock-style lock conflicts across descriptors even within one process, so
     // a boot-level lock would refuse its own reload. See `ledger_lock` for the
-    // full rationale. Taken before the empty-.bean creation below so even that
-    // first write is serialized.
+    // full rationale. Taken before `LedgerService::boot`, so the ledger's own
+    // first write is serialized too.
     let _ledger_lock = match ledger_lock::acquire(&ledger_path) {
         Ok(guard) => {
             info!(lock = %guard.path().display(), "ledger lock acquired");
@@ -160,13 +174,14 @@ async fn main() {
         }
     };
 
-    if !ledger_path.exists() {
-        info!(path = %ledger_path.display(), "ledger file not found — creating empty .bean");
-        if let Err(error) = std::fs::write(&ledger_path, "") {
-            error!(%error, path = %ledger_path.display(), "failed to create empty ledger file");
-            std::process::exit(1);
-        }
-    }
+    // L-31: there is deliberately no `std::fs::write(&ledger_path, "")` here.
+    // That pre-create ran before the ledger crate ever saw the path and produced
+    // the file at the process umask — world-readable on a default 022 umask —
+    // and `LedgerService::boot` then found a file that already existed and left
+    // those permissions in place for the whole life of the ledger. Booting on an
+    // absent path takes the crate's own creation path (`persist_atomically`),
+    // which creates 0600 and fsyncs. Let the owner of the format own the file's
+    // birth.
 
     // Boot the ledger service (§3.3).
     let author_id = "local".to_owned(); // Replaced by Iroh EndpointId when P2P boots.
@@ -200,9 +215,68 @@ async fn main() {
     let peer_registry: PeerRegistry;
     let mut p2p_router = None;
 
+    // Load the node's Ed25519 secret key ONCE, here, before anything consumes it
+    // (L-04). The same 32 bytes are the iroh QUIC identity *and* the
+    // directive-signing key — `EndpointId` is the Ed25519 verifying key — so two
+    // independent reads could hand the endpoint one key and the signer another,
+    // and each read re-resolved the path after the permission check had already
+    // passed on it. One open, one `fstat` of that handle, one read, both
+    // consumers.
+    //
+    // Which loader applies is deliberately not uniform. With p2p on, the key is
+    // this node's bootstrappable mesh identity and is created on first boot
+    // (CAP-4). With signing on and p2p off there is no identity to bootstrap, so
+    // a missing key stays an operator error rather than becoming a silently
+    // invented one — the pre-L-04 behaviour of `build_signature_provider`,
+    // preserved. Config validation already forces `signing.enabled` whenever
+    // `p2p.enabled`, so the p2p branch covers both consumers.
+    let secret_key_path = PathBuf::from(&config.p2p.secret_key_path);
+    let node_secret_key = if config.p2p.enabled {
+        match p2p_service::load_or_create_secret_key(&secret_key_path) {
+            Ok(key) => Some(key),
+            Err(error) => {
+                error!(%error, path = %secret_key_path.display(), "failed to load or create the node secret key — aborting");
+                std::process::exit(1);
+            }
+        }
+    } else if config.signing.enabled {
+        match p2p_service::load_secret_key(&secret_key_path) {
+            Ok(key) => Some(key),
+            Err(error) => {
+                error!(%error, path = %secret_key_path.display(), "signing enabled but secret key could not be loaded — aborting");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    // Resolve the mesh signature domain ONCE (L-23), here, and hand the result
+    // to every consumer. `p2p.meshId` when set, `p2p.swarmTopic` otherwise —
+    // the fallback is what keeps already-persisted signatures verifiable on a
+    // deployment that has not adopted a mesh id (see `P2pConfig::mesh_id`).
+    //
+    // One resolution, one value: the signer and the ALPN verification path both
+    // receive this string, so neither reads `swarm_topic` for signature
+    // purposes and the two cannot drift apart.
+    let signature_domain = config.p2p.signature_domain().to_owned();
+    info!(
+        source = config.p2p.signature_domain_source(),
+        length = signature_domain.len(),
+        // The domain doubles as a quasi-credential when it falls back to the
+        // swarm topic (which is also the gossip join string), so the log names
+        // its shape, never its value.
+        prefix = %signature_domain.chars().take(4).collect::<String>(),
+        "mesh signature domain resolved"
+    );
+
     // Boot P2P if enabled (§3.4). Keep identity even when the allowlist is empty.
     let gossip_sender = if config.p2p.enabled {
-        match p2p_service::boot_p2p(&config.p2p, &ledger_path).await {
+        let Some(secret_key) = node_secret_key.as_ref() else {
+            error!("p2p.enabled is true but no secret key was loaded — aborting");
+            std::process::exit(1);
+        };
+        match p2p_service::boot_p2p(&config.p2p, secret_key).await {
             Ok(peer_node) => {
                 // Update ledger service author to Iroh EndpointId (§3.3.1).
                 let iroh_author_id = peer_node.node_id();
@@ -225,7 +299,7 @@ async fn main() {
                     orphan_buffer: orphan_buffer.clone(),
                     allowlist: peer_node.allowlist().clone(),
                     signing_enabled: config.signing.enabled,
-                    swarm_topic: config.p2p.swarm_topic.clone(),
+                    mesh_id: signature_domain.clone(),
                     timeouts: anti_entropy_alpn::AntiEntropyTimeouts::default(),
                     limits,
                     limiter: connection_limiter::ConnectionLimiter::new(limits),
@@ -233,6 +307,9 @@ async fn main() {
                 p2p_router = Some(p2p_service::spawn_router(&peer_node, handler.clone()));
                 let sender = p2p_service::spawn_gossip_loop(&peer_node, handler.clone());
                 p2p_service::spawn_anti_entropy_loop(&peer_node, handler);
+                // L-20: expire orphans on a timer, not only when an insert
+                // happens to run the sweep.
+                p2p_service::spawn_orphan_eviction_loop(orphan_buffer.clone());
                 Some(sender)
             }
             Err(error) => {
@@ -245,6 +322,33 @@ async fn main() {
         peer_registry = PeerRegistry::new();
         None
     };
+
+    // Build signature provider based on config (§3.8.1).
+    // When signing is enabled the key is mandatory — never fall back to noop (H-4).
+    //
+    // Built here, BEFORE the file watcher starts, because the watcher reconciles
+    // hand edits and those now get signed at adoption (L-11): an adoption that
+    // ran before the signer was installed would persist an entry no peer will
+    // ever accept, which is the exact failure L-11 closes.
+    let signer = build_signature_provider(&config, node_secret_key.as_ref(), &signature_domain);
+
+    // L-11: hand the service a signing callback so reconcile can stamp entries
+    // the operator added by hand, exactly as `appendTransaction` stamps its own.
+    // `set_author_id` above has already run when P2P is on, so the author this
+    // signs for is the same `EndpointId` the key belongs to.
+    {
+        let signer_for_reconcile = Arc::clone(&signer);
+        shared_ledger.write().await.set_signer(Arc::new(
+            move |content_id: &str, is_transaction: bool, parents: &str, lamport: &str| {
+                signer_for_reconcile.sign(&security::signing::SignableMessage {
+                    content_id,
+                    is_transaction,
+                    parents,
+                    lamport,
+                })
+            },
+        ));
+    }
 
     // Start file watcher if external edits enabled (§3.3, CT-12).
     let file_watcher_handle = if config.external_file_edits == "enabled" {
@@ -288,10 +392,6 @@ async fn main() {
         None
     };
 
-    // Build signature provider based on config (§3.8.1).
-    // When signing is enabled the key is mandatory — never fall back to noop (H-4).
-    let signer = build_signature_provider(&config);
-
     // Build the GraphQL schema with live service + peer registry + signer.
     let schema = build_schema_with_service(
         shared_ledger.clone(),
@@ -309,9 +409,15 @@ async fn main() {
     };
 
     // Health state with live shared ledger + peer registry.
+    //
+    // L-09: the bind decides how much detail `/health` discloses to an
+    // unauthenticated caller, and the auth state lets an authenticated operator
+    // get the full picture on a public bind regardless.
     let health_state = HealthState {
         ledger: shared_ledger,
         peer_registry,
+        public_bind: config.binds_non_loopback(),
+        auth: auth_state.clone(),
     };
 
     // Host / Content-Type / Origin guard state (H-01).
@@ -376,11 +482,14 @@ async fn main() {
     );
 
     // Serve with graceful shutdown on SIGTERM / SIGINT (§3.9), under the
-    // connection-level limits `axum::serve` never applied (M-13).
+    // connection-level limits `axum::serve` never applied (M-13). The settings
+    // come from the optional `http` config section; with the section absent
+    // every field is `HttpServerSettings::default()`'s own value, which is what
+    // this call site used to pass literally.
     let server = http_server::serve_hardened(
         listener,
         application,
-        HttpServerSettings::default(),
+        config.http_server_settings(),
         shutdown_signal(),
     );
 
@@ -477,25 +586,33 @@ pub(crate) fn build_application_with_limiter(
         .layer(cors)
 }
 
-fn build_signature_provider(config: &NodeConfig) -> Arc<dyn security::signing::SignatureProvider> {
+/// Build the signature provider from the key material already loaded in `main`.
+///
+/// Takes the loaded key rather than a path (L-04): the signer and the iroh
+/// endpoint must be the *same* key, and the only way to guarantee that is for
+/// neither of them to read the file.
+///
+/// Takes the already-resolved `mesh_id` rather than the config field it came
+/// from (L-23), for the same reason: the signer and the ALPN verifier must bind
+/// the *same* domain, so this function must not be able to derive its own.
+fn build_signature_provider(
+    config: &NodeConfig,
+    node_secret_key: Option<&p2p_service::NodeSecretKey>,
+    mesh_id: &str,
+) -> Arc<dyn security::signing::SignatureProvider> {
     if config.signing.enabled {
-        let key_path = std::path::Path::new(&config.p2p.secret_key_path);
-        match p2p_service::read_secret_key_bytes(key_path) {
-            Ok(key_bytes) => {
-                // Bind signatures to this node's mesh identity (swarm topic) so
-                // they cannot be replayed into another mesh (L2).
-                let provider = security::signing::PeerKeySignatureProvider::from_bytes(
-                    &key_bytes,
-                    config.p2p.swarm_topic.clone(),
-                );
-                info!(public_key = %provider.public_key_hex(), "signing enabled");
-                Arc::new(provider)
-            }
-            Err(error) => {
-                error!(%error, "signing enabled but secret key could not be loaded — aborting");
-                std::process::exit(1);
-            }
-        }
+        let Some(secret_key) = node_secret_key else {
+            error!("signing enabled but no secret key was loaded — aborting");
+            std::process::exit(1);
+        };
+        // Bind signatures to this node's mesh identity so they cannot be
+        // replayed into another mesh (L2 / L-23).
+        let provider = security::signing::PeerKeySignatureProvider::from_bytes(
+            secret_key.bytes(),
+            mesh_id.to_owned(),
+        );
+        info!(public_key = %provider.public_key_hex(), "signing enabled");
+        Arc::new(provider)
     } else {
         info!("signing disabled");
         Arc::new(security::signing::NoopSignatureProvider)
@@ -527,5 +644,406 @@ async fn shutdown_signal() {
     tokio::select! {
         () = control_c => { info!("received SIGINT — shutting down"); }
         () = terminate => { info!("received SIGTERM — shutting down"); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// L-31: booting on a path that does not exist yet must leave the ledger
+    /// file at 0600.
+    ///
+    /// This is the exact boot sequence `main` runs — create the parent directory,
+    /// then `LedgerService::boot` — and it is the sequence that used to have a
+    /// `std::fs::write(&ledger_path, "")` wedged between the two steps. That
+    /// pre-create made the file at the process umask (0644 under the default
+    /// 022), and because the file then *existed*, the ledger crate's hardened
+    /// creation path never ran and never corrected the mode: a world-readable
+    /// ledger for the life of the deployment. The umask is forced to 0 here so
+    /// the assertion tests the code's intent rather than the environment's
+    /// leniency — with the pre-create restored, this fails at 0666.
+    #[cfg(unix)]
+    #[test]
+    fn ledger_created_on_boot_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        // A nested directory, so the parent-directory step is exercised too.
+        let ledger_path = temp_dir.path().join("nested").join("fresh.bean");
+
+        // SAFETY: `umask` is process-global. Forced to 0 so a permissive
+        // developer umask cannot mask the bug, and restored immediately.
+        let previous_umask = unsafe { libc_umask(0) };
+        let result = (|| {
+            ensure_ledger_parent_directory(&ledger_path)?;
+            assert!(
+                !ledger_path.exists(),
+                "preparing the directory must not create the .bean itself (L-31)"
+            );
+            ledger::service::LedgerService::boot(&ledger_path, "local".to_owned())
+                .map_err(|error| std::io::Error::other(error.to_string()))
+        })();
+        unsafe { libc_umask(previous_umask) };
+        result.expect("boot on an absent ledger path must succeed");
+
+        assert!(ledger_path.exists(), "boot must create the ledger file");
+        let mode = std::fs::metadata(&ledger_path)
+            .expect("stat the created ledger")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a ledger created at boot must be owner-only, got {mode:o}"
+        );
+    }
+
+    /// `umask(2)`, declared directly rather than pulling in a `libc` dependency
+    /// for one test-only call. Always succeeds and returns the previous mask.
+    #[cfg(unix)]
+    unsafe fn libc_umask(mask: u32) -> u32 {
+        extern "C" {
+            fn umask(mask: u32) -> u32;
+        }
+        unsafe { umask(mask) }
+    }
+
+    /// Preparing the ledger path is directory-only and idempotent.
+    #[test]
+    fn ensure_ledger_parent_directory_creates_only_directories() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ledger_path = temp_dir.path().join("a").join("b").join("ledger.bean");
+
+        ensure_ledger_parent_directory(&ledger_path).expect("first call");
+        ensure_ledger_parent_directory(&ledger_path).expect("second call is a no-op");
+
+        assert!(ledger_path.parent().expect("parent").is_dir());
+        assert!(
+            !ledger_path.exists(),
+            "the .bean must be left for LedgerService::boot to create (L-31)"
+        );
+    }
+
+    /// A bare file name has no parent to create, and must not be mistaken for one.
+    #[test]
+    fn ensure_ledger_parent_directory_tolerates_a_bare_file_name() {
+        ensure_ledger_parent_directory(std::path::Path::new("ledger.bean"))
+            .expect("a bare file name has an empty parent, not a missing one");
+    }
+
+    // ── L-23: mesh identity decoupled from the swarm topic ───────────────
+
+    mod mesh_identity {
+        use super::*;
+
+        use security::signing::{SignableMessage, SignatureProvider};
+        use std::collections::BTreeMap;
+
+        /// Parse and validate a config exactly as boot does.
+        fn load_config(json: &str) -> NodeConfig {
+            use std::io::Write;
+            let mut file = tempfile::NamedTempFile::new().expect("temp config file");
+            file.write_all(json.as_bytes()).expect("write temp config");
+            NodeConfig::load_from_path(&file.path().to_path_buf()).expect("config must load")
+        }
+
+        /// A signing-enabled config on `topic`, with `mesh_id` set or not.
+        fn config_for(topic: &str, mesh_id: Option<&str>) -> NodeConfig {
+            let mesh_field = match mesh_id {
+                Some(value) => format!(r#", "meshId": "{value}""#),
+                None => String::new(),
+            };
+            load_config(&format!(
+                r#"{{ "ledgerPath": "./data/ledger.bean",
+                      "signing": {{ "enabled": true }},
+                      "p2p": {{ "swarmTopic": "{topic}"{mesh_field} }} }}"#
+            ))
+        }
+
+        /// A node's key material, created once per test in a temp directory.
+        fn node_key(dir: &std::path::Path) -> p2p_service::NodeSecretKey {
+            p2p_service::load_or_create_secret_key(&dir.join("node.secret")).expect("create key")
+        }
+
+        fn author_hex(key: &p2p_service::NodeSecretKey) -> String {
+            security::signing::PeerKeySignatureProvider::from_bytes(key.bytes(), String::new())
+                .public_key_hex()
+        }
+
+        /// The exact resolve-then-pass `main` performs — no site may re-derive
+        /// the domain from `swarm_topic` on its own.
+        fn signer_for(
+            config: &NodeConfig,
+            key: &p2p_service::NodeSecretKey,
+        ) -> Arc<dyn SignatureProvider> {
+            let domain = config.p2p.signature_domain().to_owned();
+            build_signature_provider(config, Some(key), &domain)
+        }
+
+        /// A signed transaction as it arrives over ALPN: economic body plus the
+        /// four envelope keys `verify_remote_signature` reads.
+        fn signed_directive(
+            signer: &dyn SignatureProvider,
+            author: &str,
+        ) -> ledger::model::Directive {
+            use ledger::model::*;
+            use rust_decimal_macros::dec;
+
+            let transaction = Transaction {
+                date: chrono::NaiveDate::from_ymd_opt(2024, 1, 15).unwrap(),
+                flag: Flag::Complete,
+                payee: None,
+                narration: Some("cross-mesh replay".to_owned()),
+                tags: vec![],
+                links: vec![],
+                postings: vec![
+                    Posting {
+                        account: "Assets:Cash".to_owned(),
+                        amount: Some(Amount {
+                            number: dec!(100),
+                            currency: "USD".to_owned(),
+                        }),
+                        cost: None,
+                        price: None,
+                        metadata: BTreeMap::new(),
+                    },
+                    Posting {
+                        account: "Equity:Opening".to_owned(),
+                        amount: Some(Amount {
+                            number: dec!(-100),
+                            currency: "USD".to_owned(),
+                        }),
+                        cost: None,
+                        price: None,
+                        metadata: BTreeMap::new(),
+                    },
+                ],
+                metadata: BTreeMap::new(),
+            };
+            let content_id =
+                ledger::hash::compute_content_id(&Directive::Transaction(transaction.clone()));
+            let signature = signer
+                .sign(&SignableMessage {
+                    content_id: &content_id,
+                    is_transaction: true,
+                    parents: "",
+                    lamport: "1",
+                })
+                .expect("signing is enabled");
+
+            let mut metadata = BTreeMap::new();
+            metadata.insert("openledger-author".to_owned(), author.to_owned());
+            metadata.insert("openledger-lamport".to_owned(), "1".to_owned());
+            metadata.insert("openledger-parents".to_owned(), String::new());
+            metadata.insert("openledger-signature".to_owned(), signature);
+            Directive::Transaction(Transaction {
+                metadata,
+                ..transaction
+            })
+        }
+
+        /// THE two-mesh replay test (L-23).
+        ///
+        /// Two meshes that chose the same custom swarm topic — which anyone who
+        /// can reach the overlay already knows, because the topic is also the
+        /// join string — must not accept each other's signed directives. The
+        /// author key is deliberately the *same* on both sides: this is the
+        /// "one operator runs nodes on two meshes, or a key is allowlisted on
+        /// both" case, where nothing but the domain separates them.
+        #[test]
+        fn mesh_id_domains_refuse_cross_mesh_replay() {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let key = node_key(dir.path());
+            let author = author_hex(&key);
+
+            let shared_topic = "my-org/ledger";
+            let config_a = config_for(shared_topic, Some("11111111-1111-4111-8111-111111111111"));
+            let config_b = config_for(shared_topic, Some("22222222-2222-4222-8222-222222222222"));
+            assert_eq!(
+                config_a.p2p.swarm_topic, config_b.p2p.swarm_topic,
+                "the whole point is that the topic is shared"
+            );
+
+            let directive = signed_directive(signer_for(&config_a, &key).as_ref(), &author);
+
+            // Mesh A — the mesh it was signed for — accepts it.
+            p2p::union_merge::verify_remote_signature(
+                &directive,
+                true,
+                config_a.p2p.signature_domain(),
+            )
+            .expect("a directive must verify on the mesh it was signed for");
+
+            // Mesh B, same topic, same key, different mesh id — refuses it.
+            let error = p2p::union_merge::verify_remote_signature(
+                &directive,
+                true,
+                config_b.p2p.signature_domain(),
+            )
+            .expect_err(
+                "REPLAY ACCEPTED: a directive signed for mesh A verified on mesh B — the two \
+                 share only their swarm topic, so the signature domain is still coming from \
+                 the topic instead of the mesh id",
+            );
+            assert!(
+                matches!(error, p2p::union_merge::MergeError::InvalidSignature(_)),
+                "expected a signature rejection, got: {error}"
+            );
+
+            // Stated last so the behavioural assertions above are what fails if
+            // the domain ever collapses back onto the topic.
+            assert_ne!(
+                config_a.p2p.signature_domain(),
+                config_b.p2p.signature_domain(),
+                "distinct mesh ids must resolve to distinct signature domains"
+            );
+        }
+
+        /// Compatibility pin: with `meshId` unset on both sides, two nodes on
+        /// one topic verify each other exactly as they did before L-23.
+        ///
+        /// This is the constraint the fallback exists for. A signature is
+        /// checked by *reconstructing* the signed message, so any change to the
+        /// domain an existing deployment resolves to would invalidate every
+        /// signature it has already persisted.
+        #[test]
+        fn unset_mesh_id_falls_back_to_the_swarm_topic() {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let key = node_key(dir.path());
+            let author = author_hex(&key);
+
+            let config_a = config_for("my-org/ledger", None);
+            let config_b = config_for("my-org/ledger", None);
+            assert_eq!(config_a.p2p.signature_domain(), "my-org/ledger");
+            assert_eq!(
+                config_a.p2p.signature_domain_source(),
+                "p2p.swarmTopic (meshId unset)"
+            );
+
+            let directive = signed_directive(signer_for(&config_a, &key).as_ref(), &author);
+            p2p::union_merge::verify_remote_signature(
+                &directive,
+                true,
+                config_b.p2p.signature_domain(),
+            )
+            .expect("an unset meshId must keep verifying under the swarm topic");
+
+            // And the bytes are the pre-L-23 bytes: the signed message is the
+            // one built from the topic string itself.
+            let peer = security::signing::PeerKeySignatureProvider::from_bytes(
+                key.bytes(),
+                "my-org/ledger".to_owned(),
+            );
+            let content_id = match &directive {
+                ledger::model::Directive::Transaction(txn) => ledger::hash::compute_content_id(
+                    &ledger::model::Directive::Transaction(txn.clone()),
+                ),
+                other => ledger::hash::compute_content_id(other),
+            };
+            let message = SignableMessage {
+                content_id: &content_id,
+                is_transaction: true,
+                parents: "",
+                lamport: "1",
+            };
+            let signature = match &directive {
+                ledger::model::Directive::Transaction(txn) => txn
+                    .metadata
+                    .get("openledger-signature")
+                    .expect("signature")
+                    .clone(),
+                _ => unreachable!(),
+            };
+            peer.verify(&message, &signature, &author)
+                .expect("the fallback domain must be the swarm topic verbatim");
+        }
+
+        /// The decoupling actually decouples: a directive signed under mesh id
+        /// X still verifies after the swarm topic is changed — and with no mesh
+        /// id, the same topic change breaks verification, which is the coupling
+        /// L-23 removes.
+        #[test]
+        fn mesh_id_survives_a_swarm_topic_change() {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let key = node_key(dir.path());
+            let author = author_hex(&key);
+            let mesh = "33333333-3333-4333-8333-333333333333";
+
+            let before = config_for("my-org/ledger", Some(mesh));
+            let after = config_for("my-org/ledger-renamed", Some(mesh));
+            assert_ne!(before.p2p.swarm_topic, after.p2p.swarm_topic);
+
+            let directive = signed_directive(signer_for(&before, &key).as_ref(), &author);
+            p2p::union_merge::verify_remote_signature(
+                &directive,
+                true,
+                after.p2p.signature_domain(),
+            )
+            .expect("a mesh id must outlive the gossip topic it was once tied to");
+
+            // Contrast: the same topic change under the fallback invalidates
+            // the history, which is precisely why the two were separated.
+            let coupled_before = config_for("my-org/ledger", None);
+            let coupled_after = config_for("my-org/ledger-renamed", None);
+            let coupled = signed_directive(signer_for(&coupled_before, &key).as_ref(), &author);
+            p2p::union_merge::verify_remote_signature(
+                &coupled,
+                true,
+                coupled_after.p2p.signature_domain(),
+            )
+            .expect_err("without a mesh id the topic IS the domain, so renaming it breaks history");
+        }
+
+        /// The resolved domain reaches the ALPN verifier and the signer as one
+        /// value — neither reads `swarm_topic` for itself.
+        #[test]
+        fn resolved_domain_reaches_both_the_signer_and_the_alpn_verifier() {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let key = node_key(dir.path());
+            let author = author_hex(&key);
+            let config = config_for(
+                "my-org/ledger",
+                Some("44444444-4444-4444-8444-444444444444"),
+            );
+
+            // What `main` computes once and hands to both consumers.
+            let domain = config.p2p.signature_domain().to_owned();
+            assert_eq!(domain, "44444444-4444-4444-8444-444444444444");
+            assert_eq!(config.p2p.signature_domain_source(), "p2p.meshId");
+
+            let handler_domain = anti_entropy_alpn::AntiEntropyHandler {
+                ledger: Arc::new(RwLock::new(
+                    ledger::service::LedgerService::boot(
+                        dir.path().join("ledger.bean"),
+                        "local".to_owned(),
+                    )
+                    .expect("boot ledger"),
+                )),
+                broadcast: TransactionBroadcast::new(),
+                orphan_buffer: Arc::new(RwLock::new(OrphanBuffer::new())),
+                allowlist: p2p::allowlist::PeerAllowlist::parse(&[]).expect("allowlist"),
+                signing_enabled: true,
+                mesh_id: domain.clone(),
+                timeouts: anti_entropy_alpn::AntiEntropyTimeouts::default(),
+                limits: connection_limiter::AntiEntropyLimits::default(),
+                limiter: connection_limiter::ConnectionLimiter::new(
+                    connection_limiter::AntiEntropyLimits::default(),
+                ),
+            }
+            .mesh_id;
+            assert_eq!(
+                handler_domain, domain,
+                "the ALPN handler must carry the resolved domain, not the topic"
+            );
+            assert_ne!(
+                handler_domain, config.p2p.swarm_topic,
+                "and it must not be the swarm topic when a mesh id is configured"
+            );
+
+            let directive = signed_directive(signer_for(&config, &key).as_ref(), &author);
+            p2p::union_merge::verify_remote_signature(&directive, true, &handler_domain)
+                .expect("the signer's domain and the handler's domain must be the same value");
+        }
     }
 }

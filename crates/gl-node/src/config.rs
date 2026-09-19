@@ -1,11 +1,71 @@
+use crate::http_server::HttpServerSettings;
 use axum::http::{header, HeaderName, HeaderValue, Method};
 use serde::Deserialize;
+use std::fs::File;
+use std::io::Read;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tracing::warn;
+
+/// Environment variable that supplies `auth.apiKey`.
+///
+/// It takes precedence over a non-empty value in the config file: an operator
+/// rotating a key reaches for the environment, and the file is the thing that
+/// tends to be stale (baked into an image, checked into a repository, mounted
+/// read-only). See [`NodeConfig::load_from_path`].
+const API_KEY_ENV_VAR: &str = "GL_NODE_API_KEY";
 
 /// Documented sample key. Boot fails if this value is used (H-5).
 pub const FORBIDDEN_SAMPLE_API_KEY: &str = "change-me-docker-api-key";
+
+/// Values `auth.apiKey` may never take (L-08), compared case-insensitively
+/// against the trimmed configured value.
+///
+/// The first two are the samples this repository actually ships — H-5 denylisted
+/// only the Docker one, so the README's `"my-secret-key-here"`, which is the
+/// value in the "Full Config (All Options)" block that operators copy verbatim,
+/// booted a public node with a published key. The rest are the placeholders
+/// people reach for when they mean "fill this in later", which is precisely the
+/// deployment that never gets revisited.
+///
+/// Matching is exact (not substring): `"secret"` is refused, while a real key
+/// that happens to contain the word is not. A denylist is not a strength test —
+/// [`MIN_API_KEY_BYTES`] is — it is a guard against *published* values, where
+/// length is no defence at all because the attacker has the string.
+const FORBIDDEN_API_KEYS: &[&str] = &[
+    FORBIDDEN_SAMPLE_API_KEY,
+    "my-secret-key-here",
+    "changeme",
+    "change-me",
+    "password",
+    "secret",
+    "test",
+    "api-key",
+];
+
+/// Minimum length of a configured `auth.apiKey`, in bytes (L-08).
+///
+/// The key is the only thing between the internet and the writable GraphQL
+/// mutations on a public bind, and it is checked with a constant-time compare
+/// that offers no rate limiting of its own beyond the shared request limiter.
+/// 16 bytes is the low end of "not guessable", and it is deliberately below
+/// anything a generator would emit — the point is to refuse hand-typed keys
+/// like `"hunter2"`, not to dictate a format.
+const MIN_API_KEY_BYTES: usize = 16;
+
+/// The denylisted value `api_key` matches, if any (L-08).
+///
+/// Returns the canonical denylist entry rather than the operator's spelling, so
+/// the boot error names a value they can grep the docs for.
+fn forbidden_api_key_match(api_key: &str) -> Option<&'static str> {
+    let candidate = api_key.trim();
+    FORBIDDEN_API_KEYS
+        .iter()
+        .copied()
+        .find(|forbidden| forbidden.eq_ignore_ascii_case(candidate))
+}
 
 /// Top-level node configuration.
 ///
@@ -76,13 +136,59 @@ pub struct NodeConfig {
     #[serde(default)]
     pub tls: TlsConfig,
 
+    /// Connection-level HTTP hardening knobs (M-13).
+    ///
+    /// Optional in full: an absent `http` section reproduces the hardcoded
+    /// defaults `serve_hardened` shipped with, byte for byte, because every
+    /// field's serde default is read straight off
+    /// [`HttpServerSettings::default`].
+    #[serde(default)]
+    pub http: HttpConfig,
+
     /// Peer-to-peer replication configuration.
     #[serde(default)]
     pub p2p: P2pConfig,
 }
 
+/// Connection-level HTTP limits (M-13), tunable per deployment.
+///
+/// These are the node's own backstops. A public bind sits behind a
+/// TLS-terminating reverse proxy, and **that proxy must enforce equivalent
+/// header, request and connection limits of its own** — a value relaxed here
+/// does not relax anything the proxy applies first, and a proxy with no limits
+/// is not rescued by the values here, because it has already accepted and is
+/// holding the connection.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpConfig {
+    /// Seconds a client gets to deliver a complete request head. Re-armed
+    /// before every head, so it also bounds idle keep-alive.
+    #[serde(default = "default_header_read_timeout_seconds")]
+    pub header_read_timeout_seconds: u64,
+
+    /// Seconds a single request gets end to end, body read and GraphQL
+    /// execution included.
+    #[serde(default = "default_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+
+    /// Ceiling on concurrently served connections.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            header_read_timeout_seconds: default_header_read_timeout_seconds(),
+            request_timeout_seconds: default_request_timeout_seconds(),
+            max_connections: default_max_connections(),
+        }
+    }
+}
+
 /// Authentication settings (§3.8).
-#[derive(Debug, Deserialize, Default)]
+#[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthConfig {
@@ -93,6 +199,20 @@ pub struct AuthConfig {
     /// The API key value. Required when `enabled` is true.
     #[serde(default)]
     pub api_key: String,
+}
+
+/// Hand-written so the API key is never printed (T41) — see
+/// [`crate::auth::AuthState`]'s impl for why. `NodeConfig` derives `Debug` and
+/// this type is a field of it, so the derived impl here put the key into any
+/// `{:?}` of the whole config.
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthConfig")
+            .field("enabled", &self.enabled)
+            .field("api_key", &crate::auth::redact(&self.api_key))
+            .finish()
+    }
 }
 
 /// Signing settings (§3.8.1).
@@ -107,7 +227,7 @@ pub struct SigningConfig {
 }
 
 /// Peer-to-peer replication settings (§3.4, §3.9).
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct P2pConfig {
@@ -136,9 +256,88 @@ pub struct P2pConfig {
     #[serde(default = "default_swarm_topic")]
     pub swarm_topic: String,
 
+    /// This mesh's identity, bound into every signature (L-23).
+    ///
+    /// Optional, and when it is absent the signature domain falls back to
+    /// [`swarm_topic`](Self::swarm_topic) **exactly** as it behaved before this
+    /// field existed. That fallback is a hard compatibility constraint, not a
+    /// convenience: a signature is verified by *reconstructing* the signed
+    /// message with the verifier's own domain, so changing the domain a
+    /// deployment resolves to invalidates every signature it has already
+    /// persisted and every signature its peers hold. An existing deployment
+    /// that sets nothing here keeps verifying its history; one that sets a
+    /// `meshId` is choosing a new domain and must roll it out to the whole mesh
+    /// at once.
+    ///
+    /// Why it exists: the swarm topic is also the gossip *join credential* —
+    /// anyone holding the string plus one member id can join the overlay — and
+    /// using one value for both meant "can reach this mesh" and "is this mesh"
+    /// were the same claim. Two meshes that happened to pick the same custom
+    /// topic string accepted each other's signed directives. A random UUID here
+    /// separates identity from reachability.
+    #[serde(default)]
+    pub mesh_id: Option<String>,
+
     /// Iroh relay/discovery profile: `"n0"` (public relays) or `"disabled"` (direct-only).
     #[serde(default = "default_relay_mode")]
     pub relay_mode: String,
+}
+
+/// Hand-written so the two quasi-credentials this struct carries are not
+/// printed in the clear (T41).
+///
+/// `swarmTopic` is the gossip **join credential**: anyone holding the string
+/// plus one member id can join the overlay (L-23's premise). `meshId` is the
+/// signature domain, and when it is unset the domain *is* the swarm topic — so
+/// both are values a log reader should not be handed. T39 already made the boot
+/// log print source + length + a 4-character prefix rather than the value; this
+/// makes `{:?}` agree with that choice instead of quietly undoing it.
+///
+/// Everything else is ordinary operational config and stays visible.
+impl std::fmt::Debug for P2pConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("P2pConfig")
+            .field("enabled", &self.enabled)
+            .field("secret_key_path", &self.secret_key_path)
+            .field("bootstrap_endpoint_ids", &self.bootstrap_endpoint_ids)
+            .field(
+                "gossip_interval_milliseconds",
+                &self.gossip_interval_milliseconds,
+            )
+            .field(
+                "anti_entropy_interval_milliseconds",
+                &self.anti_entropy_interval_milliseconds,
+            )
+            .field("swarm_topic", &crate::auth::redact(&self.swarm_topic))
+            .field("mesh_id", &self.mesh_id.as_deref().map(crate::auth::redact))
+            .field("relay_mode", &self.relay_mode)
+            .finish()
+    }
+}
+
+impl P2pConfig {
+    /// The domain every signature on this node is bound to (L-23).
+    ///
+    /// The **single** resolution point: `main` calls this once at boot and
+    /// hands the result to the signer and to the ALPN verification path, so no
+    /// other site reads `swarm_topic` for signature purposes and the two cannot
+    /// disagree.
+    pub fn signature_domain(&self) -> &str {
+        match self.mesh_id.as_deref() {
+            Some(mesh_id) => mesh_id,
+            // Pre-L-23 behaviour, preserved on purpose: see `mesh_id`.
+            None => &self.swarm_topic,
+        }
+    }
+
+    /// Which config field [`Self::signature_domain`] came from, for the boot log.
+    pub fn signature_domain_source(&self) -> &'static str {
+        match self.mesh_id {
+            Some(_) => "p2p.meshId",
+            None => "p2p.swarmTopic (meshId unset)",
+        }
+    }
 }
 
 /// TLS settings. In-process TLS is not implemented; production public bind
@@ -179,6 +378,7 @@ impl Default for P2pConfig {
             gossip_interval_milliseconds: default_gossip_interval(),
             anti_entropy_interval_milliseconds: default_anti_entropy_interval(),
             swarm_topic: default_swarm_topic(),
+            mesh_id: None,
             relay_mode: default_relay_mode(),
         }
     }
@@ -214,9 +414,93 @@ fn default_anti_entropy_interval() -> u64 {
     5000
 }
 
+/// Lower bound on `p2p.antiEntropyIntervalMilliseconds` (L-22).
+///
+/// `tokio::time::interval` panics outright on a zero period, and that panic
+/// happens inside the spawned replication task — so a `0` in the config file
+/// killed replication silently at runtime while the node otherwise looked
+/// healthy. Anything in the low tens of milliseconds is a self-inflicted flood
+/// of the whole peer allowlist besides, so the floor is set where a cadence
+/// stops being plausible rather than at 1.
+const MIN_ANTI_ENTROPY_INTERVAL_MILLISECONDS: u64 = 100;
+
 fn default_swarm_topic() -> String {
     "openledger/transactions".to_owned()
 }
+
+/// Upper bound on `p2p.meshId` in bytes (L-23).
+///
+/// The value is a domain separator hashed into every signature, not a payload,
+/// so the only thing length buys past an identifier is room to hide things in.
+/// A UUID is 36 characters; 128 leaves space for a prefixed or namespaced one.
+const MAX_MESH_ID_BYTES: usize = 128;
+
+/// Characters `p2p.meshId` may contain (L-23).
+///
+/// ASCII alphanumerics plus the separators identifiers are actually spelled
+/// with. Deliberately excludes whitespace and control characters: the value is
+/// compared byte-for-byte on both sides of a signature, so a stray character
+/// that survives a copy-paste is a mesh-wide verification failure that looks
+/// like a key problem.
+fn is_mesh_id_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':' | '/')
+}
+
+// — HTTP hardening defaults and bounds (M-13 / T22) —
+//
+// The defaults are read off `HttpServerSettings::default()` rather than
+// restated here. That is the whole reason an absent `http` section is
+// *provably* today's behaviour: there is one set of numbers, and the config
+// layer cannot drift from the serve layer by being edited on its own.
+
+fn default_header_read_timeout_seconds() -> u64 {
+    HttpServerSettings::default().header_read_timeout.as_secs()
+}
+
+fn default_request_timeout_seconds() -> u64 {
+    HttpServerSettings::default().request_timeout.as_secs()
+}
+
+fn default_max_connections() -> usize {
+    HttpServerSettings::default().max_connections
+}
+
+/// Floor on both `http` timeouts, in seconds (M-13, L-22 style).
+///
+/// `0` is the value that matters: a zero header-read timeout fires before any
+/// client can finish a head (the node answers nothing at all), and a zero
+/// request timeout turns every request into a `408`. Both read as "turn the
+/// timeout off" to someone writing the config, and neither does that — they
+/// disable the *server*. One second is the smallest value that is still a
+/// timeout rather than a denial of service against yourself.
+const MIN_HTTP_TIMEOUT_SECONDS: u64 = 1;
+
+/// Ceiling on both `http` timeouts, in seconds (M-13).
+///
+/// A floor alone does not keep the protection: `"headerReadTimeoutSeconds":
+/// 86400` re-opens slowloris exactly as effectively as `0` would have, and it
+/// looks far more innocent in a diff. Five minutes is well past any legitimate
+/// GraphQL request against this node (the body limit is 2 MiB and the query
+/// complexity is capped), so a larger value is not a tuning choice — it is the
+/// control being switched off.
+const MAX_HTTP_TIMEOUT_SECONDS: u64 = 300;
+
+/// Floor on `http.maxConnections` (M-13).
+///
+/// The cap is applied by a permit-then-accept semaphore, so it is also the
+/// node's own concurrency: set it to `1` and a single held keep-alive
+/// connection stalls every other client, which is a self-inflicted outage
+/// wearing the costume of a hardening setting. Eight is enough for the health
+/// probe, a proxy's connection pool and a human with a browser open.
+const MIN_MAX_CONNECTIONS: usize = 8;
+
+/// Ceiling on `http.maxConnections` (M-13).
+///
+/// Same reasoning as the timeout ceiling: `usize::MAX` is not a cap. 65,536
+/// concurrent connections already exceeds the file-descriptor limit of any
+/// default-configured host, so anything beyond it is a number chosen to mean
+/// "unlimited".
+const MAX_MAX_CONNECTIONS: usize = 65_536;
 
 fn default_relay_mode() -> String {
     "n0".to_owned()
@@ -257,16 +541,73 @@ impl std::error::Error for ConfigError {}
 
 impl NodeConfig {
     /// Load configuration from the given path, applying defaults and validating.
+    ///
+    /// **`GL_NODE_API_KEY` beats a non-empty `auth.apiKey` in the file.** It used
+    /// to be the other way round — the environment was consulted only when the
+    /// file's value was empty — which made key rotation silently fail: an
+    /// operator sets the new key in the environment, restarts, sees a healthy
+    /// node, and the node is still accepting the old key baked into the config
+    /// file. Nothing reported the conflict. The file is the value that goes
+    /// stale (committed to a repository, baked into an image, mounted read-only
+    /// from a ConfigMap); the environment is where a rotation is actually
+    /// performed. When both are set the node says so and names the winner.
+    // `&PathBuf` is the signature this function has always had, and roughly
+    // fifty call sites across the crate's tests pass `&…to_path_buf()`.
+    // Narrowing it to `&Path` is the idiomatic shape, but it would turn every
+    // one of those into an `unnecessary_to_owned` lint — a large mechanical
+    // rewrite of test code this change has no business touching. The parameter
+    // is forwarded to a `&Path` seam immediately below, so the lint is correct
+    // and simply not worth acting on here.
+    #[allow(clippy::ptr_arg)]
     pub fn load_from_path(config_path: &PathBuf) -> Result<Self, ConfigError> {
-        let content = std::fs::read_to_string(config_path).map_err(ConfigError::FileRead)?;
+        Self::load_from_path_with_env_api_key(config_path, std::env::var(API_KEY_ENV_VAR).ok())
+    }
+
+    /// [`Self::load_from_path`] with the environment supplied explicitly.
+    ///
+    /// The seam exists for the tests: `cargo test` runs a process-wide
+    /// environment across parallel threads, so a test that really set
+    /// `GL_NODE_API_KEY` would be changing the input of every other test in
+    /// this module at the same time. Passing the value in keeps the precedence
+    /// rule deterministic to test; `load_from_path` is the one place that reads
+    /// the process environment, and [`API_KEY_ENV_VAR`] is the one place the
+    /// name is spelled.
+    fn load_from_path_with_env_api_key(
+        config_path: &Path,
+        env_api_key: Option<String>,
+    ) -> Result<Self, ConfigError> {
+        // Opened once and read from the handle, so the permission warning below
+        // describes the inode whose bytes became the key rather than whatever
+        // happens to sit at the path a moment later (the L-04 rule).
+        let mut file = File::open(config_path).map_err(ConfigError::FileRead)?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)
+            .map_err(ConfigError::FileRead)?;
         let mut config: NodeConfig = serde_json::from_str(&content).map_err(ConfigError::Parse)?;
-        if config.auth.api_key.is_empty() {
-            if let Ok(api_key) = std::env::var("GL_NODE_API_KEY") {
-                if !api_key.is_empty() {
-                    config.auth.api_key = api_key;
-                }
-            }
+
+        let file_api_key_set = !config.auth.api_key.is_empty();
+        if file_api_key_set {
+            warn_if_config_file_is_readable_by_others(&file, config_path);
         }
+
+        if let Some(env_api_key) = env_api_key.filter(|key| !key.is_empty()) {
+            if file_api_key_set {
+                // Warned whenever both are set, not only when they differ: two
+                // sources of truth for one credential is the condition worth
+                // reporting, and they agree only until the next rotation —
+                // which is precisely the moment the old precedence went wrong.
+                warn!(
+                    path = %config_path.display(),
+                    env_var = API_KEY_ENV_VAR,
+                    "auth.apiKey is set in both the config file and the environment; the \
+                     ENVIRONMENT value wins. Remove one so there is a single source of truth — \
+                     under the previous precedence the file value won silently, so a rotated \
+                     environment key left the node still accepting the stale one"
+                );
+            }
+            config.auth.api_key = env_api_key;
+        }
+
         config.validate()?;
         Ok(config)
     }
@@ -296,10 +637,29 @@ impl NodeConfig {
             ));
         }
 
-        if self.auth.enabled && self.auth.api_key == FORBIDDEN_SAMPLE_API_KEY {
-            return Err(ConfigError::Validation(
-                "auth.apiKey must not be the documented sample \"change-me-docker-api-key\"; set a unique key or GL_NODE_API_KEY".to_owned(),
-            ));
+        // L-08: gated on `auth.enabled` alone, with no bind condition — matching
+        // the H-5 check this replaces. A non-loopback bind with auth disabled is
+        // already refused above (M-2), so "auth is on" is strictly wider than
+        // "the bind is public": every public node passes through here, and a
+        // loopback node with a published sample key is refused too. That is the
+        // fail-closed reading, and the right one — `bindAddress` is one edit away
+        // from `0.0.0.0`, and a key that was never a secret does not become one
+        // because today's listener is loopback.
+        if self.auth.enabled {
+            if let Some(sample) = forbidden_api_key_match(&self.auth.api_key) {
+                return Err(ConfigError::Validation(format!(
+                    "auth.apiKey must not be the documented sample or placeholder \"{sample}\"; \
+                     set a unique key or GL_NODE_API_KEY"
+                )));
+            }
+
+            if self.auth.api_key.len() < MIN_API_KEY_BYTES {
+                return Err(ConfigError::Validation(format!(
+                    "auth.apiKey must be at least {MIN_API_KEY_BYTES} bytes, got {}; \
+                     it is the only credential guarding the writable GraphQL mutations",
+                    self.auth.api_key.len()
+                )));
+            }
         }
 
         if self.p2p.enabled && self.p2p.secret_key_path.is_empty() {
@@ -368,6 +728,79 @@ impl NodeConfig {
             }
         }
 
+        // L-23: validated unconditionally for the same reason as L-22 below —
+        // and additionally because the signature domain is consumed whenever
+        // `signing.enabled`, with or without p2p. A malformed value here is not
+        // a boot failure at the point of use: it is a silent mesh-wide
+        // verification failure that presents as "the other node's key is wrong".
+        if let Some(mesh_id) = &self.p2p.mesh_id {
+            if mesh_id.trim().is_empty() {
+                return Err(ConfigError::Validation(
+                    "p2p.meshId must not be empty or whitespace when present; omit the field to \
+                     fall back to p2p.swarmTopic, or set a unique value (a random UUID is the \
+                     recommendation)"
+                        .to_owned(),
+                ));
+            }
+            if mesh_id.trim() != mesh_id {
+                return Err(ConfigError::Validation(format!(
+                    "p2p.meshId must not have leading or trailing whitespace, got \"{mesh_id}\"; \
+                     the value is compared byte-for-byte on both sides of every signature"
+                )));
+            }
+            if mesh_id.len() > MAX_MESH_ID_BYTES {
+                return Err(ConfigError::Validation(format!(
+                    "p2p.meshId must be at most {MAX_MESH_ID_BYTES} bytes, got {}; it is an \
+                     identifier (a random UUID is the recommendation), not a payload",
+                    mesh_id.len()
+                )));
+            }
+            if let Some(character) = mesh_id.chars().find(|c| !is_mesh_id_character(*c)) {
+                return Err(ConfigError::Validation(format!(
+                    "p2p.meshId contains invalid character {character:?} (U+{:04X}); allowed are \
+                     ASCII letters, digits and - _ . : / (a random UUID is the recommendation)",
+                    character as u32
+                )));
+            }
+        }
+
+        // M-13: bound the HTTP hardening knobs from both sides. A floor alone
+        // is not enough here — unlike an interval, where only small values are
+        // dangerous, a timeout or a connection cap is disabled just as
+        // effectively by being made enormous, and that spelling looks far more
+        // reasonable in a config file than a `0` does.
+        Self::validate_http_timeout(
+            "http.headerReadTimeoutSeconds",
+            self.http.header_read_timeout_seconds,
+            "a client that never finishes a request head holds a connection and a task for this \
+             long (slowloris)",
+        )?;
+        Self::validate_http_timeout(
+            "http.requestTimeoutSeconds",
+            self.http.request_timeout_seconds,
+            "this is the only wall-clock bound on a stalled body and on GraphQL execution",
+        )?;
+        if !(MIN_MAX_CONNECTIONS..=MAX_MAX_CONNECTIONS).contains(&self.http.max_connections) {
+            return Err(ConfigError::Validation(format!(
+                "http.maxConnections must be between {MIN_MAX_CONNECTIONS} and \
+                 {MAX_MAX_CONNECTIONS}, got {}; below the floor the node stalls itself, above \
+                 the ceiling there is no cap left to exhaust before the file-descriptor limit \
+                 does",
+                self.http.max_connections
+            )));
+        }
+
+        // L-22: validated unconditionally, not only when `p2p.enabled` — the
+        // value is a boot-time typo either way, and catching it before the
+        // operator flips `enabled` is the whole point of boot validation.
+        if self.p2p.anti_entropy_interval_milliseconds < MIN_ANTI_ENTROPY_INTERVAL_MILLISECONDS {
+            return Err(ConfigError::Validation(format!(
+                "p2p.antiEntropyIntervalMilliseconds must be at least {MIN_ANTI_ENTROPY_INTERVAL_MILLISECONDS} ms, got {}; \
+                 0 panics the replication task at runtime and sub-{MIN_ANTI_ENTROPY_INTERVAL_MILLISECONDS}ms cadences flood every allowlisted peer",
+                self.p2p.anti_entropy_interval_milliseconds
+            )));
+        }
+
         // M-04: a trusted proxy entry that does not parse would be silently
         // dropped from the trust set, leaving the operator believing
         // `X-Forwarded-For` is honoured while every client still shares the
@@ -425,6 +858,31 @@ impl NodeConfig {
         }
 
         Ok(())
+    }
+
+    /// One bounds check for both `http` timeouts, so they cannot drift apart.
+    fn validate_http_timeout(field: &str, seconds: u64, why: &str) -> Result<(), ConfigError> {
+        if !(MIN_HTTP_TIMEOUT_SECONDS..=MAX_HTTP_TIMEOUT_SECONDS).contains(&seconds) {
+            return Err(ConfigError::Validation(format!(
+                "{field} must be between {MIN_HTTP_TIMEOUT_SECONDS} and \
+                 {MAX_HTTP_TIMEOUT_SECONDS} seconds, got {seconds}; {why}, so 0 disables the \
+                 server and a very large value disables the protection"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The connection-level limits `serve_hardened` runs under (M-13).
+    ///
+    /// With no `http` section in the file every field here is
+    /// [`HttpServerSettings::default`]'s own value, so this returns exactly the
+    /// settings the call site used to hardcode.
+    pub fn http_server_settings(&self) -> HttpServerSettings {
+        HttpServerSettings {
+            header_read_timeout: Duration::from_secs(self.http.header_read_timeout_seconds),
+            request_timeout: Duration::from_secs(self.http.request_timeout_seconds),
+            max_connections: self.http.max_connections,
+        }
     }
 
     /// True when the HTTP bind address is not loopback (I-1 / H-5 warning).
@@ -532,6 +990,58 @@ impl NodeConfig {
     }
 }
 
+/// Warn when a config file carrying an `auth.apiKey` is readable beyond its owner.
+///
+/// A **warning**, deliberately, where the node's secret key is a hard failure
+/// (C-2/L-04): the API key's config file is a general-purpose operator artefact
+/// that legitimately lives in places with a shared mode — a mounted ConfigMap,
+/// a deployment directory, a checkout — and refusing to boot on its mode would
+/// strand nodes that are otherwise correctly configured, for a file the
+/// operator may not even own. What was missing was any signal at all: a
+/// world-readable file holding the only credential in front of the writable
+/// GraphQL mutations looked exactly like a private one.
+///
+/// The mode is read through the **open handle** the key was parsed from, not by
+/// re-`stat`ing the path, for the same reason the L-04 key check does: a
+/// path-based check reports on whatever is at the path at check time, which
+/// need not be the file that was read.
+#[cfg(unix)]
+fn warn_if_config_file_is_readable_by_others(file: &File, config_path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    // A mode we cannot read is not worth failing a boot over; the key itself
+    // was already read successfully.
+    let Ok(metadata) = file.metadata() else {
+        return;
+    };
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        warn!(
+            path = %config_path.display(),
+            mode = format_args!("{mode:04o}"),
+            env_var = API_KEY_ENV_VAR,
+            "config file carries auth.apiKey and is readable by group or other; that key is the \
+             only credential guarding the writable GraphQL mutations — restrict the file \
+             (`chmod 600`), or move the key out of it into the environment variable"
+        );
+    }
+}
+
+/// Non-Unix: say that the check did not happen rather than staying silent (L-05).
+///
+/// Silence here is indistinguishable from "the mode is fine", which is the
+/// exact trap L-05 closed on the secret-key path. Gated on the file actually
+/// carrying a key, so it is not a warning every node prints at every boot.
+#[cfg(not(unix))]
+fn warn_if_config_file_is_readable_by_others(_file: &File, config_path: &Path) {
+    warn!(
+        path = %config_path.display(),
+        "config file carries auth.apiKey, but file permissions are NOT verified on this platform \
+         (non-Unix) — restrict access to it with the platform's own ACLs, as the key is the only \
+         credential guarding the writable GraphQL mutations"
+    );
+}
+
 fn lexical_normalize(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -589,7 +1099,7 @@ mod tests {
             "cors": {{ "allowedOrigins": ["http://localhost:8080"] }},
             "allowedHosts": ["ledger.example.com"],
             "trustedProxies": ["10.0.0.1"],
-            "auth": {{ "enabled": true, "apiKey": "secret-key-123" }},
+            "auth": {{ "enabled": true, "apiKey": "unit-test-api-key-0123456789abcd" }},
             "signing": {{ "enabled": true }},
             "tls": {{ "mode": "terminated" }},
             "p2p": {{
@@ -612,7 +1122,7 @@ mod tests {
         assert_eq!(config.allowed_hosts, vec!["ledger.example.com"]);
         assert_eq!(config.trusted_proxies, vec!["10.0.0.1"]);
         assert!(config.auth.enabled);
-        assert_eq!(config.auth.api_key, "secret-key-123");
+        assert_eq!(config.auth.api_key, "unit-test-api-key-0123456789abcd");
         assert!(config.signing.enabled);
         assert!(config.p2p.enabled);
         assert_eq!(config.p2p.bootstrap_endpoint_ids.len(), 2);
@@ -681,7 +1191,7 @@ mod tests {
     fn test_graphiql_explicit_false_disables_playground() {
         // A public bind now requires auth (M-2), so include it here.
         let file = write_temp_config(
-            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "graphiql": false, "tls": { "mode": "terminated" }, "auth": { "enabled": true, "apiKey": "secret-key-123" }, "allowedHosts": ["ledger.example.com"] }"#,
+            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "graphiql": false, "tls": { "mode": "terminated" }, "auth": { "enabled": true, "apiKey": "unit-test-api-key-0123456789abcd" }, "allowedHosts": ["ledger.example.com"] }"#,
         );
         let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
         assert!(!config.graphiql_enabled());
@@ -705,7 +1215,7 @@ mod tests {
         // The same public bind loads once auth is enabled (and the Host
         // allowlist is populated, per H-01).
         let file = write_temp_config(
-            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "tls": { "mode": "terminated" }, "auth": { "enabled": true, "apiKey": "secret-key-123" }, "allowedHosts": ["ledger.example.com"] }"#,
+            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "tls": { "mode": "terminated" }, "auth": { "enabled": true, "apiKey": "unit-test-api-key-0123456789abcd" }, "allowedHosts": ["ledger.example.com"] }"#,
         );
         let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
         assert!(config.binds_non_loopback());
@@ -807,6 +1317,168 @@ mod tests {
         assert!(error_message.contains("change-me-docker-api-key"));
     }
 
+    // ── L-08: API-key denylist + minimum length ──────────────────────────
+
+    /// Load a config whose only interesting field is `auth.apiKey`.
+    ///
+    /// `public_bind` picks between the two shapes that reach the key checks: a
+    /// non-loopback bind (which also needs `tls.mode` and `allowedHosts` to get
+    /// past the M-2 / H-01 rules) and the default loopback bind.
+    fn load_with_api_key(api_key: &str, public_bind: bool) -> Result<NodeConfig, ConfigError> {
+        let body = if public_bind {
+            format!(
+                r#"{{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "tls": {{ "mode": "terminated" }}, "allowedHosts": ["ledger.example.com"], "auth": {{ "enabled": true, "apiKey": "{api_key}" }} }}"#
+            )
+        } else {
+            format!(
+                r#"{{ "ledgerPath": "./data/ledger.bean", "auth": {{ "enabled": true, "apiKey": "{api_key}" }} }}"#
+            )
+        };
+        let file = write_temp_config(&body);
+        NodeConfig::load_from_path(&file.path().to_path_buf())
+    }
+
+    /// Every sample or placeholder on the denylist is refused on a public bind,
+    /// and the error names the value so the operator knows what to change.
+    #[test]
+    fn test_denylisted_api_keys_refused_on_public_bind() {
+        for sample in FORBIDDEN_API_KEYS {
+            let error = load_with_api_key(sample, true)
+                .err()
+                .unwrap_or_else(|| panic!("{sample:?} must not boot a public node"));
+            let message = format!("{error}");
+            assert!(
+                message.contains("auth.apiKey"),
+                "the error must name the field for {sample:?}: {message}"
+            );
+            assert!(
+                message.contains(sample),
+                "the error must name the offending value for {sample:?}: {message}"
+            );
+        }
+    }
+
+    /// The README's "Full Config (All Options)" key is the one H-5 missed: it is
+    /// the value operators copy, and it booted a public node until L-08.
+    #[test]
+    fn test_readme_sample_api_key_refused() {
+        let error =
+            load_with_api_key("my-secret-key-here", true).expect_err("README sample must not boot");
+        assert!(format!("{error}").contains("my-secret-key-here"));
+    }
+
+    /// The denylist is a set of *published strings*, so their casing is not a
+    /// defence — `ChangeMe` is exactly as public as `changeme`.
+    #[test]
+    fn test_api_key_denylist_is_case_insensitive() {
+        for spelling in ["CHANGEME", "ChangeMe", "My-Secret-Key-Here", "  changeme  "] {
+            assert!(
+                load_with_api_key(spelling, true).is_err(),
+                "{spelling:?} must be refused"
+            );
+        }
+    }
+
+    /// A key shorter than the floor is refused, and the error states both the
+    /// rule and the offending length.
+    #[test]
+    fn test_short_api_key_refused() {
+        let fifteen = "abcdefghijklmno";
+        assert_eq!(fifteen.len(), 15, "fixture must be one byte short");
+
+        let error = load_with_api_key(fifteen, true).expect_err("15 bytes must be refused");
+        let message = format!("{error}");
+        assert!(message.contains("auth.apiKey"), "{message}");
+        assert!(
+            message.contains("16"),
+            "the error must name the floor: {message}"
+        );
+        assert!(
+            message.contains("got 15"),
+            "the error must name the length: {message}"
+        );
+    }
+
+    /// Exactly at the floor is accepted — the rule is "at least", not "more than".
+    #[test]
+    fn test_api_key_at_minimum_length_accepted() {
+        let sixteen = "abcdefghijklmnop";
+        assert_eq!(sixteen.len(), MIN_API_KEY_BYTES);
+
+        let config = load_with_api_key(sixteen, true).expect("16 bytes is exactly the floor");
+        assert_eq!(config.auth.api_key, sixteen);
+    }
+
+    /// A realistic generated key boots a public node unchanged.
+    #[test]
+    fn test_strong_api_key_accepted_on_public_bind() {
+        let strong = "7f3a9c1e5b08d24617ae9f0c3b5d8e21";
+        assert_eq!(strong.len(), 32);
+
+        let config = load_with_api_key(strong, true).expect("a 32-byte key must boot");
+        assert_eq!(config.auth.api_key, strong);
+    }
+
+    /// House-rule gating: both checks hang off `auth.enabled`, with no bind
+    /// condition — exactly like the H-5 check they extend. A loopback node with
+    /// a published sample key, or a five-byte one, is refused too.
+    #[test]
+    fn test_weak_api_keys_refused_on_loopback_as_well() {
+        assert!(
+            load_with_api_key("changeme", false).is_err(),
+            "a denylisted key must be refused on loopback too"
+        );
+        assert!(
+            load_with_api_key("short", false).is_err(),
+            "a short key must be refused on loopback too"
+        );
+        assert!(
+            load_with_api_key("7f3a9c1e5b08d24617ae9f0c3b5d8e21", false).is_ok(),
+            "a strong key must still boot on loopback"
+        );
+    }
+
+    /// With auth off there is no key to judge, so neither rule fires — otherwise
+    /// a `"test"` left in a disabled `auth` block would block boot for nothing.
+    #[test]
+    fn test_api_key_rules_do_not_fire_when_auth_is_disabled() {
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "auth": { "enabled": false, "apiKey": "test" } }"#,
+        );
+        NodeConfig::load_from_path(&file.path().to_path_buf())
+            .expect("auth disabled means the key is inert");
+    }
+
+    /// Keep the denylist honest as the docs change: every `apiKey` value the
+    /// README publishes must be on it. A new sample added to the README without
+    /// a matching denylist entry re-creates L-08 exactly.
+    #[test]
+    fn test_every_api_key_published_in_the_readme_is_denylisted() {
+        let readme = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../README.md"),
+        )
+        .expect("README.md must be readable");
+
+        let mut found = 0;
+        for fragment in readme.split("\"apiKey\":").skip(1) {
+            let Some(rest) = fragment.trim_start().strip_prefix('"') else {
+                continue;
+            };
+            let Some(value) = rest.split('"').next() else {
+                continue;
+            };
+            if value.is_empty() {
+                continue;
+            }
+            found += 1;
+            assert!(
+                forbidden_api_key_match(value).is_some(),
+                "README publishes apiKey {value:?}, which is not on the L-08 denylist"
+            );
+        }
+        assert!(found >= 1, "expected to find a sample apiKey in the README");
+    }
+
     #[test]
     fn test_parent_dir_ledger_path_rejected() {
         let file = write_temp_config(r#"{ "ledgerPath": "../outside.bean" }"#);
@@ -895,7 +1567,7 @@ mod tests {
         // H-01: a non-loopback bind with no Host allowlist would 403 every
         // request, so it must fail closed at boot instead.
         let file = write_temp_config(
-            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "tls": { "mode": "terminated" }, "auth": { "enabled": true, "apiKey": "secret-key-123" } }"#,
+            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "tls": { "mode": "terminated" }, "auth": { "enabled": true, "apiKey": "unit-test-api-key-0123456789abcd" } }"#,
         );
         let result = NodeConfig::load_from_path(&file.path().to_path_buf());
         assert!(result.is_err());
@@ -906,7 +1578,7 @@ mod tests {
     #[test]
     fn test_public_bind_with_allowed_hosts_accepted() {
         let file = write_temp_config(
-            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "tls": { "mode": "terminated" }, "auth": { "enabled": true, "apiKey": "secret-key-123" }, "allowedHosts": ["ledger.example.com"] }"#,
+            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "tls": { "mode": "terminated" }, "auth": { "enabled": true, "apiKey": "unit-test-api-key-0123456789abcd" }, "allowedHosts": ["ledger.example.com"] }"#,
         );
         let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
         assert_eq!(config.allowed_hosts, vec!["ledger.example.com"]);
@@ -939,7 +1611,7 @@ mod tests {
     #[test]
     fn test_allowed_host_set_omits_wildcard_bind() {
         let file = write_temp_config(
-            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "tls": { "mode": "terminated" }, "auth": { "enabled": true, "apiKey": "secret-key-123" }, "allowedHosts": ["ledger.example.com"] }"#,
+            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "tls": { "mode": "terminated" }, "auth": { "enabled": true, "apiKey": "unit-test-api-key-0123456789abcd" }, "allowedHosts": ["ledger.example.com"] }"#,
         );
         let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
         let hosts = config.allowed_host_set();
@@ -1021,5 +1693,753 @@ mod tests {
         assert!(result.is_err());
         let error_message = format!("{}", result.unwrap_err());
         assert!(error_message.contains("relayMode"));
+    }
+
+    // ── L-22: anti-entropy interval floor ────────────────────────────────
+
+    fn load_with_anti_entropy_interval(interval: u64) -> Result<NodeConfig, ConfigError> {
+        let file = write_temp_config(&format!(
+            r#"{{ "ledgerPath": "./data/ledger.bean", "p2p": {{ "antiEntropyIntervalMilliseconds": {interval} }} }}"#
+        ));
+        NodeConfig::load_from_path(&file.path().to_path_buf())
+    }
+
+    #[test]
+    fn test_anti_entropy_interval_zero_rejected() {
+        // `tokio::time::interval(Duration::ZERO)` panics, and it panics inside
+        // the spawned replication task — so a `0` here used to kill replication
+        // silently while the node kept serving GraphQL.
+        let error_message = format!(
+            "{}",
+            load_with_anti_entropy_interval(0).expect_err("0 ms must be refused at boot")
+        );
+        assert!(
+            error_message.contains("antiEntropyIntervalMilliseconds"),
+            "the error must name the field: {error_message}"
+        );
+        assert!(
+            error_message.contains("100"),
+            "the error must name the floor: {error_message}"
+        );
+        assert!(
+            error_message.contains("got 0"),
+            "the error must name the offending value: {error_message}"
+        );
+    }
+
+    #[test]
+    fn test_anti_entropy_interval_below_floor_rejected() {
+        let error_message = format!(
+            "{}",
+            load_with_anti_entropy_interval(99).expect_err("99 ms is below the floor")
+        );
+        assert!(error_message.contains("antiEntropyIntervalMilliseconds"));
+        assert!(error_message.contains("got 99"));
+    }
+
+    #[test]
+    fn test_anti_entropy_interval_at_floor_accepted() {
+        let config = load_with_anti_entropy_interval(100).expect("100 ms is exactly the floor");
+        assert_eq!(config.p2p.anti_entropy_interval_milliseconds, 100);
+    }
+
+    #[test]
+    fn test_anti_entropy_interval_default_is_above_the_floor() {
+        let file = write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean" }"#);
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        assert_eq!(config.p2p.anti_entropy_interval_milliseconds, 5000);
+    }
+
+    #[test]
+    fn test_shipped_sample_configs_still_validate() {
+        // The floor must not brick the configs in `config/` or `deploy/`, which
+        // are the copy-paste starting points every operator uses.
+        let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut checked = 0;
+        for directory in ["config", "deploy"] {
+            let Ok(entries) = std::fs::read_dir(repository_root.join(directory)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let config: NodeConfig = serde_json::from_str(
+                    &std::fs::read_to_string(&path).expect("sample config must be readable"),
+                )
+                .unwrap_or_else(|error| panic!("{} does not parse: {error}", path.display()));
+                assert!(
+                    config.p2p.anti_entropy_interval_milliseconds
+                        >= MIN_ANTI_ENTROPY_INTERVAL_MILLISECONDS,
+                    "{} sets antiEntropyIntervalMilliseconds below the floor",
+                    path.display()
+                );
+                // The `http` bounds are the other validation surface a shipped
+                // config can fall foul of. Every sample currently omits the
+                // section entirely, so this asserts the *defaults* are inside
+                // their own bounds — which is exactly the regression to catch
+                // if someone later tightens a bound past the shipped default.
+                for (field, seconds) in [
+                    (
+                        "http.headerReadTimeoutSeconds",
+                        config.http.header_read_timeout_seconds,
+                    ),
+                    (
+                        "http.requestTimeoutSeconds",
+                        config.http.request_timeout_seconds,
+                    ),
+                ] {
+                    assert!(
+                        (MIN_HTTP_TIMEOUT_SECONDS..=MAX_HTTP_TIMEOUT_SECONDS).contains(&seconds),
+                        "{} sets {field} to {seconds}, outside \
+                         {MIN_HTTP_TIMEOUT_SECONDS}..={MAX_HTTP_TIMEOUT_SECONDS}",
+                        path.display()
+                    );
+                }
+                assert!(
+                    (MIN_MAX_CONNECTIONS..=MAX_MAX_CONNECTIONS)
+                        .contains(&config.http.max_connections),
+                    "{} sets http.maxConnections to {}, outside \
+                     {MIN_MAX_CONNECTIONS}..={MAX_MAX_CONNECTIONS}",
+                    path.display(),
+                    config.http.max_connections
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 4, "expected to find the shipped sample configs");
+    }
+
+    // ── L-23: p2p.meshId ─────────────────────────────────────────────────
+
+    /// A config carrying `meshId` (or not, when `None`) on a fixed topic.
+    fn load_with_mesh_id(mesh_id: Option<&str>) -> Result<NodeConfig, ConfigError> {
+        let mesh_field = match mesh_id {
+            Some(value) => format!(r#", "meshId": {}"#, serde_json::json!(value)),
+            None => String::new(),
+        };
+        let file = write_temp_config(&format!(
+            r#"{{ "ledgerPath": "./data/ledger.bean", "p2p": {{ "swarmTopic": "my-org/ledger"{mesh_field} }} }}"#
+        ));
+        NodeConfig::load_from_path(&file.path().to_path_buf())
+    }
+
+    #[test]
+    fn test_mesh_id_accepted_and_becomes_the_signature_domain() {
+        let config = load_with_mesh_id(Some("3f2504e0-4f89-41d3-9a0c-0305e82c3301"))
+            .expect("a UUID meshId must load");
+        assert_eq!(
+            config.p2p.signature_domain(),
+            "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+        );
+        assert_eq!(config.p2p.signature_domain_source(), "p2p.meshId");
+        assert_ne!(
+            config.p2p.signature_domain(),
+            config.p2p.swarm_topic,
+            "a configured meshId must displace the topic as the domain"
+        );
+    }
+
+    #[test]
+    fn test_absent_mesh_id_falls_back_to_the_swarm_topic() {
+        // The compatibility constraint: unset must behave exactly as it did
+        // before the field existed, or every already-persisted signature on
+        // the deployment stops verifying.
+        let config = load_with_mesh_id(None).expect("an absent meshId is the default");
+        assert!(config.p2p.mesh_id.is_none());
+        assert_eq!(config.p2p.signature_domain(), "my-org/ledger");
+        assert_eq!(
+            config.p2p.signature_domain_source(),
+            "p2p.swarmTopic (meshId unset)"
+        );
+    }
+
+    #[test]
+    fn test_empty_mesh_id_rejected() {
+        let error_message = format!(
+            "{}",
+            load_with_mesh_id(Some("")).expect_err("an empty meshId must be refused")
+        );
+        assert!(error_message.contains("p2p.meshId"), "{error_message}");
+        assert!(
+            error_message.contains("UUID"),
+            "the error should recommend a UUID: {error_message}"
+        );
+    }
+
+    #[test]
+    fn test_whitespace_only_mesh_id_rejected() {
+        let error_message = format!(
+            "{}",
+            load_with_mesh_id(Some("   ")).expect_err("a blank meshId must be refused")
+        );
+        assert!(error_message.contains("p2p.meshId"), "{error_message}");
+    }
+
+    #[test]
+    fn test_mesh_id_with_surrounding_whitespace_rejected() {
+        // Refused rather than trimmed: the value is compared byte-for-byte on
+        // both sides of a signature, so silently trimming here would make two
+        // nodes disagree about the domain depending on how each was edited.
+        let error_message = format!(
+            "{}",
+            load_with_mesh_id(Some(" mesh-a ")).expect_err("padded meshId must be refused")
+        );
+        assert!(error_message.contains("whitespace"), "{error_message}");
+    }
+
+    #[test]
+    fn test_mesh_id_with_invalid_characters_rejected() {
+        let error_message = format!(
+            "{}",
+            load_with_mesh_id(Some("mesh a")).expect_err("a space inside meshId must be refused")
+        );
+        assert!(error_message.contains("p2p.meshId"), "{error_message}");
+        assert!(
+            error_message.contains("invalid character"),
+            "{error_message}"
+        );
+
+        for rejected in ["mesh\u{0}a", "mesh\na", "mesh\u{00e9}", "mesh#a"] {
+            assert!(
+                load_with_mesh_id(Some(rejected)).is_err(),
+                "meshId {rejected:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mesh_id_length_bound() {
+        let at_bound = "a".repeat(MAX_MESH_ID_BYTES);
+        assert!(
+            load_with_mesh_id(Some(&at_bound)).is_ok(),
+            "exactly the bound must be accepted"
+        );
+
+        let over_bound = "a".repeat(MAX_MESH_ID_BYTES + 1);
+        let error_message = format!(
+            "{}",
+            load_with_mesh_id(Some(&over_bound)).expect_err("over the bound must be refused")
+        );
+        assert!(error_message.contains("p2p.meshId"), "{error_message}");
+        assert!(
+            error_message.contains(&MAX_MESH_ID_BYTES.to_string()),
+            "the error must name the bound: {error_message}"
+        );
+    }
+
+    #[test]
+    fn test_mesh_id_accepts_non_uuid_identifiers() {
+        // A UUID is the recommendation, not a requirement — an operator with an
+        // existing naming scheme must not be forced to abandon it.
+        for accepted in [
+            "acme-prod-ledger",
+            "acme:prod:ledger",
+            "acme.prod/ledger-01",
+            "MESH_A",
+        ] {
+            assert!(
+                load_with_mesh_id(Some(accepted)).is_ok(),
+                "meshId {accepted:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mesh_id_validated_even_with_p2p_disabled() {
+        // Same reasoning as the L-22 interval floor: it is a boot-time typo
+        // either way, and the domain is consumed whenever signing is enabled —
+        // with or without p2p.
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "p2p": { "enabled": false, "meshId": "bad mesh" } }"#,
+        );
+        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
+        assert!(
+            result.is_err(),
+            "a malformed meshId must be refused even with p2p disabled"
+        );
+    }
+
+    // ── GL_NODE_API_KEY precedence over the file value ───────────────────────
+
+    /// A 32-byte key that passes the L-08 denylist and length floor.
+    const TEST_FILE_API_KEY: &str = "file-key-0123456789abcdef0123456";
+    /// A different one, so "which value won" is observable.
+    const TEST_ENV_API_KEY: &str = "env-key-0123456789abcdef01234567";
+
+    /// A loopback config whose `auth.apiKey` is `file_api_key` (empty = unset).
+    /// T41: `NodeConfig` derives `Debug`, so one `{:?}` of the whole config used
+    /// to print the API key in the clear — and, through `P2pConfig`, the swarm
+    /// topic that doubles as the gossip join credential and the mesh id that is
+    /// the signature domain (L-23).
+    #[test]
+    fn node_config_debug_redacts_every_credential() {
+        let api_key = "s3cr3t-key-value-0123456789abcdef";
+        let swarm_topic = "acme/private/ledger-topic-2026";
+        let mesh_id = "9f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f";
+        let file = write_temp_config(&format!(
+            r#"{{ "ledgerPath": "./data/ledger.bean",
+                  "auth": {{ "enabled": true, "apiKey": {} }},
+                  "signing": {{ "enabled": true }},
+                  "p2p": {{ "enabled": true, "swarmTopic": {}, "meshId": {} }} }}"#,
+            serde_json::json!(api_key),
+            serde_json::json!(swarm_topic),
+            serde_json::json!(mesh_id),
+        ));
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("valid config");
+
+        let rendered = format!("{config:?}");
+        for secret in [api_key, swarm_topic, mesh_id] {
+            assert!(
+                !rendered.contains(secret),
+                "Debug output must not carry {secret}: {rendered}"
+            );
+        }
+        // The values are still *there* — only the rendering is redacted.
+        assert_eq!(config.auth.api_key, api_key);
+        assert_eq!(config.p2p.signature_domain(), mesh_id);
+        // And enough survives to triage with.
+        assert!(rendered.contains("<redacted"), "{rendered}");
+        assert!(
+            rendered.contains("ledgerPath") || rendered.contains("ledger_path"),
+            "{rendered}"
+        );
+    }
+
+    fn write_config_with_api_key(file_api_key: &str) -> NamedTempFile {
+        write_temp_config(&format!(
+            r#"{{ "ledgerPath": "./data/ledger.bean",
+                  "auth": {{ "enabled": true, "apiKey": {} }} }}"#,
+            serde_json::json!(file_api_key)
+        ))
+    }
+
+    /// Run `body` with every `WARN`/`ERROR` it logs captured as text.
+    ///
+    /// `tracing::subscriber::with_default` installs a *thread-local*
+    /// subscriber, so this stays correct under `cargo test`'s
+    /// thread-per-test parallelism — a concurrent test's logs never land in
+    /// this buffer. (Same helper shape as `ledger::service`'s.)
+    fn capture_warnings<T>(body: impl FnOnce() -> T) -> (T, String) {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for SharedBuffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuffer {
+            type Writer = SharedBuffer;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = SharedBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, body);
+        let logged = String::from_utf8_lossy(&buffer.0.lock().unwrap()).into_owned();
+        (value, logged)
+    }
+
+    /// The name is published in the README, in the compose file and in a boot
+    /// error message; pin it so a rename has to be deliberate.
+    #[test]
+    fn test_api_key_environment_variable_name_is_the_documented_one() {
+        assert_eq!(API_KEY_ENV_VAR, "GL_NODE_API_KEY");
+    }
+
+    /// The finding itself: a rotated environment key must not lose to a stale
+    /// file key.
+    #[test]
+    fn test_environment_api_key_wins_over_a_non_empty_file_key() {
+        let file = write_config_with_api_key(TEST_FILE_API_KEY);
+        let config = NodeConfig::load_from_path_with_env_api_key(
+            file.path(),
+            Some(TEST_ENV_API_KEY.to_owned()),
+        )
+        .expect("both keys are valid, so this must load");
+        assert_eq!(
+            config.auth.api_key, TEST_ENV_API_KEY,
+            "the environment must take precedence over the config file"
+        );
+    }
+
+    /// ...and it must say so, naming the winner, rather than resolving the
+    /// conflict in silence.
+    #[test]
+    fn test_both_api_key_sources_set_warns_and_names_the_winner() {
+        let file = write_config_with_api_key(TEST_FILE_API_KEY);
+        let (config, logged) = capture_warnings(|| {
+            NodeConfig::load_from_path_with_env_api_key(
+                file.path(),
+                Some(TEST_ENV_API_KEY.to_owned()),
+            )
+            .expect("must load")
+        });
+
+        assert_eq!(config.auth.api_key, TEST_ENV_API_KEY);
+        assert!(
+            logged.contains("auth.apiKey is set in both"),
+            "a config with two key sources must warn: {logged}"
+        );
+        assert!(
+            logged.contains("ENVIRONMENT value wins"),
+            "the warning must name which source won: {logged}"
+        );
+        assert!(
+            !logged.contains(TEST_ENV_API_KEY) && !logged.contains(TEST_FILE_API_KEY),
+            "the warning must not print either key value: {logged}"
+        );
+    }
+
+    /// File-only: unchanged behaviour, and no conflict to report.
+    #[test]
+    fn test_file_api_key_is_used_when_the_environment_is_unset() {
+        let file = write_config_with_api_key(TEST_FILE_API_KEY);
+        let (config, logged) = capture_warnings(|| {
+            NodeConfig::load_from_path_with_env_api_key(file.path(), None).expect("must load")
+        });
+        assert_eq!(config.auth.api_key, TEST_FILE_API_KEY);
+        assert!(
+            !logged.contains("auth.apiKey is set in both"),
+            "one source is not a conflict: {logged}"
+        );
+    }
+
+    /// Environment-only: unchanged behaviour (this is the case that always
+    /// worked), and still no conflict to report.
+    #[test]
+    fn test_environment_api_key_is_used_when_the_file_value_is_empty() {
+        let file = write_config_with_api_key("");
+        let (config, logged) = capture_warnings(|| {
+            NodeConfig::load_from_path_with_env_api_key(
+                file.path(),
+                Some(TEST_ENV_API_KEY.to_owned()),
+            )
+            .expect("must load")
+        });
+        assert_eq!(config.auth.api_key, TEST_ENV_API_KEY);
+        assert!(
+            !logged.contains("auth.apiKey is set in both"),
+            "one source is not a conflict: {logged}"
+        );
+    }
+
+    /// An exported-but-empty `GL_NODE_API_KEY` is "unset", not "clear the key".
+    /// Treating it as a value would turn a stray `export GL_NODE_API_KEY=` into
+    /// a boot failure on a node that is perfectly well configured by file.
+    #[test]
+    fn test_empty_environment_api_key_does_not_displace_the_file_key() {
+        let file = write_config_with_api_key(TEST_FILE_API_KEY);
+        let config = NodeConfig::load_from_path_with_env_api_key(file.path(), Some(String::new()))
+            .expect("must load");
+        assert_eq!(config.auth.api_key, TEST_FILE_API_KEY);
+    }
+
+    /// The environment key is subject to every rule the file value is: it is
+    /// the same credential whichever door it came through.
+    #[test]
+    fn test_environment_api_key_is_held_to_the_denylist_and_length_floor() {
+        let file = write_config_with_api_key(TEST_FILE_API_KEY);
+        assert!(
+            NodeConfig::load_from_path_with_env_api_key(file.path(), Some("changeme".to_owned()))
+                .is_err(),
+            "a denylisted environment key must be refused, not smuggled past the file value"
+        );
+        assert!(
+            NodeConfig::load_from_path_with_env_api_key(file.path(), Some("short".to_owned()))
+                .is_err(),
+            "an environment key below the length floor must be refused"
+        );
+    }
+
+    // ── Config-file permissions (config hygiene) ─────────────────────────────
+
+    #[cfg(unix)]
+    fn set_mode(file: &NamedTempFile, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(file.path()).unwrap().permissions();
+        permissions.set_mode(mode);
+        std::fs::set_permissions(file.path(), permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_group_readable_config_carrying_an_api_key_warns() {
+        let file = write_config_with_api_key(TEST_FILE_API_KEY);
+        set_mode(&file, 0o644);
+
+        let (config, logged) = capture_warnings(|| {
+            NodeConfig::load_from_path_with_env_api_key(file.path(), None).expect("must load")
+        });
+
+        assert_eq!(
+            config.auth.api_key, TEST_FILE_API_KEY,
+            "boot is not blocked"
+        );
+        assert!(
+            logged.contains("readable by group or other"),
+            "a 0644 config holding the API key must warn: {logged}"
+        );
+        assert!(
+            logged.contains("0644"),
+            "the warning must name the mode it found: {logged}"
+        );
+        assert!(
+            !logged.contains(TEST_FILE_API_KEY),
+            "the warning must not print the key: {logged}"
+        );
+    }
+
+    /// Control: the mode the check wants produces no noise.
+    #[cfg(unix)]
+    #[test]
+    fn test_owner_only_config_carrying_an_api_key_does_not_warn() {
+        let file = write_config_with_api_key(TEST_FILE_API_KEY);
+        set_mode(&file, 0o600);
+
+        let (_config, logged) = capture_warnings(|| {
+            NodeConfig::load_from_path_with_env_api_key(file.path(), None).expect("must load")
+        });
+
+        assert!(
+            !logged.contains("readable by group or other"),
+            "0600 is the expected mode and must be silent: {logged}"
+        );
+    }
+
+    /// Control for the gate: the warning is about a key being exposed, so a
+    /// config that carries no key has nothing to expose however it is chmod'ed.
+    /// Without this gate every default `gl-node.config.json` in a checkout
+    /// would warn at every boot and the signal would be worthless.
+    #[cfg(unix)]
+    #[test]
+    fn test_group_readable_config_without_an_api_key_does_not_warn() {
+        let file = write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean" }"#);
+        set_mode(&file, 0o644);
+
+        let (_config, logged) = capture_warnings(|| {
+            NodeConfig::load_from_path_with_env_api_key(file.path(), None).expect("must load")
+        });
+
+        assert!(
+            !logged.contains("readable by group or other"),
+            "no key in the file means nothing to warn about: {logged}"
+        );
+    }
+
+    /// The mode check must not fire on a key supplied by the environment: the
+    /// file does not hold it, so the file's mode says nothing about it.
+    #[cfg(unix)]
+    #[test]
+    fn test_group_readable_config_with_only_an_environment_key_does_not_warn() {
+        let file = write_config_with_api_key("");
+        set_mode(&file, 0o644);
+
+        let (config, logged) = capture_warnings(|| {
+            NodeConfig::load_from_path_with_env_api_key(
+                file.path(),
+                Some(TEST_ENV_API_KEY.to_owned()),
+            )
+            .expect("must load")
+        });
+
+        assert_eq!(config.auth.api_key, TEST_ENV_API_KEY);
+        assert!(
+            !logged.contains("readable by group or other"),
+            "the key came from the environment, not this file: {logged}"
+        );
+    }
+
+    // ── The optional `http` section (M-13 / T22) ─────────────────────────────
+
+    /// A loopback config carrying the given raw `http` object.
+    fn load_with_http_section(http_json: &str) -> Result<NodeConfig, ConfigError> {
+        let file = write_temp_config(&format!(
+            r#"{{ "ledgerPath": "./data/ledger.bean", "http": {http_json} }}"#
+        ));
+        NodeConfig::load_from_path(&file.path().to_path_buf())
+    }
+
+    /// The compatibility guarantee: no `http` section means exactly the numbers
+    /// `serve_hardened`'s call site used to hardcode. The literals are spelled
+    /// out on purpose — comparing only against `HttpServerSettings::default()`
+    /// would pass even if someone changed both sides at once.
+    #[test]
+    fn test_absent_http_section_yields_the_shipped_serve_defaults() {
+        let file = write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean" }"#);
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+
+        let settings = config.http_server_settings();
+        assert_eq!(settings.header_read_timeout, Duration::from_secs(30));
+        assert_eq!(settings.request_timeout, Duration::from_secs(30));
+        assert_eq!(settings.max_connections, 1024);
+        assert_eq!(
+            settings,
+            HttpServerSettings::default(),
+            "an absent section must be byte-for-byte the previous behaviour"
+        );
+    }
+
+    /// The wiring: a configured value has to arrive in the struct
+    /// `serve_hardened` actually reads.
+    #[test]
+    fn test_http_section_values_reach_the_server_settings() {
+        let config = load_with_http_section(
+            r#"{ "headerReadTimeoutSeconds": 5, "requestTimeoutSeconds": 12, "maxConnections": 64 }"#,
+        )
+        .expect("in-bounds values must load");
+
+        assert_eq!(config.http.header_read_timeout_seconds, 5);
+        assert_eq!(config.http.request_timeout_seconds, 12);
+        assert_eq!(config.http.max_connections, 64);
+
+        let settings = config.http_server_settings();
+        assert_eq!(settings.header_read_timeout, Duration::from_secs(5));
+        assert_eq!(settings.request_timeout, Duration::from_secs(12));
+        assert_eq!(settings.max_connections, 64);
+    }
+
+    /// Each field defaults independently, so tuning one knob does not silently
+    /// reset the other two.
+    #[test]
+    fn test_partial_http_section_keeps_the_remaining_defaults() {
+        let config =
+            load_with_http_section(r#"{ "maxConnections": 32 }"#).expect("partial must load");
+        assert_eq!(config.http.max_connections, 32);
+        assert_eq!(
+            config.http.header_read_timeout_seconds,
+            HttpServerSettings::default().header_read_timeout.as_secs()
+        );
+        assert_eq!(
+            config.http.request_timeout_seconds,
+            HttpServerSettings::default().request_timeout.as_secs()
+        );
+    }
+
+    #[test]
+    fn test_http_section_rejects_unknown_keys() {
+        let error_message = format!(
+            "{}",
+            load_with_http_section(r#"{ "requestTimeoutSecond": 10 }"#)
+                .expect_err("a typo'd key must not be silently ignored")
+        );
+        assert!(error_message.contains("parse"), "{error_message}");
+    }
+
+    /// A zero timeout does not "turn the timeout off", it turns the server off
+    /// — and is exactly what someone reaching for "no limit" would write.
+    #[test]
+    fn test_zero_http_timeouts_rejected() {
+        for (field, http_json) in [
+            (
+                "http.headerReadTimeoutSeconds",
+                r#"{ "headerReadTimeoutSeconds": 0 }"#,
+            ),
+            (
+                "http.requestTimeoutSeconds",
+                r#"{ "requestTimeoutSeconds": 0 }"#,
+            ),
+        ] {
+            let error_message = format!(
+                "{}",
+                load_with_http_section(http_json).expect_err("0 must be refused")
+            );
+            assert!(
+                error_message.contains(field),
+                "the error must name the field: {error_message}"
+            );
+            assert!(
+                error_message.contains("got 0"),
+                "the error must name the offending value: {error_message}"
+            );
+        }
+    }
+
+    /// The other half of the same rule: an enormous timeout re-opens the very
+    /// attack the timeout exists to stop.
+    #[test]
+    fn test_absurdly_large_http_timeouts_rejected() {
+        for http_json in [
+            r#"{ "headerReadTimeoutSeconds": 86400 }"#,
+            r#"{ "requestTimeoutSeconds": 86400 }"#,
+        ] {
+            let error_message = format!(
+                "{}",
+                load_with_http_section(http_json).expect_err("a day-long timeout must be refused")
+            );
+            assert!(
+                error_message.contains(&MAX_HTTP_TIMEOUT_SECONDS.to_string()),
+                "the error must name the ceiling: {error_message}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_http_timeout_bounds_are_inclusive() {
+        let at_floor = load_with_http_section(&format!(
+            r#"{{ "headerReadTimeoutSeconds": {MIN_HTTP_TIMEOUT_SECONDS},
+                   "requestTimeoutSeconds": {MIN_HTTP_TIMEOUT_SECONDS} }}"#
+        ))
+        .expect("exactly the floor must be accepted");
+        assert_eq!(
+            at_floor.http_server_settings().header_read_timeout,
+            Duration::from_secs(MIN_HTTP_TIMEOUT_SECONDS)
+        );
+
+        load_with_http_section(&format!(
+            r#"{{ "headerReadTimeoutSeconds": {MAX_HTTP_TIMEOUT_SECONDS},
+                   "requestTimeoutSeconds": {MAX_HTTP_TIMEOUT_SECONDS} }}"#
+        ))
+        .expect("exactly the ceiling must be accepted");
+    }
+
+    /// Both ends. `0` means "accept nothing", `1` means "serve one client at a
+    /// time" (one held keep-alive connection is then a full outage), and
+    /// `usize::MAX` means the cap is not a cap.
+    #[test]
+    fn test_max_connections_outside_its_bounds_rejected() {
+        for value in ["0", "1", "7", "65537", "18446744073709551615"] {
+            let Err(error) = load_with_http_section(&format!(r#"{{ "maxConnections": {value} }}"#))
+            else {
+                panic!("maxConnections {value} must be refused");
+            };
+            let error_message = format!("{error}");
+            assert!(
+                error_message.contains("http.maxConnections"),
+                "the error must name the field: {error_message}"
+            );
+            assert!(
+                error_message.contains(&format!("got {value}")),
+                "the error must name the offending value: {error_message}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_max_connections_bounds_are_inclusive() {
+        let at_floor =
+            load_with_http_section(&format!(r#"{{ "maxConnections": {MIN_MAX_CONNECTIONS} }}"#))
+                .expect("exactly the floor must be accepted");
+        assert_eq!(at_floor.http.max_connections, MIN_MAX_CONNECTIONS);
+
+        let at_ceiling =
+            load_with_http_section(&format!(r#"{{ "maxConnections": {MAX_MAX_CONNECTIONS} }}"#))
+                .expect("exactly the ceiling must be accepted");
+        assert_eq!(at_ceiling.http.max_connections, MAX_MAX_CONNECTIONS);
     }
 }

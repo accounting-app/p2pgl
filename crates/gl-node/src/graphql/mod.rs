@@ -306,6 +306,39 @@ mod tests {
         }
     }
 
+    /// The `Peer` type exposes membership only (0902 informational).
+    ///
+    /// `Peer.heads` was fed by a registry field that nothing ever wrote a head
+    /// into, so it answered `[]` for every peer on every healthy mesh. Asserting
+    /// the exact field set — rather than just that `heads` is gone — is what
+    /// stops it being reintroduced as another always-empty list.
+    #[tokio::test]
+    async fn test_peer_type_exposes_membership_only() {
+        let schema = build_schema();
+        let result = schema
+            .execute(r#"{ __type(name: "Peer") { fields { name } } }"#)
+            .await;
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let data = result.data.into_json().unwrap();
+        let field_names: Vec<&str> = data["__type"]["fields"]
+            .as_array()
+            .expect("Peer must still be in the schema")
+            .iter()
+            .map(|field| field["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(field_names, vec!["id"]);
+
+        // And querying the removed field is now a schema error, not an empty list.
+        let removed = schema.execute("{ peers { id heads } }").await;
+        assert!(
+            !removed.errors.is_empty(),
+            "peers.heads must no longer resolve"
+        );
+
+        let live = schema.execute("{ peers { id } }").await;
+        assert!(live.errors.is_empty(), "errors: {:?}", live.errors);
+    }
+
     #[tokio::test]
     async fn test_wired_schema_with_service() {
         let dir = tempfile::tempdir().unwrap();
