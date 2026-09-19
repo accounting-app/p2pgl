@@ -5,20 +5,81 @@
 # (empty allowlist = no remote Supply). Use a unique swarmTopic per mesh;
 # this sample uses openledger/docker-dev (not the public default).
 #
-# Usage:
-#   GL_NODE_API_KEY="$(openssl rand -hex 32)" docker compose -f deploy/docker-compose.yml up --build
+# Usage — every node needs its OWN key, so generate three:
+#   GL_NODE_0_API_KEY="$(openssl rand -hex 32)" \
+#   GL_NODE_1_API_KEY="$(openssl rand -hex 32)" \
+#   GL_NODE_2_API_KEY="$(openssl rand -hex 32)" \
+#     docker compose -f deploy/docker-compose.yml up --build
 #
-# Each node exposes:
-#   - node-0: http://localhost:3000/graphql  (POST; set X-Api-Key)
-#   - node-1: http://localhost:3001/graphql
-#   - node-2: http://localhost:3002/graphql
+# Or, to keep the keys out of your shell history: copy deploy/.env.example to
+# deploy/.env, fill in the three values there, and run the plain
+# `docker compose -f deploy/docker-compose.yml up --build`. Compose reads a
+# `.env` beside the compose file automatically. `deploy/.env` is gitignored;
+# `deploy/.env.example` is the committed template and holds no secret.
+#
+# Each node exposes, ON THE HOST LOOPBACK INTERFACE ONLY:
+#   - node-0: http://127.0.0.1:3000/graphql  (POST; set X-Api-Key)
+#   - node-1: http://127.0.0.1:3001/graphql
+#   - node-2: http://127.0.0.1:3002/graphql
 #   - All nodes: GET /health for health checks
 #
-# GraphiQL is off. Set GL_NODE_API_KEY in the environment; the sample
-# "change-me-docker-api-key" is rejected at boot.
-# Bind is 0.0.0.0 with tls.mode=terminated — put a TLS terminator in front
-# of published ports. p2p.relayMode is disabled (same Docker bridge);
-# set "n0" only when peers must traverse NAT via public Iroh relays.
+# ── Why the ports are published as "127.0.0.1:PORT:3000" (L-03) ───────────────
+# `"3000:3000"` publishes on 0.0.0.0, i.e. every host interface. This stack
+# declares tls.mode "terminated" in gl-node.docker.json but contains no
+# terminator, so all-interfaces publishing served the writable GraphQL API as
+# plaintext HTTP to anything that could route to the host — the API key would
+# cross the wire in the clear on every request. Binding the published side to
+# loopback keeps the stack reachable for local development and unreachable from
+# off-host. When you add a real TLS terminator, put it in this compose file (or
+# on the host), point it at these loopback ports, and only the terminator gets a
+# public listener.
+#
+# ── API keys (L-08) ──────────────────────────────────────────────────────────
+# Each node gets a distinct GL_NODE_API_KEY. One shared key means compromising
+# any single node hands the attacker write access to all of them, and rotating
+# it is an all-or-nothing outage. The `:-` defaults below are deliberately
+# unusable placeholders: they are shorter than the 16-byte minimum gl-node
+# enforces on auth.apiKey, so a stack started without the three variables set
+# FAILS TO BOOT with a config-validation error naming the key, rather than
+# coming up with a guessable credential. Set real per-node values of at least
+# 16 bytes (`openssl rand -hex 32` gives 64). Published sample/placeholder
+# strings are refused outright by the denylist, so do not reuse anything that
+# appears in this repository or the README.
+#
+# ── Reverse proxy / trustedProxies (M-04) ────────────────────────────────────
+# gl-node.docker.json deliberately ships with no `trustedProxies`, so it logs
+# the M-04 boot warning ("trustedProxies is empty while tls.mode is
+# terminated"). That is correct for this stack as shipped: there is no
+# terminator, nothing sends X-Forwarded-For, and trusting a header nobody sets
+# would be strictly worse. The moment you add a terminator in front of these
+# loopback ports, add its address to gl-node.docker.json so the per-IP rate
+# limiter keys on the real client instead of putting the whole internet in one
+# bucket:
+#
+#   "trustedProxies": ["172.18.0.9"]
+#
+# Entries are exact IP literals of the proxies themselves — not CIDR ranges,
+# not hostnames, not ports — and only `X-Forwarded-For` is honoured (RFC 7239
+# `Forwarded:` is not supported). Listing anything an untrusted client can
+# reach lets that client forge its own rate-limit identity.
+#
+# ── Mesh identity (L-23) ─────────────────────────────────────────────────────
+# All three nodes share gl-node.docker.json, so they share a signature domain —
+# which is what a single mesh needs. No `meshId` is set there on purpose: a
+# literal UUID shipped in the repository would be copy-pasted into every
+# deployment, giving them all one mesh identity (the L-08 sample-key failure
+# mode with a different field). The domain therefore falls back to swarmTopic
+# ("openledger/docker-dev"). For a real deployment, set a `meshId` you generated
+# yourself (`uuidgen`) in your own copy of the config — see the README's
+# `p2p.meshId` section for the rollout procedure on an existing mesh.
+#
+# GraphiQL is off. p2p.relayMode is disabled (same Docker bridge); set "n0"
+# only when peers must traverse NAT via public Iroh relays.
+#
+# Each node gets its OWN volume and therefore its own .bean file. Pointing two
+# containers at one ledger volume now fails closed at startup on the
+# `<ledger>.lock` sidecar (M-17) — that is the exclusivity check working, not a
+# bug.
 
 services:
   node-0:
@@ -27,14 +88,14 @@ services:
       dockerfile: Dockerfile
     container_name: gl-node-0
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     volumes:
       - node0-data:/data
       - ./gl-node.docker.json:/data/gl-node.config.json:ro
     environment:
       - RUST_LOG=info
       - GL_NODE_CONFIG=/data/gl-node.config.json
-      - GL_NODE_API_KEY=${GL_NODE_API_KEY:?Set GL_NODE_API_KEY to a unique secret}
+      - GL_NODE_API_KEY=${GL_NODE_0_API_KEY:-change-me-0}
     networks:
       - openledger
     healthcheck:
@@ -50,14 +111,14 @@ services:
       dockerfile: Dockerfile
     container_name: gl-node-1
     ports:
-      - "3001:3000"
+      - "127.0.0.1:3001:3000"
     volumes:
       - node1-data:/data
       - ./gl-node.docker.json:/data/gl-node.config.json:ro
     environment:
       - RUST_LOG=info
       - GL_NODE_CONFIG=/data/gl-node.config.json
-      - GL_NODE_API_KEY=${GL_NODE_API_KEY:?Set GL_NODE_API_KEY to a unique secret}
+      - GL_NODE_API_KEY=${GL_NODE_1_API_KEY:-change-me-1}
     networks:
       - openledger
     healthcheck:
@@ -76,14 +137,14 @@ services:
       dockerfile: Dockerfile
     container_name: gl-node-2
     ports:
-      - "3002:3000"
+      - "127.0.0.1:3002:3000"
     volumes:
       - node2-data:/data
       - ./gl-node.docker.json:/data/gl-node.config.json:ro
     environment:
       - RUST_LOG=info
       - GL_NODE_CONFIG=/data/gl-node.config.json
-      - GL_NODE_API_KEY=${GL_NODE_API_KEY:?Set GL_NODE_API_KEY to a unique secret}
+      - GL_NODE_API_KEY=${GL_NODE_2_API_KEY:-change-me-2}
     networks:
       - openledger
     healthcheck:

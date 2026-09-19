@@ -14,6 +14,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Do not leave the job's GITHUB_TOKEN in .git/config as an
+          # `extraheader` credential. It is there for the rest of the job
+          # otherwise, so anything the job runs — a build script, a proc macro,
+          # a dependency's `build.rs` — can read it and push with it. Nothing
+          # here does any git operation after checkout, so the credential has no
+          # use and only a blast radius.
+          persist-credentials: false
       # Pinned by SHA, so the toolchain can no longer be inferred from the ref;
       # `toolchain: stable` keeps installing current stable at run time while the
       # action code stays frozen at this commit (stable branch tip at pin time).
@@ -33,6 +41,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # `cargo audit` against the RustSec advisory DB, over the committed
+      # `Cargo.lock` — this is the watch that covers the `lru`/`h2` advisories
+      # the 09/02 report asked to keep an eye on. The token is for posting
+      # findings; `contents: read` above is the only repository permission the
+      # workflow grants.
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
