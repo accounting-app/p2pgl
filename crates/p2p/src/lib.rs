@@ -5,6 +5,7 @@
 
 pub mod allowlist;
 pub mod anti_entropy;
+pub mod cbor_scan;
 pub mod gossip;
 pub mod node;
 pub mod orphan_buffer;

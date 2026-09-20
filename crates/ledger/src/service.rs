@@ -39,7 +39,80 @@ pub const MAX_METADATA_KEYS_PER_DIRECTIVE: usize = 100;
 /// Maximum UTF-8 bytes of a remote `economic_bean` body (M-4).
 pub const MAX_ECONOMIC_BEAN_LENGTH: usize = 1_048_576;
 /// Maximum ledger file size on boot, reconcile, and persist (§3.12).
+///
+/// T44: this bounds the canonical `.bean` **and** the commit journal together —
+/// the journal's read budget is whatever is left of this after the canonical
+/// file, and an append that would push the pair past it is refused before any
+/// bytes are written. So the compacted file can never exceed the cap, and a
+/// journal this node wrote can always be booted.
 pub const MAX_LEDGER_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Canonical-file size below which every commit simply rewrites the whole
+/// `.bean` and no journal is created (T44).
+///
+/// The journal exists to stop one appended directive costing a whole-file
+/// rewrite. Below 64 KiB that rewrite is a single small write plus an fsync —
+/// the fsync dominates either way, so the journal would buy nothing and cost a
+/// second file, a second failure mode, and a lagging canonical file. Above it
+/// the rewrite is what T44 is about.
+///
+/// A ledger therefore behaves *exactly* as it did before T44 until it grows
+/// past this point: same bytes, same write path, no sidecar on disk.
+pub const COMPACTION_MIN_CANONICAL_BYTES: u64 = 64 * 1024;
+
+/// Compact once the journal reaches 1/this of the canonical file's size (T44).
+///
+/// Two is the ratio that makes the amortised cost a constant rather than a
+/// function of ledger size: each compaction rewrites `canonical × 3/2` bytes
+/// after absorbing `canonical / 2` bytes of journal, so every appended byte
+/// costs a bounded ~3 bytes of eventual rewrite however large the ledger gets.
+/// A larger ratio would leave more state in the journal (slower boots, longer
+/// crash-window replay) for a win that is already constant.
+const COMPACTION_JOURNAL_RATIO: u64 = 2;
+
+/// What a [`PendingCommit`] will do to the files (T44).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitKind {
+    /// Frame the staged directives as one journal record, append it, fsync.
+    /// O(staged bytes) — the canonical `.bean` is not touched at all.
+    Append,
+    /// Rewrite the canonical `.bean` from memory (temp + fsync + rename) and
+    /// delete the journal. O(ledger).
+    Compact,
+}
+
+/// Observer invoked at the head of [`PendingCommit::commit`], on the blocking
+/// thread, before any I/O — **a test seam**.
+///
+/// Production never installs one: `set_commit_observer` is called from tests
+/// only, and the commit path pays a single `Option` check. Tests use it two
+/// ways: to record the bytes each commit actually writes (the O(1) proof), and
+/// to stall a commit in flight so a concurrent GraphQL read can be shown to
+/// complete anyway (the reads-not-blocked proof).
+pub type CommitObserver = std::sync::Arc<dyn Fn(CommitKind, u64) + Send + Sync>;
+
+/// Size + mtime of the canonical file as this service last saw it (T44).
+///
+/// The cheap half of the T35 hand-edit check: one `stat` per commit says
+/// "nothing touched the `.bean`", which is all an append needs to know. The
+/// exact half — re-read, re-hash, adopt — still runs, but only on the
+/// compaction path, which is the only path that rewrites the file and therefore
+/// the only one that could erase an edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileMarker {
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl FileMarker {
+    fn of(path: &Path) -> Option<FileMarker> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(FileMarker {
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
 
 /// Write `content` via a sibling `.tmp` file, fsync, then POSIX rename (H-10 / CAP-1).
 fn persist_atomically(path: &Path, content: &str) -> Result<(), std::io::Error> {
@@ -683,6 +756,16 @@ pub enum ServiceError {
     /// H-06: an `openledger-*` key in the economic body, where the envelope
     /// rules permit none (unknown at directive level, or any at posting level).
     BodyEnvelopeKey { key: String },
+    /// T44: the append-only commit journal could not be read — it is over
+    /// budget, or corrupt in a way a crash cannot produce. Fails closed.
+    Journal { message: String },
+    /// T44: a durable commit prepared earlier has not been finished or
+    /// recovered yet.
+    ///
+    /// Unreachable when callers honour the single-writer contract documented on
+    /// [`LedgerService::prepare_commit`]; it exists so a caller that violates it
+    /// gets a loud refusal instead of an interleaved write.
+    CommitInFlight,
 }
 
 impl std::fmt::Display for ServiceError {
@@ -740,6 +823,10 @@ impl std::fmt::Display for ServiceError {
                     "metadata key '{key}' is not an envelope key permitted in this position"
                 )
             }
+            ServiceError::Journal { message } => write!(f, "{message}"),
+            ServiceError::CommitInFlight => {
+                write!(f, "a durable ledger commit is already in flight")
+            }
         }
     }
 }
@@ -770,6 +857,8 @@ impl ServiceError {
             ServiceError::InvalidInput { .. } => "INVALID_INPUT",
             ServiceError::DateOutOfRange { .. } => "DATE_OUT_OF_RANGE",
             ServiceError::BodyEnvelopeKey { .. } => "BODY_ENVELOPE_KEY",
+            ServiceError::Journal { .. } => "LEDGER_JOURNAL",
+            ServiceError::CommitInFlight => "COMMIT_IN_FLIGHT",
         }
     }
 }
@@ -789,6 +878,20 @@ impl From<DagError> for ServiceError {
 impl From<std::io::Error> for ServiceError {
     fn from(e: std::io::Error) -> Self {
         ServiceError::Io(e)
+    }
+}
+
+impl From<crate::journal::JournalError> for ServiceError {
+    fn from(e: crate::journal::JournalError) -> Self {
+        match e {
+            // An unreadable journal is an unreadable ledger: it is routed to the
+            // same `Io` arm the `.bean` uses so the L-13 reload path and the
+            // GraphQL error mapping (which redacts paths, L3) treat it alike.
+            crate::journal::JournalError::Io(error) => ServiceError::Io(error),
+            other => ServiceError::Journal {
+                message: other.to_string(),
+            },
+        }
     }
 }
 
@@ -833,6 +936,154 @@ pub struct AppendOutcome {
     /// `true` when this exact economic body was already in the ledger and
     /// nothing new was recorded.
     pub already_existed: bool,
+}
+
+// ─── Two-phase durable commit (T44) ──────────────────────────────────────────
+
+/// A durable write that has been *prepared* in memory and not yet performed.
+///
+/// # Why persistence is split in two
+///
+/// Before T44 a mutation serialized, wrote and fsynced the whole `.bean` while
+/// holding the ledger write lock, on a tokio worker thread. A slow fsync
+/// therefore blocked every GraphQL **read** behind the `RwLock` and parked a
+/// runtime worker for the duration. Splitting the write gives the node layer
+/// the shape it needs:
+///
+/// ```text
+/// write lock { mutate; prepare_commit() }   // in-memory + serialize, cheap
+/// drop(lock)
+/// spawn_blocking { pending.commit() }       // the write + the fsync
+/// write lock { finish_commit(receipt) }     // bookkeeping
+///        └── on failure: recover_failed_commit()   (L-13)
+/// ```
+///
+/// [`PendingCommit`] owns everything the I/O needs — paths and bytes, no
+/// borrow of the service — so it is `Send + 'static` and can be moved into
+/// `spawn_blocking`. It deliberately holds **no** handle back to the
+/// `LedgerService`: the only way a commit can affect in-memory state is through
+/// the [`CommitReceipt`] the caller feeds to `finish_commit`, which is what
+/// makes "the commit cannot race the ledger" a property of the types rather
+/// than of the caller's discipline.
+///
+/// Synchronous callers (the ledger's own tests, `reconcile_file`, any library
+/// user that does not care) never see this: [`LedgerService::persist_or_reload`]
+/// and [`LedgerService::compact`] still do prepare + commit + finish in one
+/// call, inline, exactly as before.
+pub struct PendingCommit {
+    generation: u64,
+    kind: CommitKind,
+    ledger_path: PathBuf,
+    journal_path: PathBuf,
+    /// [`CommitKind::Compact`] only: the full canonical file text.
+    canonical: String,
+    /// [`CommitKind::Append`] only: the framed journal record.
+    record: String,
+    observer: Option<CommitObserver>,
+}
+
+impl std::fmt::Debug for PendingCommit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the ledger contents.
+        f.debug_struct("PendingCommit")
+            .field("generation", &self.generation)
+            .field("kind", &self.kind)
+            .field("bytes_to_write", &self.bytes_to_write())
+            .finish()
+    }
+}
+
+impl PendingCommit {
+    /// Whether this commit appends a journal record or rewrites the `.bean`.
+    pub fn kind(&self) -> CommitKind {
+        self.kind
+    }
+
+    /// Bytes this commit will write. `O(directive)` for an append; `O(ledger)`
+    /// for a compaction — which is the whole difference T44 buys, made
+    /// observable without a test seam.
+    pub fn bytes_to_write(&self) -> u64 {
+        match self.kind {
+            CommitKind::Append => self.record.len() as u64,
+            CommitKind::Compact => self.canonical.len() as u64,
+        }
+    }
+
+    /// Perform the write and the fsync. **Blocking** — call it from
+    /// `spawn_blocking` (or from a synchronous context), never on a runtime
+    /// worker thread while a lock is held.
+    ///
+    /// A compaction writes the canonical file first and only then deletes the
+    /// journal. A crash in between leaves both on disk, holding overlapping
+    /// directives — which boot unions and the DAG's G-Set dedups by content id,
+    /// so the crash window is safe by construction rather than by recovery
+    /// logic. The reverse order would have a window in which neither file holds
+    /// the directives.
+    pub fn commit(self) -> Result<CommitReceipt, ServiceError> {
+        if let Some(ref observe) = self.observer {
+            observe(self.kind, self.bytes_to_write());
+        }
+        match self.kind {
+            CommitKind::Compact => {
+                persist_atomically(&self.ledger_path, &self.canonical)?;
+                crate::journal::remove_journal(&self.journal_path)?;
+                Ok(CommitReceipt {
+                    generation: self.generation,
+                    kind: self.kind,
+                    bytes_written: self.canonical.len() as u64,
+                    // Hashing the canonical text is O(ledger); doing it here
+                    // keeps it off the write lock with the rest of the cost.
+                    canonical_hash: Some(file_content_hash(&self.canonical)),
+                    canonical_bytes: Some(self.canonical.len() as u64),
+                    canonical_marker: FileMarker::of(&self.ledger_path),
+                    journal_bytes: 0,
+                })
+            }
+            CommitKind::Append => {
+                let (journal_bytes, _created) =
+                    crate::journal::append_record(&self.journal_path, &self.record)?;
+                Ok(CommitReceipt {
+                    generation: self.generation,
+                    kind: self.kind,
+                    bytes_written: self.record.len() as u64,
+                    // The canonical file was not touched, so nothing about it
+                    // changes: no new hash, no new size, no new marker.
+                    canonical_hash: None,
+                    canonical_bytes: None,
+                    canonical_marker: None,
+                    journal_bytes,
+                })
+            }
+        }
+    }
+}
+
+/// What a completed [`PendingCommit`] tells the service about the files.
+///
+/// The only channel from the off-lock commit back into in-memory state; it
+/// carries a generation so [`LedgerService::finish_commit`] can refuse a
+/// receipt that does not belong to the commit it is waiting for.
+#[derive(Debug, Clone)]
+pub struct CommitReceipt {
+    generation: u64,
+    kind: CommitKind,
+    bytes_written: u64,
+    canonical_hash: Option<String>,
+    canonical_bytes: Option<u64>,
+    canonical_marker: Option<FileMarker>,
+    journal_bytes: u64,
+}
+
+impl CommitReceipt {
+    /// Whether the commit appended to the journal or rewrote the `.bean`.
+    pub fn kind(&self) -> CommitKind {
+        self.kind
+    }
+
+    /// Bytes actually written by this commit.
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
 }
 
 // ─── Ledger service ──────────────────────────────────────────────────────────
@@ -890,18 +1141,100 @@ pub struct LedgerService {
     /// `None` means "never sign", which is also what a signing-disabled provider
     /// returns, so the two cannot disagree about the disabled case.
     signer: Option<DirectiveSigner>,
+
+    // ── T44: append-only persistence ──────────────────────────────────────
+    /// `<ledger>.bean.journal` — the append-only sidecar, derived once at boot.
+    journal_path: PathBuf,
+    /// Byte length of the canonical `.bean` as this service last wrote or read
+    /// it. Drives the compaction threshold and the combined size cap.
+    canonical_bytes: u64,
+    /// Size + mtime of the canonical `.bean` as last seen — the O(1) hand-edit
+    /// probe (see [`FileMarker`]).
+    canonical_marker: Option<FileMarker>,
+    /// Does the canonical `.bean` hold exactly the bytes this service would
+    /// write for the directives it contains?
+    ///
+    /// **False after boot**, because boot *read* a file it did not write: a
+    /// hand-authored ledger, a file carrying a BOM (L-28), or one written by an
+    /// older format are all legitimately non-canonical on disk. Before T44
+    /// every persist was a full rewrite, so the first one after boot silently
+    /// canonicalised the file; the append path would not, so the first commit
+    /// after a boot is still a compaction and the guarantee is preserved
+    /// exactly. True from that compaction onwards — an append leaves the
+    /// canonical file untouched and therefore still canonical for its own
+    /// contents.
+    canonical_is_current: bool,
+    /// Byte length of the journal on disk, as of the last commit.
+    canonical_journal_bytes: u64,
+    /// Content ids inserted since the last commit and not yet written anywhere.
+    ///
+    /// Ids, not directives: the record is built by resolving them against the
+    /// DAG at prepare time, which costs one `serialize_directive` per staged
+    /// directive and keeps the memory overhead of a large catch-up batch at 64
+    /// bytes per entry instead of a second full clone of every body.
+    pending_ids: Vec<String>,
+    /// Set when the next commit MUST be a full rewrite rather than an append.
+    ///
+    /// Three producers, all of them cases an append cannot express: a
+    /// [`Self::stamp_signature`] that mutated a directive already on disk (a
+    /// journal record carrying the same content id would be dropped by the
+    /// G-Set on the way back in, losing the signature); a reconcile, which has
+    /// to *remove* refused entries from the file; and a journal whose tail was
+    /// torn by a crash, which cannot be safely appended to.
+    force_compaction: bool,
+    /// Bumped by every [`Self::prepare_commit`]; stamped into the
+    /// [`PendingCommit`] and checked by [`Self::finish_commit`].
+    commit_generation: u64,
+    /// True between a prepare and its finish/recover. See
+    /// [`Self::prepare_commit`] for the single-writer contract this enforces.
+    commit_in_flight: bool,
+    /// The process-wide single-writer gate (see [`Self::commit_gate`]).
+    commit_gate: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Test seam; `None` in production. See [`CommitObserver`].
+    commit_observer: Option<CommitObserver>,
 }
 
 impl LedgerService {
     // ── Boot ──────────────────────────────────────────────────────────────
 
-    /// Boot the ledger service from a `.bean` file.
+    /// Boot the ledger service from a `.bean` file **and its commit journal**.
     ///
     /// If the file doesn't exist, creates an empty file and starts with an empty ledger.
     /// Parses directives, builds account state, populates the DAG, and initializes
     /// the Lamport clock.
+    ///
+    /// # Canonical ∪ journal (T44)
+    ///
+    /// Since T44 a mutation on a ledger past
+    /// [`COMPACTION_MIN_CANONICAL_BYTES`] becomes an append to
+    /// `<ledger>.bean.journal` rather than a rewrite of the `.bean`, so the
+    /// durable state is the **union** of the two files. Boot reads both,
+    /// concatenates the journal's records after the canonical text, and runs
+    /// the identical pipeline over the result: one canonical `(date,
+    /// type_priority)` sort, one cycle pre-scan, one insert loop. Nothing else
+    /// changes, and it is that reuse — rather than a second merge routine —
+    /// that makes "boot(canonical + journal) == boot(compacted canonical)" hold
+    /// by construction:
+    ///
+    /// * the union is a set, and directive identity is the content hash, so a
+    ///   directive present in *both* files (the post-crash, pre-compaction
+    ///   shape) is deduped for free by the DAG's G-Set;
+    /// * record order in the journal is arrival order, and the sort discards it
+    ///   before anything is inserted, so the state cannot depend on it;
+    /// * the leading comments and the L-30 file hash are taken from the
+    ///   canonical text **only** — the journal is node-private and holds no
+    ///   comments, and the hash's only job is to answer "did a human edit the
+    ///   `.bean`?".
+    ///
+    /// Boot never writes. That is deliberate: [`Self::persist_or_reload`]
+    /// recovers a failed commit by re-booting this very path, and a recovery
+    /// that tried to write would fail for exactly the reason the commit just
+    /// failed. A journal present at boot is simply carried; the first commit —
+    /// or an explicit [`Self::compact`] from the node's startup path — folds it
+    /// in.
     pub fn boot(file_path: impl Into<PathBuf>, author_id: String) -> Result<Self, ServiceError> {
         let file_path = file_path.into();
+        let journal_path = crate::journal::journal_path_for(&file_path);
 
         // Read or create the file.
         let content = if file_path.exists() {
@@ -914,15 +1247,47 @@ impl LedgerService {
             persist_atomically(&file_path, "")?;
             String::new()
         };
+        let canonical_bytes = content.len() as u64;
+        let canonical_marker = FileMarker::of(&file_path);
 
-        // Extract leading comments (lines starting with `;` before any directive).
+        // T44 invariant 5: the journal's budget is whatever `MAX_LEDGER_FILE_BYTES`
+        // has left after the canonical file, so canonical ∪ journal — and hence
+        // the file a compaction would write — is bounded by the same constant
+        // that has always bounded the `.bean`.
+        let journal_budget = MAX_LEDGER_FILE_BYTES.saturating_sub(canonical_bytes);
+        let scan = crate::journal::read_journal(&journal_path, journal_budget)?;
+        if scan.torn_tail_bytes > 0 {
+            warn!(
+                dropped_bytes = scan.torn_tail_bytes,
+                intact_records = scan.payloads.len(),
+                journal = %journal_path.display(),
+                "ledger commit journal ends in a torn record — the node crashed mid-append; \
+                 the torn record is DROPPED (its commit never reported success) and the rest \
+                 of the journal loads normally. The next commit will compact."
+            );
+        }
+
+        // Extract leading comments (lines starting with `;` before any
+        // directive) from the CANONICAL text: the journal carries none, and a
+        // record header is a `;` line that would otherwise be mistaken for one.
         let leading_comments = extract_leading_comments(&content);
 
+        // Canonical ∪ journal, as one `.bean`-shaped string. Each payload and
+        // the canonical text already end in `\n`, so one extra `\n` reproduces
+        // the blank-line separator `full_file_serialize` writes.
+        let mut combined = content.clone();
+        for payload in &scan.payloads {
+            if !combined.trim().is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(payload);
+        }
+
         // Parse directives.
-        let directives = if content.trim().is_empty() {
+        let directives = if combined.trim().is_empty() {
             Vec::new()
         } else {
-            parse_file(&content).map_err(ServiceError::Parse)?
+            parse_file(&combined).map_err(ServiceError::Parse)?
         };
 
         // Sort by canonical order for correct AccountState building.
@@ -1061,12 +1426,33 @@ impl LedgerService {
             file_path,
             leading_comments,
             // L-30: the bytes we just read (or the empty file we just created)
-            // are the baseline every later persist compares against.
+            // are the baseline every later persist compares against. Hashed
+            // over the CANONICAL text alone — the journal is not part of the
+            // artefact a human edits.
             last_file_hash: file_content_hash(&content),
             external_reconcile_count: 0,
             // L-11: installed by the node after the key is loaded; boot itself
             // adopts nothing, it only loads what is already persisted.
             signer: None,
+            journal_path,
+            canonical_bytes,
+            canonical_marker,
+            // Boot read this file; it did not write it, so it may not be in
+            // canonical form. The first commit rewrites it, exactly as every
+            // pre-T44 persist did.
+            canonical_is_current: false,
+            canonical_journal_bytes: scan.file_bytes,
+            // Everything just loaded came off disk, so nothing is uncommitted.
+            pending_ids: Vec::new(),
+            // A torn tail must not be appended after: the scanner would read
+            // the truncated payload's bytes as the next record's header. The
+            // next commit rewrites the canonical file and deletes the journal,
+            // which is the only safe way to make the file appendable again.
+            force_compaction: scan.torn_tail_bytes > 0,
+            commit_generation: 0,
+            commit_in_flight: false,
+            commit_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            commit_observer: None,
         })
     }
 
@@ -1086,7 +1472,35 @@ impl LedgerService {
     }
 
     /// Append a transaction, attaching `openledger-signature` before the first persist (M-11).
+    ///
+    /// Durable when it returns: this is
+    /// [`Self::append_transaction_staged`] followed by an inline
+    /// [`Self::persist_or_reload`]. Callers that want the fsync off the ledger
+    /// write lock (T44) use the staged form and drive the commit themselves.
     pub fn append_transaction_signing(
+        &mut self,
+        input: TransactionInput,
+        sign: impl FnOnce(&str, &str, &str) -> Option<String>,
+    ) -> Result<AppendOutcome, ServiceError> {
+        let outcome = self.append_transaction_staged(input, sign)?;
+        // A duplicate body staged nothing, so this is a no-op for it (T44:
+        // `prepare_commit` returns `None` when there is nothing to write and
+        // nobody has touched the file).
+        self.persist_or_reload()?;
+        Ok(outcome)
+    }
+
+    /// Append a transaction into **memory only** — no file write (T44).
+    ///
+    /// Everything [`Self::append_transaction_signing`] does except the durable
+    /// write: validate, stamp, sign, insert, index. The directive is recorded
+    /// as pending, so the next [`Self::prepare_commit`] carries it to disk.
+    ///
+    /// The caller owes the ledger a commit. Until one lands, in-memory state is
+    /// ahead of disk — which is exactly the window L-13 exists to close, and is
+    /// why the node layer takes the single-writer gate around the whole
+    /// stage → prepare → commit → finish sequence.
+    pub fn append_transaction_staged(
         &mut self,
         input: TransactionInput,
         sign: impl FnOnce(&str, &str, &str) -> Option<String>,
@@ -1214,8 +1628,8 @@ impl LedgerService {
         // Update read model incrementally.
         self.read_model.index_directive(&directive);
 
-        // Persist to file (L-13: reload from disk if the persist fails).
-        self.persist_or_reload()?;
+        // T44: durable on the next commit, not before this call returns.
+        self.pending_ids.push(content_id.clone());
 
         Ok(AppendOutcome {
             txid: content_id,
@@ -1238,7 +1652,24 @@ impl LedgerService {
     }
 
     /// Open an account, attaching `openledger-signature` before the first persist (M-11).
+    ///
+    /// Durable when it returns — see [`Self::append_transaction_signing`].
     pub fn open_account_signing(
+        &mut self,
+        account: String,
+        date: NaiveDate,
+        currencies: Vec<String>,
+        sign: impl FnOnce(&str, &str, &str) -> Option<String>,
+    ) -> Result<String, ServiceError> {
+        let content_id = self.open_account_staged(account, date, currencies, sign)?;
+        self.persist_or_reload()?;
+        Ok(content_id)
+    }
+
+    /// Open an account into **memory only** — no file write (T44).
+    ///
+    /// See [`Self::append_transaction_staged`] for the contract.
+    pub fn open_account_staged(
         &mut self,
         account: String,
         date: NaiveDate,
@@ -1305,8 +1736,8 @@ impl LedgerService {
         // its state after a reboot from the same file are identical.
         self.accounts.record_lifecycle(&directive, &content_id);
 
-        // Persist (L-13: reload from disk if the persist fails).
-        self.persist_or_reload()?;
+        // T44: durable on the next commit.
+        self.pending_ids.push(content_id.clone());
 
         Ok(content_id)
     }
@@ -1324,7 +1755,23 @@ impl LedgerService {
     }
 
     /// Close an account, attaching `openledger-signature` before the first persist (M-11).
+    ///
+    /// Durable when it returns — see [`Self::append_transaction_signing`].
     pub fn close_account_signing(
+        &mut self,
+        account: String,
+        date: NaiveDate,
+        sign: impl FnOnce(&str, &str, &str) -> Option<String>,
+    ) -> Result<String, ServiceError> {
+        let content_id = self.close_account_staged(account, date, sign)?;
+        self.persist_or_reload()?;
+        Ok(content_id)
+    }
+
+    /// Close an account into **memory only** — no file write (T44).
+    ///
+    /// See [`Self::append_transaction_staged`] for the contract.
+    pub fn close_account_staged(
         &mut self,
         account: String,
         date: NaiveDate,
@@ -1387,11 +1834,11 @@ impl LedgerService {
             InsertResult::Duplicate { content_id } => return Ok(content_id),
         };
 
-        // Update account state (M-09) — see `open_account_signing`.
+        // Update account state (M-09) — see `open_account_staged`.
         self.accounts.record_lifecycle(&directive, &content_id);
 
-        // Persist (L-13: reload from disk if the persist fails).
-        self.persist_or_reload()?;
+        // T44: durable on the next commit.
+        self.pending_ids.push(content_id.clone());
 
         Ok(content_id)
     }
@@ -1441,24 +1888,311 @@ impl LedgerService {
         )
     }
 
-    // ── Persistence ──────────────────────────────────────────────────────
+    // ── Persistence (T44: two-phase, append-only) ────────────────────────
 
-    /// Serialize the full ledger to the `.bean` file.
+    /// The process-wide single-writer gate for this ledger (T44 invariant 7).
     ///
-    /// The 64 MiB `MAX_LEDGER_FILE_BYTES` cap is still checked inside
-    /// `persist_atomically` (which also performs the atomic temp+rename), so a
-    /// persist can fail either at the cap or on any IO error. Callers on a
-    /// mutation path must therefore route through [`Self::persist_or_reload`],
-    /// not this raw serialize+write, so that a failed persist never leaves
-    /// in-memory state ahead of disk (L-13).
-    fn persist(&mut self) -> Result<(), ServiceError> {
-        let directives: Vec<Directive> = self.dag.directives().into_iter().cloned().collect();
-        let content = full_file_serialize(&directives, &self.leading_comments);
-        persist_atomically(&self.file_path, &content)?;
-        // L-30: the file now says exactly this. Record it so the next persist
-        // can tell "nobody touched it" from "a human edited it".
-        self.last_file_hash = file_content_hash(&content);
-        Ok(())
+    /// # What it protects
+    ///
+    /// Commits now happen **outside** the ledger write lock, so without a gate
+    /// two writers could prepare in one order and commit in another. Appends
+    /// alone would survive that (journal order is arrival order and boot sorts
+    /// the union), but a compaction would not: it writes a snapshot taken at
+    /// *its* prepare and then deletes the journal, so a concurrent append that
+    /// landed in between would be erased from disk after its caller had already
+    /// been told the write was durable. That is a durability bug, not a
+    /// performance one.
+    ///
+    /// # The contract
+    ///
+    /// An async caller takes this mutex **before** the ledger write lock and
+    /// holds it until the commit is finished or recovered:
+    ///
+    /// ```text
+    /// let gate = ledger.read().await.commit_gate();   // guard dropped here
+    /// let _permit = gate.lock().await;                // single writer from now on
+    /// let pending = { ledger.write().await; mutate; prepare_commit() };
+    /// let receipt = spawn_blocking(|| pending.commit()).await?;
+    /// ledger.write().await.finish_commit(receipt);
+    /// ```
+    ///
+    /// The ordering is one-way — permit, then write lock, never the reverse —
+    /// so the two locks cannot deadlock. Readers take neither, which is the
+    /// entire point: a stalled fsync now delays the next writer and nothing
+    /// else.
+    ///
+    /// [`Self::prepare_commit`] refuses while a commit is in flight, so a
+    /// caller that skips the gate gets [`ServiceError::CommitInFlight`] rather
+    /// than an interleaved write. The gate makes that refusal unreachable; it
+    /// is the belt to the gate's braces, not the mechanism.
+    ///
+    /// The gate survives an L-13 reload (see [`Self::recover_failed_commit`]):
+    /// replacing it would hand the next writer a *different* mutex and silently
+    /// undo the serialization for as long as the old permit was held.
+    pub fn commit_gate(&self) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        std::sync::Arc::clone(&self.commit_gate)
+    }
+
+    /// Install the commit observer. **Test seam** — see [`CommitObserver`].
+    pub fn set_commit_observer(&mut self, observer: CommitObserver) {
+        self.commit_observer = Some(observer);
+    }
+
+    /// Bytes currently held in the commit journal on disk (T44).
+    ///
+    /// `0` on any ledger small enough that every commit compacts — which is
+    /// what makes this a usable signal that the append-only path is in play.
+    pub fn journal_bytes(&self) -> u64 {
+        self.canonical_journal_bytes
+    }
+
+    /// Byte length of the canonical `.bean` as this service last wrote or read
+    /// it (T44).
+    pub fn canonical_bytes(&self) -> u64 {
+        self.canonical_bytes
+    }
+
+    /// The commit journal's path (`<ledger>.bean.journal`).
+    pub fn journal_path(&self) -> &Path {
+        &self.journal_path
+    }
+
+    /// How many directives are in memory but not yet written to either file.
+    ///
+    /// Non-zero only between a staged mutation and its commit.
+    pub fn uncommitted_count(&self) -> usize {
+        self.pending_ids.len()
+    }
+
+    /// Prepare the durable write for everything staged since the last commit.
+    ///
+    /// Returns `None` when there is genuinely nothing to do: nothing staged, no
+    /// forced compaction outstanding, and the canonical file on disk is exactly
+    /// what this service last wrote. (Before T44 a no-op persist rewrote the
+    /// file with identical bytes; skipping that is the only behavioural
+    /// difference, and it is invisible to anything that reads the file.)
+    ///
+    /// # Which commit it prepares
+    ///
+    /// An **append** — one framed journal record, `O(staged)` — unless one of
+    /// these forces a **compaction**:
+    ///
+    /// * the canonical file is below [`COMPACTION_MIN_CANONICAL_BYTES`], where
+    ///   the rewrite is cheaper than the sidecar it would avoid;
+    /// * the journal would reach half the canonical file's size, the
+    ///   ratio-triggered fold-back that keeps the amortised cost constant;
+    /// * something changed the `.bean` underneath us (the `stat` probe), so
+    ///   T35's adopt-before-overwrite has to run;
+    /// * the canonical file has not been written by this service yet, so it may
+    ///   not be in canonical form at all (see `canonical_is_current`);
+    /// * a forced compaction is outstanding — an in-place signature stamp, a
+    ///   reconcile that must delete refused entries, or a torn journal tail.
+    ///
+    /// # Single-writer contract
+    ///
+    /// Exactly one commit may be outstanding per service. A second prepare
+    /// before the first is finished or recovered returns
+    /// [`ServiceError::CommitInFlight`] — see [`Self::commit_gate`] for how the
+    /// node layer makes that unreachable.
+    pub fn prepare_commit(&mut self) -> Result<Option<PendingCommit>, ServiceError> {
+        self.prepare(false)
+    }
+
+    /// Prepare a full canonical rewrite, whatever the threshold says (T44).
+    ///
+    /// Used at the deliberate compaction points — process start, process stop,
+    /// and after a reconcile — and by [`Self::compact`]. Always returns
+    /// `Some`: a compaction asked for explicitly is never optimised away, since
+    /// its caller wants the journal gone, not merely the state durable.
+    pub fn prepare_compaction(&mut self) -> Result<Option<PendingCommit>, ServiceError> {
+        self.prepare(true)
+    }
+
+    fn prepare(
+        &mut self,
+        explicit_compaction: bool,
+    ) -> Result<Option<PendingCommit>, ServiceError> {
+        if self.commit_in_flight {
+            return Err(ServiceError::CommitInFlight);
+        }
+
+        // The O(1) hand-edit probe. It runs on every prepare, including the
+        // append path — an append does not rewrite the `.bean` and so cannot
+        // erase an edit, but noticing early means the edit is adopted at the
+        // next write instead of waiting for the next compaction.
+        let file_changed = self.canonical_file_changed_on_disk();
+        let must_rewrite = explicit_compaction
+            || self.force_compaction
+            || file_changed
+            || !self.canonical_is_current;
+
+        if self.pending_ids.is_empty() && !must_rewrite {
+            return Ok(None);
+        }
+
+        // Only the ratio arm needs the staged bytes, and it is the only arm
+        // that does not already know it is compacting — so a small ledger (the
+        // pre-T44 shape) pays nothing at all for the journal machinery.
+        let mut compact = must_rewrite || self.canonical_bytes < COMPACTION_MIN_CANONICAL_BYTES;
+        let mut record = String::new();
+        if !compact {
+            record = crate::journal::record_bytes(&self.pending_block());
+            compact = (self.canonical_journal_bytes + record.len() as u64)
+                .saturating_mul(COMPACTION_JOURNAL_RATIO)
+                >= self.canonical_bytes;
+        }
+
+        let (kind, canonical, record) = if compact {
+            // L-30 / L-12: this is the write that would erase a hand edit, so
+            // this is where the exact check belongs — re-read, re-hash, and
+            // reconcile the edit in before serializing over it.
+            self.adopt_external_edits()?;
+            let directives: Vec<Directive> = self.dag.directives().into_iter().cloned().collect();
+            (
+                CommitKind::Compact,
+                full_file_serialize(&directives, &self.leading_comments),
+                String::new(),
+            )
+        } else {
+            // T27's "reject an over-cap write BEFORE any state changes" applies
+            // to the append path too, and has to be re-derived here because the
+            // file the cap bounds is not the one being written. The compacted
+            // file is at most canonical + journal + this record (the journal's
+            // record headers are counted, so the bound is conservative), and
+            // that is what must stay under `MAX_LEDGER_FILE_BYTES`.
+            let projected = self
+                .canonical_bytes
+                .saturating_add(self.canonical_journal_bytes)
+                .saturating_add(record.len() as u64);
+            if projected > MAX_LEDGER_FILE_BYTES {
+                return Err(ServiceError::ResourceLimitExceeded {
+                    message: format!(
+                        "ledger plus journal would reach {projected} bytes (max {MAX_LEDGER_FILE_BYTES})"
+                    ),
+                });
+            }
+            (CommitKind::Append, String::new(), record)
+        };
+
+        self.commit_generation = self.commit_generation.saturating_add(1);
+        self.commit_in_flight = true;
+        Ok(Some(PendingCommit {
+            generation: self.commit_generation,
+            kind,
+            ledger_path: self.file_path.clone(),
+            journal_path: self.journal_path.clone(),
+            canonical,
+            record,
+            observer: self.commit_observer.clone(),
+        }))
+    }
+
+    /// Canonical text of the directives staged since the last commit.
+    ///
+    /// `O(staged)`, not `O(ledger)` — this is the whole of T44's goal (a). The
+    /// ids are resolved against the DAG rather than kept as cloned directives,
+    /// so an in-place change (a signature stamp) can never be written stale;
+    /// the one shape that cannot express — re-writing a directive already on
+    /// disk — is what `force_compaction` exists for.
+    ///
+    /// The block is emitted by the same `full_file_serialize` a compaction
+    /// uses, so a record's bytes are exactly the bytes those directives will
+    /// occupy in the canonical file once folded in.
+    fn pending_block(&self) -> String {
+        let directives: Vec<Directive> = self
+            .pending_ids
+            .iter()
+            .filter_map(|id| self.dag.get(id).cloned())
+            .collect();
+        full_file_serialize(&directives, &[])
+    }
+
+    /// Has anything touched the `.bean` since this service last wrote or read
+    /// it? One `stat`, no read (T44).
+    ///
+    /// Conservative in the direction that costs nothing: an unreadable file, or
+    /// a service with no recorded marker, answers "yes" and escalates to a
+    /// compaction, which runs the exact hash check.
+    fn canonical_file_changed_on_disk(&self) -> bool {
+        match (FileMarker::of(&self.file_path), self.canonical_marker) {
+            (Some(current), Some(recorded)) => current != recorded,
+            _ => true,
+        }
+    }
+
+    /// Fold a completed commit back into in-memory bookkeeping (T44).
+    ///
+    /// Takes the ledger write lock at the call site; does no I/O.
+    pub fn finish_commit(&mut self, receipt: CommitReceipt) {
+        if receipt.generation != self.commit_generation {
+            // Unreachable under the single-writer contract: the generation only
+            // advances in `prepare`, and `prepare` refuses while a commit is in
+            // flight. Reaching it means a caller finished a commit this service
+            // is not waiting for, so the receipt describes files in a state
+            // this service cannot reason about — refuse it rather than write
+            // its numbers over the ones belonging to the live commit.
+            error!(
+                receipt_generation = receipt.generation,
+                service_generation = self.commit_generation,
+                "ignoring a ledger commit receipt from a different commit generation; \
+                 the single-writer contract on LedgerService::commit_gate was violated"
+            );
+            return;
+        }
+        self.commit_in_flight = false;
+        self.force_compaction = false;
+        self.pending_ids.clear();
+        self.canonical_journal_bytes = receipt.journal_bytes;
+        if let Some(hash) = receipt.canonical_hash {
+            // L-30: the file now says exactly this.
+            self.last_file_hash = hash;
+        }
+        if let Some(bytes) = receipt.canonical_bytes {
+            self.canonical_bytes = bytes;
+        }
+        if receipt.kind == CommitKind::Compact {
+            self.canonical_marker = receipt.canonical_marker;
+            // The `.bean` now holds exactly the bytes this service wrote.
+            self.canonical_is_current = true;
+        }
+    }
+
+    /// Restore memory == disk after a commit that failed (L-13, T44 shape).
+    ///
+    /// The pre-T44 reasoning is unchanged and still exact: `persist_atomically`
+    /// writes a sibling `.tmp` and renames, and a journal append either lands
+    /// whole or leaves a torn tail the scanner drops, so **a failed commit
+    /// always leaves the files in their last good state**. The unpersisted
+    /// in-memory mutations are therefore discarded by reconstructing the entire
+    /// service from disk via [`Self::boot`] — which now reads canonical ∪
+    /// journal, so the reload lands on exactly the state the failed commit
+    /// started from rather than on a pre-journal one.
+    ///
+    /// Two handles are carried across the reload rather than re-created,
+    /// because they are process-scoped machinery and not ledger state: the
+    /// [`Self::commit_gate`] (a fresh mutex would silently unserialize any
+    /// writer holding the old permit) and the commit observer.
+    ///
+    /// If the reload itself fails there is no better on-disk state to fall back
+    /// to; memory is left as-is and the failure is logged, exactly as before.
+    pub fn recover_failed_commit(&mut self) {
+        self.commit_in_flight = false;
+        match LedgerService::boot(self.file_path.clone(), self.author_id.clone()) {
+            Ok(reloaded) => {
+                let gate = std::sync::Arc::clone(&self.commit_gate);
+                let observer = self.commit_observer.clone();
+                *self = reloaded;
+                self.commit_gate = gate;
+                self.commit_observer = observer;
+            }
+            Err(reload_error) => {
+                error!(
+                    %reload_error,
+                    "ledger reload-from-disk failed after a failed commit; in-memory state may be \
+                     ahead of disk (L-13)"
+                );
+            }
+        }
     }
 
     /// Adopt an out-of-band hand edit before a full-file persist overwrites it
@@ -1484,8 +2218,25 @@ impl LedgerService {
     ///
     /// Entries that parse but fail validation are surfaced by
     /// [`Self::reconcile_content`] and then dropped by the canonical re-persist.
+    ///
+    /// # T44: called from the compaction path only
+    ///
+    /// This is `O(file)` — a read, a hash, and on a mismatch a full reconcile —
+    /// and since T44 it runs where the `O(file)` cost already lives: inside the
+    /// compaction branch of [`Self::prepare_commit`], which is the only branch
+    /// that rewrites the `.bean` and therefore the only one that could erase an
+    /// edit. An append leaves the canonical file untouched, so a hand edit made
+    /// before it is still on disk afterwards, and boot unions the two files.
+    /// The `stat` probe in `prepare` escalates to a compaction the moment the
+    /// file's size or mtime moves, so in practice an edit is still adopted at
+    /// the very next write — what changed is only that the adoption is no
+    /// longer *unconditionally* re-read on every single write.
     fn adopt_external_edits(&mut self) -> Result<(), ServiceError> {
         let content = read_ledger_file(&self.file_path)?;
+        // Re-baseline the cheap probe from the same read, so an editor that
+        // merely touched the mtime does not escalate every later append.
+        self.canonical_marker = FileMarker::of(&self.file_path);
+        self.canonical_bytes = content.len() as u64;
         if file_content_hash(&content) == self.last_file_hash {
             return Ok(());
         }
@@ -1547,26 +2298,63 @@ impl LedgerService {
     /// It closes the wide hole (an edit made minutes before the next persist)
     /// and does not pretend to close the narrow one. Editing a `.bean` that a
     /// running node owns is still unsupported; stop the node first.
+    ///
+    /// ## The commit journal (T44)
+    ///
+    /// The journal is **node-private**: hand-editing it is unsupported and will
+    /// fail closed on its per-record hash. There is nothing to adopt from it —
+    /// it holds only directives this node itself wrote.
     pub fn persist_or_reload(&mut self) -> Result<(), ServiceError> {
-        let persist_error = match self.adopt_external_edits().and_then(|()| self.persist()) {
-            Ok(()) => return Ok(()),
+        self.commit_inline(false)
+    }
+
+    /// Fold the journal back into the canonical `.bean`, synchronously (T44).
+    ///
+    /// The explicit compaction point: a node calls it once after boot (so a
+    /// crash-window journal does not linger) and once at a clean shutdown (so
+    /// the file an operator looks at is the canonical one). Reconcile uses it
+    /// too, because canonicalising the file is the entire point there.
+    ///
+    /// Like [`Self::persist_or_reload`], a failure restores memory == disk.
+    pub fn compact(&mut self) -> Result<(), ServiceError> {
+        self.commit_inline(true)
+    }
+
+    /// prepare + commit + finish, inline — the one-call form for synchronous
+    /// callers (T44).
+    ///
+    /// The blocking write happens on the calling thread with whatever lock the
+    /// caller holds still held; that is exactly the pre-T44 behaviour, and it
+    /// is why the node layer uses the two-phase form on its async paths
+    /// instead.
+    fn commit_inline(&mut self, explicit_compaction: bool) -> Result<(), ServiceError> {
+        let prepared = if explicit_compaction {
+            self.prepare_compaction()
+        } else {
+            self.prepare_commit()
+        };
+        let commit_error = match prepared {
+            Ok(None) => return Ok(()),
+            Ok(Some(pending)) => match pending.commit() {
+                Ok(receipt) => {
+                    self.finish_commit(receipt);
+                    return Ok(());
+                }
+                Err(error) => error,
+            },
+            // A refusal to prepare *because another commit is in flight* must
+            // not trigger the L-13 reload: the other commit owns the files, and
+            // re-booting under it would discard state it is about to make
+            // durable. Nothing was written, nothing is ahead of disk.
+            Err(ServiceError::CommitInFlight) => return Err(ServiceError::CommitInFlight),
             Err(error) => error,
         };
 
-        match LedgerService::boot(self.file_path.clone(), self.author_id.clone()) {
-            Ok(reloaded) => {
-                *self = reloaded;
-            }
-            Err(reload_error) => {
-                error!(
-                    %persist_error,
-                    %reload_error,
-                    "ledger persist failed AND reload-from-disk failed; in-memory state may be ahead of disk (L-13)"
-                );
-            }
-        }
-
-        Err(persist_error)
+        // L-13. `prepare` may already have mutated memory (adoption reconciles
+        // a hand edit in before it serializes), so the reload runs on both the
+        // prepare-failed and the commit-failed path.
+        self.recover_failed_commit();
+        Err(commit_error)
     }
 
     /// Reconcile external edits to the `.bean` file (§3.3, CT-12).
@@ -1578,14 +2366,34 @@ impl LedgerService {
     ///
     /// Returns the number of new directives adopted.
     pub fn reconcile_file(&mut self) -> Result<crate::file_watcher::ReconcileResult, ServiceError> {
-        let content = read_ledger_file(&self.file_path)?;
-        let result = self.reconcile_content(&content)?;
+        let result = self.reconcile_file_staged()?;
 
         // Re-persist in canonical form (L-13: reload from disk if it fails).
+        //
+        // T44: a COMPACTION, not an append. Reconcile's output is a canonical
+        // rewrite — it drops the entries it refused and re-spells everything
+        // else — and neither of those is something a journal record can say.
         if result.new_directives > 0 {
-            self.persist_or_reload()?;
+            self.compact()?;
         }
 
+        Ok(result)
+    }
+
+    /// [`Self::reconcile_file`] without the write (T44).
+    ///
+    /// Union-merges the file into memory and, when anything was adopted, marks
+    /// the next commit as a forced compaction. The caller drives that commit —
+    /// `reconcile_file` does it inline, the node's file watcher does it off the
+    /// ledger write lock.
+    pub fn reconcile_file_staged(
+        &mut self,
+    ) -> Result<crate::file_watcher::ReconcileResult, ServiceError> {
+        let content = read_ledger_file(&self.file_path)?;
+        let result = self.reconcile_content(&content)?;
+        if result.new_directives > 0 {
+            self.force_compaction = true;
+        }
         Ok(result)
     }
 
@@ -1615,8 +2423,15 @@ impl LedgerService {
     ) -> Result<crate::file_watcher::ReconcileResult, ServiceError> {
         // Record the hash of what we are about to merge from, before anything
         // can fail: this text is now the baseline for the next persist's
-        // hand-edit check (L-30).
+        // hand-edit check (L-30). T44: and the cheap `stat` probe's baseline
+        // too, so the facts this service holds about the canonical file are
+        // refreshed together and cannot drift.
         self.last_file_hash = file_content_hash(content);
+        self.canonical_bytes = content.len() as u64;
+        self.canonical_marker = FileMarker::of(&self.file_path);
+        // Whatever is on disk right now came from a text editor, not from this
+        // service's serializer: it needs canonicalising, not appending to.
+        self.canonical_is_current = false;
 
         let file_directives = parse_file(content).map_err(|errors| {
             warn!(
@@ -1769,6 +2584,12 @@ impl LedgerService {
                         match self.dag.insert(final_directive.clone(), false) {
                             Ok(InsertResult::Inserted { .. }) => {
                                 self.read_model.index_directive(&final_directive);
+                                // T44: reconcile always compacts, so this entry
+                                // is written by the full rewrite rather than by
+                                // a journal record; tracking it keeps
+                                // `uncommitted_count` honest and makes the
+                                // "nothing to do" short-circuit correct.
+                                self.pending_ids.push(stored_id.clone());
                                 new_count += 1;
                             }
                             Ok(InsertResult::Duplicate { .. }) => {
@@ -1807,6 +2628,8 @@ impl LedgerService {
                     Ok(InsertResult::Inserted { .. }) => {
                         self.accounts.record_lifecycle(&directive, &content_id);
                         self.read_model.index_directive(&directive);
+                        // T44: see the transaction arm above.
+                        self.pending_ids.push(content_id.clone());
                         new_count += 1;
                     }
                     Ok(InsertResult::Duplicate { .. }) => {
@@ -2246,6 +3069,8 @@ impl LedgerService {
                 match self.dag.insert(final_directive.clone(), true)? {
                     InsertResult::Inserted { content_id } => {
                         self.read_model.index_directive(&final_directive);
+                        // T44: staged in memory, durable on the caller's commit.
+                        self.pending_ids.push(content_id.clone());
                         Ok(Some(content_id))
                     }
                     InsertResult::Duplicate { .. } => Ok(None),
@@ -2262,6 +3087,7 @@ impl LedgerService {
                     InsertResult::Inserted { content_id } => {
                         self.accounts.record_lifecycle(&directive, &content_id);
                         self.read_model.index_directive(&directive);
+                        self.pending_ids.push(content_id.clone());
                         Ok(Some(content_id))
                     }
                     InsertResult::Duplicate { .. } => Ok(None),
@@ -2277,6 +3103,7 @@ impl LedgerService {
                     InsertResult::Inserted { content_id } => {
                         self.accounts.record_lifecycle(&directive, &content_id);
                         self.read_model.index_directive(&directive);
+                        self.pending_ids.push(content_id.clone());
                         Ok(Some(content_id))
                     }
                     InsertResult::Duplicate { .. } => Ok(None),
@@ -2287,6 +3114,7 @@ impl LedgerService {
                 match self.dag.insert(directive.clone(), false)? {
                     InsertResult::Inserted { content_id } => {
                         self.read_model.index_directive(&directive);
+                        self.pending_ids.push(content_id.clone());
                         Ok(Some(content_id))
                     }
                     InsertResult::Duplicate { .. } => Ok(None),
@@ -2318,6 +3146,11 @@ impl LedgerService {
                 Directive::Price(d) => &mut d.metadata,
             };
             metadata.insert(ENVELOPE_KEY_SIGNATURE.to_owned(), signature_hex.to_owned());
+            // T44: this edits a directive that may ALREADY be on disk, and an
+            // append cannot express an edit — a journal record carrying the
+            // same content id would be dropped by the G-Set on the way back in,
+            // losing the signature forever. Force the full rewrite.
+            self.force_compaction = true;
             // L-13: reload from disk if the persist fails, so the in-memory
             // signature stamp never gets ahead of the on-disk file.
             self.persist_or_reload()?;
@@ -4347,7 +5180,7 @@ mod tests {
         // Persist again (internally during boot, state was rebuilt).
         drop(svc2);
         let mut svc3 = LedgerService::boot(path.clone(), "peer-1".to_owned()).unwrap();
-        svc3.persist().unwrap();
+        svc3.compact().unwrap();
         let content2 = std::fs::read_to_string(&path).unwrap();
 
         assert_eq!(content1, content2, "Re-serialization should be stable");
@@ -6573,7 +7406,7 @@ mod tests {
         // The merged file is canonical, not an append of raw edited text.
         let mut rebooted = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
         assert_eq!(rebooted.directive_count(), svc.directive_count());
-        rebooted.persist().unwrap();
+        rebooted.compact().unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             after,
@@ -6693,5 +7526,578 @@ mod tests {
             .any(|t| t.narration.as_deref() == Some("Needs the open below it")));
 
         std::fs::remove_file(path).ok();
+    }
+
+    // ── T44: append-only persistence + off-runtime fsync ─────────────────
+
+    fn filler_envelope(lamport: u64) -> Metadata {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("openledger-author".to_owned(), "test-peer".to_owned());
+        metadata.insert("openledger-lamport".to_owned(), lamport.to_string());
+        metadata
+    }
+
+    /// Canonical text for a ledger comfortably past
+    /// [`COMPACTION_MIN_CANONICAL_BYTES`], so commits take the append path.
+    ///
+    /// Built through `full_file_serialize` rather than as hand-written text, so
+    /// the fixture is canonical by construction and a serializer change cannot
+    /// leave these tests booting a file no node would write. The accounts are
+    /// padded rather than numerous: the same byte count from 500 directives
+    /// instead of 1,200 keeps every boot in this section cheap.
+    fn large_ledger_content() -> String {
+        let padding = "A".repeat(80);
+        let mut directives = vec![
+            Directive::Open(Open {
+                date: make_date(2024, 1, 1),
+                account: "Assets:Cash".to_owned(),
+                currencies: vec!["USD".to_owned()],
+                metadata: filler_envelope(1),
+            }),
+            Directive::Open(Open {
+                date: make_date(2024, 1, 1),
+                account: "Equity:Opening".to_owned(),
+                currencies: Vec::new(),
+                metadata: filler_envelope(2),
+            }),
+        ];
+        for index in 0..500u64 {
+            directives.push(Directive::Open(Open {
+                date: make_date(2024, 1, 1),
+                account: format!("Assets:F{padding}{index:06}"),
+                currencies: vec!["USD".to_owned()],
+                metadata: filler_envelope(index + 3),
+            }));
+        }
+        full_file_serialize(&directives, &[])
+    }
+
+    /// A booted service whose canonical file is past the compaction threshold,
+    /// with the first (canonicalising) commit already taken — so the NEXT
+    /// commit is an append.
+    fn boot_large_ledger() -> (LedgerService, PathBuf) {
+        let path = test_file_path();
+        std::fs::write(&path, large_ledger_content()).unwrap();
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        // Boot reads a file it did not write, so the first commit is always a
+        // full rewrite (see `canonical_is_current`). Take it here, exactly as a
+        // running node's first write would.
+        svc.compact().unwrap();
+        assert!(
+            svc.canonical_bytes() > COMPACTION_MIN_CANONICAL_BYTES,
+            "the fixture must be past the threshold, got {} bytes",
+            svc.canonical_bytes()
+        );
+        assert_eq!(svc.journal_bytes(), 0, "a compaction leaves no journal");
+        (svc, path)
+    }
+
+    fn remove_ledger_and_journal(path: &Path) {
+        std::fs::remove_file(crate::journal::journal_path_for(path)).ok();
+        std::fs::remove_file(path).ok();
+    }
+
+    fn stage_filler_opens(svc: &mut LedgerService, range: std::ops::Range<usize>) {
+        for index in range {
+            svc.stage_remote_directive(Directive::Open(Open {
+                date: make_date(2024, 3, 1),
+                account: format!("Assets:Batch{index:06}"),
+                currencies: vec!["USD".to_owned()],
+                metadata: remote_envelope(1_000 + index as u64),
+            }))
+            .unwrap();
+        }
+    }
+
+    /// T44 goal (a): persisting one appended directive must not re-serialize or
+    /// rewrite the whole ledger.
+    ///
+    /// Proved against observable I/O rather than a counter: the canonical
+    /// `.bean` is compared byte-for-byte before and after, and the journal's
+    /// growth is required to equal the record exactly.
+    #[test]
+    fn t44_appending_one_directive_to_a_large_ledger_does_not_rewrite_the_file() {
+        let (mut svc, path) = boot_large_ledger();
+        let journal_path = svc.journal_path().to_path_buf();
+        let canonical_before = std::fs::read(&path).unwrap();
+        let canonical_bytes = svc.canonical_bytes();
+
+        svc.append_transaction_staged(balanced_input(), |_, _, _| None)
+            .unwrap();
+        let pending = svc
+            .prepare_commit()
+            .unwrap()
+            .expect("a staged directive must produce a commit");
+
+        assert_eq!(
+            pending.kind(),
+            CommitKind::Append,
+            "a ledger past the threshold appends; it does not rewrite"
+        );
+        let written = pending.bytes_to_write();
+        assert!(
+            written * 20 < canonical_bytes,
+            "one directive cost {written} bytes against a {canonical_bytes}-byte ledger; \
+             that is not O(directive)"
+        );
+
+        let receipt = pending.commit().unwrap();
+        assert_eq!(receipt.bytes_written(), written);
+        svc.finish_commit(receipt);
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            canonical_before,
+            "the .bean must be byte-for-byte untouched by an append"
+        );
+        assert_eq!(
+            std::fs::metadata(&journal_path).unwrap().len(),
+            written,
+            "the journal must have grown by exactly the record and nothing else"
+        );
+        assert_eq!(svc.journal_bytes(), written);
+
+        remove_ledger_and_journal(&path);
+    }
+
+    /// The same property over a run of writes, stated as the number the tracker
+    /// asks for: eight appends together cost less than a single pre-T44
+    /// rewrite, of which there would have been eight.
+    #[test]
+    fn t44_a_run_of_appends_costs_the_directives_not_the_ledger() {
+        let (mut svc, path) = boot_large_ledger();
+        let canonical_bytes = svc.canonical_bytes();
+
+        let written = std::sync::Arc::new(AtomicU64::new(0));
+        let sink = std::sync::Arc::clone(&written);
+        svc.set_commit_observer(std::sync::Arc::new(move |_kind, bytes| {
+            sink.fetch_add(bytes, Ordering::SeqCst);
+        }));
+
+        for index in 0..8u64 {
+            svc.stage_remote_directive(remote_open(
+                &format!("Assets:Run{index:03}"),
+                make_date(2024, 3, 1),
+                10 + index,
+            ))
+            .unwrap();
+            svc.persist_or_reload().unwrap();
+        }
+
+        let total = written.load(Ordering::SeqCst);
+        assert!(
+            total < canonical_bytes,
+            "eight appends wrote {total} bytes; one pre-T44 persist rewrote \
+             {canonical_bytes} and there would have been eight of them"
+        );
+        assert_eq!(
+            svc.journal_bytes(),
+            total,
+            "every one of those bytes went to the journal, none to the .bean"
+        );
+
+        remove_ledger_and_journal(&path);
+    }
+
+    /// Below the threshold nothing changes: no sidecar, and the `.bean` is
+    /// current after every write exactly as it was before T44.
+    #[test]
+    fn t44_a_small_ledger_never_creates_a_journal() {
+        let (mut svc, path) = setup_with_accounts();
+        svc.append_transaction(balanced_input()).unwrap();
+
+        assert!(svc.canonical_bytes() < COMPACTION_MIN_CANONICAL_BYTES);
+        assert_eq!(svc.journal_bytes(), 0);
+        assert!(
+            !svc.journal_path().exists(),
+            "below the threshold the .bean is the only file on disk"
+        );
+        assert!(std::fs::read_to_string(&path).unwrap().contains("Funding"));
+
+        remove_ledger_and_journal(&path);
+    }
+
+    /// The compaction policy, pinned: appends accumulate until the journal
+    /// reaches half the canonical file, and that commit folds it back.
+    #[test]
+    fn t44_the_journal_is_folded_back_once_it_reaches_half_the_canonical_file() {
+        let (mut svc, path) = boot_large_ledger();
+        let canonical_bytes = svc.canonical_bytes();
+
+        // Well under half the ledger: appended.
+        stage_filler_opens(&mut svc, 0..40);
+        let first = svc.prepare_commit().unwrap().unwrap();
+        assert_eq!(first.kind(), CommitKind::Append);
+        let receipt = first.commit().unwrap();
+        svc.finish_commit(receipt);
+        assert!(svc.journal_bytes() > 0);
+        assert!(
+            svc.journal_bytes() * COMPACTION_JOURNAL_RATIO < canonical_bytes,
+            "the fixture must still be under the ratio for this to prove anything"
+        );
+
+        // Enough more to cross it: folded back in one commit.
+        stage_filler_opens(&mut svc, 40..600);
+        let second = svc.prepare_commit().unwrap().unwrap();
+        assert_eq!(
+            second.kind(),
+            CommitKind::Compact,
+            "past the ratio the journal must be folded back"
+        );
+        let receipt = second.commit().unwrap();
+        svc.finish_commit(receipt);
+        assert_eq!(svc.journal_bytes(), 0);
+        assert!(
+            !svc.journal_path().exists(),
+            "compaction unlinks the journal"
+        );
+
+        remove_ledger_and_journal(&path);
+    }
+
+    /// T44 invariant 5: booting canonical ∪ journal reaches exactly the state a
+    /// compacted canonical file boots to.
+    #[test]
+    fn t44_boot_over_canonical_plus_journal_matches_boot_over_the_compacted_file() {
+        let (mut svc, path) = boot_large_ledger();
+        svc.append_transaction_staged(balanced_input(), |_, _, _| None)
+            .unwrap();
+        let mut second = balanced_input();
+        second.narration = Some("Second".to_owned());
+        second.date = make_date(2024, 2, 1);
+        svc.append_transaction_staged(second, |_, _, _| None)
+            .unwrap();
+        svc.persist_or_reload().unwrap();
+        assert!(
+            svc.journal_bytes() > 0,
+            "the appends must have gone to the journal for this to prove anything"
+        );
+
+        // (a) the crash-window shape: canonical file plus a live journal.
+        let unioned = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+
+        // (b) the same directives after a compaction, canonical file alone.
+        let mut compacting = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        compacting.compact().unwrap();
+        assert_eq!(compacting.journal_bytes(), 0);
+        let from_file = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+
+        assert_eq!(unioned.directive_count(), from_file.directive_count());
+        assert_eq!(unioned.dag().content_ids(), from_file.dag().content_ids());
+        assert_eq!(unioned.head_txids(), from_file.head_txids());
+        assert_eq!(unioned.lamport_clock(), from_file.lamport_clock());
+        assert!(unioned.accounts().is_open("Assets:Cash"));
+        assert_eq!(
+            unioned.accounts().is_open("Assets:Cash"),
+            from_file.accounts().is_open("Assets:Cash")
+        );
+
+        remove_ledger_and_journal(&path);
+    }
+
+    /// T44 invariant 3, re-proved through the NEW path: every arrival order
+    /// journals its directives one commit at a time, and the file each node
+    /// compacts to is byte-identical.
+    ///
+    /// This is T29's 66-permutation shape at the scale the journal path can be
+    /// exercised at — 24 orders of four lifecycle directives, each on its own
+    /// ledger past the compaction threshold.
+    #[test]
+    fn t44_compaction_is_byte_identical_across_every_arrival_order() {
+        let lifecycle = [
+            remote_open("Assets:Vault", make_date(2024, 3, 1), 10),
+            remote_close("Assets:Vault", make_date(2024, 5, 1), 11),
+            remote_open("Assets:Safe", make_date(2024, 4, 1), 12),
+            remote_close("Assets:Safe", make_date(2024, 6, 1), 13),
+        ];
+
+        let mut orders: Vec<Vec<usize>> = Vec::new();
+        for a in 0..4 {
+            for b in 0..4 {
+                for c in 0..4 {
+                    for d in 0..4 {
+                        let order = vec![a, b, c, d];
+                        let mut seen = order.clone();
+                        seen.sort_unstable();
+                        seen.dedup();
+                        if seen.len() == 4 {
+                            orders.push(order);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(orders.len(), 24, "every permutation of four");
+
+        let mut outputs: Vec<String> = Vec::new();
+        for order in &orders {
+            let path = test_file_path();
+            std::fs::write(&path, large_ledger_content()).unwrap();
+            let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+            svc.compact().unwrap();
+
+            for index in order {
+                svc.stage_remote_directive(lifecycle[*index].clone())
+                    .unwrap();
+                svc.persist_or_reload().unwrap();
+            }
+            assert!(
+                svc.journal_bytes() > 0,
+                "every arrival must have been journalled, not rewritten"
+            );
+
+            svc.compact().unwrap();
+            outputs.push(std::fs::read_to_string(&path).unwrap());
+            remove_ledger_and_journal(&path);
+        }
+
+        for (index, output) in outputs.iter().enumerate() {
+            assert_eq!(
+                output, &outputs[0],
+                "arrival order {:?} compacted to different canonical bytes",
+                orders[index]
+            );
+        }
+    }
+
+    /// T44 invariant 4: a crash mid-append leaves a torn final record. It is
+    /// dropped with a warning; everything before it still loads.
+    #[test]
+    fn t44_a_torn_journal_tail_is_dropped_with_a_warning() {
+        let (mut svc, path) = boot_large_ledger();
+        let journal_path = svc.journal_path().to_path_buf();
+
+        svc.stage_remote_directive(remote_open("Assets:Vault", make_date(2024, 3, 1), 10))
+            .unwrap();
+        svc.persist_or_reload().unwrap();
+        svc.stage_remote_directive(remote_open("Assets:Safe", make_date(2024, 3, 2), 11))
+            .unwrap();
+        svc.persist_or_reload().unwrap();
+
+        // The crash: `write_all` got part way and `sync_all` never returned.
+        let both = std::fs::read(&journal_path).unwrap();
+        std::fs::write(&journal_path, &both[..both.len() - 30]).unwrap();
+
+        let (booted, logged) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "test-peer".to_owned()));
+        let booted = booted.expect("a torn tail must not brick the boot");
+        assert!(
+            logged.contains("torn record"),
+            "the dropped record must be reported, got: {logged}"
+        );
+        assert!(
+            booted.accounts().is_open("Assets:Vault"),
+            "the intact record still loads"
+        );
+        assert!(
+            !booted.accounts().is_open("Assets:Safe"),
+            "only the torn record is dropped"
+        );
+
+        remove_ledger_and_journal(&path);
+    }
+
+    /// The other half of invariant 4: corruption that a crash cannot produce
+    /// fails closed rather than silently dropping directives.
+    #[test]
+    fn t44_a_corrupt_journal_record_fails_boot_closed() {
+        let (mut svc, path) = boot_large_ledger();
+        let journal_path = svc.journal_path().to_path_buf();
+
+        svc.stage_remote_directive(remote_open("Assets:Vault", make_date(2024, 3, 1), 10))
+            .unwrap();
+        svc.persist_or_reload().unwrap();
+        svc.stage_remote_directive(remote_open("Assets:Safe", make_date(2024, 3, 2), 11))
+            .unwrap();
+        svc.persist_or_reload().unwrap();
+
+        // Flip a byte inside the FIRST record's payload: the full length is
+        // present, so this is corruption and not a torn tail.
+        let mut bytes = std::fs::read(&journal_path).unwrap();
+        let position = bytes
+            .windows(12)
+            .position(|window| window == b"Assets:Vault")
+            .unwrap();
+        bytes[position + 8] = b'X';
+        std::fs::write(&journal_path, &bytes).unwrap();
+
+        let Err(error) = LedgerService::boot(path.clone(), "test-peer".to_owned()) else {
+            panic!("a corrupt journal record must fail the boot closed");
+        };
+        assert_eq!(error.error_code(), "LEDGER_JOURNAL", "got {error}");
+
+        remove_ledger_and_journal(&path);
+    }
+
+    /// T44 invariant 4 / T35: a hand edit to the canonical file is still
+    /// adopted, not clobbered, when journal records are outstanding — and both
+    /// halves survive the compaction that adoption forces.
+    #[test]
+    fn t44_a_hand_edit_is_adopted_with_journal_records_outstanding() {
+        let (mut svc, path) = boot_large_ledger();
+
+        svc.stage_remote_directive(remote_open("Assets:Vault", make_date(2024, 3, 1), 10))
+            .unwrap();
+        svc.persist_or_reload().unwrap();
+        assert!(
+            svc.journal_bytes() > 0,
+            "the arrival must be journalled for this to prove anything"
+        );
+
+        // A human appends to the canonical `.bean` while the node runs.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!("{on_disk}\n2024-04-01 open Assets:Safe USD\n"),
+        )
+        .unwrap();
+
+        // The next write notices (the O(1) stat probe), escalates to a
+        // compaction, and adopts the edit before serializing over it.
+        svc.stage_remote_directive(remote_open("Assets:Attic", make_date(2024, 3, 5), 11))
+            .unwrap();
+        svc.persist_or_reload().unwrap();
+
+        assert_eq!(
+            svc.external_reconcile_count(),
+            1,
+            "the hand edit must have been adopted, not clobbered"
+        );
+        assert_eq!(svc.journal_bytes(), 0, "adoption forces a compaction");
+        assert!(!svc.journal_path().exists());
+        for account in ["Assets:Vault", "Assets:Safe", "Assets:Attic"] {
+            assert!(svc.accounts().is_open(account), "{account} must survive");
+        }
+
+        // And all three are in the canonical file, not merely in memory.
+        let rebooted = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        for account in ["Assets:Vault", "Assets:Safe", "Assets:Attic"] {
+            assert!(
+                rebooted.accounts().is_open(account),
+                "{account} must be on disk"
+            );
+        }
+
+        remove_ledger_and_journal(&path);
+    }
+
+    /// The crash window a compaction opens: the canonical file is written and
+    /// the process dies before the journal is unlinked, so both files hold the
+    /// same directives. Content addressing makes the dedup free.
+    #[test]
+    fn t44_a_journal_overlapping_the_canonical_file_boots_to_the_same_set() {
+        let (mut svc, path) = boot_large_ledger();
+        let journal_path = svc.journal_path().to_path_buf();
+
+        svc.stage_remote_directive(remote_open("Assets:Vault", make_date(2024, 3, 1), 10))
+            .unwrap();
+        svc.persist_or_reload().unwrap();
+        let journal_snapshot = std::fs::read(&journal_path).unwrap();
+        let expected_count = svc.directive_count();
+        let expected_ids: Vec<String> = svc
+            .dag()
+            .content_ids()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+
+        svc.compact().unwrap();
+        assert!(!journal_path.exists());
+        // Put the journal back: the crash landed between the rename and the
+        // unlink.
+        std::fs::write(&journal_path, &journal_snapshot).unwrap();
+
+        let booted = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert_eq!(
+            booted.directive_count(),
+            expected_count,
+            "overlapping directives are id-identical, so the G-Set dedups them"
+        );
+        assert_eq!(
+            booted
+                .dag()
+                .content_ids()
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<String>>(),
+            expected_ids
+        );
+
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-13 through the new shape: a commit that fails leaves memory no further
+    /// ahead of disk than it was, and the durable prefix survives.
+    #[cfg(unix)]
+    #[test]
+    fn t44_a_failed_commit_leaves_memory_level_with_disk() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (mut svc, path) = boot_large_ledger();
+        let journal_path = svc.journal_path().to_path_buf();
+
+        svc.stage_remote_directive(remote_open("Assets:Vault", make_date(2024, 3, 1), 10))
+            .unwrap();
+        svc.persist_or_reload().unwrap();
+        let durable_count = svc.directive_count();
+
+        // A read-only journal fails the append on the REAL I/O path, with no
+        // mocking, and stays readable so the L-13 reload can still run.
+        let mut permissions = std::fs::metadata(&journal_path).unwrap().permissions();
+        permissions.set_mode(0o400);
+        std::fs::set_permissions(&journal_path, permissions).unwrap();
+
+        svc.stage_remote_directive(remote_open("Assets:Safe", make_date(2024, 3, 2), 11))
+            .unwrap();
+        assert_eq!(svc.uncommitted_count(), 1);
+        let error = svc.persist_or_reload().unwrap_err();
+        assert_eq!(error.error_code(), "IO_ERROR", "got {error}");
+
+        assert_eq!(
+            svc.directive_count(),
+            durable_count,
+            "L-13: the undurable directive must be rolled out of memory"
+        );
+        assert_eq!(svc.uncommitted_count(), 0);
+        assert!(
+            svc.accounts().is_open("Assets:Vault"),
+            "the durable arrival survives the rollback"
+        );
+        assert!(
+            !svc.accounts().is_open("Assets:Safe"),
+            "the undurable one does not"
+        );
+
+        let mut permissions = std::fs::metadata(&journal_path).unwrap().permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&journal_path, permissions).unwrap();
+        remove_ledger_and_journal(&path);
+    }
+
+    /// The single-writer backstop: a second prepare while a commit is in flight
+    /// is refused rather than allowed to interleave.
+    #[test]
+    fn t44_a_second_prepare_while_a_commit_is_in_flight_is_refused() {
+        let (mut svc, path) = boot_large_ledger();
+
+        svc.stage_remote_directive(remote_open("Assets:Vault", make_date(2024, 3, 1), 10))
+            .unwrap();
+        let first = svc.prepare_commit().unwrap().unwrap();
+
+        svc.stage_remote_directive(remote_open("Assets:Safe", make_date(2024, 3, 2), 11))
+            .unwrap();
+        let error = svc.prepare_commit().unwrap_err();
+        assert_eq!(error.error_code(), "COMMIT_IN_FLIGHT", "got {error}");
+
+        // And the refusal did NOT trigger an L-13 reload — nothing was written,
+        // so nothing is ahead of disk and the outstanding commit still owns the
+        // files.
+        assert_eq!(svc.uncommitted_count(), 2);
+
+        let receipt = first.commit().unwrap();
+        svc.finish_commit(receipt);
+        assert_eq!(svc.uncommitted_count(), 0);
+
+        remove_ledger_and_journal(&path);
     }
 }

@@ -12,3 +12,4 @@
 identity.secret
 iroh.secret
 *.bean.lock
+*.bean.journal

@@ -6,6 +6,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use crate::cbor_scan::{self, ArrayBound, CborScanError, ScanOutcome};
+
 /// Protocol version. Unknown versions → close the stream.
 pub const WIRE_VERSION: u64 = 1;
 
@@ -51,6 +53,22 @@ pub const SUPPLY_FRAME_BUDGET_BYTES: usize = 15 * 1024 * 1024;
 /// `supply_discriminator_pins_wire_format`: if the encoding ever drifts, that
 /// test fails loudly.
 pub const SUPPLY_TYPE_DISCRIMINATOR: &[u8] = b"\x64type\x66supply";
+
+/// Whether `head` — a frame's leading bytes, or the whole frame — carries the
+/// `Supply` discriminator at the one offset serde can put it (M-16).
+///
+/// The single statement of "the map header occupies byte 0, the tag entry
+/// follows it", so the ~13-byte peek gate in `anti_entropy_alpn::read_frame` and
+/// the T43 pre-scan gate in [`WireMessage::decode_checked`] cannot drift about
+/// where the discriminator lives. A `head` too short to hold it is not a
+/// `Supply`.
+///
+/// This answers "does this frame CLAIM to be a `Supply`", which is exactly the
+/// question both gates need — a claim is enough to decide which bound applies,
+/// and the ordinary decode still has to agree afterwards.
+pub fn carries_supply_discriminator(head: &[u8]) -> bool {
+    head.get(1..1 + SUPPLY_TYPE_DISCRIMINATOR.len()) == Some(SUPPLY_TYPE_DISCRIMINATOR)
+}
 
 // ─── Message types ───────────────────────────────────────────────────────────
 
@@ -175,6 +193,14 @@ impl WireMessage {
         }
     }
 
+    /// The post-decode cardinality caps (H-2).
+    ///
+    /// Still the authority on a DECODED message — `to_wire` senders and any
+    /// caller holding a `WireMessage` reach it — but on the inbound path
+    /// [`prescan_frame`] has already enforced the same three caps against the
+    /// wire bytes (T43, T43b), so by the time a frame gets here the check is a
+    /// restatement rather than the first line of defence. The `kind` strings are
+    /// shared with `NON_SUPPLY_ARRAY_BOUNDS` so both points refuse identically.
     fn check_cardinality(&self) -> Result<(), WireError> {
         match self {
             WireMessage::Supply { entries, .. } if entries.len() > MAX_SUPPLY_ENTRIES => {
@@ -219,10 +245,19 @@ impl WireMessage {
     }
 
     /// Decode gossip/application CBOR with the same size and version gates as `from_wire` (H-7).
+    ///
+    /// THE inbound choke point: `from_wire`, `gossip::decode_broadcast` and
+    /// `anti_entropy_alpn::read_frame` all arrive here, and nothing on a send
+    /// path does. That is why T43's pre-scan is wired in here rather than beside
+    /// T26's peek gate in `read_frame` — one placement covers every reader of a
+    /// `Supply` frame, including the gossip-side decode that never sees a length
+    /// prefix at all. T43b widened the same gate to `Want` and `HaveHeads`
+    /// without moving it: see [`prescan_frame`].
     pub fn decode_checked(data: &[u8]) -> Result<Self, WireError> {
         if data.len() > MAX_MESSAGE_SIZE as usize {
             return Err(WireError::MessageTooLarge(data.len()));
         }
+        prescan_frame(data)?;
         let message = Self::from_cbor(data).map_err(WireError::CborDecode)?;
         if message.version() != WIRE_VERSION {
             return Err(WireError::UnsupportedVersion(message.version()));
@@ -283,6 +318,108 @@ impl WireMessage {
     }
 }
 
+/// Every unbounded-cardinality array a non-`Supply` frame can carry, with the
+/// cap it is held to and the `BatchTooLarge` kind that names it (T43b).
+///
+/// `label` IS the kind string `check_cardinality` reports for the same array, so
+/// the pre-decode and post-decode refusals are identical by construction rather
+/// than by two string literals that happen to agree today:
+/// `Want.ids` → `"want"`, and both of `HaveHeads`' lists → `"have_heads"`.
+/// `Announce` carries no array and matches nothing here, which is exactly the
+/// tolerance [`cbor_scan::scan_bounded_arrays`] is built for.
+///
+/// `Supply.entries` is deliberately absent: it has its own stricter path (see
+/// [`prescan_supply_entries`]), which requires the key to be present rather than
+/// tolerating its absence.
+pub(crate) const NON_SUPPLY_ARRAY_BOUNDS: &[ArrayBound] = &[
+    ArrayBound {
+        key: b"ids",
+        max: MAX_WANT_IDS,
+        label: "want",
+    },
+    ArrayBound {
+        key: b"head_txids",
+        max: MAX_HAVE_HEADS,
+        label: "have_heads",
+    },
+    ArrayBound {
+        key: b"directive_ids",
+        max: MAX_HAVE_HEADS,
+        label: "have_heads",
+    },
+];
+
+/// Bound every array in a frame BEFORE the buffering decode (T43, T43b).
+///
+/// `WireMessage` is internally tagged, so serde must `Content`-buffer the whole
+/// value tree before it can dispatch on `"type"` — which means
+/// `check_cardinality` only ever ran *after* a frame claiming millions of
+/// elements had already been materialised at tens of bytes of `Content` per
+/// element. The amplification belongs to the enum, not to one variant, so this
+/// gate covers all four:
+///
+/// * a frame carrying the `Supply` discriminator goes to
+///   [`prescan_supply_entries`], which requires an `entries` array and bounds it;
+/// * every other frame goes to [`cbor_scan::scan_bounded_arrays`] with
+///   [`NON_SUPPLY_ARRAY_BOUNDS`], which bounds whichever of `ids`,
+///   `head_txids` and `directive_ids` the frame actually carries and tolerates a
+///   frame that carries none.
+///
+/// Either way an over-count is reported as the same [`WireError::BatchTooLarge`]
+/// the post-decode cap would have produced, with the same `kind`, because it is
+/// the same rule — only enforced earlier — and every caller already classifies
+/// it. A scan that cannot *answer* is [`WireError::FramePrescan`] instead.
+///
+/// See [`crate::cbor_scan`] for the scan's bounds, its element-skip allowance,
+/// and why each of its rejections is unreachable for an honest peer.
+fn prescan_frame(data: &[u8]) -> Result<(), WireError> {
+    if carries_supply_discriminator(data) {
+        return prescan_supply_entries(data);
+    }
+    match cbor_scan::scan_bounded_arrays(data, NON_SUPPLY_ARRAY_BOUNDS)
+        .map_err(WireError::FramePrescan)?
+    {
+        ScanOutcome::WithinBounds => Ok(()),
+        ScanOutcome::OverBound {
+            label,
+            claimed,
+            max,
+        } => Err(WireError::BatchTooLarge {
+            kind: label,
+            count: saturating_count(claimed),
+            max,
+        }),
+    }
+}
+
+/// The `Supply` arm of [`prescan_frame`] (T43).
+///
+/// Split out because its contract is genuinely stricter than the general scan's:
+/// a `Supply` that carries no `entries` array is malformed and is refused,
+/// whereas a frame with no `ids` is just some other variant. T26's peek gate
+/// already bounds every non-`Supply` frame's BYTES, so this is the one variant
+/// that gate must let through at full size and therefore the one whose element
+/// count has to be proven before serde sees it.
+fn prescan_supply_entries(data: &[u8]) -> Result<(), WireError> {
+    let claimed = cbor_scan::supply_entry_count(data).map_err(WireError::FramePrescan)?;
+    if claimed > MAX_SUPPLY_ENTRIES as u64 {
+        return Err(WireError::BatchTooLarge {
+            kind: "supply",
+            count: saturating_count(claimed),
+            max: MAX_SUPPLY_ENTRIES,
+        });
+    }
+    Ok(())
+}
+
+/// A claimed element count as a `usize`, saturating rather than truncating.
+///
+/// The count is only ever reported, and a wrapped value would understate the
+/// frame in the one message an operator reads to size the attack.
+fn saturating_count(claimed: u64) -> usize {
+    usize::try_from(claimed).unwrap_or(usize::MAX)
+}
+
 /// Wire protocol errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireError {
@@ -290,6 +427,14 @@ pub enum WireError {
     MessageTooLarge(usize),
     CborDecode(String),
     UnsupportedVersion(u64),
+    /// The pre-scan could not cheaply prove a frame's arrays were within their
+    /// cardinality caps, so the frame was refused before serde saw it (T43,
+    /// widened to every variant by T43b).
+    ///
+    /// Distinct from [`Self::CborDecode`] on purpose: this is the guard
+    /// declining to answer, not ciborium reporting malformed CBOR, and the two
+    /// have very different operational meanings in a log.
+    FramePrescan(CborScanError),
     BatchTooLarge {
         kind: &'static str,
         count: usize,
@@ -307,6 +452,9 @@ impl std::fmt::Display for WireError {
             WireError::CborDecode(e) => write!(f, "CBOR decode error: {e}"),
             WireError::UnsupportedVersion(v) => {
                 write!(f, "Unsupported wire version: {v} (expected {WIRE_VERSION})")
+            }
+            WireError::FramePrescan(error) => {
+                write!(f, "frame refused by pre-scan: {error}")
             }
             WireError::BatchTooLarge { kind, count, max } => {
                 write!(f, "{kind} batch too large: {count} (max {max})")
@@ -559,6 +707,378 @@ mod tests {
                 "non-Supply variant unexpectedly matched the Supply discriminator: {message:?}"
             );
         }
+    }
+
+    // ─── T43: full M-16 closure — the pre-decode entry-count gate ────────────
+
+    fn supply_entry(index: usize) -> SupplyEntry {
+        SupplyEntry {
+            id: format!("{index:064x}"),
+            kind: DirectiveKind::Open,
+            economic_bean: "2024-01-01 open Assets:Cash USD".to_owned(),
+            envelope: BTreeMap::new(),
+        }
+    }
+
+    /// The `{"type": "supply", "v": 1, "entries": ` prefix exactly as ciborium
+    /// emits it, so a crafted frame is a genuine `Supply` up to the point where
+    /// `entries_tail` lies about the array.
+    fn forged_supply_frame(entries_tail: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0xa3];
+        frame.extend_from_slice(SUPPLY_TYPE_DISCRIMINATOR);
+        frame.extend_from_slice(b"\x61v\x01");
+        frame.extend_from_slice(b"\x67entries");
+        frame.extend_from_slice(entries_tail);
+        frame
+    }
+
+    /// An `entries` array header claiming `count` elements, with no element
+    /// bytes behind it at all.
+    fn entries_header_claiming(count: u32) -> Vec<u8> {
+        let mut tail = vec![0x9a];
+        tail.extend_from_slice(&count.to_be_bytes());
+        tail
+    }
+
+    /// The T43 hole, closed: a ~30-byte frame whose `entries` array header
+    /// claims ten million elements is refused from the header alone, with no
+    /// element bytes present at all — so serde was never handed the buffer.
+    ///
+    /// The absent body is what makes this a PRE-decode proof rather than a
+    /// restatement of the post-decode cap. Before the gate, ciborium would have
+    /// run out of input part way through building a ten-million-element
+    /// `Vec<Content>` and reported a decode error; the frame is now answered by
+    /// `BatchTooLarge` naming the claimed count.
+    #[test]
+    fn prescan_rejects_a_forged_entry_count_before_serde_sees_the_body() {
+        let frame = forged_supply_frame(&entries_header_claiming(10_000_000));
+        assert!(frame.len() < 64, "the whole attack fits in a tiny frame");
+        assert_eq!(
+            WireMessage::decode_checked(&frame).unwrap_err(),
+            WireError::BatchTooLarge {
+                kind: "supply",
+                count: 10_000_000,
+                max: MAX_SUPPLY_ENTRIES,
+            }
+        );
+    }
+
+    /// The boundary is inclusive both ways, against REAL encoded frames: exactly
+    /// `MAX_SUPPLY_ENTRIES` still round-trips, and one more is refused.
+    #[test]
+    fn prescan_accepts_the_entry_cap_and_rejects_one_over() {
+        let at_cap = WireMessage::supply((0..MAX_SUPPLY_ENTRIES).map(supply_entry).collect());
+        let cbor = at_cap.to_cbor().unwrap();
+        assert_eq!(WireMessage::decode_checked(&cbor).unwrap(), at_cap);
+
+        let over_cap = WireMessage::supply((0..MAX_SUPPLY_ENTRIES + 1).map(supply_entry).collect());
+        assert_eq!(
+            WireMessage::decode_checked(&over_cap.to_cbor().unwrap()).unwrap_err(),
+            WireError::BatchTooLarge {
+                kind: "supply",
+                count: MAX_SUPPLY_ENTRIES + 1,
+                max: MAX_SUPPLY_ENTRIES,
+            }
+        );
+    }
+
+    /// A hand-rolled indefinite-length `entries` array is refused by the scan
+    /// rather than followed. ciborium emits definite lengths for every serde
+    /// type (pinned by `honest_supply_frames_scan_to_their_entry_count` in
+    /// `cbor_scan`), so no honest peer can produce this frame.
+    #[test]
+    fn prescan_rejects_an_indefinite_length_entries_array() {
+        let frame = forged_supply_frame(b"\x9f\xff");
+        assert_eq!(
+            WireMessage::decode_checked(&frame).unwrap_err(),
+            WireError::FramePrescan(CborScanError::IndefiniteLength)
+        );
+    }
+
+    /// The ENTRY-COUNT scan is keyed on the `Supply` discriminator: a `Want` is
+    /// decoded exactly as before even though that scan, if it ran, would refuse
+    /// it for having no `entries` key.
+    ///
+    /// T43b did not change this. A non-`Supply` frame now goes to
+    /// `cbor_scan::scan_bounded_arrays` instead — tolerant of absent keys, and
+    /// with an element-skip allowance for walking id arrays — which is a
+    /// different scan with different semantics, not a widening of this one.
+    /// Routing a `Want` through `supply_entry_count` would still refuse it, and
+    /// this pins that it never happens.
+    #[test]
+    fn prescan_only_runs_on_supply_discriminator_frames() {
+        for count in [2usize, 1_000] {
+            let want = WireMessage::want((0..count).map(|index| format!("{index:064x}")).collect());
+            let cbor = want.to_cbor().unwrap();
+            assert!(!carries_supply_discriminator(&cbor));
+            // The entry-count scan would refuse this frame — a small Want for
+            // having no `entries` key, a large one on the visit budget while
+            // skipping the id vector as an unrecognised value. The discriminator
+            // split is what spares both.
+            assert!(cbor_scan::supply_entry_count(&cbor).is_err());
+            assert_eq!(WireMessage::decode_checked(&cbor).unwrap(), want);
+        }
+        let small = WireMessage::want(vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(
+            cbor_scan::supply_entry_count(&small.to_cbor().unwrap()),
+            Err(CborScanError::MissingEntries)
+        );
+    }
+
+    /// `carries_supply_discriminator` is the single statement of where the tag
+    /// entry sits, shared with `anti_entropy_alpn`'s T26 peek gate.
+    #[test]
+    fn carries_supply_discriminator_matches_only_supply() {
+        assert!(carries_supply_discriminator(
+            &WireMessage::supply(vec![]).to_cbor().unwrap()
+        ));
+        assert!(carries_supply_discriminator(
+            &WireMessage::supply(vec![supply_entry(0)])
+                .to_cbor()
+                .unwrap()
+        ));
+        for message in [
+            WireMessage::want(vec!["id".to_owned()]),
+            WireMessage::have_heads(vec!["tx".to_owned()], vec!["dir".to_owned()]),
+            WireMessage::announce("id".to_owned(), DirectiveKind::Transaction),
+        ] {
+            assert!(!carries_supply_discriminator(&message.to_cbor().unwrap()));
+        }
+        // Too short to hold the discriminator is not a Supply.
+        assert!(!carries_supply_discriminator(&[0xa3]));
+        assert!(!carries_supply_discriminator(&[]));
+    }
+
+    /// The gossip path shares the choke point, so it inherits the same gate —
+    /// gossip frames carry no length prefix and never saw T26's peek gate at
+    /// all, which is precisely why the scan lives in `decode_checked`.
+    #[test]
+    fn gossip_decode_inherits_the_prescan() {
+        let frame = forged_supply_frame(&entries_header_claiming(10_000_000));
+        let error = crate::gossip::decode_broadcast(&frame).unwrap_err();
+        assert!(
+            error.contains("supply batch too large: 10000000"),
+            "unexpected error: {error}"
+        );
+    }
+
+    // ─── T43b: the same gate over `Want` and `HaveHeads` id arrays ──────────
+
+    fn hex_ids(count: usize) -> Vec<String> {
+        (0..count).map(|index| format!("{index:064x}")).collect()
+    }
+
+    /// An array header claiming `count` elements, with no element bytes behind
+    /// it at all — the shape that makes a rejection a PRE-decode proof.
+    fn array_header_claiming(count: u32) -> Vec<u8> {
+        let mut header = vec![0x9a];
+        header.extend_from_slice(&count.to_be_bytes());
+        header
+    }
+
+    /// `{"type": "want", "v": 1, "ids": ` exactly as ciborium emits it, then
+    /// whatever `ids_tail` claims. Pinned against real bytes by
+    /// `cbor_scan::tests::crafted_non_supply_prefixes_match_real_encodings`.
+    fn forged_want_frame(ids_tail: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0xa3];
+        frame.extend_from_slice(b"\x64type\x64want");
+        frame.extend_from_slice(b"\x61v\x01");
+        frame.extend_from_slice(b"\x63ids");
+        frame.extend_from_slice(ids_tail);
+        frame
+    }
+
+    /// `{"type": "have_heads", "v": 1, "head_txids": …, "directive_ids": …}`
+    /// with both arrays supplied by the caller.
+    fn forged_have_heads_frame(head_tail: &[u8], directive_tail: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0xa4];
+        frame.extend_from_slice(b"\x64type\x6ahave_heads");
+        frame.extend_from_slice(b"\x61v\x01");
+        frame.extend_from_slice(b"\x6ahead_txids");
+        frame.extend_from_slice(head_tail);
+        frame.extend_from_slice(b"\x6ddirective_ids");
+        frame.extend_from_slice(directive_tail);
+        frame
+    }
+
+    /// Honest maximal traffic still round-trips through the widened gate,
+    /// against REAL encoded frames at exactly the caps production emits.
+    ///
+    /// The compatibility half of T43b: `paginate_have_heads` really does emit
+    /// pages that are full in BOTH id arrays with `more` set, and
+    /// `MAX_WANT_IDS` really is the size of a maximal request, so these are the
+    /// frames a gate this strict is most likely to break. None of them may
+    /// change behaviour by so much as a byte.
+    #[test]
+    fn prescan_accepts_honest_want_and_have_heads_frames_at_their_caps() {
+        let frames = [
+            WireMessage::want(hex_ids(1)),
+            WireMessage::want(hex_ids(MAX_WANT_IDS)),
+            // A full intermediate page, exactly as `paginate_have_heads` emits
+            // it: both arrays at the cap, `more` set because a page follows.
+            WireMessage::have_heads_page(hex_ids(MAX_HAVE_HEADS), hex_ids(MAX_HAVE_HEADS), true),
+            // …and the final page, where `more` is false and omitted entirely.
+            WireMessage::have_heads(hex_ids(MAX_HAVE_HEADS), hex_ids(MAX_HAVE_HEADS)),
+        ];
+        for message in frames {
+            let cbor = message.to_cbor().unwrap();
+            assert_eq!(
+                WireMessage::decode_checked(&cbor).unwrap(),
+                message,
+                "the T43b gate must not disturb an honest maximal frame"
+            );
+            // The full wire path, length prefix and all.
+            let wire = message.to_wire().unwrap();
+            assert_eq!(WireMessage::from_wire(&wire).unwrap().0, message);
+        }
+    }
+
+    /// The T43b hole, closed for `Want`: a ~25-byte frame whose `ids` array
+    /// header claims ten million elements is refused from the header alone.
+    ///
+    /// The frame carries NO element bytes, so before the gate ciborium would
+    /// have run out of input part way through building a ten-million-element
+    /// `Vec<Content>` and reported a decode error. The refusal now names the
+    /// claimed count, with the same `kind` the post-decode cap uses.
+    #[test]
+    fn prescan_rejects_a_forged_want_id_count_before_serde_sees_the_body() {
+        let frame = forged_want_frame(&array_header_claiming(10_000_000));
+        assert!(frame.len() < 64, "the whole attack fits in a tiny frame");
+        assert_eq!(
+            WireMessage::decode_checked(&frame).unwrap_err(),
+            WireError::BatchTooLarge {
+                kind: "want",
+                count: 10_000_000,
+                max: MAX_WANT_IDS,
+            }
+        );
+    }
+
+    /// The same, for each of `HaveHeads`' two id arrays independently.
+    #[test]
+    fn prescan_rejects_forged_have_heads_id_counts_before_serde_sees_the_body() {
+        let expected = WireError::BatchTooLarge {
+            kind: "have_heads",
+            count: 10_000_000,
+            max: MAX_HAVE_HEADS,
+        };
+        // Forged first array; the second is never reached.
+        let head_forged = forged_have_heads_frame(&array_header_claiming(10_000_000), &[0x80][..]);
+        assert!(head_forged.len() < 80);
+        assert_eq!(
+            WireMessage::decode_checked(&head_forged).unwrap_err(),
+            expected
+        );
+        // Forged second array, behind an honest empty first one.
+        let directive_forged =
+            forged_have_heads_frame(&[0x80][..], &array_header_claiming(10_000_000));
+        assert!(directive_forged.len() < 80);
+        assert_eq!(
+            WireMessage::decode_checked(&directive_forged).unwrap_err(),
+            expected
+        );
+    }
+
+    /// The case the element-skip allowance exists for, at the protocol level: a
+    /// REAL, honest-full first array with a forged second one spliced on behind
+    /// it.
+    ///
+    /// `head_txids` here is byte-for-byte what the production serializer emits
+    /// for a maximal page — 4,096 sixty-four-hex ids, three orders of magnitude
+    /// past the 64-visit budget T43's scan ran on. Only a walker that steps
+    /// through all of it reaches the `directive_ids` header that lies.
+    #[test]
+    fn prescan_reaches_the_second_have_heads_array_through_a_full_first() {
+        let mut frame = WireMessage::have_heads(hex_ids(MAX_HAVE_HEADS), Vec::new())
+            .to_cbor()
+            .unwrap();
+        // `directive_ids` is omitted when empty, so the real frame is a 3-pair
+        // map; widen the header and splice the forged fourth pair on.
+        assert_eq!(frame[0], 0xa3, "expected a 3-pair have_heads map");
+        frame[0] = 0xa4;
+        frame.extend_from_slice(b"\x6ddirective_ids");
+        frame.extend_from_slice(&array_header_claiming(10_000_000));
+        assert_eq!(
+            WireMessage::decode_checked(&frame).unwrap_err(),
+            WireError::BatchTooLarge {
+                kind: "have_heads",
+                count: 10_000_000,
+                max: MAX_HAVE_HEADS,
+            }
+        );
+    }
+
+    /// One over the cap, on REAL encoded frames, is refused before the decode —
+    /// with exactly the verdict `check_cardinality` would have returned after
+    /// it.
+    ///
+    /// Asserting equality against the post-decode error rather than against a
+    /// literal is the point: the pre-scan is the same rule moved earlier, so the
+    /// two must agree on `kind`, `count` and `max` by construction. A drifting
+    /// `kind` string would silently reclassify a refusal in every caller that
+    /// matches on it.
+    #[test]
+    fn prescan_refuses_one_over_cap_with_the_post_decode_verdict() {
+        let over_cap = [
+            WireMessage::want(hex_ids(MAX_WANT_IDS + 1)),
+            WireMessage::have_heads(hex_ids(MAX_HAVE_HEADS + 1), Vec::new()),
+            WireMessage::have_heads(Vec::new(), hex_ids(MAX_HAVE_HEADS + 1)),
+        ];
+        for message in over_cap {
+            let post_decode = message
+                .check_cardinality()
+                .expect_err("the fixture must be over cap");
+            assert_eq!(
+                WireMessage::decode_checked(&message.to_cbor().unwrap()).unwrap_err(),
+                post_decode,
+                "pre-scan and post-decode must refuse identically"
+            );
+        }
+    }
+
+    /// A bomb nested inside an id element is refused by the scan's structure
+    /// rules, not walked.
+    ///
+    /// Every bounded array is a `Vec<String>`, so a non-text element could never
+    /// have decoded; refusing it keeps the element walk exactly one header per
+    /// element, which is what the allowance is sized for.
+    #[test]
+    fn prescan_rejects_a_nesting_bomb_inside_a_want_id_element() {
+        // "ids": [ [[[[…]]]] ] — one element, 64 arrays deep.
+        let mut ids_tail = vec![0x81];
+        ids_tail.extend(std::iter::repeat_n(0x81u8, 64));
+        ids_tail.push(0x00);
+        let frame = forged_want_frame(&ids_tail);
+        assert!(frame.len() < 128, "a tiny frame, however deep it nests");
+        assert_eq!(
+            WireMessage::decode_checked(&frame).unwrap_err(),
+            WireError::FramePrescan(CborScanError::NonTextArrayElement("want"))
+        );
+    }
+
+    /// An `Announce` carries no bounded array at all, and passes untouched —
+    /// the tolerance that lets one gate cover every non-`Supply` variant.
+    #[test]
+    fn prescan_tolerates_variants_with_no_id_arrays() {
+        let announce = WireMessage::announce("f".repeat(64), DirectiveKind::Price);
+        let cbor = announce.to_cbor().unwrap();
+        assert!(!carries_supply_discriminator(&cbor));
+        assert_eq!(WireMessage::decode_checked(&cbor).unwrap(), announce);
+        // The gossip path shares the choke point, and `Announce` is what it
+        // actually carries.
+        assert_eq!(crate::gossip::decode_broadcast(&cbor).unwrap(), announce);
+    }
+
+    /// The gossip choke point inherits the widened gate too: a forged `Want`
+    /// broadcast is refused there without a length prefix ever being involved.
+    #[test]
+    fn gossip_decode_inherits_the_want_prescan() {
+        let frame = forged_want_frame(&array_header_claiming(10_000_000));
+        let error = crate::gossip::decode_broadcast(&frame).unwrap_err();
+        assert!(
+            error.contains("want batch too large: 10000000"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

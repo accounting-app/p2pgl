@@ -6,6 +6,7 @@ mod fetch_coordinator;
 mod graphql;
 mod health;
 mod http_server;
+mod ledger_commit;
 mod ledger_lock;
 mod p2p_service;
 mod rate_limit;
@@ -205,6 +206,20 @@ async fn main() {
     // Wrap in Arc<RwLock> for concurrent access (§3.5).
     let shared_ledger: SharedLedger = Arc::new(RwLock::new(service));
 
+    // T44: fold any commit journal back into the canonical `.bean` before
+    // serving. A journal is only ever present here after an unclean stop (a
+    // clean one compacts on the way out), so this is the crash-recovery point:
+    // boot has already unioned canonical ∪ journal into memory, and this writes
+    // that union out as one canonical file and deletes the sidecar.
+    //
+    // A failure is logged, not fatal. The journal is still on disk and still
+    // correct — boot read it once and would read it again — so refusing to
+    // start would turn a recoverable disk hiccup into an outage.
+    if let Err(error) = ledger_commit::compact(&shared_ledger).await {
+        warn!(%error, "could not compact the ledger commit journal at startup; \
+                       the journal is intact and will be folded in by a later write");
+    }
+
     // Transaction broadcast for subscriptions.
     let broadcast = TransactionBroadcast::new();
 
@@ -365,22 +380,44 @@ async fn main() {
                 let change = current.detect_change(&last_state);
                 if change == FileChangeKind::Modified {
                     info!("external edit detected — reconciling");
-                    let mut svc = watcher_ledger.write().await;
-                    match svc.reconcile_file() {
-                        Ok(result) => {
-                            if result.new_directives > 0 {
-                                info!(
-                                    new = result.new_directives,
-                                    duplicates = result.duplicates,
-                                    rejected = result.rejected,
-                                    "reconciled external edit"
-                                );
+                    // T44: the same permit → lock → prepare → unlock → commit
+                    // sequence the mutations use. A reconcile always compacts
+                    // (it has to delete the entries it refused and re-spell the
+                    // rest), and that rewrite is exactly the kind of write that
+                    // must not run under the read-blocking write lock.
+                    let permit = ledger_commit::acquire_write_permit(&watcher_ledger).await;
+                    let prepared = {
+                        let mut svc = watcher_ledger.write().await;
+                        match svc.reconcile_file_staged() {
+                            Ok(result) => {
+                                if result.new_directives > 0 {
+                                    info!(
+                                        new = result.new_directives,
+                                        duplicates = result.duplicates,
+                                        rejected = result.rejected,
+                                        "reconciled external edit"
+                                    );
+                                    ledger_commit::prepare_or_recover(&mut svc, true)
+                                } else {
+                                    Ok(None)
+                                }
+                            }
+                            Err(error) => {
+                                warn!(%error, "failed to reconcile external edit");
+                                Ok(None)
                             }
                         }
-                        Err(error) => {
-                            warn!(%error, "failed to reconcile external edit");
+                    };
+                    let committed = match prepared {
+                        Ok(pending) => {
+                            ledger_commit::commit_pending(&watcher_ledger, pending).await
                         }
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = committed {
+                        warn!(%error, "failed to persist a reconciled external edit");
                     }
+                    drop(permit);
                 }
                 last_state = current;
             }
@@ -413,6 +450,9 @@ async fn main() {
     // L-09: the bind decides how much detail `/health` discloses to an
     // unauthenticated caller, and the auth state lets an authenticated operator
     // get the full picture on a public bind regardless.
+    // T44: kept for the shutdown compaction below, since `HealthState` takes
+    // ownership of the shared handle.
+    let ledger_for_shutdown = shared_ledger.clone();
     let health_state = HealthState {
         ledger: shared_ledger,
         peer_registry,
@@ -501,6 +541,16 @@ async fn main() {
     // Stop file watcher if running.
     if let Some(handle) = file_watcher_handle {
         handle.abort();
+    }
+
+    // T44: fold the commit journal back into the canonical `.bean` on the way
+    // out, so a cleanly-stopped node leaves exactly one file behind and the
+    // next boot has nothing to replay. Cheap — it is one rewrite of a file
+    // every pre-T44 mutation rewrote anyway — and safe to skip: the journal is
+    // durable, and boot unions it if this fails.
+    if let Err(error) = ledger_commit::compact(&ledger_for_shutdown).await {
+        warn!(%error, "could not compact the ledger commit journal at shutdown; \
+                       the journal is intact and will be folded in on the next boot");
     }
 
     if let Some(router) = p2p_router {

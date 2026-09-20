@@ -616,10 +616,13 @@ async fn apply_supply_entries(
 
     // ── Phase 2: one ledger write lock for the whole batch (M-15) ───────
     //
-    // Lock-ordering discipline is unchanged: the ledger write lock is taken
-    // first and held across the batch; the orphan_buffer lock is only ever
-    // acquired under it (here and inside `drain_orphans`).
+    // Lock-ordering discipline is unchanged inside the write lock: the
+    // orphan_buffer lock is only ever acquired under it (here and inside
+    // `drain_orphans`). T44 adds one lock ABOVE it — the single-writer commit
+    // permit — taken before the write lock on every write path and released
+    // only once the batch is durable.
     if !staged.is_empty() {
+        let permit = crate::ledger_commit::acquire_write_permit(&handler.ledger).await;
         let mut svc = handler.ledger.write().await;
         let mut inserted_any = false;
         for directive in staged {
@@ -708,8 +711,8 @@ async fn apply_supply_entries(
 
         if inserted_any {
             // Drain orphans this batch unblocked, then persist ONCE for the whole
-            // batch plus the drained orphans (M-15). `drain_orphans` now stages
-            // (no persist), so this single `persist_or_reload` covers everything.
+            // batch plus the drained orphans (M-15). `drain_orphans` stages
+            // (no persist), so this single commit covers everything.
             drain_orphans(
                 &handler.orphan_buffer,
                 &mut svc,
@@ -719,15 +722,30 @@ async fn apply_supply_entries(
                 &handler.mesh_id,
             )
             .await;
-            if let Err(error) = svc.persist_or_reload() {
-                // L-13: `persist_or_reload` already reloaded from disk, so the
+            // T44: prepare under the lock, commit off it. For a catch-up batch
+            // on a ledger past the compaction threshold this is a single
+            // journal record for the whole batch — O(batch), not O(ledger) —
+            // and the fsync runs on a blocking thread with the write lock
+            // already released, so a peer streaming history no longer parks
+            // GraphQL readers on the disk.
+            let prepared = crate::ledger_commit::prepare_or_recover(&mut svc, false);
+            drop(svc);
+            let commit = match prepared {
+                Ok(pending) => crate::ledger_commit::commit_pending(&handler.ledger, pending).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = commit {
+                // L-13: the failure path already reloaded from disk, so the
                 // batch is rolled back in memory (memory==disk again) and
                 // anti-entropy will re-pull it. The tallies above describe what
                 // was attempted, not what is stored; we return them without
                 // panicking.
                 warn!(%error, peer = %remote, "failed to persist ALPN supply batch; rolled back in memory, will re-pull");
             }
+        } else {
+            drop(svc);
         }
+        drop(permit);
     }
 
     debug!(
@@ -961,9 +979,9 @@ fn frame_is_rejectable(len: usize, peek: &[u8]) -> bool {
     if len <= NON_SUPPLY_FRAME_CAP {
         return false;
     }
-    let discriminator = p2p::protocol::SUPPLY_TYPE_DISCRIMINATOR;
-    // Skip the map header byte at peek[0]; compare the "type" entry that follows.
-    peek.get(1..1 + discriminator.len()) != Some(discriminator)
+    // The offset rule (map header at peek[0], tag entry after it) is stated once,
+    // in `protocol`, so this gate and T43's pre-scan gate cannot drift apart.
+    !p2p::protocol::carries_supply_discriminator(peek)
 }
 
 /// Why a frame read ended (T41).
@@ -1079,16 +1097,15 @@ async fn read_message(
 /// Generic over [`ExactReader`] so the framing logic is unit-testable with an
 /// in-memory reader; production always passes an iroh [`RecvStream`].
 ///
-/// RESIDUAL M-16 limitation: a frame that *does* open with the `Supply`
-/// discriminator but then carries millions of fake entries still flows into
-/// `decode_checked`, where serde's internally-tagged decode `Content`-buffers
-/// the whole value before `MAX_SUPPLY_ENTRIES` can reject it (the cardinality
-/// cap only applies after buffering). That residual is bounded by the byte cap
-/// (`MAX_MESSAGE_SIZE`, 16 MiB), by the connection cap (`ConnectionLimiter`,
-/// which bounds how many such decodes run at once), and by the fact that this
-/// path is allowlisted-only. Full closure — an element-count scan of the CBOR,
-/// or an externally-tagged wire format that reads the tag without buffering —
-/// is deferred and tracked separately.
+/// The M-16 residual this used to carry — a frame that *does* open with the
+/// `Supply` discriminator but then claims millions of fake entries, which serde
+/// `Content`-buffers in full before `MAX_SUPPLY_ENTRIES` can reject it — is
+/// closed by T43. `decode_checked` now runs a bounded CBOR header scan
+/// (`p2p::cbor_scan`) over any `Supply`-discriminator frame and refuses an
+/// `entries` array header claiming more than the cap **before** handing the
+/// bytes to serde. Nothing changes at this call site: the gate lives at the
+/// shared inbound choke point so the gossip-side decode is covered by the same
+/// code.
 async fn read_frame<R>(recv: &mut R, io_timeout: Duration) -> Result<WireMessage, FrameError>
 where
     R: ExactReader,
