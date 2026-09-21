@@ -20,6 +20,7 @@ use crate::connection_limiter::{AntiEntropyLimits, ConnectionLimiter};
 use crate::graphql::broadcast::TransactionBroadcast;
 use crate::graphql::query::domain_txn_to_graphql;
 use crate::graphql::SharedLedger;
+use crate::peer_connections::{AcquireError, PeerConnectionCache, Reuse};
 
 use ledger::validate::ValidationError;
 use p2p::allowlist::PeerAllowlist;
@@ -115,6 +116,13 @@ pub struct AntiEntropyHandler {
     pub limits: AntiEntropyLimits,
     /// Shared connection admission control (M-16); clones share one budget.
     pub limiter: ConnectionLimiter,
+    /// OUTBOUND per-peer connection reuse (T42); clones share one cache.
+    ///
+    /// Purely an optimization on the dial path: `fetch_want` and
+    /// `exchange_with_peer` take their connection from here instead of dialling
+    /// fresh every time. It has no bearing on the inbound side, which keeps
+    /// every limit `limiter` and `limits` enforce.
+    pub connections: PeerConnectionCache,
 }
 
 impl std::fmt::Debug for AntiEntropyHandler {
@@ -162,29 +170,6 @@ async fn serve_anti_entropy(
     remote: EndpointId,
 ) -> Result<(), String> {
     let io_timeout = handler.timeouts.io;
-    // T41: bound the wait for the peer's first bi-stream. `accept_bi()` has no
-    // deadline of its own, so a peer that completes the QUIC handshake and then
-    // opens nothing parked this serve task forever — and with it the M-16
-    // `ConnectionLimiter` guard held by `accept`, which is a per-peer AND a
-    // global slot. Thirty-two such connections from one allowlisted peer
-    // exhausted its share and starved every genuine session from it, at the cost
-    // of a handshake each.
-    //
-    // Reusing the I/O timeout rather than the connect one: this is a wait for
-    // the peer to say something on an established connection, which is the same
-    // shape as a frame read, and the same value applies to it (M-06).
-    let (mut send, mut recv) = match tokio::time::timeout(io_timeout, connection.accept_bi()).await
-    {
-        Ok(Ok(streams)) => streams,
-        Ok(Err(error)) => return Err(error.to_string()),
-        Err(_elapsed) => {
-            // Close explicitly so the peer learns why rather than waiting out
-            // its own idle timeout, and so the limiter slot is released against
-            // a connection that is actually gone.
-            connection.close(3u32.into(), b"accept-bi-timeout");
-            return Err("anti-entropy peer opened no stream before the timeout".to_owned());
-        }
-    };
     // T24: bound how many messages one connection may issue. This is a backstop
     // against an infinite/absurd flood on a single stream, not a tight limit —
     // the default (100_000) is far past any legitimate catch-up. A peer cut off
@@ -202,6 +187,28 @@ async fn serve_anti_entropy(
     // is bounded. Honest traffic is unaffected: a catch-up sends its advert
     // once, and 245 units out of 100,000 is noise.
     let mut requests_handled: usize = 0;
+    // T42: a peer may now run SEVERAL operations over one connection, each on
+    // its own bi-stream, so this serves streams until the connection ends
+    // instead of serving exactly one and closing. Nothing above changes shape
+    // for it: `requests_handled` stays a PER-CONNECTION budget spanning every
+    // stream (making it per-stream would relax T24's cap by however many
+    // streams a peer chose to open), and every read is still bounded by the
+    // same I/O timeout.
+    //
+    // Streams are served one at a time, deliberately. Concurrency here would
+    // multiply the M-16 memory bound: `ConnectionLimiter` caps concurrent
+    // accepted CONNECTIONS precisely because each one can have a multi-MiB
+    // `Supply` decode in flight, and N concurrent streams per connection would
+    // make that N × the cap. The cost is head-of-line blocking between a peer's
+    // own overlapping operations, which is bounded by their I/O timeouts and
+    // which each peer inflicts only on itself.
+    let mut streams_served: usize = 0;
+    // The most recently finished send half, held for the tidy-close drain
+    // below. Earlier streams were finished (their FIN is queued and their data
+    // keeps flowing while the connection lives) and their peer had already read
+    // every reply it asked for before it closed its half, so the stream that
+    // can still have unacknowledged bytes when we close is the last one.
+    let mut last_send: Option<SendStream> = None;
     // T41: how this session ended, so the close frame can say so. Returning from
     // `accept` used to just DROP the `Connection`, which closes it with a zero
     // code and no reason and does not wait for anything already written to be
@@ -209,68 +216,249 @@ async fn serve_anti_entropy(
     // itself (anti-entropy is idempotent and the peer re-Wants on reconnect),
     // but it also meant a budget cut-off and an ordinary end of session looked
     // identical from the other end.
-    let mut close_code = 0u32;
-    let mut close_reason: &[u8] = b"anti-entropy session complete";
-    loop {
-        if requests_handled >= handler.limits.max_requests_per_connection {
-            warn!(
-                peer = %remote,
-                limit = handler.limits.max_requests_per_connection,
-                "anti-entropy request budget exhausted; closing connection"
-            );
-            close_code = 4;
-            close_reason = b"request-budget-exhausted";
-            break;
-        }
-        let message = match read_message(&mut recv, io_timeout).await {
-            Ok(message) => message,
-            // T41: a typed clean shutdown, not a substring match on a formatted
-            // error — see `FrameError` and `classify_read_error`.
-            Err(FrameError::Eof) => break,
-            Err(error) => return Err(error.to_string()),
+    //
+    // Both ways out of the loop below name themselves, so the loop yields the
+    // code and reason rather than defaulting to one: since T42 a peer ends a
+    // connection it is done with by CLOSING it (handled above, nothing left for
+    // us to say) or by leaving it idle, so there is no third "session complete"
+    // ending left to describe.
+    let (close_code, close_reason): (u32, &[u8]) = loop {
+        // T41: bound the wait for the peer's next bi-stream. `accept_bi()` has
+        // no deadline of its own, so a peer that completes the QUIC handshake
+        // and then opens nothing parked this serve task forever — and with it
+        // the M-16 `ConnectionLimiter` guard held by `accept`, which is a
+        // per-peer AND a global slot. Thirty-two such connections from one
+        // allowlisted peer exhausted its share and starved every genuine
+        // session from it, at the cost of a handshake each.
+        //
+        // Reusing the I/O timeout rather than the connect one: this is a wait
+        // for the peer to say something on an established connection, which is
+        // the same shape as a frame read, and the same value applies to it
+        // (M-06). Since T42 the same bound applies to every SUBSEQUENT stream
+        // too, which is what stops a reused connection from being parked
+        // indefinitely — and what makes a pooled connection idle for longer
+        // than this one dead on the client's next use of it.
+        let (mut send, mut recv) = match tokio::time::timeout(io_timeout, connection.accept_bi())
+            .await
+        {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(error)) => {
+                if streams_served == 0 {
+                    return Err(error.to_string());
+                }
+                // The peer served its operations and then closed the
+                // connection. That is an ordinary end of session, not a
+                // failure, and there is nothing left to close.
+                return Ok(());
+            }
+            Err(_elapsed) => {
+                if streams_served == 0 {
+                    // Close explicitly so the peer learns why rather than
+                    // waiting out its own idle timeout, and so the limiter slot
+                    // is released against a connection that is actually gone.
+                    connection.close(3u32.into(), b"accept-bi-timeout");
+                    return Err("anti-entropy peer opened no stream before the timeout".to_owned());
+                }
+                // A connection that DID serve work and then went idle is a
+                // pooled connection its peer has finished with (T42). The same
+                // timeout still fires and still closes it — only the verdict
+                // differs, because reporting an error for every reused
+                // connection's ordinary expiry would bury the T41 case above in
+                // routine noise.
+                break (3u32, b"accept-bi-timeout".as_slice());
+            }
         };
-        requests_handled += 1;
-        match message {
-            // A non-final page of the peer's advert (H-02): its content is not
-            // used — we always answer with our own full state — so wait for the
-            // final page and reply exactly once per advert, keeping the session
-            // lockstep.
-            WireMessage::HaveHeads { more: true, .. } => {}
-            WireMessage::HaveHeads { .. } => {
-                let pages = local_have_heads_pages(&handler.ledger).await;
-                // L-01: charge for the whole advert before writing it.
-                requests_handled = requests_handled.saturating_add(pages.len());
-                for page in pages {
-                    write_message(&mut send, &page, io_timeout).await?;
+        streams_served += 1;
+        // The stream itself costs one budget unit (T42 review). Frames are
+        // charged inside the loop below, but a stream that carries NO frame
+        // would otherwise be free — and an endless supply of empty bi-streams,
+        // each accepted within the timeout above, would hold this connection,
+        // its serve task, and its M-16 limiter slot alive forever without the
+        // T24 budget ever advancing. Honest cost is noise: one unit per
+        // operation on top of that operation's own frames, against a budget of
+        // 100,000.
+        requests_handled = requests_handled.saturating_add(1);
+        let mut budget_exhausted = false;
+        loop {
+            if requests_handled >= handler.limits.max_requests_per_connection {
+                warn!(
+                    peer = %remote,
+                    limit = handler.limits.max_requests_per_connection,
+                    "anti-entropy request budget exhausted; closing connection"
+                );
+                budget_exhausted = true;
+                break;
+            }
+            let message = match read_message(&mut recv, io_timeout).await {
+                Ok(message) => message,
+                // T41: a typed clean shutdown, not a substring match on a
+                // formatted error — see `FrameError` and `classify_read_error`.
+                // Since T42 this ends the STREAM, not the connection: the peer
+                // may open another one for its next operation.
+                Err(FrameError::Eof) => break,
+                Err(error) => return Err(error.to_string()),
+            };
+            requests_handled += 1;
+            match message {
+                // A non-final page of the peer's advert (H-02): its content is
+                // not used — we always answer with our own full state — so wait
+                // for the final page and reply exactly once per advert, keeping
+                // the session lockstep.
+                WireMessage::HaveHeads { more: true, .. } => {}
+                WireMessage::HaveHeads { .. } => {
+                    let pages = local_have_heads_pages(&handler.ledger).await;
+                    // L-01: charge for the whole advert before writing it.
+                    requests_handled = requests_handled.saturating_add(pages.len());
+                    for page in pages {
+                        write_message(&mut send, &page, io_timeout).await?;
+                    }
+                }
+                WireMessage::Want { ids, .. } => {
+                    // One Supply per Want, trimmed to what the requester can
+                    // decode (H-02); it re-Wants any tail we could not fit.
+                    // Already 1:1, so the L-01 charge below is the same unit the
+                    // read already took.
+                    let entries = collect_supply(&handler.ledger, &ids).await;
+                    let reply = p2p::anti_entropy::truncate_supply(entries);
+                    requests_handled = requests_handled.saturating_add(1);
+                    write_message(&mut send, &reply, io_timeout).await?;
+                }
+                WireMessage::Supply { entries, .. } => {
+                    apply_supply_entries(handler, entries, remote).await;
+                }
+                WireMessage::Announce { .. } => {
+                    debug!(peer = %remote, "ignoring announce on anti-entropy ALPN");
                 }
             }
-            WireMessage::Want { ids, .. } => {
-                // One Supply per Want, trimmed to what the requester can decode
-                // (H-02); it re-Wants any tail we could not fit. Already 1:1, so
-                // the L-01 charge below is the same unit the read already took.
-                let entries = collect_supply(&handler.ledger, &ids).await;
-                let reply = p2p::anti_entropy::truncate_supply(entries);
-                requests_handled = requests_handled.saturating_add(1);
-                write_message(&mut send, &reply, io_timeout).await?;
-            }
-            WireMessage::Supply { entries, .. } => {
-                apply_supply_entries(handler, entries, remote).await;
-            }
-            WireMessage::Announce { .. } => {
-                debug!(peer = %remote, "ignoring announce on anti-entropy ALPN");
-            }
         }
+        // This stream is done. Finish our half before anything else so a reply
+        // written under the last of the budget is not reset out from under the
+        // peer, then go back for the peer's next operation (or, on a cut-off,
+        // straight to the close below).
+        let _ = send.finish();
+        last_send = Some(send);
+        if budget_exhausted {
+            break (4u32, b"request-budget-exhausted".as_slice());
+        }
+    };
+    // Give the peer a BOUNDED window to acknowledge what we already wrote, then
+    // close explicitly with a code and a reason (T41). The drain is deliberately
+    // its own short budget rather than `io_timeout`: a peer that stops reading
+    // must not be able to hold the serve task — and the M-16 limiter slot with
+    // it — for a full I/O timeout on the way out, which is the very thing the
+    // `accept_bi` timeout above exists to prevent.
+    if let Some(send) = last_send {
+        let _ = tokio::time::timeout(CLOSE_DRAIN, send.stopped()).await;
     }
-    // Finish our half, give the peer a BOUNDED window to acknowledge what we
-    // already wrote, then close explicitly with a code and a reason (T41).
-    // The drain is deliberately its own short budget rather than `io_timeout`:
-    // a peer that stops reading must not be able to hold the serve task — and
-    // the M-16 limiter slot with it — for a full I/O timeout on the way out,
-    // which is the very thing the `accept_bi` timeout above exists to prevent.
-    let _ = send.finish();
-    let _ = tokio::time::timeout(CLOSE_DRAIN, send.stopped()).await;
     connection.close(close_code.into(), close_reason);
     Ok(())
+}
+
+/// One outbound operation's stream pair, plus the connection it runs over.
+///
+/// The connection is carried alongside so a failure mid-protocol can invalidate
+/// exactly the connection it happened on (T42) — never a newer one another task
+/// has since pooled for the same peer.
+struct PeerSession {
+    connection: Connection,
+    send: SendStream,
+    recv: RecvStream,
+}
+
+/// Why an outbound session could not be started (T42).
+///
+/// The variants exist to keep the pre-T42 log surfaces intact: a dial failure
+/// and a dial timeout were reported differently by each call site, and a failure
+/// to open the stream was reported as a session failure. Pooling changes which
+/// of these can happen, not what any of them says.
+enum SessionOpenError {
+    Dial(String),
+    DialTimeout,
+    OpenStream(String),
+}
+
+impl From<AcquireError> for SessionOpenError {
+    fn from(error: AcquireError) -> Self {
+        match error {
+            AcquireError::Dial(message) => Self::Dial(message),
+            AcquireError::Timeout => Self::DialTimeout,
+        }
+    }
+}
+
+/// Take a connection to `addr` from the per-peer cache (dialling if needed) and
+/// open this operation's bi-stream on it (T42).
+///
+/// The ONE re-dial an operation gets lives here, and only here: if opening the
+/// stream fails on a connection that came OUT OF THE POOL, that connection is
+/// stale, so it is invalidated and dialled again — once. A freshly dialled
+/// connection that cannot open a stream is a genuine failure and is reported as
+/// one, exactly as before T42; retrying it would turn one dial into two against
+/// a peer that is simply unreachable.
+///
+/// The retry sits entirely BEFORE any frame is written or read, which is the
+/// property that makes it safe to describe as transparent: no request has been
+/// issued yet, so nothing can be issued twice. A connection that dies once the
+/// protocol is under way is invalidated by the caller and the operation FAILS —
+/// anti-entropy is idempotent and would survive a replay, but a silent replay
+/// would double the work and the peer's request budget, and would hide a real
+/// mid-transfer fault behind a retry.
+async fn open_peer_session(
+    endpoint: &iroh::Endpoint,
+    handler: &AntiEntropyHandler,
+    addr: iroh::EndpointAddr,
+) -> Result<PeerSession, SessionOpenError> {
+    let peer = addr.id;
+    let acquired = handler
+        .connections
+        .acquire(
+            endpoint,
+            addr.clone(),
+            &handler.allowlist,
+            handler.timeouts.connect,
+            Reuse::IfLive,
+        )
+        .await?;
+    let open_error = match acquired.connection.open_bi().await {
+        Ok((send, recv)) => {
+            return Ok(PeerSession {
+                connection: acquired.connection,
+                send,
+                recv,
+            })
+        }
+        Err(error) => error,
+    };
+    if !acquired.reused {
+        return Err(SessionOpenError::OpenStream(open_error.to_string()));
+    }
+    handler.connections.invalidate(peer, &acquired.connection);
+    debug!(
+        peer = %peer,
+        error = %open_error,
+        "pooled anti-entropy connection was stale; re-dialing once"
+    );
+    let fresh = handler
+        .connections
+        .acquire(
+            endpoint,
+            addr,
+            &handler.allowlist,
+            handler.timeouts.connect,
+            Reuse::Never,
+        )
+        .await?;
+    match fresh.connection.open_bi().await {
+        Ok((send, recv)) => Ok(PeerSession {
+            connection: fresh.connection,
+            send,
+            recv,
+        }),
+        Err(error) => {
+            handler.connections.invalidate(peer, &fresh.connection);
+            Err(SessionOpenError::OpenStream(error.to_string()))
+        }
+    }
 }
 
 /// Fetch missing ids from an allowlisted peer (gossip Announce catch-up).
@@ -285,23 +473,31 @@ pub async fn fetch_want(
     if ids.is_empty() || !handler.allowlist.admits(peer) {
         return;
     }
-    let connection = match tokio::time::timeout(
-        handler.timeouts.connect,
-        endpoint.connect(peer_addr, p2p::protocol::ANTI_ENTROPY_ALPN),
-    )
-    .await
-    {
-        Ok(Ok(connection)) => connection,
-        Ok(Err(error)) => {
+    let session = match open_peer_session(endpoint, handler, peer_addr).await {
+        Ok(session) => session,
+        Err(SessionOpenError::Dial(error)) => {
             warn!(peer = %peer, %error, "anti-entropy connect failed");
             return;
         }
-        Err(_elapsed) => {
+        Err(SessionOpenError::DialTimeout) => {
             warn!(peer = %peer, "anti-entropy connect timed out");
             return;
         }
+        Err(SessionOpenError::OpenStream(error)) => {
+            warn!(peer = %peer, %error, "anti-entropy want session failed");
+            return;
+        }
     };
-    if let Err(error) = run_want_session(&connection, ids, handler, peer).await {
+    let PeerSession {
+        connection,
+        mut send,
+        mut recv,
+    } = session;
+    if let Err(error) = run_want_session(&mut send, &mut recv, ids, handler, peer).await {
+        // The connection may be the reason this failed; either way the next
+        // operation must not inherit it (T42). This drops only the cache's
+        // handle — a concurrent operation on the same connection keeps running.
+        handler.connections.invalidate(peer, &connection);
         warn!(peer = %peer, %error, "anti-entropy want session failed");
     }
 }
@@ -317,58 +513,60 @@ pub async fn exchange_with_peer(
     if !handler.allowlist.admits(peer) {
         return;
     }
-    let connection = match tokio::time::timeout(
-        handler.timeouts.connect,
-        endpoint.connect(peer_addr, p2p::protocol::ANTI_ENTROPY_ALPN),
-    )
-    .await
-    {
-        Ok(Ok(connection)) => connection,
-        Ok(Err(error)) => {
+    let session = match open_peer_session(endpoint, handler, peer_addr).await {
+        Ok(session) => session,
+        Err(SessionOpenError::Dial(error)) => {
             debug!(peer = %peer, %error, "anti-entropy exchange connect failed");
             return;
         }
-        Err(_elapsed) => {
+        Err(SessionOpenError::DialTimeout) => {
             debug!(peer = %peer, "anti-entropy exchange connect timed out");
             return;
         }
+        Err(SessionOpenError::OpenStream(error)) => {
+            warn!(peer = %peer, %error, "anti-entropy head exchange failed");
+            return;
+        }
     };
-    if let Err(error) = run_head_exchange(&connection, handler, peer).await {
+    let PeerSession {
+        connection,
+        mut send,
+        mut recv,
+    } = session;
+    if let Err(error) = run_head_exchange(&mut send, &mut recv, handler, peer).await {
+        handler.connections.invalidate(peer, &connection);
         warn!(peer = %peer, %error, "anti-entropy head exchange failed");
     }
 }
 
 async fn run_want_session(
-    connection: &Connection,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
     ids: Vec<String>,
     handler: &AntiEntropyHandler,
     remote: EndpointId,
 ) -> Result<(), String> {
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|error| error.to_string())?;
     for chunk in ids.chunks(MAX_SUPPLY_ENTRIES) {
-        fetch_want_chunk(&mut send, &mut recv, chunk, handler, remote).await?;
+        fetch_want_chunk(send, recv, chunk, handler, remote).await?;
     }
+    // Finishing our half is what tells the server this operation is over, so it
+    // can move on to the next stream on this connection (T42) instead of
+    // waiting out its I/O timeout.
     let _ = send.finish();
     Ok(())
 }
 
 async fn run_head_exchange(
-    connection: &Connection,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
     handler: &AntiEntropyHandler,
     remote: EndpointId,
 ) -> Result<(), String> {
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|error| error.to_string())?;
     for page in local_have_heads_pages(&handler.ledger).await {
-        write_message(&mut send, &page, handler.timeouts.io).await?;
+        write_message(send, &page, handler.timeouts.io).await?;
     }
     let (head_txids, directive_ids) =
-        read_have_heads_advert(&mut recv, remote, handler.timeouts.io).await?;
+        read_have_heads_advert(recv, remote, handler.timeouts.io).await?;
     let want = {
         let svc = handler.ledger.read().await;
         p2p::anti_entropy::compute_want(
@@ -379,8 +577,9 @@ async fn run_head_exchange(
         )
     };
     for chunk in want.chunks(MAX_SUPPLY_ENTRIES) {
-        fetch_want_chunk(&mut send, &mut recv, chunk, handler, remote).await?;
+        fetch_want_chunk(send, recv, chunk, handler, remote).await?;
     }
+    // See `run_want_session`: the FIN is what releases the server's stream.
     let _ = send.finish();
     Ok(())
 }
@@ -1284,6 +1483,7 @@ pub(crate) mod tests {
             timeouts,
             limits,
             limiter: ConnectionLimiter::new(limits),
+            connections: PeerConnectionCache::new(),
         }
     }
 
@@ -2489,6 +2689,89 @@ pub(crate) mod tests {
         );
     }
 
+    /// T42 review: a flood of EMPTY bi-streams must not hold a connection —
+    /// and its M-16 limiter slot — outside the request budget.
+    ///
+    /// A zero-byte finished stream reaches `accept_bi`, reads as a clean EOF
+    /// (`FinishedEarly(0)`), and carries no frame — so before the per-stream
+    /// budget charge it advanced `requests_handled` by nothing at all, and a
+    /// peer could loop it forever. With the charge, each accepted stream costs
+    /// one unit and the budget closes the connection on schedule.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn empty_streams_cannot_hold_a_connection_outside_the_budget() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_server = bind_direct_endpoint().await;
+        let endpoint_client = bind_direct_endpoint().await;
+
+        let id_server = endpoint_server.id();
+        let id_client = endpoint_client.id();
+
+        let allow_server =
+            PeerAllowlist::parse(&[id_client.to_string()]).expect("allowlist server");
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ledger_server: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("server.bean"), id_server.to_string())
+                .expect("boot server ledger"),
+        ));
+
+        let limits = AntiEntropyLimits {
+            max_total_connections: 256,
+            max_connections_per_peer: 32,
+            max_requests_per_connection: 6,
+        };
+        let handler_server = make_handler_with_limits(ledger_server, allow_server, limits);
+        let router_server = Router::builder(endpoint_server.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler_server.clone())
+            .spawn();
+
+        wait_until_dialable(&endpoint_server).await;
+        wait_until_dialable(&endpoint_client).await;
+        let addr_server = endpoint_server.addr();
+
+        let conn = connect_retry(&endpoint_client, addr_server.clone()).await;
+
+        // Open zero-byte streams until the server's budget closes the
+        // connection. Each stream is finished immediately so it reaches the
+        // server as a clean EOF with no frame ever sent.
+        let mut opened = 0usize;
+        let mut refused = false;
+        for _ in 0..50 {
+            let Ok((mut send, _recv)) =
+                tokio::time::timeout(Duration::from_secs(5), conn.open_bi())
+                    .await
+                    .map_err(|_| ())
+                    .and_then(|r| r.map_err(|_| ()))
+            else {
+                refused = true;
+                break;
+            };
+            if send.finish().is_err() {
+                refused = true;
+                break;
+            }
+            opened += 1;
+            // Yield so the server can drain the stream and advance its budget;
+            // without this the client can race dozens of opens ahead of the
+            // server ever seeing one.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let _ = router_server.shutdown().await;
+
+        assert!(
+            refused,
+            "T42: the server must close a connection fed only empty streams; \
+             all 50 were accepted — the budget never advanced"
+        );
+        assert!(
+            opened <= 20,
+            "T42: with a budget of 6, the empty-stream flood must be cut off \
+             promptly, got {opened} accepted streams"
+        );
+    }
+
     /// L-01: a client looping over one connection cannot extract bytes out of
     /// proportion to what it sends.
     ///
@@ -2680,6 +2963,374 @@ pub(crate) mod tests {
         }
 
         let _ = router_source.shutdown().await;
+    }
+
+    // ─── T42: per-peer connection reuse (network) ─────────────────────────
+
+    /// A mutually-allowlisted client/server pair, the server already serving a
+    /// seeded ledger over the anti-entropy ALPN.
+    ///
+    /// The T42 tests all need the same three things: a client that dials
+    /// through the cache, a server whose `ConnectionLimiter` counts what it
+    /// ADMITTED (the observable that separates "reused one connection" from
+    /// "dialled again"), and a ledger difference so an operation's success is
+    /// visible in the data rather than only in the absence of a log line.
+    struct ReusePair {
+        endpoint_client: Endpoint,
+        handler_client: AntiEntropyHandler,
+        handler_server: AntiEntropyHandler,
+        router_server: Router,
+        addr_server: iroh::EndpointAddr,
+        server_id: EndpointId,
+        ledger_server: SharedLedger,
+        ledger_client: SharedLedger,
+        _temp_dir: tempfile::TempDir,
+    }
+
+    impl ReusePair {
+        /// Connections the server has admitted since it started. One per dial —
+        /// the number T42 is supposed to stop growing with the operation count.
+        fn accepted(&self) -> usize {
+            self.handler_server.limiter.accepted_total()
+        }
+
+        /// Wait until the server has admitted at least `at_least` connections.
+        ///
+        /// `accept` runs on the SERVER's task, so a dial returning on the
+        /// client side does not yet mean the limiter has counted it. A baseline
+        /// taken before that lands is off by one, and the assertion that
+        /// follows it reads as a reuse failure when nothing failed.
+        async fn wait_for_accepted(&self, at_least: usize) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while self.accepted() < at_least {
+                assert!(
+                    tokio::time::Instant::now() <= deadline,
+                    "T42 fixture: the server never admitted {at_least} connection(s), saw {}",
+                    self.accepted()
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        async fn client_count(&self) -> usize {
+            self.ledger_client.read().await.directive_count()
+        }
+
+        async fn server_count(&self) -> usize {
+            self.ledger_server.read().await.directive_count()
+        }
+
+        /// Append one directive to the server so a LATER operation has
+        /// something to carry, and return its id.
+        async fn append_to_server(&self, account: &str) -> String {
+            self.ledger_server
+                .write()
+                .await
+                .open_account(
+                    account.to_owned(),
+                    NaiveDate::from_ymd_opt(2024, 2, 1).expect("valid date"),
+                    vec!["USD".to_owned()],
+                )
+                .expect("open an account on the server")
+        }
+
+        async fn exchange(&self) {
+            exchange_with_peer(
+                &self.endpoint_client,
+                self.addr_server.clone(),
+                &self.handler_client,
+            )
+            .await;
+        }
+
+        async fn fetch(&self, ids: Vec<String>) {
+            fetch_want(
+                &self.endpoint_client,
+                self.addr_server.clone(),
+                ids,
+                &self.handler_client,
+            )
+            .await;
+        }
+
+        /// Run exchanges until the client has caught up, so the reuse
+        /// assertions that follow start from a settled, connected state.
+        ///
+        /// A cold path can need more than one dial on a loaded machine (every
+        /// other network test here loops or retries for the same reason), so
+        /// the reuse tests assert a DELTA from after this point rather than
+        /// pinning the very first dial — a distinction that costs nothing,
+        /// since reverting the cache makes the delta grow with every operation.
+        async fn converge(&self) {
+            let target = self.server_count().await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                self.exchange().await;
+                if self.client_count().await == target {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() <= deadline,
+                    "T42 fixture: the client never caught up with the server"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+
+        async fn shutdown(self) {
+            let _ = self.router_server.shutdown().await;
+        }
+    }
+
+    /// Stand up a [`ReusePair`] whose server holds `directives` independent
+    /// `open`s (no parent chain, so one exchange transfers the lot).
+    async fn reuse_pair(directives: usize, server_io: Duration) -> ReusePair {
+        let endpoint_client = bind_direct_endpoint().await;
+        let endpoint_server = bind_direct_endpoint().await;
+
+        let client_id = endpoint_client.id();
+        let server_id = endpoint_server.id();
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server_path = temp_dir.path().join("server.bean");
+        write_open_directive_ledger(&server_path, directives, &server_id.to_string());
+
+        let ledger_server: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(server_path, server_id.to_string()).expect("boot server ledger"),
+        ));
+        let ledger_client: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("client.bean"), client_id.to_string())
+                .expect("boot client ledger"),
+        ));
+
+        let allow_server =
+            PeerAllowlist::parse(&[client_id.to_string()]).expect("server allowlist");
+        let allow_client =
+            PeerAllowlist::parse(&[server_id.to_string()]).expect("client allowlist");
+
+        let handler_server = make_handler_with_timeouts(
+            ledger_server.clone(),
+            allow_server,
+            AntiEntropyTimeouts {
+                connect: AntiEntropyTimeouts::default().connect,
+                io: server_io,
+            },
+        );
+        let handler_client = make_handler(ledger_client.clone(), allow_client);
+
+        let router_server = Router::builder(endpoint_server.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler_server.clone())
+            .spawn();
+
+        wait_until_dialable(&endpoint_client).await;
+        wait_until_dialable(&endpoint_server).await;
+        let addr_server = endpoint_server.addr();
+
+        ReusePair {
+            endpoint_client,
+            handler_client,
+            handler_server,
+            router_server,
+            addr_server,
+            server_id,
+            ledger_server,
+            ledger_client,
+            _temp_dir: temp_dir,
+        }
+    }
+
+    /// T42 (reuse): successive operations against one peer — exchange, exchange
+    /// AND a fetch — run over a single accepted server connection.
+    ///
+    /// Before the cache each of them dialled, so the server's admitted count
+    /// climbed by one per operation; now it does not move at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sequential_operations_reuse_one_pooled_connection() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+        let pair = reuse_pair(4, Duration::from_secs(30)).await;
+
+        pair.converge().await;
+        let settled = pair.accepted();
+        assert!(
+            settled >= 1,
+            "the server must have admitted the connection the client caught up over"
+        );
+
+        // Two more exchanges: both must ride the pooled connection.
+        pair.exchange().await;
+        pair.exchange().await;
+        assert_eq!(
+            pair.accepted(),
+            settled,
+            "T42: two further exchanges must reuse the pooled connection, not dial"
+        );
+
+        // And a FETCH — the other call site — shares the same pooled connection
+        // as the exchanges, which is the point of keying the cache by peer
+        // rather than giving each call site its own.
+        let new_id = pair.append_to_server("Assets:Fetched").await;
+        pair.fetch(vec![new_id.clone()]).await;
+        assert_eq!(
+            pair.accepted(),
+            settled,
+            "T42: a fetch must reuse the connection the exchanges pooled"
+        );
+        assert!(
+            pair.ledger_client
+                .read()
+                .await
+                .get_directive(&new_id)
+                .is_some(),
+            "the fetch had to actually transfer the directive over that connection"
+        );
+
+        pair.shutdown().await;
+    }
+
+    /// T42 (transparent re-dial): a pooled connection that has died is replaced
+    /// without the caller seeing anything.
+    ///
+    /// The connection is closed outright — the same state the client finds when
+    /// the server's idle timeout has closed it — and the next operation must
+    /// still do its work, over a NEW connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dead_pooled_connection_is_redialed_transparently() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+        let pair = reuse_pair(4, Duration::from_secs(30)).await;
+
+        pair.converge().await;
+        let settled = pair.accepted();
+
+        let pooled = pair
+            .handler_client
+            .connections
+            .pooled(pair.server_id)
+            .await
+            .expect("T42: a successful exchange must leave a connection pooled");
+        pooled.close(9u32.into(), b"test-killed-the-pooled-connection");
+        assert!(
+            pooled.close_reason().is_some(),
+            "the fixture must really have killed the pooled connection"
+        );
+
+        // Something new to carry, so "the operation succeeded" is a fact about
+        // the ledger and not just the absence of an error.
+        let after_death = pair.append_to_server("Assets:AfterDeath").await;
+        pair.exchange().await;
+
+        assert!(
+            pair.ledger_client
+                .read()
+                .await
+                .get_directive(&after_death)
+                .is_some(),
+            "T42: the operation after a dead pooled connection must still succeed"
+        );
+        assert_eq!(
+            pair.accepted(),
+            settled + 1,
+            "T42: exactly one re-dial — no more, and not zero"
+        );
+
+        pair.shutdown().await;
+    }
+
+    /// T42 (dial dedup): a fetch and an exchange started CONCURRENTLY against a
+    /// peer with nothing pooled share one dial.
+    ///
+    /// The path is warmed with a throwaway probe connection first (so a cold
+    /// dial cannot flake the count) but the CACHE is left cold, which is what
+    /// makes this a test of the per-peer slot: without it both operations dial
+    /// and the server admits two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_fetch_and_exchange_share_one_dial() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+        let pair = reuse_pair(4, Duration::from_secs(30)).await;
+
+        // Warm the path only — this connection never enters the cache.
+        let probe = connect_retry(&pair.endpoint_client, pair.addr_server.clone()).await;
+        drop(probe);
+        pair.wait_for_accepted(1).await;
+        let warmed = pair.accepted();
+
+        let target = pair.server_count().await;
+        let ids: Vec<String> = pair
+            .ledger_server
+            .read()
+            .await
+            .all_directive_ids()
+            .into_iter()
+            .collect();
+
+        // Both call sites at once, from a cold cache.
+        tokio::join!(pair.fetch(ids), pair.exchange());
+
+        assert_eq!(
+            pair.accepted(),
+            warmed + 1,
+            "T42: concurrent operations to one peer must share a single dial"
+        );
+        assert_eq!(
+            pair.client_count().await,
+            target,
+            "both concurrent operations must complete — no corrupted shared state"
+        );
+
+        pair.shutdown().await;
+    }
+
+    /// T42 (stale after idle): the server closes a pooled connection that has
+    /// been idle past its `accept_bi` bound, and the client treats it as dead
+    /// and re-dials rather than failing.
+    ///
+    /// This is the honest limit of the optimization, pinned as a test: reuse
+    /// wins WITHIN a burst, and the server's idle close — which nothing here
+    /// touches — ends the burst.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pooled_connection_idle_past_the_server_bound_is_redialed() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+        // A server whose I/O timeout — and so whose wait for the next stream —
+        // is short, so its idle close lands inside the test rather than in 30s.
+        let pair = reuse_pair(4, Duration::from_millis(400)).await;
+
+        pair.converge().await;
+        let settled = pair.accepted();
+
+        let pooled = pair
+            .handler_client
+            .connections
+            .pooled(pair.server_id)
+            .await
+            .expect("T42: a successful exchange must leave a connection pooled");
+
+        // Wait for the SERVER's own idle close rather than sleeping past a
+        // guess at it: this is the interplay the module docs describe.
+        let reason = tokio::time::timeout(Duration::from_secs(10), pooled.closed())
+            .await
+            .expect("the server must close a pooled connection left idle past its bound");
+        assert!(
+            format!("{reason}").contains("accept-bi-timeout"),
+            "the idle close must still name itself, got: {reason}"
+        );
+
+        let after_idle = pair.append_to_server("Assets:AfterIdle").await;
+        pair.exchange().await;
+
+        assert!(
+            pair.ledger_client
+                .read()
+                .await
+                .get_directive(&after_idle)
+                .is_some(),
+            "T42: the exchange after the server's idle close must still succeed"
+        );
+        assert_eq!(
+            pair.accepted(),
+            settled + 1,
+            "T42: the client must re-dial exactly once after the idle close"
+        );
+
+        pair.shutdown().await;
     }
 
     // ─── T27: batched apply_supply_entries (M-15) ────────────────────────

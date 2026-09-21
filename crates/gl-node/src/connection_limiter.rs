@@ -12,6 +12,8 @@
 //! router accepts on enforces one shared budget.
 
 use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use iroh::EndpointId;
@@ -62,6 +64,13 @@ struct LimiterInner {
     /// Live connection count per peer. Entries at 0 are removed, never leaked.
     per_peer: Mutex<HashMap<EndpointId, usize>>,
     max_connections_per_peer: usize,
+    /// CUMULATIVE count of admitted connections, as opposed to the concurrent
+    /// counts above — the seam T42's reuse tests read to tell "the peer opened
+    /// one connection and multiplexed over it" from "the peer dialled again".
+    ///
+    /// Test-only: it bounds nothing, so it does not exist in a real build.
+    #[cfg(test)]
+    accepted_total: AtomicUsize,
 }
 
 impl ConnectionLimiter {
@@ -72,8 +81,18 @@ impl ConnectionLimiter {
                 global: Arc::new(Semaphore::new(limits.max_total_connections)),
                 per_peer: Mutex::new(HashMap::new()),
                 max_connections_per_peer: limits.max_connections_per_peer,
+                #[cfg(test)]
+                accepted_total: AtomicUsize::new(0),
             }),
         }
+    }
+
+    /// How many connections this limiter has admitted since it was built.
+    ///
+    /// Observability for tests only; see [`LimiterInner::accepted_total`].
+    #[cfg(test)]
+    pub(crate) fn accepted_total(&self) -> usize {
+        self.inner.accepted_total.load(Ordering::Relaxed)
     }
 
     /// Try to admit one inbound connection from `peer`.
@@ -100,6 +119,8 @@ impl ConnectionLimiter {
             }
             per_peer.insert(peer, current + 1);
         }
+        #[cfg(test)]
+        self.inner.accepted_total.fetch_add(1, Ordering::Relaxed);
         Some(ConnectionGuard {
             inner: Arc::clone(&self.inner),
             peer,

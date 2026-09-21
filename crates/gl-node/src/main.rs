@@ -9,6 +9,7 @@ mod http_server;
 mod ledger_commit;
 mod ledger_lock;
 mod p2p_service;
+mod peer_connections;
 mod rate_limit;
 mod request_guard;
 #[cfg(test)]
@@ -318,6 +319,9 @@ async fn main() {
                     timeouts: anti_entropy_alpn::AntiEntropyTimeouts::default(),
                     limits,
                     limiter: connection_limiter::ConnectionLimiter::new(limits),
+                    // T42: one cache for the whole node — the router's clone,
+                    // the gossip loop's and the anti-entropy tick's all share it.
+                    connections: peer_connections::PeerConnectionCache::new(),
                 };
                 p2p_router = Some(p2p_service::spawn_router(&peer_node, handler.clone()));
                 let sender = p2p_service::spawn_gossip_loop(&peer_node, handler.clone());
@@ -1080,6 +1084,7 @@ mod tests {
                 limiter: connection_limiter::ConnectionLimiter::new(
                     connection_limiter::AntiEntropyLimits::default(),
                 ),
+                connections: peer_connections::PeerConnectionCache::new(),
             }
             .mesh_id;
             assert_eq!(

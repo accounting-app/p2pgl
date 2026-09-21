@@ -1693,6 +1693,79 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    /// T44b: the same proof, with an L-13 recovery in the middle.
+    ///
+    /// A commit fails, `recover_failed_commit` rebuilds the service from disk,
+    /// and the hand edit adopted **after** that recovery must still be one a
+    /// peer accepts. Until T44b the reload went through `boot`, which sets
+    /// `signer: None`, so the entry was adopted unsigned and `peer_would_accept`
+    /// refused it — L-11's exact failure, reachable from any node that ever had
+    /// a disk error.
+    ///
+    /// The failure seam is a read-only ledger *directory*: `persist_atomically`
+    /// cannot create its sibling `.tmp`, so the commit fails on the real I/O
+    /// path, while the `.bean` stays readable for the reload. The directory is
+    /// this test's own, so nothing else is affected by the mode change.
+    #[cfg(unix)]
+    #[test]
+    fn test_a_recovered_commit_failure_still_signs_the_next_adoption() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = temp_bean_path("recovered").with_extension("dir");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("ledger.bean");
+        let (mut service, provider) = signing_service(&path, 14);
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        service
+            .open_account("Expenses:Food".to_owned(), date, vec![])
+            .unwrap();
+        service
+            .open_account("Assets:Cash".to_owned(), date, vec![])
+            .unwrap();
+        let durable = service.directive_count();
+
+        // Fail a commit for real, and recover from it.
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let error = service
+            .open_account("Assets:Vault".to_owned(), date, vec![])
+            .unwrap_err();
+        assert_eq!(error.error_code(), "IO_ERROR", "got {error}");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            service.directive_count(),
+            durable,
+            "L-13: the failed write must have been rolled back, i.e. the reload ran"
+        );
+
+        // Now the hand edit, on the far side of the recovery.
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str(HAND_EDIT);
+        std::fs::write(&path, &content).unwrap();
+
+        let result = service.reconcile_file().unwrap();
+        assert_eq!(result.new_directives, 1, "the hand edit must be adopted");
+        assert_eq!(result.rejected, 0);
+
+        let adopted = service
+            .dag()
+            .directives()
+            .into_iter()
+            .find(|d| matches!(d, Directive::Transaction(_)))
+            .expect("the adopted transaction")
+            .clone();
+        assert_eq!(
+            directive_metadata(&adopted).get("openledger-author"),
+            Some(&provider.public_key_hex()),
+        );
+        assert!(
+            peer_would_accept(&adopted).is_ok(),
+            "a peer must accept an entry adopted after a recovered commit failure: {:?}",
+            peer_would_accept(&adopted)
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
     #[test]
     fn test_reconcile_signs_an_adopted_hand_edit_with_an_elided_posting() {
         // The sharp edge of "sign what will be stored": I2 resolves the elided

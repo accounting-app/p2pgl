@@ -1140,6 +1140,9 @@ pub struct LedgerService {
     ///
     /// `None` means "never sign", which is also what a signing-disabled provider
     /// returns, so the two cannot disagree about the disabled case.
+    ///
+    /// Installed once, it stays installed: it is carried across every L-13
+    /// reload by [`Self::adopt_reloaded`] (T44b).
     signer: Option<DirectiveSigner>,
 
     // ── T44: append-only persistence ──────────────────────────────────────
@@ -2168,23 +2171,17 @@ impl LedgerService {
     /// journal, so the reload lands on exactly the state the failed commit
     /// started from rather than on a pre-journal one.
     ///
-    /// Two handles are carried across the reload rather than re-created,
-    /// because they are process-scoped machinery and not ledger state: the
-    /// [`Self::commit_gate`] (a fresh mutex would silently unserialize any
-    /// writer holding the old permit) and the commit observer.
+    /// The fields that describe this *service* rather than its file are carried
+    /// across the reload by [`Self::adopt_reloaded`] — the signer, the reconcile
+    /// counter and the commit machinery. See there for the invariant and for the
+    /// per-field reasoning.
     ///
     /// If the reload itself fails there is no better on-disk state to fall back
     /// to; memory is left as-is and the failure is logged, exactly as before.
     pub fn recover_failed_commit(&mut self) {
         self.commit_in_flight = false;
         match LedgerService::boot(self.file_path.clone(), self.author_id.clone()) {
-            Ok(reloaded) => {
-                let gate = std::sync::Arc::clone(&self.commit_gate);
-                let observer = self.commit_observer.clone();
-                *self = reloaded;
-                self.commit_gate = gate;
-                self.commit_observer = observer;
-            }
+            Ok(reloaded) => self.adopt_reloaded(reloaded),
             Err(reload_error) => {
                 error!(
                     %reload_error,
@@ -2193,6 +2190,68 @@ impl LedgerService {
                 );
             }
         }
+    }
+
+    /// Install a freshly booted service in place of this one, keeping everything
+    /// that describes the SERVICE rather than the file (T44b).
+    ///
+    /// # The invariant
+    ///
+    /// **A reload replaces the ledger's CONTENT, never the service's
+    /// configuration.** [`Self::boot`] derives its whole result from the two
+    /// files plus the author id, so every field that was *installed* after boot
+    /// — or *accumulated* since it — comes back at its default unless it is
+    /// carried here. Every wholesale reload goes through this one function, so
+    /// a field added to the carry set cannot be forgotten at a second site.
+    ///
+    /// # What is carried, and why each one
+    ///
+    /// * [`Self::signer`] (L-11). The bug this function exists for. `boot` sets
+    ///   it to `None`, so a reconcile-adoption after a recovered commit failure
+    ///   stamped an entry with **no** `openledger-signature` — adopted into the
+    ///   DAG, written to the `.bean`, present in every local report, and refused
+    ///   by every signing peer forever. That is exactly the silent split-brain
+    ///   L-11 closed, re-opened by the recovery path; the signer is the node's
+    ///   identity, not the file's content.
+    /// * [`Self::external_reconcile_count`] (L-30). An observability counter
+    ///   over the *process*, not a fact about the file. Resetting it to zero
+    ///   would erase the evidence that someone is hand-editing a live ledger,
+    ///   and would do so precisely on the failure path where an operator is most
+    ///   likely to be doing it.
+    /// * [`Self::commit_gate`] (T44). A fresh mutex would silently unserialize
+    ///   any writer holding the old permit.
+    /// * [`Self::commit_observer`] (T44). A test seam installed after boot; the
+    ///   same argument as the signer, with no production consequence.
+    /// * [`Self::commit_generation`] (T44). The receipt guard is only meaningful
+    ///   while generations are never reused, and `boot` restarts them at zero —
+    ///   which would make already-issued numbers issuable again. Carrying it
+    ///   keeps the sequence monotonic for the life of the process.
+    ///
+    /// # What is deliberately NOT carried
+    ///
+    /// Everything else, because everything else is the file: the DAG, the
+    /// account state, the read model, the Lamport clock, the leading comments,
+    /// the L-30 file hash, and the whole T44 file-shape block (`canonical_*`,
+    /// `pending_ids`, `force_compaction`). Discarding those *is* the L-13
+    /// reload. `author_id` and `file_path` are configuration too, and are
+    /// already carried by construction — [`Self::recover_failed_commit`] passes
+    /// them into `boot`, so a `set_author_id` made after boot survives, and
+    /// `journal_path` is re-derived from the same path.
+    fn adopt_reloaded(&mut self, reloaded: LedgerService) {
+        // Moved out of the old `self` before the assignment drops it.
+        let signer = self.signer.take();
+        let external_reconcile_count = self.external_reconcile_count;
+        let commit_gate = std::sync::Arc::clone(&self.commit_gate);
+        let commit_observer = self.commit_observer.take();
+        let commit_generation = self.commit_generation;
+
+        *self = reloaded;
+
+        self.signer = signer;
+        self.external_reconcile_count = external_reconcile_count;
+        self.commit_gate = commit_gate;
+        self.commit_observer = commit_observer;
+        self.commit_generation = commit_generation;
     }
 
     /// Adopt an out-of-band hand edit before a full-file persist overwrites it
@@ -8097,6 +8156,191 @@ mod tests {
         let receipt = first.commit().unwrap();
         svc.finish_commit(receipt);
         assert_eq!(svc.uncommitted_count(), 0);
+
+        remove_ledger_and_journal(&path);
+    }
+
+    // ── T44b: a reload replaces the CONTENT, never the SERVICE ───────────
+
+    /// A second hand edit, distinguishable from [`HAND_EDITED_TRANSACTION`] so
+    /// the G-Set does not dedupe it away.
+    const HAND_EDITED_SECOND_TRANSACTION: &str = "\n2024-01-16 * \"Shop\" \"Tea\"\n  \
+         Expenses:Food                                        3.25 USD\n  \
+         Assets:Cash                                         -3.25 USD\n";
+
+    /// The headline regression (T44b): a commit fails, L-13 recovers, and the
+    /// very next hand-edit adoption is **still signed**.
+    ///
+    /// Before this, the reload ran through `boot`, which sets `signer: None` —
+    /// so an adoption after a recovered commit failure persisted an entry with
+    /// no `openledger-signature`: in this node's DAG, in its `.bean`, in every
+    /// report, and refused by every signing peer forever. That is precisely the
+    /// silent split-brain L-11 (T40) closed, re-opened by the recovery path.
+    /// The L-30 reconcile counter rode along in the same reset, so both are
+    /// asserted here on one recovery.
+    ///
+    /// The failure seam is T44's: a read-only journal fails the append on the
+    /// real I/O path with no mocking, and stays readable so the reload can run.
+    #[cfg(unix)]
+    #[test]
+    fn t44b_a_recovered_commit_failure_keeps_the_signer_and_the_reconcile_count() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (mut svc, path) = boot_large_ledger();
+        let journal_path = svc.journal_path().to_path_buf();
+        svc.set_signer(marker_signer());
+        svc.open_account(
+            "Expenses:Food".to_owned(),
+            make_date(2024, 1, 1),
+            vec!["USD".to_owned()],
+        )
+        .unwrap();
+
+        // A hand edit adopted the ordinary way first, so the L-30 counter has a
+        // history that a reset would visibly destroy. Adoption always compacts,
+        // which is why the journal is (re-)created by the append below and not
+        // by this write.
+        append_to_file(&path, HAND_EDITED_TRANSACTION);
+        svc.open_account("Assets:Wallet".to_owned(), make_date(2024, 1, 2), vec![])
+            .unwrap();
+        assert_eq!(
+            svc.external_reconcile_count(),
+            1,
+            "the pre-failure adoption must have run"
+        );
+
+        // One append, so there is a journal to make unwritable.
+        svc.stage_remote_directive(remote_open("Assets:Vault", make_date(2024, 3, 1), 10))
+            .unwrap();
+        svc.persist_or_reload().unwrap();
+
+        let mut permissions = std::fs::metadata(&journal_path).unwrap().permissions();
+        permissions.set_mode(0o400);
+        std::fs::set_permissions(&journal_path, permissions).unwrap();
+
+        svc.stage_remote_directive(remote_open("Assets:Safe", make_date(2024, 3, 2), 11))
+            .unwrap();
+        let error = svc.persist_or_reload().unwrap_err();
+        assert_eq!(error.error_code(), "IO_ERROR", "got {error}");
+        assert!(
+            !svc.accounts().is_open("Assets:Safe"),
+            "L-13: the undurable write must have been rolled back, i.e. the reload ran"
+        );
+
+        // L-30: the counter is a fact about this process, not about the file it
+        // just re-read.
+        assert_eq!(
+            svc.external_reconcile_count(),
+            1,
+            "the reconcile counter must survive the L-13 reload"
+        );
+
+        let mut permissions = std::fs::metadata(&journal_path).unwrap().permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&journal_path, permissions).unwrap();
+
+        // L-11: the adoption AFTER the recovery must be signed exactly as one
+        // before it would have been.
+        append_to_file(&path, HAND_EDITED_SECOND_TRANSACTION);
+        assert_eq!(svc.reconcile_file().unwrap().new_directives, 1);
+
+        let adopted = svc
+            .dag()
+            .directives()
+            .into_iter()
+            .find(|directive| match directive {
+                Directive::Transaction(txn) => txn.narration.as_deref() == Some("Tea"),
+                _ => false,
+            })
+            .expect("the post-recovery hand edit must have been adopted");
+        let metadata = adopted.metadata();
+        let signature = metadata.get("openledger-signature").expect(
+            "an entry adopted after a recovered commit failure must be signed, or it will \
+             never replicate",
+        );
+        assert!(
+            signature.contains(&compute_content_id(adopted)),
+            "signature must cover the stored id: {signature}"
+        );
+        assert!(signature.contains("|true|"), "{signature}");
+        assert_eq!(metadata.get("openledger-author"), Some(&svc.author_id));
+        assert_eq!(
+            svc.external_reconcile_count(),
+            1,
+            "reconcile_file is not a persist-time adoption"
+        );
+
+        remove_ledger_and_journal(&path);
+    }
+
+    /// The carry helper itself, field by field: a reload discards the ledger's
+    /// content and keeps every handle that describes the service.
+    ///
+    /// `recover_failed_commit` is the workspace's **only** wholesale reload —
+    /// `persist_or_reload`/`compact` reach it through `commit_inline`, and the
+    /// node's async commit path through `commit_pending`/`prepare_or_recover` —
+    /// so this pins the one function all of them share.
+    #[test]
+    fn t44b_a_reload_replaces_the_content_and_keeps_the_service() {
+        let (mut svc, path) = boot_large_ledger();
+        svc.set_signer(marker_signer());
+
+        let fired = std::sync::Arc::new(AtomicU64::new(0));
+        let observer_count = std::sync::Arc::clone(&fired);
+        svc.set_commit_observer(std::sync::Arc::new(move |_kind, _bytes| {
+            observer_count.fetch_add(1, Ordering::SeqCst);
+        }));
+        let gate_before = svc.commit_gate();
+        // A stand-in for a history of adoptions; the end-to-end form of this
+        // assertion is in the headline test above.
+        svc.external_reconcile_count = 7;
+
+        svc.stage_remote_directive(remote_open("Assets:Vault", make_date(2024, 3, 1), 10))
+            .unwrap();
+        svc.persist_or_reload().unwrap();
+        let generation_before = svc.commit_generation;
+        let fired_before = fired.load(Ordering::SeqCst);
+        assert!(generation_before > 0, "a commit must have advanced it");
+        assert!(fired_before > 0, "the observer must have seen that commit");
+
+        // An undurable mutation, then the reload that discards it.
+        svc.stage_remote_directive(remote_open("Assets:Safe", make_date(2024, 3, 2), 11))
+            .unwrap();
+        svc.recover_failed_commit();
+
+        // The content is gone, down to the durable state.
+        assert_eq!(svc.uncommitted_count(), 0);
+        assert!(!svc.accounts().is_open("Assets:Safe"));
+        assert!(
+            svc.accounts().is_open("Assets:Vault"),
+            "the durable half must survive the reload"
+        );
+
+        // The service is intact.
+        assert!(svc.signer.is_some(), "L-11: the signer must survive");
+        assert_eq!(
+            svc.external_reconcile_count(),
+            7,
+            "L-30: the reconcile counter must survive"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&gate_before, &svc.commit_gate()),
+            "a fresh gate would silently unserialize a writer holding the old permit"
+        );
+        assert!(
+            svc.commit_generation >= generation_before,
+            "a commit generation must never be re-issued after a reload"
+        );
+
+        // The observer is a handle like any other: the next commit still fires.
+        svc.stage_remote_directive(remote_open("Assets:Deposit", make_date(2024, 3, 3), 12))
+            .unwrap();
+        svc.persist_or_reload().unwrap();
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            fired_before + 1,
+            "the commit observer must survive the reload too"
+        );
 
         remove_ledger_and_journal(&path);
     }
