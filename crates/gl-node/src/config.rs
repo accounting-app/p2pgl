@@ -86,10 +86,32 @@ pub struct NodeConfig {
     #[serde(default = "default_port")]
     pub port: u16,
 
-    /// Whether external (non-API) edits to `.bean` are accepted.
-    /// `"enabled"` or `"disabled"`. Default: `"disabled"`.
-    #[serde(default = "default_external_file_edits")]
-    pub external_file_edits: String,
+    /// Poll the `.bean` for hand edits and reconcile them promptly (§3.3,
+    /// CT-12). Default: `false`.
+    ///
+    /// This replaces `externalFileEdits`, which claimed to control something it
+    /// did not (M-19). What it gated, and all it ever gated, is the 250 ms file
+    /// watcher — the node's *proactive* half, which notices a hand edit and
+    /// folds it in without waiting for the next write.
+    ///
+    /// # What no setting controls, and why (M-19)
+    ///
+    /// Whether a hand edit is **adopted**. `LedgerService` re-reads and
+    /// reconciles the file immediately before the full-file rewrite that would
+    /// otherwise erase it (L-30 adopt-before-persist), and that is not a
+    /// feature to be switched off: it is only reachable on the path that is
+    /// about to overwrite the operator's bytes, so "off" would mean "destroy
+    /// the edit silently" rather than "ignore it". Refusing the write instead
+    /// would wedge every write on a node whose file was merely touched, and
+    /// both readings strand the T47/T51 quarantine, whose release runs through
+    /// the same reconcile. The README says so in the same words.
+    ///
+    /// Leaving this `false` therefore does not mean hand edits are ignored. It
+    /// means they are adopted at the next full rewrite rather than within
+    /// 250 ms, and that the node does not spend a read of the ledger file four
+    /// times a second to find out.
+    #[serde(default)]
+    pub watch_ledger_file: bool,
 
     /// Serve GraphiQL on `GET /graphql`. Default: `false`. Loopback only.
     #[serde(default = "default_graphiql")]
@@ -408,10 +430,6 @@ fn default_port() -> u16 {
     4000
 }
 
-fn default_external_file_edits() -> String {
-    "disabled".to_owned()
-}
-
 fn default_graphiql() -> bool {
     false
 }
@@ -545,6 +563,44 @@ fn default_tls_mode() -> String {
     "disabled".to_owned()
 }
 
+/// Config keys this node no longer accepts, each with the sentence an operator
+/// needs in order to act on it (M-19).
+///
+/// `deny_unknown_fields` already refuses them — with serde's "unknown field"
+/// message, which is accurate and tells an operator whose node stopped booting
+/// after an upgrade nothing about what to do. A removed key is the one case
+/// where the node knows exactly what the operator meant, so it says so. The
+/// node still fails closed: a config carrying a key that no longer means what
+/// it says is not silently ignored.
+const REMOVED_CONFIG_KEYS: [(&str, &str); 1] = [(
+    "externalFileEdits",
+    "it never controlled whether hand edits to the .bean were adopted — adoption \
+     is unconditional by design, because the only alternative is destroying the \
+     edit during the node's own full-file rewrite (M-19). The one thing it gated \
+     was the poll-and-reconcile file watcher: set \"watchLedgerFile\": true for \
+     that, or drop the key",
+)];
+
+/// Refuse a config that still carries a removed key, by name (M-19).
+///
+/// Runs before the typed parse, so the removed key wins over serde's generic
+/// unknown-field complaint. Anything that is not a JSON object is left to the
+/// typed parse, whose error carries a line and column.
+fn reject_removed_config_keys(content: &str) -> Result<(), ConfigError> {
+    let Ok(serde_json::Value::Object(keys)) = serde_json::from_str::<serde_json::Value>(content)
+    else {
+        return Ok(());
+    };
+    for (key, guidance) in REMOVED_CONFIG_KEYS {
+        if keys.contains_key(key) {
+            return Err(ConfigError::Validation(format!(
+                "{key} is no longer a configuration key: {guidance}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Errors that can occur during configuration loading or validation.
 #[derive(Debug)]
 pub enum ConfigError {
@@ -618,6 +674,7 @@ impl NodeConfig {
         let mut content = String::new();
         file.read_to_string(&mut content)
             .map_err(ConfigError::FileRead)?;
+        reject_removed_config_keys(&content)?;
         let mut config: NodeConfig = serde_json::from_str(&content).map_err(ConfigError::Parse)?;
 
         let file_api_key_set = !config.auth.api_key.is_empty();
@@ -650,15 +707,6 @@ impl NodeConfig {
     /// Validate boot-time invariants per §3.11.
     fn validate(&self) -> Result<(), ConfigError> {
         Self::validate_ledger_path(&self.ledger_path)?;
-
-        match self.external_file_edits.as_str() {
-            "enabled" | "disabled" => {}
-            other => {
-                return Err(ConfigError::Validation(format!(
-                    "externalFileEdits must be \"enabled\" or \"disabled\", got \"{other}\""
-                )));
-            }
-        }
 
         if self.graphiql && self.binds_non_loopback() {
             return Err(ConfigError::Validation(
@@ -1182,7 +1230,10 @@ mod tests {
         assert_eq!(config.ledger_path, "./data/ledger.bean");
         assert_eq!(config.bind_address, "127.0.0.1");
         assert_eq!(config.port, 4000);
-        assert_eq!(config.external_file_edits, "disabled");
+        assert!(
+            !config.watch_ledger_file,
+            "the file watcher is off by default (M-19)"
+        );
         assert!(!config.graphiql, "GraphiQL off by default");
         assert!(config.cors.allowed_origins.is_empty());
         assert!(!config.auth.enabled);
@@ -1201,7 +1252,7 @@ mod tests {
             "ledgerPath": "./data/ledger.bean",
             "bindAddress": "0.0.0.0",
             "port": 8080,
-            "externalFileEdits": "disabled",
+            "watchLedgerFile": true,
             "cors": {{ "allowedOrigins": ["http://localhost:8080"] }},
             "allowedHosts": ["ledger.example.com"],
             "trustedProxies": ["10.0.0.1"],
@@ -1223,7 +1274,7 @@ mod tests {
         let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
         assert_eq!(config.bind_address, "0.0.0.0");
         assert_eq!(config.port, 8080);
-        assert_eq!(config.external_file_edits, "disabled");
+        assert!(config.watch_ledger_file);
         assert_eq!(config.cors.allowed_origins, vec!["http://localhost:8080"]);
         assert_eq!(config.allowed_hosts, vec!["ledger.example.com"]);
         assert_eq!(config.trusted_proxies, vec!["10.0.0.1"]);
@@ -1271,15 +1322,41 @@ mod tests {
         assert!(error_message.contains("apiKey"));
     }
 
+    /// M-19: the removed key is refused by name, with the replacement spelled
+    /// out — not with serde's generic "unknown field".
     #[test]
-    fn test_invalid_external_file_edits_rejected() {
-        let file = write_temp_config(
-            r#"{ "ledgerPath": "./data/ledger.bean", "externalFileEdits": "maybe" }"#,
-        );
-        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
-        assert!(result.is_err());
-        let error_message = format!("{}", result.unwrap_err());
-        assert!(error_message.contains("externalFileEdits"));
+    fn m19_removed_external_file_edits_key_is_refused_with_guidance() {
+        for value in ["\"disabled\"", "\"enabled\"", "\"maybe\"", "true"] {
+            let file = write_temp_config(&format!(
+                r#"{{ "ledgerPath": "./data/ledger.bean", "externalFileEdits": {value} }}"#
+            ));
+            let result = NodeConfig::load_from_path(&file.path().to_path_buf());
+            let error_message = format!(
+                "{}",
+                result.expect_err("a config carrying the removed key must not boot")
+            );
+            assert!(
+                error_message.contains("externalFileEdits"),
+                "the refusal must name the key: {error_message}"
+            );
+            assert!(
+                error_message.contains("watchLedgerFile"),
+                "the refusal must name the replacement: {error_message}"
+            );
+            assert!(
+                error_message.contains("M-19"),
+                "the refusal must cite the finding: {error_message}"
+            );
+        }
+    }
+
+    /// M-19: and the setting really is gone — it is not merely undocumented.
+    #[test]
+    fn m19_the_watcher_switch_is_the_only_file_edit_setting() {
+        let file =
+            write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean", "watchLedgerFile": true }"#);
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        assert!(config.watch_ledger_file);
     }
 
     #[test]

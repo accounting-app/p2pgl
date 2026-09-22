@@ -36,7 +36,7 @@ use tokio::signal;
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Explicit GraphQL HTTP body cap (M-7), enforced by `RequestBodyLimitLayer`,
 /// which wraps the request body itself: an oversized payload is refused with
@@ -392,8 +392,15 @@ async fn main() {
         ));
     }
 
-    // Start file watcher if external edits enabled (§3.3, CT-12).
-    let file_watcher_handle = if config.external_file_edits == "enabled" {
+    // Start the file watcher if the operator asked for it (§3.3, CT-12).
+    //
+    // M-19: this switch is `watchLedgerFile`, and it gates the watcher and
+    // nothing else — which is all its predecessor `externalFileEdits` ever
+    // gated either, while being documented as the master switch for adopting
+    // hand edits. Adoption itself is unconditional: see
+    // `LedgerService::adopt_external_edits` for why "off" could only mean
+    // "destroy the operator's edit during our own rewrite".
+    let file_watcher_handle = if config.watch_ledger_file {
         let watcher_ledger = shared_ledger.clone();
         let watcher_path = ledger_path.clone();
         let handle = tokio::spawn(async move {
@@ -406,6 +413,31 @@ async fn main() {
                 let current = FileState::from_path(&watcher_path);
                 let change = current.detect_change(&last_state);
                 if change == FileChangeKind::Modified {
+                    // M-29: self-write suppression. Every commit this node makes
+                    // to the canonical file is a `Modified` here, and without
+                    // this check the watcher answered it by taking the write
+                    // permit and the write lock and re-parsing the entire
+                    // ledger to discover that all of it was already in the DAG
+                    // — while `reconcile_content` cleared `canonical_is_current`
+                    // on the way out, which forced the NEXT commit to be a full
+                    // compaction, which the watcher then saw as another change.
+                    // T44's append path was off for the life of the process
+                    // after one tick.
+                    //
+                    // The hash is the one already computed by the poll above, so
+                    // suppression costs a read lock and a string compare. The
+                    // service-side short-circuit in `reconcile_file_staged`
+                    // backs it up for anything this misses (a BOM'd file, an
+                    // over-cap one).
+                    let is_own_write = match current.content_hash_hex() {
+                        Some(hash) => watcher_ledger.read().await.file_hash_is_current(&hash),
+                        None => false,
+                    };
+                    if is_own_write {
+                        debug!("ledger file change is this node's own write — not reconciling");
+                        last_state = current;
+                        continue;
+                    }
                     info!("external edit detected — reconciling");
                     // T44: the same permit → lock → prepare → unlock → commit
                     // sequence the mutations use. A reconcile always compacts

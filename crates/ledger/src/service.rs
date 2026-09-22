@@ -2845,6 +2845,14 @@ impl LedgerService {
             // L-30 / L-12: this is the write that would erase a hand edit, so
             // this is where the exact check belongs — re-read, re-hash, and
             // reconcile the edit in before serializing over it.
+            //
+            // M-19: unconditional, and deliberately not configurable. See
+            // `adopt_external_edits` for the argument; the short version is
+            // that this call is reachable only from the write that is about to
+            // overwrite the operator's bytes, so there is no "off" that means
+            // "ignore the edit" — only one that means "destroy it silently".
+            // `gl-node` used to advertise `externalFileEdits: "disabled"` as
+            // that switch; the setting is gone (it never reached this line).
             self.adopt_external_edits()?;
             // H-08: DAG ∪ quarantine, not the DAG alone. This is the single
             // production write that replaces the whole `.bean`, so it is the
@@ -3256,6 +3264,38 @@ impl LedgerService {
     /// refused here again for the same reason, and is written back by the
     /// re-persist rather than dropped (H-08).
     ///
+    /// # Not configurable, by design (M-19)
+    ///
+    /// `gl-node` shipped `externalFileEdits: "enabled" | "disabled"`, defaulted
+    /// it to `"disabled"`, and the README said adoption "requires
+    /// `"externalFileEdits": "enabled"`". No such gate ever existed on this
+    /// path: the value's only reader gated the node's file *watcher*. That was
+    /// false assurance, and the fix was to delete the setting rather than to
+    /// honour it, because neither reading of "honour it" is a behaviour worth
+    /// shipping:
+    ///
+    /// * **Skip the adoption.** The compaction still rewrites the whole file
+    ///   from memory, so the operator's edit is not *ignored*, it is
+    ///   *destroyed* — with no error, no log line and no trace. That is exactly
+    ///   the L-30 defect this function exists to close, re-armed and made the
+    ///   default.
+    /// * **Refuse the write.** Fail-closed on any changed file wedges every
+    ///   write on a node whose `.bean` was edited at all, by default, and the
+    ///   only way out is an operator who knows to restart the node.
+    ///
+    /// Both also strand the quarantine. A record boot refused (H-08) or a block
+    /// that never parsed (L-45) LEAVES quarantine by being repaired in the file
+    /// and re-derived here — that is what [`Self::reconcile_content`] means by
+    /// "the raw-text analogue of `release_quarantined_now_in_dag`". With
+    /// adoption disabled, the repair is never read: T47/T51's quarantined
+    /// records would be retained verbatim on every rewrite, forever, with no
+    /// operator action able to release them.
+    ///
+    /// What the operator does control is the node's *proactive* half — whether
+    /// it polls the file and folds an edit in within 250 ms instead of at the
+    /// next rewrite. That is `gl-node`'s `watchLedgerFile`, which is named for
+    /// what it does.
+    ///
     /// # T44: called from the compaction path only
     ///
     /// This is `O(file)` — a read, a hash, and on a mismatch a full reconcile —
@@ -3423,15 +3463,54 @@ impl LedgerService {
     /// the next commit as a forced compaction. The caller drives that commit —
     /// `reconcile_file` does it inline, the node's file watcher does it off the
     /// ledger write lock.
+    ///
+    /// # The identical-bytes short-circuit (M-29)
+    ///
+    /// [`Self::adopt_external_edits`] has always compared the file's hash
+    /// against [`Self::last_file_hash`] and returned on a match; this path did
+    /// not, and it is the one the file watcher drives — under the **write**
+    /// lock, four times a second, on every change including the node's own
+    /// writes. So a self-write cost a full `parse_file` plus a content id per
+    /// directive with readers blocked, to discover that every directive was a
+    /// duplicate.
+    ///
+    /// The two entry points now carry the same guard in the same shape. The
+    /// probe is re-baselined from this read either way, so an editor that
+    /// merely touched the mtime does not escalate the next append.
     pub fn reconcile_file_staged(
         &mut self,
     ) -> Result<crate::file_watcher::ReconcileResult, ServiceError> {
         let content = read_ledger_file(&self.file_path)?;
+        self.canonical_marker = FileMarker::of(&self.file_path);
+        self.canonical_bytes = content.len() as u64;
+        if file_content_hash(&content) == self.last_file_hash {
+            return Ok(crate::file_watcher::ReconcileResult {
+                new_directives: 0,
+                duplicates: 0,
+                rejected: 0,
+            });
+        }
         let result = self.reconcile_content(&content)?;
         if result.new_directives > 0 {
             self.force_compaction = true;
         }
         Ok(result)
+    }
+
+    /// Is `hash` — lowercase-hex SHA-256 of the canonical file's bytes — the
+    /// text this service last wrote to, or last read from, the `.bean`? (M-29)
+    ///
+    /// The file watcher's self-write suppression. The watcher has already
+    /// hashed the bytes it polled; this lets it answer "that change was us"
+    /// against a **read** lock and skip the write permit, the write lock and
+    /// the reconcile entirely, rather than taking all three to be told that
+    /// every directive it just re-parsed was a duplicate.
+    ///
+    /// Conservative in the cheap direction: a `false` answer costs one wasted
+    /// reconcile, which the short-circuit in [`Self::reconcile_file_staged`]
+    /// then catches with this service's own hash of its own read.
+    pub fn file_hash_is_current(&self, hash: &str) -> bool {
+        hash == self.last_file_hash
     }
 
     /// Union-merge already-read file text into memory — the body of
@@ -3463,12 +3542,34 @@ impl LedgerService {
         // hand-edit check (L-30). T44: and the cheap `stat` probe's baseline
         // too, so the facts this service holds about the canonical file are
         // refreshed together and cannot drift.
-        self.last_file_hash = file_content_hash(content);
+        let content_hash = file_content_hash(content);
+        // M-29: is this text the one this service itself last wrote (or read)?
+        let is_own_bytes = content_hash == self.last_file_hash;
+        self.last_file_hash = content_hash;
         self.canonical_bytes = content.len() as u64;
         self.canonical_marker = FileMarker::of(&self.file_path);
         // Whatever is on disk right now came from a text editor, not from this
         // service's serializer: it needs canonicalising, not appending to.
-        self.canonical_is_current = false;
+        //
+        // M-29: unless it did come from this service's serializer. The clear
+        // was unconditional, and `prepare` turns `canonical_is_current = false`
+        // into a forced rewrite — so ONE watcher tick over the node's own
+        // compaction output permanently demoted every subsequent commit from
+        // T44's `Append` to a full `Compact`, and each of those compactions
+        // rewrote the file, which the watcher saw, which cleared the flag
+        // again. A self-sustaining loop that turned the append-only path off
+        // for the life of the process, entered by the node writing its own
+        // file.
+        //
+        // Setting it, never clearing it, is the correct asymmetry: this
+        // function learns "the file is not canonical" but never learns "it is"
+        // — only a compaction this service performed knows that, and
+        // `finish_commit` is where it is recorded. So identical bytes leave the
+        // flag exactly as it was: still `false` after boot (which read a file
+        // it did not write), still `true` after a compaction.
+        if !is_own_bytes {
+            self.canonical_is_current = false;
+        }
 
         // L-45: the file this reconcile is reading contains, at its tail,
         // whatever boot could not parse — `compaction_text` puts it back on
@@ -7453,7 +7554,7 @@ mod tests {
         // Record the last-write hash.
         let original_content = std::fs::read_to_string(&path).unwrap();
         let config = FileWatcherConfig {
-            external_edits_enabled: false,
+            watch_enabled: false,
             ..Default::default()
         };
 
@@ -7478,11 +7579,10 @@ mod tests {
             "CT-11: External file modification must be detectable by content hash"
         );
 
-        // The config flag is correctly set to disabled.
-        assert!(
-            !config.external_edits_enabled,
-            "CT-11: external_edits_enabled must be false"
-        );
+        // The config flag is correctly set to disabled. M-19 renamed it from
+        // `external_edits_enabled`: what it gates is the polling, not whether
+        // an edit is accepted, and CT-11's contract is the detection above.
+        assert!(!config.watch_enabled, "CT-11: the watcher must be off");
 
         std::fs::remove_file(path).ok();
     }
@@ -10703,6 +10803,255 @@ mod tests {
             fired.load(Ordering::SeqCst),
             fired_before + 1,
             "the commit observer must survive the reload too"
+        );
+
+        remove_ledger_and_journal(&path);
+    }
+
+    // ── T52: the `.bean` as an operator-edit interface (M-19 / M-25 / M-29) ──
+
+    /// M-19: adoption on the compaction path is unconditional, and there is no
+    /// setting anywhere in this workspace that changes it.
+    ///
+    /// `gl-node` advertised `externalFileEdits: "disabled"` — the default — as
+    /// the switch that turned this off, and the README said adoption "requires
+    /// `"externalFileEdits": "enabled"`". It never reached this code. The
+    /// setting is gone rather than honoured; this pins the behaviour it was
+    /// falsely describing, so a future "make it configurable" has to delete an
+    /// assertion that says why not.
+    #[test]
+    fn m19_a_hand_edit_is_adopted_on_the_compaction_path() {
+        let (mut svc, path) = setup_with_accounts();
+        assert!(
+            svc.canonical_bytes() < COMPACTION_MIN_CANONICAL_BYTES,
+            "premise: a small ledger, so every commit is a compaction"
+        );
+        append_to_file(&path, HAND_EDITED_TRANSACTION);
+
+        // An ordinary write. Nothing here asks for a reconcile.
+        svc.append_transaction(balanced_input()).unwrap();
+
+        assert_eq!(
+            svc.external_reconcile_count(),
+            1,
+            "M-19: the compaction path adopts, with no configuration consulted"
+        );
+        let adopted = transactions_on_disk(&path)
+            .into_iter()
+            .find(|transaction| transaction.narration.as_deref() == Some("Coffee"))
+            .expect("M-19: the hand edit must survive the rewrite that would have erased it");
+        assert_eq!(adopted.payee.as_deref(), Some("Shop"));
+
+        remove_ledger_and_journal(&path);
+    }
+
+    /// M-19, the reason the setting could not simply be honoured: the
+    /// compaction path is also how a quarantined record is RELEASED (T47/T51).
+    ///
+    /// Disabling adoption would have made the operator's repair unreadable, so
+    /// the record would be retained verbatim on every rewrite forever with no
+    /// way out. This drives the release through a plain `compact()` — no
+    /// `reconcile_file` call — so the release really is running inside
+    /// `adopt_external_edits`.
+    #[test]
+    fn m19_a_quarantined_record_is_released_by_the_compaction_path() {
+        let (mut svc, path) = setup_with_accounts();
+        let mut input = balanced_input();
+        input.date = make_date(2024, 2, 1);
+        input.narration = Some("Self parent".to_owned());
+        let txid = svc.append_transaction(input).unwrap().txid;
+        drop(svc);
+
+        // Break it exactly as T47/T51's quarantine tests do: a transaction that
+        // names itself as a parent is a one-node cycle, so boot refuses it and
+        // holds it rather than deleting it (H-08).
+        let content = std::fs::read_to_string(&path).unwrap();
+        let broken = content.replace(
+            "openledger-parents: \"\"",
+            &format!("openledger-parents: \"{txid}\""),
+        );
+        assert_ne!(broken, content, "the parents line must have been rewritten");
+        std::fs::write(&path, &broken).unwrap();
+
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert_eq!(svc.quarantined_count(), 1, "premise: it is quarantined");
+
+        // The operator repairs the file and the node simply writes, as it does
+        // at shutdown or on the next mutation.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        let repaired = on_disk.replace(
+            &format!("openledger-parents: \"{txid}\""),
+            "openledger-parents: \"\"",
+        );
+        assert_ne!(repaired, on_disk, "the repair must have changed the file");
+        std::fs::write(&path, &repaired).unwrap();
+
+        svc.compact().unwrap();
+
+        assert_eq!(
+            svc.quarantined_count(),
+            0,
+            "M-19: the repair is read by the compaction path's adoption, so the record \
+             leaves quarantine — this is what disabling adoption would have stranded"
+        );
+        assert!(svc.get_directive(&txid).is_some());
+        assert_eq!(
+            transactions_on_disk(&path).len(),
+            1,
+            "and it is written exactly once, not once per copy"
+        );
+
+        remove_ledger_and_journal(&path);
+    }
+
+    /// M-25 at the service level: a truncated hand edit is refused, not adopted
+    /// and written back short.
+    ///
+    /// `open Assets:Vault USD AND MORE JUNK` used to parse cleanly as
+    /// `open Assets:Vault USD`. Reconcile adopted THAT, signed it with this
+    /// node's key and the compaction rewrote the file without the tail — no
+    /// error, no rejection tally, nothing for the operator to find. Now the
+    /// file does not parse, which is the same fail-closed treatment a
+    /// half-saved edit has always had: the write is abandoned and the
+    /// operator's bytes stay on disk.
+    #[test]
+    fn m25_a_truncated_hand_edit_is_refused_not_adopted() {
+        let (mut svc, path) = setup_with_accounts();
+        append_to_file(&path, "\n2024-02-01 open Assets:Vault USD AND MORE JUNK\n");
+
+        let (outcome, logged) = capture_warnings(|| svc.append_transaction(balanced_input()));
+        let error = outcome.expect_err(
+            "M-25: a line the parser cannot read in full must block the write, not be \
+             silently truncated into a different directive",
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("AND MORE JUNK"),
+            "the refusal must quote what it could not read: {rendered}"
+        );
+        assert!(
+            logged.contains("repair the file"),
+            "the operator must be told what to do: {logged}"
+        );
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            on_disk.contains("2024-02-01 open Assets:Vault USD AND MORE JUNK"),
+            "M-25: the operator's exact text must still be there, not a truncated \
+             re-spelling of it:\n{on_disk}"
+        );
+        assert!(
+            !svc.accounts().is_open("Assets:Vault"),
+            "M-25: and the truncated reading must not have been adopted"
+        );
+
+        remove_ledger_and_journal(&path);
+    }
+
+    /// M-29, the finding's proof inverted.
+    ///
+    /// Proven on a 138 KB ledger: `Some(Append)` ×4 became `Some(Compact)` ×4
+    /// after one watcher tick, because `reconcile_content` cleared
+    /// `canonical_is_current` unconditionally and `prepare` turns that into a
+    /// forced rewrite — a loop the node entered by writing its own file.
+    #[test]
+    fn m29_a_watcher_tick_over_our_own_bytes_keeps_the_append_path() {
+        let (mut svc, path) = boot_large_ledger();
+
+        let mut kinds = Vec::new();
+        let take_one_commit = |svc: &mut LedgerService, index: usize| {
+            let mut input = balanced_input();
+            input.date = make_date(2024, 4, 1);
+            input.narration = Some(format!("Before {index}"));
+            svc.append_transaction_staged(input, |_, _, _| None)
+                .unwrap();
+            let pending = svc.prepare_commit().unwrap().expect("something is staged");
+            let kind = pending.kind();
+            let receipt = pending.commit().unwrap();
+            svc.finish_commit(receipt);
+            kind
+        };
+
+        for index in 0..4 {
+            kinds.push(take_one_commit(&mut svc, index));
+        }
+        assert_eq!(
+            kinds,
+            vec![CommitKind::Append; 4],
+            "premise: a ledger past the threshold appends"
+        );
+
+        // One watcher tick over the file the node itself wrote. This is the
+        // exact call `gl-node`'s watcher makes.
+        let result = svc.reconcile_file_staged().unwrap();
+        assert_eq!(result.new_directives, 0);
+        assert_eq!(
+            result.duplicates, 0,
+            "M-29: the short-circuit means nothing was even re-parsed to be called a \
+             duplicate"
+        );
+
+        // And a tick before every subsequent commit, which is what a 250 ms
+        // poll actually does: that is what made the pre-fix behaviour
+        // self-sustaining rather than a one-off — each forced compaction
+        // rewrote the file, which the next tick saw as a change, which forced
+        // the next compaction.
+        let after: Vec<CommitKind> = (0..4)
+            .map(|i| {
+                svc.reconcile_file_staged().unwrap();
+                take_one_commit(&mut svc, 10 + i)
+            })
+            .collect();
+        assert_eq!(
+            after,
+            vec![CommitKind::Append; 4],
+            "M-29: a tick over our own bytes must not demote T44's append path to a \
+             full rewrite — this is the assertion the finding's proof failed"
+        );
+
+        remove_ledger_and_journal(&path);
+    }
+
+    /// M-29: and a tick over bytes that really did change still reconciles.
+    ///
+    /// The short-circuit must be a hash comparison, not a way of never looking.
+    #[test]
+    fn m29_a_watcher_tick_over_a_real_edit_still_reconciles() {
+        let (mut svc, path) = setup_with_accounts();
+        svc.compact().unwrap();
+        assert_eq!(svc.reconcile_file_staged().unwrap().new_directives, 0);
+
+        append_to_file(&path, HAND_EDITED_TRANSACTION);
+        assert_eq!(
+            svc.reconcile_file_staged().unwrap().new_directives,
+            1,
+            "M-29: a genuine edit must still be adopted"
+        );
+
+        remove_ledger_and_journal(&path);
+    }
+
+    /// M-29: the predicate the watcher uses to recognise its own write, against
+    /// the hash the watcher actually computes.
+    #[test]
+    fn m29_the_self_write_predicate_agrees_with_the_watchers_hash() {
+        let (mut svc, path) = setup_with_accounts();
+        svc.compact().unwrap();
+
+        let polled = crate::file_watcher::FileState::from_path(&path);
+        let hash = polled
+            .content_hash_hex()
+            .expect("the watcher must have hashed a readable file");
+        assert!(
+            svc.file_hash_is_current(&hash),
+            "M-29: the file the node just wrote must be recognised as its own write"
+        );
+
+        append_to_file(&path, HAND_EDITED_TRANSACTION);
+        let edited = crate::file_watcher::FileState::from_path(&path);
+        assert!(
+            !svc.file_hash_is_current(&edited.content_hash_hex().unwrap()),
+            "M-29: a hand edit must not be suppressed as a self-write"
         );
 
         remove_ledger_and_journal(&path);

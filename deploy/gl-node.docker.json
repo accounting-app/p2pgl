@@ -27,6 +27,5 @@
         "antiEntropyIntervalMilliseconds": 5000,
         "swarmTopic": "openledger/docker-dev",
         "relayMode": "disabled"
-    },
-    "externalFileEdits": "disabled"
+    }
 }

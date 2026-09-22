@@ -395,7 +395,7 @@ boot if it is missing — the node will not start half-hardened.
   "ledgerPath": "./data/company.bean",
   "bindAddress": "0.0.0.0",
   "port": 4000,
-  "externalFileEdits": "disabled",
+  "watchLedgerFile": false,
   "graphiql": false,
   "cors": { "allowedOrigins": [] },
   "allowedHosts": ["ledger.example.com"],
@@ -432,7 +432,7 @@ boot if it is missing — the node will not start half-hardened.
 | `ledgerPath` | **(required)** | Path to the `.bean` file |
 | `bindAddress` | `"127.0.0.1"` | HTTP listen address |
 | `port` | `4000` | HTTP listen port |
-| `externalFileEdits` | `"disabled"` | Accept hand-edits to the `.bean` file — see [Editing the `.bean` file](#editing-the-bean-file-by-hand) |
+| `watchLedgerFile` | `false` | Poll the `.bean` every 250 ms and fold a hand edit in promptly. It does **not** control whether a hand edit is accepted — nothing does — see [Editing the `.bean` file](#editing-the-bean-file-by-hand) |
 | `graphiql` | `false` | GraphiQL playground; refused outright on a non-loopback bind |
 | `cors.allowedOrigins` | `[]` | Browser origin allowlist; `"*"` is rejected |
 | `allowedHosts` | `[]` | Extra `Host` header values accepted, beyond loopback and the bind address. **Required (non-empty) on a non-loopback bind** — see below |
@@ -627,9 +627,31 @@ lost, and so is one made by an editor that replaces the file's inode rather than
 writing through it. There is no window in which concurrent editing is correct —
 only a window that is now smaller.
 
-When an edit *is* adopted (which requires `"externalFileEdits": "enabled"`), it
-is treated exactly as a local API write by the same operator, because that is
-the authority it carries — same machine, same file, same trust boundary:
+**There is no setting that turns adoption off, and there never was.** This
+README used to say adoption required `"externalFileEdits": "enabled"`; that
+setting gated the 250 ms file watcher and nothing else, so an operator who set
+the documented opt-out — which was also the default — got no control at all.
+The key is gone (a config that still carries it is refused at boot, by name,
+with the replacement spelled out), and what it really gated is now
+`watchLedgerFile`.
+
+Adoption itself is not configurable, on purpose. Adopt-before-persist runs
+*inside* the write that is about to replace the whole file, so "off" could not
+mean "ignore the edit" — only "destroy it silently", which is the bug the
+mechanism exists to fix. Refusing the write instead would wedge every write on
+a node whose file was edited at all. Both readings also strand the quarantine:
+a record the node refused at boot, or a block it could not parse, is held
+verbatim and leaves only by being repaired **in the file** and re-read by this
+same path.
+
+So `watchLedgerFile: false` (the default) does not mean hand edits are ignored.
+It means they are adopted at the node's next full rewrite rather than within
+250 ms, and that the node does not read the ledger file four times a second to
+find out.
+
+When an edit is adopted it is treated exactly as a local API write by the same
+operator, because that is the authority it carries — same machine, same file,
+same trust boundary:
 
 - Entries are canonicalized and re-ordered the way boot orders them, so where
   you pasted something in the file does not change the result.
@@ -641,7 +663,12 @@ the authority it carries — same machine, same file, same trust boundary:
 - Entries that fail validation are dropped, each logged with its content id and
   the reason, before the canonical rewrite removes them from the file.
 - A file that no longer **parses** blocks writes until a human fixes it, rather
-  than being canonicalized on top of a half-saved edit.
+  than being canonicalized on top of a half-saved edit. A line the parser
+  cannot read *in full* counts as not parsing: trailing tokens it does not
+  understand are refused, naming the text it could not read, rather than being
+  dropped so that the shorter line left over is adopted and written back in
+  place of what you typed. Comments and trailing whitespace are still fine
+  everywhere they were before.
 
 ---
 

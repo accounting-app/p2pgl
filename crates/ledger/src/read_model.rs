@@ -5,7 +5,7 @@
 
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::hash::compute_content_id;
 use crate::model::*;
@@ -56,6 +56,28 @@ pub struct IncomeStatementReport {
     pub income: Vec<AccountBalanceEntry>,
     pub expenses: Vec<AccountBalanceEntry>,
     pub net: CurrencyBalances,
+}
+
+/// Result of one batched balances-at-date sweep ([`ReadModel::balances_at_dates`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchedBalances {
+    /// One answer per query, in the order the queries were supplied.
+    ///
+    /// `None` where the account had no priced posting on or before its query
+    /// date — the same thing [`ReadModel::account_balance`] returns for an
+    /// account it has never seen, which callers read as a balance of `0`.
+    pub entries: Vec<Option<AccountBalanceEntry>>,
+    /// Postings the sweep walked, across the whole batch.
+    ///
+    /// This is the measured cost model the GraphQL `verify` weight is derived
+    /// from (M-23), which is why it is reported rather than left implicit: the
+    /// invariant that weight rests on is that this number is a property of the
+    /// *ledger* (and the latest query date), not of the query count. T32 broke
+    /// exactly that invariant, and a comment did not catch it — a test reading
+    /// this number does. See
+    /// `read_model::tests::test_batched_sweep_cost_is_independent_of_query_count`
+    /// and `graphql::query::tests::test_verify_complexity_matches_measured_cost_model`.
+    pub postings_visited: usize,
 }
 
 /// A transaction with its computed content ID.
@@ -417,6 +439,125 @@ impl ReadModel {
         })
     }
 
+    /// Balances for many `(account, date)` pairs, from **one** date-ordered
+    /// sweep of the ledger (M-23).
+    ///
+    /// Answers exactly what calling [`Self::account_balance(account,
+    /// Some(date))`](Self::account_balance) once per pair answers — including
+    /// `None` for an account with no priced postings on or before its date —
+    /// but walks the transactions once in total instead of once per pair.
+    ///
+    /// # Why this exists
+    ///
+    /// T32 wired balance assertions into `verify` (M-08) by calling
+    /// `account_balance(acct, Some(date))` per `balance` directive. Each of
+    /// those calls rebuilt the **whole-ledger** balance map — every transaction,
+    /// every posting, a `String` allocated per account and per currency — and
+    /// then kept one entry. That made `verify`
+    /// O(assertions × transactions × postings), and the assertion count is
+    /// attacker-supplied: `balance` directives are ~250 bytes, carry no
+    /// lifecycle check, and need not name an account that exists. The 0922
+    /// audit measured perfect quadratic scaling (171 ms / 656 ms / 2.61 s at
+    /// 1000², 2000², 4000²) and >100k plantable assertions under the file cap.
+    ///
+    /// # Shape
+    ///
+    /// Queries are visited in ascending date order against a cursor into the
+    /// date-ordered transactions, so the running totals are only ever carried
+    /// *forward*: each query's snapshot is taken after advancing the cursor
+    /// through every transaction dated `<= its date`. Only accounts some query
+    /// asks about are accumulated, and their keys are borrowed from the query
+    /// set rather than cloned per posting.
+    ///
+    /// Cost is O(T·P + Q log Q + T log T) — linear in the ledger, with the
+    /// assertion count no longer multiplying it. The `T log T` term is paid
+    /// only when the transaction vector is actually out of date order (see
+    /// [`Self::date_ordered_transactions`]).
+    ///
+    /// # Semantics preserved from T32 (pinned by
+    /// `checkpoint::tests::test_batched_assertions_match_per_assertion_evaluation`)
+    ///
+    /// - **`<= date`**: a transaction dated *on* the query date is included.
+    ///   This is deliberately not beancount's start-of-day rule; see
+    ///   [`crate::checkpoint::evaluate_balance_assertion`].
+    /// - **Same-date queries** all see the same cut: advancing the cursor for
+    ///   the first one leaves nothing for the rest to advance.
+    /// - **Unknown accounts** yield `None`, which callers read as `0` — so
+    ///   `balance Assets:Unknown 0 USD` still passes.
+    /// - Postings with no amount contribute nothing and create no entry, as in
+    ///   [`Self::balances_at`].
+    pub fn balances_at_dates(&self, queries: &[(&str, NaiveDate)]) -> BatchedBalances {
+        let mut entries: Vec<Option<AccountBalanceEntry>> = vec![None; queries.len()];
+        if queries.is_empty() {
+            return BatchedBalances {
+                entries,
+                postings_visited: 0,
+            };
+        }
+
+        // The accounts anyone asked about. Accumulating only these keeps the
+        // running map bounded by the query set rather than by the ledger's
+        // account count, and lets every posting reuse a key borrowed from here
+        // instead of allocating a `String` (M-23).
+        let wanted: HashSet<&str> = queries.iter().map(|&(account, _)| account).collect();
+
+        // Query visit order: ascending by date. Stable, so two queries on the
+        // same date keep their input order — irrelevant to the answer, but it
+        // keeps the sweep deterministic.
+        let mut visit: Vec<usize> = (0..queries.len()).collect();
+        visit.sort_by_key(|&i| queries[i].1);
+
+        let order = self.date_ordered_transactions();
+        let mut running: HashMap<&str, CurrencyBalances> = HashMap::new();
+        let mut cursor = 0usize;
+        let mut postings_visited = 0usize;
+
+        for &query in &visit {
+            let (account, at) = queries[query];
+
+            // Carry the running totals forward to this query's date. The
+            // cursor never rewinds, which is what makes the whole batch one
+            // pass rather than one pass each.
+            while cursor < order.len() {
+                let txn = &self.transactions[order[cursor]].transaction;
+                if txn.date > at {
+                    break;
+                }
+                for posting in &txn.postings {
+                    postings_visited += 1;
+                    let Some(ref amount) = posting.amount else {
+                        continue;
+                    };
+                    // `get` rather than `contains`: it hands back the `&str`
+                    // owned by `queries`, so the running map's key costs no
+                    // allocation.
+                    let Some(&key) = wanted.get(posting.account.as_str()) else {
+                        continue;
+                    };
+                    let balances = running.entry(key).or_default();
+                    match balances.get_mut(&amount.currency) {
+                        Some(total) => *total = total.saturating_add(amount.number),
+                        // Only the first sighting of a currency allocates.
+                        None => {
+                            balances.insert(amount.currency.clone(), amount.number);
+                        }
+                    }
+                }
+                cursor += 1;
+            }
+
+            entries[query] = running.get(account).map(|balances| AccountBalanceEntry {
+                account: account.to_owned(),
+                balances: balances.clone(),
+            });
+        }
+
+        BatchedBalances {
+            entries,
+            postings_visited,
+        }
+    }
+
     /// Number of indexed transactions.
     pub fn transaction_count(&self) -> usize {
         self.transactions.len()
@@ -432,6 +573,32 @@ impl ReadModel {
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────
+
+    /// Indices into [`Self::transactions`], ascending by transaction date (M-23).
+    ///
+    /// [`Self::build`] leaves the vector sorted by `(date, lamport, txid)`, but
+    /// [`Self::index_directive`] — the incremental path every insert uses —
+    /// appends. A backdated directive arriving after boot (a gossiped older
+    /// transaction, an adopted file edit) therefore leaves the vector out of
+    /// date order, and [`Self::balances_at_dates`] sweeps it with a cursor that
+    /// never rewinds, so it cannot just trust the vector's order.
+    ///
+    /// The check is O(T) and the common case really is already sorted, so the
+    /// sort is paid only when a backdated append has actually happened. The
+    /// sort is stable, so ties keep the vector's own `(date, lamport, txid)`
+    /// order — balances are a sum over the cut, so intra-date order does not
+    /// affect the answer either way.
+    fn date_ordered_transactions(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.transactions.len()).collect();
+        let already_sorted = self
+            .transactions
+            .windows(2)
+            .all(|pair| pair[0].transaction.date <= pair[1].transaction.date);
+        if !already_sorted {
+            order.sort_by_key(|&i| self.transactions[i].transaction.date);
+        }
+        order
+    }
 
     /// Compute account balances at a given date (transactions with date ≤ at).
     fn balances_at(&self, at: NaiveDate) -> HashMap<String, CurrencyBalances> {
@@ -949,5 +1116,239 @@ mod tests {
         let cash = model.account_balance("Assets:Cash", None).unwrap();
         // 1000 + 25 - 1500 = -475 USD
         assert_eq!(cash.balances.get("USD"), Some(&dec!(-475.00)));
+    }
+
+    // ── M-23: batched balances-at-date ───────────────────────────────────
+
+    /// The safety property: one batched sweep answers exactly what one
+    /// `account_balance(acct, Some(date))` call per query answered.
+    ///
+    /// The fixture deliberately covers every case the sweep has to get right —
+    /// queries out of date order, two queries on the same date, a posting dated
+    /// *on* a query date (the `<= date` rule), a later transaction that must
+    /// not leak backwards, a second currency on the same account, an account
+    /// that exists but has nothing yet, and an account that never appears.
+    #[test]
+    fn test_batched_sweep_matches_account_balance_per_query() {
+        let jan10 = make_date(2024, 1, 10);
+        let jan20 = make_date(2024, 1, 20);
+        let jan31 = make_date(2024, 1, 31);
+
+        let directives = vec![
+            make_txn(
+                jan10,
+                "deposit",
+                vec![
+                    ("Assets:Cash", dec!(1000), "USD"),
+                    ("Equity:Opening", dec!(-1000), "USD"),
+                ],
+            ),
+            make_txn(
+                jan10,
+                "same day, second currency",
+                vec![
+                    ("Assets:Cash", dec!(7), "EUR"),
+                    ("Equity:Opening", dec!(-7), "EUR"),
+                ],
+            ),
+            make_txn(
+                jan20,
+                "later",
+                vec![
+                    ("Assets:Cash", dec!(500), "USD"),
+                    ("Expenses:Rent", dec!(-500), "USD"),
+                ],
+            ),
+        ];
+        let model = ReadModel::build(&directives);
+
+        let queries = [
+            ("Assets:Cash", jan31),
+            ("Assets:Cash", jan10), // `<= date`: jan10's postings count.
+            ("Equity:Opening", jan10),
+            ("Assets:Cash", jan10),    // Same account, same date, repeated.
+            ("Expenses:Rent", jan10),  // Exists later, nothing yet here.
+            ("Assets:Nowhere", jan31), // Never posted to at all.
+            ("Assets:Cash", jan20),
+        ];
+
+        let batched = model.balances_at_dates(&queries);
+        let one_by_one: Vec<Option<AccountBalanceEntry>> = queries
+            .iter()
+            .map(|&(account, at)| model.account_balance(account, Some(at)))
+            .collect();
+
+        assert_eq!(batched.entries, one_by_one);
+
+        // And pin the values, so both paths cannot regress together.
+        let usd = |entry: &Option<AccountBalanceEntry>| {
+            entry
+                .as_ref()
+                .and_then(|e| e.balances.get("USD").copied())
+                .unwrap_or(Decimal::ZERO)
+        };
+        assert_eq!(usd(&batched.entries[0]), dec!(1500));
+        assert_eq!(usd(&batched.entries[1]), dec!(1000));
+        assert_eq!(usd(&batched.entries[2]), dec!(-1000));
+        assert_eq!(usd(&batched.entries[3]), dec!(1000));
+        assert!(
+            batched.entries[4].is_none(),
+            "no postings on or before jan10"
+        );
+        assert!(batched.entries[5].is_none(), "account never appears");
+        assert_eq!(usd(&batched.entries[6]), dec!(1500));
+        // The EUR leg rode along on the same sweep.
+        assert_eq!(
+            batched.entries[1].as_ref().unwrap().balances.get("EUR"),
+            Some(&dec!(7))
+        );
+    }
+
+    /// M-23: the sweep's cost is a property of the ledger, not of the query
+    /// count — the invariant T32 broke and the one the GraphQL `verify` weight
+    /// is sized on.
+    ///
+    /// Counted rather than timed: a multiplier is exact, and a wall-clock ratio
+    /// on a fixture this size measures the allocator.
+    #[test]
+    fn test_batched_sweep_cost_is_independent_of_query_count() {
+        let jan10 = make_date(2024, 1, 10);
+        let jan20 = make_date(2024, 1, 20);
+
+        let mut directives = Vec::new();
+        for i in 0..500 {
+            directives.push(make_txn(
+                if i % 2 == 0 { jan10 } else { jan20 },
+                &format!("txn {i}"),
+                vec![
+                    ("Assets:Cash", dec!(1), "USD"),
+                    ("Equity:Opening", dec!(-1), "USD"),
+                ],
+            ));
+        }
+        let model = ReadModel::build(&directives);
+
+        let one = [("Assets:Cash", jan20)];
+        let many: Vec<(&str, NaiveDate)> = (0..20_000)
+            .map(|i| {
+                (
+                    if i % 3 == 0 {
+                        "Assets:Cash"
+                    } else {
+                        "Assets:Planted"
+                    },
+                    if i % 7 == 0 { jan10 } else { jan20 },
+                )
+            })
+            .collect();
+
+        let one_cost = model.balances_at_dates(&one).postings_visited;
+        let many_cost = model.balances_at_dates(&many).postings_visited;
+
+        assert_eq!(one_cost, 1000, "500 transactions x 2 postings, one pass");
+        assert_eq!(
+            many_cost, one_cost,
+            "20,000 planted assertions must not multiply the ledger walk (M-23)"
+        );
+    }
+
+    /// M-23: the sweep stops at the latest query date — work a query never
+    /// needed is not done.
+    #[test]
+    fn test_batched_sweep_stops_at_the_latest_query_date() {
+        let jan10 = make_date(2024, 1, 10);
+        let jan20 = make_date(2024, 1, 20);
+
+        let directives = vec![
+            make_txn(
+                jan10,
+                "early",
+                vec![
+                    ("Assets:Cash", dec!(1), "USD"),
+                    ("Equity:Opening", dec!(-1), "USD"),
+                ],
+            ),
+            make_txn(
+                jan20,
+                "late",
+                vec![
+                    ("Assets:Cash", dec!(1), "USD"),
+                    ("Equity:Opening", dec!(-1), "USD"),
+                ],
+            ),
+        ];
+        let model = ReadModel::build(&directives);
+
+        assert_eq!(
+            model
+                .balances_at_dates(&[("Assets:Cash", jan10)])
+                .postings_visited,
+            2
+        );
+        assert_eq!(
+            model
+                .balances_at_dates(&[("Assets:Cash", jan20)])
+                .postings_visited,
+            4
+        );
+    }
+
+    /// M-23: `index_directive` appends, so a backdated directive arriving after
+    /// boot leaves `transactions` out of date order. The cursor-based sweep
+    /// must re-order before walking, or it silently drops the backdated entry.
+    #[test]
+    fn test_batched_sweep_handles_out_of_order_transactions() {
+        let jan10 = make_date(2024, 1, 10);
+        let jan20 = make_date(2024, 1, 20);
+
+        let mut model = ReadModel::build(&[make_txn(
+            jan20,
+            "booted",
+            vec![
+                ("Assets:Cash", dec!(500), "USD"),
+                ("Equity:Opening", dec!(-500), "USD"),
+            ],
+        )]);
+        model.index_directive(&make_txn(
+            jan10,
+            "backdated arrival",
+            vec![
+                ("Assets:Cash", dec!(1000), "USD"),
+                ("Equity:Opening", dec!(-1000), "USD"),
+            ],
+        ));
+
+        let queries = [("Assets:Cash", jan10), ("Assets:Cash", jan20)];
+        let batched = model.balances_at_dates(&queries);
+        let one_by_one: Vec<Option<AccountBalanceEntry>> = queries
+            .iter()
+            .map(|&(account, at)| model.account_balance(account, Some(at)))
+            .collect();
+
+        assert_eq!(batched.entries, one_by_one);
+        assert_eq!(
+            batched.entries[0].as_ref().unwrap().balances.get("USD"),
+            Some(&dec!(1000))
+        );
+        assert_eq!(
+            batched.entries[1].as_ref().unwrap().balances.get("USD"),
+            Some(&dec!(1500))
+        );
+    }
+
+    /// No queries: no answers, and no walk.
+    #[test]
+    fn test_batched_sweep_with_no_queries_does_no_work() {
+        let model = ReadModel::build(&[make_txn(
+            make_date(2024, 1, 10),
+            "txn",
+            vec![
+                ("Assets:Cash", dec!(1), "USD"),
+                ("Equity:Opening", dec!(-1), "USD"),
+            ],
+        )]);
+        let batched = model.balances_at_dates(&[]);
+        assert!(batched.entries.is_empty());
+        assert_eq!(batched.postings_visited, 0);
     }
 }

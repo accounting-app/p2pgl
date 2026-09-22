@@ -57,15 +57,25 @@ pub fn evaluate_balance_assertion(balance: &Balance, read_model: &ReadModel) -> 
         .and_then(|entry| entry.balances.get(&balance.amount.currency).copied())
         .unwrap_or(Decimal::ZERO);
 
-    let ok = actual == balance.amount.number;
+    assertion_result(balance, actual)
+}
 
+/// Build the [`AssertionResult`] for `balance` from the account's `actual`
+/// holding of the asserted currency.
+///
+/// Shared by the per-assertion path ([`evaluate_balance_assertion`]) and the
+/// batched one ([`evaluate_all_assertions`]) so the two cannot drift (M-23):
+/// the *only* difference between them is how `actual` is obtained, which is
+/// what makes "the fast path answers what the slow path answered" a testable
+/// claim about one lookup rather than about two copies of the comparison.
+fn assertion_result(balance: &Balance, actual: Decimal) -> AssertionResult {
     AssertionResult {
         date: balance.date,
         account: balance.account.clone(),
         expected: balance.amount.number,
         actual,
         currency: balance.amount.currency.clone(),
-        ok,
+        ok: actual == balance.amount.number,
     }
 }
 
@@ -149,18 +159,57 @@ pub fn generate_pad_transaction(
 ///
 /// Takes any iterator of directive references so the DAG's borrowed view
 /// (`LedgerDag::directives()`) can be evaluated without cloning the ledger.
+///
+/// # Cost (M-23)
+///
+/// Every assertion is answered from **one** date-ordered sweep of the ledger
+/// ([`ReadModel::balances_at_dates`]), not from a whole-ledger balance rebuild
+/// per `balance` directive. T32 wired assertions in the obvious way — one
+/// [`evaluate_balance_assertion`] call each — which made this, and therefore
+/// [`crate::verify::verify_dag`], O(assertions × transactions × postings) while
+/// holding the ledger's read lock. The assertion count is attacker-supplied
+/// (a `balance` directive is ~250 bytes, needs no lifecycle check and need not
+/// name an account that exists), so that product was a peer-controlled stall:
+/// more than 100k assertions fit under the file cap, and against a
+/// 78k-transaction ledger that is ~2×10^10 posting visits.
+///
+/// The batched form is linear in the ledger and no longer multiplied by the
+/// assertion count. Both properties are tested, not asserted in prose — see
+/// `tests::test_assertion_evaluation_is_subsecond_at_4000x4000` and
+/// `tests::test_assertion_evaluation_does_not_scale_with_assertion_count`.
 pub fn evaluate_all_assertions<'a, I>(directives: I, read_model: &ReadModel) -> Vec<AssertionResult>
 where
     I: IntoIterator<Item = &'a Directive>,
 {
-    directives
+    // Two passes over the directive *refs* (cheap) rather than one pass with a
+    // whole-ledger rebuild inside it (not cheap): the queries have to be known
+    // up front for the sweep to answer them all in one go.
+    let assertions: Vec<&Balance> = directives
         .into_iter()
-        .filter_map(|d| {
-            if let Directive::Balance(b) = d {
-                Some(evaluate_balance_assertion(b, read_model))
-            } else {
-                None
-            }
+        .filter_map(|d| match d {
+            Directive::Balance(b) => Some(b),
+            _ => None,
+        })
+        .collect();
+
+    let queries: Vec<(&str, NaiveDate)> = assertions
+        .iter()
+        .map(|balance| (balance.account.as_str(), balance.date))
+        .collect();
+
+    let batched = read_model.balances_at_dates(&queries);
+
+    assertions
+        .iter()
+        .zip(batched.entries)
+        .map(|(balance, entry)| {
+            // `None` (account never posted to on or before the date) reads as
+            // 0, so `balance Assets:Unknown 0 USD` still passes — the same
+            // `unwrap_or` the per-assertion path applies.
+            let actual = entry
+                .and_then(|entry| entry.balances.get(&balance.amount.currency).copied())
+                .unwrap_or(Decimal::ZERO);
+            assertion_result(balance, actual)
         })
         .collect()
 }
@@ -580,5 +629,328 @@ mod tests {
             "Golden fixture balance assertion should pass: expected={}, actual={}",
             results[0].expected, results[0].actual
         );
+    }
+
+    // ── M-23: one date-ordered sweep for every assertion ─────────────────
+
+    /// Wall-clock budget for the 4000 × 4000 case (M-23).
+    ///
+    /// The 0922 audit measured the per-assertion rebuild at **2.61 s** for this
+    /// shape (release, perfect quadratic scaling: 171 ms at 1000 × 1000, 656 ms
+    /// at 2000 × 2000). The batched sweep is linear, so it lands three orders of
+    /// magnitude under that even in a debug build; the budget is deliberately
+    /// slack so this is a *shape* check (linear vs quadratic) that no amount of
+    /// CI noise can flip, not a microbenchmark. It is not `#[ignore]`d: the
+    /// whole point of M-23 is that a comment did not hold the line, so this runs
+    /// on every `cargo test -p ledger`.
+    const ASSERTION_SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_millis(900);
+
+    /// Number of distinct accounts the load fixture spreads postings over.
+    const LOAD_ACCOUNTS: usize = 64;
+
+    /// Number of distinct dates the load fixture spreads directives over.
+    const LOAD_SPREAD: i64 = 365;
+
+    fn posting(account: &str, number: Decimal, currency: &str) -> Posting {
+        Posting {
+            account: account.to_owned(),
+            amount: Some(Amount {
+                number,
+                currency: currency.to_owned(),
+            }),
+            cost: None,
+            price: None,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    /// The M-23 load shape: `txns` transactions and `assertions` `balance`
+    /// directives over the same dates and accounts.
+    ///
+    /// The two counts are independent on purpose. A `balance` directive is the
+    /// cheapest thing a peer can plant — `stage_remote_directive` routes it
+    /// through the `_ =>` catch-all with no lifecycle check and no requirement
+    /// that the account exist — so the assertion count is attacker-supplied,
+    /// and it used to *multiply* the cost of a whole-ledger rebuild.
+    fn assertion_load(txns: usize, assertions: usize) -> Vec<Directive> {
+        let base = make_date(2024, 1, 1);
+        let account = |i: usize| format!("Assets:A{:04}", i % LOAD_ACCOUNTS);
+        let mut directives = Vec::with_capacity(txns + assertions);
+
+        for i in 0..txns {
+            directives.push(Directive::Transaction(Transaction {
+                date: base + chrono::Duration::days(i as i64 % LOAD_SPREAD),
+                flag: Flag::Complete,
+                payee: None,
+                // Distinct, so no two transactions share a content id and the
+                // read model indexes all of them.
+                narration: Some(format!("load {i}")),
+                tags: vec![],
+                links: vec![],
+                postings: vec![
+                    posting(&account(i), dec!(1), "USD"),
+                    posting("Equity:Opening", dec!(-1), "USD"),
+                ],
+                metadata: BTreeMap::new(),
+            }));
+        }
+
+        for i in 0..assertions {
+            directives.push(Directive::Balance(Balance {
+                date: base + chrono::Duration::days(i as i64 % LOAD_SPREAD),
+                account: account(i),
+                amount: Amount {
+                    number: dec!(0),
+                    currency: "USD".to_owned(),
+                },
+                metadata: BTreeMap::new(),
+            }));
+        }
+
+        directives
+    }
+
+    /// M-23 regression: 4000 transactions × 4000 assertions, sub-second.
+    ///
+    /// Measured by the 0922 audit at 2.61 s with the per-assertion rebuild —
+    /// and that was the *release* number; a debug build of the old path takes
+    /// minutes. Reverting `evaluate_all_assertions` to
+    /// `evaluate_balance_assertion` per directive fails this test.
+    #[test]
+    fn test_assertion_evaluation_is_subsecond_at_4000x4000() {
+        let directives = assertion_load(4000, 4000);
+        let model = ReadModel::build(&directives);
+
+        let start = std::time::Instant::now();
+        let results = evaluate_all_assertions(&directives, &model);
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 4000);
+        assert!(
+            elapsed < ASSERTION_SWEEP_BUDGET,
+            "4000x4000 assertion evaluation took {elapsed:?}, budget is \
+             {ASSERTION_SWEEP_BUDGET:?} (M-23: the per-assertion rebuild was 2.61s)"
+        );
+    }
+
+    /// M-23: the ledger walk must not scale with the attacker-supplied
+    /// multiplier.
+    ///
+    /// This is the invariant the GraphQL `verify` weight is sized on, so it is
+    /// checked by **counting** rather than by timing: a wall-clock ratio at
+    /// this scale measures allocator noise, and the thing that must never come
+    /// back is a *multiplier*, which is exact and countable. Holding the ledger
+    /// and the latest assertion date fixed, the sweep visits the same postings
+    /// whether a peer planted 365 assertions or 40,960 — under the
+    /// per-assertion rebuild that count was multiplied by the assertion count.
+    ///
+    /// Paired with `graphql::query::tests::test_verify_complexity_matches_measured_cost_model`
+    /// in `gl-node`, which pins the weight to this cost model.
+    #[test]
+    fn test_assertion_pass_walks_the_ledger_once_regardless_of_assertion_count() {
+        const TXNS: usize = 2000;
+        const POSTINGS_PER_TXN: usize = 2;
+
+        // Every count at or above the date spread reaches the ledger's last
+        // date, so all three sweep the same cut and must cost the same.
+        let mut counts = Vec::new();
+        for assertions in [LOAD_SPREAD as usize, 4096, 40_960] {
+            let directives = assertion_load(TXNS, assertions);
+            let model = ReadModel::build(&directives);
+            let queries: Vec<(&str, NaiveDate)> = directives
+                .iter()
+                .filter_map(|d| match d {
+                    Directive::Balance(b) => Some((b.account.as_str(), b.date)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(queries.len(), assertions);
+            counts.push(model.balances_at_dates(&queries).postings_visited);
+        }
+
+        assert_eq!(
+            counts,
+            vec![TXNS * POSTINGS_PER_TXN; 3],
+            "the assertion count is multiplying the ledger walk again (M-23)"
+        );
+    }
+
+    /// M-23 safety property: the batched path answers exactly what the
+    /// per-assertion path answered. A faster wrong answer is worse than a slow
+    /// right one, so this pins T32's documented semantics directly:
+    ///
+    /// - assertions on the **same date** all see the same cut of the ledger;
+    /// - an account with no postings reads **0** (`balance Assets:Unknown 0 USD`
+    ///   passes);
+    /// - the cut is `<= date` — a posting dated *on* the assertion date counts,
+    ///   which is where this deliberately differs from beancount's
+    ///   start-of-day rule;
+    /// - only the asserted currency is compared.
+    #[test]
+    fn test_batched_assertions_match_per_assertion_evaluation() {
+        let jan1 = make_date(2024, 1, 1);
+        let jan10 = make_date(2024, 1, 10);
+        let jan20 = make_date(2024, 1, 20);
+
+        let directives = vec![
+            // Two transactions on the same date, plus a later one and a
+            // second currency on the same account.
+            Directive::Transaction(Transaction {
+                date: jan10,
+                flag: Flag::Complete,
+                payee: None,
+                narration: Some("deposit".to_owned()),
+                tags: vec![],
+                links: vec![],
+                postings: vec![
+                    posting("Assets:Cash", dec!(1000), "USD"),
+                    posting("Equity:Opening", dec!(-1000), "USD"),
+                ],
+                metadata: BTreeMap::new(),
+            }),
+            Directive::Transaction(Transaction {
+                date: jan10,
+                flag: Flag::Complete,
+                payee: None,
+                narration: Some("same-day second leg".to_owned()),
+                tags: vec![],
+                links: vec![],
+                postings: vec![
+                    posting("Assets:Cash", dec!(25), "USD"),
+                    posting("Assets:Cash", dec!(7), "EUR"),
+                    posting("Equity:Opening", dec!(-25), "USD"),
+                    posting("Equity:Opening", dec!(-7), "EUR"),
+                ],
+                metadata: BTreeMap::new(),
+            }),
+            Directive::Transaction(Transaction {
+                date: jan20,
+                flag: Flag::Complete,
+                payee: None,
+                narration: Some("later, must not count on jan10".to_owned()),
+                tags: vec![],
+                links: vec![],
+                postings: vec![
+                    posting("Assets:Cash", dec!(500), "USD"),
+                    posting("Equity:Opening", dec!(-500), "USD"),
+                ],
+                metadata: BTreeMap::new(),
+            }),
+            // Assertions, deliberately out of date order so the batch has to
+            // sort them, and including two on the same date.
+            balance_at(jan20, "Assets:Cash", dec!(1525), "USD"),
+            balance_at(jan10, "Assets:Cash", dec!(1025), "USD"), // `<= date`: same-day postings count.
+            balance_at(jan10, "Assets:Cash", dec!(7), "EUR"),    // Same date, other currency.
+            balance_at(jan10, "Assets:Cash", dec!(999), "USD"),  // Same date, wrong: must fail.
+            balance_at(jan1, "Assets:Cash", dec!(0), "USD"),     // Before any posting: 0.
+            balance_at(jan20, "Assets:Unknown", dec!(0), "USD"), // Never posted to: 0.
+            balance_at(jan20, "Assets:Unknown", dec!(1), "USD"), // ... so this fails.
+        ];
+
+        let model = ReadModel::build(&directives);
+
+        let batched = evaluate_all_assertions(&directives, &model);
+        let one_by_one: Vec<AssertionResult> = directives
+            .iter()
+            .filter_map(|d| match d {
+                Directive::Balance(b) => Some(evaluate_balance_assertion(b, &model)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            batched, one_by_one,
+            "the batched sweep must return exactly what the per-assertion rebuild returned"
+        );
+
+        // And pin the values themselves, so the two paths cannot agree on a
+        // shared regression.
+        let actual: Vec<(&str, Decimal, bool)> = batched
+            .iter()
+            .map(|r| (r.account.as_str(), r.actual, r.ok))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                ("Assets:Cash", dec!(1525), true),
+                ("Assets:Cash", dec!(1025), true),
+                ("Assets:Cash", dec!(7), true),
+                ("Assets:Cash", dec!(1025), false),
+                ("Assets:Cash", dec!(0), true),
+                ("Assets:Unknown", dec!(0), true),
+                ("Assets:Unknown", dec!(0), false),
+            ]
+        );
+    }
+
+    /// M-23: the sweep walks transactions in date order, but the read model's
+    /// vector is only date-sorted by `ReadModel::build` — `index_directive`
+    /// appends. A backdated directive arriving after boot therefore leaves the
+    /// vector out of order, and the batched path must still agree with the
+    /// per-assertion one.
+    #[test]
+    fn test_batched_assertions_match_after_backdated_incremental_append() {
+        let jan10 = make_date(2024, 1, 10);
+        let jan20 = make_date(2024, 1, 20);
+
+        let built = vec![Directive::Transaction(Transaction {
+            date: jan20,
+            flag: Flag::Complete,
+            payee: None,
+            narration: Some("booted".to_owned()),
+            tags: vec![],
+            links: vec![],
+            postings: vec![
+                posting("Assets:Cash", dec!(500), "USD"),
+                posting("Equity:Opening", dec!(-500), "USD"),
+            ],
+            metadata: BTreeMap::new(),
+        })];
+        let mut model = ReadModel::build(&built);
+
+        // Arrives later, dated earlier: appended past the sorted prefix.
+        let backdated = Directive::Transaction(Transaction {
+            date: jan10,
+            flag: Flag::Complete,
+            payee: None,
+            narration: Some("backdated".to_owned()),
+            tags: vec![],
+            links: vec![],
+            postings: vec![
+                posting("Assets:Cash", dec!(1000), "USD"),
+                posting("Equity:Opening", dec!(-1000), "USD"),
+            ],
+            metadata: BTreeMap::new(),
+        });
+        model.index_directive(&backdated);
+
+        let assertions = vec![
+            balance_at(jan20, "Assets:Cash", dec!(1500), "USD"),
+            balance_at(jan10, "Assets:Cash", dec!(1000), "USD"),
+        ];
+
+        let batched = evaluate_all_assertions(&assertions, &model);
+        let one_by_one: Vec<AssertionResult> = assertions
+            .iter()
+            .filter_map(|d| match d {
+                Directive::Balance(b) => Some(evaluate_balance_assertion(b, &model)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(batched, one_by_one);
+        assert!(batched.iter().all(|r| r.ok), "results: {batched:?}");
+    }
+
+    fn balance_at(date: NaiveDate, account: &str, number: Decimal, currency: &str) -> Directive {
+        Directive::Balance(Balance {
+            date,
+            account: account.to_owned(),
+            amount: Amount {
+                number,
+                currency: currency.to_owned(),
+            },
+            metadata: BTreeMap::new(),
+        })
     }
 }

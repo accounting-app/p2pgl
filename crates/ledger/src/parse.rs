@@ -66,6 +66,32 @@ impl Scanner {
         self.position + 1
     }
 
+    /// The unconsumed remainder of the line, with surrounding whitespace
+    /// trimmed. Empty exactly when [`Self::at_eol`] is true (M-25).
+    ///
+    /// Only used to quote the offending text back to the operator; nothing
+    /// parses it.
+    fn rest_of_line(&self) -> String {
+        self.chars[self.position..]
+            .iter()
+            .collect::<String>()
+            .trim()
+            .to_owned()
+    }
+
+    /// 1-based column of the first unconsumed NON-blank character (M-25).
+    ///
+    /// [`Self::column`] would point at the run of spaces that separates the
+    /// last token from the junk after it, which is not where the operator
+    /// needs to look.
+    fn column_of_rest(&self) -> usize {
+        let mut offset = self.position;
+        while matches!(self.chars.get(offset), Some(' ') | Some('\t')) {
+            offset += 1;
+        }
+        offset + 1
+    }
+
     // ── Token readers ────────────────────────────────────────────────────
 
     fn read_date(&mut self) -> Result<NaiveDate, String> {
@@ -583,6 +609,59 @@ pub fn parse_file(input: &str) -> Result<Vec<Directive>, Vec<ParseError>> {
     }
 }
 
+// ─── Trailing-content check (M-25) ───────────────────────────────────────────
+
+/// How much of the offending text a rejection quotes back.
+const TRAILING_CONTENT_EXCERPT_CHARS: usize = 60;
+
+/// Refuse a line that still carries tokens after its grammar is satisfied (M-25).
+///
+/// Every line form in this grammar used to stop scanning the moment it had what
+/// it came for and simply **drop the rest of the line**. That is not a cosmetic
+/// leniency, because the `.bean` is a read-write interface: a half-finished
+/// hand edit was not rejected and not logged, it was re-read as a *different,
+/// valid* directive, adopted, signed with this node's key and written back
+/// truncated. `2024-01-01 close Assets:Cash 2020-01-01` became
+/// `2024-01-01 close Assets:Cash`; `Assets:Cash 1 USD this is dropped` lost its
+/// tail without a trace; a third quoted string on a transaction header
+/// vanished. The rejection tally that exists so an operator "has a way to find
+/// out what they lost" (L-12) never fired, because nothing was ever refused.
+///
+/// So the rule is now: after the last token a form legitimately accepts, the
+/// line must be at end-of-line. [`Scanner::at_eol`] — not a bare
+/// `position == len` — is what makes that safe, because it is the established
+/// shape here (`parse_open`'s optional currency list and `parse_posting_line`'s
+/// elided-posting check both use it): trailing spaces, tabs and a `;` comment
+/// are end-of-line, so every legitimate trailing form still parses. Anything
+/// else is a refusal, and a refusal surfaces — a file that does not parse
+/// blocks writes until a human repairs it rather than being canonicalised on
+/// top of a half-saved edit, which is the trade `reconcile_content` already
+/// documents and the only one that does not lose data.
+fn reject_trailing_content(
+    scanner: &Scanner,
+    line_number: usize,
+    form: &str,
+) -> Result<(), ParseError> {
+    if scanner.at_eol() {
+        return Ok(());
+    }
+    let rest = scanner.rest_of_line();
+    let excerpt: String = if rest.chars().count() > TRAILING_CONTENT_EXCERPT_CHARS {
+        rest.chars()
+            .take(TRAILING_CONTENT_EXCERPT_CHARS)
+            .chain(std::iter::once('\u{2026}'))
+            .collect()
+    } else {
+        rest
+    };
+    Err(ParseError::new(
+        line_number,
+        scanner.column_of_rest(),
+        format!("Unexpected trailing content after {form}: '{excerpt}'"),
+        ParseErrorKind::UnexpectedToken,
+    ))
+}
+
 // ─── Directive block parsing ─────────────────────────────────────────────────
 
 fn parse_directive_block(
@@ -757,6 +836,11 @@ fn parse_transaction(
         }
     }
 
+    // M-25: a third quoted string, a stray word, a half-typed tag — anything
+    // after the tags and links — used to be dropped, leaving a DIFFERENT
+    // transaction to be adopted and re-signed.
+    reject_trailing_content(scanner, line_number, "a transaction header")?;
+
     // Parse body lines into transaction metadata and postings.
     let (metadata, postings) = parse_transaction_body(body_lines)?;
 
@@ -826,6 +910,11 @@ fn parse_open(
         }
     }
 
+    // M-25. Note this is reached on both arms: an `open` with no currency list
+    // at all took the `at_eol` branch above, which already proved the line is
+    // finished, so the check is a no-op there rather than a second rule.
+    reject_trailing_content(scanner, line_number, "an open directive")?;
+
     let metadata = parse_metadata_body(body_lines)?;
 
     Ok(Open {
@@ -851,6 +940,8 @@ fn parse_close(
             ParseErrorKind::InvalidAccountName,
         )
     })?;
+    // M-25: `close Assets:Cash 2020-01-01` used to parse as `close Assets:Cash`.
+    reject_trailing_content(scanner, line_number, "a close directive")?;
     let metadata = parse_metadata_body(body_lines)?;
     Ok(Close {
         date,
@@ -874,6 +965,7 @@ fn parse_commodity(
             ParseErrorKind::InvalidCurrency,
         )
     })?;
+    reject_trailing_content(scanner, line_number, "a commodity directive")?; // M-25
     let metadata = parse_metadata_body(body_lines)?;
     Ok(Commodity {
         date,
@@ -906,6 +998,7 @@ fn parse_pad(
             ParseErrorKind::InvalidAccountName,
         )
     })?;
+    reject_trailing_content(scanner, line_number, "a pad directive")?; // M-25
     let metadata = parse_metadata_body(body_lines)?;
     Ok(Pad {
         date,
@@ -939,6 +1032,7 @@ fn parse_balance(
             ParseErrorKind::InvalidNumber,
         )
     })?;
+    reject_trailing_content(scanner, line_number, "a balance directive")?; // M-25
     let metadata = parse_metadata_body(body_lines)?;
     Ok(Balance {
         date,
@@ -972,6 +1066,7 @@ fn parse_note(
             ParseErrorKind::UnterminatedString,
         )
     })?;
+    reject_trailing_content(scanner, line_number, "a note directive")?; // M-25
     let metadata = parse_metadata_body(body_lines)?;
     Ok(Note {
         date,
@@ -1005,6 +1100,7 @@ fn parse_document(
             ParseErrorKind::UnterminatedString,
         )
     })?;
+    reject_trailing_content(scanner, line_number, "a document directive")?; // M-25
     let metadata = parse_metadata_body(body_lines)?;
     Ok(Document {
         date,
@@ -1038,6 +1134,7 @@ fn parse_event(
             ParseErrorKind::UnterminatedString,
         )
     })?;
+    reject_trailing_content(scanner, line_number, "an event directive")?; // M-25
     let metadata = parse_metadata_body(body_lines)?;
     Ok(Event {
         date,
@@ -1102,6 +1199,7 @@ fn parse_price(
             ParseErrorKind::InvalidNumber,
         )
     })?;
+    reject_trailing_content(scanner, line_number, "a price directive")?; // M-25
     let metadata = parse_metadata_body(body_lines)?;
     Ok(Price {
         date,
@@ -1247,6 +1345,8 @@ fn parse_metadata_line(trimmed: &str, line_number: usize) -> Result<(String, Str
         )
     })?;
 
+    reject_trailing_content(&scanner, line_number, "a metadata value")?; // M-25
+
     Ok((key, value))
 }
 
@@ -1305,6 +1405,12 @@ fn parse_posting_line(trimmed: &str, line_number: usize) -> Result<Posting, Pars
     } else {
         None
     };
+
+    // M-25. The elided-posting arm above already returned on `at_eol`, so this
+    // is the only exit that could have carried junk — and it is the one that
+    // mattered most: `Assets:Cash 1 USD this is dropped` was adopted as a plain
+    // `Assets:Cash 1 USD` with no trace of what went missing.
+    reject_trailing_content(&scanner, line_number, "a posting")?;
 
     Ok(Posting {
         account,
@@ -2471,5 +2577,172 @@ mod tests {
             result.is_err(),
             "CT-15: Unsupported include fixture must fail to parse"
         );
+    }
+
+    // ── M-25: trailing tokens are refused, not dropped ───────────────────
+
+    /// The four truncations the finding proved, verbatim.
+    ///
+    /// Each one used to parse **successfully** into a different, shorter
+    /// directive — which reconcile then adopted, signed with this node's key
+    /// and wrote back over the operator's text. Nothing was rejected, so
+    /// nothing was logged. Now each is a parse error, which is what stops the
+    /// canonical rewrite from running at all.
+    #[test]
+    fn m25_the_four_proven_truncations_are_refused() {
+        let cases: [(&str, &str, &str); 4] = [
+            (
+                "2024-01-01 open Assets:Cash USD AND MORE JUNK",
+                "an open directive",
+                "AND MORE JUNK",
+            ),
+            (
+                "2024-01-01 close Assets:Cash 2020-01-01",
+                "a close directive",
+                "2020-01-01",
+            ),
+            (
+                "2024-01-01 * \"p\" \"n\" \"third string dropped\"\n\
+                 \x20 Assets:Cash                                       1.00 USD\n\
+                 \x20 Equity:Opening                                   -1.00 USD\n",
+                "a transaction header",
+                "\"third string dropped\"",
+            ),
+            (
+                "2024-01-01 * \"p\" \"n\"\n\
+                 \x20 Assets:Cash                                       1.00 USD this is dropped\n\
+                 \x20 Equity:Opening                                   -1.00 USD\n",
+                "a posting",
+                "this is dropped",
+            ),
+        ];
+
+        for (input, form, dropped) in cases {
+            let errors = match parse_file(input) {
+                Ok(directives) => panic!(
+                    "M-25: {input:?} must not parse; it silently became {:?}",
+                    crate::serialize::full_file_serialize(&directives, &[])
+                ),
+                Err(errors) => errors,
+            };
+            let rendered = errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            assert!(
+                rendered.contains(form),
+                "the rejection must name the line form it was refusing ({form}): {rendered}"
+            );
+            assert!(
+                rendered.contains(dropped),
+                "the rejection must quote back the text that used to be dropped \
+                 ({dropped}): {rendered}"
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.kind == ParseErrorKind::UnexpectedToken),
+                "classified as UnexpectedToken: {rendered}"
+            );
+        }
+    }
+
+    /// Every line form, not just the four that were proven.
+    ///
+    /// The finding's list was what someone happened to try; the defect was that
+    /// `at_eol` had three call sites in the whole grammar. This walks each form
+    /// so a new one cannot be added without the check.
+    #[test]
+    fn m25_every_line_form_refuses_trailing_junk() {
+        let cases = [
+            "2024-01-01 open Assets:Cash USD junk",
+            "2024-01-01 close Assets:Cash junk",
+            "2024-01-01 commodity USD junk",
+            "2024-01-01 pad Assets:Cash Equity:Opening junk",
+            "2024-01-01 balance Assets:Cash 1.00 USD junk",
+            "2024-01-01 note Assets:Cash \"hi\" junk",
+            "2024-01-01 document Assets:Cash \"/a.pdf\" junk",
+            "2024-01-01 event \"location\" \"here\" junk",
+            "2024-01-01 price EUR 1.10 USD junk",
+            "2024-01-01 txn \"p\" \"n\" junk\n  Assets:Cash   1.00 USD\n",
+            "2024-01-01 * \"p\" \"n\"\n  Assets:Cash   1.00 USD {1.00 USD} @ 2.00 USD junk\n",
+            "2024-01-01 * \"p\" \"n\"\n  key: \"value\" junk\n  Assets:Cash   1.00 USD\n",
+        ];
+        for input in cases {
+            assert!(
+                parse_file(input).is_err(),
+                "M-25: trailing junk must be refused, not dropped: {input:?}"
+            );
+        }
+    }
+
+    /// The other half of M-25: what the grammar genuinely allows must still
+    /// parse. `at_eol` treats spaces, tabs and a `;` comment as end-of-line, so
+    /// a comment after ANY line form is still legal — which is the whole reason
+    /// the check is written in terms of `at_eol` rather than "nothing left".
+    #[test]
+    fn m25_comments_and_whitespace_are_still_end_of_line() {
+        let input = "2024-01-01 open Assets:Cash USD, EUR   ; multi-currency  \n\
+                     2024-01-01 open Equity:Opening\t\t; tabs then a comment\n\
+                     2024-01-01 commodity EUR ; a commodity\n\
+                     2024-01-01 pad Assets:Cash Equity:Opening ; a pad\n\
+                     2024-02-01 balance Assets:Cash 1.00 USD ; an assertion\n\
+                     2024-03-01 note Assets:Cash \"n\" ; a note\n\
+                     2024-03-01 document Assets:Cash \"/a.pdf\" ; a document\n\
+                     2024-06-01 event \"location\" \"here\" ; an event\n\
+                     2024-12-01 price EUR 1.10 USD ; a quote\n\
+                     2024-01-15 * \"p\" \"n\" #tag ^link   ; a transaction\n\
+                     \x20 key: \"value\"  ; posting-less metadata\n\
+                     \x20 Assets:Cash    1.00 USD {1.00 USD} @ 2.00 USD  ; a full posting\n\
+                     \x20 Equity:Opening\t; an elided posting with a comment\n\
+                     2024-12-31 close Assets:Cash ; done\n";
+        let directives = parse_file(input).unwrap_or_else(|errors| {
+            panic!(
+                "M-25 must not reject legal trailing content: {}",
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
+        assert_eq!(directives.len(), 11);
+    }
+
+    /// The check must not perturb what the serializer writes: every fixture
+    /// round-trips through `parse → serialize → parse` to the same text, so a
+    /// canonical file this node wrote can always be read back (M-25).
+    #[test]
+    fn m25_every_fixture_still_round_trips() {
+        for (name, fixture) in [
+            (
+                "fixture-simple",
+                include_str!("../../../testfixtures/fixture-simple.bean"),
+            ),
+            (
+                "fixture-multicurrency",
+                include_str!("../../../testfixtures/fixture-multicurrency.bean"),
+            ),
+            (
+                "fixture-cost-price",
+                include_str!("../../../testfixtures/fixture-cost-price.bean"),
+            ),
+            (
+                "fixture-pad-balance",
+                include_str!("../../../testfixtures/fixture-pad-balance.bean"),
+            ),
+        ] {
+            let once = parse_file(fixture)
+                .unwrap_or_else(|errors| panic!("{name} must parse: {errors:?}"));
+            let text = crate::serialize::full_file_serialize(&once, &[]);
+            let twice = parse_file(&text)
+                .unwrap_or_else(|errors| panic!("{name} must re-parse: {errors:?}"));
+            assert_eq!(
+                text,
+                crate::serialize::full_file_serialize(&twice, &[]),
+                "{name} must round-trip"
+            );
+        }
     }
 }

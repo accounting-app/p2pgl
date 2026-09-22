@@ -114,6 +114,29 @@ pub struct VerifyReport {
 /// `read_model` must be the model built from the same directives as `dag`
 /// (`LedgerService` keeps the two in step), otherwise the assertion results
 /// describe a ledger that does not exist.
+///
+/// # Cost (M-23)
+///
+/// Linear in the directive count: one hash recomputation per directive
+/// (the dominant term by far), two cycle-detection walks, and **one**
+/// date-ordered balance sweep that answers every assertion. Nothing here is a
+/// product of two attacker-influenced counts any more.
+///
+/// Measured (release, `Assets`-heavy synthetic ledgers), against one
+/// whole-ledger scan (`ReadModel::trial_balance`) as the unit the GraphQL
+/// heavy-resolver weight is denominated in:
+///
+/// ```text
+/// directives                one scan   verify_dag   assertion pass
+///  4k txns +   4k balances    0.69ms      26.4ms          0.85ms
+/// 20k txns +  20k balances    4.08ms     139.0ms          5.46ms
+/// 20k txns + 100k balances    3.42ms     395.5ms         43.5ms
+/// ```
+///
+/// The last row is the attack shape — a peer inflating the directive count
+/// with cheap `balance` directives — and it now costs sub-second, linearly.
+/// The GraphQL weight is sized on these numbers and pinned by
+/// `gl-node`'s `graphql::query::tests::test_verify_complexity_matches_measured_cost_model`.
 pub fn verify_dag(dag: &LedgerDag, read_model: &ReadModel) -> VerifyReport {
     let mut errors = Vec::new();
     let mut nodes_checked = 0;
@@ -155,6 +178,14 @@ pub fn verify_dag(dag: &LedgerDag, read_model: &ReadModel) -> VerifyReport {
     // 4. Balance assertions (§3.6, M-08). Evaluated over the DAG's own
     // directives — the borrowed view, so no clone of the ledger — and reported
     // separately from the structural errors above.
+    //
+    // One batched date-ordered sweep answers all of them (M-23). T32 wired
+    // this in as one whole-ledger balance rebuild per `balance` directive,
+    // which made this call O(assertions × transactions × postings) with the
+    // assertion count supplied by whoever can plant a `balance` directive —
+    // any peer. Measured at 2.61 s for 4000 × 4000 and tens of minutes for a
+    // plausible plant, all of it under `ledger.read()`. See
+    // [`crate::checkpoint::evaluate_all_assertions`].
     let results = evaluate_all_assertions(dag.directives(), read_model);
     let assertions = BalanceAssertionSummary {
         evaluated: results.len(),
