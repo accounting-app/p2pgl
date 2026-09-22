@@ -1,0 +1,217 @@
+# Outstanding Security Tasks — 2026-09-22
+
+Remediation backlog for every open finding in [SECURITY_AUDIT_0922.md](../SECURITY_AUDIT_0922.md).
+Task numbering continues from [OUTSTANDING_TASKS_09.md](OUTSTANDING_TASKS_09.md) (T18–T45, which
+covered the 09/01 and 09/02 registers; T18–T44 are ☑, T45 is design-approved-pending).
+Line references are current as of HEAD `9f62435`.
+
+**Already closed — do not re-do:** the 0922 re-audit verified **42 of the 52** carried register
+entries fully closed by mechanism (H-02…H-06 · M-04, M-07, M-08, M-11, M-12, M-13, M-14, M-15,
+M-17, M-18 · 27 Lows). See [SECURITY_AUDIT_0922.md §1.1](../SECURITY_AUDIT_0922.md). This tracker
+covers only what remains open plus the five new Highs.
+
+**Status legend:** ☐ not started · ◐ in progress · ☑ done
+**Effort:** S = <½ day, M = ~1–2 days.
+
+> **The shape of this backlog is different from T18–T44's.** That campaign fixed findings in
+> code written before the audits. **Every one of the five new Highs is in code the campaign itself
+> wrote**, and two (T48, T49) are regressions of findings a previous task had closed. The
+> implication for execution: the adversarial bug-catch proof (revert the fix → the named test
+> fails → restore) must be run against *follow-up* tasks too, not only against the original finding.
+
+## Priority order at a glance
+
+| # | Findings addressed | Sev | Effort | Status |
+|---|---|---|---|---|
+| T46 | H-07 — lamport ceiling off-by-one; mesh-wide authoring kill | **High** | S | ☐ |
+| T47 | H-08 — boot skip + startup compaction deletes transactions | **High** | S–M | ☐ |
+| T48 | H-09 — `supply_entry_count` bypasses the T43 pre-scan | **High** | S | ☐ |
+| T49 | H-10 + M-06 + M-26 + M-27 + M-28 — anti-entropy session bounds | **High** | M | ☐ |
+| T50 | H-11 — cancelled mutation wedges every write path | **High** | S | ☐ |
+| T51 | M-20 + L-02 + L-29 + L-45 — reconcile/boot check parity | Med | S–M | ☐ |
+| T52 | M-19 + M-25 + M-29 — file-interface honesty | Med | S–M | ☐ |
+| T53 | M-24 — total serialization order (restores I7) | Med | S | ☐ |
+| T54 | M-23 + L-35 — batched balances-at-date; re-weight `verify` | Med | M | ☐ |
+| T55 | M-21 + M-30 + M-33 + H-01 residual + 6 Lows — HTTP edge | Med | M | ☐ |
+| T56 | M-34 + M-22 + L-46 — dependency bumps, h2c, CI hygiene | Med | S | ☐ |
+| T57 | M-31 + M-32 + L-23 — mesh identity and logging | Med | S | ☐ |
+| T58 | L-01, L-33, L-34, L-38, L-39, L-53, L-54 — P2P cost/robustness | Low | M | ☐ |
+| T59 | L-40, L-41, L-43, L-44 — ledger/commit robustness | Low | S–M | ☐ |
+| T60 | L-47, L-48, L-49 + doc/config drift — docs & key hygiene | Low | S | ☐ |
+
+**Coverage check — every open register entry maps to exactly one task:**
+
+H-07→T46 · H-08→T47 · H-09→T48 · H-10→T49 · H-11→T50 · H-01(residual `/health`)→T55 ·
+M-06→T49 · M-16→T48 (+L-39 half to T58) · M-19→T52 · M-20→T51 · M-21→T55 · M-22→T56 · M-23→T54 ·
+M-24→T53 · M-25→T52 · M-26→T49 · M-27→T49 · M-28→T49 · M-29→T52 · M-30→T55 · M-31→T57 · M-32→T57 ·
+M-33→T55 · M-34→T56 · L-01→T58 · L-02→T51 · L-23→T57 · L-29→T51 · L-33/34/38/39/53/54→T58 ·
+L-35→T54 · L-36/37/42/50/51/52→T55 · L-40/41/43/44→T59 · L-45→T51 · L-46→T56 · L-47/48/49→T60.
+
+**Deferred by design to T45 (Format v2), not tracked here:** M-09 (the remote-`close` admission
+residual is ordered by envelope lamport, which Facet A/B re-specify — a content-id-only tiebreak
+would be envelope-free), M-10 (interim `already_existed` shipped; the real fix is Facet A), L-06
+(length-prefix the signed fields at Facet B — and note **M-31/T57 is now a prerequisite**, because
+`mesh_id` is the one interpolated field still unconstrained).
+
+---
+
+## Tier 1 — ship-blockers (the five new Highs; fix before any multi-node or exposed deployment)
+
+### ☐ T46 — Reconcile the lamport ceiling with the arithmetic around it (H-07) — S
+- **Why first:** it is the cheapest catastrophic attack in the register. One signed directive from an allowlisted peer permanently stops the victim authoring anything any peer will accept, **survives reboot**, and — because the poison directive is itself valid — replicates and poisons every node it reaches. Silent: mutations keep returning 200.
+- **The defect:** `MAX_REMOTE_LAMPORT` caps what a node **accepts**; nothing caps what a node **stamps**, and there is a `+1` on each side of the accept bound. `grep` confirms no lamport ceiling exists anywhere in the `ledger` crate — the constant lives only in `p2p`, as an inbound check.
+- **Change:** (a) clamp at the **stamp** sites — refuse to author above the ceiling rather than emitting an unreplicable directive; (b) reject an inbound lamport that would push the local clock past the ceiling instead of adopting it; (c) make the accept bound exclusive or reserve explicit documented headroom; (d) move the clock adoption **after** validation — today a directive that is ultimately rejected still poisons; (e) single-source the constant so `ledger` and `p2p` cannot drift again.
+- **Files:** [union_merge.rs:50,276-284](../crates/p2p/src/union_merge.rs#L276-L284), [service.rs:3115](../crates/ledger/src/service.rs#L3115) (adoption `+1`), [service.rs:1856,1873](../crates/ledger/src/service.rs#L1856) (both stamp sites), [service.rs:1413-1416](../crates/ledger/src/service.rs#L1413-L1416) (boot re-derivation).
+- **Verify:** ingest a directive at exactly `MAX_REMOTE_LAMPORT`, then assert a locally-authored directive still passes `validate_envelope` — **and again after a restart**. Property test: no reachable ingest path can push the clock past the ceiling. Bug-catch proof: against the unfixed code, the post-ingest local append must be rejected by the peer-side validator.
+
+### ☐ T47 — A lossy boot must never reach a rewrite (H-08) — S/M
+- **Why:** this is the only finding in the series that **destroys financial records**. T35 replaced the L-17 boot brick with a skip and a warning telling the operator to repair the file; [main.rs:219](../crates/gl-node/src/main.rs#L219) compacts unconditionally before they can, and compaction serializes `self.dag.directives()` — which never contained the skipped directives. `remove_journal` then takes the sidecar. Strictly worse than the brick it replaced: a brick is recoverable by editing the file back.
+- **Reachability is not exotic.** `directives_blocked_by_parent_cycles` is Kahn's and returns cycle members **plus all descendants**; a normal ledger is one parent chain, so pointing the oldest transaction's `openledger-parents` at the newest txid blocks the whole chain. Parents are envelope metadata, stripped before hashing — **no content id changes and no signature breaks**. The T41 fan-in skip fires the same way on **pre-T41 files at upgrade, with no attacker at all**, and so does any `dag.insert` refusal, which since L-14 includes `CycleCheckExhausted`.
+- **Change:** never let a lossy boot reach a rewrite. Either (a) carry skipped directives through boot in a quarantine set that compaction re-serializes verbatim (preferred — preserves the records and stays tolerant), or (b) refuse to compact while any skip set is non-empty and surface a fail-closed operator error. Must cover **all three** skip sites, not just the cycle one.
+- **Files:** [service.rs:1311](../crates/ledger/src/service.rs#L1311) (`cycle_blocked`), [service.rs:1355-1360](../crates/ledger/src/service.rs#L1355-L1360) (cycle skip), [service.rs:1377](../crates/ledger/src/service.rs#L1377) (fan-in skip), [service.rs:1385](../crates/ledger/src/service.rs#L1385) (insert refusal), [service.rs:2052-2056](../crates/ledger/src/service.rs#L2052-L2056) (compaction serializes the DAG), [main.rs:219](../crates/gl-node/src/main.rs#L219).
+- **Verify:** the audit's proof, as a test — append six transactions through the public API, rewrite one `openledger-parents` line, reboot, **assert all six are still on disk**. Repeat for a pre-T41 over-fan-in file and for a `CycleCheckExhausted` file. Bug-catch proof: against the unfixed code the assertion drops to 0 transactions.
+
+### ☐ T48 — Complete the CBOR pre-scan (H-09) — S
+- **Why:** it re-opens M-16, which T26/T43/T43b were written to close, and it is **silent** — the frame decodes *successfully* as an empty `Supply`, so there is no `BatchTooLarge`, no `FramePrescan`, no warning. Measured **805 MB peak for a 16 MB frame** (50.33×, the same factor `decode_memory.rs` records for the unguarded path); one budget unit per frame against a 100k per-connection budget, × 32 connections per peer ≈ 25 GB of transient heap from one key.
+- **The defect:** `supply_entry_count` returns at the **first** `entries` key and never walks the rest of the top-level map, so a sibling key carries an unbounded array straight into serde's `Content` buffer. `scan_bounded_arrays` — the non-`Supply` arm — has no such hole. **The asymmetry is the bug:** the one variant T26 deliberately admits at 16 MiB is the one whose scan short-circuits.
+- **Change:** walk every top-level pair and bound every array the frame carries, as `scan_bounded_arrays` already does; and reject `Supply` frames carrying unknown keys outright, since serde buffers them regardless of whether the struct wants them. Verified in vendored `serde-1.0.229/src/private/de.rs:859-886` that `TaggedContentVisitor::visit_map` buffers **every** pair, unknown keys included; ciborium's only guard is a 256-level *recursion* limit, not cardinality.
+- **Files:** [cbor_scan.rs:560-573](../crates/p2p/src/cbor_scan.rs#L560-L573), [protocol.rs:375-378](../crates/p2p/src/protocol.rs#L375-L378).
+- **Verify:** extend [decode_memory.rs](../crates/p2p/tests/decode_memory.rs) with the `{"type":"supply","entries":[],"z":[…]}` shape, asserting **both** rejection and bounded peak allocation — the existing tests measure only the two shapes T43/T43b fixed, which is why this survived. Bug-catch proof: the counting allocator must show the ~50× peak against the unfixed scan.
+
+### ☐ T49 — Session bounds on anti-entropy, and a tick drain that cannot be held hostage (H-10, M-06, M-26, M-27, M-28) — M
+- **Why:** ~40 bytes per frame from one allowlisted peer kills **all** anti-entropy with **all** peers, permanently, for the process lifetime — and anti-entropy is the designated correctness backstop that makes dropping gossip hints safe (T23). Silent: no error, no log, no health signal.
+- **The defect chain:** `read_have_heads_advert`'s only exits are `more == false`, a read error, and the **distinct**-id cap. T41 changed `absorb_page` to count distinct ids — its own rustdoc and test say so (*"A peer replaying one page 10,000 times advertises ONE id"*) — which removed the only bound the loop had. `AntiEntropyTimeouts.io` is **per-frame** and every frame refreshes it. Then one never-returning task in the `JoinSet` means `while set.join_next().await.is_some() {}` never returns and `interval.tick()` is never reached again. **T41's dedup fix introduced this**; it is the clearest case for the bug-catch-proof note at the top of this file.
+- **Change:** (a) a deadline around the **whole** exchange, not per frame; (b) a page counter and a byte budget on the advert loop (M-26 — the cap bounds count, not bytes, and nothing validates id length); (c) require `^[0-9a-f]{64}$` on every advertised id — the rule `openledger-parents` already has, and the cheapest fix for M-26; (d) a timeout on `open_bi` (M-27 — verified in vendored `noq-1.1.0/src/connection.rs:1007-1046` that `poll_open` pends forever against a peer advertising `initial_max_streams_bidi = 0`; the same hang in the gossip task leaks a `FetchCoordinator` permit and in-flight entry); (e) a client-side frame/round budget mirroring the server's `max_requests_per_connection` (M-28); (f) make the drain resilient — `join_next` with a timeout, or abort the `JoinSet` at the next tick — so one stuck peer can never stop the scheduler.
+- **Files:** [anti_entropy_alpn.rs:624-648](../crates/gl-node/src/anti_entropy_alpn.rs#L624-L648) (`read_have_heads_advert`), [:592-598](../crates/gl-node/src/anti_entropy_alpn.rs#L592-L598) (`absorb_page`), [:422,451](../crates/gl-node/src/anti_entropy_alpn.rs#L422) (`open_bi`), [:565-567,579-581,658-699](../crates/gl-node/src/anti_entropy_alpn.rs#L579-L581), [p2p_service.rs:313-324,424-435](../crates/gl-node/src/p2p_service.rs#L424-L435), [anti_entropy.rs:24-51](../crates/p2p/src/anti_entropy.rs#L24-L51) (`compute_want`).
+- **Verify:** the money test — a peer answering `more: true` with empty pages forever: assert the exchange aborts **and that the next tick still syncs a healthy peer** (the second half is the point; the first alone would have passed pre-T41). Plus a peer advertising `initial_max_streams_bidi = 0`; plus an advert of 255-byte ids asserting bounded resident bytes. Bug-catch proof: against the unfixed code the healthy peer never converges.
+
+### ☐ T50 — Make `commit_in_flight` RAII (H-11) — S
+- **Why:** one cancelled mutation permanently wedges **every** ledger write path — the three GraphQL mutations, the ALPN anti-entropy path (so **peer replication stops being persisted**), the file-watcher reconcile, and the shutdown compaction. Reads keep working and `/health` still returns `{"status":"ok"}`, so nothing surfaces it.
+- **The defect:** `prepare()` sets the flag synchronously; the only two clears live **after** `spawn_blocking(...).await`; there is no `Drop` guard (`grep -rn "impl Drop"` over both files returns nothing). The `spawn_blocking` task is not cancelled, so the write still lands — only the bookkeeping is lost. `prepare_or_recover` then deliberately **re-raises** `CommitInFlight` without recovering, which makes it terminal.
+- **Triggers are ordinary, not exotic:** (1) the node's **own** `TimeoutLayer` — vendored `tower-http/src/timeout/service.rs:138` returns `Poll::Ready(Ok(408))` and drops `inner`; the default is 30 s but `requestTimeoutSeconds` is legal down to **1 s**; (2) HTTP/2 `RST_STREAM`, a precise repeatable cancel primitive that needs no TLS because the port serves cleartext h2c (M-22/T56); (3) any panic on that path. Note the composition: **T54's quadratic `verify` is exactly what pushes a concurrent mutation past its timeout.**
+- **Change:** make the flag RAII — a guard cleared on drop — or clear it explicitly on the cancellation path. Either way a wedged flag should become recoverable rather than terminal; consider whether `prepare_or_recover`'s deliberate re-raise is still the right call once the flag can no longer leak.
+- **Files:** [service.rs:2081](../crates/ledger/src/service.rs#L2081) (set), [:2145,2182](../crates/ledger/src/service.rs#L2145) (the two clears), [:2017](../crates/ledger/src/service.rs#L2017) (the rejection), [ledger_commit.rs:100,155](../crates/gl-node/src/ledger_commit.rs#L100).
+- **Verify:** issue a mutation, cancel the future mid-commit, assert the **next** mutation succeeds. Repeat for the 408 path (set `requestTimeoutSeconds: 1`) and for an h2 `RST_STREAM`. Bug-catch proof: against the unfixed code the second mutation returns `CommitInFlight` forever.
+
+---
+
+## Tier 2 — the file-ingest path (its guards diverged from the wire's, and it signs what it adopts)
+
+> **The theme.** L-11's fix made `reconcile_file` sign what it adopts. That turned the file path
+> from a local-only concern into a **replication** concern: anything the file path accepts but the
+> wire path rejects gets signed with this node's key, persisted, served, and then refused by every
+> peer forever — permanent divergence plus perpetual re-Want churn, which is the H-03/H-06 shape
+> reached through the file. The code names this outcome itself at
+> [service.rs:396-399](../crates/ledger/src/service.rs#L396-L399). These two tasks close the gap.
+
+### ☐ T51 — Reconcile/boot check parity (M-20, L-02, L-29, L-45) — S/M
+- **Why:** three guards the wire and local-API paths enforce are simply absent from `reconcile_content`, and one is absent from boot. M-19 (T52) makes this reachable in **every** deployment, including those that set the documented opt-out.
+- **What is missing, precisely:**
+  1. `enforce_economic_bean_limit` — the open half of **L-02**. Nothing else bounds body length; the parser caps charsets, not lengths. The oversized entry is signed and then refused at [union_merge.rs:137-143](../crates/p2p/src/union_merge.rs#L137-L143) forever.
+  2. **Any parent-txid form check** — **L-29's rule, absent on the file path.** `parent_txid_is_well_formed` ([service.rs:224](../crates/ledger/src/service.rs#L224)) has exactly **one** production call site, `:3082` in `stage_remote_directive`. Reconcile (`:2554`) and boot (`:1378`) call only `validate_parent_fan_in`, which is a *count* check ([service.rs:562-573](../crates/ledger/src/service.rs#L562-L573)). `LedgerDag::insert` does not check form either. Parents are envelope metadata, so a hand edit changes no content id.
+  3. **Any lamport format or range check** — `:2604-2607` silently ignores an unparseable value, and a file lamport of `u64::MAX` sets the boot clock to `u64::MAX`, destroying the `(author, lamport)` uniqueness T31 restored. **Coordinate with T46**, which owns the ceiling.
+  4. **L-45:** T37's charset tightening made boot *fatal* on a pre-existing ledger. Pre-T37 both parser and `validate_account_name` accepted Unicode alphanumerics, so `Assets:Cаsh` (Cyrillic а) was storable **and replicable**; at HEAD `parse_file` rejects it and boot propagates hard to `exit(1)`. Any deployment that booked — or merely *received* — such a name cannot start after upgrade, with no targeted error. Fix is **skip-and-warn at boot ingress, not loosening the charset**, matching the tolerant-boot rule the same task family applied to the fan-in cap and the L-17 cycle pre-scan.
+- **Note the ordering constraint:** the checks must refuse the entry **before** it is signed, not after.
+- **Files:** [service.rs:2479-2704](../crates/ledger/src/service.rs#L2479-L2704) (`reconcile_content`), [:2554,2604-2607,2642](../crates/ledger/src/service.rs#L2554), [:1290-1294,1378](../crates/ledger/src/service.rs#L1378) (boot), [:224,562-573](../crates/ledger/src/service.rs#L224), [dag.rs:176-190](../crates/ledger/src/dag.rs#L176-L190).
+- **Verify:** one regression test per rejected class, each asserting the entry is refused **before** signing; a Unicode-account ledger boots with a warning instead of exiting. Bug-catch proof: against the unfixed code, a reconciled over-cap/uppercase-parent entry is signed and then rejected by the real `validate_supply_entry`.
+
+### ☐ T52 — File-interface honesty (M-19, M-25, M-29) — S/M
+- **Why:** the `.bean` is the supported operator-edit interface, and all three of these make it lie — a setting that does nothing, edits silently truncated, and a watcher that quietly disables T44.
+- **M-19 — `externalFileEdits: "disabled"` does not disable adoption.** [service.rs:2052](../crates/ledger/src/service.rs#L2052) calls `adopt_external_edits()` **unconditionally** on the compaction branch. The only reader of the config value in the whole workspace is [main.rs:373](../crates/gl-node/src/main.rs#L373), gating the *file watcher* alone. The compaction branch runs at boot, at shutdown, whenever the stat probe fires — which a hand edit itself causes — and on **every** write while the canonical file is under 64 KiB. [README.md:622](../README.md#L622) states the opposite. `"disabled"` is the default and ships in `deploy/gl-node.docker.json`. **In fairness** the README elsewhere argues file-write authority *is* local-API-write authority ("same machine, same file, same trust boundary"), so this is not the privilege escalation it first appears — the defect is **false assurance**, the same class as H-05's misleading comment. **Change:** honour the setting on the compaction path too, **or** delete it and correct README:622. Do not leave a third state.
+- **M-25 — the parser silently discards trailing tokens.** `at_eol` is called in only two places in all of `parse.rs`. Proven: `"… open Assets:Cash USD AND MORE JUNK"` → `"… open Assets:Cash USD"`; `"… close Assets:Cash 2020-01-01"` → `"… close Assets:Cash"`; a third narration string is dropped; `"  Assets:Cash   1 USD this is dropped"` leaves no trace. A half-finished edit is not rejected or logged — it is re-read as a **different valid directive**, adopted, signed, and written back truncated, and the rejection log at [service.rs:2695](../crates/ledger/src/service.rs#L2695) (which exists so an operator "has a way to find out what they lost") never fires. **Change:** `at_eol` after every line form.
+- **M-29 — the watcher permanently disables T44's append path.** `reconcile_content` unconditionally sets `canonical_is_current = false` ([service.rs:2478](../crates/ledger/src/service.rs#L2478)), which `prepare` turns into a forced rewrite; the watcher has no self-write suppression and `reconcile_file_staged` lacks the `last_file_hash` short-circuit `adopt_external_edits` has, so it re-parses and re-hashes every directive under the **write** lock — closing a self-sustaining loop. Proven: `Some(Append)` ×4 becomes `Some(Compact)` ×4 after one watcher tick. Also `FileState::from_path` ([file_watcher.rs:71](../crates/ledger/src/file_watcher.rs#L71)) reads the file with **no size cap**, unlike `read_ledger_file`, every 250 ms. **Change:** self-write suppression, the `last_file_hash` short-circuit, and a size cap.
+- **Files:** [service.rs:2052,2478,2695](../crates/ledger/src/service.rs#L2052), [main.rs:373,380](../crates/gl-node/src/main.rs#L373), [parse.rs](../crates/ledger/src/parse.rs) (`at_eol` call sites), [file_watcher.rs:71](../crates/ledger/src/file_watcher.rs#L71), [config.rs:91-92,397,619](../crates/gl-node/src/config.rs#L619), [README.md:622](../README.md#L622).
+- **Verify:** the four M-25 truncation cases are rejected or logged, never silently adopted; with `externalFileEdits: "disabled"` a hand edit is **not** adopted on the compaction path (or the setting is gone and the README matches); the M-29 proof inverted — a self-write after a watcher tick still yields `Append`.
+
+---
+
+## Tier 3 — cost, determinism, and the HTTP edge
+
+### ☐ T53 — Total serialization order (M-24) — S
+- **Why:** it breaks the project's own I7/C4 guarantee, with **no attacker and ordinary data**. `stable_sort_key` ([serialize.rs:68](../crates/ledger/src/serialize.rs#L68)) is `narration|payee` for transactions and `account` for opens — omitting postings, amounts and currency lists — and `sort_by` is stable, so ties fall back to `LedgerDag::insertion_order`, i.e. **arrival order**. Proven for two "Starbucks/Coffee" transactions with different amounts and for two same-date `open Assets:Cash` with different currencies. Permanent: a reboot re-derives insertion order from the file's own order. Directly contradicts the assertion at [service.rs:6348](../crates/ledger/src/service.rs#L6348) (*"CT-9: After convergence, .bean files must be byte-identical (C4/I7)"*).
+- **Change:** append the content id to the key — exactly as `accounts::LifecycleKey` already does. It is total by construction and already the pattern in-tree.
+- **Files:** [serialize.rs:68](../crates/ledger/src/serialize.rs#L68), CT-9 at [service.rs:6348](../crates/ledger/src/service.rs#L6348).
+- **Verify:** both proven tie cases produce byte-identical files under **both** arrival orders; strengthen CT-9 so it would have caught this (today it passes because its fixture has no ties).
+
+### ☐ T54 — Batched balances-at-date, and re-weight `verify` (M-23, L-35) — M
+- **Why:** T32 fixed M-08 ("assertions are never evaluated") and in doing so made `verify` **O(assertions × transactions × postings)** — and the mitigation's model broke silently. `HEAVY_RESOLVER_COMPLEXITY = 512` was sized on "scan the ledger once" (its comment says so) against a 4096 budget, so **8 quadratic scans per request** are still allowed. Measured, release, perfect quadratic scaling: `1000×1000 → 171ms`, `2000×2000 → 656ms`, `4000×4000 → 2.61s`.
+- **A peer supplies the multiplier.** A `balance` directive is the cheapest thing to plant: `stage_remote_directive` routes it through the `_ =>` catch-all ([service.rs:3163](../crates/ledger/src/service.rs#L3163)) with no lifecycle check and no requirement that the account exist. At ~250 bytes, >100k fit under the file cap. It runs inside `ledger.read().await` ([query.rs:231](../crates/gl-node/src/graphql/query.rs#L231)), blocking every writer, inline on a tokio worker — and the 408 drops the *response*, not the work, which is precisely what feeds T50's wedge.
+- **Change:** a batched balances-at-date API in `read_model.rs` (one pass for all assertions instead of a full rebuild per assertion); re-weight `verify` against measured cost; move the work off the read lock (`spawn_blocking` or a snapshot). Fold in **L-35**: `all_directive_ids()` ([service.rs:2971-2977](../crates/ledger/src/service.rs#L2971-L2977)) is still a full O(N) `String` clone called twice per peer per tick plus once per inbound advert, and compaction still does a blocking whole-file read + O(N) serialize under the write lock — T27's "incremental index" was never built.
+- **Files:** [verify.rs:155](../crates/ledger/src/verify.rs#L155), [checkpoint.rs:55,152-166](../crates/ledger/src/checkpoint.rs#L152-L166), [read_model.rs:407,437-456](../crates/ledger/src/read_model.rs#L437-L456), [query.rs:229-233](../crates/gl-node/src/graphql/query.rs#L229-L233), [service.rs:2971-2977,3163](../crates/ledger/src/service.rs#L2971-L2977).
+- **Verify:** the 4000×4000 case stays sub-second; a test asserts the declared weight matches measured cost so the next change cannot silently invalidate it again; `verify` no longer holds the read lock across the computation.
+
+### ☐ T55 — HTTP edge hardening (M-21, M-30, M-33, H-01 residual, L-36, L-37, L-42, L-50, L-51, L-52) — M
+- **M-21 — the bucket cap is a sustainable total bypass.** [rate_limit.rs:199-214](../crates/gl-node/src/rate_limit.rs#L199-L214): at `MAX_BUCKETS` (65,536) a new key is `return true`'d **and never inserted**. The in-code comment reasons only about incidental overflow and concludes "the table drains within one window" — but an attacker holds the table at the cap by touching 65,536 keys once per 60 s window (~1,100 cheap requests/s, each well under the per-bucket limit), and flood traffic from any further key **never grows the table**. A single routed IPv6 /48 supplies exactly 65,536 /64 keys. **Change:** fail closed under a shared overflow budget, or evict expired-soonest — never admit free.
+- **M-30 — `trustedProxies` misses a dual-stack peer.** `bucket_key` normalizes IPv4-mapped IPv6 ([:267](../crates/gl-node/src/rate_limit.rs#L267)); `client_ip` does not ([:135](../crates/gl-node/src/rate_limit.rs#L135)). With `bindAddress: "::"` an IPv4 proxy arrives as `::ffff:172.18.0.9`, never equal to `V4(172.18.0.9)` → XFF discarded → **every client behind the terminator shares one 60/min bucket**, i.e. M-04 re-created by a type mismatch. Silent both ways: the M-04 warning fires only when the list is *empty*, and the operator sees the reassuring "X-Forwarded-For trusted" line instead. **Change:** normalize in `client_ip` too; test a v4-mapped peer against a v4 entry.
+- **M-33 — no per-IP connection cap.** `accept_with_permit` takes the permit **before** `accept()` ([http_server.rs:223-233](../crates/gl-node/src/http_server.rs#L223-L233)) — deliberate and correct against a flood — but the cap is **global only**, with no analogue of the ALPN side's 32-per-peer. One client holding all 1024 slots stops the process accepting **at all**, upstream of the Host guard, limiter and auth; 1024 idle sockets refreshed every 30 s lock out `/health`, failing the Docker `HEALTHCHECK` and, via `depends_on: service_healthy`, the peers' startup.
+- **H-01 residual + L-42 — `/health` is outside the Host guard and the limiter.** [main.rs:634-640](../crates/gl-node/src/main.rs#L634-L640) applies `request_guard` and `graphql_rate_limit` to `graphql_routes` only, and L-09's gate keys on `public_bind` — so a **loopback** node answers any `Host` with version/head-count/peer-count. H-01's DNS-rebinding read, closed for `/graphql` by T19, is still open here, plus an unauthenticated unmetered `ledger.read()` per request.
+- **Also:** L-36 (`client_ip` parses every XFF entry with no count cap), L-37 (the empty-`trustedProxies` warning fires only when `tls.mode == "terminated"`, so a node behind an ingress with the default gets none), L-50 (`auth.apiKey` not validated for header-safety while `allowedHosts` and `cors.allowedOrigins` are — a non-ASCII key boots then 401s everything forever), L-51 (`origin_allowed` is scheme-blind, so behind the mandated terminator a plaintext `http://<node-host>` page reads as same-origin), L-52 (`Origin: null` is accepted if configured, contradicting the guard's own doc comment; `cors_layer()` then echoes `Access-Control-Allow-Origin: null`).
+- **Files:** [rate_limit.rs:135,140-155,199-214,267](../crates/gl-node/src/rate_limit.rs#L199-L214), [http_server.rs:122-123,223-233](../crates/gl-node/src/http_server.rs#L223-L233), [main.rs:484-489,634-640](../crates/gl-node/src/main.rs#L634-L640), [request_guard.rs:153-166](../crates/gl-node/src/request_guard.rs#L153-L166), [auth.rs:73](../crates/gl-node/src/auth.rs#L73), [config.rs:701,724](../crates/gl-node/src/config.rs#L701), [health.rs:71-90](../crates/gl-node/src/health.rs#L71-L90).
+- **Verify:** an attacker holding the bucket table at the cap is still limited; a v4-mapped proxy is trusted; one host cannot consume all connection slots; `/health` honours the Host guard and the limiter.
+
+### ☐ T56 — Dependency bumps, the h2c decision, and CI hygiene (M-34, M-22, L-46) — S
+- **Why first among Tier 3:** it is one command, and **CI is currently red** — [ci.yml:40-53](../.github/workflows/ci.yml#L40-L53) runs `rustsec/audit-check` with no `continue-on-error` and `cargo audit` exits `error: 3 vulnerabilities found!`. A red audit job is how the *next* advisory gets ignored.
+- **M-34 — new advisory.** `rustls` 0.23.42 → RUSTSEC-2026-0285 (published 2026-09-14, CVSS 5.3, "TLS 1.3 handshake messages incorrectly accepted across encryption level boundaries"). `cargo tree -i rustls -e normal` puts it **directly under `iroh v1.0.3`** and its `noq` QUIC layer — the TLS 1.3 under the node's own peer transport, not a DoH side-path. The advisory's own impact is limited (the transcript stays authenticated).
+- **M-22 — the register's `h2` assessment was wrong, not just stale.** [http_server.rs:126](../crates/gl-node/src/http_server.rs#L126) uses hyper-util's sniffing `auto::Builder` and never restricts it; `:139-143` configures `.http2()` keep-alives (which compiling proves the feature is on). Verified in vendored `hyper-util-0.1.20/src/server/conn/auto/mod.rs:39,350-358` that it matches the `PRI * HTTP/2.0` preface and serves HTTP/2 **over cleartext** — no TLS, no ALPN. So RUSTSEC-2026-0258's frame decoder is reachable by **any unauthenticated client that can open a TCP connection**, below the axum stack where the API key, Host guard and limiter do not reach. It is also T50's cleanest trigger (`RST_STREAM`).
+- **Change:** `cargo update -p rustls -p h2 -p lru -p chacha20` — all four are **semver-compatible lockfile-only** moves, verified by `cargo update --dry-run` (`chacha20 0.10.1→0.10.2 · h2 0.4.15→0.4.19 · lru 0.18.1→0.18.4 · rustls 0.23.42→0.23.45 · rustls-webpki 0.103.13→0.103.15`). Then **decide deliberately whether to serve h2c at all** — `Builder::http1_only()` if not; if yes, document that the GraphQL port speaks cleartext HTTP/2 to unauthenticated clients. **L-46:** add `--locked` to the clippy step — [ci.yml:36](../.github/workflows/ci.yml#L36) runs `cargo clippy` *without* it before `:38`'s `cargo test --locked`, and clippy regenerates `Cargo.lock`, so by the Test step it is consistent and `--locked` passes, defeating exactly the unreviewed-bump scenario the `Dockerfile:39` comment says the flag exists to catch.
+- **Verify:** `cargo audit` exits clean and CI is green; a test or documented decision records the h2c posture.
+
+### ☐ T57 — Mesh identity and logging (M-31, M-32, L-23) — S
+- **M-31 — `swarmTopic` is the signature domain by default but gets none of `meshId`'s validation.** [config.rs:326-332](../crates/gl-node/src/config.rs#L326-L332) falls back to `swarm_topic` when `meshId` is unset — the default, and what `deploy/gl-node.docker.json` ships. `meshId` gets four hard boot checks ([config.rs:736-765](../crates/gl-node/src/config.rs#L736-L765): non-empty, no leading/trailing whitespace — *"compared byte-for-byte on both sides of every signature"* — ≤128 bytes, restricted charset); `swarm_topic` gets exactly one, about uniqueness. So on the default path a trailing space silently partitions the mesh and presents as `InvalidSignature`; `""` passes; there is no length cap; and `|` is allowed.
+- **This is now a T45 prerequisite.** `mesh_id` is the **only** unconstrained field in the v3 signature message — `parents` is 64-lowercase-hex CSV, `lamport` decimal-u64, `content_id` locally computed — so it is the live half of **L-06** and it falsifies the injectivity premise in [FORMAT_V2_DESIGN.md:30-34](FORMAT_V2_DESIGN.md#L30-L34) on the default path.
+- **M-32 — the topic is logged verbatim at INFO.** [p2p_service.rs:84-88](../crates/gl-node/src/p2p_service.rs#L84-L88) does `info!(topic = %config.swarm_topic, …)` while three other sites deliberately refuse to ([config.rs:286-294](../crates/gl-node/src/config.rs#L286-L294): *"the gossip join credential … prints source + length + a 4-character prefix rather than the value"*; `config.rs:312`; [main.rs:279-287](../crates/gl-node/src/main.rs#L279-L287): *"names its shape, never its value"*). The other half of the credential is 20 lines earlier.
+- **Change:** apply `meshId`'s four checks to whatever resolves as the signature domain; stop logging the topic verbatim; consider making `meshId` required (which would close L-23 outright rather than leaving it opt-in).
+- **Verify:** a `swarmTopic` with a trailing space, an empty one, and an over-long one are all refused at boot when they are the signature domain; no log line contains the topic value.
+
+---
+
+## Tier 4 — scheduled hardening (Lows)
+
+### ☐ T58 — P2P cost and robustness sweep (L-01, L-33, L-34, L-38, L-39, L-53, L-54) — M
+- **L-01 / L-33 — `collect_supply` trims at the wrong end.** [anti_entropy_alpn.rs:706-718](../crates/gl-node/src/anti_entropy_alpn.rs#L706-L718) serializes and hashes *every* matched directive for a Want of up to 1,024 ids under the ledger read lock, then `truncate_supply` discards all but 256 / 15 MiB. A ~68 KiB request frame costs up to ~64 MiB of allocation (the 09/01 report's "1 GiB" is now wrong — the 64 MiB file cap bounds it), and 32 connections per peer sustain it concurrently. **Change:** budget while collecting, not after. This is L-01's open Want arm; the advert arm is already closed.
+- **L-34 — no refusal cache.** `compute_want` just diffs, so any permanently-rejected directive — the M-09 residual, anything in the M-20 class — is re-Wanted, re-transferred and re-validated **every tick forever**, with its orphans churning on the 1 h TTL. **Change:** a bounded negative cache on the anti-entropy path, mirroring `FetchCoordinator`'s.
+- **L-39 — `ConnectionLimiter` bounds count, not bytes:** 256 connections × up to 16 MiB in-flight frame body ≈ 4–8 GiB of legitimately-shaped buffers. (M-16's other half; T48 owns the pre-scan.)
+- **L-38 — `fetch_coordinator` panics on mutex poisoning.** `.expect()` at [fetch_coordinator.rs:149,158,177,222,230](../crates/gl-node/src/fetch_coordinator.rs#L149) inside the gossip-loop task, where everywhere else in the tree uses `unwrap_or_else(|p| p.into_inner())`.
+- **L-53 — `Announce.id` is unvalidated** and used as a negative-cache key (bounded to ~16 MB by iroh-gossip's 4096-byte frame default). Fold into T49's `^[0-9a-f]{64}$` rule if that lands first.
+- **L-54 — `drain_orphans` re-runs an O(n) TTL sweep per re-buffer** under both write locks.
+
+### ☐ T59 — Ledger and commit robustness sweep (L-40, L-41, L-43, L-44) — S/M
+- **L-41 — journal header length overflows instead of failing closed.** [journal.rs:246](../crates/ledger/src/journal.rs#L246) parses an unbounded `usize`; `:214` does `cursor + payload_length`. Proven panic (`attempt to add with overflow`; `overflow-checks = true` in release too) against a module whose stated policy is `JournalError::Corrupt`. `read_journal` is the body of `recover_failed_commit`, so the panic can land in a live node **holding the write lock**. Highest-value item in this task.
+- **L-43 — the L-13 recovery path re-introduces a blocking whole-file rebuild under the write lock.** [ledger_commit.rs:108,115,157](../crates/gl-node/src/ledger_commit.rs#L108) call `recover_failed_commit`, which runs `LedgerService::boot` synchronously ([service.rs:2184](../crates/ledger/src/service.rs#L2184)) — up to 64 MiB read + parse + per-directive DAG insert + `ReadModel::build`, on a runtime worker with the **write** guard held. Exactly the stall `ledger_commit.rs:1-14` says T44 removed, repeated per failed commit (ENOSPC/EIO/read-only mount).
+- **L-44 — `persist_atomically` chmods by path after the rename.** [service.rs:174-182](../crates/ledger/src/service.rs#L174-L182) uses `std::fs::metadata` + `set_permissions` (both symlink-following) post-rename, so a directory-writable attacker can have an arbitrary target chmod'd 0600 by the node — possibly root in the shipped container. Every other T36 site avoids precisely this; the key writer's own comment reads *"restore 0600 through the handle (`fchmod`), never by path"*. **Change:** set the mode on the temp file's handle before the rename; the path-based call then disappears.
+- **L-40 — a dangling `openledger-parents` naming a predictable future txid blocks that exact transaction.** Proven: the append is refused with `CYCLE_DETECTED` naming the victim's own new txid. The wire path is *not* exposed (`require_parents: true` routes to the orphan buffer — verified); reachable via hand edit and `reconcile_content`, and cleared by appending any other transaction first. Lowest priority here; T47 and T51 may subsume it.
+
+### ☐ T60 — Docs, config and key hygiene sweep (L-47, L-48, L-49 + drift) — S
+- **L-49 — the key-file check verifies mode but not owner, and the read path follows symlinks.** [p2p_service.rs:712-727](../crates/gl-node/src/p2p_service.rs#L712-L727) checks `mode & 0o077` via `fstat` (correct — that is L-04) but never compares `st_uid` to `geteuid()`; [:615](../crates/gl-node/src/p2p_service.rs#L615) uses plain `File::open` with no `O_NOFOLLOW`. The *write* path is hardened with `O_EXCL` against exactly this. Since one key is both QUIC identity and signing key, adopting a pre-planted 0600 key is **full node impersonation** — the security-relevant item in this task.
+- **L-47 — [README.md:13](../README.md#L13) says "Rust 1.87+"; [Cargo.toml:13](../Cargo.toml#L13) is `rust-version = "1.91"`.** Quick Start's `cargo build --release` hard-fails for anyone on 1.87–1.90.
+- **L-48 — `p2p.relayMode` defaults to `"n0"` and appears nowhere in the README** ([config.rs:505-507](../crates/gl-node/src/config.rs#L505-L507)) — absent from the block labelled "Full Config (All Options)" and from the options table. There is a boot `warn!`, which is why it is Low.
+- **Drift to fix in the same pass:** `SPEC.md` does not exist but is referenced; `gl-node.config.json` is tracked with `graphiql: true` while README:53 says off by default; the `docker run` example's `-v $(pwd)/data:/data` creates a root-owned directory uid-1000 cannot write; and **document the unpinned cross-crate coupling** — `truncate_supply` emits an *empty* Supply for any entry over 15 MiB (pinned as intentional at `anti_entropy.rs:434-439`), which the client reads as `stalled` and abandons; this is unreachable **only** because `MAX_ECONOMIC_BEAN_LENGTH` (1 MiB) is far below `SUPPLY_FRAME_BUDGET_BYTES` (15 MiB), the constants live in different crates, and nothing tests the dependency. A Format-v2 bean-cap raise would silently re-create an H-03-class divergence.
+
+---
+
+## Suggested landing order & regression-test manifest
+
+**T56 first** — it is one command plus a one-word CI fix, and it turns the build green so every later
+task lands against a trustworthy signal. Then Tier 1 as five focused PRs (**T46 → T47 → T48 → T50 →
+T49**, cheapest-and-most-severe first; T49 is last because it is the only M-sized one). Tier 2 then
+Tier 3 can proceed in parallel; Tier 4 is scheduled.
+
+**T45 interaction:** wave C (wire v2) can run in parallel with Tier 1. **Waves A+B should wait for
+T46 and T51**, which both touch envelope fields Format v2 re-specifies, and **T57 is a prerequisite
+for Facet B** (it constrains `mesh_id`, the one signed field L-06 still leaves open).
+
+Tests that must exist by the end of Tier 1:
+
+1. Ingest at `MAX_REMOTE_LAMPORT` → a locally-authored directive still validates at a peer, **across a restart** (T46 / H-07).
+2. Patch one `openledger-parents` line → reboot → **all transactions still on disk**; same for a pre-T41 over-fan-in file and a `CycleCheckExhausted` file (T47 / H-08).
+3. `{"type":"supply","entries":[],"z":[…]}` rejected **and** peak allocation bounded, measured with `decode_memory.rs`'s counting allocator (T48 / H-09).
+4. A peer answering `more: true` with empty pages forever → exchange aborts **and the next tick still syncs a healthy peer**; plus `initial_max_streams_bidi = 0`; plus a 255-byte-id advert with bounded resident bytes (T49 / H-10, M-26, M-27, M-28).
+5. Cancel a mutation mid-commit → the next mutation succeeds; repeated for the 408 path at `requestTimeoutSeconds: 1` and for an h2 `RST_STREAM` (T50 / H-11).
+
+Every one of the five needs its **bug-catch proof** — revert the fix, watch the named test fail,
+restore — and for T48 and T49 the proof must be run against the *T43/T41 code that introduced the
+regression*, not against the pre-T26 baseline.
+
+---
+
+*Audit: [SECURITY_AUDIT_0922.md](../SECURITY_AUDIT_0922.md). Previous trackers: [OUTSTANDING_TASKS_09.md](OUTSTANDING_TASKS_09.md) (T18–T45) · [OUTSTANDING_TASKS.md](OUTSTANDING_TASKS.md) (T1–T17, all ☑). Format v2 design: [FORMAT_V2_DESIGN.md](FORMAT_V2_DESIGN.md).*
