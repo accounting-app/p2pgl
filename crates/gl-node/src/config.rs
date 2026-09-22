@@ -252,7 +252,16 @@ pub struct P2pConfig {
     #[serde(default = "default_anti_entropy_interval")]
     pub anti_entropy_interval_milliseconds: u64,
 
-    /// TopicId preimage string (§3.4.3).
+    /// TopicId preimage string (§3.4.3), and — while
+    /// [`mesh_id`](Self::mesh_id) is unset — the signature domain too (M-31).
+    ///
+    /// Two jobs, both byte-exact. As a preimage it is SHA-256'd into the
+    /// `TopicId` every peer must derive identically to meet on the overlay; as
+    /// the fallback domain it is interpolated into every signed message. It is
+    /// therefore held to the same rules as `mesh_id`
+    /// ([`NodeConfig::validate_signature_domain`]) rather than the single
+    /// uniqueness check it used to get: a trailing space here is not a cosmetic
+    /// difference, it is a different mesh.
     #[serde(default = "default_swarm_topic")]
     pub swarm_topic: String,
 
@@ -323,6 +332,11 @@ impl P2pConfig {
     /// hands the result to the signer and to the ALPN verification path, so no
     /// other site reads `swarm_topic` for signature purposes and the two cannot
     /// disagree.
+    ///
+    /// Whichever arm it takes, the value returned has passed
+    /// [`NodeConfig::validate_signature_domain`] (M-31) — the fallback arm is
+    /// the default path in every shipped config, so validating only `mesh_id`
+    /// validated nothing that actually shipped.
     pub fn signature_domain(&self) -> &str {
         match self.mesh_id.as_deref() {
             Some(mesh_id) => mesh_id,
@@ -428,21 +442,42 @@ fn default_swarm_topic() -> String {
     "openledger/transactions".to_owned()
 }
 
-/// Upper bound on `p2p.meshId` in bytes (L-23).
+/// Upper bound in bytes on **either** field that can resolve as the signature
+/// domain — `p2p.meshId` and `p2p.swarmTopic` (L-23, M-31).
 ///
 /// The value is a domain separator hashed into every signature, not a payload,
 /// so the only thing length buys past an identifier is room to hide things in.
 /// A UUID is 36 characters; 128 leaves space for a prefixed or namespaced one.
-const MAX_MESH_ID_BYTES: usize = 128;
+///
+/// Applied to the topic too as of M-31: `meshId` is opt-in, so on every shipped
+/// config the *topic* is the domain, and a bound that only guards the field
+/// nobody sets is not a bound.
+const MAX_SIGNATURE_DOMAIN_BYTES: usize = 128;
 
-/// Characters `p2p.meshId` may contain (L-23).
+/// Characters `p2p.meshId` and `p2p.swarmTopic` may contain (L-23, M-31).
 ///
 /// ASCII alphanumerics plus the separators identifiers are actually spelled
 /// with. Deliberately excludes whitespace and control characters: the value is
 /// compared byte-for-byte on both sides of a signature, so a stray character
 /// that survives a copy-paste is a mesh-wide verification failure that looks
 /// like a key problem.
-fn is_mesh_id_character(character: char) -> bool {
+///
+/// **This charset is what keeps the v3 signature message injective (L-06), and
+/// it is a prerequisite for T45 Facet B.** The signed string is
+/// `openledger-sig-v3|{kind}|{content_id}|parents|{parents}|lamport|{lamport}|mesh|{mesh_id}`
+/// ([`security::signing::build_sign_message`]), and it is unambiguous *only*
+/// because every interpolated field is independently constrained so that none
+/// of them can spell the `|` separator: `parents` is 64-lowercase-hex CSV and
+/// `lamport` is a decimal `u64` (both pinned by M-01), and `content_id` is
+/// computed locally rather than carried. Until M-31 the domain was the one
+/// field with no constraint at all whenever `meshId` was unset — which is every
+/// real deployment — so a topic containing `|` could shift the field boundaries
+/// and make two different logical messages share one signed string. Excluding
+/// `|` here is what makes the injectivity premise in
+/// `docs/FORMAT_V2_DESIGN.md` §0.2 true of the running code rather than only of
+/// the opt-in path; T45 Facet B builds on that premise and must not be started
+/// before this rule is in force.
+fn is_signature_domain_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':' | '/')
 }
 
@@ -728,41 +763,59 @@ impl NodeConfig {
             }
         }
 
-        // L-23: validated unconditionally for the same reason as L-22 below —
-        // and additionally because the signature domain is consumed whenever
-        // `signing.enabled`, with or without p2p. A malformed value here is not
-        // a boot failure at the point of use: it is a silent mesh-wide
-        // verification failure that presents as "the other node's key is wrong".
+        // L-23 / M-31: the rules below are applied to whatever actually
+        // *resolves* as the signature domain, not merely to the field the rules
+        // were written for.
+        //
+        // L-23 shipped the four checks on `p2p.meshId` alone. `meshId` is
+        // opt-in and no shipped config sets one, so on every real deployment
+        // `P2pConfig::signature_domain` falls back to `p2p.swarmTopic` — which
+        // had exactly one check, and that one is about *uniqueness* (it forbids
+        // the public default topic), not well-formedness. The validated field
+        // was the one nobody sets; the field every node signs with was
+        // unvalidated. So both are checked here, and
+        // `signature_domain_is_validated` below pins that the resolved value
+        // went through this regardless of which field it came from.
+        //
+        // Both fields, always, rather than only the resolved one: the other is
+        // one config edit away from *becoming* the resolved one (delete
+        // `meshId` and the topic is the domain again), and a rule that only
+        // holds for the current shape of the file is a rule that fails on the
+        // day someone changes the file.
+        //
+        // Unconditional, not gated on `p2p.enabled`, for L-22's reason plus one
+        // of its own: the domain is consumed whenever `signing.enabled`, with
+        // or without p2p. A malformed value here is not a boot failure at the
+        // point of use — it is a silent mesh-wide verification failure that
+        // presents as "the other node's key is wrong".
+        Self::validate_signature_domain(
+            "p2p.swarmTopic",
+            &self.p2p.swarm_topic,
+            if self.p2p.mesh_id.is_some() {
+                "it is the gossip join credential, hashed byte-for-byte into the TopicId every \
+                 peer must agree on, and it becomes this node's signature domain again the \
+                 moment p2p.meshId is removed"
+            } else {
+                "with p2p.meshId unset it IS this node's signature domain, compared \
+                 byte-for-byte on both sides of every signature"
+            },
+        )?;
         if let Some(mesh_id) = &self.p2p.mesh_id {
-            if mesh_id.trim().is_empty() {
-                return Err(ConfigError::Validation(
-                    "p2p.meshId must not be empty or whitespace when present; omit the field to \
-                     fall back to p2p.swarmTopic, or set a unique value (a random UUID is the \
-                     recommendation)"
-                        .to_owned(),
-                ));
-            }
-            if mesh_id.trim() != mesh_id {
-                return Err(ConfigError::Validation(format!(
-                    "p2p.meshId must not have leading or trailing whitespace, got \"{mesh_id}\"; \
-                     the value is compared byte-for-byte on both sides of every signature"
-                )));
-            }
-            if mesh_id.len() > MAX_MESH_ID_BYTES {
-                return Err(ConfigError::Validation(format!(
-                    "p2p.meshId must be at most {MAX_MESH_ID_BYTES} bytes, got {}; it is an \
-                     identifier (a random UUID is the recommendation), not a payload",
-                    mesh_id.len()
-                )));
-            }
-            if let Some(character) = mesh_id.chars().find(|c| !is_mesh_id_character(*c)) {
-                return Err(ConfigError::Validation(format!(
-                    "p2p.meshId contains invalid character {character:?} (U+{:04X}); allowed are \
-                     ASCII letters, digits and - _ . : / (a random UUID is the recommendation)",
-                    character as u32
-                )));
-            }
+            Self::validate_signature_domain(
+                "p2p.meshId",
+                mesh_id,
+                "the value is compared byte-for-byte on both sides of every signature",
+            )?;
         }
+        debug_assert!(
+            Self::validate_signature_domain(
+                self.p2p.signature_domain_source(),
+                self.p2p.signature_domain(),
+                "resolved domain",
+            )
+            .is_ok(),
+            "the resolved signature domain must have been validated above (M-31)"
+        );
 
         // M-13: bound the HTTP hardening knobs from both sides. A floor alone
         // is not enough here — unlike an interval, where only small values are
@@ -857,6 +910,59 @@ impl NodeConfig {
             ));
         }
 
+        Ok(())
+    }
+
+    /// The four well-formedness rules every candidate signature domain obeys
+    /// (L-23, M-31), applied to `p2p.meshId` and `p2p.swarmTopic` alike.
+    ///
+    /// One function for both fields, for the same reason
+    /// [`Self::validate_http_timeout`] is one function for both timeouts: two
+    /// copies of a rule are two rules, and the pair that must agree here is the
+    /// pair that decides whether a signature made on one node verifies on
+    /// another.
+    ///
+    /// `why` names the role the value plays in *this* call, so the boot error
+    /// tells an operator what they have actually broken — the topic's role
+    /// differs depending on whether a `meshId` is displacing it as the domain.
+    ///
+    /// **Nothing here normalizes.** A padded value is *refused*, never trimmed:
+    /// the domain is compared byte-for-byte on both sides of every signature,
+    /// so quietly trimming it on the node that happens to run this code would
+    /// let two nodes resolve different domains from the same intent — turning a
+    /// loud boot failure into a silent mesh partition that surfaces much later
+    /// as `InvalidSignature`, which reads as a key problem and sends the
+    /// operator hunting in the wrong place entirely.
+    fn validate_signature_domain(field: &str, value: &str, why: &str) -> Result<(), ConfigError> {
+        if value.trim().is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "{field} must not be empty or whitespace; {why}, so it must name something (a \
+                 random UUID is the recommendation)"
+            )));
+        }
+        if value.trim() != value {
+            return Err(ConfigError::Validation(format!(
+                "{field} must not have leading or trailing whitespace, got \"{value}\"; {why} — \
+                 refused rather than trimmed, because trimming it here would turn a loud boot \
+                 failure into a silent partition"
+            )));
+        }
+        if value.len() > MAX_SIGNATURE_DOMAIN_BYTES {
+            return Err(ConfigError::Validation(format!(
+                "{field} must be at most {MAX_SIGNATURE_DOMAIN_BYTES} bytes, got {}; it is an \
+                 identifier (a random UUID is the recommendation), not a payload",
+                value.len()
+            )));
+        }
+        if let Some(character) = value.chars().find(|c| !is_signature_domain_character(*c)) {
+            return Err(ConfigError::Validation(format!(
+                "{field} contains invalid character {character:?} (U+{:04X}); allowed are ASCII \
+                 letters, digits and - _ . : / (a random UUID is the recommendation). \"|\" in \
+                 particular is the field separator of the v3 signature message, which is \
+                 injective only because no interpolated field can spell it (L-06)",
+                character as u32
+            )));
+        }
         Ok(())
     }
 
@@ -1911,20 +2017,20 @@ mod tests {
 
     #[test]
     fn test_mesh_id_length_bound() {
-        let at_bound = "a".repeat(MAX_MESH_ID_BYTES);
+        let at_bound = "a".repeat(MAX_SIGNATURE_DOMAIN_BYTES);
         assert!(
             load_with_mesh_id(Some(&at_bound)).is_ok(),
             "exactly the bound must be accepted"
         );
 
-        let over_bound = "a".repeat(MAX_MESH_ID_BYTES + 1);
+        let over_bound = "a".repeat(MAX_SIGNATURE_DOMAIN_BYTES + 1);
         let error_message = format!(
             "{}",
             load_with_mesh_id(Some(&over_bound)).expect_err("over the bound must be refused")
         );
         assert!(error_message.contains("p2p.meshId"), "{error_message}");
         assert!(
-            error_message.contains(&MAX_MESH_ID_BYTES.to_string()),
+            error_message.contains(&MAX_SIGNATURE_DOMAIN_BYTES.to_string()),
             "the error must name the bound: {error_message}"
         );
     }
@@ -1959,6 +2065,182 @@ mod tests {
             result.is_err(),
             "a malformed meshId must be refused even with p2p disabled"
         );
+    }
+
+    // ── M-31: the *resolved* signature domain, not just the meshId field ─────
+
+    /// A config with an explicit `swarmTopic`, optionally carrying a `meshId`.
+    ///
+    /// `p2p.enabled` is left false so these exercise the validation itself
+    /// rather than the p2p-only uniqueness and signing gates; the enabled path
+    /// gets its own test below.
+    fn load_with_swarm_topic(
+        swarm_topic: &str,
+        mesh_id: Option<&str>,
+    ) -> Result<NodeConfig, ConfigError> {
+        let mesh_field = match mesh_id {
+            Some(value) => format!(r#", "meshId": {}"#, serde_json::json!(value)),
+            None => String::new(),
+        };
+        let file = write_temp_config(&format!(
+            r#"{{ "ledgerPath": "./data/ledger.bean", "p2p": {{ "swarmTopic": {}{mesh_field} }} }}"#,
+            serde_json::json!(swarm_topic)
+        ));
+        NodeConfig::load_from_path(&file.path().to_path_buf())
+    }
+
+    /// Values no signature domain may take, with the reason each is refused.
+    ///
+    /// Shared by the two tests below so the `meshId` path and the `swarmTopic`
+    /// path are provably held to the *same* list rather than to two lists that
+    /// drift.
+    fn malformed_domain_values() -> Vec<(String, &'static str)> {
+        vec![
+            (String::new(), "empty"),
+            ("   ".to_owned(), "whitespace only"),
+            (
+                "my-org/ledger ".to_owned(),
+                "trailing space — the M-31 headline case",
+            ),
+            (" my-org/ledger".to_owned(), "leading space"),
+            ("my-org/ledger\t".to_owned(), "trailing tab"),
+            ("my-org/ledger\n".to_owned(), "trailing newline"),
+            ("my org/ledger".to_owned(), "interior space"),
+            (
+                "my-org|ledger".to_owned(),
+                "the v3 signature field separator (L-06)",
+            ),
+            ("my-org/ledger\u{0}".to_owned(), "NUL"),
+            ("my-org/l\u{00e9}dger".to_owned(), "non-ASCII"),
+            (
+                "a".repeat(MAX_SIGNATURE_DOMAIN_BYTES + 1),
+                "over the length cap",
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_malformed_swarm_topic_refused_at_boot_when_it_is_the_domain() {
+        // M-31, the default path in every shipped config: `meshId` is unset, so
+        // `swarmTopic` IS the signature domain. Before this it got exactly one
+        // check — "must not be the public default" — which is about uniqueness,
+        // not well-formedness. A trailing space therefore booted happily and
+        // partitioned the mesh, surfacing much later as InvalidSignature.
+        for (value, reason) in malformed_domain_values() {
+            let error = load_with_swarm_topic(&value, None)
+                .err()
+                .unwrap_or_else(|| panic!("swarmTopic {value:?} ({reason}) must be refused"));
+            let message = format!("{error}");
+            assert!(
+                message.contains("p2p.swarmTopic"),
+                "the error must name the field the operator has to fix ({reason}): {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_swarm_topic_error_says_it_is_the_signature_domain() {
+        // The whole failure mode M-31 describes is that the operator is told
+        // nothing until a peer reports InvalidSignature. The boot error has to
+        // say, at the point of refusal, that this string is signed with.
+        let message = format!(
+            "{}",
+            load_with_swarm_topic("my-org/ledger ", None)
+                .expect_err("padded topic must be refused")
+        );
+        assert!(message.contains("whitespace"), "{message}");
+        assert!(
+            message.contains("signature domain"),
+            "the error must explain the value's role: {message}"
+        );
+        assert!(
+            message.contains("refused rather than trimmed"),
+            "and that it is deliberately not normalized: {message}"
+        );
+    }
+
+    #[test]
+    fn test_resolved_signature_domain_is_validated_whichever_field_it_came_from() {
+        // The rule must not be bypassable by leaving `meshId` unset (M-31), and
+        // it must not be bypassable by setting one either: whichever field
+        // `signature_domain()` resolves to, the same list applies.
+        for (value, reason) in malformed_domain_values() {
+            assert!(
+                load_with_mesh_id(Some(&value)).is_err(),
+                "meshId {value:?} ({reason}) must be refused — it is the resolved domain"
+            );
+            assert!(
+                load_with_swarm_topic(&value, None).is_err(),
+                "swarmTopic {value:?} ({reason}) must be refused — with meshId unset it is the \
+                 resolved domain"
+            );
+            // And the topic is still checked when a meshId displaces it: it
+            // remains the gossip join credential, and deleting one line of
+            // config makes it the domain again.
+            assert!(
+                load_with_swarm_topic(&value, Some("3f2504e0-4f89-41d3-9a0c-0305e82c3301"))
+                    .is_err(),
+                "swarmTopic {value:?} ({reason}) must be refused even behind a valid meshId"
+            );
+        }
+    }
+
+    #[test]
+    fn test_well_formed_swarm_topics_still_load() {
+        // The complement of the above: M-31 must refuse the malformed, not
+        // narrow what a legitimate deployment may call itself. The shipped
+        // Docker topic and the default are both in here on purpose — a rule
+        // that rejects what this repository ships is a rule that gets reverted.
+        for accepted in [
+            "openledger/transactions", // the default (p2p disabled, so allowed)
+            "openledger/docker-dev",   // deploy/gl-node.docker.json
+            "my-org/ledger",
+            "acme:prod:ledger",
+            "acme.prod/ledger-01",
+            "MESH_A",
+            "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+            &"a".repeat(MAX_SIGNATURE_DOMAIN_BYTES), // exactly at the bound
+        ] {
+            assert!(
+                load_with_swarm_topic(accepted, None).is_ok(),
+                "swarmTopic {accepted:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_malformed_swarm_topic_refused_on_a_live_p2p_node() {
+        // The shape an actual mesh runs in: p2p on, signing on, a unique topic
+        // — and a trailing space. This is the config that used to boot.
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean",
+                  "signing": { "enabled": true },
+                  "p2p": { "enabled": true, "swarmTopic": "my-org/ledger " } }"#,
+        );
+        let message = format!(
+            "{}",
+            NodeConfig::load_from_path(&file.path().to_path_buf())
+                .expect_err("a padded topic must not boot a p2p node")
+        );
+        assert!(message.contains("p2p.swarmTopic"), "{message}");
+        assert!(message.contains("whitespace"), "{message}");
+    }
+
+    #[test]
+    fn test_signature_domain_charset_excludes_the_v3_field_separator() {
+        // L-06 / T45 Facet B: `openledger-sig-v3|…|mesh|{mesh_id}` is injective
+        // only because no interpolated field can spell `|`. `parents` is
+        // hex-CSV and `lamport` is decimal by M-01; the domain was the last
+        // unconstrained field on the default path, so this is the check that
+        // makes the premise in docs/FORMAT_V2_DESIGN.md §0.2 true of the
+        // running code and not only of the opt-in path.
+        assert!(!is_signature_domain_character('|'));
+        for field in ["p2p.swarmTopic", "p2p.meshId"] {
+            let error = NodeConfig::validate_signature_domain(field, "mesh|a", "under test")
+                .expect_err("a pipe must be refused");
+            let message = format!("{error}");
+            assert!(message.contains("L-06"), "{message}");
+        }
     }
 
     // ── GL_NODE_API_KEY precedence over the file value ───────────────────────

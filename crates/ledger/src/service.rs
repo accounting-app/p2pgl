@@ -238,6 +238,156 @@ fn file_content_hash(content: &str) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// One source block of a `.bean` file: a header line at column 0 plus the
+/// indented lines that belong to it (L-45).
+///
+/// The unit [`parse_file`] succeeds or fails at, kept as **exact source text**
+/// so a block this node cannot parse can still be written back verbatim.
+#[derive(Debug, Clone)]
+struct LedgerBlock {
+    /// 1-based line number of the block's first line, for the operator.
+    line: usize,
+    /// The block's source text, newline-terminated.
+    text: String,
+}
+
+/// Split ledger text into the blocks [`parse_file`] reads it as (L-45).
+///
+/// A deliberate re-statement of `parse_file`'s outer loop — header at column 0,
+/// then every indented non-blank line until a blank line or the next header —
+/// and nothing else: it does not tokenize, does not validate, and cannot fail.
+/// Splitting is what makes a *partial* parse possible, because `parse_file`
+/// accumulates errors across the whole file and then throws away the directives
+/// it did parse.
+///
+/// The blocks are independent by construction (the parser carries no state
+/// across them), so `parse_file(block.text)` yields exactly the directive
+/// `parse_file` over the whole file would have yielded for those lines, and the
+/// blocks in order yield the whole file's directives in order. A leading
+/// byte-order mark is stripped first, for the same reason `parse_file` strips
+/// one (L-28).
+///
+/// Line endings are normalised to `\n` because `str::lines` is what both this
+/// and the parser split on. A CRLF file therefore round-trips through the
+/// quarantine as LF, which is what every other line this serializer writes uses
+/// anyway.
+fn split_ledger_blocks(content: &str) -> Vec<LedgerBlock> {
+    let content = crate::parse::strip_byte_order_mark(content);
+    let lines: Vec<&str> = content.lines().collect();
+    let mut blocks = Vec::new();
+    let mut index = 0;
+
+    while index < lines.len() {
+        let line = lines[index];
+        let trimmed = line.trim();
+
+        // Blank and comment-only lines belong to no block — exactly as
+        // `parse_file` skips them. Leading comments are re-emitted by the
+        // serializer from `LedgerService::leading_comments`; interior ones are
+        // not preserved by a canonical rewrite and never were.
+        if trimmed.is_empty() || trimmed.starts_with(';') {
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        index += 1;
+        // An indented line with no header above it is its own one-line block:
+        // `parse_file` reports "Unexpected indented line without a preceding
+        // directive" for it and advances by one, so keeping the same shape here
+        // keeps the two in step.
+        if !line.starts_with(' ') && !line.starts_with('\t') {
+            while index < lines.len() {
+                let body_line = lines[index];
+                if body_line.is_empty()
+                    || !(body_line.starts_with(' ') || body_line.starts_with('\t'))
+                {
+                    break;
+                }
+                index += 1;
+            }
+        }
+
+        let mut text = lines[start..index].join("\n");
+        text.push('\n');
+        blocks.push(LedgerBlock {
+            line: start + 1,
+            text,
+        });
+    }
+
+    blocks
+}
+
+/// A block boot could not parse, with the reason (L-45).
+#[derive(Debug, Clone)]
+struct UnparsableBlock {
+    line: usize,
+    text: String,
+    reason: String,
+}
+
+/// Parse a ledger file block by block, keeping what parses and the raw text of
+/// what does not (L-45).
+///
+/// ## The finding
+///
+/// T37 tightened the account grammar to ASCII (L-25's confusable-account fix).
+/// Before it, **both** the parser and `validate_account_name` used Unicode
+/// `char::is_alphanumeric`, so `Assets:Cаsh` with a Cyrillic `а` was a name this
+/// system would store, persist **and replicate**. At HEAD `parse_file` refuses
+/// it, `boot` propagates the parse error, and `gl-node`'s `main` turns that into
+/// `exit(1)`. Any deployment that ever booked — or merely *received* from a peer
+/// — such a name cannot start after the upgrade, and the only diagnostic is a
+/// parse error on a line the operator did not write.
+///
+/// That is the failure mode T35 removed from L-17 and T41 declined to
+/// reintroduce for the fan-in cap: **boot must never brick on a file the node
+/// can otherwise read.** A brick is not even the conservative choice here — the
+/// node is down, the ledger is unserved, and the fix requires hand-editing a
+/// file the node no longer protects.
+///
+/// ## Why not loosen the charset back
+///
+/// Because the charset is the fix. L-25 is a forgery finding: two account names
+/// no reviewer can tell apart are two identities, and they key the read model,
+/// every I3/I9 lifecycle check and the content id. Accepting them again to make
+/// boot work would trade a availability bug for an integrity one.
+///
+/// ## Scope: any parse failure, not just the charset
+///
+/// The salvage is written against the *block*, not against a specific error, so
+/// a truncated final transaction, a half-typed line left by a crashed editor, or
+/// a directive written by a future format version get the same treatment. That
+/// is deliberate: the property worth having is "boot loads everything it can
+/// read and destroys nothing it cannot", and a rule that enumerated error kinds
+/// would have to be extended every time the grammar tightens again — which is
+/// precisely the mistake this finding is.
+///
+/// Costs nothing on a well-formed file: `boot` only calls this after
+/// `parse_file` over the whole text has already failed.
+fn salvage_unparsable_blocks(content: &str) -> (Vec<Directive>, Vec<UnparsableBlock>) {
+    let mut directives = Vec::new();
+    let mut refused = Vec::new();
+
+    for block in split_ledger_blocks(content) {
+        match parse_file(&block.text) {
+            Ok(parsed) => directives.extend(parsed),
+            Err(errors) => refused.push(UnparsableBlock {
+                line: block.line,
+                text: block.text,
+                reason: errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            }),
+        }
+    }
+
+    (directives, refused)
+}
+
 /// Content ids of the file's transactions that sit on — or descend from — a
 /// parent cycle (L-17).
 ///
@@ -415,6 +565,138 @@ pub fn enforce_economic_bean_limit(directive: &Directive) -> Result<(), ServiceE
             ),
         });
     }
+    Ok(())
+}
+
+/// Reject an `openledger-parents` entry that is not a well-formed txid (L-29).
+///
+/// [`parent_txid_is_well_formed`] had exactly **one** production call site —
+/// `stage_remote_directive` — so the rule was a wire rule only, and the file was
+/// a sibling ingest path with no form check at all. `openledger-parents` is
+/// envelope metadata, stripped before the content hash is taken, so a text
+/// editor can rewrite a parent to an uppercase spelling of a real txid and **no
+/// content id changes**: nothing downstream notices, validation passes, and
+/// `LedgerDag::insert` does not check form either.
+///
+/// Only transactions carry parents, so nothing else can fail this.
+fn validate_parent_txid_form(directive: &Directive) -> Result<(), ServiceError> {
+    let Directive::Transaction(transaction) = directive else {
+        return Ok(());
+    };
+    for parent_id in transaction.parent_ids() {
+        if !parent_txid_is_well_formed(parent_id) {
+            return Err(ServiceError::InvalidInput {
+                message: format!(
+                    "openledger-parents entry must be a 64-character lowercase hex txid, \
+                     got {parent_id}"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Reject an `openledger-lamport` this node cannot read back as a decimal
+/// `u64` (M-20).
+///
+/// The **format** half of the wire rule in `p2p::union_merge::
+/// validate_supply_entry`: non-empty, ASCII digits only, and in `u64` range.
+/// `str::parse::<u64>` on its own is not that rule — it accepts `+7` — so the
+/// digit scan is load-bearing and is spelled the same way on both sides.
+///
+/// The **range** half is [`LAMPORT_CEILING`] and is deliberately NOT repeated
+/// here: T46 owns that bound and already applies it through [`checked_lamport`]
+/// on every path that writes `lamport_clock`, including both file paths. Two
+/// spellings of one cap is exactly how the H-07 off-by-one happened.
+///
+/// Why format matters on the file path at all: reconcile read this value with
+/// `.parse::<u64>().ok()` and treated `None` as "leave the clock alone", so a
+/// hand-edited `openledger-lamport: "seven"` was adopted, **signed with this
+/// node's key**, persisted and served — and then refused by every peer forever
+/// on the line above. It also silently unmoored the entry from the
+/// `(author, lamport)` uniqueness M-18 depends on, because a value the clock
+/// never saw cannot bound what this node stamps next.
+fn validate_envelope_lamport_form(directive: &Directive) -> Result<(), ServiceError> {
+    let Some(value) = directive.metadata().get(ENVELOPE_KEY_LAMPORT) else {
+        return Ok(());
+    };
+    let well_formed = !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u64>().is_ok();
+    if !well_formed {
+        return Err(ServiceError::InvalidInput {
+            message: format!(
+                "openledger-lamport must be a decimal u64, got {value:?}; \
+                 a directive carrying anything else is refused by every peer"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The two ENVELOPE-form rules the wire enforces and the **file** paths did not
+/// (M-20).
+///
+/// `reconcile_content` and `boot` are ingest paths like any other, and since
+/// L-11 reconcile *signs* what it adopts — so anything the file accepts and the
+/// wire refuses is adopted, signed with this node's key, persisted, served, and
+/// then rejected by every peer forever while this node keeps advertising it.
+/// That is the permanent-divergence-plus-re-Want-churn shape H-03 and H-06
+/// describe, reached through a text editor instead of a peer; the comment on
+/// [`enforce_economic_bean_limit`] states the same conclusion for its own cap.
+/// Neither is detectable after the fact: both live in `openledger-*` metadata
+/// that the content hash strips, so editing them changes no content id and
+/// breaks no signature.
+///
+/// Applied by **both** file paths — [`LedgerService::boot`] (as a quarantine)
+/// and [`LedgerService::reconcile_content`] (as a rejection) — from this one
+/// definition, so they cannot drift apart from each other the way they both
+/// drifted from the wire. Each check is the *same* rule the wire path applies,
+/// never a second spelling of it.
+///
+/// Costs two metadata lookups.
+fn validate_file_envelope_form(directive: &Directive) -> Result<(), ServiceError> {
+    // L-29.
+    validate_parent_txid_form(directive)?;
+    // M-20's lamport half.
+    validate_envelope_lamport_form(directive)?;
+    Ok(())
+}
+
+/// [`validate_file_envelope_form`] plus the body-size cap — the full wire check
+/// set, for the file path that ADMITS NEW RECORDS (M-20, L-02).
+///
+/// ## Why the bean cap is here and not at boot
+///
+/// A deliberate asymmetry, recorded rather than left to be rediscovered.
+///
+/// `reconcile_content` admits records that are not yet part of this ledger and
+/// **signs them with this node's key**, so an over-cap body it accepts is a
+/// divergence seed this node manufactures: signed here, refused by every peer
+/// forever, re-Wanted forever. Refusing it costs nothing that was ever in the
+/// ledger.
+///
+/// `boot` loads records that ARE already this ledger's history. Quarantining an
+/// over-cap directive there would take a real transaction out of this node's
+/// balances on a file that a pre-L-02 build wrote perfectly legitimately — a
+/// much larger consequence than the two envelope-form checks above, which only
+/// ever remove a directive whose parents or clock **nobody, including this
+/// node, can resolve**. Boot's standing rule is that it applies no write caps
+/// (`close_account`'s own size check is reachable precisely because of that),
+/// and T51 does not change it.
+///
+/// The residual is stated plainly: an over-cap directive already on disk is
+/// still loaded at boot and still served, and every peer still refuses it.
+/// What T51 closes is this node *creating* more of them through the file.
+///
+/// Costs one canonical serialization on top of
+/// [`validate_file_envelope_form`] — the same order as the
+/// `compute_content_id` the caller does anyway.
+fn validate_file_ingest_parity(directive: &Directive) -> Result<(), ServiceError> {
+    // L-02: nothing else bounds body length on this path — the parser caps
+    // charsets, not lengths.
+    enforce_economic_bean_limit(directive)?;
+    validate_file_envelope_form(directive)?;
     Ok(())
 }
 
@@ -1371,6 +1653,48 @@ pub struct LedgerService {
     /// leaves the content id untouched, so the directive enters the DAG and
     /// drops out of the quarantine on the spot.
     quarantined: BTreeMap<String, Directive>,
+    /// The exact source text of every file block [`Self::boot`] could not
+    /// **parse** — kept, like [`Self::quarantined`], so the next compaction
+    /// writes it back (L-45, H-08).
+    ///
+    /// # Why this cannot be a `Directive`
+    ///
+    /// [`Self::quarantined`] holds parsed directives and re-serializes them,
+    /// and its own doc comment argues at length that this is the right
+    /// representation. It is — for everything that parses. An
+    /// `Assets:Cаsh` with a Cyrillic `а` never becomes a [`Directive`] at all:
+    /// `parse_file` refuses it, so there is nothing to key by content id,
+    /// nothing to re-serialize, and no `parse ∘ serialize == id` round-trip to
+    /// lean on. The choice is between keeping the bytes and losing the record.
+    ///
+    /// So this is the deliberately narrow second half of the quarantine: raw
+    /// text, spliced verbatim into the tail of every full rewrite by
+    /// [`Self::compaction_text`]. It is NOT canonicalised, because
+    /// canonicalising it is exactly the thing this node cannot do.
+    ///
+    /// # The invariant it preserves, and the one it gives up
+    ///
+    /// Preserved — the one H-08 is about: **a lossy boot never reaches a
+    /// destructive rewrite.** Without this field, L-45's fix (boot skips what
+    /// it cannot parse instead of exiting) would be the precise shape T47
+    /// closed: skip at boot, compact at startup, record gone from disk seconds
+    /// later.
+    ///
+    /// Given up: `canonical_is_current`'s "the `.bean` holds exactly the bytes
+    /// this service would write" no longer holds byte-for-byte over the tail.
+    /// That is accepted knowingly and is bounded — the tail is only ever text
+    /// this node *read from that same file* and could not interpret, it is
+    /// never served, never hashed into anything, and never re-ordered.
+    ///
+    /// # How an entry leaves
+    ///
+    /// Only by ceasing to be in the file, and the only party that can do that
+    /// is the operator. [`Self::reconcile_content`] re-derives the whole set
+    /// from the text it just read, so a repaired block (which then parses, and
+    /// is adopted as an ordinary directive) or a deleted one drops out on the
+    /// spot — the raw-text analogue of
+    /// [`Self::release_quarantined_now_in_dag`]. Nothing else mutates it.
+    quarantined_text: BTreeSet<String>,
     /// SHA-256 of the exact file text this service last wrote or read (L-30).
     ///
     /// Set at boot, after every successful persist, and after every reconcile.
@@ -1553,10 +1877,60 @@ impl LedgerService {
         }
 
         // Parse directives.
+        //
+        // L-45: a block that does not parse costs the node that block, NOT the
+        // boot. Until T51 this line was `?`, and `gl-node`'s `main` turns a boot
+        // error into `exit(1)` — so T37's ASCII account grammar (L-25's
+        // confusable-account fix) made every pre-T37 ledger holding
+        // `Assets:Cаsh` with a Cyrillic `а` unbootable at the moment of the
+        // upgrade, on a node nobody had touched, with no targeted error. That
+        // name was storable AND replicable before T37, so a node could acquire
+        // one from a peer without its operator ever typing it.
+        //
+        // The tolerant path costs a well-formed file nothing: it runs only
+        // after `parse_file` over the whole text has already failed, which on a
+        // healthy ledger never happens. See [`salvage_unparsable_blocks`] for
+        // why the salvage is per-block and why loosening the charset back is
+        // not the fix.
+        //
+        // H-08 is the reason this is not simply a skip: the startup compaction
+        // rewrites the whole `.bean` from memory, so a boot that merely skipped
+        // these blocks would delete them from disk seconds after coming up.
+        // Their raw text goes into `quarantined_text` and is spliced back by
+        // every rewrite ([`Self::compaction_text`]).
+        let mut unparsable: Vec<UnparsableBlock> = Vec::new();
         let directives = if combined.trim().is_empty() {
             Vec::new()
         } else {
-            parse_file(&combined).map_err(ServiceError::Parse)?
+            match parse_file(&combined) {
+                Ok(directives) => directives,
+                Err(errors) => {
+                    let (directives, refused) = salvage_unparsable_blocks(&combined);
+                    // Fail closed if the splitter and the parser disagree about
+                    // where the failure is: whole-file parse said no, per-block
+                    // parse said every block is fine. That cannot happen while
+                    // `split_ledger_blocks` mirrors `parse_file`'s outer loop,
+                    // and if it ever does, the old hard failure is the safe
+                    // answer — adopting a set of directives neither function
+                    // agrees on is not.
+                    if refused.is_empty() {
+                        return Err(ServiceError::Parse(errors));
+                    }
+                    for block in &refused {
+                        warn!(
+                            line = block.line,
+                            reason = %block.reason,
+                            file = %file_path.display(),
+                            "quarantining a ledger-file block this node cannot parse — kept in \
+                             the file byte-for-byte, kept out of the DAG; the rest of the file \
+                             still loads. A pre-T37 ledger holding a Unicode account name looks \
+                             exactly like this; stop the node and repair the line (L-45)"
+                        );
+                    }
+                    unparsable = refused;
+                    directives
+                }
+            }
         };
 
         // Sort by canonical order for correct AccountState building.
@@ -1658,14 +2032,41 @@ impl LedgerService {
             // the upgrade, on a node nobody has touched — and, before the
             // quarantine, the startup compaction that followed erased whatever
             // it skipped. Quarantine it.
-            if let Err(error) = validate_parent_fan_in(directive) {
+            //
+            // M-20: and the rest of the wire path's check set with it, by the
+            // identical argument. Boot was the other half of the sibling-path
+            // gap — an over-cap economic body (L-02), a malformed parent txid
+            // (L-29) or an unreadable `openledger-lamport` all loaded here
+            // without complaint, joined the served set, and were then refused
+            // by every peer forever. Same tolerant treatment, same quarantine,
+            // one call site so the two file paths cannot drift apart:
+            // `reconcile_content` runs the very same
+            // [`validate_file_ingest_parity`].
+            //
+            // Two things are deliberately NOT checked here, both recorded so
+            // the omission reads as a decision rather than an oversight:
+            //
+            // * `enforce_economic_bean_limit`. Boot loads history; reconcile
+            //   admits new records and signs them. See
+            //   [`validate_file_ingest_parity`] for the full argument and for
+            //   the residual it leaves.
+            // * [`LAMPORT_CEILING`]. T46 owns that bound and deliberately chose
+            //   warn-and-load at boot, so a poisoned clock stops *authoring*
+            //   loudly while reads, reports and the file stay intact.
+            //   Re-deciding it here would also buy nothing: `max_lamport` above
+            //   is scanned before every skip in this loop, so a quarantined
+            //   directive still carries its value into the clock.
+            if let Err(error) = validate_parent_fan_in(directive)
+                .and_then(|()| validate_file_envelope_form(directive))
+            {
                 let content_id = compute_content_id(directive);
                 warn!(
                     %error,
                     id = %content_id,
                     file = %file_path.display(),
-                    "quarantining a directive whose openledger-parents exceeds the fan-in cap — \
-                     kept in the file, kept out of the DAG; the rest of the file still loads (H-08)"
+                    "quarantining a ledger-file directive that the wire path would refuse — \
+                     kept in the file, kept out of the DAG; the rest of the file still loads \
+                     (H-08, M-20)"
                 );
                 quarantined.insert(content_id, (*directive).clone());
                 continue;
@@ -1737,15 +2138,21 @@ impl LedgerService {
         // true — the records are still in the file — because the pre-H-08
         // warnings said "skipped", which an operator reasonably read as "still
         // there", and it was the one thing that was not.
-        if !quarantined.is_empty() {
+        if !quarantined.is_empty() || !unparsable.is_empty() {
             warn!(
                 quarantined = quarantined.len(),
+                unparsable_blocks = unparsable.len(),
                 ids = %quarantined.keys().cloned().collect::<Vec<_>>().join(", "),
+                unparsable_lines = %unparsable
+                    .iter()
+                    .map(|block| block.line.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 file = %file_path.display(),
                 "ledger booted with directives QUARANTINED out of the DAG; they are NOT served, \
                  NOT in the read model and NOT in any balance, but they remain in the .bean and \
                  every compaction writes them back verbatim, so nothing is lost. Stop the node \
-                 and repair them (H-08)"
+                 and repair them (H-08, L-45)"
             );
         }
 
@@ -1765,6 +2172,11 @@ impl LedgerService {
             // holds records this boot would otherwise have let the next
             // compaction delete.
             quarantined,
+            // L-45: likewise, for the blocks that never became directives at
+            // all. Both halves are re-derived from the file on every boot, so
+            // neither is ever carried across a reload (see
+            // [`Self::adopt_reloaded`]).
+            quarantined_text: unparsable.into_iter().map(|block| block.text).collect(),
             // L-30: the bytes we just read (or the empty file we just created)
             // are the baseline every later persist compares against. Hashed
             // over the CANONICAL text alone — the journal is not part of the
@@ -2437,12 +2849,8 @@ impl LedgerService {
             // H-08: DAG ∪ quarantine, not the DAG alone. This is the single
             // production write that replaces the whole `.bean`, so it is the
             // single place where "boot skipped it" could turn into "it is gone".
-            let directives = self.compaction_directives();
-            (
-                CommitKind::Compact,
-                full_file_serialize(&directives, &self.leading_comments),
-                String::new(),
-            )
+            // L-45 adds the third term — the blocks that never parsed.
+            (CommitKind::Compact, self.compaction_text(), String::new())
         } else {
             // T27's "reject an over-cap write BEFORE any state changes" applies
             // to the append path too, and has to be re-derived here because the
@@ -2501,6 +2909,42 @@ impl LedgerService {
     /// `O(quarantine)` on top of the rewrite it feeds, and the quarantine is
     /// empty on every well-formed ledger, so a normal compaction pays one
     /// `is_empty` check.
+    /// The exact text a full rewrite of the `.bean` must contain (H-08, L-45).
+    ///
+    /// `full_file_serialize(DAG ∪ quarantine)` — the canonical ledger — with
+    /// the raw text of every block boot could not parse spliced onto the tail.
+    ///
+    /// The tail is verbatim and unsorted, which is the only thing it can be:
+    /// this node cannot read those blocks, so it cannot order them by date,
+    /// cannot canonicalise them, and must not rewrite them. It is appended
+    /// rather than interleaved so that the canonical region above it is
+    /// byte-for-byte what `full_file_serialize` would produce on its own —
+    /// every existing determinism assertion (T27's batch-vs-per-entry,
+    /// T29's byte-identical convergence) is therefore untouched on every file
+    /// that has no unparsable blocks, and on a file that does, they compare
+    /// regions this node did not author anyway.
+    ///
+    /// Blank-line separated like every other directive in the file, so the next
+    /// boot's [`split_ledger_blocks`] sees exactly the blocks this one did and
+    /// the set is a fixed point across restarts.
+    ///
+    /// Empty quarantines on both halves — the normal case — make this literally
+    /// `full_file_serialize(dag.directives(), leading_comments)`.
+    fn compaction_text(&self) -> String {
+        let directives = self.compaction_directives();
+        let mut text = full_file_serialize(&directives, &self.leading_comments);
+        for block in &self.quarantined_text {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(block);
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+        }
+        text
+    }
+
     fn compaction_directives(&self) -> Vec<Directive> {
         let mut directives: Vec<Directive> = self.dag.directives().into_iter().cloned().collect();
         if self.quarantined.is_empty() {
@@ -2554,18 +2998,36 @@ impl LedgerService {
             .retain(|content_id, _| dag.get(content_id).is_none());
     }
 
-    /// How many directives the file holds that the DAG deliberately does not
-    /// (H-08).
+    /// How many records the file holds that the DAG deliberately does not
+    /// (H-08, L-45).
     ///
     /// Zero on every well-formed ledger. Non-zero is an operator signal, not a
     /// data-loss one: the records are still in the `.bean` and every rewrite
     /// puts them back — but they are invisible to reports, balances and peers
-    /// until their `openledger-parents` is repaired and the node restarted.
+    /// until the file is repaired and the node restarted.
+    ///
+    /// Counts **both** halves of the quarantine: the directives boot parsed and
+    /// refused ([`Self::quarantined`]) and the blocks it could not parse at all
+    /// ([`Self::quarantined_text`]). `gl-node`'s startup banner reads this
+    /// number, and a count that silently omitted half the held-back records
+    /// would be the same false-assurance defect this series keeps finding.
+    /// [`Self::quarantined_ids`] can only name the first half — an unparsable
+    /// block has no content id, by definition — so the two can legitimately
+    /// disagree in length; the per-block `warn!` boot emits carries the line
+    /// numbers.
     pub fn quarantined_count(&self) -> usize {
-        self.live_quarantine().count()
+        self.live_quarantine().count() + self.quarantined_text.len()
     }
 
-    /// Content ids of the quarantined directives, in id order (H-08).
+    /// How many file blocks this node could not parse and is holding verbatim
+    /// (L-45).
+    pub fn unparsable_block_count(&self) -> usize {
+        self.quarantined_text.len()
+    }
+
+    /// Content ids of the quarantined *directives*, in id order (H-08).
+    ///
+    /// Not the unparsable blocks — see [`Self::quarantined_count`].
     pub fn quarantined_ids(&self) -> Vec<&str> {
         self.live_quarantine().map(|(id, _)| id).collect()
     }
@@ -3008,15 +3470,52 @@ impl LedgerService {
         // service's serializer: it needs canonicalising, not appending to.
         self.canonical_is_current = false;
 
-        let file_directives = parse_file(content).map_err(|errors| {
-            warn!(
-                file = %self.file_path.display(),
-                errors = %errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; "),
-                "ledger file does not parse; NOT reconciling and NOT persisting over it — \
-                 repair the file (the in-memory ledger is unaffected)"
-            );
-            ServiceError::Parse(errors)
-        })?;
+        // L-45: the file this reconcile is reading contains, at its tail,
+        // whatever boot could not parse — `compaction_text` puts it back on
+        // every rewrite precisely so it is not lost. So `parse_file` over the
+        // whole text fails on a ledger that is behaving exactly as designed,
+        // and the pre-T51 hard failure here would have wedged every subsequent
+        // write on such a node: reconcile refuses, `adopt_external_edits`
+        // propagates the refusal, and `prepare`'s compaction branch can never
+        // complete again.
+        //
+        // The exemption is deliberately the narrowest one that works: a block
+        // is skipped ONLY if its text is byte-identical to one this service is
+        // already holding in `quarantined_text`. Anything else that fails to
+        // parse — a human mid-edit, a truncated paste — still refuses the whole
+        // reconcile, which is the property the original hard failure exists for
+        // and which is worth keeping: canonicalising over a half-written file
+        // is not recoverable, blocking writes until it is repaired is.
+        //
+        // Re-deriving the set from the text just read is also how a block
+        // LEAVES the quarantine. It is the raw-text analogue of
+        // `release_quarantined_now_in_dag`: an operator who repairs the account
+        // name makes that block parse, so it is adopted as an ordinary
+        // directive and is no longer retained; one who deletes the block
+        // outright is simply obeyed. Without this the next compaction would
+        // splice the stale broken text back in underneath the repaired copy.
+        let file_directives = match parse_file(content) {
+            Ok(directives) => {
+                // Everything parses: nothing is being held back any more.
+                self.quarantined_text.clear();
+                directives
+            }
+            Err(errors) => match self.parse_around_quarantined_text(content) {
+                Some((directives, retained)) => {
+                    self.quarantined_text = retained;
+                    directives
+                }
+                None => {
+                    warn!(
+                        file = %self.file_path.display(),
+                        errors = %errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; "),
+                        "ledger file does not parse; NOT reconciling and NOT persisting over it — \
+                         repair the file (the in-memory ledger is unaffected)"
+                    );
+                    return Err(ServiceError::Parse(errors));
+                }
+            },
+        };
 
         // L-12: canonical order, like boot. Stable, so equal keys keep file order.
         let mut file_directives = file_directives;
@@ -3065,9 +3564,40 @@ impl LedgerService {
             // The cap was wire-only, so a hand edit — or a pre-hardening file —
             // could carry an `openledger-parents` list of any length, which the
             // next persist would then serve to every peer, where it is refused.
+            // M-20: and the rest of the wire path's check set, which this path
+            // simply did not have. Since L-11 reconcile SIGNS what it adopts,
+            // so an entry the file accepts and the wire refuses is adopted,
+            // signed with this node's key, persisted and served — and then
+            // refused by every peer forever while this node keeps advertising
+            // it. Permanent divergence plus perpetual re-Want churn, reached
+            // through a text editor rather than a peer. The three missing
+            // checks were:
+            //
+            // * **L-02** — `enforce_economic_bean_limit`. Called on all three
+            //   local API paths and on `stage_remote_directive`, never here,
+            //   and nothing else bounds body length: the parser caps charsets,
+            //   not lengths.
+            // * **L-29** — parent txid FORM. `parent_txid_is_well_formed` had
+            //   exactly one production call site. Parents are envelope metadata
+            //   and are stripped before hashing, so an uppercase-hex spelling
+            //   of a real txid changes no content id, passes `validate_parent_
+            //   fan_in` (a count check), passes `LedgerDag::insert` (no form
+            //   check), and then never resolves.
+            // * The **format** of `openledger-lamport`. The adoption arm below
+            //   read it with `.parse().ok()` and treated failure as "leave the
+            //   clock alone", so `openledger-lamport: "seven"` was adopted
+            //   silently. Its RANGE is T46's `checked_lamport`, applied a few
+            //   lines down — one rule, one constant, not a second copy here.
+            //
+            // Placed in this chain, i.e. BEFORE the envelope stamp, so a
+            // refusal costs the entry its line in `rejections` and moves
+            // neither the Lamport clock nor a half-stamped envelope — the same
+            // ordering rule H-04 states above and T27 states for the local
+            // paths.
             if let Err(error) = validate_body_envelope_keys(&directive, ENVELOPE_KEYS)
                 .and_then(|()| validate_body_strings(&directive))
                 .and_then(|()| validate_parent_fan_in(&directive))
+                .and_then(|()| validate_file_ingest_parity(&directive))
             {
                 rejected += 1;
                 rejections.push((content_id.clone(), error.to_string()));
@@ -3176,6 +3706,22 @@ impl LedgerService {
                         // and a signature over the pre-resolution id would fail
                         // on every peer.
                         let stored_id = compute_content_id(&final_directive);
+                        // M-20 / L-02, the second application. The guard chain
+                        // above measured the body as the FILE spells it; I2
+                        // then resolved the elided posting, which is what the
+                        // signature, the DAG and every peer actually see. A
+                        // body within the cap before resolution can be over it
+                        // after, and the wire cap is enforced on the resolved
+                        // form — so the entry must be re-measured on this side
+                        // of `validate_transaction` and before
+                        // `sign_adopted_entry`. Costs one serialization on the
+                        // reconcile path only, which already rewrites the whole
+                        // file.
+                        if let Err(error) = enforce_economic_bean_limit(&final_directive) {
+                            rejected += 1;
+                            rejections.push((content_id.clone(), error.to_string()));
+                            continue;
+                        }
                         self.sign_adopted_entry(&mut final_directive, &stored_id);
                         match self.dag.insert(final_directive.clone(), false) {
                             Ok(InsertResult::Inserted { .. }) => {
@@ -3293,6 +3839,43 @@ impl LedgerService {
             duplicates: dup_count,
             rejected,
         })
+    }
+
+    /// Re-parse a file that `parse_file` refused, skipping only the blocks this
+    /// service is already holding verbatim (L-45).
+    ///
+    /// Returns `Some((directives, retained))` when every block that is NOT
+    /// already quarantined parses cleanly — `retained` being exactly the
+    /// quarantined blocks this text still contains, which becomes the new
+    /// [`Self::quarantined_text`]. Returns `None` the moment any other block
+    /// fails, so the caller restores the pre-T51 behaviour: refuse the whole
+    /// reconcile and leave the file alone.
+    ///
+    /// `None` also when nothing is quarantined, so a node that has never held
+    /// an unparsable block pays one `is_empty` check and takes the original
+    /// path — this is not a general relaxation of the parser, it is a way of
+    /// reading back what this same service wrote.
+    fn parse_around_quarantined_text(
+        &self,
+        content: &str,
+    ) -> Option<(Vec<Directive>, BTreeSet<String>)> {
+        if self.quarantined_text.is_empty() {
+            return None;
+        }
+
+        let mut directives = Vec::new();
+        let mut retained = BTreeSet::new();
+        for block in split_ledger_blocks(content) {
+            if self.quarantined_text.contains(&block.text) {
+                retained.insert(block.text);
+                continue;
+            }
+            match parse_file(&block.text) {
+                Ok(parsed) => directives.extend(parsed),
+                Err(_) => return None,
+            }
+        }
+        Some((directives, retained))
     }
 
     /// Sign an entry this reconcile is adopting, when this node can (L-11).
@@ -4422,7 +5005,10 @@ mod tests {
             "the two opens must load and the over-cap transaction must not"
         );
         assert!(
-            logged.contains("fan-in cap"),
+            // T51 folded the fan-in skip into one file-ingest quarantine site,
+            // so the REASON now arrives in the error field rather than in the
+            // message — which is the more precise thing to assert anyway.
+            logged.contains("openledger-parents has"),
             "boot must say which directive it skipped and why, got: {logged}"
         );
 
@@ -5138,26 +5724,160 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    /// A pre-T37 ledger: `Assets:Cаsh` with a Cyrillic `а`, which both the old
+    /// parser and the old `validate_account_name` accepted, so a node could
+    /// book one — or merely *receive* one from a peer — and persist it.
+    const UNICODE_ACCOUNT_LEDGER: &str =
+        "2024-01-01 open Assets:Cash USD\n\n2024-01-01 open Assets:C\u{0430}sh USD\n";
+
     #[test]
-    fn test_boot_fails_closed_on_persisted_mixed_script_account() {
-        // BREAKING CHANGE, deliberately fail-closed: a file carrying a
-        // non-ASCII account (hand-edited, or written by a pre-hardening build)
-        // no longer boots. It surfaces as an ordinary parse error with a
-        // location, not a panic — the operator has to fix the name.
+    fn test_boot_warns_and_skips_a_persisted_mixed_script_account() {
+        // L-45, replacing T37's deliberate fail-closed. That decision made the
+        // upgrade itself the outage: `parse_file` refuses the Cyrillic name,
+        // `boot` propagated the error, and `gl-node`'s `main` turns a boot error
+        // into `exit(1)`. Any deployment holding such a name — including one
+        // that only ever RECEIVED it — could not start after upgrading, and the
+        // node was down, not degraded.
+        //
+        // The charset is not loosened: L-25 is a confusable-account forgery
+        // finding and the ASCII rule stands. What changes is that a block this
+        // node cannot parse costs the node that block, not the boot.
         let path = test_file_path();
-        std::fs::write(
-            &path,
-            "2024-01-01 open Assets:Cash USD\n\n2024-01-01 open Assets:C\u{0430}sh USD\n",
-        )
-        .unwrap();
-        let Err(error) = LedgerService::boot(path.clone(), "peer-1".to_owned()) else {
-            panic!("boot must refuse a file with a non-ASCII account name");
-        };
-        let message = error.to_string();
-        assert!(
-            message.contains("U+0430") && message.contains("line 3"),
-            "boot must report the offending line and character: {message}"
+        std::fs::write(&path, UNICODE_ACCOUNT_LEDGER).unwrap();
+
+        let (booted, logged) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "peer-1".to_owned()));
+        let svc = booted.expect("a pre-T37 Unicode account name must not brick boot (L-45)");
+
+        assert_eq!(
+            svc.directive_count(),
+            1,
+            "the ASCII open loads; the Cyrillic one does not"
         );
+        assert!(svc.accounts().is_open("Assets:Cash"));
+        assert_eq!(svc.unparsable_block_count(), 1);
+        assert_eq!(
+            svc.quarantined_count(),
+            1,
+            "the operator-facing count must include the block it cannot name by id"
+        );
+
+        // The diagnostic T37's test asked for is still required: the operator
+        // has to be able to find the line and the character.
+        assert!(
+            logged.contains("U+0430") && logged.contains("line=3"),
+            "boot must report the offending line and character: {logged}"
+        );
+        assert!(
+            logged.contains("L-45"),
+            "the warning must name the finding: {logged}"
+        );
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_the_startup_compaction_does_not_delete_the_unparsable_record() {
+        // L-45 × H-08 — the half that makes the skip safe. `gl-node` runs a
+        // compaction unconditionally, seconds after boot, to fold in the
+        // crash-window journal; a compaction serializes memory over the whole
+        // `.bean`. So "boot skips it" without this would mean "the record is
+        // deleted from disk before any operator reads the warning" — precisely
+        // the H-08 shape T47 just closed, re-opened through a different door.
+        //
+        // The quarantine T47 built holds `Directive` values and this record
+        // never becomes one, so it is held as raw text and spliced back by
+        // `compaction_text`. This test is the proof that it is.
+        let path = test_file_path();
+        std::fs::write(&path, UNICODE_ACCOUNT_LEDGER).unwrap();
+
+        let mut svc = LedgerService::boot(path.clone(), "peer-1".to_owned()).unwrap();
+        svc.compact().unwrap();
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            on_disk.contains("Assets:C\u{0430}sh"),
+            "the unparsable record must survive the rewrite verbatim, got:\n{on_disk}"
+        );
+        assert!(
+            on_disk.contains("2024-01-01 open Assets:Cash USD"),
+            "…and the rest of the ledger is still canonicalised: {on_disk}"
+        );
+
+        // Fixed point: rebooting on the rewritten file reaches the same state,
+        // and a second compaction neither loses nor duplicates the block.
+        let mut rebooted = LedgerService::boot(path.clone(), "peer-1".to_owned()).unwrap();
+        assert_eq!(rebooted.directive_count(), 1);
+        assert_eq!(rebooted.unparsable_block_count(), 1);
+        rebooted.compact().unwrap();
+        let twice = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            twice.matches("Assets:C\u{0430}sh").count(),
+            1,
+            "the held block must be written back exactly once: {twice}"
+        );
+        assert_eq!(twice, on_disk, "the file is a fixed point across restarts");
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_repairing_the_unparsable_line_releases_it_and_adopts_the_record() {
+        // How a held block LEAVES: the operator fixes the name, and the very
+        // next reconcile parses it, adopts it as an ordinary directive, and
+        // stops writing the broken text back. Without the re-derivation in
+        // `reconcile_content` the stale block would be spliced in underneath
+        // the repaired copy forever.
+        let path = test_file_path();
+        std::fs::write(&path, UNICODE_ACCOUNT_LEDGER).unwrap();
+        let mut svc = LedgerService::boot(path.clone(), "peer-1".to_owned()).unwrap();
+        svc.compact().unwrap();
+        assert_eq!(svc.unparsable_block_count(), 1);
+
+        // The operator repairs the name in place.
+        let repaired = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("Assets:C\u{0430}sh", "Assets:Savings");
+        std::fs::write(&path, &repaired).unwrap();
+
+        let result = svc.reconcile_file().unwrap();
+        assert_eq!(result.new_directives, 1, "the repaired open is adopted");
+        assert_eq!(svc.unparsable_block_count(), 0, "and nothing is held back");
+        assert!(svc.accounts().is_open("Assets:Savings"));
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !on_disk.contains("Assets:C\u{0430}sh"),
+            "the broken text must not be resurrected: {on_disk}"
+        );
+        assert!(on_disk.contains("Assets:Savings"));
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_a_new_hand_edit_that_does_not_parse_still_refuses_the_whole_reconcile() {
+        // The narrowness of the exemption, pinned. Tolerating a block this
+        // service is ALREADY holding is not the same as tolerating a broken
+        // hand edit: the latter must still abandon the reconcile rather than
+        // canonicalise over a file a human is mid-way through editing (L-30).
+        let path = test_file_path();
+        std::fs::write(&path, UNICODE_ACCOUNT_LEDGER).unwrap();
+        let mut svc = LedgerService::boot(path.clone(), "peer-1".to_owned()).unwrap();
+        svc.compact().unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // A half-typed directive appended under the held block.
+        std::fs::write(&path, format!("{before}\n2024-02-02 open\n")).unwrap();
+
+        let error = svc.reconcile_file().unwrap_err();
+        assert_eq!(error.error_code(), "PARSE_ERROR");
+        assert_eq!(
+            svc.unparsable_block_count(),
+            1,
+            "a refused reconcile must not change what is held"
+        );
+
         std::fs::remove_file(path).ok();
     }
 
@@ -7566,6 +8286,431 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    // ── M-20: reconcile applies the wire path's check set ────────────────
+
+    /// A signer that records every id it is ASKED to sign.
+    ///
+    /// The M-20 tests need more than "the entry is not in the DAG": the finding
+    /// is that a refused entry was being **signed with this node's key** before
+    /// anything noticed, so the ordering itself is the property under test.
+    /// This makes it directly observable — a guard that runs after
+    /// `sign_adopted_entry` leaves the id in this log even when the entry never
+    /// lands.
+    fn recording_signer() -> (
+        crate::service::DirectiveSigner,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let for_signer = std::sync::Arc::clone(&log);
+        let signer: crate::service::DirectiveSigner = std::sync::Arc::new(
+            move |content_id: &str, _is_transaction: bool, _parents: &str, _lamport: &str| {
+                for_signer.lock().unwrap().push(content_id.to_owned());
+                Some(format!("sig({content_id})"))
+            },
+        );
+        (signer, log)
+    }
+
+    /// A reconcile-refused transaction must be out of the DAG **and** must
+    /// never have been handed to the signer.
+    ///
+    /// The second half is the ordering property M-20 is actually about: L-11
+    /// made reconcile sign what it adopts, so a guard placed after
+    /// `sign_adopted_entry` would still leave this node having signed — and
+    /// therefore vouched for — an entry every peer refuses.
+    fn assert_refused_before_signing(
+        svc: &LedgerService,
+        signed: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        narration: &str,
+    ) {
+        assert!(
+            !svc.dag().directives().iter().any(|directive| matches!(
+                directive,
+                Directive::Transaction(txn) if txn.narration.as_deref() == Some(narration)
+            )),
+            "{narration} must not reach the DAG"
+        );
+        let signed_ids = signed.lock().unwrap().clone();
+        assert!(
+            signed_ids.is_empty(),
+            "{narration}: the guard must refuse BEFORE sign_adopted_entry — nothing may \
+             have been signed, got: {signed_ids:?}"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_rejects_a_body_over_the_wire_size_cap() {
+        // L-02's open half (M-20). `enforce_economic_bean_limit` guarded the
+        // three local API paths and `stage_remote_directive`; reconcile called
+        // it nowhere, and nothing else on this path bounds body length — the
+        // parser caps charsets, not lengths. So a hand-edited `.bean` whose
+        // every per-field cap passes (two postings, no narration beyond a
+        // label, no tags, no links) could carry a megabytes-long body straight
+        // into the DAG, where L-11 SIGNED it with this node's key, the persist
+        // wrote it, and every peer refused it forever.
+        let path = test_file_path();
+        let asset = long_account("Assets", MAX_ECONOMIC_BEAN_LENGTH / 2 + 16);
+        let equity = long_account("Equity", MAX_ECONOMIC_BEAN_LENGTH / 2 + 16);
+        std::fs::write(&path, "").unwrap();
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        let (signer, signed) = recording_signer();
+        svc.open_account(asset.clone(), make_date(2024, 1, 1), vec![])
+            .unwrap();
+        svc.open_account(equity.clone(), make_date(2024, 1, 1), vec![])
+            .unwrap();
+        // Installed only now, so the two setup opens do not pollute the log.
+        svc.set_signer(signer);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{content}\n\
+                 2024-03-01 * \"Hand\" \"Oversized\"\n\
+                 \x20 {asset}                              1.00 USD\n\
+                 \x20 {equity}                             -1.00 USD\n"
+            ),
+        )
+        .unwrap();
+
+        let result = svc.reconcile_file().unwrap();
+        assert_eq!(result.rejected, 1, "the over-cap body must be refused");
+        assert_eq!(result.new_directives, 0);
+        assert_refused_before_signing(&svc, &signed, "Oversized");
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_reconcile_rejects_a_body_that_only_crosses_the_cap_once_i2_resolves() {
+        // The sharp edge of L-02 on this path, and the reason the cap is
+        // applied twice. The guard chain measures the body as the FILE spells
+        // it; I2 then resolves the elided posting, and the RESOLVED body is
+        // what gets hashed, signed, stored and served. A body one byte under
+        // the cap before resolution can be over it after — and the peer
+        // measures the resolved form.
+        //
+        // The pad is computed rather than guessed so the test cannot drift if
+        // the serializer's spacing changes.
+        let path = test_file_path();
+        std::fs::write(&path, "").unwrap();
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+
+        let measure = |asset: &str, equity: &str, elide: bool| -> usize {
+            let directive = Directive::Transaction(Transaction {
+                date: make_date(2024, 3, 1),
+                flag: Flag::Complete,
+                payee: Some("Hand".to_owned()),
+                narration: Some("Straddle".to_owned()),
+                tags: vec![],
+                links: vec![],
+                postings: vec![
+                    Posting {
+                        account: asset.to_owned(),
+                        amount: Some(Amount {
+                            number: dec!(1),
+                            currency: "USD".to_owned(),
+                        }),
+                        cost: None,
+                        price: None,
+                        metadata: BTreeMap::new(),
+                    },
+                    Posting {
+                        account: equity.to_owned(),
+                        amount: if elide {
+                            None
+                        } else {
+                            Some(Amount {
+                                number: dec!(-1),
+                                currency: "USD".to_owned(),
+                            })
+                        },
+                        cost: None,
+                        price: None,
+                        metadata: BTreeMap::new(),
+                    },
+                ],
+                metadata: BTreeMap::new(),
+            });
+            crate::serialize::economic_canonical_serialize(&directive).len()
+        };
+
+        // Start from a base pair, then grow the equity name until the RESOLVED
+        // body is exactly one byte over the cap.
+        let asset = long_account("Assets", MAX_ECONOMIC_BEAN_LENGTH / 2 - 256);
+        let base = long_account("Equity", MAX_ECONOMIC_BEAN_LENGTH / 2 - 256);
+        let short = measure(&asset, &base, false);
+        assert!(
+            short <= MAX_ECONOMIC_BEAN_LENGTH,
+            "the base pair must leave room to grow, got {short}"
+        );
+        // Growing the account name by one character grows the body by exactly
+        // one, so the pad is exact rather than searched for.
+        let equity = format!("{base}{}", "a".repeat(MAX_ECONOMIC_BEAN_LENGTH + 1 - short));
+        assert_eq!(
+            measure(&asset, &equity, false),
+            MAX_ECONOMIC_BEAN_LENGTH + 1,
+            "premise: the resolved body is one byte over the cap"
+        );
+        assert!(
+            measure(&asset, &equity, true) <= MAX_ECONOMIC_BEAN_LENGTH,
+            "premise: the ELIDED body — the one the file spells — is under it, \
+             so only the post-resolution check can catch this"
+        );
+
+        svc.open_account(asset.clone(), make_date(2024, 1, 1), vec![])
+            .unwrap();
+        svc.open_account(equity.clone(), make_date(2024, 1, 1), vec![])
+            .unwrap();
+        let (signer, signed) = recording_signer();
+        svc.set_signer(signer);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{content}\n\
+                 2024-03-01 * \"Hand\" \"Straddle\"\n\
+                 \x20 {asset}                              1.00 USD\n\
+                 \x20 {equity}\n"
+            ),
+        )
+        .unwrap();
+
+        let result = svc.reconcile_file().unwrap();
+        assert_eq!(
+            result.rejected, 1,
+            "the post-I2 body is over the cap and must be refused"
+        );
+        assert_eq!(result.new_directives, 0);
+        assert_refused_before_signing(&svc, &signed, "Straddle");
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_reconcile_rejects_an_uppercase_hex_parent() {
+        // L-29 on the file path (M-20). `parent_txid_is_well_formed` had
+        // exactly ONE production call site — `stage_remote_directive` — so the
+        // rule was a wire rule and the file was a sibling ingest path with no
+        // form check at all. `validate_parent_fan_in` is a COUNT check and
+        // `LedgerDag::insert` checks no form either.
+        //
+        // The mechanism is that `openledger-parents` is envelope metadata,
+        // stripped before the content hash: uppercasing a real parent id
+        // changes NO content id and breaks NO signature, so the edit is
+        // invisible to everything except a peer's validator — where it is
+        // refused forever.
+        let (mut svc, path) = setup_with_accounts();
+        let (signer, signed) = recording_signer();
+        svc.set_signer(signer);
+
+        let real_parent = "ab".repeat(32);
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{content}\n\
+                 2024-03-01 * \"Hand\" \"UppercaseParent\"\n\
+                 \x20 openledger-parents: \"{shouted}\"\n\
+                 \x20 Assets:Cash                                      3.00 USD\n\
+                 \x20 Equity:Opening                                   -3.00 USD\n",
+                shouted = real_parent.to_uppercase()
+            ),
+        )
+        .unwrap();
+
+        let result = svc.reconcile_file().unwrap();
+        assert_eq!(result.rejected, 1);
+        assert_eq!(result.new_directives, 0);
+        assert_refused_before_signing(&svc, &signed, "UppercaseParent");
+
+        // The control: the identical entry in lowercase is adopted, so this is
+        // a form check and not a blanket refusal of hand-written parents.
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{content}\n\
+                 2024-03-02 * \"Hand\" \"LowercaseParent\"\n\
+                 \x20 openledger-parents: \"{real_parent}\"\n\
+                 \x20 Assets:Cash                                      3.00 USD\n\
+                 \x20 Equity:Opening                                   -3.00 USD\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(svc.reconcile_file().unwrap().new_directives, 1);
+
+        // That adoption forces the canonical re-persist, which is where L-12
+        // says a refused entry leaves the file. The uppercase one is gone; the
+        // lowercase one is there, signed.
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(!persisted.contains("UppercaseParent"), "{persisted}");
+        assert!(persisted.contains("LowercaseParent"), "{persisted}");
+        assert!(persisted.contains("openledger-signature"), "{persisted}");
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_reconcile_rejects_a_malformed_lamport() {
+        // M-20's lamport half. The adoption arm read `openledger-lamport` with
+        // `.parse::<u64>().ok()` and treated `None` as "leave the clock where
+        // it is" — so a value this node cannot read was adopted in silence,
+        // signed, persisted and served, and then refused by every peer on
+        // `union_merge`'s decimal-u64 check.
+        //
+        // `+7` is in the test on purpose: `str::parse::<u64>` ACCEPTS it, so a
+        // bare `.parse()` is not the wire rule. The digit scan is, and it is
+        // spelled the same way on both sides.
+        let (mut svc, path) = setup_with_accounts();
+        let (signer, signed) = recording_signer();
+        svc.set_signer(signer);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        for (label, lamport) in [("Unreadable", "seven"), ("Signed", "+7"), ("Empty", "")] {
+            std::fs::write(
+                &path,
+                format!(
+                    "{content}\n\
+                     2024-03-01 * \"Hand\" \"{label}\"\n\
+                     \x20 openledger-author: \"test-peer\"\n\
+                     \x20 openledger-lamport: \"{lamport}\"\n\
+                     \x20 Assets:Cash                                      2.00 USD\n\
+                     \x20 Equity:Opening                                   -2.00 USD\n"
+                ),
+            )
+            .unwrap();
+
+            let result = svc.reconcile_file().unwrap();
+            assert_eq!(result.rejected, 1, "{label}: must be refused");
+            assert_eq!(result.new_directives, 0, "{label}");
+            assert_refused_before_signing(&svc, &signed, label);
+        }
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_reconcile_rejects_an_out_of_range_lamport() {
+        // The RANGE half, which T46 already owns: `checked_lamport` refuses a
+        // value that would carry this node's clock to `LAMPORT_CEILING`, and
+        // `max(clock, incoming)` is ≥ `incoming`, so an out-of-range incoming
+        // value is refused by the same single constant rather than by a second
+        // copy of the rule here. Pinned so a future edit cannot quietly drop
+        // the range check while adding the format one.
+        let (mut svc, path) = setup_with_accounts();
+        let (signer, signed) = recording_signer();
+        svc.set_signer(signer);
+        let clock_before = svc.lamport_clock();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{content}\n\
+                 2024-03-01 * \"Hand\" \"Ceiling\"\n\
+                 \x20 openledger-author: \"test-peer\"\n\
+                 \x20 openledger-lamport: \"{max}\"\n\
+                 \x20 Assets:Cash                                      2.00 USD\n\
+                 \x20 Equity:Opening                                   -2.00 USD\n",
+                max = u64::MAX
+            ),
+        )
+        .unwrap();
+
+        let result = svc.reconcile_file().unwrap();
+        assert_eq!(result.rejected, 1);
+        assert_eq!(result.new_directives, 0);
+        assert_eq!(
+            svc.lamport_clock(),
+            clock_before,
+            "a refused adoption must not move the clock (H-07)"
+        );
+        assert_refused_before_signing(&svc, &signed, "Ceiling");
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_boot_quarantines_an_uppercase_hex_parent_without_deleting_it() {
+        // The same rule on the other file path, with boot's tolerant treatment
+        // (M-20 × H-08): out of the DAG, still on disk after the startup
+        // compaction. An uppercase parent is a pointer nobody — including this
+        // node — can resolve, so loading it only makes it something this node
+        // serves and every peer refuses.
+        let path = test_file_path();
+        std::fs::write(
+            &path,
+            format!(
+                "2024-01-01 open Assets:Cash USD\n\n\
+                 2024-01-01 open Equity:Opening\n\n\
+                 2024-03-01 * \"Hand\" \"Shouted\"\n\
+                 \x20 openledger-parents: \"{shouted}\"\n\
+                 \x20 Assets:Cash                                      3.00 USD\n\
+                 \x20 Equity:Opening                                   -3.00 USD\n",
+                shouted = "ab".repeat(32).to_uppercase()
+            ),
+        )
+        .unwrap();
+
+        let (booted, logged) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "peer-1".to_owned()));
+        let mut svc = booted.expect("a malformed parent must not brick boot");
+        assert_eq!(svc.directive_count(), 2, "only the two opens load");
+        assert_eq!(svc.quarantined_count(), 1);
+        assert!(
+            logged.contains("lowercase hex txid"),
+            "boot must say what it refused and why: {logged}"
+        );
+
+        svc.compact().unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            on_disk.contains("Shouted"),
+            "H-08: the quarantined record must survive the rewrite: {on_disk}"
+        );
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_boot_quarantines_a_malformed_lamport_without_deleting_it() {
+        // M-20's lamport half at boot. `Directive::lamport_clock()` already
+        // yields `None` for an unreadable value, so quarantining it cannot move
+        // `max_lamport` — the directive is simply kept out of the served set.
+        let path = test_file_path();
+        std::fs::write(
+            &path,
+            "2024-01-01 open Assets:Cash USD\n\n\
+             2024-01-01 open Equity:Opening\n\n\
+             2024-03-01 * \"Hand\" \"Garbled\"\n\
+             \x20 openledger-author: \"peer-1\"\n\
+             \x20 openledger-lamport: \"seven\"\n\
+             \x20 Assets:Cash                                      3.00 USD\n\
+             \x20 Equity:Opening                                   -3.00 USD\n",
+        )
+        .unwrap();
+
+        let (booted, logged) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "peer-1".to_owned()));
+        let mut svc = booted.expect("a malformed lamport must not brick boot");
+        assert_eq!(svc.directive_count(), 2);
+        assert_eq!(svc.quarantined_count(), 1);
+        assert!(
+            logged.contains("openledger-lamport must be a decimal u64"),
+            "boot must say what it refused and why: {logged}"
+        );
+
+        svc.compact().unwrap();
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("Garbled"),
+            "H-08: the quarantined record must survive the rewrite"
+        );
+
+        std::fs::remove_file(path).ok();
+    }
+
     #[test]
     fn test_reconcile_rejects_body_smuggled_envelope_key() {
         // H-06: a hand-edited (or peer-written) file must not be able to smuggle
@@ -8329,7 +9474,7 @@ mod tests {
         );
         assert_eq!(svc.quarantined_count(), 1, "…and kept for the file");
         assert!(
-            logged.contains("fan-in cap"),
+            logged.contains("openledger-parents has"),
             "boot must still say what it refused and why: {logged}"
         );
 

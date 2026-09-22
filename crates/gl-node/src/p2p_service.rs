@@ -82,13 +82,40 @@ pub async fn boot_p2p(
     };
 
     let node = PeerNode::new(endpoint, gossip, peer_config, allowlist);
+    log_node_ready(config);
+
+    Ok(node)
+}
+
+/// The "P2P node ready" boot line, with the swarm topic redacted (M-32).
+///
+/// This line used to print `topic = %config.swarm_topic` verbatim at INFO,
+/// which quietly undid the redaction three other sites had deliberately chosen:
+/// [`P2pConfig`]'s hand-written `Debug`, the `p2p.meshId`/`swarmTopic`
+/// permission-and-shape boot log in `main`, and the T39 domain-resolution log.
+/// The topic is the gossip **join credential** — anyone holding the string plus
+/// one member id can join the overlay (L-23's premise) — and the other half of
+/// that pair, the node id, is logged roughly twenty lines above this call.
+///
+/// The impact of the overlay half alone is bounded: membership yields Announce
+/// metadata, not bodies. The reason it is redacted anyway is the other half of
+/// the value's job — while `p2p.meshId` is unset, and it is unset in every
+/// shipped config, this same string **is** the signature domain (M-31).
+///
+/// Redacted through [`crate::auth::redact`] rather than with a fourth spelling
+/// of "length plus a short prefix", so all four sites say the same thing and a
+/// change to what "redacted" means lands everywhere at once. It keeps the line
+/// useful for triage: source, length and four characters are enough to tell two
+/// nodes' topics apart, and not enough to join with.
+///
+/// Factored out of [`boot_p2p`] purely so it is testable without binding an
+/// endpoint — see `p2p_ready_log_never_prints_the_swarm_topic`.
+fn log_node_ready(config: &P2pConfig) {
     info!(
-        topic = %config.swarm_topic,
+        topic = %crate::auth::redact(&config.swarm_topic),
         bootstrap_peers = config.bootstrap_endpoint_ids.len(),
         "P2P node ready"
     );
-
-    Ok(node)
 }
 
 /// Route gossip and anti-entropy ALPNs. The returned `Router` must be kept alive.
@@ -949,6 +976,107 @@ mod tests {
     };
     use crate::anti_entropy_alpn::AntiEntropyTimeouts;
     use crate::graphql::SharedLedger;
+
+    // ─── M-32: the boot log must not print the join credential ─────────────
+
+    /// Run `body` with everything it logs at INFO and above captured as text.
+    ///
+    /// `tracing::subscriber::with_default` installs a **thread-local**
+    /// subscriber, so this stays correct under `cargo test`'s
+    /// thread-per-test parallelism: a concurrent test's logs never land in this
+    /// buffer. (Same helper shape as `config`'s `capture_warnings`, at INFO
+    /// rather than WARN because the line under test is an INFO line — which is
+    /// exactly why M-32 mattered: it printed on every healthy boot.)
+    fn capture_info<T>(body: impl FnOnce() -> T) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for SharedBuffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuffer {
+            type Writer = SharedBuffer;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = SharedBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, body);
+        let logged = String::from_utf8_lossy(&buffer.0.lock().unwrap()).into_owned();
+        (value, logged)
+    }
+
+    /// M-32: `topic = %config.swarm_topic` put the gossip join credential into
+    /// the log of every healthy boot, defeating the redaction T39/T41 applied at
+    /// the three other sites that handle the same string. While `p2p.meshId` is
+    /// unset — which is every shipped config — it is also the signature domain.
+    #[test]
+    fn p2p_ready_log_never_prints_the_swarm_topic() {
+        let topic = "acme/private/ledger-topic-2026";
+        let config = P2pConfig {
+            swarm_topic: topic.to_owned(),
+            ..P2pConfig::default()
+        };
+
+        let ((), logged) = capture_info(|| log_node_ready(&config));
+
+        assert!(
+            logged.contains("P2P node ready"),
+            "the line must still be emitted: {logged}"
+        );
+        assert!(
+            !logged.contains(topic),
+            "the topic value must not appear in any log line: {logged}"
+        );
+        // Redacted, not merely truncated: the marker plus length plus a
+        // four-character prefix is the shape `auth::redact` defines and the
+        // other three sites already print.
+        assert!(logged.contains("<redacted"), "{logged}");
+        assert!(
+            logged.contains(&topic.len().to_string()),
+            "length survives, for telling two nodes' topics apart: {logged}"
+        );
+        assert!(
+            logged.contains("acme"),
+            "the 4-character prefix survives: {logged}"
+        );
+        // Not the fourth spelling of "redacted": this is byte-identical to what
+        // `P2pConfig`'s Debug impl and the boot logs in `main` produce.
+        assert!(
+            logged.contains(&crate::auth::redact(topic)),
+            "the rendering must be the shared helper's own output: {logged}"
+        );
+    }
+
+    /// A short topic gets no prefix at all — four characters of a six-character
+    /// value is most of the value. Pinned here because the join credential has
+    /// no length floor of its own, so short ones are reachable.
+    #[test]
+    fn p2p_ready_log_omits_the_prefix_for_a_short_topic() {
+        let topic = "ab/cd";
+        let config = P2pConfig {
+            swarm_topic: topic.to_owned(),
+            ..P2pConfig::default()
+        };
+
+        let ((), logged) = capture_info(|| log_node_ready(&config));
+
+        assert!(!logged.contains(topic), "{logged}");
+        assert!(logged.contains("<redacted, 5 bytes>"), "{logged}");
+    }
 
     // ─── T41: defensive interval floor (L-22 defence in depth) ─────────────
 

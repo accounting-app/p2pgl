@@ -1781,6 +1781,123 @@ mod tests {
     }
 
     #[test]
+    fn test_reconcile_refuses_an_uppercase_parent_the_mesh_would_refuse() {
+        // M-20 / L-29, proven by the real mechanism rather than by inspecting
+        // an `if`.
+        //
+        // Before T51, `reconcile_content` had no parent-txid FORM check — the
+        // rule lived only on the wire and at `stage_remote_directive` — so a
+        // hand edit that uppercased a parent id was adopted, **signed with this
+        // node's key** (L-11), persisted and served, and then refused by
+        // exactly the validator below, on every peer, forever, while this node
+        // kept advertising it. `openledger-parents` is envelope metadata and is
+        // stripped before hashing, so the edit changes no content id and breaks
+        // no signature: nothing local could ever notice.
+        //
+        // This test is written so that removing the guard does not merely fail
+        // an equality — it walks the divergence and reports it. The `if let`
+        // arm below is dead in a correct build and is the whole bug-catch
+        // apparatus: it takes the entry reconcile actually adopted, proves it
+        // carries this node's signature, and hands it to the real
+        // `validate_supply_entry` + `verify_remote_signature` pair a peer runs.
+        let path = temp_bean_path("uppercase-parent");
+        let (mut service, provider) = signing_service(&path, 13);
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        service
+            .open_account("Expenses:Food".to_owned(), date, vec![])
+            .unwrap();
+        service
+            .open_account("Assets:Cash".to_owned(), date, vec![])
+            .unwrap();
+
+        // A real, well-formed parent id — uppercased. `is_content_id` rejects
+        // this spelling precisely because stored ids are lowercase and lookups
+        // are exact, so it would never resolve anywhere.
+        let lowercase = "ab".repeat(32);
+        let shouted = lowercase.to_uppercase();
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str(&format!(
+            "\n2024-01-15 * \"Corner Shop\" \"Shouted parent\"\n  \
+             openledger-parents: \"{shouted}\"\n  \
+             Expenses:Food                                        4.50 USD\n  \
+             Assets:Cash                                         -4.50 USD\n"
+        ));
+        std::fs::write(&path, &content).unwrap();
+
+        let result = service.reconcile_file().unwrap();
+
+        if let Some(adopted) = service
+            .dag()
+            .directives()
+            .into_iter()
+            .find(|d| matches!(d, Directive::Transaction(t) if t.narration.as_deref() == Some("Shouted parent")))
+            .cloned()
+        {
+            // Unreachable while T51's guard stands. Reached, it means the guard
+            // is gone, and everything below is the finding happening for real.
+            let metadata = directive_metadata(&adopted);
+            let author = metadata.get("openledger-author").cloned().unwrap_or_default();
+            let signature = metadata
+                .get("openledger-signature")
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(
+                author,
+                provider.public_key_hex(),
+                "the divergence needs this node to be the author"
+            );
+            let verdict = peer_would_accept(&adopted);
+            panic!(
+                "M-20/L-29: reconcile ADOPTED and SIGNED an entry the mesh refuses.\n  \
+                 author    = {author}\n  \
+                 signature = {signature}\n  \
+                 parents   = {parents:?}\n  \
+                 peer says = {verdict:?}\n\
+                 This node now serves a directive every peer rejects forever, \
+                 while advertising it on every anti-entropy tick.",
+                parents = metadata.get("openledger-parents"),
+            );
+        }
+
+        assert_eq!(
+            result.rejected, 1,
+            "the malformed parent must be refused by reconcile"
+        );
+        assert_eq!(result.new_directives, 0);
+
+        // The control: the identical entry with the parent in lowercase is
+        // adopted, signed, and accepted by the same validator — so the guard is
+        // a form check, not a refusal of hand-written parents.
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str(&format!(
+            "\n2024-01-16 * \"Corner Shop\" \"Quiet parent\"\n  \
+             openledger-parents: \"{lowercase}\"\n  \
+             Expenses:Food                                        4.50 USD\n  \
+             Assets:Cash                                         -4.50 USD\n"
+        ));
+        std::fs::write(&path, &content).unwrap();
+        assert_eq!(service.reconcile_file().unwrap().new_directives, 1);
+        let quiet = service
+            .dag()
+            .directives()
+            .into_iter()
+            .find(|d| matches!(d, Directive::Transaction(t) if t.narration.as_deref() == Some("Quiet parent")))
+            .expect("the lowercase-parent entry must be adopted")
+            .clone();
+        assert!(
+            directive_metadata(&quiet).contains_key("openledger-signature"),
+            "premise: the control really is signed by this node"
+        );
+        assert!(
+            peer_would_accept(&quiet).is_ok(),
+            "a peer must accept the lowercase control: {:?}",
+            peer_would_accept(&quiet)
+        );
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
     fn test_reconcile_signs_an_adopted_hand_edit_with_an_elided_posting() {
         // The sharp edge of "sign what will be stored": I2 resolves the elided
         // amount, so the STORED body hashes differently from the parsed one. A

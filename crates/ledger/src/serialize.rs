@@ -6,6 +6,9 @@
 
 use std::fmt::Write;
 
+use chrono::NaiveDate;
+
+use crate::hash::compute_content_id;
 use crate::model::*;
 
 // ─── Public API ──────────────────────────────────────────────────────────────
@@ -36,21 +39,10 @@ pub fn full_file_serialize(directives: &[Directive], leading_comments: &[String]
         writeln!(output, "; {comment}").unwrap();
     }
 
-    // Sort directives by (date, type_priority, stable_sort_key).
-    let mut sorted_indices: Vec<usize> = (0..directives.len()).collect();
-    sorted_indices.sort_by(|&a, &b| {
-        let directive_a = &directives[a];
-        let directive_b = &directives[b];
-        directive_a
-            .date()
-            .cmp(&directive_b.date())
-            .then_with(|| {
-                directive_a
-                    .type_priority()
-                    .cmp(&directive_b.type_priority())
-            })
-            .then_with(|| stable_sort_key(directive_a).cmp(&stable_sort_key(directive_b)))
-    });
+    // Sort by (date, type priority, stable sort key, content id) — see
+    // [`canonical_order`]. The last component is M-24's; the first three are
+    // §3.3.2 unchanged.
+    let sorted_indices = canonical_order(directives);
 
     // Emit directives with blank lines between.
     for (index, &directive_index) in sorted_indices.iter().enumerate() {
@@ -61,6 +53,126 @@ pub fn full_file_serialize(directives: &[Directive], leading_comments: &[String]
     }
 
     output
+}
+
+// ─── Canonical order (§3.3.2 + M-24) ─────────────────────────────────────────
+
+/// One directive decorated with its §3.3.2 sort position.
+///
+/// Built once per directive rather than once per comparison (the pre-M-24
+/// comparator formatted two [`stable_sort_key`] strings on every compare).
+struct OrderKey {
+    date: NaiveDate,
+    priority: u8,
+    stable_key: String,
+    /// Index into the caller's slice — carried, never compared.
+    index: usize,
+}
+
+impl OrderKey {
+    /// The §3.3.2 part of the key. Two directives agreeing here are a TIE, and
+    /// a tie is the only thing M-24's discriminator is allowed to touch.
+    fn primary(&self) -> (NaiveDate, u8, &str) {
+        (self.date, self.priority, self.stable_key.as_str())
+    }
+}
+
+/// The canonical order of `directives`, as indices into the slice.
+///
+/// The key is §3.3.2's ordering with one component appended (M-24):
+///
+/// ```text
+/// (date, type priority, stable sort key, content id)
+/// ```
+///
+/// and it is TOTAL by construction — which is the whole point. This mirrors
+/// [`crate::accounts::LifecycleKey`], whose final component is the content id
+/// for exactly the same reason (M-09).
+///
+/// ## Why the fourth component exists
+///
+/// [`stable_sort_key`] is not injective: for a transaction it is
+/// `narration|payee`, which omits the postings, the amounts and the
+/// currencies; for an `open` it is the account, which omits the currency list.
+/// Two coffees bought from the same shop on the same day tie, and so do two
+/// same-date `open Assets:Cash` with different currency lists — ORDINARY data,
+/// no attacker. `sort_by` is a STABLE sort, so a tie fell through to the input
+/// order, and on the persist path the input is `LedgerDag::insertion_order`,
+/// i.e. ARRIVAL order. Two replicas holding the same directive set but having
+/// received it in different orders therefore wrote different `.bean` bytes,
+/// violating I7/C4 — the invariant `ct9_two_nodes_converge_after_partition`
+/// states as *"After convergence, .bean files must be byte-identical"* — and
+/// they did so permanently, because a reboot re-derives insertion order from
+/// the file's own order, so each node re-persists its own divergence forever.
+///
+/// ## Why the content id, and nothing else
+///
+/// It is a pure function of the directive's economic body, so every replica
+/// computes the same one for the same directive, and it is already the DAG's
+/// notion of identity. The alternatives are all replica-local and must never
+/// enter the key: arrival order and file position are accidents of transport,
+/// and the envelope Lamport (which [`crate::accounts::LifecycleKey`] can
+/// afford, because it orders one account's events) may differ per replica for
+/// one content id under M-10.
+///
+/// ## Why the primary ordering is untouched
+///
+/// §3.3.2's (date, type priority, stable key) ordering is read well beyond this
+/// function — boot's canonical order, `reconcile_content`'s sort, T44's journal
+/// — so this appends a final discriminator to EXACT ties; it does not re-sort
+/// the ledger. `test_m24_tie_free_file_is_byte_identical_to_the_pre_fix_serializer`
+/// pins that with a golden captured from the pre-fix serializer.
+///
+/// ## Cost
+///
+/// The content id is a SHA-256 over a second serialization of the directive, so
+/// it is computed for the members of a tie run and for nobody else: a tie-free
+/// file pays nothing new, and it pays less than before, since decorating costs
+/// n key strings where the old comparator cost 2 per comparison.
+fn canonical_order(directives: &[Directive]) -> Vec<usize> {
+    let mut order: Vec<OrderKey> = directives
+        .iter()
+        .enumerate()
+        .map(|(index, directive)| OrderKey {
+            date: directive.date(),
+            priority: directive.type_priority(),
+            stable_key: stable_sort_key(directive),
+            index,
+        })
+        .collect();
+    order.sort_by(|a, b| a.primary().cmp(&b.primary()));
+
+    // Break the exact ties, and only those. Equal primaries are adjacent after
+    // the sort above, so each run is one tie.
+    let mut start = 0;
+    while start < order.len() {
+        let mut end = start + 1;
+        while end < order.len() && order[end].primary() == order[start].primary() {
+            end += 1;
+        }
+        if end - start > 1 {
+            order[start..end].sort_by_cached_key(|key| tie_break_key(&directives[key.index]));
+        }
+        start = end;
+    }
+
+    order.into_iter().map(|key| key.index).collect()
+}
+
+/// The discriminator that makes the canonical order total (M-24).
+///
+/// The content id comes first: it is the envelope-independent half, so replicas
+/// that disagree about an envelope (M-10) still agree about the order. The
+/// emitted bytes come second so the key is total over what this function
+/// actually decides — OUTPUT BYTES — even for a caller holding two entries with
+/// one content id and different envelopes. The production path cannot build
+/// that slice (`compaction_directives`' quarantine arm drops any entry whose id
+/// the DAG already holds), but [`full_file_serialize`] is public, and a
+/// totality that rests on a caller's invariant is precisely what M-24 was.
+fn tie_break_key(directive: &Directive) -> (String, String) {
+    let mut emitted = String::new();
+    serialize_directive(&mut emitted, directive, true);
+    (compute_content_id(directive), emitted)
 }
 
 // ─── Stable sort key (§3.3.2) ────────────────────────────────────────────────
@@ -370,8 +482,10 @@ fn quote_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hash::compute_content_id;
     use crate::parse::parse_file;
     use chrono::NaiveDate;
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use std::collections::BTreeMap;
 
@@ -1189,4 +1303,306 @@ mod tests {
             "envelope differences must not affect economic form"
         );
     }
+    // ── M-24: the canonical order must be TOTAL ──────────────────────────
+    //
+    // `stable_sort_key` is `narration|payee` for a transaction and the account
+    // for an `open`, so it omits the postings, the amounts and the currency
+    // list — and `sort_by` is a STABLE sort, so before the fix a tie fell
+    // through to the INPUT order. On the persist path the input is
+    // `LedgerDag::insertion_order`, i.e. ARRIVAL order, so two replicas holding
+    // the same directive set wrote different `.bean` bytes purely because the
+    // directives reached them in different orders. That breaks I7/C4 — the
+    // invariant `ct9_two_nodes_converge_after_partition` states as *"After
+    // convergence, .bean files must be byte-identical"* — and it is permanent,
+    // because a reboot re-derives insertion order from the file's own order, so
+    // each node re-persists its own divergence forever.
+    //
+    // Both tie shapes below are ORDINARY data: no attacker, no collision
+    // engineering. Each test builds the same set in both arrival orders and
+    // demands one file, which is exactly what convergence asserts.
+
+    /// Two coffees from the same shop on the same day — identical payee and
+    /// narration, different amounts. The §3.3.2 key is `Coffee|Starbucks` for
+    /// both.
+    fn coffee(amount: Decimal) -> Directive {
+        Directive::Transaction(Transaction {
+            date: make_date(2024, 3, 7),
+            flag: Flag::Complete,
+            payee: Some("Starbucks".to_owned()),
+            narration: Some("Coffee".to_owned()),
+            tags: Vec::new(),
+            links: Vec::new(),
+            postings: vec![
+                Posting {
+                    account: "Expenses:Food".to_owned(),
+                    amount: Some(Amount {
+                        number: amount,
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+                Posting {
+                    account: "Assets:Cash".to_owned(),
+                    amount: Some(Amount {
+                        number: -amount,
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                    metadata: BTreeMap::new(),
+                },
+            ],
+            metadata: BTreeMap::new(),
+        })
+    }
+
+    /// A same-date `open` of one account with a given currency list.
+    fn open_cash(currencies: &[&str]) -> Directive {
+        Directive::Open(Open {
+            date: make_date(2024, 1, 1),
+            account: "Assets:Cash".to_owned(),
+            currencies: currencies.iter().map(|c| (*c).to_owned()).collect(),
+            metadata: BTreeMap::new(),
+        })
+    }
+
+    /// The two arrival orders of a two-directive set must produce ONE file.
+    ///
+    /// Asserted on the whole serialized string, not on a digest or a line
+    /// count: byte-identity is the invariant, so bytes are what is compared,
+    /// and a failure prints both files so the divergence is visible.
+    fn assert_one_file_under_both_arrival_orders(
+        first: &Directive,
+        second: &Directive,
+        what: &str,
+    ) {
+        let forward = full_file_serialize(&[first.clone(), second.clone()], &[]);
+        let reverse = full_file_serialize(&[second.clone(), first.clone()], &[]);
+        assert_eq!(
+            forward, reverse,
+            "M-24: {what} must serialize to the same bytes whatever order they \
+             arrived in (I7/C4)\n── arrival order A,B ──\n{forward}\n── arrival \
+             order B,A ──\n{reverse}"
+        );
+    }
+
+    /// The tied pair must be emitted in CONTENT ID order, not in some other
+    /// consistent order: the content id is the one discriminator every replica
+    /// computes identically (arrival order, file position and the envelope
+    /// Lamport are all replica-local — see M-10).
+    fn assert_emitted_in_content_id_order(first: &Directive, second: &Directive) {
+        let (low, high) = if compute_content_id(first) <= compute_content_id(second) {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let file = full_file_serialize(&[first.clone(), second.clone()], &[]);
+        // These fixtures carry no envelope metadata, so a directive's economic
+        // form is byte-for-byte the block it occupies in the file.
+        let position = |directive: &Directive| {
+            file.find(&economic_canonical_serialize(directive))
+                .expect("each directive appears in the file it was serialized from")
+        };
+        assert!(
+            position(low) < position(high),
+            "the smaller content id must be emitted first:\n{file}"
+        );
+    }
+
+    #[test]
+    fn test_m24_same_day_same_payee_transactions_are_order_insensitive() {
+        let small = coffee(dec!(4.50));
+        let large = coffee(dec!(6.25));
+        assert_ne!(
+            compute_content_id(&small),
+            compute_content_id(&large),
+            "the two coffees are distinct directives"
+        );
+        assert_eq!(
+            stable_sort_key(&small),
+            stable_sort_key(&large),
+            "mechanism: the §3.3.2 key alone ties — amounts are not in it"
+        );
+        assert_one_file_under_both_arrival_orders(&small, &large, "two same-day coffees");
+    }
+
+    #[test]
+    fn test_m24_same_date_opens_with_different_currencies_are_order_insensitive() {
+        let usd = open_cash(&["USD"]);
+        let eur = open_cash(&["EUR", "GBP"]);
+        assert_ne!(compute_content_id(&usd), compute_content_id(&eur));
+        assert_eq!(
+            stable_sort_key(&usd),
+            stable_sort_key(&eur),
+            "mechanism: the §3.3.2 key for an `open` is the account alone"
+        );
+        assert_one_file_under_both_arrival_orders(&usd, &eur, "two same-date opens of one account");
+    }
+
+    #[test]
+    fn test_m24_tie_break_is_the_content_id() {
+        assert_emitted_in_content_id_order(&coffee(dec!(4.50)), &coffee(dec!(6.25)));
+        assert_emitted_in_content_id_order(&open_cash(&["USD"]), &open_cash(&["EUR", "GBP"]));
+    }
+
+    #[test]
+    fn test_m24_one_content_id_under_two_envelopes_still_has_one_order() {
+        // The residual the emitted bytes close. Envelope metadata is outside
+        // the content id — that is L-17's premise — so two entries can share an
+        // id and still produce different bytes. `compaction_directives` cannot
+        // build that slice (its quarantine arm drops any entry whose id the DAG
+        // already holds), but `full_file_serialize` is public, and a totality
+        // that rests on a caller's invariant is precisely what M-24 was.
+        let stamped = |author: &str| -> Directive {
+            let mut metadata = BTreeMap::new();
+            metadata.insert("openledger-author".to_owned(), author.to_owned());
+            Directive::Open(Open {
+                date: make_date(2024, 1, 1),
+                account: "Assets:Cash".to_owned(),
+                currencies: vec!["USD".to_owned()],
+                metadata,
+            })
+        };
+        let peer_1 = stamped("peer-1");
+        let peer_2 = stamped("peer-2");
+        assert_eq!(
+            compute_content_id(&peer_1),
+            compute_content_id(&peer_2),
+            "the envelope is outside the content id, so these tie on it too"
+        );
+        assert_one_file_under_both_arrival_orders(
+            &peer_1,
+            &peer_2,
+            "one content id under two envelopes",
+        );
+    }
+
+    #[test]
+    fn test_m24_every_arrival_order_of_a_tied_set_yields_one_file() {
+        // Ties of more than two members, and two independent tie runs in one
+        // file: a discriminator that only fixed adjacent pairs would still
+        // diverge here. Every permutation is an arrival order a replica can
+        // legitimately see.
+        let directives = vec![
+            coffee(dec!(4.50)),
+            coffee(dec!(6.25)),
+            coffee(dec!(3.00)),
+            open_cash(&["USD"]),
+            open_cash(&["EUR", "GBP"]),
+        ];
+        let reference = full_file_serialize(&directives, &[]);
+        let orders = permutations(&directives);
+        assert_eq!(orders.len(), 120, "5 directives have 120 arrival orders");
+        for order in orders {
+            let file = full_file_serialize(&order, &[]);
+            assert_eq!(
+                file, reference,
+                "M-24: an arrival order changed the file\n── reference ──\n{reference}\n── this order ──\n{file}"
+            );
+        }
+    }
+
+    /// Every ordering of `items`.
+    fn permutations(items: &[Directive]) -> Vec<Vec<Directive>> {
+        if items.len() <= 1 {
+            return vec![items.to_vec()];
+        }
+        let mut orders = Vec::new();
+        for index in 0..items.len() {
+            let mut rest = items.to_vec();
+            let chosen = rest.remove(index);
+            for mut tail in permutations(&rest) {
+                tail.insert(0, chosen.clone());
+                orders.push(tail);
+            }
+        }
+        orders
+    }
+
+    #[test]
+    fn test_m24_tie_free_file_is_byte_identical_to_the_pre_fix_serializer() {
+        // THE SAFETY PROPERTY. M-24 appends a discriminator to break exact
+        // ties; it must change NOTHING else. §3.3.2's (date, type priority,
+        // stable key) ordering is load-bearing well beyond this file — boot's
+        // canonical order, `reconcile_content`'s sort and T44's journal all
+        // read the same order — so re-sorting the ledger would be a far larger
+        // change than the bug.
+        //
+        // `GOLDEN_TIE_FREE` is the output of the PRE-FIX serializer for the
+        // golden fixture, captured verbatim before the change. The fixture is
+        // tie-free (asserted below, so the golden keeps meaning what it says),
+        // and a tie-free set must therefore serialize to exactly these bytes.
+        let fixture = include_str!("../../../testfixtures/fixture-simple.bean");
+        let directives = parse_file(fixture).unwrap();
+
+        let mut keys: Vec<(NaiveDate, u8, String)> = directives
+            .iter()
+            .map(|d| (d.date(), d.type_priority(), stable_sort_key(d)))
+            .collect();
+        keys.sort();
+        let distinct = {
+            let mut deduped = keys.clone();
+            deduped.dedup();
+            deduped.len()
+        };
+        assert_eq!(
+            keys.len(),
+            distinct,
+            "the golden fixture must be tie-free for this golden to prove anything"
+        );
+
+        assert_eq!(
+            full_file_serialize(&directives, &[]),
+            GOLDEN_TIE_FREE,
+            "a tie-free set must serialize exactly as it did before M-24"
+        );
+    }
+
+    /// The pre-M-24 serialization of `testfixtures/fixture-simple.bean`.
+    const GOLDEN_TIE_FREE: &str = r#"2024-01-01 open Assets:Cash USD, EUR
+
+2024-01-01 open Assets:Stock AAPL
+
+2024-01-01 open Equity:Opening USD
+
+2024-01-01 open Expenses:Food USD
+
+2024-01-01 open Income:Salary USD
+
+2024-01-01 commodity EUR
+
+2024-01-01 pad Assets:Cash Equity:Opening
+
+2024-01-15 * "Acme Corp" "Initial funding" #setup ^opening-001
+  openledger-author: "local"
+  openledger-lamport: "1"
+  openledger-parents: ""
+  Assets:Cash                                      1000.00 USD
+  Equity:Opening                                   -1000.00 USD
+
+2024-01-20 ! "Pending refund"
+  openledger-author: "local"
+  openledger-lamport: "2"
+  openledger-parents: "dd4a9ec5ec298be6edaa02c4408c0b1cb1b25eb51426599b7eda600cfc5fa88f"
+  Assets:Cash                                      25.00 USD
+  Expenses:Food                                    -25.00 USD
+
+2024-02-01 balance Assets:Cash 1025.00 USD
+
+2024-03-01 note Assets:Cash "Reconciled with bank statement"
+
+2024-03-01 document Assets:Cash "/statements/2024-Q1.pdf"
+
+2024-06-01 event "location" "San Francisco"
+
+2024-06-15 * "Buy stock"
+  Assets:Stock                                     10 AAPL {150.00 USD}
+  Assets:Cash                                      -1500.00 USD
+
+2024-12-01 price EUR 1.10 USD
+
+2024-12-31 close Expenses:Food
+"#;
 }

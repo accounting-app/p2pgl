@@ -447,7 +447,7 @@ boot if it is missing — the node will not start half-hardened.
 | `p2p.enabled` | `false` | Enable Iroh mesh replication |
 | `p2p.bootstrapEndpointIds` | `[]` | Allowlisted peer EndpointIds; empty drops inbound `Supply` |
 | `p2p.antiEntropyIntervalMilliseconds` | `5000` | ALPN head-exchange cadence; minimum `100` |
-| `p2p.swarmTopic` | `openledger/transactions` | Gossip topic; required unique on a public bind |
+| `p2p.swarmTopic` | `openledger/transactions` | Gossip topic, and the signature domain while `meshId` is unset; required unique on a public bind. Same form as `meshId`: non-empty, no surrounding whitespace, ASCII letters, digits and `- _ . : /`, up to 128 bytes |
 | `p2p.meshId` | *(unset)* | Mesh identity bound into every signature. Use a random UUID. Unset falls back to `swarmTopic` — see below |
 
 **`allowedHosts`.** The request guard checks the `Host` header on every
@@ -536,6 +536,14 @@ signature domain too meant two meshes that happened to pick the same custom
 topic accepted each other's signed directives. Setting `meshId` separates the
 two — a random UUID (`uuidgen`) is the recommendation, though any identifier of
 ASCII letters, digits and `- _ . : /` up to 128 bytes is accepted.
+
+Because leaving `meshId` unset is the default and the topic then *is* the
+domain, **`swarmTopic` is held to exactly the same form rules** — non-empty, no
+leading or trailing whitespace, ASCII letters, digits and `- _ . : /`, at most
+128 bytes — and a value that breaks them is refused at boot rather than
+trimmed. A topic differing by one space between two nodes is not a cosmetic
+difference: it is a different gossip overlay *and* a different signature
+domain, and it would otherwise surface much later as `InvalidSignature`.
 
 Leaving it unset keeps the pre-existing behaviour exactly: the domain is
 `swarmTopic`. That matters on an existing deployment, because a signature is
