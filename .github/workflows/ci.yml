@@ -32,8 +32,13 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Format
         run: cargo fmt --all -- --check
+      # `--locked` here, not only on Test: clippy runs the resolver, so without
+      # it a Cargo.toml change with a stale Cargo.lock is silently resolved and
+      # the lockfile rewritten — after which the Test step's own `--locked`
+      # trivially passes and proves nothing. Both steps need it or neither
+      # catches an unreviewed dependency bump (L-46).
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
 

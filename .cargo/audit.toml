@@ -1,0 +1,33 @@
+# `cargo audit` configuration.
+#
+# The CI `audit` job has no `continue-on-error`, which is deliberate: a red
+# audit is supposed to stop the line. That only works if the job stays
+# actionable, so an advisory is ignored here ONLY when it is provably not
+# compiled into any artifact — never merely because it is inconvenient.
+#
+# Every entry must carry: the reachability evidence, the command that
+# reproduces it, and the condition that retires the entry.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0235 — rkyv 0.7.46, out-of-bounds read via Rc/Arc archives.
+    #
+    # NOT COMPILED. `rkyv` is an *optional* dependency of `rust_decimal`
+    # 1.42.1 (its `rkyv` feature), and that feature is not enabled by anything
+    # in this workspace. Cargo records optional dependencies of dependencies in
+    # `Cargo.lock` whether or not the feature is on, so the entry is an orphan:
+    # it is in the lockfile and in no dependency graph.
+    #
+    # Reproduce:  cargo tree -i rkyv -e all --target all
+    #             -> "warning: nothing to print."
+    # (Contrast a genuinely live advisory, e.g. the `lru` one, which prints a
+    # tree under iroh-relay. Re-run this on every dependency bump.)
+    #
+    # The fix is upstream and not semver-compatible for us: the advisory wants
+    # >= 0.8.17 and `rust_decimal` pins 0.7.x. There is nothing to bump.
+    #
+    # RETIRE THIS ENTRY WHEN: `rust_decimal` moves to rkyv >= 0.8.17, or the
+    # command above starts printing a tree (which would mean something in the
+    # workspace turned the feature on and the advisory became live).
+    "RUSTSEC-2026-0235",
+]
