@@ -13,7 +13,7 @@ use ledger::model::*;
 use ledger::parse::parse_file;
 
 use crate::allowlist::PeerAllowlist;
-use crate::protocol::{DirectiveKind, SupplyEntry};
+use crate::protocol::{is_content_id, DirectiveKind, SupplyEntry};
 
 /// Closed set of envelope keys accepted on remote `Supply` (§3.3.1).
 ///
@@ -38,16 +38,21 @@ const MAX_ENVELOPE_VALUE_LEN: usize = 32 * 1024;
 /// not to a hand-written file.
 use ledger::service::MAX_PARENTS;
 
-/// Maximum accepted remote `openledger-lamport` value (0820-M3 completion).
+/// Exclusive ceiling on an accepted remote `openledger-lamport` (0820-M3
+/// completion, H-07).
 ///
-/// The clock update saturates, so without an inbound bound a single peer
-/// sending `u64::MAX` would pin every replica's clock at the saturation point
-/// forever, degenerating Lamport ordering to all-ties. Legitimate clocks track
-/// mesh event counts (the 64 MiB file cap bounds directives to well under a
-/// million), so 2^53 is absurd headroom for honest traffic while keeping
-/// `u64::MAX` unreachable — from this cap the clock would need 2^63 further
-/// single-step increments to saturate.
-const MAX_REMOTE_LAMPORT: u64 = 1 << 53;
+/// Aliases the ledger's constant rather than repeating the number, so what a
+/// peer may send can never drift from what this node's own clock and stamp
+/// sites are bounded by — the same rule (and the same reason) as
+/// [`ALLOWED_ENVELOPE_KEYS`] and [`MAX_PARENTS`]. The cap lived here alone until
+/// T46, which is exactly why it bounded what a node *accepted* while nothing
+/// bounded what it *stamped*.
+///
+/// See `ledger::service::LAMPORT_CEILING` for the single rule both sides now
+/// share, and for why this bound is exclusive: adoption is
+/// `max(local, remote) + 1`, so a value accepted *at* the cap would carry the
+/// receiver's clock past it.
+use ledger::service::LAMPORT_CEILING;
 
 /// Errors that can occur during merge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,12 +257,13 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
         // for the full TTL. Uppercase is garbage too: stored ids are always
         // lowercase and lookups exact, so an uppercased spelling of a real txid
         // would pass a case-insensitive check and then never resolve.
+        //
+        // T49: the predicate moved to `protocol::is_content_id` unchanged, so
+        // the advert reader (M-26) and the gossip `Announce` id (L-53) — which
+        // had no form check at all — enforce the SAME rule as this one rather
+        // than a second spelling of it that can drift.
         for parent_id in &parent_ids {
-            if parent_id.len() != 64
-                || !parent_id
-                    .chars()
-                    .all(|c| matches!(c, '0'..='9' | 'a'..='f'))
-            {
+            if !is_content_id(parent_id) {
                 return Err(MergeError::InvalidEnvelope(
                     "openledger-parents contains a malformed txid (expected 64 lowercase hex characters)"
                         .to_owned(),
@@ -268,17 +274,25 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
 
     if let Some(lamport) = metadata.get("openledger-lamport") {
         // Strict inbound Lamport validation (0820-M3 completion): the value must
-        // be a plain decimal u64 within the plausibility cap. Without this, a
+        // be a plain decimal u64 below the plausibility cap. Without this, a
         // garbage string is silently persisted verbatim, and a huge value pins
         // every replica's saturating clock permanently.
+        //
+        // EXCLUSIVE since T46 (H-07). The receiver adopts
+        // `max(local, remote) + 1`, so a value accepted *at* the cap lands the
+        // receiver's clock above it — and every directive that receiver goes on
+        // to stamp is then rejected here, on this very line, by every peer it
+        // has. The cap and the arithmetic around it are one rule, stated once on
+        // `ledger::service::LAMPORT_CEILING`; the ledger re-checks the same
+        // bound as it adopts, for the callers that reach it without the wire.
         let lamport_ok = !lamport.is_empty()
             && lamport.bytes().all(|b| b.is_ascii_digit())
             && lamport
                 .parse::<u64>()
-                .is_ok_and(|value| value <= MAX_REMOTE_LAMPORT);
+                .is_ok_and(|value| value < LAMPORT_CEILING);
         if !lamport_ok {
             return Err(MergeError::InvalidEnvelope(format!(
-                "openledger-lamport must be a decimal u64 ≤ {MAX_REMOTE_LAMPORT}"
+                "openledger-lamport must be a decimal u64 < {LAMPORT_CEILING}"
             )));
         }
     }
@@ -1919,6 +1933,114 @@ mod tests {
         let entry = crate::gossip::make_supply_entry(&adopted);
         let parsed = validate_supply_entry(&entry).unwrap();
         assert!(verify_remote_signature(&parsed, false, RECONCILE_MESH).is_ok());
+
+        std::fs::remove_file(path).ok();
+    }
+
+    // ── H-07 / T46: the Lamport ceiling, both sides of it ────────────────
+
+    /// The envelope half of the remote receive path, as the next hop runs it.
+    ///
+    /// No signature check: the node under test runs without a signer, which is
+    /// the `signing.enabled: false` case. `peer_would_accept` above is the
+    /// signed variant.
+    fn peer_envelope_check(directive: &Directive) -> Result<Directive, MergeError> {
+        validate_supply_entry(&crate::gossip::make_supply_entry(directive))
+    }
+
+    /// The whole attack in one directive: an otherwise-valid `open` that a peer
+    /// has stamped at `lamport`.
+    fn hostile_open(account: &str, lamport: u64) -> Directive {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("openledger-author".to_owned(), "hostile-peer".to_owned());
+        metadata.insert("openledger-lamport".to_owned(), lamport.to_string());
+        Directive::Open(Open {
+            date: chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+            account: account.to_owned(),
+            currencies: Vec::new(),
+            metadata,
+        })
+    }
+
+    #[test]
+    fn test_ingest_at_the_ceiling_cannot_brick_local_authoring() {
+        // H-07 end to end. One allowlisted peer sends a directive stamped at
+        // exactly the inbound cap. Before T46 the bound was inclusive, so it was
+        // accepted; adoption's `+1` put the victim's clock one step ABOVE the
+        // cap; the stamp sites had no cap at all; and from then on every
+        // directive the victim authored was refused by every peer — silently,
+        // because the mutation still returned success, and permanently, because
+        // boot re-derives the clock from the file.
+        let path = temp_bean_path("lamport-ceiling");
+        let mut service =
+            ledger::service::LedgerService::boot(&path, "victim-node".to_owned()).unwrap();
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+
+        // Delivered as the attack would be: staged AND persisted, so a node
+        // without the fix carries the poisoned clock across the restart below.
+        let ingest = service.insert_remote_directive(hostile_open(
+            "Assets:Poison",
+            ledger::service::LAMPORT_CEILING,
+        ));
+
+        // The consequence that matters: this node can still author, and what it
+        // authors is accepted by the next hop.
+        let id = service
+            .open_account("Assets:Cash".to_owned(), date, vec!["USD".to_owned()])
+            .expect("authoring must still succeed after the ingest");
+        let authored = service.get_directive(&id).expect("just authored").clone();
+        assert!(
+            peer_envelope_check(&authored).is_ok(),
+            "a locally-authored directive must pass the peer-side envelope check; \
+             lamport {:?} gave {:?}",
+            authored.lamport_clock(),
+            peer_envelope_check(&authored),
+        );
+
+        // And again after a restart, because a poisoned value that reached the
+        // file would be re-derived into the clock on every later boot.
+        drop(service);
+        let mut rebooted =
+            ledger::service::LedgerService::boot(&path, "victim-node".to_owned()).unwrap();
+        let id = rebooted
+            .open_account("Assets:Savings".to_owned(), date, vec!["USD".to_owned()])
+            .expect("authoring must still succeed after a restart");
+        let authored = rebooted.get_directive(&id).expect("just authored").clone();
+        assert!(
+            peer_envelope_check(&authored).is_ok(),
+            "after a restart, a locally-authored directive must still pass the peer-side \
+             envelope check; lamport {:?} gave {:?}",
+            authored.lamport_clock(),
+            peer_envelope_check(&authored),
+        );
+
+        // Why those two hold: the poison is refused on both sides of the same
+        // rule — here on the wire (exclusive, so the `+1` cannot carry a
+        // receiver past the cap) and again as the ledger adopts.
+        assert!(
+            ingest.is_err(),
+            "a remote lamport at the ceiling must be refused, not adopted"
+        );
+        let entry = crate::gossip::make_supply_entry(&hostile_open(
+            "Assets:Poison",
+            ledger::service::LAMPORT_CEILING,
+        ));
+        assert!(
+            matches!(
+                validate_supply_entry(&entry),
+                Err(MergeError::InvalidEnvelope(_))
+            ),
+            "the wire bound is exclusive: {:?}",
+            validate_supply_entry(&entry)
+        );
+
+        // One step lower is still accepted on the wire — a bound, not a blanket
+        // refusal.
+        let entry = crate::gossip::make_supply_entry(&hostile_open(
+            "Assets:Fine",
+            ledger::service::LAMPORT_CEILING - 1,
+        ));
+        assert!(validate_supply_entry(&entry).is_ok());
 
         std::fs::remove_file(path).ok();
     }

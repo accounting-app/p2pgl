@@ -1,4 +1,4 @@
-//! Bounded CBOR header scan for the M-16 pre-decode gate (T43).
+//! Bounded CBOR header scan for the M-16 pre-decode gate (T43, T43b, H-09).
 //!
 //! # Why this exists
 //!
@@ -21,12 +21,12 @@
 //! and `MAX_SUPPLY_ENTRIES` (256) only applies **after** the buffering decode
 //! has already built the multi-million-element `Content` tree.
 //!
-//! [`supply_entry_count`] answers "how many elements does this frame's
-//! `entries` array header claim?" by walking CBOR **headers only**, touching no
-//! payload bytes and allocating nothing on the honest path. The answer is
-//! compared against `MAX_SUPPLY_ENTRIES` before serde is handed the buffer, so
-//! the cardinality cap now runs where it always should have: on the wire bytes,
-//! not on the materialised tree.
+//! [`scan_supply_frame`] answers "does this frame declare more than
+//! `MAX_SUPPLY_ENTRIES` entries, or anything else serde would have to buffer?"
+//! by walking CBOR **headers only**, touching no payload bytes beyond the map
+//! keys and allocating nothing at all. The answer comes back before serde is
+//! handed the buffer, so the cardinality cap now runs where it always should
+//! have: on the wire bytes, not on the materialised tree.
 //!
 //! This is option (a) from T43. Option (b) — moving `WireMessage` to an
 //! externally- or adjacently-tagged encoding so serde can dispatch without
@@ -45,7 +45,7 @@
 //! ~21 GB from allowlisted peers.
 //!
 //! [`scan_bounded_arrays`] closes it with the same walker. Its semantics differ
-//! from [`supply_entry_count`] in exactly one deliberate way: a `Supply` **must**
+//! from [`scan_supply_frame`] in exactly one deliberate way: a `Supply` **must**
 //! have an `entries` key, so a missing one is a refusal, whereas a non-`Supply`
 //! frame need carry no bounded array at all (an `Announce` carries none), so
 //! absent keys are simply tolerated. Everything else stays fail-closed —
@@ -63,41 +63,90 @@
 //!   `MAX_HAVE_HEADS` (4,096) — enforced here before the decode, bound the
 //!   **elements** of every unbounded-cardinality array a `WireMessage` has.
 //!
-//! A `SupplyEntry` is a fixed four-field struct of scalars plus one
-//! `BTreeMap<String, String>`; its nested structure is therefore bounded by the
-//! frame's byte length, not by a second independent count. 256 entries inside
-//! 16 MiB is at most a few thousand `Content` nodes — a constant multiple of the
-//! frame, which is exactly what `decode_memory.rs` asserts. The `Want` and
-//! `HaveHeads` arrays are `Vec<String>`: leaves, so the same argument applies
-//! with nothing nested at all.
+//! The `Want` and `HaveHeads` arrays are `Vec<String>` — leaves, so nothing can
+//! nest inside them and the element count IS the node count.
+//!
+//! `Supply.entries` is not a leaf array, and T43's version of this paragraph got
+//! it wrong. It argued that "a `SupplyEntry` is a fixed four-field struct of
+//! scalars plus one `BTreeMap<String, String>`, so its nested structure is
+//! bounded by the frame's byte length, not by a second independent count" — but
+//! bounded by the frame's byte length is precisely what does NOT bound the
+//! amplification. Every CBOR item costs one byte on the wire and ~32 bytes of
+//! `Content`, so a frame whose bytes are all *items* is the 50× case whether
+//! those items sit at the top level or inside an entry, and ONE entry holding a
+//! sixteen-million-element array is inside `MAX_SUPPLY_ENTRIES` by a factor of
+//! 256. [`ElementKind::Struct`] supplies the missing bound: an entry may spend
+//! at most `items` CBOR headers, so the frame's node count is bounded by
+//! `MAX_SUPPLY_ENTRIES × items` — 17,408 — rather than by its byte length. That
+//! is the constant multiple of the frame `decode_memory.rs` asserts.
 //!
 //! # The element-skip allowance (T43b)
 //!
-//! [`supply_entry_count`] answers and returns the moment it finds `entries`, so
-//! it never walks an array's elements and [`MAX_SCAN_VISITS`] alone bounds it.
-//! [`scan_bounded_arrays`] cannot stop at the first array: a `HaveHeads` has
+//! No scan here can stop at the first array it recognises. A `HaveHeads` has
 //! **two**, and an honest-full `head_txids` sits between the scan and
-//! `directive_ids`. Walking past 4,096 element headers on a 64-visit budget is
-//! impossible, so the general scan carries a second, separate allowance:
+//! `directive_ids`; a `Supply` has one, and H-09 showed that stopping at it
+//! hides the entire rest of the map. Walking past 4,096 element headers on a
+//! 64-visit budget is impossible, so the walk carries a second, separate
+//! allowance:
 //!
 //! * A recognised array is bounded **at its header**: a claim over its cap is
 //!   refused before a single element byte is touched, so an over-cap array is
 //!   never walked and never paid for.
 //! * A claim **within** its cap is already proven bounded by the cap, so the
-//!   scan grants itself exactly `count` extra header reads to step over that
-//!   array's elements — and consumes them exactly, because every element must be
-//!   a definite-length text string (one header, then a length jump over the
-//!   payload). Nothing nested can appear inside to spend more.
-//! * The grants are drawn from one frame-wide pool of `Σ(bound.max)` — 9,216
-//!   headers for the three arrays `WireMessage` has. A frame that repeats a
-//!   recognised key to ask for the allowance twice runs the pool dry and is
-//!   refused on the visit budget.
+//!   scan grants itself `count × ` the element's header cost to step over that
+//!   array's elements — and spends no more than it granted, because an element
+//!   is either a definite-length text string ([`ElementKind::Text`]: exactly one
+//!   header, then a length jump over the payload, nothing nested possible to
+//!   spend more) or a whole value walked under a per-element item budget
+//!   ([`ElementKind::Struct`]: whatever it does not spend is handed back, so a
+//!   frame of cheap entries cannot bank the difference).
+//! * The grants are drawn from one frame-wide pool sized from the caps
+//!   themselves — 9,216 headers for the three id arrays, 17,408 for the 256
+//!   entries of a `Supply`. A frame that repeats a recognised key to ask for the
+//!   allowance twice runs the pool dry and is refused on the visit budget.
 //!
-//! So the general walk is bounded by the caps themselves, by construction,
-//! rather than by a hand-picked number: at most `MAX_SCAN_VISITS + Σ(bound.max)`
+//! So the walk is bounded by the caps themselves, by construction, rather than
+//! by a hand-picked number: at most `MAX_SCAN_VISITS + Σ(bound.max × cost)`
 //! header reads, each consuming at least one byte of a frame the receive path
 //! has already read. The top-level visit, key-count and key-length budgets stay
 //! exactly as tight as T43 set them.
+//!
+//! # H-09: the short-circuit, and the keys serde buffers anyway
+//!
+//! T43's `supply_entry_count` returned at the **first** `entries` key it found
+//! and never read another pair. [`scan_bounded_arrays`] never had that hole — it
+//! walks every pair under the visit budget — so the asymmetry was the bug: the
+//! one variant T26 deliberately admits at the full 16 MiB cap was the one whose
+//! scan short-circuited. A frame shaped
+//! `{"type": "supply", "entries": [], "v": 1, "z": [16 M items]}` was answered
+//! `Ok(0)` by the gate and then cost **805 MB** of transient `Content` for its
+//! 16 MB of input — 50.33×, the same factor the unguarded path reaches — and it
+//! *decoded successfully*, as an empty `Supply`. No error, no log, nothing: one
+//! budget unit per frame against a 100k per-connection budget, ×32 connections
+//! per peer.
+//!
+//! Three changes close it, and two of them are just the general walk:
+//!
+//! * The `Supply` scan is now the same private `walk` as the general one, so it
+//!   reads **every** top-level pair and puts every value it does not recognise
+//!   through `Scanner::skip_value` under [`MAX_SCAN_VISITS`] — which is what
+//!   refuses a sixteen-million-item array however it is keyed, and wherever in
+//!   the map it is hidden.
+//! * `entries` is now an [`ArrayBound`] like any other, carrying
+//!   [`ElementKind::Struct`] rather than [`ElementKind::Text`], so it is judged
+//!   at its header and then STEPPED OVER on the allowance instead of being
+//!   returned from. That also bounds what one entry may nest, which the header
+//!   claim alone never did.
+//! * A `Supply` frame carrying a top-level key the variant does not define is
+//!   refused ([`CborScanError::UnknownKey`]), and so is one that repeats a key it
+//!   does ([`CborScanError::DuplicateKey`]). serde's internally-tagged
+//!   `TaggedContentVisitor` buffers **every** pair of such a map into
+//!   `Content` — unknown keys included — and discards them only once the variant
+//!   has been chosen and replayed, so an undeclared key is pure amplification
+//!   that no honest sender has any reason to emit. ciborium's own guard is a
+//!   256-level *recursion* limit, which bounds nothing about cardinality. The
+//!   allowlist is the wire struct's real field set (`type`, `v`, `entries`),
+//!   owned by `crate::protocol` beside the bounds so the two cannot drift.
 //!
 //! # Fail-closed, and why that is safe for honest peers
 //!
@@ -117,20 +166,28 @@
 //! * A real `Supply` is a three-pair map — `"type"`, `"v"`, `"entries"` — whose
 //!   longest key is seven bytes and whose only skipped values are a short text
 //!   string and a small integer. The honest scan reads **seven** headers at
-//!   depth zero, so every bound here sits at least an order of magnitude above
-//!   the traffic it has to pass.
+//!   depth zero, so every top-level bound here sits at least an order of
+//!   magnitude above the traffic it has to pass. The entries walk H-09 added is
+//!   paid for separately, out of the allowance above: a real entry spends 17
+//!   headers (its map, three scalar fields, and an envelope whose keys are the
+//!   closed `ledger::service::ENVELOPE_KEYS` set) against a per-entry budget of
+//!   68.
 //!
 //! The scan deliberately does not assume field ORDER. serde emits the tag first
 //! and ciborium preserves struct order (`type`, `v`, `entries` — verified by
-//! inspecting real encoded bytes), but the loop reads keys generically and skips
-//! whatever it does not recognise, so a reordered or extended map still finds
-//! `entries` as long as it stays inside the budget.
+//! inspecting real encoded bytes), but the loop reads keys generically, so a
+//! reordered map walks exactly as well. It is no longer tolerant of an EXTENDED
+//! one on the `Supply` path: since H-09 an undeclared top-level key is a
+//! refusal, because serde buffers it whether or not the struct wants it. Adding
+//! a field to `Supply` therefore means adding it to the allowlist, which is the
+//! same edit as adding it to the struct and sits three lines away from it.
 //!
 //! T43b widens those same rules from "every `Supply` frame" to "every frame",
 //! which raises the bar for a future `WireMessage` variant: it must still encode
 //! as a definite-length map of at most [`MAX_SCAN_MAP_KEYS`] text keys of at most
 //! [`MAX_SCAN_KEY_BYTES`] bytes, and any new unbounded array it adds wants a
-//! [`ArrayBound`] beside the others. Every variant today is a three-to-five-field
+//! [`ArrayBound`] beside the others — with the [`ElementKind`] that says how its
+//! elements may be stepped over. Every variant today is a three-to-five-field
 //! struct whose longest key is `"directive_ids"` (13 bytes), so the headroom is
 //! an order of magnitude; `honest_non_supply_frames_scan_within_their_bounds`
 //! pins it against real encoded bytes rather than against this paragraph.
@@ -144,11 +201,15 @@
 /// cannot make the guard itself the expensive part, which is the failure mode a
 /// hand-rolled scanner most easily introduces.
 ///
-/// T43b does **not** relax this. [`scan_bounded_arrays`] has to step over the
-/// elements of arrays it has already proven to be within cap, and pays for that
-/// out of a separate per-array allowance (see the module docs) rather than out
-/// of this budget, so the bound on everything *else* the general walk does — map
-/// header, keys, unrecognised values — stays exactly where T43 put it.
+/// T43b does **not** relax this, and neither does H-09. A walk has to step over
+/// the elements of arrays it has already proven to be within cap — `entries`
+/// among them since H-09 — and pays for that out of a separate per-array
+/// allowance (see the module docs) rather than out of this budget, so the bound
+/// on everything *else* the walk does — map header, keys, unrecognised values —
+/// stays exactly where T43 put it. That is what refuses a frame which hides a
+/// sixteen-million-item array behind an empty `entries`: the array is an
+/// unrecognised value, and unrecognised values still get 64 headers between
+/// them.
 pub const MAX_SCAN_VISITS: usize = 64;
 
 /// Maximum container nesting the skipper may enter (T43).
@@ -172,10 +233,51 @@ pub const MAX_SCAN_MAP_KEYS: u64 = 16;
 /// `"entries"` is seven.
 pub const MAX_SCAN_KEY_BYTES: u64 = 64;
 
-/// The map key whose array header carries the `Supply` entry count.
-const ENTRIES_KEY: &[u8] = b"entries";
+/// What the elements of a bounded array are, and therefore how a walk may step
+/// over one it has already proven to be within cap (T43b, H-09).
+///
+/// The distinction is about COST, not about types. A text element is priced
+/// exactly — one header, then a jump over its payload — so an array of them can
+/// be stepped over for a price the cap itself pays. A struct element has no
+/// such price: a `SupplyEntry` nests a `BTreeMap<String, String>`, so the
+/// headers one element spends are bounded by the frame's bytes rather than by
+/// any cap, and the walk has to impose a budget of its own to step over it at
+/// all. T43 sidestepped that by never stepping over `entries`, which is exactly
+/// the short-circuit H-09 found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElementKind {
+    /// Definite-length text strings — every `Vec<String>` array on the wire.
+    ///
+    /// Refused if an element is anything else, which is what makes the walk
+    /// provably one header plus one length jump per element with nothing nested
+    /// inside to spend the allowance or the depth budget on.
+    Text,
+    /// Whole CBOR values, each allowed at most `items` headers (H-09).
+    ///
+    /// `Supply.entries` is a `Vec<SupplyEntry>`: a four-field struct whose
+    /// `envelope` is a map, so an element is a subtree rather than a leaf and
+    /// the scan cannot price it from the array's cap alone. `items` is the
+    /// caller's statement of how many CBOR items one element may be worth —
+    /// enough for the encoding the wire struct really produces, and low enough
+    /// that `max × items` is a constant the walk can afford. An element over
+    /// budget is [`CborScanError::VisitBudgetExhausted`], not a decode later.
+    Struct {
+        /// Maximum CBOR headers one element may spend.
+        items: usize,
+    },
+}
 
-/// One top-level array [`scan_bounded_arrays`] knows how to bound (T43b).
+impl ElementKind {
+    /// Header reads one element of this kind may cost the allowance.
+    fn header_cost(self) -> usize {
+        match self {
+            Self::Text => 1,
+            Self::Struct { items } => items,
+        }
+    }
+}
+
+/// One top-level array a walk knows how to bound (T43b, H-09).
 ///
 /// The caller owns the whole policy — which keys are arrays, what each one's cap
 /// is, and what to call it in an error — so this module stays a CBOR walker with
@@ -191,6 +293,9 @@ pub struct ArrayBound {
     /// The caller's name for this bound, echoed back in
     /// [`ScanOutcome::OverBound`]. Opaque here: the scan never interprets it.
     pub label: &'static str,
+    /// What the array's elements are, and so how the walk may step over them
+    /// once the header's claim has been proven within [`Self::max`] (H-09).
+    pub elements: ElementKind,
 }
 
 /// What [`scan_bounded_arrays`] found, for a frame it was able to walk (T43b).
@@ -247,7 +352,27 @@ pub enum CborScanError {
     EntriesNotAnArray,
     /// The top-level map held no `entries` key.
     MissingEntries,
-    /// The scan read [`MAX_SCAN_VISITS`] headers without reaching `entries`.
+    /// A frame carried a top-level key its variant does not define (H-09).
+    ///
+    /// Only the allowlisted scans refuse this — see [`scan_supply_frame`]. The
+    /// offending key is deliberately NOT carried: it is attacker-chosen text,
+    /// this error is `Copy` and allocates nothing, and the variant's field set
+    /// is three names an operator can read off the struct. What matters in a log
+    /// is that the frame claimed to be something it was not shaped like.
+    UnknownKey,
+    /// A frame repeated a top-level key (H-09).
+    ///
+    /// ciborium serialises struct fields once each, so a repeat cannot come from
+    /// an honest peer. Refusing it — rather than picking a winner the way a
+    /// decoder would — is what keeps "this frame declares N entries"
+    /// unambiguous, and stops a second `entries` from being smuggled past a
+    /// harmless first one.
+    DuplicateKey,
+    /// The scan read [`MAX_SCAN_VISITS`] headers without finishing the walk.
+    ///
+    /// Also how an over-budget [`ElementKind::Struct`] element is refused, and
+    /// how a frame that repeats a recognised key to draw the element-skip
+    /// allowance twice runs the frame-wide pool dry (T43b, H-09).
     VisitBudgetExhausted,
     /// A skipped value nested deeper than [`MAX_SCAN_DEPTH`].
     DepthExceeded,
@@ -299,6 +424,10 @@ impl std::fmt::Display for CborScanError {
                 write!(formatter, "entries is not a definite-length array")
             }
             Self::MissingEntries => write!(formatter, "no entries key in the frame"),
+            Self::UnknownKey => {
+                write!(formatter, "undeclared top-level key in a wire frame")
+            }
+            Self::DuplicateKey => write!(formatter, "repeated top-level map key"),
             Self::VisitBudgetExhausted => {
                 write!(
                     formatter,
@@ -441,17 +570,30 @@ impl<'a> Scanner<'a> {
     /// not an error. The explicit frame stack makes the depth bound checkable
     /// and the failure a [`CborScanError`].
     fn skip_value(&mut self) -> Result<(), CborScanError> {
-        // Remaining item counts for each enclosing container. Never allocates on
-        // the honest path, where every skipped value is a leaf.
-        let mut enclosing: Vec<u64> = Vec::new();
+        // Remaining item counts for each enclosing container. A fixed array
+        // rather than a `Vec` because [`MAX_SCAN_DEPTH`] already bounds how deep
+        // this can go, and because the scan's contract is that it allocates
+        // NOTHING: T43 could honour that with a `Vec` only because every value
+        // it skipped was a leaf, and H-09 sends it through `Supply` entries,
+        // which are maps. A heap allocation per entry would be a small
+        // allocation the guard performs on behalf of a hostile frame — the one
+        // thing this module exists to avoid — and would land in
+        // `decode_memory.rs`'s measurement besides.
+        let mut enclosing = [0u64; MAX_SCAN_DEPTH];
+        let mut depth: usize = 0;
         let mut remaining: u64 = 1;
         loop {
             // Unwind finished containers. Bounded by MAX_SCAN_DEPTH per turn.
             while remaining == 0 {
-                match enclosing.pop() {
-                    Some(outer) => remaining = outer,
-                    None => return Ok(()),
-                }
+                let Some(outer) = depth.checked_sub(1) else {
+                    return Ok(());
+                };
+                depth = outer;
+                // `outer` is the depth just left, so it is below the depth
+                // the push path bounded at MAX_SCAN_DEPTH and the slot is
+                // always there. `get` states that rather than asserting it,
+                // keeping the scanner free of indexing panics.
+                remaining = *enclosing.get(outer).ok_or(CborScanError::DepthExceeded)?;
             }
             remaining -= 1;
             let items = match self.head()? {
@@ -476,10 +618,13 @@ impl<'a> Scanner<'a> {
             if items == 0 {
                 continue;
             }
-            if enclosing.len() >= MAX_SCAN_DEPTH {
-                return Err(CborScanError::DepthExceeded);
-            }
-            enclosing.push(remaining);
+            // The bounds check IS the depth check: `enclosing` is exactly
+            // MAX_SCAN_DEPTH long, so a frame nesting past it lands on `None`.
+            let slot = enclosing
+                .get_mut(depth)
+                .ok_or(CborScanError::DepthExceeded)?;
+            *slot = remaining;
+            depth += 1;
             remaining = items;
         }
     }
@@ -544,59 +689,156 @@ impl<'a> Scanner<'a> {
         }
         Ok(())
     }
-}
 
-/// Read the element count the frame's `entries` array header CLAIMS, without
-/// decoding the frame (T43).
-///
-/// The returned count is the header's claim, not a verified element count —
-/// that is the point: it is available after ~7 header reads, before serde has
-/// allocated anything, and a claim above `MAX_SUPPLY_ENTRIES` is sufficient
-/// grounds to refuse the frame. A claim *within* the cap still has to survive
-/// the ordinary decode, which will fail on a frame whose body does not match.
-///
-/// Fails closed: see the module docs for why every rejection below is
-/// unreachable for an honest peer.
-pub fn supply_entry_count(body: &[u8]) -> Result<u64, CborScanError> {
-    let mut scanner = Scanner::new(body);
-    let pairs = scanner.open_top_level_map()?;
-    for _ in 0..pairs {
-        if scanner.map_key()? == ENTRIES_KEY {
-            return match scanner.head()? {
-                Head::Array(count) => Ok(count),
-                _ => Err(CborScanError::EntriesNotAnArray),
-            };
+    /// Step over `count` whole CBOR values, each allowed at most `items` header
+    /// reads — the elements of an array whose count is already proven within its
+    /// cap (H-09).
+    ///
+    /// The counterpart of [`Self::skip_text_elements`] for
+    /// [`ElementKind::Struct`], and the reason a `Supply`'s `entries` can be
+    /// walked past at all. A struct element is a subtree of unbounded shape, so
+    /// unlike a text element it cannot be priced from the cap: the budget has to
+    /// be imposed. Each element gets `items`, and then two things happen to it:
+    ///
+    /// * **It is a ceiling, not just an allowance.** A grant only widens
+    ///   [`Self::head`]'s comparison against `MAX_SCAN_VISITS + granted`, so an
+    ///   element could otherwise also draw on however much of the top-level
+    ///   budget the walk had not spent — which would make the per-element bound
+    ///   `items + 64`, and a different number for every frame shape. Comparing
+    ///   the spend against `items` afterwards makes it the flat bound the caller
+    ///   sized `max × items` from. The overshoot before the comparison is
+    ///   bounded by the same 64 and costs nothing but header reads.
+    /// * **What it does not spend is handed back**, so `granted` ends up equal
+    ///   to what the elements ACTUALLY spent. Without that, a frame of 256 empty
+    ///   maps would bank ~17,000 unspent headers and could spend them on the
+    ///   parts of the walk no cap covers; with it, [`MAX_SCAN_VISITS`] keeps
+    ///   governing everything outside these arrays exactly as it did before.
+    ///
+    /// The caller owes the same thing [`Self::skip_text_elements`] is owed:
+    /// `count` must already be within the array's cap, so the total is a
+    /// constant derived from the caps rather than a number the frame chose.
+    fn skip_struct_elements(&mut self, count: usize, items: usize) -> Result<(), CborScanError> {
+        for _ in 0..count {
+            let before = self.visits;
+            self.granted = self.granted.saturating_add(items);
+            self.skip_value()?;
+            let spent = self.visits.saturating_sub(before);
+            if spent > items {
+                return Err(CborScanError::VisitBudgetExhausted);
+            }
+            self.granted = self.granted.saturating_sub(items - spent);
         }
-        scanner.skip_value()?;
+        Ok(())
     }
-    Err(CborScanError::MissingEntries)
 }
 
-/// Bound EVERY array in `bounds` that the frame actually carries, from the
-/// array headers alone (T43b).
+/// The top-level keys a frame's variant defines, and which of them it has used
+/// (H-09).
 ///
-/// The general counterpart to [`supply_entry_count`], and the reason this module
-/// now covers the whole `WireMessage` enum rather than its one worst variant.
-/// Two semantic differences, both deliberate:
+/// serde's `TaggedContentVisitor::visit_map` buffers EVERY pair of an
+/// internally-tagged map into `Content` — keys the chosen variant has no field
+/// for included, discarded only after the whole tree has been built — so an
+/// undeclared key is amplification an honest sender has no reason to emit.
+/// Refusing one is therefore free of compatibility cost in the direction that
+/// matters: the frames it rejects are frames whose extra bytes the decoder was
+/// going to throw away anyway.
 ///
-/// * **Tolerant of absence.** A `Supply` without `entries` is malformed; a frame
-///   without `ids` is simply an `Announce`. A key no frame carries is not an
-///   error here, and neither is a frame carrying none of them.
-/// * **It enforces, rather than reports.** [`supply_entry_count`] returns a claim
-///   for the caller to judge, because it stops at the first array. This one has
-///   to keep walking to reach a second array, so it judges each claim **at the
-///   header** — an over-cap array is refused with [`ScanOutcome::OverBound`]
-///   before a single one of its elements is touched — and only then spends the
-///   element-skip allowance described in the module docs to step over an array
-///   it has proven safe.
+/// The general scan over three variants at once cannot use this (their field
+/// sets differ, so the union would be a weak allowlist and a new variant would
+/// silently widen it); T26's 1 MiB byte cap and the visit budget bound that path
+/// instead. The `Supply` path, which is the one admitted at the full 16 MiB, is
+/// a single variant with a three-name field set.
+struct KeyAllowlist<'a> {
+    /// The keys the frame may carry, or `None` to tolerate any.
+    keys: Option<&'a [&'static [u8]]>,
+    /// Bit `i` set once `keys[i]` has been seen, for the duplicate check and
+    /// for the "was it present?" question [`scan_supply_frame`] asks afterwards.
+    seen: u16,
+}
+
+impl<'a> KeyAllowlist<'a> {
+    /// Tolerate any top-level key (T43b's general scan).
+    fn any() -> Self {
+        Self {
+            keys: None,
+            seen: 0,
+        }
+    }
+
+    /// Admit only `keys`, each at most once (H-09).
+    ///
+    /// The assertion is on the ALLOWLIST, never on the frame: it depends on a
+    /// `&'static` constant this crate writes, so it either always holds or never
+    /// does and no peer can reach it. [`MAX_SCAN_MAP_KEYS`] caps a frame at 16
+    /// pairs, so an allowlist longer than `seen` can track would be pointless as
+    /// well as untrackable.
+    fn of(keys: &'a [&'static [u8]]) -> Self {
+        assert!(
+            keys.len() <= u16::BITS as usize,
+            "a scan allowlist may name at most {} keys",
+            u16::BITS
+        );
+        Self {
+            keys: Some(keys),
+            seen: 0,
+        }
+    }
+
+    /// Position of `key` in the allowlist.
+    ///
+    /// Linear over a handful of entries, which is cheaper than any index at this
+    /// size — the same reasoning `bounds` is searched on.
+    fn position(&self, key: &[u8]) -> Option<usize> {
+        self.keys?.iter().position(|allowed| *allowed == key)
+    }
+
+    /// Record one top-level key, refusing an undeclared or repeated one.
+    fn admit(&mut self, key: &[u8]) -> Result<(), CborScanError> {
+        if self.keys.is_none() {
+            return Ok(());
+        }
+        let index = self.position(key).ok_or(CborScanError::UnknownKey)?;
+        // `of` bounded the allowlist below `u16::BITS`, so the shift is in range.
+        let bit = 1u16 << index;
+        if self.seen & bit != 0 {
+            return Err(CborScanError::DuplicateKey);
+        }
+        self.seen |= bit;
+        Ok(())
+    }
+
+    /// Whether the frame carried `key`. Always false without an allowlist,
+    /// which is why only [`scan_supply_frame`] asks.
+    fn holds(&self, key: &[u8]) -> bool {
+        self.position(key)
+            .is_some_and(|index| self.seen & (1u16 << index) != 0)
+    }
+}
+
+/// Walk a frame's whole top-level map, bounding every array in `bounds` that it
+/// carries (T43, T43b, H-09).
 ///
-/// Everything else is T43's contract unchanged: headers only, no allocation, no
-/// assumption about field order, and fail-closed on every structural hostility.
-/// `bounds` is expected to be a handful of entries; it is searched linearly per
-/// key, which is cheaper than any index at this size.
-pub fn scan_bounded_arrays(
+/// The single mechanism behind both public scans, and the reason there is no
+/// longer a second one to drift: T43's `supply_entry_count` was a separate walk
+/// that returned at the first `entries` key, which is precisely the hole H-09
+/// records. Everything either scan does — the map header, the key budget, the
+/// unrecognised-value skip, the array headers, the element-skip allowance — is
+/// here, once.
+///
+/// Every value is accounted for exactly one of three ways, and that exhaustive
+/// split is what makes "nothing in this frame is unbounded" checkable:
+///
+/// * a value under a key no [`ArrayBound`] names goes through
+///   [`Scanner::skip_value`] on the ordinary [`MAX_SCAN_VISITS`] budget, so a
+///   wide or deep one is refused wherever in the map it sits;
+/// * a bounded array over its cap is refused AT ITS HEADER, before an element
+///   byte is touched;
+/// * a bounded array within its cap is stepped over on the frame-wide allowance,
+///   sized `Σ(bound.max × element cost)` from the caps themselves.
+fn walk(
     body: &[u8],
     bounds: &[ArrayBound],
+    keys: &mut KeyAllowlist<'_>,
 ) -> Result<ScanOutcome, CborScanError> {
     let mut scanner = Scanner::new(body);
     let pairs = scanner.open_top_level_map()?;
@@ -605,9 +847,13 @@ pub fn scan_bounded_arrays(
     // arrays it carries are distinct and each is within its own cap. A frame
     // that repeats a recognised key to draw twice runs it dry, and the ordinary
     // visit budget then refuses the walk.
-    let mut allowance: usize = bounds.iter().map(|bound| bound.max).sum();
+    let mut allowance: usize = bounds
+        .iter()
+        .map(|bound| bound.max.saturating_mul(bound.elements.header_cost()))
+        .fold(0usize, usize::saturating_add);
     for _ in 0..pairs {
         let key = scanner.map_key()?;
+        keys.admit(key)?;
         let Some(bound) = bounds.iter().find(|bound| bound.key == key) else {
             scanner.skip_value()?;
             continue;
@@ -631,13 +877,92 @@ pub fn scan_bounded_arrays(
         }
         // `count <= bound.max` from here, so the allowance this array draws is
         // bounded by the cap rather than by the frame's claim.
-        let Some(remaining) = allowance.checked_sub(count) else {
+        let draw = count.saturating_mul(bound.elements.header_cost());
+        let Some(remaining) = allowance.checked_sub(draw) else {
             return Err(CborScanError::VisitBudgetExhausted);
         };
         allowance = remaining;
-        scanner.skip_text_elements(count, bound.label)?;
+        match bound.elements {
+            ElementKind::Text => scanner.skip_text_elements(count, bound.label)?,
+            ElementKind::Struct { items } => scanner.skip_struct_elements(count, items)?,
+        }
     }
     Ok(ScanOutcome::WithinBounds)
+}
+
+/// Bound a frame that claims to be a `Supply`, from its array headers and its
+/// key set alone (T43, rewritten by H-09).
+///
+/// The strict counterpart of [`scan_bounded_arrays`], for the one variant T26's
+/// peek gate deliberately admits at the full 16 MiB `MAX_MESSAGE_SIZE` — and
+/// therefore the one whose every byte has to be accounted for here rather than
+/// by a byte cap. It is the same `walk`, with two rules added:
+///
+/// * **Every bound's key must be PRESENT.** A `Supply` without `entries` is
+///   malformed, where a frame without `ids` is simply some other variant, so an
+///   absent bound is [`CborScanError::MissingEntries`] rather than tolerated.
+/// * **No key outside `allowed_keys`, and none of them twice.** serde buffers
+///   undeclared keys into `Content` regardless of whether the variant wants
+///   them, so they are amplification with no honest sender — see the module
+///   docs. `allowed_keys` is the wire struct's real field set and must be a
+///   superset of `bounds`' keys, or a bounded key could never be admitted.
+///
+/// T43's `supply_entry_count` stood here and returned the `entries` claim the
+/// moment it found the key, never reading another pair; a frame that put
+/// `"entries": []` SECOND hid everything behind it from the guard. This returns
+/// the same verdicts through the general walk instead, so the `Supply` path can
+/// no longer be the loose one.
+pub fn scan_supply_frame(
+    body: &[u8],
+    bounds: &[ArrayBound],
+    allowed_keys: &[&'static [u8]],
+) -> Result<ScanOutcome, CborScanError> {
+    debug_assert!(
+        bounds.iter().all(|bound| allowed_keys.contains(&bound.key)),
+        "a bounded key outside the allowlist could never be admitted"
+    );
+    let mut keys = KeyAllowlist::of(allowed_keys);
+    let outcome = walk(body, bounds, &mut keys).map_err(|error| match error {
+        // T43 named this case for `entries` specifically and callers log it by
+        // that name. The general walk cannot know the key it refused is
+        // `entries`, so the taxonomy is restored here rather than changed under
+        // them.
+        CborScanError::BoundedKeyNotAnArray(_) => CborScanError::EntriesNotAnArray,
+        other => other,
+    })?;
+    for bound in bounds {
+        if !keys.holds(bound.key) {
+            return Err(CborScanError::MissingEntries);
+        }
+    }
+    Ok(outcome)
+}
+
+/// Bound EVERY array in `bounds` that the frame actually carries, from the
+/// array headers alone (T43b).
+///
+/// The tolerant counterpart to [`scan_supply_frame`], covering the three
+/// non-`Supply` variants with one call. Two semantic differences, both
+/// deliberate:
+///
+/// * **Tolerant of absence.** A `Supply` without `entries` is malformed; a frame
+///   without `ids` is simply an `Announce`. A key no frame carries is not an
+///   error here, and neither is a frame carrying none of them.
+/// * **Tolerant of unrecognised keys.** Three variants share this scan, so an
+///   allowlist could only be their union — weak, and silently widened by every
+///   variant added. T26's `NON_SUPPLY_FRAME_CAP` bounds these frames to 1 MiB of
+///   BYTES, which is the bound the `Supply` path cannot have and the reason it
+///   needs the allowlist instead.
+///
+/// Everything else is T43's contract unchanged: headers only, no allocation, no
+/// assumption about field order, and fail-closed on every structural hostility.
+/// `bounds` is expected to be a handful of entries; it is searched linearly per
+/// key, which is cheaper than any index at this size.
+pub fn scan_bounded_arrays(
+    body: &[u8],
+    bounds: &[ArrayBound],
+) -> Result<ScanOutcome, CborScanError> {
+    walk(body, bounds, &mut KeyAllowlist::any())
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -646,18 +971,29 @@ pub fn scan_bounded_arrays(
 mod tests {
     use super::*;
     use crate::protocol::{
-        DirectiveKind, SupplyEntry, WireMessage, MAX_HAVE_HEADS, MAX_SUPPLY_ENTRIES, MAX_WANT_IDS,
-        NON_SUPPLY_ARRAY_BOUNDS, SUPPLY_TYPE_DISCRIMINATOR,
+        DirectiveKind, SupplyEntry, WireMessage, MAX_HAVE_HEADS, MAX_SUPPLY_ENTRIES,
+        MAX_SUPPLY_ENTRY_ITEMS, MAX_WANT_IDS, NON_SUPPLY_ARRAY_BOUNDS, SUPPLY_ARRAY_BOUNDS,
+        SUPPLY_TOP_LEVEL_KEYS, SUPPLY_TYPE_DISCRIMINATOR,
     };
-    use std::collections::BTreeMap;
 
+    /// A maximal honest entry: every key the closed envelope set allows, which
+    /// is the most CBOR items an entry can honestly be worth and therefore what
+    /// `MAX_SUPPLY_ENTRY_ITEMS` has to cover (H-09).
     fn entry(index: usize) -> SupplyEntry {
         SupplyEntry {
             id: format!("{index:064x}"),
             kind: DirectiveKind::Open,
             economic_bean: "2024-01-01 open Assets:Cash USD".to_owned(),
-            envelope: BTreeMap::from([("openledger-author".to_owned(), "peer-1".to_owned())]),
+            envelope: ledger::service::ENVELOPE_KEYS
+                .iter()
+                .map(|key| ((*key).to_owned(), format!("{index}")))
+                .collect(),
         }
+    }
+
+    /// The `Supply` policy, as `prescan_frame` hands it over.
+    fn scan_supply(frame: &[u8]) -> Result<ScanOutcome, CborScanError> {
+        scan_supply_frame(frame, SUPPLY_ARRAY_BOUNDS, SUPPLY_TOP_LEVEL_KEYS)
     }
 
     /// The `"type": "supply"` + `"v": 1` prefix a real frame opens with, as
@@ -671,26 +1007,33 @@ mod tests {
         bytes
     }
 
-    /// The honest path: real encoded frames scan to exactly their entry count,
-    /// and still decode identically afterwards.
+    /// The honest path: real encoded frames pass the scan and still decode
+    /// identically afterwards.
     ///
     /// This is also the proof the module's fail-closed rules rest on — it runs
     /// against bytes ciborium actually produced, so it pins that the top-level
     /// map and the `entries` array are BOTH definite-length (an indefinite head
     /// would make the scan return `IndefiniteLength` and the `unwrap` below
-    /// fail), that the keys are text strings, and that `entries` is reachable
-    /// within the visit budget at the field order serde emits.
+    /// fail), that the keys are text strings and all three are allowlisted, and
+    /// that the whole map is walkable within the budgets at the field order
+    /// serde emits.
+    ///
+    /// Since H-09 it pins one thing more, and the expensive-looking part is the
+    /// point: every entry is a maximal one, so a 256-entry frame is walked
+    /// element by element and every one of them has to fit
+    /// `MAX_SUPPLY_ENTRY_ITEMS`. A budget the real encoding could not meet would
+    /// break honest traffic on the next `Supply` a peer sent.
     #[test]
-    fn honest_supply_frames_scan_to_their_entry_count() {
+    fn honest_supply_frames_scan_within_their_bounds() {
         // 23/24 and 255/256 straddle CBOR's additional-info encoding boundaries
         // (inline, one-byte, two-byte), so all three argument widths are covered.
         for count in [0usize, 1, 23, 24, 255, MAX_SUPPLY_ENTRIES] {
             let message = WireMessage::supply((0..count).map(entry).collect());
             let cbor = message.to_cbor().unwrap();
             assert_eq!(
-                supply_entry_count(&cbor),
-                Ok(count as u64),
-                "scan disagreed with the real encoding at {count} entries"
+                scan_supply(&cbor),
+                Ok(ScanOutcome::WithinBounds),
+                "scan refused the real encoding at {count} entries"
             );
             assert_eq!(
                 WireMessage::decode_checked(&cbor).unwrap(),
@@ -698,20 +1041,75 @@ mod tests {
                 "pre-scan must not disturb an honest round-trip at {count} entries"
             );
         }
+        // The claim is read off the array the frame really carries, not guessed:
+        // one entry over the cap is refused naming the count ciborium wrote.
+        let over_cap = WireMessage::supply((0..MAX_SUPPLY_ENTRIES + 1).map(entry).collect());
+        assert_eq!(
+            scan_supply(&over_cap.to_cbor().unwrap()),
+            Ok(ScanOutcome::OverBound {
+                label: "supply",
+                claimed: MAX_SUPPLY_ENTRIES as u64 + 1,
+                max: MAX_SUPPLY_ENTRIES,
+            })
+        );
+    }
+
+    /// What an honestly-encoded entry actually costs the element-skip allowance,
+    /// measured rather than assumed (H-09).
+    ///
+    /// `MAX_SUPPLY_ENTRY_ITEMS` is the bound that stops a frame hiding its
+    /// amplification inside `entries`, so it has to sit above what the real
+    /// encoder emits and well below anything that would let one entry matter.
+    /// Binary-searching the budget an entry needs pins both halves: if a field
+    /// or an envelope key is ever added, this fails with the new number rather
+    /// than a peer being refused in production.
+    #[test]
+    fn an_honest_entry_costs_far_less_than_its_item_budget() {
+        let frame = WireMessage::supply(vec![entry(0)]).to_cbor().unwrap();
+        let needed = (1..=MAX_SUPPLY_ENTRY_ITEMS)
+            .find(|items| {
+                let bounds = [ArrayBound {
+                    key: b"entries",
+                    max: MAX_SUPPLY_ENTRIES,
+                    label: "supply",
+                    elements: ElementKind::Struct { items: *items },
+                }];
+                scan_supply_frame(&frame, &bounds, SUPPLY_TOP_LEVEL_KEYS)
+                    == Ok(ScanOutcome::WithinBounds)
+            })
+            .expect("an honest entry must fit its own budget");
+        assert_eq!(
+            needed, 17,
+            "an honest entry's item count changed: map header, 3 scalar fields, \
+             the envelope key and header, and 2 per envelope key"
+        );
+        assert!(
+            needed * 4 <= MAX_SUPPLY_ENTRY_ITEMS,
+            "the budget must keep a 4x margin over the real encoding"
+        );
     }
 
     /// The T43 hole itself: a ~30-byte frame whose `entries` header claims ten
-    /// million elements is answered from the header alone.
+    /// million elements is answered from the header alone, with no element bytes
+    /// present at all.
     #[test]
-    fn scan_reads_a_forged_ten_million_element_claim_from_the_header() {
+    fn scan_refuses_a_forged_ten_million_element_claim_from_the_header() {
         let mut frame = supply_prefix();
         frame.extend_from_slice(&[0x9a]);
         frame.extend_from_slice(&10_000_000u32.to_be_bytes());
         assert!(frame.len() < 64, "the whole attack fits in a tiny frame");
-        assert_eq!(supply_entry_count(&frame), Ok(10_000_000));
+        assert_eq!(
+            scan_supply(&frame),
+            Ok(ScanOutcome::OverBound {
+                label: "supply",
+                claimed: 10_000_000,
+                max: MAX_SUPPLY_ENTRIES,
+            })
+        );
     }
 
-    /// Field order is not assumed: `entries` is found wherever it sits.
+    /// Field order is not assumed: `entries` is found wherever it sits, and —
+    /// since H-09 — the walk carries on past it to the pairs behind.
     #[test]
     fn scan_finds_entries_at_any_key_position() {
         // {"entries": [], "type": "supply", "v": 1} — tag last, entries first.
@@ -719,21 +1117,176 @@ mod tests {
         frame.extend_from_slice(b"\x67entries\x80");
         frame.extend_from_slice(SUPPLY_TYPE_DISCRIMINATOR);
         frame.extend_from_slice(b"\x61v\x01");
-        assert_eq!(supply_entry_count(&frame), Ok(0));
+        assert_eq!(scan_supply(&frame), Ok(ScanOutcome::WithinBounds));
+    }
+
+    // ─── H-09: the short-circuit, and the keys serde buffers anyway ──────────
+
+    /// THE H-09 frame: `"entries": []` placed second, with the payload behind
+    /// it.
+    ///
+    /// T43's scan returned `Ok(0)` here and never read another pair, so a
+    /// sixteen-million-item array sitting two keys later reached serde intact —
+    /// 805 MB of `Content` for 16 MB of input, decoding SUCCESSFULLY as an empty
+    /// `Supply` so that nothing was logged and nothing failed. Refused twice
+    /// over now: the key is undeclared, and the array behind it would have blown
+    /// the visit budget anyway. `decode_memory.rs` measures the peak; this pins
+    /// the verdict on a fixture small enough to read.
+    #[test]
+    fn scan_sees_past_an_empty_entries_array_to_the_rest_of_the_map() {
+        // {"type": "supply", "entries": [], "v": 1, "z": [10 M items]}
+        let mut frame = vec![0xa4];
+        frame.extend_from_slice(SUPPLY_TYPE_DISCRIMINATOR);
+        frame.extend_from_slice(b"\x67entries\x80");
+        frame.extend_from_slice(b"\x61v\x01");
+        frame.extend_from_slice(b"\x61z");
+        frame.extend_from_slice(&array_header_claiming(10_000_000));
+        assert!(frame.len() < 64, "the whole attack fits in a tiny frame");
+        assert_eq!(scan_supply(&frame), Err(CborScanError::UnknownKey));
+
+        // The same payload under a key the variant DOES define, so the
+        // allowlist cannot be what refuses it: the walk still has to reach the
+        // value and hold it to the visit budget.
+        let mut declared_key = vec![0xa3];
+        declared_key.extend_from_slice(SUPPLY_TYPE_DISCRIMINATOR);
+        declared_key.extend_from_slice(b"\x67entries\x80");
+        declared_key.extend_from_slice(b"\x61v");
+        declared_key.extend_from_slice(&empty_string_array(1_000));
+        assert_eq!(
+            scan_supply(&declared_key),
+            Err(CborScanError::VisitBudgetExhausted)
+        );
+    }
+
+    /// The other half of the same hole: the payload hidden INSIDE `entries`.
+    ///
+    /// One element is within `MAX_SUPPLY_ENTRIES` by a factor of 256, so no
+    /// bound on the entry COUNT can see this — T43's header claim said `1` and
+    /// was perfectly true. `ElementKind::Struct` is what refuses it: the entry
+    /// is walked, and it runs out of its item budget long before its ten
+    /// millionth item.
+    #[test]
+    fn scan_bounds_what_one_entry_may_nest() {
+        // {"type": "supply", "v": 1, "entries": [[1,000 items]]} — one entry,
+        // holding an array of a thousand. A real one is worth 17 items.
+        let mut frame = supply_prefix();
+        frame.push(0x81); // entries: exactly one element…
+        frame.extend_from_slice(&empty_string_array(1_000)); // …a bomb.
+        assert_eq!(
+            scan_supply(&frame),
+            Err(CborScanError::VisitBudgetExhausted)
+        );
+
+        // The same shape with nothing behind the claim is refused too, just by
+        // the buffer rather than the budget: the walk never gets to spend the
+        // ten million header reads the array asks for.
+        let mut truncated = supply_prefix();
+        truncated.push(0x81);
+        truncated.extend_from_slice(&array_header_claiming(10_000_000));
+        assert!(
+            truncated.len() < 64,
+            "the whole attack fits in a tiny frame"
+        );
+        assert_eq!(scan_supply(&truncated), Err(CborScanError::Truncated));
+
+        // Flat rather than nested, and spread over the full entry cap: 256
+        // entries of 1,000 items each. Every entry is a legal CBOR array and
+        // the count is exactly at the cap, so only the per-entry budget
+        // separates this from honest traffic.
+        let mut spread = supply_prefix();
+        spread.push(0x99);
+        spread.extend_from_slice(&(MAX_SUPPLY_ENTRIES as u16).to_be_bytes());
+        for _ in 0..MAX_SUPPLY_ENTRIES {
+            spread.extend_from_slice(&empty_string_array(1_000));
+        }
+        assert_eq!(
+            scan_supply(&spread),
+            Err(CborScanError::VisitBudgetExhausted)
+        );
+    }
+
+    /// An entry cheaper than its budget does not bank the difference.
+    ///
+    /// 256 empty maps cost one header each against a budget of 68, so a walker
+    /// that granted the budget rather than the spend would leave ~17,000 header
+    /// reads on the table — enough to step over a bomb behind them. The reclaim
+    /// in `skip_struct_elements` is what keeps the ordinary 64-visit budget
+    /// governing everything outside the array.
+    #[test]
+    fn scan_hands_back_the_item_budget_an_entry_does_not_spend() {
+        // {"type": "supply", "entries": [{} × 256], "v": [0 × 1000]}
+        let mut frame = vec![0xa3];
+        frame.extend_from_slice(SUPPLY_TYPE_DISCRIMINATOR);
+        frame.extend_from_slice(b"\x67entries\x99");
+        frame.extend_from_slice(&(MAX_SUPPLY_ENTRIES as u16).to_be_bytes());
+        frame.extend(std::iter::repeat_n(0xa0u8, MAX_SUPPLY_ENTRIES));
+        frame.extend_from_slice(b"\x61v");
+        frame.push(0x99);
+        frame.extend_from_slice(&1000u16.to_be_bytes());
+        frame.extend(std::iter::repeat_n(0x00u8, 1000));
+        assert_eq!(
+            scan_supply(&frame),
+            Err(CborScanError::VisitBudgetExhausted)
+        );
+    }
+
+    /// Undeclared and repeated top-level keys are both refused (H-09).
+    ///
+    /// serde buffers either one into `Content` regardless of whether the variant
+    /// wants it, so neither has an honest sender — and a repeated `entries`
+    /// would additionally make "how many entries does this frame declare?"
+    /// ambiguous, which is the question the whole gate exists to answer.
+    #[test]
+    fn scan_rejects_undeclared_and_repeated_supply_keys() {
+        // A single undeclared key, with a harmless value.
+        let mut undeclared = vec![0xa4];
+        undeclared.extend_from_slice(SUPPLY_TYPE_DISCRIMINATOR);
+        undeclared.extend_from_slice(b"\x61v\x01");
+        undeclared.extend_from_slice(b"\x67entries\x80");
+        undeclared.extend_from_slice(b"\x61z\x01");
+        assert_eq!(scan_supply(&undeclared), Err(CborScanError::UnknownKey));
+
+        // A 16 MiB text string under an undeclared key: cheap for the scan to
+        // skip (one header and a length jump), a 16 MiB `Content::String` for
+        // serde. Skipping it is exactly what the allowlist is for.
+        let mut fat_value = vec![0xa4];
+        fat_value.extend_from_slice(SUPPLY_TYPE_DISCRIMINATOR);
+        fat_value.extend_from_slice(b"\x61v\x01");
+        fat_value.extend_from_slice(b"\x67entries\x80");
+        fat_value.extend_from_slice(b"\x61z\x7a");
+        fat_value.extend_from_slice(&(16u32 * 1024 * 1024).to_be_bytes());
+        assert_eq!(scan_supply(&fat_value), Err(CborScanError::UnknownKey));
+
+        // `entries` twice: the first empty and harmless, the second the payload.
+        let mut repeated = vec![0xa4];
+        repeated.extend_from_slice(SUPPLY_TYPE_DISCRIMINATOR);
+        repeated.extend_from_slice(b"\x61v\x01");
+        repeated.extend_from_slice(b"\x67entries\x80");
+        repeated.extend_from_slice(b"\x67entries");
+        repeated.extend_from_slice(&array_header_claiming(10_000_000));
+        assert_eq!(scan_supply(&repeated), Err(CborScanError::DuplicateKey));
+
+        // A repeat of an ordinary key is refused on the same rule.
+        let mut repeated_scalar = vec![0xa4];
+        repeated_scalar.extend_from_slice(SUPPLY_TYPE_DISCRIMINATOR);
+        repeated_scalar.extend_from_slice(b"\x61v\x01");
+        repeated_scalar.extend_from_slice(b"\x61v\x01");
+        repeated_scalar.extend_from_slice(b"\x67entries\x80");
+        assert_eq!(
+            scan_supply(&repeated_scalar),
+            Err(CborScanError::DuplicateKey)
+        );
     }
 
     /// An indefinite-length `entries` array is refused, not followed. ciborium
-    /// never emits one (see `honest_supply_frames_scan_to_their_entry_count`),
+    /// never emits one (see `honest_supply_frames_scan_within_their_bounds`),
     /// so this can only be hand-rolled.
     #[test]
     fn scan_rejects_an_indefinite_length_entries_array() {
         let mut frame = supply_prefix();
         frame.push(0x9f); // array(*)
         frame.push(0xff); // break
-        assert_eq!(
-            supply_entry_count(&frame),
-            Err(CborScanError::IndefiniteLength)
-        );
+        assert_eq!(scan_supply(&frame), Err(CborScanError::IndefiniteLength));
     }
 
     /// Same rule at the top level: an indefinite-length map is refused before
@@ -743,10 +1296,7 @@ mod tests {
         let mut frame = vec![0xbf]; // map(*)
         frame.extend_from_slice(SUPPLY_TYPE_DISCRIMINATOR);
         frame.push(0xff);
-        assert_eq!(
-            supply_entry_count(&frame),
-            Err(CborScanError::IndefiniteLength)
-        );
+        assert_eq!(scan_supply(&frame), Err(CborScanError::IndefiniteLength));
     }
 
     /// A nesting bomb in a SKIPPED value dies on the depth bound, not on the
@@ -758,10 +1308,7 @@ mod tests {
         frame.extend_from_slice(b"\x61v");
         frame.extend(std::iter::repeat_n(0x81u8, 64));
         frame.push(0x00);
-        assert_eq!(
-            supply_entry_count(&frame),
-            Err(CborScanError::DepthExceeded)
-        );
+        assert_eq!(scan_supply(&frame), Err(CborScanError::DepthExceeded));
     }
 
     /// A WIDE skipped value dies on the visit budget: the scan cannot be made
@@ -777,7 +1324,7 @@ mod tests {
         frame.extend(std::iter::repeat_n(0x00u8, 1000));
         frame.extend_from_slice(b"\x67entries\x80");
         assert_eq!(
-            supply_entry_count(&frame),
+            scan_supply(&frame),
             Err(CborScanError::VisitBudgetExhausted)
         );
     }
@@ -789,7 +1336,7 @@ mod tests {
         let mut frame = vec![0xbb]; // map, 8-byte argument
         frame.extend_from_slice(&u64::MAX.to_be_bytes());
         assert_eq!(
-            supply_entry_count(&frame),
+            scan_supply(&frame),
             Err(CborScanError::TooManyMapKeys(u64::MAX))
         );
     }
@@ -797,57 +1344,53 @@ mod tests {
     /// Structural refusals, one per fail-closed rule.
     #[test]
     fn scan_rejects_malformed_frame_shapes() {
-        assert_eq!(supply_entry_count(&[]), Err(CborScanError::Truncated));
+        assert_eq!(scan_supply(&[]), Err(CborScanError::Truncated));
         // An array, not a map.
-        assert_eq!(supply_entry_count(&[0x80]), Err(CborScanError::NotAMap));
+        assert_eq!(scan_supply(&[0x80]), Err(CborScanError::NotAMap));
         // Reserved additional info (28).
         assert_eq!(
-            supply_entry_count(&[0xbc]),
+            scan_supply(&[0xbc]),
             Err(CborScanError::MalformedHeader(0xbc))
         );
         // Integer key instead of a text key.
         assert_eq!(
-            supply_entry_count(&[0xa1, 0x01, 0x01]),
+            scan_supply(&[0xa1, 0x01, 0x01]),
             Err(CborScanError::NonTextKey)
         );
         // A key claiming 65_535 bytes.
         assert_eq!(
-            supply_entry_count(&[0xa1, 0x79, 0xff, 0xff]),
+            scan_supply(&[0xa1, 0x79, 0xff, 0xff]),
             Err(CborScanError::KeyTooLong(65_535))
         );
         // `entries` present but not an array.
         let mut not_an_array = vec![0xa1];
         not_an_array.extend_from_slice(b"\x67entries\x01");
         assert_eq!(
-            supply_entry_count(&not_an_array),
+            scan_supply(&not_an_array),
             Err(CborScanError::EntriesNotAnArray)
         );
         // A well-formed map with no `entries` key at all.
         let mut no_entries = vec![0xa1];
         no_entries.extend_from_slice(SUPPLY_TYPE_DISCRIMINATOR);
-        assert_eq!(
-            supply_entry_count(&no_entries),
-            Err(CborScanError::MissingEntries)
-        );
+        assert_eq!(scan_supply(&no_entries), Err(CborScanError::MissingEntries));
         // The `entries` key is there but its value is cut off.
         let mut truncated = supply_prefix();
         truncated.push(0x9a);
-        assert_eq!(
-            supply_entry_count(&truncated),
-            Err(CborScanError::Truncated)
-        );
+        assert_eq!(scan_supply(&truncated), Err(CborScanError::Truncated));
     }
 
     /// Tags and empty containers are skipped correctly — a tagged value ahead of
     /// `entries` must not desynchronise the key loop.
     #[test]
     fn scan_skips_tagged_and_empty_values() {
-        // {"v": 0("x"), "e": [], "entries": [1 element]}
+        // {"v": 0("x"), "type": [], "entries": [1 element]} — the tag's value
+        // is an empty array rather than text, which the scan does not care
+        // about: only that skipping it leaves the cursor on the next key.
         let mut frame = vec![0xa3];
         frame.extend_from_slice(b"\x61v\xc0\x61x");
-        frame.extend_from_slice(b"\x61e\x80");
+        frame.extend_from_slice(b"\x64type\x80");
         frame.extend_from_slice(b"\x67entries\x81\x00");
-        assert_eq!(supply_entry_count(&frame), Ok(1));
+        assert_eq!(scan_supply(&frame), Ok(ScanOutcome::WithinBounds));
     }
 
     // ─── T43b: the general walk over every bounded array ─────────────────────
@@ -1066,19 +1609,16 @@ mod tests {
     }
 
     /// Absent keys are TOLERATED — the one semantic difference from
-    /// [`supply_entry_count`], which treats a missing `entries` as malformed.
+    /// [`scan_supply_frame`], which treats a missing `entries` as malformed.
     ///
     /// A non-`Supply` frame need carry no bounded array at all: that is what an
     /// `Announce` is. Structural hostility is still refused, so the tolerance is
     /// about which keys are present, not about how well-formed the frame is.
     #[test]
     fn scan_tolerates_frames_carrying_no_bounded_array() {
-        // An empty map: no `ids`, no error — where `supply_entry_count` refuses.
+        // An empty map: no `ids`, no error — where the `Supply` scan refuses.
         assert_eq!(scan(&[0xa0]), Ok(ScanOutcome::WithinBounds));
-        assert_eq!(
-            supply_entry_count(&[0xa0]),
-            Err(CborScanError::MissingEntries)
-        );
+        assert_eq!(scan_supply(&[0xa0]), Err(CborScanError::MissingEntries));
         // A map of unrecognised keys with leaf values.
         let mut announce_shaped = vec![0xa2];
         announce_shaped.extend_from_slice(b"\x64type\x68announce");

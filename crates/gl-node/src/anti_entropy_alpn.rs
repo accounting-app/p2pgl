@@ -26,7 +26,10 @@ use ledger::validate::ValidationError;
 use p2p::allowlist::PeerAllowlist;
 use p2p::gossip::make_supply_entry;
 use p2p::orphan_buffer::{OrphanBuffer, OrphanInsert};
-use p2p::protocol::{WireMessage, MAX_MESSAGE_SIZE, MAX_SUPPLY_ENTRIES};
+use p2p::protocol::{
+    is_content_id, WireMessage, CONTENT_ID_LEN, MAX_HAVE_HEADS, MAX_MESSAGE_SIZE,
+    MAX_SUPPLY_ENTRIES,
+};
 use p2p::union_merge::{validate_supply_entry, verify_author_allowlisted, verify_remote_signature};
 
 /// Cap on DISTINCT ids accumulated across one peer's paginated `HaveHeads`
@@ -39,6 +42,49 @@ use p2p::union_merge::{validate_supply_entry, verify_author_allowlisted, verify_
 /// Counted per distinct id since T41 — see [`read_have_heads_advert`] for why
 /// counting repeats instead made the cap answer the wrong question.
 const MAX_ACCUMULATED_HAVE_HEADS: usize = 1_048_576;
+
+/// Default cap on the PAGES one peer's advert may span (H-10, M-26).
+///
+/// Derived, not chosen. `paginate_have_heads` fills every page but the last, so
+/// advertising the `MAX_ACCUMULATED_HAVE_HEADS` ids the count cap already allows
+/// takes exactly `MAX_ACCUMULATED_HAVE_HEADS / MAX_HAVE_HEADS` pages. Doubling
+/// that is headroom for a sender that pages less tightly than ours does; ours
+/// never needs it, because it pages the longer list and lets the shorter run dry.
+///
+/// This is the bound T41 removed without meaning to. Counting DISTINCT ids made
+/// `MAX_ACCUMULATED_HAVE_HEADS` mean what its rustdoc says — but it was also the
+/// only thing that ended the `more: true` loop, and a page that repeats ids, or
+/// carries none at all, advances a distinct-id count by zero. Pages are the
+/// right quantity to count precisely because a peer cannot make one free: every
+/// page is a frame it had to send, whatever is in it.
+const MAX_ADVERT_PAGES: usize = 2 * MAX_ACCUMULATED_HAVE_HEADS.div_ceil(MAX_HAVE_HEADS);
+
+/// Default cap on the bytes of DISTINCT advertised id text one exchange retains
+/// (M-26).
+///
+/// `MAX_ACCUMULATED_HAVE_HEADS` bounds a COUNT, and until T49 nothing anywhere
+/// bounded an advertised id's LENGTH — so a million 255-byte ids put ~1.7 GB
+/// live behind that count, and pages of a single ~1 MiB "id" (comfortably under
+/// `NON_SUPPLY_FRAME_CAP`) cost ~2 MiB resident each while barely moving it. The
+/// anti-entropy loop runs one exchange per allowlisted peer, so whatever one
+/// peer can pin, N peers pin N times.
+///
+/// Sized off the form rule rather than guessed: [`check_advert_ids`] refuses
+/// anything but a 64-lowercase-hex content id, so `MAX_ACCUMULATED_HAVE_HEADS`
+/// ids is exactly 64 MiB of id text. Charged once per distinct id across BOTH
+/// lists, which makes it strictly tighter than the per-list count cap it backs
+/// up — deliberately, because heads are a subset of directive ids (L-21), so an
+/// honest advert is about one id per directive rather than two. A ledger at the
+/// file-size cap holds a few hundred thousand directives (each carries an
+/// author, a lamport and a 128-hex signature on disk), i.e. ~15 MiB of id text:
+/// several times inside this.
+///
+/// Stated in bytes rather than left implied by the form rule, because it is the
+/// bound that still holds if the form rule is ever relaxed — which Format v2
+/// (T45) may well do. Live cost is a small multiple of it: `absorb_page` keeps
+/// each id in both the accumulator and the dedup set, and `compute_want` clones
+/// again.
+const MAX_ADVERT_ID_BYTES: usize = MAX_ACCUMULATED_HAVE_HEADS * CONTENT_ID_LEN;
 
 /// Byte cap for any inbound frame that is not a `Supply` (M-16).
 ///
@@ -65,20 +111,89 @@ const CLOSE_DRAIN: Duration = Duration::from_secs(5);
 /// actually received, never `vec![0u8; len]` reserved up front.
 const READ_CHUNK: usize = 64 * 1024;
 
-/// Per-operation timeouts for ALPN anti-entropy sessions (M-06).
+/// The bounds ONE outbound anti-entropy session runs under (M-06, H-10, M-26,
+/// M-27, M-28).
 ///
-/// Without these a peer that accepts a connection and then never sends stalls
-/// the session — and, before the loop was made concurrent, all replication.
+/// Without the two original timeouts a peer that accepts a connection and then
+/// never sends stalls the session — and, before the loop was made concurrent,
+/// all replication (M-06). The four bounds T49 added answer the opposite shape:
+/// a peer that is never silent, and holds a session open frame by frame
+/// forever. `io` cannot see that peer at all, because every frame refreshes it.
 ///
-/// The defaults are deliberately generous: a full 16 MiB Supply frame transfers
-/// well within 30s on any real link, and a read timeout only fires when a peer
-/// genuinely stalls. These will get a config surface later (T38).
+/// The type name predates those four and is kept deliberately. Read it as "the
+/// settings one outbound session runs under", of which two happen to be
+/// timeouts; renaming would touch construction sites in `main.rs` and buy
+/// nothing this doc comment does not.
+///
+/// Defaults are deliberately generous — a full 16 MiB `Supply` frame transfers
+/// well within 30s on any real link, and every count below is an order of
+/// magnitude past what an honest peer at the ledger's own size limits needs.
+/// They are struct fields rather than constants for the reason T24/T26's limits
+/// are: tests drive them now, config drives them later (T38).
 #[derive(Clone, Copy, Debug)]
 pub struct AntiEntropyTimeouts {
     /// Cap on establishing a QUIC connection to a peer.
     pub connect: Duration,
     /// Cap on a single frame read or write.
     pub io: Duration,
+    /// Cap on opening one bi-stream on an ALREADY-established connection (M-27).
+    ///
+    /// Its own knob rather than a reuse of `connect` or `io`, because it bounds
+    /// a third resource: QUIC bidirectional-stream credit, which the REMOTE
+    /// grants. `open_bi` pends on `stream_budget_available[Bi]` (verified in
+    /// vendored `noq-1.1.0/src/connection.rs:1007-1046`), so a peer advertising
+    /// `initial_max_streams_bidi = 0` — the default is 100 — and then holding
+    /// the connection open with keep-alives parks the caller forever, with no
+    /// dial and no frame in flight for either of the other two to bound.
+    pub open_stream: Duration,
+    /// Cap on ONE whole exchange, start to finish (H-10, M-28).
+    ///
+    /// The bound `io` is not. `io` is per-frame and every frame refreshes it, so
+    /// any peer willing to keep answering — even with ~40 bytes of empty
+    /// `HaveHeads` page — holds a session indefinitely without ever once
+    /// "stalling".
+    ///
+    /// Enforced as a DEADLINE that the session's own reads and writes are
+    /// clamped against, never as a `timeout()` wrapped around the exchange
+    /// future. That distinction is load-bearing: `apply_supply_entries` commits
+    /// through `ledger_commit::commit_pending`, and dropping that future
+    /// mid-commit is exactly H-11's wedge — the `spawn_blocking` write still
+    /// lands while the bookkeeping that clears `commit_in_flight` never runs. A
+    /// deadline checked at I/O boundaries can only end a session BETWEEN frames,
+    /// where there is nothing half-done to leave behind.
+    ///
+    /// T50 closed H-11, so that constraint no longer binds: the commit owns the
+    /// write permit and detaches rather than cancels, and the in-flight flag is
+    /// released by a `Drop` guard, so dropping an exchange future mid-commit
+    /// leaves nothing half-done either. The deadline is kept in this shape
+    /// anyway — it is strictly the gentler of the two, it ends a session at a
+    /// point where the peer's next frame is the only thing lost, and a
+    /// `timeout()` would now be a tightening rather than a fix. T49's residual
+    /// 3 is what to reopen if that tightening is ever wanted.
+    ///
+    /// Five minutes is far past any honest exchange (a catch-up of the whole
+    /// file-size cap is tens of seconds of transfer), and cutting one short
+    /// costs nothing anyway: anti-entropy is idempotent and incremental, so the
+    /// next tick resumes where this one stopped.
+    pub session: Duration,
+    /// Pages one peer's `HaveHeads` advert may span — see [`MAX_ADVERT_PAGES`].
+    pub max_advert_pages: usize,
+    /// Distinct advertised id bytes one exchange may retain — see
+    /// [`MAX_ADVERT_ID_BYTES`].
+    pub max_advert_id_bytes: usize,
+    /// Frames one outbound session may read or write (M-28).
+    ///
+    /// The client-side mirror of the server's `max_requests_per_connection`,
+    /// taken from it below so the two cannot drift, and a backstop rather than a
+    /// tight limit for the same reason T24 gives. The client had NO such bound,
+    /// which is what let a peer advertising a million ids drive 4,096 `Want`
+    /// chunks of up to 256 rounds each — every round comfortably inside its
+    /// per-frame timeout, the whole thing days long, and (before the drain fix)
+    /// holding every other peer's replication hostage while it ran.
+    ///
+    /// An honest full catch-up at the accumulation cap spends ~8,700 frames: 256
+    /// advert pages each way, then one `Want` and one `Supply` per 256-id chunk.
+    pub max_session_frames: usize,
 }
 
 impl Default for AntiEntropyTimeouts {
@@ -86,7 +201,70 @@ impl Default for AntiEntropyTimeouts {
         Self {
             connect: Duration::from_secs(10),
             io: Duration::from_secs(30),
+            open_stream: Duration::from_secs(10),
+            session: Duration::from_secs(300),
+            max_advert_pages: MAX_ADVERT_PAGES,
+            max_advert_id_bytes: MAX_ADVERT_ID_BYTES,
+            // Read off the server-side limit rather than restated, so "mirrors
+            // the server's budget" stays true by construction (M-28).
+            max_session_frames: AntiEntropyLimits::default().max_requests_per_connection,
         }
+    }
+}
+
+/// What one outbound exchange has left to spend (H-10, M-28).
+///
+/// Built once per session and threaded through every frame it reads or writes,
+/// so the session's total time and total frames are bounded even though no
+/// single frame ever exceeds its own limit. [`Self::charge_frame`] is the only
+/// way to obtain a timeout on this path, which is what makes the accounting
+/// unskippable: a new read or write that forgets to charge does not compile.
+///
+/// Deliberately NOT a `tokio::time::timeout` around the whole exchange — see
+/// [`AntiEntropyTimeouts::session`] for why cancelling this future mid-commit is
+/// the wrong shape (H-11).
+struct SessionBudget {
+    /// When this session must be over, whatever it is in the middle of.
+    deadline: tokio::time::Instant,
+    /// Frames left to read or write (M-28).
+    frames_left: usize,
+    /// Per-frame cap; every timeout handed out is `min(io, time left)`.
+    io: Duration,
+    /// Advert page cap, carried so the advert reader needs one argument (M-26).
+    max_advert_pages: usize,
+    /// Advert id-byte cap, likewise (M-26).
+    max_advert_id_bytes: usize,
+}
+
+impl SessionBudget {
+    fn new(timeouts: &AntiEntropyTimeouts) -> Self {
+        Self {
+            deadline: tokio::time::Instant::now() + timeouts.session,
+            frames_left: timeouts.max_session_frames,
+            io: timeouts.io,
+            max_advert_pages: timeouts.max_advert_pages,
+            max_advert_id_bytes: timeouts.max_advert_id_bytes,
+        }
+    }
+
+    /// Charge one frame and return the timeout it is allowed to run under.
+    ///
+    /// `min(io, time left)`, never a bare `io`: a frame started a millisecond
+    /// before the deadline must not receive a fresh thirty seconds, which is
+    /// precisely the shape H-10 exploited — every frame refreshing the only
+    /// bound there was.
+    fn charge_frame(&mut self) -> Result<Duration, String> {
+        let remaining = self
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("anti-entropy session deadline reached".to_owned());
+        }
+        if self.frames_left == 0 {
+            return Err("anti-entropy session frame budget exhausted".to_owned());
+        }
+        self.frames_left -= 1;
+        Ok(self.io.min(remaining))
     }
 }
 
@@ -419,7 +597,8 @@ async fn open_peer_session(
             Reuse::IfLive,
         )
         .await?;
-    let open_error = match acquired.connection.open_bi().await {
+    let open_error = match open_bi_bounded(&acquired.connection, handler.timeouts.open_stream).await
+    {
         Ok((send, recv)) => {
             return Ok(PeerSession {
                 connection: acquired.connection,
@@ -430,7 +609,7 @@ async fn open_peer_session(
         Err(error) => error,
     };
     if !acquired.reused {
-        return Err(SessionOpenError::OpenStream(open_error.to_string()));
+        return Err(SessionOpenError::OpenStream(open_error));
     }
     handler.connections.invalidate(peer, &acquired.connection);
     debug!(
@@ -448,7 +627,7 @@ async fn open_peer_session(
             Reuse::Never,
         )
         .await?;
-    match fresh.connection.open_bi().await {
+    match open_bi_bounded(&fresh.connection, handler.timeouts.open_stream).await {
         Ok((send, recv)) => Ok(PeerSession {
             connection: fresh.connection,
             send,
@@ -456,7 +635,38 @@ async fn open_peer_session(
         }),
         Err(error) => {
             handler.connections.invalidate(peer, &fresh.connection);
-            Err(SessionOpenError::OpenStream(error.to_string()))
+            Err(SessionOpenError::OpenStream(error))
+        }
+    }
+}
+
+/// Open one bi-stream, bounded by `open_stream` (M-27).
+///
+/// Both call sites above were bare `open_bi().await`. `open_bi` pends on the
+/// REMOTE's bidirectional-stream credit — verified in vendored
+/// `noq-1.1.0/src/connection.rs:1007-1046`, where `poll_open` waits on
+/// `stream_budget_available[Bi]` — so a peer advertising
+/// `initial_max_streams_bidi = 0` and then keeping the connection alive parks
+/// the caller forever, with no dial in progress for `connect` to bound and no
+/// frame in flight for `io` to bound. On the exchange path that was a second
+/// route into H-10's wedge; on the gossip catch-up path the parked task never
+/// reached its `drop(guard)`, leaking a `FetchCoordinator` permit and in-flight
+/// entry permanently — sixteen such peers end announce-driven catch-up.
+///
+/// A timeout here is reported like any other open failure, which means a POOLED
+/// connection that hits it is invalidated and re-dialled once (the caller's
+/// existing rule). That is the right reading: a live connection whose peer will
+/// not grant a stream is indistinguishable from a stale one, and a fresh
+/// connection that does the same thing fails outright rather than retrying.
+async fn open_bi_bounded(
+    connection: &Connection,
+    open_stream: Duration,
+) -> Result<(SendStream, RecvStream), String> {
+    match tokio::time::timeout(open_stream, connection.open_bi()).await {
+        Ok(Ok(streams)) => Ok(streams),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_elapsed) => {
+            Err("anti-entropy open_bi timed out: peer granted no stream credit".to_owned())
         }
     }
 }
@@ -473,6 +683,10 @@ pub async fn fetch_want(
     if ids.is_empty() || !handler.allowlist.admits(peer) {
         return;
     }
+    // H-10/M-28: the session's clock and frame budget start HERE, before the
+    // dial, so establishing the connection is spent out of the exchange's own
+    // time rather than being free.
+    let mut budget = SessionBudget::new(&handler.timeouts);
     let session = match open_peer_session(endpoint, handler, peer_addr).await {
         Ok(session) => session,
         Err(SessionOpenError::Dial(error)) => {
@@ -493,7 +707,9 @@ pub async fn fetch_want(
         mut send,
         mut recv,
     } = session;
-    if let Err(error) = run_want_session(&mut send, &mut recv, ids, handler, peer).await {
+    if let Err(error) =
+        run_want_session(&mut send, &mut recv, ids, handler, peer, &mut budget).await
+    {
         // The connection may be the reason this failed; either way the next
         // operation must not inherit it (T42). This drops only the cache's
         // handle — a concurrent operation on the same connection keeps running.
@@ -513,6 +729,8 @@ pub async fn exchange_with_peer(
     if !handler.allowlist.admits(peer) {
         return;
     }
+    // H-10/M-28: see `fetch_want` — the budget covers the dial too.
+    let mut budget = SessionBudget::new(&handler.timeouts);
     let session = match open_peer_session(endpoint, handler, peer_addr).await {
         Ok(session) => session,
         Err(SessionOpenError::Dial(error)) => {
@@ -533,7 +751,7 @@ pub async fn exchange_with_peer(
         mut send,
         mut recv,
     } = session;
-    if let Err(error) = run_head_exchange(&mut send, &mut recv, handler, peer).await {
+    if let Err(error) = run_head_exchange(&mut send, &mut recv, handler, peer, &mut budget).await {
         handler.connections.invalidate(peer, &connection);
         warn!(peer = %peer, %error, "anti-entropy head exchange failed");
     }
@@ -545,9 +763,10 @@ async fn run_want_session(
     ids: Vec<String>,
     handler: &AntiEntropyHandler,
     remote: EndpointId,
+    budget: &mut SessionBudget,
 ) -> Result<(), String> {
     for chunk in ids.chunks(MAX_SUPPLY_ENTRIES) {
-        fetch_want_chunk(send, recv, chunk, handler, remote).await?;
+        fetch_want_chunk(send, recv, chunk, handler, remote, budget).await?;
     }
     // Finishing our half is what tells the server this operation is over, so it
     // can move on to the next stream on this connection (T42) instead of
@@ -561,12 +780,13 @@ async fn run_head_exchange(
     recv: &mut RecvStream,
     handler: &AntiEntropyHandler,
     remote: EndpointId,
+    budget: &mut SessionBudget,
 ) -> Result<(), String> {
     for page in local_have_heads_pages(&handler.ledger).await {
-        write_message(send, &page, handler.timeouts.io).await?;
+        let io = budget.charge_frame()?;
+        write_message(send, &page, io).await?;
     }
-    let (head_txids, directive_ids) =
-        read_have_heads_advert(recv, remote, handler.timeouts.io).await?;
+    let (head_txids, directive_ids) = read_have_heads_advert(recv, remote, budget).await?;
     let want = {
         let svc = handler.ledger.read().await;
         p2p::anti_entropy::compute_want(
@@ -577,7 +797,7 @@ async fn run_head_exchange(
         )
     };
     for chunk in want.chunks(MAX_SUPPLY_ENTRIES) {
-        fetch_want_chunk(send, recv, chunk, handler, remote).await?;
+        fetch_want_chunk(send, recv, chunk, handler, remote, budget).await?;
     }
     // See `run_want_session`: the FIN is what releases the server's stream.
     let _ = send.finish();
@@ -589,11 +809,46 @@ async fn run_head_exchange(
 /// Order-preserving (first occurrence wins) so the accumulated advert is still
 /// in the order the peer sent it, matching the dedup `compute_supply`'s
 /// `compute_want` does downstream (L-21).
-fn absorb_page(into: &mut Vec<String>, seen: &mut HashSet<String>, page: Vec<String>) {
+///
+/// Returns the bytes of id text this page ADDED, which is what
+/// [`read_have_heads_advert`] charges against `max_advert_id_bytes` (M-26). A
+/// repeat costs nothing because it retains nothing — the same reasoning that
+/// makes the distinct-id cap correct, applied to bytes.
+fn absorb_page(into: &mut Vec<String>, seen: &mut HashSet<String>, page: Vec<String>) -> usize {
+    let mut retained = 0usize;
     for id in page {
         if seen.insert(id.clone()) {
+            retained = retained.saturating_add(id.len());
             into.push(id);
         }
+    }
+    retained
+}
+
+/// Refuse an advert page carrying anything that is not a content id (M-26, L-53).
+///
+/// Every id a peer can legitimately advertise is a SHA-256 content id:
+/// `ledger::hash::compute_content_id` returns 64 lowercase hex characters, and
+/// nothing else ever reaches `head_txids()` or `all_directive_ids()`. So this is
+/// the rule `openledger-parents` has had since L-29, applied to the other place
+/// a peer hands us ids — and it is also what turns `max_advert_id_bytes` from a
+/// guess into arithmetic.
+///
+/// Refuses the whole advert rather than filtering the offending ids. A peer that
+/// advertises a non-id is not a peer with one bad row, and filtering would leave
+/// the exchange looking successful while the two nodes silently disagree about
+/// what was offered. An honest peer cannot produce one.
+///
+/// The offending id is NOT logged — only its length. It is attacker-chosen and
+/// may be most of a megabyte; the same reasoning as `protocol`'s decode-error
+/// elision.
+fn check_advert_ids(remote: EndpointId, ids: &[String]) -> Result<(), String> {
+    match ids.iter().find(|id| !is_content_id(id)) {
+        Some(malformed) => Err(format!(
+            "peer {remote} advertised a malformed id: {} bytes (expected {CONTENT_ID_LEN} lowercase hex)",
+            malformed.len()
+        )),
+        None => Ok(()),
     }
 }
 
@@ -612,16 +867,35 @@ fn absorb_page(into: &mut Vec<String>, seen: &mut HashSet<String>, page: Vec<Str
 /// accumulation makes the cap mean what its rustdoc says, and `compute_want`
 /// downstream is unaffected — it deduped already (L-21), which is why this was
 /// harmless rather than a live bug.
+///
+/// H-10: it was not harmless. That fix also removed the loop's ONLY bound. The
+/// exits were `more == false`, a read error, and the distinct-id cap — and a
+/// peer replying `HaveHeads { head_txids: [], directive_ids: [], more: true }`
+/// (about forty CBOR bytes, decoding cleanly because both fields are
+/// `#[serde(default)]`) grows neither accumulator, so the cap never fires.
+/// Infinite loop, for ~40 bytes, repeatable forever. `io` did not rescue it:
+/// it is per-frame, and every frame refreshed it. And the blast radius was the
+/// whole subsystem, not one peer — `run_head_exchange` never returned, so the
+/// tick's `JoinSet` drain never returned, so no further tick ever ran.
+///
+/// The loop now carries four bounds, three of which a repeated page cannot
+/// dodge because none of them is a function of the ids it carries: the session
+/// deadline and frame budget ([`SessionBudget`]) and `max_advert_pages`. The
+/// fourth, `max_advert_id_bytes`, together with the 64-hex form check, bounds
+/// what the ids themselves can cost (M-26, L-53).
 async fn read_have_heads_advert(
     recv: &mut RecvStream,
     remote: EndpointId,
-    io_timeout: Duration,
+    budget: &mut SessionBudget,
 ) -> Result<(Vec<String>, Vec<String>), String> {
     let mut head_txids: Vec<String> = Vec::new();
     let mut directive_ids: Vec<String> = Vec::new();
     let mut seen_heads: HashSet<String> = HashSet::new();
     let mut seen_directives: HashSet<String> = HashSet::new();
+    let mut pages: usize = 0;
+    let mut retained_bytes: usize = 0;
     loop {
+        let io_timeout = budget.charge_frame()?;
         let WireMessage::HaveHeads {
             head_txids: page_heads,
             directive_ids: page_directives,
@@ -633,8 +907,31 @@ async fn read_have_heads_advert(
         else {
             return Err("expected HaveHeads from peer".to_owned());
         };
-        absorb_page(&mut head_txids, &mut seen_heads, page_heads);
-        absorb_page(&mut directive_ids, &mut seen_directives, page_directives);
+        // H-10: charged BEFORE anything looks at the page's contents, so an
+        // empty page costs exactly as much as a full one. This is the bound
+        // that a peer sending nothing cannot avoid paying.
+        pages += 1;
+        if pages > budget.max_advert_pages {
+            return Err(format!(
+                "peer {remote} sent more than {} HaveHeads pages in one advert",
+                budget.max_advert_pages
+            ));
+        }
+        check_advert_ids(remote, &page_heads)?;
+        check_advert_ids(remote, &page_directives)?;
+        retained_bytes = retained_bytes
+            .saturating_add(absorb_page(&mut head_txids, &mut seen_heads, page_heads))
+            .saturating_add(absorb_page(
+                &mut directive_ids,
+                &mut seen_directives,
+                page_directives,
+            ));
+        if retained_bytes > budget.max_advert_id_bytes {
+            return Err(format!(
+                "peer {remote} advertised more than {} bytes of distinct ids",
+                budget.max_advert_id_bytes
+            ));
+        }
         if head_txids.len() > MAX_ACCUMULATED_HAVE_HEADS
             || directive_ids.len() > MAX_ACCUMULATED_HAVE_HEADS
         {
@@ -661,16 +958,18 @@ async fn fetch_want_chunk(
     chunk: &[String],
     handler: &AntiEntropyHandler,
     remote: EndpointId,
+    budget: &mut SessionBudget,
 ) -> Result<(), String> {
     let mut remaining: Vec<String> = chunk.to_vec();
     while !remaining.is_empty() {
-        write_message(
-            send,
-            &WireMessage::want(remaining.clone()),
-            handler.timeouts.io,
-        )
-        .await?;
-        let entries = match read_message(recv, handler.timeouts.io)
+        // M-28: the round loop below makes progress by construction, but only
+        // one id per round in the worst case — 256 rounds per chunk, 4,096
+        // chunks for an advert at the accumulation cap. Charging every frame
+        // puts the whole of that under one budget and one deadline.
+        let io_timeout = budget.charge_frame()?;
+        write_message(send, &WireMessage::want(remaining.clone()), io_timeout).await?;
+        let io_timeout = budget.charge_frame()?;
+        let entries = match read_message(recv, io_timeout)
             .await
             .map_err(|error| error.to_string())?
         {
@@ -930,7 +1229,12 @@ async fn apply_supply_entries(
             let prepared = crate::ledger_commit::prepare_or_recover(&mut svc, false);
             drop(svc);
             let commit = match prepared {
-                Ok(pending) => crate::ledger_commit::commit_pending(&handler.ledger, pending).await,
+                // H-11: the permit is handed to the commit, so a dropped
+                // exchange future cannot release the single-writer slot while
+                // the batch is still being written.
+                Ok(pending) => {
+                    crate::ledger_commit::commit_pending(&handler.ledger, pending, permit).await
+                }
                 Err(error) => Err(error),
             };
             if let Err(error) = commit {
@@ -944,7 +1248,6 @@ async fn apply_supply_entries(
         } else {
             drop(svc);
         }
-        drop(permit);
     }
 
     debug!(
@@ -1832,6 +2135,7 @@ pub(crate) mod tests {
         AntiEntropyTimeouts {
             connect: Duration::from_millis(500),
             io: Duration::from_millis(500),
+            ..AntiEntropyTimeouts::default()
         }
     }
 
@@ -2346,13 +2650,17 @@ pub(crate) mod tests {
         let mut seen: HashSet<String> = HashSet::new();
 
         // A peer replaying one page 10,000 times advertises ONE id, not 10,000.
+        // T49: and retains bytes only the FIRST time, which is what makes
+        // `max_advert_id_bytes` a bound on live memory rather than on traffic.
+        let mut retained = 0usize;
         for _ in 0..10_000 {
-            absorb_page(
+            retained += absorb_page(
                 &mut accumulated,
                 &mut seen,
                 vec!["aa".to_owned(), "bb".to_owned()],
             );
         }
+        assert_eq!(retained, 4, "9,999 replays of the same page retain nothing");
         assert_eq!(
             accumulated,
             vec!["aa".to_owned(), "bb".to_owned()],
@@ -2361,10 +2669,14 @@ pub(crate) mod tests {
 
         // New ids append after the ones already seen; repeats among them are
         // dropped wherever they appear.
-        absorb_page(
-            &mut accumulated,
-            &mut seen,
-            vec!["cc".to_owned(), "aa".to_owned(), "dd".to_owned()],
+        assert_eq!(
+            absorb_page(
+                &mut accumulated,
+                &mut seen,
+                vec!["cc".to_owned(), "aa".to_owned(), "dd".to_owned()],
+            ),
+            4,
+            "only the two NEW ids are charged"
         );
         assert_eq!(
             accumulated,
@@ -2378,12 +2690,466 @@ pub(crate) mod tests {
         );
 
         // Duplicates within a single page are deduped too.
-        absorb_page(
-            &mut accumulated,
-            &mut seen,
-            vec!["ee".to_owned(), "ee".to_owned(), "ee".to_owned()],
+        assert_eq!(
+            absorb_page(
+                &mut accumulated,
+                &mut seen,
+                vec!["ee".to_owned(), "ee".to_owned(), "ee".to_owned()],
+            ),
+            2,
+            "a page that repeats one id is charged for it once"
         );
         assert_eq!(accumulated.len(), 5);
+    }
+
+    // ─── T49: session bounds (H-10, M-26, M-27, M-28) ──────────────────────
+
+    /// An ALPN server that answers every session with `HaveHeads { [], [],
+    /// more: true }` forever — the ~40-byte frame at the centre of H-10.
+    ///
+    /// Both list fields are `#[serde(default)]`, so the frame decodes cleanly
+    /// while advertising nothing; `absorb_page` dedups it to nothing, so the
+    /// distinct-id cap never advances. Pre-T49 this was an infinite loop inside
+    /// `read_have_heads_advert` for as long as the peer kept answering.
+    ///
+    /// Paced at one page per millisecond so a test that (correctly) bounds the
+    /// flood by TIME does not have to read millions of frames to get there. The
+    /// pacing is generosity toward the attacker's CPU, not a bound: nothing in
+    /// the client depends on it.
+    #[derive(Debug, Clone)]
+    pub(crate) struct EmptyPageFloodHandler;
+
+    impl ProtocolHandler for EmptyPageFloodHandler {
+        async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+            let Ok((mut send, _recv)) = connection.accept_bi().await else {
+                return Ok(());
+            };
+            let page = WireMessage::have_heads_page(Vec::new(), Vec::new(), true);
+            loop {
+                if write_message(&mut send, &page, Duration::from_secs(5))
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    }
+
+    /// An ALPN server whose advert carries ids that are not content ids (M-26),
+    /// counting the `Want`s the client sends afterwards.
+    ///
+    /// 2,048 ids of 255 bytes: ~528 KiB, comfortably inside
+    /// `NON_SUPPLY_FRAME_CAP`, so the M-16 frame gate passes it and the form
+    /// rule is the only thing that can refuse it. A client that ACCEPTS the
+    /// advert immediately asks for all 2,048 — which is the observable
+    /// difference the assertion reads.
+    #[derive(Debug, Clone)]
+    struct BloatedAdvertHandler {
+        wants_seen: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ProtocolHandler for BloatedAdvertHandler {
+        async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+            let Ok((mut send, mut recv)) = connection.accept_bi().await else {
+                return Ok(());
+            };
+            let ids: Vec<String> = (0..2_048).map(|index| format!("{index:0255x}")).collect();
+            let page = WireMessage::have_heads_page(ids, Vec::new(), false);
+            if write_message(&mut send, &page, Duration::from_secs(5))
+                .await
+                .is_err()
+            {
+                return Ok(());
+            }
+            // The client's own advert arrives first; anything AFTER it that is a
+            // `Want` means the client acted on the 255-byte ids.
+            while let Ok(message) = read_message(&mut recv, Duration::from_secs(2)).await {
+                if matches!(message, WireMessage::Want { .. }) {
+                    self.wants_seen
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// The advert form rule is the parents rule (L-29), applied to adverts.
+    ///
+    /// Pure; the shapes are the ones M-26 and L-53 name.
+    #[test]
+    fn advert_ids_must_be_content_ids() {
+        // `check_advert_ids` only needs an id to name in the message; no
+        // endpoint is bound, so this stays a pure test.
+        let remote = iroh::SecretKey::generate().public();
+
+        let good: Vec<String> = (0..4).map(|index| format!("{index:064x}")).collect();
+        assert!(check_advert_ids(remote, &good).is_ok());
+        assert!(check_advert_ids(remote, &[]).is_ok());
+
+        // The M-26 shapes: 255-byte ids, and a ~1 MiB single "id".
+        for bad in [
+            "0".repeat(255),
+            "a".repeat(1024 * 1024),
+            String::new(),
+            "0".repeat(63),
+            "0".repeat(65),
+            // Uppercase resolves to nothing and must be refused, for L-29's reason.
+            format!("{:063x}A", 0),
+            // Non-hex, and a multi-byte character that would make a `chars()`
+            // length test and a `len()` byte test disagree.
+            format!("{:063x}z", 0),
+            format!("{:062x}é", 0),
+        ] {
+            let error = check_advert_ids(remote, std::slice::from_ref(&bad))
+                .expect_err("a non-content-id must be refused");
+            assert!(
+                error.contains(&bad.len().to_string()),
+                "the refusal must name the id's LENGTH: {error}"
+            );
+            assert!(
+                !error.contains(&bad) || bad.is_empty(),
+                "the refusal must not echo the attacker's id back into a log"
+            );
+        }
+
+        // One bad id anywhere poisons the page — it is not filtered out.
+        let mut mixed = good.clone();
+        mixed.push("0".repeat(255));
+        assert!(check_advert_ids(remote, &mixed).is_err());
+    }
+
+    /// H-10 / M-26: an empty-page flood must abort the exchange rather than
+    /// loop, and it must do so on TIME even with every count bound disabled.
+    ///
+    /// `max_advert_pages` and `max_session_frames` are set to `usize::MAX` on
+    /// purpose: this test is about the session DEADLINE, which is the bound that
+    /// holds no matter what shape a peer's frames take. The page cap gets its
+    /// own test below.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn empty_page_flood_is_ended_by_the_session_deadline() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_client = bind_direct_endpoint().await;
+        let endpoint_flood = bind_direct_endpoint().await;
+        let id_client = endpoint_client.id();
+        let id_flood = endpoint_flood.id();
+
+        let router_flood = Router::builder(endpoint_flood.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, EmptyPageFloodHandler)
+            .spawn();
+
+        let allow_client = PeerAllowlist::parse(&[id_flood.to_string()]).expect("allowlist client");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ledger_client: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("client.bean"), id_client.to_string())
+                .expect("boot client ledger"),
+        ));
+        let handler_client = make_handler_with_timeouts(
+            ledger_client,
+            allow_client,
+            AntiEntropyTimeouts {
+                connect: Duration::from_secs(5),
+                io: Duration::from_secs(5),
+                session: Duration::from_secs(2),
+                // Every COUNT bound off, so only the clock can end this.
+                max_advert_pages: usize::MAX,
+                max_session_frames: usize::MAX,
+                ..AntiEntropyTimeouts::default()
+            },
+        );
+
+        wait_until_dialable(&endpoint_client).await;
+        wait_until_dialable(&endpoint_flood).await;
+        let addr_flood = endpoint_flood.addr();
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            exchange_with_peer(&endpoint_client, addr_flood, &handler_client),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let _ = router_flood.shutdown().await;
+
+        assert!(
+            outcome.is_ok(),
+            "H-10: exchange_with_peer never returned against a peer replying \
+             `more: true` with empty pages"
+        );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "H-10: the exchange should end at its ~2s session deadline, took {elapsed:?}"
+        );
+    }
+
+    /// M-26: the page counter ends the same flood long before the deadline.
+    ///
+    /// The deadline is set to a minute here, so a return in seconds can only
+    /// come from `max_advert_pages`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn empty_page_flood_is_ended_by_the_page_cap() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_client = bind_direct_endpoint().await;
+        let endpoint_flood = bind_direct_endpoint().await;
+        let id_client = endpoint_client.id();
+        let id_flood = endpoint_flood.id();
+
+        let router_flood = Router::builder(endpoint_flood.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, EmptyPageFloodHandler)
+            .spawn();
+
+        let allow_client = PeerAllowlist::parse(&[id_flood.to_string()]).expect("allowlist client");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ledger_client: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("client.bean"), id_client.to_string())
+                .expect("boot client ledger"),
+        ));
+        let handler_client = make_handler_with_timeouts(
+            ledger_client,
+            allow_client,
+            AntiEntropyTimeouts {
+                connect: Duration::from_secs(5),
+                io: Duration::from_secs(5),
+                session: Duration::from_secs(60),
+                max_advert_pages: 8,
+                ..AntiEntropyTimeouts::default()
+            },
+        );
+
+        wait_until_dialable(&endpoint_client).await;
+        wait_until_dialable(&endpoint_flood).await;
+        let addr_flood = endpoint_flood.addr();
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            exchange_with_peer(&endpoint_client, addr_flood, &handler_client),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let _ = router_flood.shutdown().await;
+
+        assert!(outcome.is_ok(), "M-26: the page cap never fired");
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "M-26: eight pages must end the advert well inside the 60s session \
+             deadline, took {elapsed:?}"
+        );
+    }
+
+    /// M-26: an advert of 255-byte ids is refused, and — the consequence that
+    /// matters — the client never acts on those ids.
+    ///
+    /// Rejection rather than resident bytes, because rejection is the stronger
+    /// statement: nothing is retained *and* nothing is requested. A client that
+    /// accepted the advert would immediately `Want` all 2,048 of them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn oversized_advert_ids_are_refused_and_never_wanted() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_client = bind_direct_endpoint().await;
+        let endpoint_liar = bind_direct_endpoint().await;
+        let id_client = endpoint_client.id();
+        let id_liar = endpoint_liar.id();
+
+        let wants_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let router_liar = Router::builder(endpoint_liar.clone())
+            .accept(
+                p2p::protocol::ANTI_ENTROPY_ALPN,
+                BloatedAdvertHandler {
+                    wants_seen: wants_seen.clone(),
+                },
+            )
+            .spawn();
+
+        let allow_client = PeerAllowlist::parse(&[id_liar.to_string()]).expect("allowlist client");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ledger_client: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("client.bean"), id_client.to_string())
+                .expect("boot client ledger"),
+        ));
+        let handler_client =
+            make_handler_with_timeouts(ledger_client.clone(), allow_client, short_timeouts());
+
+        wait_until_dialable(&endpoint_client).await;
+        wait_until_dialable(&endpoint_liar).await;
+        let addr_liar = endpoint_liar.addr();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            exchange_with_peer(&endpoint_client, addr_liar, &handler_client),
+        )
+        .await;
+
+        // Give the liar's read loop a moment to observe anything the client
+        // sent before its stream was torn down.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let wants = wants_seen.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = router_liar.shutdown().await;
+
+        assert!(outcome.is_ok(), "the exchange must return, not hang");
+        assert_eq!(
+            wants, 0,
+            "M-26: the client acted on an advert of 255-byte ids ({wants} Wants)"
+        );
+        assert_eq!(
+            ledger_client.read().await.directive_count(),
+            0,
+            "nothing may be merged from a refused advert"
+        );
+    }
+
+    /// M-26: the BYTE budget is a live bound, not a restatement of the form rule.
+    ///
+    /// A/B against the same source: a client whose id-byte budget is four ids
+    /// wide refuses a twenty-directive advert and pulls nothing; the same sink,
+    /// with the default budget, converges. Without the A half, a byte budget
+    /// sized off `CONTENT_ID_LEN` would be untestable and could silently become
+    /// unreachable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn advert_byte_budget_refuses_before_the_count_cap_would() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_source = bind_direct_endpoint().await;
+        let endpoint_sink = bind_direct_endpoint().await;
+        let id_source = endpoint_source.id();
+        let id_sink = endpoint_sink.id();
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let source_path = temp_dir.path().join("source.bean");
+        write_open_directive_ledger(&source_path, 20, &id_source.to_string());
+        let ledger_source: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(source_path, id_source.to_string()).expect("boot source ledger"),
+        ));
+        let source_count = ledger_source.read().await.directive_count();
+        assert_eq!(source_count, 20);
+
+        let allow_source = PeerAllowlist::parse(&[id_sink.to_string()]).expect("allowlist source");
+        let router_source = Router::builder(endpoint_source.clone())
+            .accept(
+                p2p::protocol::ANTI_ENTROPY_ALPN,
+                make_handler(ledger_source, allow_source),
+            )
+            .spawn();
+
+        let allow_sink = PeerAllowlist::parse(&[id_source.to_string()]).expect("allowlist sink");
+        let ledger_sink: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("sink.bean"), id_sink.to_string())
+                .expect("boot sink ledger"),
+        ));
+
+        wait_until_dialable(&endpoint_source).await;
+        wait_until_dialable(&endpoint_sink).await;
+        let addr_source = endpoint_source.addr();
+
+        // A: four ids' worth of budget against a twenty-id advert.
+        let starved = make_handler_with_timeouts(
+            ledger_sink.clone(),
+            allow_sink.clone(),
+            AntiEntropyTimeouts {
+                max_advert_id_bytes: 4 * CONTENT_ID_LEN,
+                ..short_timeouts()
+            },
+        );
+        exchange_with_peer(&endpoint_sink, addr_source.clone(), &starved).await;
+        assert_eq!(
+            ledger_sink.read().await.directive_count(),
+            0,
+            "M-26: the advert exceeded the id-byte budget and must have been refused"
+        );
+
+        // B: the same sink, the same source, the default budget — it converges,
+        // so A's zero is the budget's doing and not a broken fixture.
+        let healthy = make_handler_with_timeouts(ledger_sink.clone(), allow_sink, short_timeouts());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            exchange_with_peer(&endpoint_sink, addr_source.clone(), &healthy).await;
+            if ledger_sink.read().await.directive_count() == source_count {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "control arm never converged: the fixture, not the budget, is broken"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let _ = router_source.shutdown().await;
+    }
+
+    /// M-27: a peer that grants NO bidirectional-stream credit must not park the
+    /// caller in `open_bi`.
+    ///
+    /// The server's transport config sets `max_concurrent_bidi_streams` to 0
+    /// (the default is 100) while iroh's own keep-alive holds the connection
+    /// open, so the client's `open_bi` pends on `stream_budget_available[Bi]`
+    /// with nothing else in flight: no dial for `connect` to bound, no frame for
+    /// `io` to bound. The assertion is simply that the call RETURNS.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn peer_granting_no_stream_credit_does_not_hang_the_caller() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_client = bind_direct_endpoint().await;
+        let endpoint_stingy = iroh::Endpoint::builder(presets::Minimal)
+            .alpns(vec![p2p::protocol::ANTI_ENTROPY_ALPN.to_vec()])
+            .transport_config(
+                iroh::endpoint::QuicTransportConfig::builder()
+                    .max_concurrent_bidi_streams(0u32.into())
+                    .build(),
+            )
+            .bind()
+            .await
+            .expect("bind a peer that grants no bidi stream credit");
+
+        let id_client = endpoint_client.id();
+        let id_stingy = endpoint_stingy.id();
+
+        // A handler is still registered so the ALPN is accepted and the
+        // connection is established — the refusal is purely stream credit.
+        let router_stingy = Router::builder(endpoint_stingy.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, TarpitHandler)
+            .spawn();
+
+        let allow_client =
+            PeerAllowlist::parse(&[id_stingy.to_string()]).expect("allowlist client");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ledger_client: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("client.bean"), id_client.to_string())
+                .expect("boot client ledger"),
+        ));
+        let handler_client = make_handler_with_timeouts(
+            ledger_client,
+            allow_client,
+            AntiEntropyTimeouts {
+                connect: Duration::from_secs(5),
+                io: Duration::from_secs(5),
+                open_stream: Duration::from_millis(500),
+                ..AntiEntropyTimeouts::default()
+            },
+        );
+
+        wait_until_dialable(&endpoint_client).await;
+        wait_until_dialable(&endpoint_stingy).await;
+        let addr_stingy = endpoint_stingy.addr();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            exchange_with_peer(&endpoint_client, addr_stingy, &handler_client),
+        )
+        .await;
+
+        let _ = router_stingy.shutdown().await;
+
+        assert!(
+            outcome.is_ok(),
+            "M-27: open_bi parked forever against a peer advertising \
+             initial_max_streams_bidi = 0"
+        );
     }
 
     // ─── T41: `accept_bi` timeout + tidy close ─────────────────────────────
@@ -2425,6 +3191,7 @@ pub(crate) mod tests {
         let timeouts = AntiEntropyTimeouts {
             connect: Duration::from_secs(5),
             io: Duration::from_millis(600),
+            ..AntiEntropyTimeouts::default()
         };
         let handler_server = make_handler_full(ledger_server, allow_server, timeouts, limits);
         let router_server = Router::builder(endpoint_server.clone())
@@ -3112,8 +3879,8 @@ pub(crate) mod tests {
             ledger_server.clone(),
             allow_server,
             AntiEntropyTimeouts {
-                connect: AntiEntropyTimeouts::default().connect,
                 io: server_io,
+                ..AntiEntropyTimeouts::default()
             },
         );
         let handler_client = make_handler(ledger_client.clone(), allow_client);

@@ -21,6 +21,15 @@ const SUPPLY_ENTRY_OVERHEAD_BYTES: usize = 128;
 ///
 /// Given our local heads and the remote's advertised heads + directive IDs,
 /// returns the IDs we should request via a `want` message.
+///
+/// The remote lists arrive already **form-checked**: T49 made the advert reader
+/// (`gl-node`'s `read_have_heads_advert`) refuse a page carrying anything that
+/// is not a `protocol::is_content_id` — the rule `openledger-parents` has had
+/// since L-29 (M-26, L-53). The check is deliberately there and NOT repeated
+/// here: this function would have to *filter*, and a filter would let a
+/// malformed advert produce a successful-looking exchange in which the two
+/// nodes silently disagree about what was offered. One refusal, at the point
+/// where the bytes are first retained, is the stronger property.
 pub fn compute_want(
     local_txids: &HashSet<String>,
     local_directive_ids: &HashSet<String>,

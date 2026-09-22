@@ -1,10 +1,18 @@
-//! T43 / T43b — the memory assertions for the full M-16 closure.
+//! T43 / T43b / H-09 — the memory assertions for the full M-16 closure.
 //!
 //! A frame claiming millions of array elements used to reach serde's
 //! internally-tagged decode, which `Content`-buffers the entire value tree
 //! before any cardinality cap can look at it. This binary measures what
 //! `decode_checked` actually allocates for exactly those frames: the
-//! `Supply`-discriminator one T43 closed, and the `Want` one T43b closed.
+//! `Supply`-discriminator one T43 closed, the `Want` one T43b closed, and the
+//! one H-09 found still open behind both of them.
+//!
+//! H-09 is the reason this file is written the way it is. T43 and T43b each
+//! measured the ONE frame shape they had just fixed, so the pre-scan's own
+//! coverage was never the thing under test — and a frame that moved its payload
+//! two keys to the right walked straight through the gate and past both
+//! measurements. Every shape added here is therefore a shape the guard is
+//! claimed to bound, not a shape a particular change happened to be about.
 //!
 //! Its own binary on purpose: the counting `#[global_allocator]` below is
 //! process-wide, so putting it beside ordinary tests would make every unrelated
@@ -21,10 +29,10 @@
 //! the first one, without either test having to know about the other.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
+use p2p::cbor_scan::CborScanError;
 use p2p::protocol::{
     DirectiveKind, SupplyEntry, WireError, WireMessage, MAX_MESSAGE_SIZE, MAX_SUPPLY_ENTRIES,
     MAX_WANT_IDS, SUPPLY_TYPE_DISCRIMINATOR,
@@ -131,13 +139,21 @@ fn forged_supply_frame() -> Vec<u8> {
 
 /// A real, maximal-cardinality `Supply`: `MAX_SUPPLY_ENTRIES` entries with a
 /// 32 KiB economic body each, encoded by the production serializer.
+///
+/// Every entry carries every key the closed envelope set allows (H-09), which is
+/// the widest an honest entry gets: the per-entry item budget the pre-scan now
+/// walks against is sized for exactly this, so a frame that decodes here is a
+/// frame the gate cannot be refusing in production.
 fn honest_supply_frame() -> Vec<u8> {
     let entries: Vec<SupplyEntry> = (0..MAX_SUPPLY_ENTRIES)
         .map(|index| SupplyEntry {
             id: format!("{index:064x}"),
             kind: DirectiveKind::Open,
             economic_bean: "x".repeat(32 * 1024),
-            envelope: BTreeMap::from([("openledger-author".to_owned(), "peer-1".to_owned())]),
+            envelope: ledger::service::ENVELOPE_KEYS
+                .iter()
+                .map(|key| ((*key).to_owned(), format!("peer-{index}")))
+                .collect(),
         })
         .collect();
     WireMessage::supply(entries).to_cbor().unwrap()
@@ -353,6 +369,174 @@ fn oversized_want_frame_is_rejected_within_a_bounded_peak() {
     assert!(
         honest_peak <= honest_budget,
         "an honest {}-byte Want peaked at {honest_peak} bytes, over the \
+         {PEAK_BUDGET_MULTIPLE}× budget of {honest_budget} — the budget the \
+         attack is held to must be one honest traffic meets",
+        honest.len(),
+    );
+}
+
+// ─── H-09: the payload the entry count could not see ─────────────────────────
+
+/// Elements in the crafted frame's HIDDEN array header.
+///
+/// One CBOR byte each, so both frames below land just under the 16 MiB
+/// `MAX_MESSAGE_SIZE` — the largest frame the receive path will consider, and
+/// the size T26's peek gate deliberately admits for a `Supply`. This is the same
+/// count `FORGED_ENTRIES` uses, for the same reason: it is the densest element
+/// count a frame of this size can carry.
+const HIDDEN_ITEMS: u32 = 16_000_000;
+
+/// A ~16 MiB `Supply` whose payload sits AFTER an empty `entries` array.
+///
+/// `{"type": "supply", "entries": [], "v": 1, "z": [16 M items]}`, byte for byte
+/// the prefix ciborium emits for a real `Supply` up to the point where `entries`
+/// truthfully declares nothing. T43's `supply_entry_count` returned `Ok(0)` from
+/// that header and never read another pair, so the three pairs behind it —
+/// including a sixteen-million-element array — were invisible to the gate.
+fn hidden_tail_supply_frame() -> Vec<u8> {
+    let mut frame = Vec::with_capacity(HIDDEN_ITEMS as usize + 32);
+    frame.push(0xa4);
+    frame.extend_from_slice(SUPPLY_TYPE_DISCRIMINATOR);
+    frame.extend_from_slice(b"\x67entries\x80");
+    frame.extend_from_slice(b"\x61v\x01");
+    frame.extend_from_slice(b"\x61z\x9a");
+    frame.extend_from_slice(&HIDDEN_ITEMS.to_be_bytes());
+    assert_eq!(frame.len(), 32, "the prefix must be the one H-09 measured");
+    frame.resize(frame.len() + HIDDEN_ITEMS as usize, 0x00);
+    frame
+}
+
+/// A ~16 MiB `Supply` whose payload sits INSIDE `entries`, as its one element.
+///
+/// `{"type": "supply", "v": 1, "entries": [[16 M items]]}`. The `entries` header
+/// claims exactly one element and is telling the truth, so no bound on the entry
+/// COUNT can see this frame — it is inside `MAX_SUPPLY_ENTRIES` by a factor of
+/// 256. Only a bound on what one entry may be WORTH refuses it.
+fn hidden_entry_supply_frame() -> Vec<u8> {
+    let mut frame = Vec::with_capacity(HIDDEN_ITEMS as usize + 32);
+    frame.push(0xa3);
+    frame.extend_from_slice(SUPPLY_TYPE_DISCRIMINATOR);
+    frame.extend_from_slice(b"\x61v\x01");
+    frame.extend_from_slice(b"\x67entries\x81\x9a");
+    frame.extend_from_slice(&HIDDEN_ITEMS.to_be_bytes());
+    assert_eq!(frame.len(), 30);
+    frame.resize(frame.len() + HIDDEN_ITEMS as usize, 0x00);
+    frame
+}
+
+/// H-09: a 16 MiB `Supply` that hides its payload where the `entries` header
+/// cannot see it is rejected, and rejecting it costs a bounded multiple of the
+/// frame rather than fifty times it.
+///
+/// The hole T43 and T43b both left, and the reason it survived two rounds of
+/// this file: each of those tests measured the one frame shape its own change
+/// was about — an over-claiming `entries` header, an over-claiming `ids` header
+/// — so the guard's COVERAGE was never under test. Neither shape here
+/// over-claims anything. Both are honest about every number they state, and both
+/// were waved through.
+///
+/// Reverting the H-09 half of `cbor_scan::walk` — returning the `entries` claim
+/// at the key that carries it, the way `supply_entry_count` did, instead of
+/// walking the rest of the map — is what this test is calibrated against.
+/// Measured on the same machine, same debug profile, same frames:
+///
+/// * fix in place — peak **0 bytes** for both, refused by the pre-scan as
+///   `UnknownKey` and `VisitBudgetExhausted` respectively;
+/// * short-circuit restored — the hidden-tail frame peaks at **805,306,633
+///   bytes**, 50.33× the frame, and then DECODES SUCCESSFULLY as
+///   `Supply { v: 1, entries: [] }`. That is the part worth keeping in view: no
+///   error, no log, no cap tripped, one budget unit spent against a 100k
+///   per-connection allowance — ×32 connections per peer.
+///
+/// Note which assertion catches it, because only one of them can. The frame is
+/// well-formed, so there is no post-decode verdict to disagree with and
+/// `check_cardinality` is perfectly happy with an empty `Supply`: the ERROR
+/// assertion is what fails on that revert, and the peak is what says how much it
+/// cost. For the nested frame the decode fails either way (an integer is not a
+/// `SupplyEntry`) and only the peak separates "refused from a 30-byte header"
+/// from "refused after 805 MB of transient allocation".
+#[test]
+fn supply_payload_hidden_from_the_entry_count_is_rejected_within_a_bounded_peak() {
+    let _measuring = measurement_lock();
+
+    // ── Hidden behind an empty `entries` ────────────────────────────────────
+    let frame = hidden_tail_supply_frame();
+    assert!(
+        frame.len() <= MAX_MESSAGE_SIZE as usize,
+        "the frame must be one the receive path would accept on size"
+    );
+    let budget = frame.len() * PEAK_BUDGET_MULTIPLE;
+    let (result, peak) = peak_allocated_during(|| WireMessage::decode_checked(&frame));
+
+    println!(
+        "hidden tail: {} bytes, {HIDDEN_ITEMS} items behind an empty entries, peak {peak} bytes \
+         ({:.2}× frame, budget {budget})",
+        frame.len(),
+        peak as f64 / frame.len() as f64,
+    );
+    assert_eq!(
+        result.unwrap_err(),
+        WireError::FramePrescan(CborScanError::UnknownKey),
+        "the frame must be REJECTED — the short-circuit DECODED it, as an empty Supply"
+    );
+    assert!(
+        peak <= budget,
+        "decoding a {}-byte frame with a hidden tail peaked at {peak} bytes, over the \
+         {PEAK_BUDGET_MULTIPLE}× budget of {budget}",
+        frame.len(),
+    );
+
+    // ── Hidden inside `entries`, as its one truthful element ────────────────
+    let nested = hidden_entry_supply_frame();
+    let nested_budget = nested.len() * PEAK_BUDGET_MULTIPLE;
+    let (nested_result, nested_peak) =
+        peak_allocated_during(|| WireMessage::decode_checked(&nested));
+
+    println!(
+        "hidden entry: {} bytes, {HIDDEN_ITEMS} items inside one entry, peak {nested_peak} bytes \
+         ({:.2}× frame, budget {nested_budget})",
+        nested.len(),
+        nested_peak as f64 / nested.len() as f64,
+    );
+    assert_eq!(
+        nested_result.unwrap_err(),
+        WireError::FramePrescan(CborScanError::VisitBudgetExhausted),
+        "the frame must be refused by the GATE, not by serde at the far end"
+    );
+    assert!(
+        nested_peak <= nested_budget,
+        "decoding a {}-byte frame with a bomb inside one entry peaked at {nested_peak} \
+         bytes, over the {PEAK_BUDGET_MULTIPLE}× budget of {nested_budget}",
+        nested.len(),
+    );
+
+    // ── The same budget, measured against honest traffic ────────────────────
+    // H-09 tightened the `Supply` path in the two ways an honest frame could
+    // notice — every top-level key is now checked against the variant's field
+    // set, and every entry is walked against an item budget — so the maximal
+    // real frame has to be measured through the SAME gate, not assumed past it.
+    let honest = honest_supply_frame();
+    let honest_budget = honest.len() * PEAK_BUDGET_MULTIPLE;
+    let (decoded, honest_peak) = peak_allocated_during(|| WireMessage::decode_checked(&honest));
+
+    println!(
+        "honest supply: {} bytes, {MAX_SUPPLY_ENTRIES} entries with a full envelope, peak \
+         {honest_peak} bytes ({:.2}× frame, budget {honest_budget})",
+        honest.len(),
+        honest_peak as f64 / honest.len() as f64,
+    );
+    let Ok(WireMessage::Supply { entries, .. }) = decoded else {
+        panic!("a maximal honest Supply must still decode");
+    };
+    assert_eq!(entries.len(), MAX_SUPPLY_ENTRIES);
+    assert_eq!(
+        entries[0].envelope.len(),
+        ledger::service::ENVELOPE_KEYS.len(),
+        "the honest frame must carry the widest envelope the protocol allows"
+    );
+    assert!(
+        honest_peak <= honest_budget,
+        "an honest {}-byte Supply peaked at {honest_peak} bytes, over the \
          {PEAK_BUDGET_MULTIPLE}× budget of {honest_budget} — the budget the \
          attack is held to must be one honest traffic meets",
         honest.len(),

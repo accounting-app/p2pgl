@@ -197,12 +197,35 @@ async fn main() {
 
     let directive_count = service.directive_count();
     let head_count = service.head_count();
+    let quarantined_count = service.quarantined_count();
     info!(
         directives = directive_count,
         heads = head_count,
+        quarantined = quarantined_count,
         path = %ledger_path.display(),
         "ledger service booted"
     );
+
+    // H-08: the startup compaction below rewrites the whole `.bean` from
+    // memory, so anything boot could not load has to be carried by the ledger's
+    // quarantine or it is deleted here, seconds after the node comes up and
+    // before any operator has read the warning telling them to repair the file.
+    // The ledger crate owns that guarantee (`LedgerService::quarantined`); this
+    // repeats the count at the node's own startup banner because this is the
+    // process where an operator actually looks, and because a node running with
+    // a non-empty quarantine is serving an incomplete ledger — correct, but not
+    // whole — until the file is repaired and the node restarted.
+    if quarantined_count > 0 {
+        warn!(
+            quarantined = quarantined_count,
+            ids = %service.quarantined_ids().join(", "),
+            path = %ledger_path.display(),
+            "this node booted with ledger directives quarantined out of the DAG: they stay in \
+             the .bean (every compaction rewrites them verbatim) but are NOT served, NOT in any \
+             balance and NOT replicated. Stop the node and repair their openledger-parents \
+             metadata (H-08)"
+        );
+    }
 
     // Wrap in Arc<RwLock> for concurrent access (§3.5).
     let shared_ledger: SharedLedger = Arc::new(RwLock::new(service));
@@ -413,15 +436,17 @@ async fn main() {
                         }
                     };
                     let committed = match prepared {
+                        // H-11: the permit goes WITH the commit. The `Err` arm
+                        // drops it here instead, which is correct — a prepare
+                        // that failed left no commit to serialize against.
                         Ok(pending) => {
-                            ledger_commit::commit_pending(&watcher_ledger, pending).await
+                            ledger_commit::commit_pending(&watcher_ledger, pending, permit).await
                         }
                         Err(error) => Err(error),
                     };
                     if let Err(error) = committed {
                         warn!(%error, "failed to persist a reconciled external edit");
                     }
-                    drop(permit);
                 }
                 last_state = current;
             }

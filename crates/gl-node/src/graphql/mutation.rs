@@ -153,10 +153,12 @@ impl MutationRoot {
         // on a blocking-pool thread rather than a runtime worker. The caller
         // still awaits the outcome, so a mutation that returns success is still
         // a mutation whose directive is on disk.
-        commit_pending(ledger, pending)
+        // T44/H-11: `commit_pending` owns the permit from here, so the
+        // single-writer slot is released by the commit itself rather than by
+        // this frame — which a dropped request future would not run.
+        commit_pending(ledger, pending, permit)
             .await
             .map_err(service_error_to_graphql)?;
-        drop(permit);
 
         if !outcome.already_existed {
             // Publish to subscribers (local + remote appends) only once the
@@ -230,10 +232,9 @@ impl MutationRoot {
         // pinned current behaviour.
         let to_gossip = svc.get_directive(&content_id).cloned();
         drop(svc);
-        commit_pending(ledger, pending)
+        commit_pending(ledger, pending, permit)
             .await
             .map_err(service_error_to_graphql)?;
-        drop(permit);
         gossip_after_unlock(ctx, to_gossip).await;
         Ok(true)
     }
@@ -275,10 +276,9 @@ impl MutationRoot {
         // L-18: see `open_account`.
         let to_gossip = svc.get_directive(&content_id).cloned();
         drop(svc);
-        commit_pending(ledger, pending)
+        commit_pending(ledger, pending, permit)
             .await
             .map_err(service_error_to_graphql)?;
-        drop(permit);
         gossip_after_unlock(ctx, to_gossip).await;
         Ok(true)
     }

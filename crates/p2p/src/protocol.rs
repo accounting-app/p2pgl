@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::cbor_scan::{self, ArrayBound, CborScanError, ScanOutcome};
+use crate::cbor_scan::{self, ArrayBound, CborScanError, ElementKind, ScanOutcome};
 
 /// Protocol version. Unknown versions → close the stream.
 pub const WIRE_VERSION: u64 = 1;
@@ -25,6 +25,37 @@ pub const MAX_WANT_IDS: usize = 1024;
 
 /// Maximum `HaveHeads` id lists in one message (H-2).
 pub const MAX_HAVE_HEADS: usize = 4096;
+
+/// Characters in a content id.
+///
+/// `ledger::hash::compute_content_id` is a SHA-256 rendered as lowercase hex,
+/// so every txid and every directive id is exactly this long — which is what
+/// lets a receiver state an id budget in BYTES rather than only in ids (M-26).
+pub const CONTENT_ID_LEN: usize = 64;
+
+/// Is `id` a well-formed content id — exactly `^[0-9a-f]{64}$` (L-29, M-26, L-53)?
+///
+/// THE one spelling of a rule the codebase was applying in one place and
+/// missing in two. `union_merge`'s `openledger-parents` check has enforced it
+/// since L-29/M-05; the anti-entropy advert reader (M-26) and the gossip
+/// `Announce` id (L-53) did not, and both feed attacker-chosen strings into
+/// structures that retain them — an accumulator plus a dedup set in the first
+/// case, a negative-cache key in the second.
+///
+/// Uppercase is rejected as firmly as punctuation, for the reason L-29 gives:
+/// stored ids are lowercase and lookups are exact, so an uppercased spelling of
+/// a real id would pass a case-insensitive check and then resolve to nothing,
+/// forever.
+///
+/// Byte-wise rather than `char`-wise on purpose: the length test is on bytes, so
+/// a multi-byte character would otherwise make `len()` and "64 characters"
+/// disagree. Restricting to ASCII hex makes the two the same statement.
+pub fn is_content_id(id: &str) -> bool {
+    id.len() == CONTENT_ID_LEN
+        && id
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
 
 /// Sender-side byte budget for one `Supply` frame (H-02).
 ///
@@ -240,8 +271,12 @@ impl WireMessage {
     }
 
     /// Decode from CBOR bytes.
+    ///
+    /// The error is [`elide_decode_error`]'d rather than `to_string`'d: serde
+    /// puts the offending VALUE in a type-mismatch message, so a 16 MiB text
+    /// string under a declared key returns a 16 MiB error (T49).
     pub fn from_cbor(data: &[u8]) -> Result<Self, String> {
-        ciborium::from_reader(data).map_err(|error| error.to_string())
+        ciborium::from_reader(data).map_err(|error| elide_decode_error(&error))
     }
 
     /// Decode gossip/application CBOR with the same size and version gates as `from_wire` (H-7).
@@ -336,18 +371,77 @@ pub(crate) const NON_SUPPLY_ARRAY_BOUNDS: &[ArrayBound] = &[
         key: b"ids",
         max: MAX_WANT_IDS,
         label: "want",
+        elements: ElementKind::Text,
     },
     ArrayBound {
         key: b"head_txids",
         max: MAX_HAVE_HEADS,
         label: "have_heads",
+        elements: ElementKind::Text,
     },
     ArrayBound {
         key: b"directive_ids",
         max: MAX_HAVE_HEADS,
         label: "have_heads",
+        elements: ElementKind::Text,
     },
 ];
+
+/// CBOR items one honestly-encoded [`SupplyEntry`] is worth (H-09).
+///
+/// Counted off the encoding, not guessed: the entry's own map header (1), a key
+/// and a value for each of `id`, `kind` and `economic_bean` (6), the `envelope`
+/// key and the envelope map's own header (2), and a key and a value per envelope
+/// pair. The envelope is not open-ended — `gossip::extract_envelope` emits only
+/// `ledger::service::ENVELOPE_KEYS` and `union_merge::validate_supply_envelope`
+/// refuses anything else on arrival — so it is read from that set rather than
+/// restated, the same single-sourcing both of those use. Four keys today, so 17.
+const SUPPLY_ENTRY_ITEMS: usize = 9 + 2 * ledger::service::ENVELOPE_KEYS.len();
+
+/// Maximum CBOR items the pre-scan will let one `Supply` entry spend (H-09).
+///
+/// The bound that stops a frame from hiding its amplification INSIDE `entries`
+/// rather than beside it. `MAX_SUPPLY_ENTRIES` caps how many entries a frame may
+/// declare but says nothing about what one entry may contain, and a single entry
+/// holding a sixteen-million-element array is a 50× `Content` tree that the
+/// entry cap passes by a factor of 256. With this, the whole frame is worth at
+/// most `MAX_SUPPLY_ENTRIES × MAX_SUPPLY_ENTRY_ITEMS` = 17,408 `Content` nodes
+/// whatever its bytes look like.
+///
+/// 4× what the real encoding spends. The headroom is for a future field or a
+/// fifth envelope key, not for a shape the wire struct cannot produce:
+/// `prescan_accepts_an_entry_with_every_envelope_key` measures the honest cost
+/// against real encoded bytes, so drift is a test failure rather than a refused
+/// peer.
+pub(crate) const MAX_SUPPLY_ENTRY_ITEMS: usize = 4 * SUPPLY_ENTRY_ITEMS;
+
+/// The `Supply` frame's one unbounded-cardinality array (T43, H-09).
+///
+/// Kept apart from [`NON_SUPPLY_ARRAY_BOUNDS`] because the scan it feeds is the
+/// stricter one — [`cbor_scan::scan_supply_frame`] requires the key to be
+/// present, where the general scan tolerates its absence — and because its
+/// elements are structs rather than ids, which is what
+/// [`ElementKind::Struct`] says. `label` is again the `BatchTooLarge` kind
+/// `check_cardinality` reports, so the two enforcement points refuse identically
+/// by construction.
+pub(crate) const SUPPLY_ARRAY_BOUNDS: &[ArrayBound] = &[ArrayBound {
+    key: b"entries",
+    max: MAX_SUPPLY_ENTRIES,
+    label: "supply",
+    elements: ElementKind::Struct {
+        items: MAX_SUPPLY_ENTRY_ITEMS,
+    },
+}];
+
+/// Every top-level key a `Supply` frame may carry (H-09).
+///
+/// The wire struct's real field set: serde's internal tag, plus the two fields
+/// of `WireMessage::Supply`. serde `Content`-buffers every pair of an
+/// internally-tagged map — keys the variant has no field for included — so a
+/// frame carrying anything else is asking the decoder to build a tree it will
+/// then discard, which is amplification with no honest sender. The list is three
+/// lines from the variant it describes so that adding a field is one edit.
+pub(crate) const SUPPLY_TOP_LEVEL_KEYS: &[&[u8]] = &[b"type", b"v", b"entries"];
 
 /// Bound every array in a frame BEFORE the buffering decode (T43, T43b).
 ///
@@ -359,11 +453,21 @@ pub(crate) const NON_SUPPLY_ARRAY_BOUNDS: &[ArrayBound] = &[
 /// gate covers all four:
 ///
 /// * a frame carrying the `Supply` discriminator goes to
-///   [`prescan_supply_entries`], which requires an `entries` array and bounds it;
+///   [`cbor_scan::scan_supply_frame`] with [`SUPPLY_ARRAY_BOUNDS`] and
+///   [`SUPPLY_TOP_LEVEL_KEYS`], which requires an `entries` array, bounds it,
+///   bounds what each of its elements may nest, and refuses any top-level key
+///   the variant does not define (H-09);
 /// * every other frame goes to [`cbor_scan::scan_bounded_arrays`] with
 ///   [`NON_SUPPLY_ARRAY_BOUNDS`], which bounds whichever of `ids`,
 ///   `head_txids` and `directive_ids` the frame actually carries and tolerates a
 ///   frame that carries none.
+///
+/// The split is about strictness, not about mechanism: since H-09 both arms are
+/// the same walk over the whole top-level map, differing only in the policy they
+/// are handed. T26's peek gate caps a non-`Supply` frame at 1 MiB of bytes and
+/// lets a `Supply` through at the full 16 MiB, so the `Supply` arm is the one
+/// that has to account for every byte itself — which is exactly why it was the
+/// wrong arm to have a scan that stopped early.
 ///
 /// Either way an over-count is reported as the same [`WireError::BatchTooLarge`]
 /// the post-decode cap would have produced, with the same `kind`, because it is
@@ -373,12 +477,13 @@ pub(crate) const NON_SUPPLY_ARRAY_BOUNDS: &[ArrayBound] = &[
 /// See [`crate::cbor_scan`] for the scan's bounds, its element-skip allowance,
 /// and why each of its rejections is unreachable for an honest peer.
 fn prescan_frame(data: &[u8]) -> Result<(), WireError> {
-    if carries_supply_discriminator(data) {
-        return prescan_supply_entries(data);
+    let outcome = if carries_supply_discriminator(data) {
+        cbor_scan::scan_supply_frame(data, SUPPLY_ARRAY_BOUNDS, SUPPLY_TOP_LEVEL_KEYS)
+    } else {
+        cbor_scan::scan_bounded_arrays(data, NON_SUPPLY_ARRAY_BOUNDS)
     }
-    match cbor_scan::scan_bounded_arrays(data, NON_SUPPLY_ARRAY_BOUNDS)
-        .map_err(WireError::FramePrescan)?
-    {
+    .map_err(WireError::FramePrescan)?;
+    match outcome {
         ScanOutcome::WithinBounds => Ok(()),
         ScanOutcome::OverBound {
             label,
@@ -392,32 +497,88 @@ fn prescan_frame(data: &[u8]) -> Result<(), WireError> {
     }
 }
 
-/// The `Supply` arm of [`prescan_frame`] (T43).
-///
-/// Split out because its contract is genuinely stricter than the general scan's:
-/// a `Supply` that carries no `entries` array is malformed and is refused,
-/// whereas a frame with no `ids` is just some other variant. T26's peek gate
-/// already bounds every non-`Supply` frame's BYTES, so this is the one variant
-/// that gate must let through at full size and therefore the one whose element
-/// count has to be proven before serde sees it.
-fn prescan_supply_entries(data: &[u8]) -> Result<(), WireError> {
-    let claimed = cbor_scan::supply_entry_count(data).map_err(WireError::FramePrescan)?;
-    if claimed > MAX_SUPPLY_ENTRIES as u64 {
-        return Err(WireError::BatchTooLarge {
-            kind: "supply",
-            count: saturating_count(claimed),
-            max: MAX_SUPPLY_ENTRIES,
-        });
-    }
-    Ok(())
-}
-
 /// A claimed element count as a `usize`, saturating rather than truncating.
 ///
 /// The count is only ever reported, and a wrapped value would understate the
 /// frame in the one message an operator reads to size the attack.
 fn saturating_count(claimed: u64) -> usize {
     usize::try_from(claimed).unwrap_or(usize::MAX)
+}
+
+/// Longest decode-error detail this crate will carry out of ciborium (T49).
+///
+/// Enough to name the type mismatch and where it happened; far too short to be
+/// worth using as a channel.
+const MAX_DECODE_ERROR_CHARS: usize = 256;
+
+/// A [`std::fmt::Write`] sink that keeps at most `budget` characters (T49).
+///
+/// Character-counted, not byte-counted, and it only ever cuts on a character
+/// boundary — so the result is always valid UTF-8 and always printable.
+struct BoundedSink {
+    kept: String,
+    budget: usize,
+    elided: bool,
+}
+
+impl std::fmt::Write for BoundedSink {
+    fn write_str(&mut self, chunk: &str) -> std::fmt::Result {
+        if self.budget == 0 {
+            self.elided |= !chunk.is_empty();
+            return Ok(());
+        }
+        let mut bytes_taken = 0usize;
+        let mut chars_taken = 0usize;
+        for (offset, character) in chunk.char_indices() {
+            if chars_taken == self.budget {
+                break;
+            }
+            chars_taken += 1;
+            bytes_taken = offset + character.len_utf8();
+        }
+        self.kept.push_str(&chunk[..bytes_taken]);
+        self.budget -= chars_taken;
+        self.elided |= bytes_taken < chunk.len();
+        Ok(())
+    }
+}
+
+/// Render a decode error, truncated to [`MAX_DECODE_ERROR_CHARS`] (T49).
+///
+/// serde's type-mismatch errors embed the value that did not fit the field —
+/// `invalid type: string "…", expected u64` — and ciborium hands that message
+/// straight through. So `{"type":"supply","v":"<16 MiB of text>","entries":[]}`
+/// decodes to a *sixteen-megabyte error string*: a `v` key the variant declares,
+/// carrying the wrong CBOR type. The pre-scan cannot refuse it (the key is
+/// declared and there is no array to over-count), and the frame is a legal
+/// `Supply` by every byte-level rule, so the whole cost lands in the error —
+/// which `serve_anti_entropy` and the gossip loop then hand to `warn!`, turning
+/// a 16 MiB frame into a 16 MiB log line an attacker wrote.
+///
+/// Truncation happens as the message is FORMATTED, through [`BoundedSink`],
+/// rather than by trimming an already-materialized `String`: the oversized
+/// message exists inside ciborium either way, but nothing downstream ever gets a
+/// second copy of it, and nothing retains one.
+///
+/// Note what this does not claim to fix: the peak allocation during the decode
+/// itself. That is `Content` buffering plus serde's own message, both inside
+/// ciborium, and bounding it belongs with the frame caps (M-16/H-09), not here.
+fn elide_decode_error(error: &impl std::fmt::Display) -> String {
+    use std::fmt::Write as _;
+    let mut sink = BoundedSink {
+        kept: String::new(),
+        budget: MAX_DECODE_ERROR_CHARS,
+        elided: false,
+    };
+    // `BoundedSink` never returns `Err`, and a `Display` impl can only fail by
+    // way of its sink, so this cannot fail — ignored rather than unwrapped
+    // because a panic while formatting an attacker's error would be the worse
+    // of the two outcomes.
+    let _ = write!(sink, "{error}");
+    if sink.elided {
+        sink.kept.push_str("… (error truncated)");
+    }
+    sink.kept
 }
 
 /// Wire protocol errors.
@@ -661,6 +822,151 @@ mod tests {
         let error = WireMessage::supply(entries).to_wire().unwrap_err();
         assert!(error.contains("max"), "unexpected error: {error}");
     }
+    // ─── T49: a decode error is not an attacker's log channel ─────────────
+
+    /// A 4 MiB text string under the DECLARED key `v`.
+    ///
+    /// Every byte-level rule passes it: the `Supply` discriminator is genuine,
+    /// `v` is a key the variant defines (so H-09's unknown-key gate does not
+    /// fire), `entries` is present and empty (so no array is over-count), and
+    /// the frame is inside `MAX_MESSAGE_SIZE`. The only thing wrong with it is
+    /// the CBOR *type* of `v` — which is discovered by serde, which reports it
+    /// by quoting the offending value.
+    fn wrong_typed_declared_key_frame(payload_bytes: usize) -> Vec<u8> {
+        use ciborium::value::Value;
+        let frame = Value::Map(vec![
+            (
+                Value::Text("type".to_owned()),
+                Value::Text("supply".to_owned()),
+            ),
+            (
+                Value::Text("v".to_owned()),
+                Value::Text("x".repeat(payload_bytes)),
+            ),
+            (Value::Text("entries".to_owned()), Value::Array(Vec::new())),
+        ]);
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&frame, &mut bytes).expect("encode the forged frame");
+        assert!(carries_supply_discriminator(&bytes));
+        assert!(bytes.len() <= MAX_MESSAGE_SIZE as usize);
+        bytes
+    }
+
+    /// T49: the decode error must not carry the attacker's payload.
+    ///
+    /// serde's type-mismatch message embeds the value that did not fit, so
+    /// before [`elide_decode_error`] this frame produced a multi-megabyte
+    /// `WireError::CborDecode(String)` — which the anti-entropy serve loop and
+    /// the gossip loop then hand to `warn!`, turning a 4 MiB frame into a 4 MiB
+    /// log line written by a peer. (At the full `MAX_MESSAGE_SIZE` the same
+    /// shape was measured at 80,000,161 bytes of peak allocation, 5.00× the
+    /// frame — most of it this string.) 4 MiB here keeps the test quick; the
+    /// property is a constant bound, so the payload size cannot matter.
+    #[test]
+    fn a_decode_error_cannot_carry_a_multi_megabyte_payload() {
+        let payload_bytes = 4 * 1024 * 1024;
+        let frame = wrong_typed_declared_key_frame(payload_bytes);
+
+        let error = WireMessage::decode_checked(&frame)
+            .expect_err("a text `v` where a u64 belongs must not decode");
+        let WireError::CborDecode(detail) = &error else {
+            panic!("expected a CBOR decode error, got {error:?}");
+        };
+
+        assert!(
+            detail.chars().count()
+                <= MAX_DECODE_ERROR_CHARS + "… (error truncated)".chars().count(),
+            "the decode error is {} characters — it is carrying the payload",
+            detail.chars().count()
+        );
+        assert!(
+            detail.ends_with("… (error truncated)"),
+            "a truncated error must say so: {detail}"
+        );
+        // And the whole rendered `WireError` stays small, since that is what a
+        // log line actually contains.
+        assert!(error.to_string().len() < 1024);
+        // Sanity: the payload really is in the frame, so the test is not passing
+        // because the frame was rejected before serde ever saw it.
+        assert!(frame.len() > payload_bytes);
+    }
+
+    /// The sink cuts on character boundaries and reports whether it cut.
+    #[test]
+    fn bounded_sink_never_splits_a_character() {
+        use std::fmt::Write as _;
+
+        // Multi-byte characters straddling the budget: a byte-wise truncation
+        // would panic or produce invalid UTF-8 here.
+        let mut sink = BoundedSink {
+            kept: String::new(),
+            budget: 3,
+            elided: false,
+        };
+        write!(sink, "héllo").expect("bounded sink never fails");
+        assert_eq!(sink.kept, "hél");
+        assert!(sink.elided);
+
+        // Exactly at the budget is not elided.
+        let mut exact = BoundedSink {
+            kept: String::new(),
+            budget: 5,
+            elided: false,
+        };
+        write!(exact, "héllo").expect("bounded sink never fails");
+        assert_eq!(exact.kept, "héllo");
+        assert!(!exact.elided);
+
+        // Writes past exhaustion are dropped, not panicked on.
+        let mut spent = BoundedSink {
+            kept: String::new(),
+            budget: 0,
+            elided: false,
+        };
+        write!(spent, "anything").expect("bounded sink never fails");
+        assert!(spent.kept.is_empty());
+        assert!(spent.elided);
+    }
+
+    /// An error small enough to keep is kept verbatim — truncation must not
+    /// cost an operator the ordinary message.
+    #[test]
+    fn a_short_decode_error_is_untouched() {
+        // Not CBOR at all: ciborium's message names the fault and nothing else.
+        let error =
+            WireMessage::decode_checked(&[0xff, 0xff, 0xff]).expect_err("garbage must not decode");
+        let rendered = error.to_string();
+        assert!(!rendered.contains("(error truncated)"), "got: {rendered}");
+        assert!(rendered.len() < 200, "got: {rendered}");
+    }
+
+    /// The content-id rule the wire, the advert reader and the parents check all
+    /// share (L-29, M-26, L-53).
+    #[test]
+    fn content_id_rule_is_exactly_sixty_four_lowercase_hex() {
+        assert!(is_content_id(&"0".repeat(CONTENT_ID_LEN)));
+        assert!(is_content_id(&"abcdef0123456789".repeat(4)));
+
+        assert!(!is_content_id(""));
+        assert!(!is_content_id(&"0".repeat(CONTENT_ID_LEN - 1)));
+        assert!(!is_content_id(&"0".repeat(CONTENT_ID_LEN + 1)));
+        assert!(!is_content_id(&"0".repeat(255)));
+        // Uppercase would pass a case-insensitive check and then resolve to
+        // nothing, forever — L-29's reasoning, pinned.
+        assert!(!is_content_id(&format!(
+            "{}A",
+            "0".repeat(CONTENT_ID_LEN - 1)
+        )));
+        assert!(!is_content_id(&format!(
+            "{}g",
+            "0".repeat(CONTENT_ID_LEN - 1)
+        )));
+        // 63 chars + one two-byte character is 64 BYTES but not 64 hex digits.
+        assert!(!is_content_id(&format!(
+            "{}é",
+            "0".repeat(CONTENT_ID_LEN - 2)
+        )));
+    }
 
     /// M-16: pins the coupling between serde's tag-first, definite-length-map
     /// encoding and `SUPPLY_TYPE_DISCRIMINATOR`. A genuine `Supply` frame carries
@@ -795,32 +1101,53 @@ mod tests {
         );
     }
 
-    /// The ENTRY-COUNT scan is keyed on the `Supply` discriminator: a `Want` is
+    /// The STRICT scan is keyed on the `Supply` discriminator: a `Want` is
     /// decoded exactly as before even though that scan, if it ran, would refuse
     /// it for having no `entries` key.
     ///
-    /// T43b did not change this. A non-`Supply` frame now goes to
-    /// `cbor_scan::scan_bounded_arrays` instead — tolerant of absent keys, and
-    /// with an element-skip allowance for walking id arrays — which is a
-    /// different scan with different semantics, not a widening of this one.
-    /// Routing a `Want` through `supply_entry_count` would still refuse it, and
-    /// this pins that it never happens.
+    /// Neither T43b nor H-09 changed this. A non-`Supply` frame goes to
+    /// `cbor_scan::scan_bounded_arrays` instead — tolerant of absent keys and of
+    /// keys its three variants do not share — which is the same walk under a
+    /// looser policy, not a widening of this one. Routing a `Want` through the
+    /// `Supply` policy would refuse it on both counts, and this pins that it
+    /// never happens.
     #[test]
     fn prescan_only_runs_on_supply_discriminator_frames() {
         for count in [2usize, 1_000] {
             let want = WireMessage::want((0..count).map(|index| format!("{index:064x}")).collect());
             let cbor = want.to_cbor().unwrap();
             assert!(!carries_supply_discriminator(&cbor));
-            // The entry-count scan would refuse this frame — a small Want for
-            // having no `entries` key, a large one on the visit budget while
-            // skipping the id vector as an unrecognised value. The discriminator
-            // split is what spares both.
-            assert!(cbor_scan::supply_entry_count(&cbor).is_err());
+            // The Supply policy would refuse this frame: `ids` is not a key the
+            // variant declares, and a small Want has no `entries` besides. The
+            // discriminator split is what spares both.
+            assert!(cbor_scan::scan_supply_frame(
+                &cbor,
+                SUPPLY_ARRAY_BOUNDS,
+                SUPPLY_TOP_LEVEL_KEYS
+            )
+            .is_err());
             assert_eq!(WireMessage::decode_checked(&cbor).unwrap(), want);
         }
+        // `type` and `v` are shared, so the first key a `Want` carries that the
+        // `Supply` policy has no field for is `ids` — an undeclared key, which
+        // the strict scan reaches before it can notice the missing `entries`.
         let small = WireMessage::want(vec!["a".to_owned(), "b".to_owned()]);
         assert_eq!(
-            cbor_scan::supply_entry_count(&small.to_cbor().unwrap()),
+            cbor_scan::scan_supply_frame(
+                &small.to_cbor().unwrap(),
+                SUPPLY_ARRAY_BOUNDS,
+                SUPPLY_TOP_LEVEL_KEYS
+            ),
+            Err(CborScanError::UnknownKey)
+        );
+        // With the undeclared key gone, the absence is what refuses it.
+        let no_entries = vec![0xa2u8]
+            .into_iter()
+            .chain(SUPPLY_TYPE_DISCRIMINATOR.iter().copied())
+            .chain(b"\x61v\x01".iter().copied())
+            .collect::<Vec<u8>>();
+        assert_eq!(
+            cbor_scan::scan_supply_frame(&no_entries, SUPPLY_ARRAY_BOUNDS, SUPPLY_TOP_LEVEL_KEYS),
             Err(CborScanError::MissingEntries)
         );
     }
@@ -859,6 +1186,98 @@ mod tests {
         assert!(
             error.contains("supply batch too large: 10000000"),
             "unexpected error: {error}"
+        );
+    }
+
+    // ─── H-09: the `Supply` arm walks the whole map ─────────────────────────
+
+    /// The H-09 frame, at the choke point: a 16 MiB `Supply` whose payload sits
+    /// BEHIND an empty `entries`.
+    ///
+    /// T43's scan answered `Ok(0)` from the `entries` header and never read
+    /// another pair, so this decoded — successfully, as an empty `Supply` — after
+    /// building a `Content` tree 50× the frame. There was no error to log and no
+    /// cap to trip: just one budget unit spent against a 100k per-connection
+    /// allowance, ×32 connections per peer. `decode_memory.rs` measures the
+    /// peak; this pins the verdict.
+    #[test]
+    fn prescan_rejects_a_supply_frame_that_hides_its_payload_after_entries() {
+        // {"type": "supply", "entries": [], "v": 1, "z": [10 M items]}
+        let mut frame = vec![0xa4];
+        frame.extend_from_slice(SUPPLY_TYPE_DISCRIMINATOR);
+        frame.extend_from_slice(b"\x67entries\x80");
+        frame.extend_from_slice(b"\x61v\x01");
+        frame.extend_from_slice(b"\x61z");
+        frame.extend_from_slice(&array_header_claiming(10_000_000));
+        assert!(frame.len() < 64, "the whole attack fits in a tiny frame");
+        assert!(
+            carries_supply_discriminator(&frame),
+            "the frame must reach the Supply arm, as it does at T26's peek gate"
+        );
+        assert_eq!(
+            WireMessage::decode_checked(&frame).unwrap_err(),
+            WireError::FramePrescan(CborScanError::UnknownKey)
+        );
+        // The gossip choke point inherits it, as it does every other pre-scan
+        // rule — and gossip never saw T26's byte cap at all.
+        assert!(crate::gossip::decode_broadcast(&frame)
+            .unwrap_err()
+            .contains("undeclared top-level key"));
+    }
+
+    /// The same payload hidden INSIDE `entries` rather than after it.
+    ///
+    /// One element is inside `MAX_SUPPLY_ENTRIES` by a factor of 256, so the
+    /// entry-count cap passes this frame however it is enforced: the header's
+    /// claim of `1` is perfectly true. Only `MAX_SUPPLY_ENTRY_ITEMS` — a bound
+    /// on what one entry may be WORTH, which T43 had no notion of — refuses it.
+    #[test]
+    fn prescan_rejects_a_supply_frame_that_hides_its_payload_inside_entries() {
+        // {"type": "supply", "v": 1, "entries": [[1,000 empty strings]]}
+        let mut ids_tail = vec![0x81, 0x99];
+        ids_tail.extend_from_slice(&1000u16.to_be_bytes());
+        ids_tail.extend(std::iter::repeat_n(0x60u8, 1000));
+        let frame = forged_supply_frame(&ids_tail);
+        assert_eq!(
+            WireMessage::decode_checked(&frame).unwrap_err(),
+            WireError::FramePrescan(CborScanError::VisitBudgetExhausted)
+        );
+    }
+
+    /// The compatibility half of H-09, against REAL encoded frames: a maximal
+    /// `Supply` whose every entry carries every envelope key the protocol allows
+    /// still passes the walk, at the cap, through the full wire path.
+    ///
+    /// This is what `MAX_SUPPLY_ENTRY_ITEMS` is sized against. The per-entry item
+    /// budget is the one bound H-09 added that an honest sender can reach, so
+    /// the frame it has to pass is the widest one `gossip::to_wire_entry` can
+    /// produce: `ENVELOPE_KEYS` in full, `MAX_SUPPLY_ENTRIES` times over. A
+    /// budget the encoder could outgrow would refuse live traffic rather than an
+    /// attack.
+    #[test]
+    fn prescan_accepts_an_entry_with_every_envelope_key() {
+        let entries: Vec<SupplyEntry> = (0..MAX_SUPPLY_ENTRIES)
+            .map(|index| SupplyEntry {
+                id: format!("{index:064x}"),
+                kind: DirectiveKind::Transaction,
+                economic_bean: "2024-01-15 * \"x\"\n  Assets:Cash 1 USD".to_owned(),
+                envelope: ledger::service::ENVELOPE_KEYS
+                    .iter()
+                    .map(|key| ((*key).to_owned(), format!("{index}")))
+                    .collect(),
+            })
+            .collect();
+        let message = WireMessage::supply(entries);
+        let wire = message.to_wire().unwrap();
+        assert_eq!(
+            WireMessage::from_wire(&wire).unwrap().0,
+            message,
+            "the H-09 item budget must not refuse the widest honest Supply"
+        );
+        // And the budget has real headroom over it, rather than just clearing.
+        assert!(
+            MAX_SUPPLY_ENTRY_ITEMS >= 4 * (9 + 2 * ledger::service::ENVELOPE_KEYS.len()),
+            "MAX_SUPPLY_ENTRY_ITEMS has lost its margin over the real encoding"
         );
     }
 

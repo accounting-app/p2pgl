@@ -5,10 +5,11 @@
 //! `LedgerService` and `TransactionBroadcast`, spawning background tasks
 //! for gossip broadcasts, anti-entropy head exchanges, and orphan resolution.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use iroh::endpoint::presets;
@@ -290,6 +291,29 @@ pub fn spawn_gossip_loop(
                             let data = msg.content.as_ref();
                             match decode_broadcast(data) {
                                 Ok(WireMessage::Announce { id, kind, .. }) => {
+                                    // L-53: `id` is an untrusted string that
+                                    // becomes a `FetchCoordinator` key (both
+                                    // in-flight and negative-cache) and is then
+                                    // sent straight back out inside a `Want`.
+                                    // Nothing checked its shape, so a relay
+                                    // could seed those tables with arbitrary
+                                    // multi-KB keys — bounded only by
+                                    // iroh-gossip's frame default — and make
+                                    // this node ask its peers for them. Every
+                                    // id a peer can honestly announce is a
+                                    // content id, so hold it to the same rule
+                                    // the advert reader (M-26) and
+                                    // `openledger-parents` (L-29) use. The id
+                                    // is never logged, only its length: it is
+                                    // attacker-chosen text.
+                                    if !p2p::protocol::is_content_id(&id) {
+                                        debug!(
+                                            relay = %relay,
+                                            bytes = id.len(),
+                                            "dropping gossip announce with a malformed id (L-53)"
+                                        );
+                                        continue;
+                                    }
                                     debug!(id = %id, kind = ?kind, "received gossip announce");
                                     let have_it = {
                                         let svc = handler.ledger.read().await;
@@ -378,11 +402,22 @@ pub fn spawn_anti_entropy_loop(peer_node: &PeerNode, handler: AntiEntropyHandler
     let allowlist = peer_node.allowlist().clone();
 
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+        let tick = Duration::from_millis(interval_ms);
+        let mut interval = tokio::time::interval(tick);
         info!(interval_ms = interval_ms, "anti-entropy loop started");
+
+        // Both live ACROSS ticks (H-10). An exchange may outlive the tick that
+        // started it, and the two together are what stop that from either
+        // holding the scheduler or piling up: `set` keeps the straggler's
+        // handle, `in_flight` keeps its peer from being handed a second one.
+        let mut set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        let in_flight: InFlightPeers = Arc::new(Mutex::new(HashSet::new()));
 
         loop {
             interval.tick().await;
+            // Reap anything that finished while this task was parked on the
+            // tick. Non-blocking, so a straggler does not delay the reap.
+            while set.try_join_next().is_some() {}
 
             // Targets come from the ALLOWLIST, not from the live peer registry
             // (M-11). The registry is filled exclusively by allowlist-gated
@@ -419,22 +454,137 @@ pub fn spawn_anti_entropy_loop(peer_node: &PeerNode, handler: AntiEntropyHandler
             // Run every peer's exchange concurrently (M-06): a peer that accepts
             // a connection and then stalls must not block replication with the
             // healthy peers, as it did when this loop awaited each exchange
-            // inline. Each spawned exchange is itself bounded by the connect and
-            // I/O timeouts on the handler, so the drain below cannot hang.
-            let mut set = tokio::task::JoinSet::new();
+            // inline.
+            //
+            // A peer whose exchange from an EARLIER tick is still running is
+            // skipped rather than given a second one (H-10). Anti-entropy with
+            // one peer is idempotent, so a concurrent duplicate buys nothing —
+            // and it is what bounds the backlog: `set` can hold at most one task
+            // per allowlisted peer, however many ticks pass.
+            let mut skipped = 0usize;
             for peer_id in targets {
+                let Some(claim) = InFlightGuard::claim(&in_flight, peer_id) else {
+                    skipped += 1;
+                    continue;
+                };
                 let endpoint = endpoint.clone();
                 let handler = handler.clone();
                 set.spawn(async move {
+                    // Held for the whole exchange; its `Drop` is what releases
+                    // the peer, on every path including a panic.
+                    let _claim = claim;
                     exchange_with_peer(&endpoint, peer_id, &handler).await;
                 });
             }
+            if skipped > 0 {
+                // `debug!`, not `warn!`: a legitimate large catch-up routinely
+                // outlives a tick, so this is ordinary bookkeeping. A peer that
+                // is stuck for a PATHOLOGICAL reason surfaces separately, and
+                // loudly — its exchange ends with a session-deadline, page-cap
+                // or frame-budget error that `exchange_with_peer` logs at
+                // `warn!` with the peer named. That is the signal H-10 was
+                // missing, and it is not this line.
+                debug!(
+                    skipped,
+                    "anti-entropy tick skipped peers whose previous exchange is still running"
+                );
+            }
 
             // Drain this tick's exchanges before the next tick so ticks do not
-            // pile up. Bounded by the per-exchange timeouts above (M-06).
-            while set.join_next().await.is_some() {}
+            // pile up — but NEVER wait on them without a bound (H-10).
+            //
+            // The comment this replaces claimed the drain was "Bounded by the
+            // per-exchange timeouts above (M-06)". It was not. Those timeouts
+            // are per-frame and every frame refreshes them, so one allowlisted
+            // peer answering `more: true` with ~40-byte empty `HaveHeads` pages
+            // kept its task inside `read_have_heads_advert`, kept this drain
+            // inside `join_next`, and `interval.tick()` was never reached again:
+            // ALL anti-entropy with ALL peers, dead for the process lifetime,
+            // with no error, no log and no health signal. Anti-entropy is the
+            // correctness backstop that makes dropping gossip hints safe (T23),
+            // so that is not a degraded mode — it is silent divergence.
+            //
+            // T49 bounded the exchange itself, which is the real fix; this is
+            // defence in depth, and it is the difference between "one peer
+            // fails" and "the subsystem dies" if a future change finds another
+            // way to stall. Stragglers are CARRIED to the next tick rather than
+            // aborted or detached: `exchange_with_peer` commits through
+            // `ledger_commit::commit_pending`, and aborting it mid-commit was
+            // H-11's wedge (the `spawn_blocking` write lands, the bookkeeping
+            // that clears `commit_in_flight` does not). Keeping the handles also
+            // keeps the backlog visible and bounded, where `detach_all` would
+            // throw away the only record that they exist.
+            //
+            // T50 fixed H-11, so an abort here would no longer wedge anything:
+            // `commit_pending` runs the commit on a task of its own that an
+            // abort of THIS task does not reach, and it holds the write permit
+            // until it is done. Carrying stragglers is still the right default
+            // — it is the only shape that keeps the backlog observable — but it
+            // is now a choice about visibility rather than the only safe
+            // option.
+            //
+            // The budget is one tick: an exchange that outlives a whole tick is,
+            // by definition, one the scheduler should stop waiting on.
+            let drain_deadline = tokio::time::Instant::now() + tick;
+            loop {
+                match tokio::time::timeout_at(drain_deadline, set.join_next()).await {
+                    // `None` means the set is empty: this tick is fully drained.
+                    Ok(None) => break,
+                    Ok(Some(_)) => {}
+                    Err(_elapsed) => {
+                        debug!(
+                            still_running = set.len(),
+                            "anti-entropy tick drain reached its budget; carrying exchanges over"
+                        );
+                        break;
+                    }
+                }
+            }
         }
     });
+}
+
+/// The peers whose anti-entropy exchange has not finished yet (H-10).
+type InFlightPeers = Arc<Mutex<HashSet<iroh::EndpointId>>>;
+
+/// Marks one peer as having an exchange in flight; unmarks it on drop.
+///
+/// RAII rather than "remove the id when `join_next` hands it back", because a
+/// task that PANICS hands nothing back — and an id stuck in the set forever
+/// would mean that peer is skipped forever, which is the exact failure this
+/// exists to prevent, reintroduced by its own fix. `Drop` runs during an unwind
+/// and when a task is aborted, so the claim is released on every path.
+///
+/// A poisoned mutex is recovered from rather than panicked on, for the same
+/// reason [`floor_anti_entropy_interval`] clamps instead of refusing (L-22):
+/// this runs inside the replication task, and killing replication while the
+/// process carries on looking healthy is the worse outcome.
+struct InFlightGuard {
+    peers: InFlightPeers,
+    peer: iroh::EndpointId,
+}
+
+impl InFlightGuard {
+    /// Claim `peer`, or `None` when an exchange with it is already running.
+    fn claim(peers: &InFlightPeers, peer: iroh::EndpointId) -> Option<Self> {
+        let claimed = peers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(peer);
+        claimed.then(|| Self {
+            peers: peers.clone(),
+            peer,
+        })
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.peers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.peer);
+    }
 }
 
 /// Spawn the orphan-buffer TTL sweep as a background tokio task (L-20).
@@ -795,7 +945,7 @@ mod tests {
 
     use crate::anti_entropy_alpn::tests::{
         bind_direct_endpoint, make_handler, make_handler_with_timeouts, wait_until_dialable,
-        write_open_directive_ledger, NET_TEST_LOCK,
+        write_open_directive_ledger, EmptyPageFloodHandler, NET_TEST_LOCK,
     };
     use crate::anti_entropy_alpn::AntiEntropyTimeouts;
     use crate::graphql::SharedLedger;
@@ -950,6 +1100,7 @@ mod tests {
             AntiEntropyTimeouts {
                 connect: Duration::from_secs(2),
                 io: Duration::from_secs(5),
+                ..AntiEntropyTimeouts::default()
             },
         );
 
@@ -1011,6 +1162,152 @@ mod tests {
         );
 
         let _ = router_server.shutdown().await;
+    }
+
+    // ── H-10: one stuck peer must not stop the scheduler ─────────────────
+
+    /// **The money test.** An allowlisted peer replying `more: true` with empty
+    /// `HaveHeads` pages forever must not stop anti-entropy with everyone else.
+    ///
+    /// The second half is the point. Pre-T41, and pre-T49, an exchange against
+    /// such a peer never returned; its `JoinSet` task never finished; the tick
+    /// drain's `while set.join_next().await.is_some() {}` never returned; and
+    /// `interval.tick()` was never reached again. All anti-entropy with all
+    /// peers, dead for the process lifetime, silently — for about forty bytes
+    /// per frame from one peer.
+    ///
+    /// So the healthy peer is made reachable only AFTER the flood is already
+    /// under way: the client's `MemoryLookup` learns the source's address once
+    /// several ticks have passed, so convergence can only come from a tick that
+    /// happened *after* the wedge. A test that let the healthy peer sync on the
+    /// first tick would pass against the broken code, which is exactly the trap
+    /// this is written to avoid — and it is checked, not assumed: the client is
+    /// asserted empty at the moment the source becomes reachable.
+    ///
+    /// Drives the real `spawn_anti_entropy_loop`, because the defect lived in
+    /// the drain as much as in the advert loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn empty_page_flood_peer_cannot_stop_anti_entropy_with_healthy_peers() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_source = bind_direct_endpoint().await;
+        let endpoint_flood = bind_direct_endpoint().await;
+        let source_id = endpoint_source.id();
+        let flood_id = endpoint_flood.id();
+
+        let address_lookup = MemoryLookup::new();
+        let endpoint_client = iroh::Endpoint::builder(presets::Minimal)
+            .alpns(vec![p2p::protocol::ANTI_ENTROPY_ALPN.to_vec()])
+            .address_lookup(address_lookup.clone())
+            .bind()
+            .await
+            .expect("bind client endpoint with memory address lookup");
+        let client_id = endpoint_client.id();
+
+        // The healthy peer: five independent opens, so one exchange round
+        // transfers the lot with no orphan buffering.
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let source_path = temp_dir.path().join("source.bean");
+        write_open_directive_ledger(&source_path, 5, &source_id.to_string());
+        let ledger_source: SharedLedger = Arc::new(RwLock::new(
+            ledger::service::LedgerService::boot(source_path, source_id.to_string())
+                .expect("boot source ledger"),
+        ));
+        let source_count = ledger_source.read().await.directive_count();
+        assert_eq!(source_count, 5, "seed: five independent opens");
+
+        let allow_source =
+            PeerAllowlist::parse(&[client_id.to_string()]).expect("source allowlist");
+        let router_source = Router::builder(endpoint_source.clone())
+            .accept(
+                p2p::protocol::ANTI_ENTROPY_ALPN,
+                make_handler(ledger_source, allow_source),
+            )
+            .spawn();
+
+        let router_flood = Router::builder(endpoint_flood.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, EmptyPageFloodHandler)
+            .spawn();
+
+        let ledger_client: SharedLedger = Arc::new(RwLock::new(
+            ledger::service::LedgerService::boot(
+                temp_dir.path().join("client.bean"),
+                client_id.to_string(),
+            )
+            .expect("boot client ledger"),
+        ));
+        let allow_client = PeerAllowlist::parse(&[source_id.to_string(), flood_id.to_string()])
+            .expect("client allowlist");
+        let handler_client = make_handler_with_timeouts(
+            ledger_client.clone(),
+            allow_client.clone(),
+            AntiEntropyTimeouts {
+                connect: Duration::from_secs(1),
+                io: Duration::from_secs(1),
+                // Short enough that the flooder's exchange ends within the
+                // test, long enough that it spans many ticks while it runs.
+                session: Duration::from_secs(2),
+                ..AntiEntropyTimeouts::default()
+            },
+        );
+
+        wait_until_dialable(&endpoint_client).await;
+        wait_until_dialable(&endpoint_source).await;
+        wait_until_dialable(&endpoint_flood).await;
+
+        // Only the flooder is resolvable to begin with: the loop holds bare
+        // `EndpointId`s, so the source's dial cannot even start until its
+        // address is published below.
+        address_lookup.add_endpoint_info(endpoint_flood.addr());
+
+        // A gossip handle that never subscribes: the registry stays empty and
+        // targets come from the allowlist alone, as in the M-11 test above.
+        let gossip_client = iroh_gossip::net::Gossip::builder().spawn(endpoint_client.clone());
+        let client_node = PeerNode::new(
+            endpoint_client,
+            gossip_client,
+            PeerNodeConfig {
+                swarm_topic: "openledger/h10-page-flood".to_owned(),
+                anti_entropy_interval_ms: 200,
+            },
+            allow_client,
+        );
+        spawn_anti_entropy_loop(&client_node, handler_client);
+
+        // Let several ticks happen with the flooder as the only reachable peer.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            ledger_client.read().await.directive_count(),
+            0,
+            "precondition: the healthy peer must still be unreachable, so a pass \
+             cannot come from a sync that happened before the flood started"
+        );
+
+        // NOW make the healthy peer reachable. Everything after this point
+        // depends on a tick that the wedged drain would never have delivered.
+        address_lookup.add_endpoint_info(endpoint_source.addr());
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+        let converged = loop {
+            let count = ledger_client.read().await.directive_count();
+            if count == source_count {
+                break true;
+            }
+            if tokio::time::Instant::now() > deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+
+        let _ = router_source.shutdown().await;
+        let _ = router_flood.shutdown().await;
+
+        assert!(
+            converged,
+            "H-10: the empty-page flood stopped anti-entropy with the healthy \
+             peer — client has {} of {source_count} directives",
+            ledger_client.read().await.directive_count()
+        );
     }
 
     // ── L-20: the spawned TTL sweep ──────────────────────────────────────
