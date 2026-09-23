@@ -368,6 +368,75 @@ impl LedgerDag {
         }
     }
 
+    /// The current heads that a NEW transaction whose content id is `new_id`
+    /// can name as its parents without closing a cycle (L-40).
+    ///
+    /// # The bug this closes
+    ///
+    /// A local append names **every** head as a parent (§3.3.1). A head is a
+    /// transaction nothing points at — but it may itself point at an id that
+    /// is not in the DAG yet, and content ids hash the economic body only, so
+    /// that id is computable by anyone who can guess the body of a future
+    /// transaction. Plant one such dangling `openledger-parents` (a hand edit,
+    /// a reconcile) and the victim's append of exactly that body names the
+    /// planted head as its parent while the planted head names it back: a
+    /// genuine two-node cycle, which [`Self::insert`] correctly refused with
+    /// `CYCLE_DETECTED` naming the victim's own new txid. The check was right;
+    /// the parent choice was what built the cycle.
+    ///
+    /// # Why here, and why not "just ignore the dangling edge"
+    ///
+    /// Relaxing I8 for a late arrival would admit a cycle into the `.bean`,
+    /// and the next boot's cycle pre-scan (T47) would quarantine **both**
+    /// transactions — the victim's included. The only acyclic outcome is for
+    /// the new transaction not to name anything that already descends from it.
+    /// By [`Self::pending_children`]'s invariant those are exactly the
+    /// descendants-or-self of `pending_children[new_id]`, which is the same set
+    /// [`Self::check_no_cycle`] searches, so excluding them makes the insert's
+    /// check pass by construction rather than by luck. The planted edge then
+    /// resolves normally when the new transaction lands, in the one direction
+    /// that is acyclic.
+    ///
+    /// # Cost
+    ///
+    /// Nothing on an honest ledger: `pending_children[new_id]` is empty unless
+    /// something already names this exact body, so this is one hash lookup and
+    /// a copy of the heads — what the caller built before. Otherwise the walk
+    /// is capped at half the I8 budget, which also guarantees the insert's own
+    /// check (two visits per step) then finishes inside its budget. Past that
+    /// cap it gives up on causal parents altogether and returns none: a
+    /// parentless transaction can never close a cycle, and losing the parent
+    /// links of one write on a deliberately crafted graph is a far smaller cost
+    /// than refusing the write.
+    pub fn heads_admissible_as_parents_of(&self, new_id: &str) -> Vec<&str> {
+        let Some(seeds) = self.pending_children.get(new_id) else {
+            return self.heads.iter().map(String::as_str).collect();
+        };
+
+        let mut descendants: HashSet<&str> = seeds.iter().map(String::as_str).collect();
+        let mut frontier: Vec<&str> = descendants.iter().copied().collect();
+        let mut budget = self.cycle_check_budget / 2;
+        while let Some(id) = frontier.pop() {
+            if budget == 0 {
+                return Vec::new();
+            }
+            budget -= 1;
+            if let Some(node) = self.nodes.get(id) {
+                for child in &node.children {
+                    if descendants.insert(child.as_str()) {
+                        frontier.push(child.as_str());
+                    }
+                }
+            }
+        }
+
+        self.heads
+            .iter()
+            .map(String::as_str)
+            .filter(|head| !descendants.contains(head))
+            .collect()
+    }
+
     // ─── Accessors ───────────────────────────────────────────────────────
 
     /// The current head txids (transactions with no children).
@@ -700,6 +769,76 @@ mod tests {
             matches!(error, DagError::CycleDetected { .. }),
             "got {error:?}"
         );
+    }
+
+    // ── L-40: parent choice must not build a cycle ───────────────────────
+
+    #[test]
+    fn l40_admissible_parents_are_all_heads_on_an_honest_dag() {
+        let mut dag = LedgerDag::new();
+        let a = insert_chain(&mut dag, "a", 3, None);
+        let b = insert_chain(&mut dag, "b", 2, None);
+        let mut admissible = dag.heads_admissible_as_parents_of(&"f".repeat(64));
+        admissible.sort_unstable();
+        let mut heads = vec![a[2].as_str(), b[1].as_str()];
+        heads.sort_unstable();
+        assert_eq!(admissible, heads);
+    }
+
+    /// The L-40 shape, one hop removed: `planted` names the future `victim` as
+    /// its parent and has a descendant of its own. Neither `planted` nor
+    /// anything below it may be a parent of `victim`; an unrelated head may.
+    #[test]
+    fn l40_heads_descending_from_a_dangling_pointer_are_excluded() {
+        let mut dag = LedgerDag::new();
+        let victim = make_txn("victim", &[]);
+        let victim_id = compute_content_id(&victim);
+
+        let planted = make_txn("planted", &[victim_id.as_str()]);
+        let planted_id = match dag.insert(planted, false).unwrap() {
+            InsertResult::Inserted { content_id } => content_id,
+            other => panic!("{other:?}"),
+        };
+        let below = insert_chain(&mut dag, "below", 2, Some(&planted_id));
+        let unrelated = insert_chain(&mut dag, "unrelated", 1, None);
+
+        let admissible = dag.heads_admissible_as_parents_of(&victim_id);
+        assert_eq!(admissible, vec![unrelated[0].as_str()]);
+        assert!(!admissible.contains(&below[1].as_str()));
+
+        // Naming ALL heads is the cycle the finding reports ...
+        let all_heads: Vec<String> = dag.heads().iter().cloned().collect();
+        let all_heads: Vec<&str> = all_heads.iter().map(String::as_str).collect();
+        let mut cyclic = dag.clone();
+        assert!(matches!(
+            cyclic.insert(make_txn("victim", &all_heads), false),
+            Err(DagError::CycleDetected { .. })
+        ));
+        // ... and naming the admissible ones is not.
+        let admissible: Vec<String> = admissible.into_iter().map(str::to_owned).collect();
+        let admissible: Vec<&str> = admissible.iter().map(String::as_str).collect();
+        dag.insert(make_txn("victim", &admissible), false)
+            .expect("L-40: the admissible parents must never close a cycle");
+        assert!(dag.children_of(&victim_id).unwrap().contains(&planted_id));
+    }
+
+    /// Past half the I8 budget the walk gives up on parents entirely — a
+    /// parentless transaction cannot close a cycle — rather than handing the
+    /// insert a set it might then refuse.
+    #[test]
+    fn l40_an_exhausted_walk_yields_no_parents_rather_than_a_refusal() {
+        let mut dag = LedgerDag::with_cycle_check_budget(8);
+        let victim_id = compute_content_id(&make_txn("victim", &[]));
+        let planted = make_txn("planted", &[victim_id.as_str()]);
+        let planted_id = match dag.insert(planted, false).unwrap() {
+            InsertResult::Inserted { content_id } => content_id,
+            other => panic!("{other:?}"),
+        };
+        insert_chain(&mut dag, "below", 10, Some(&planted_id));
+        insert_chain(&mut dag, "unrelated", 1, None);
+
+        assert!(dag.heads_admissible_as_parents_of(&victim_id).is_empty());
+        dag.insert(make_txn("victim", &[]), false).unwrap();
     }
 
     #[test]

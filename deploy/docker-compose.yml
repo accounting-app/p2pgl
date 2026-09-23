@@ -48,8 +48,10 @@
 #
 # ── Reverse proxy / trustedProxies (M-04) ────────────────────────────────────
 # gl-node.docker.json deliberately ships with no `trustedProxies`, so it logs
-# the M-04 boot warning ("trustedProxies is empty while tls.mode is
-# terminated"). That is correct for this stack as shipped: there is no
+# the M-04 boot warning ("trustedProxies is empty on a node that sits behind a
+# reverse proxy …"). Once a terminator is added, list its address there too:
+# otherwise every client behind it shares one rate-limit bucket (M-04) AND one
+# per-IP connection share (`http.maxConnectionsPerIp`, M-33). That is correct for this stack as shipped: there is no
 # terminator, nothing sends X-Forwarded-For, and trusting a header nobody sets
 # would be strictly worse. The moment you add a terminator in front of these
 # loopback ports, add its address to gl-node.docker.json so the per-IP rate

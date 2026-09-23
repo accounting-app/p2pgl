@@ -55,6 +55,15 @@ const FORBIDDEN_API_KEYS: &[&str] = &[
 /// like `"hunter2"`, not to dictate a format.
 const MIN_API_KEY_BYTES: usize = 16;
 
+/// Whether `api_key` can be sent, and matched, as an `X-Api-Key` value (L-50).
+fn is_header_safe_api_key(api_key: &str) -> bool {
+    HeaderValue::from_str(api_key).is_ok()
+        && api_key
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+        && api_key.trim() == api_key
+}
+
 /// The denylisted value `api_key` matches, if any (L-08).
 ///
 /// Returns the canonical denylist entry rather than the operator's spelling, so
@@ -197,6 +206,13 @@ pub struct HttpConfig {
     /// Ceiling on concurrently served connections.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
+
+    /// Ceiling on concurrently served connections from one client address —
+    /// an IPv4 address or an IPv6 /64 (M-33). Addresses in `trustedProxies`
+    /// are exempt: a terminator carries every client through one address.
+    /// Values above `maxConnections` behave as `maxConnections`.
+    #[serde(default = "default_max_connections_per_ip")]
+    pub max_connections_per_ip: usize,
 }
 
 impl Default for HttpConfig {
@@ -205,6 +221,7 @@ impl Default for HttpConfig {
             header_read_timeout_seconds: default_header_read_timeout_seconds(),
             request_timeout_seconds: default_request_timeout_seconds(),
             max_connections: default_max_connections(),
+            max_connections_per_ip: default_max_connections_per_ip(),
         }
     }
 }
@@ -518,6 +535,10 @@ fn default_max_connections() -> usize {
     HttpServerSettings::default().max_connections
 }
 
+fn default_max_connections_per_ip() -> usize {
+    HttpServerSettings::default().max_connections_per_ip
+}
+
 /// Floor on both `http` timeouts, in seconds (M-13, L-22 style).
 ///
 /// `0` is the value that matters: a zero header-read timeout fires before any
@@ -554,6 +575,13 @@ const MIN_MAX_CONNECTIONS: usize = 8;
 /// default-configured host, so anything beyond it is a number chosen to mean
 /// "unlimited".
 const MAX_MAX_CONNECTIONS: usize = 65_536;
+
+/// Floor on `http.maxConnectionsPerIp` (M-33).
+///
+/// A browser opens up to six connections per host, and GraphiQL on a loopback
+/// node is a browser; below that the operator's own tab starts getting its
+/// connections closed.
+const MIN_MAX_CONNECTIONS_PER_IP: usize = 8;
 
 fn default_relay_mode() -> String {
     "n0".to_owned()
@@ -743,6 +771,24 @@ impl NodeConfig {
                     self.auth.api_key.len()
                 )));
             }
+
+            // L-50: the key is compared against an `X-Api-Key` header value, so
+            // it must be something a client can actually send. A non-ASCII or
+            // control-character key booted fine and then 401'd every request
+            // forever — `HeaderValue::to_str` fails on the client's side of the
+            // comparison, so no request can ever match — and surrounding
+            // whitespace is stripped from header values in transit, so a padded
+            // key can never match either. The same `HeaderValue::from_str`
+            // test `allowedHosts` and `cors.allowedOrigins` already get. The
+            // message deliberately does not echo the key.
+            if !is_header_safe_api_key(&self.auth.api_key) {
+                return Err(ConfigError::Validation(
+                    "auth.apiKey must be printable ASCII with no leading or trailing whitespace; \
+                     it is sent as the X-Api-Key header, and any other value can never match, \
+                     so the node would reject every request (401) forever"
+                        .to_owned(),
+                ));
+            }
         }
 
         if self.p2p.enabled && self.p2p.secret_key_path.is_empty() {
@@ -785,6 +831,18 @@ impl NodeConfig {
                 return Err(ConfigError::Validation(format!(
                     "cors.allowedOrigins contains invalid origin: {origin}"
                 )));
+            }
+            // L-52: `null` is the origin of every sandboxed iframe, `data:` and
+            // `file:` document at once — listing it trusts all of them, and the
+            // CORS layer would then echo `Access-Control-Allow-Origin: null`.
+            // The request guard refuses it regardless; refusing it here too
+            // means the config cannot claim a trust the node will not honour.
+            if origin.eq_ignore_ascii_case("null") {
+                return Err(ConfigError::Validation(
+                    "cors.allowedOrigins must not include \"null\"; it is the shared origin of \
+                     every sandboxed iframe, data: and file: document, and is never a trusted caller"
+                        .to_owned(),
+                ));
             }
         }
 
@@ -888,6 +946,20 @@ impl NodeConfig {
                  the ceiling there is no cap left to exhaust before the file-descriptor limit \
                  does",
                 self.http.max_connections
+            )));
+        }
+        // M-33: the per-IP share. Only a floor and the same absolute ceiling —
+        // a value above `maxConnections` is clamped to it at serve time rather
+        // than refused, so lowering the global cap never bricks a config that
+        // left this at its default.
+        if !(MIN_MAX_CONNECTIONS_PER_IP..=MAX_MAX_CONNECTIONS)
+            .contains(&self.http.max_connections_per_ip)
+        {
+            return Err(ConfigError::Validation(format!(
+                "http.maxConnectionsPerIp must be between {MIN_MAX_CONNECTIONS_PER_IP} and \
+                 {MAX_MAX_CONNECTIONS}, got {}; below the floor a browser's normal parallel \
+                 connections are refused",
+                self.http.max_connections_per_ip
             )));
         }
 
@@ -1036,6 +1108,7 @@ impl NodeConfig {
             header_read_timeout: Duration::from_secs(self.http.header_read_timeout_seconds),
             request_timeout: Duration::from_secs(self.http.request_timeout_seconds),
             max_connections: self.http.max_connections,
+            max_connections_per_ip: self.http.max_connections_per_ip,
         }
     }
 
@@ -1660,6 +1733,56 @@ mod tests {
             );
         }
         assert!(found >= 1, "expected to find a sample apiKey in the README");
+    }
+
+    // ── L-50: auth.apiKey must be sendable as a header ──────────────────────
+
+    #[test]
+    fn test_non_header_safe_api_keys_refused_at_boot() {
+        // Each of these booted pre-T55 and then 401'd every request forever:
+        // no client can send (or have delivered intact) a matching header.
+        for (label, key) in [
+            ("non-ASCII", "clé-secrète-0123456789abcdef"),
+            ("control character", "abcdefghij\u{0007}klmnopqrstuv"),
+            ("tab", "abcdefghij\tklmnopqrstuvwxyz"),
+            ("leading space", " abcdefghijklmnopqrstuvwxyz"),
+            ("trailing space", "abcdefghijklmnopqrstuvwxyz "),
+        ] {
+            let json = serde_json::json!({
+                "ledgerPath": "./data/ledger.bean",
+                "auth": { "enabled": true, "apiKey": key }
+            });
+            let file = write_temp_config(&json.to_string());
+            let error = NodeConfig::load_from_path(&file.path().to_path_buf())
+                .expect_err(&format!("a {label} key must be refused at boot (L-50)"));
+            let message = format!("{error}");
+            assert!(message.contains("auth.apiKey"), "{label}: {message}");
+            assert!(
+                !message.contains(key.trim()),
+                "{label}: the error must not echo the key: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_header_safe_api_key_with_inner_space_accepted() {
+        // Printable ASCII including an inner space is a sendable header value.
+        load_with_api_key("correct horse battery staple", false)
+            .expect("an inner space is header-safe");
+    }
+
+    // ── L-52: "null" is never an allowed origin ─────────────────────────────
+
+    #[test]
+    fn test_null_cors_origin_rejected() {
+        for spelling in ["null", "NULL"] {
+            let file = write_temp_config(&format!(
+                r#"{{ "ledgerPath": "./data/ledger.bean", "cors": {{ "allowedOrigins": ["{spelling}"] }} }}"#
+            ));
+            let error = NodeConfig::load_from_path(&file.path().to_path_buf())
+                .expect_err("Origin null must not be configurable (L-52)");
+            assert!(format!("{error}").contains("\"null\""), "{error}");
+        }
     }
 
     #[test]
@@ -2787,6 +2910,46 @@ mod tests {
                 "the error must name the offending value: {error_message}"
             );
         }
+    }
+
+    // ── M-33: http.maxConnectionsPerIp ───────────────────────────────────────
+
+    #[test]
+    fn test_max_connections_per_ip_defaults_and_wires_through() {
+        let file = write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean" }"#);
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        assert_eq!(config.http.max_connections_per_ip, 64);
+        assert_eq!(config.http_server_settings().max_connections_per_ip, 64);
+
+        let config = load_with_http_section(r#"{ "maxConnectionsPerIp": 16 }"#)
+            .expect("an in-bounds per-IP cap must load");
+        assert_eq!(config.http_server_settings().max_connections_per_ip, 16);
+    }
+
+    #[test]
+    fn test_max_connections_per_ip_floor_is_enforced() {
+        for value in ["0", "1", "7"] {
+            let Err(error) =
+                load_with_http_section(&format!(r#"{{ "maxConnectionsPerIp": {value} }}"#))
+            else {
+                panic!("maxConnectionsPerIp {value} must be refused");
+            };
+            let message = format!("{error}");
+            assert!(message.contains("http.maxConnectionsPerIp"), "{message}");
+            assert!(message.contains(&format!("got {value}")), "{message}");
+        }
+        load_with_http_section(&format!(
+            r#"{{ "maxConnectionsPerIp": {MIN_MAX_CONNECTIONS_PER_IP} }}"#
+        ))
+        .expect("exactly the floor must be accepted");
+    }
+
+    #[test]
+    fn test_lowering_max_connections_alone_does_not_brick_the_per_ip_default() {
+        // The default per-IP share (64) is above a lowered global cap; that is
+        // clamped at serve time, never refused at boot.
+        load_with_http_section(r#"{ "maxConnections": 32 }"#)
+            .expect("a global cap below the per-IP default must still boot");
     }
 
     #[test]

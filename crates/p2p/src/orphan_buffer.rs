@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 
 use ledger::model::Directive;
 
+use crate::anti_entropy::RefusalCache;
+
 /// Maximum number of orphans to buffer.
 pub const MAX_ORPHANS: usize = 10_000;
 /// Maximum orphans attributed to a single peer (M-3).
@@ -217,6 +219,34 @@ pub struct OrphanBuffer {
     max_bytes: usize,
     /// Per-peer byte budget (`MAX_ORPHAN_BYTES_PER_PEER`; overridable in tests).
     max_bytes_per_peer: usize,
+    /// A lower bound on every resident entry's `buffered_at` (L-54).
+    ///
+    /// `insert_waiting` used to run the full O(n) TTL sweep on EVERY insert —
+    /// and `drain_orphans` re-buffers a freed entry through `insert_waiting`,
+    /// under both the ledger and the buffer write locks, so a drain releasing k
+    /// account-waiting entries paid k full passes over the buffer. Nothing can
+    /// have expired before `oldest_buffered_at + MAX_ORPHAN_AGE`, so a sweep
+    /// before then is pure waste; this makes the check O(1) and a pass happen
+    /// only once something may genuinely be stale.
+    ///
+    /// Kept as a BOUND, not the exact minimum: inserts only lower it, removals
+    /// leave it (possibly stale, never wrong), and each full sweep recomputes it
+    /// exactly — so a stale bound costs at most one pass that then corrects it.
+    /// `None` exactly when the buffer is empty.
+    oldest_buffered_at: Option<Instant>,
+    /// Full sweeps actually performed; the observable L-54's tests read.
+    #[cfg(test)]
+    sweeps: usize,
+    /// Directives the anti-entropy path refused for good, per peer (L-34).
+    ///
+    /// Lives here because this buffer is already the node's one shared,
+    /// lock-guarded record of "what intake did with a directive it could not
+    /// stage": every ALPN ingest path reaches it, and its timer-driven
+    /// [`Self::evict_expired`] sweep ages this cache out on a quiet mesh too. A
+    /// separate handle would have to be threaded through every construction
+    /// site of the ALPN handler. It shares NO budget with the orphans: a refused
+    /// id is never buffered, and an orphan is never a refusal.
+    refusals: RefusalCache,
 }
 
 impl OrphanBuffer {
@@ -230,7 +260,21 @@ impl OrphanBuffer {
             total_bytes: 0,
             max_bytes: MAX_ORPHAN_BYTES,
             max_bytes_per_peer: MAX_ORPHAN_BYTES_PER_PEER,
+            oldest_buffered_at: None,
+            #[cfg(test)]
+            sweeps: 0,
+            refusals: RefusalCache::new(),
         }
+    }
+
+    /// The anti-entropy refusal cache (L-34). See the field docs.
+    pub fn refusals(&self) -> &RefusalCache {
+        &self.refusals
+    }
+
+    /// Mutable access to the anti-entropy refusal cache (L-34).
+    pub fn refusals_mut(&mut self) -> &mut RefusalCache {
+        &mut self.refusals
     }
 
     /// Test-only constructor with small byte budgets.
@@ -281,8 +325,10 @@ impl OrphanBuffer {
         // Expired entries first — they may be exactly what is holding the
         // budget this insert is about to be measured against. (The background
         // sweep in gl-node keeps this true on a quiet mesh too; see
-        // `evict_expired`.)
-        self.evict_expired(Instant::now());
+        // `evict_expired`.) O(1) unless something can actually have expired
+        // (L-54): see `oldest_buffered_at`.
+        let now = Instant::now();
+        self.evict_expired(now);
 
         // L-20: containment BEFORE the budget gates. A re-gossiped duplicate
         // changes nothing and costs nothing, so at a full buffer it must report
@@ -338,6 +384,10 @@ impl OrphanBuffer {
         }
         self.total_bytes += cost_bytes;
 
+        self.oldest_buffered_at = Some(
+            self.oldest_buffered_at
+                .map_or(now, |oldest| oldest.min(now)),
+        );
         self.entries.insert(
             id.clone(),
             OrphanEntry {
@@ -345,7 +395,7 @@ impl OrphanBuffer {
                 directive,
                 missing_parents,
                 missing_accounts,
-                buffered_at: Instant::now(),
+                buffered_at: now,
                 from_peer,
                 cost_bytes,
             },
@@ -398,6 +448,7 @@ impl OrphanBuffer {
                 resolved.push(entry);
             }
         }
+        self.forget_bound_if_empty();
         self.debug_assert_accounting_drained();
         resolved
     }
@@ -467,17 +518,46 @@ impl OrphanBuffer {
     /// The trade flips if `MAX_ORPHANS` grows by an order of magnitude, since
     /// the hold is linear in the buffer and the contention it creates is on the
     /// P2P receive path. Raising that constant is the signal to revisit this.
+    ///
+    /// ## Amortized (L-54)
+    ///
+    /// The pass only runs once the oldest resident entry can have expired —
+    /// `oldest_buffered_at` is a lower bound on every `buffered_at` — so
+    /// the per-insert call in `insert_waiting` (and with it every re-buffer a
+    /// drain performs under both write locks) is O(1) until something is
+    /// genuinely stale, and the pass that then runs re-derives the bound.
+    ///
+    /// Also ages out the anti-entropy refusal cache (L-34), whose own sweep
+    /// costs only what it evicts.
     pub fn evict_expired(&mut self, now: Instant) -> Vec<String> {
-        let expired: Vec<String> = self
-            .entries
-            .iter()
-            .filter(|(_, entry)| now.saturating_duration_since(entry.buffered_at) > MAX_ORPHAN_AGE)
-            .map(|(id, _)| id.clone())
-            .collect();
+        self.refusals.evict_expired(now);
+        let Some(oldest) = self.oldest_buffered_at else {
+            return Vec::new();
+        };
+        if now.saturating_duration_since(oldest) <= MAX_ORPHAN_AGE {
+            return Vec::new();
+        }
+        #[cfg(test)]
+        {
+            self.sweeps += 1;
+        }
+
+        let mut expired: Vec<String> = Vec::new();
+        let mut survivors_oldest: Option<Instant> = None;
+        for (id, entry) in &self.entries {
+            if now.saturating_duration_since(entry.buffered_at) > MAX_ORPHAN_AGE {
+                expired.push(id.clone());
+            } else {
+                survivors_oldest = Some(
+                    survivors_oldest.map_or(entry.buffered_at, |at| at.min(entry.buffered_at)),
+                );
+            }
+        }
 
         for id in &expired {
             self.remove(id);
         }
+        self.oldest_buffered_at = survivors_oldest;
         expired
     }
 
@@ -526,7 +606,17 @@ impl OrphanBuffer {
                 }
             }
         }
+        self.forget_bound_if_empty();
         self.debug_assert_accounting_drained();
+    }
+
+    /// An empty buffer has no oldest entry (L-54), so the next insert starts
+    /// the bound afresh instead of inheriting a stale one that would trigger a
+    /// pointless pass.
+    fn forget_bound_if_empty(&mut self) {
+        if self.entries.is_empty() {
+            self.oldest_buffered_at = None;
+        }
     }
 
     /// An empty buffer must own no budget (L-20).
@@ -1132,6 +1222,133 @@ mod tests {
             "eviction must clear the reverse index too, or `want` names a parent \
              nothing is waiting for"
         );
+    }
+
+    /// L-54: re-buffering is O(1) in the buffer's size. A drain that frees and
+    /// re-buffers every entry — the `restage_freed_entry` shape, under both
+    /// write locks in `gl-node` — used to run one full TTL pass PER re-buffer;
+    /// with nothing old enough to have expired it now runs none at all, and a
+    /// pass happens exactly when something can be stale.
+    #[test]
+    fn test_rebuffering_does_not_sweep_until_something_can_have_expired() {
+        const ENTRIES: usize = 500;
+        let mut buf = OrphanBuffer::new();
+        for index in 0..ENTRIES {
+            buf.insert_awaiting_accounts(
+                format!("id{index}"),
+                make_directive(&format!("wait-{index}")),
+                vec!["Assets:Cash".to_owned()],
+                Some("peer-a".to_owned()),
+            );
+        }
+        // The drain: release everything waiting on the account, then put each
+        // entry back under a new blocking account, one insert at a time.
+        let freed = buf.account_opened("Assets:Cash");
+        assert_eq!(freed.len(), ENTRIES);
+        for entry in freed {
+            let outcome = buf.insert_awaiting_accounts(
+                entry.id,
+                entry.directive,
+                vec!["Assets:Bank".to_owned()],
+                entry.from_peer,
+            );
+            assert_eq!(outcome, OrphanInsert::Buffered);
+        }
+        assert_eq!(buf.len(), ENTRIES);
+        assert_eq!(
+            buf.sweeps,
+            0,
+            "{} inserts must not have run a single O(n) TTL pass",
+            ENTRIES * 2
+        );
+        // The background sweep is O(1) too while nothing is old enough.
+        assert!(buf.evict_expired(Instant::now()).is_empty());
+        assert_eq!(buf.sweeps, 0);
+
+        // Once the oldest CAN have expired, exactly one pass runs, evicts, and
+        // re-derives the bound (the buffer is empty, so there is none).
+        let later = Instant::now() + MAX_ORPHAN_AGE + Duration::from_secs(1);
+        assert_eq!(buf.evict_expired(later).len(), ENTRIES);
+        assert_eq!(buf.sweeps, 1);
+        assert!(buf.is_empty());
+        assert_eq!(buf.total_cost_bytes(), 0);
+        assert!(buf.evict_expired(later).is_empty());
+        assert_eq!(buf.sweeps, 1, "an empty buffer is never swept");
+    }
+
+    /// L-54: the bound is a LOWER bound, so a pass is never skipped while an
+    /// entry is stale, and survivors keep their own expiry after a pass.
+    #[test]
+    fn test_amortized_eviction_never_skips_a_stale_entry() {
+        let mut buf = OrphanBuffer::new();
+        let before = Instant::now();
+        buf.insert(
+            "old".to_owned(),
+            make_directive("old"),
+            vec!["p".to_owned()],
+            None,
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        let middle = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        buf.insert(
+            "new".to_owned(),
+            make_directive("new"),
+            vec!["q".to_owned()],
+            None,
+        );
+
+        // Past "old"'s TTL but not "new"'s: exactly "old" goes.
+        let between = middle + MAX_ORPHAN_AGE;
+        assert!(between > before + MAX_ORPHAN_AGE);
+        assert_eq!(buf.evict_expired(between), vec!["old".to_owned()]);
+        assert_eq!(buf.len(), 1);
+        // The re-derived bound still covers "new".
+        let past_new = Instant::now() + MAX_ORPHAN_AGE + Duration::from_secs(1);
+        assert_eq!(buf.evict_expired(past_new), vec!["new".to_owned()]);
+        // Removing the oldest by resolution leaves a stale (early) bound: it
+        // costs at most one pass, which evicts nothing wrongly.
+        buf.insert(
+            "a".to_owned(),
+            make_directive("a"),
+            vec!["pa".to_owned()],
+            None,
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        // Taken before "b" is inserted, so "b" is at most one TTL old at
+        // `b_at_ttl` — while the stale bound ("a") is strictly older than that.
+        let before_b = Instant::now();
+        buf.insert(
+            "b".to_owned(),
+            make_directive("b"),
+            vec!["pb".to_owned()],
+            None,
+        );
+        assert_eq!(buf.parent_arrived("pa").len(), 1);
+        let sweeps_before = buf.sweeps;
+        let b_at_ttl = before_b + MAX_ORPHAN_AGE;
+        assert!(buf.evict_expired(b_at_ttl).is_empty(), "b is still fresh");
+        assert_eq!(buf.len(), 1);
+        assert_eq!(
+            buf.sweeps,
+            sweeps_before + 1,
+            "the stale bound cost one pass"
+        );
+        assert!(buf.evict_expired(b_at_ttl).is_empty());
+        assert_eq!(buf.sweeps, sweeps_before + 1, "...which corrected it");
+    }
+
+    /// L-34: the refusal cache the buffer hosts is aged out by the same
+    /// timer-driven sweep, even when there are no orphans at all.
+    #[test]
+    fn test_evict_expired_also_ages_out_refusals() {
+        let mut buf = OrphanBuffer::new();
+        let id = format!("{:064x}", 7);
+        let now = Instant::now();
+        assert!(buf.refusals_mut().record("peer-a", &id, now));
+        assert!(buf.refusals().is_refused("peer-a", &id, now));
+        buf.evict_expired(now + crate::anti_entropy::REFUSAL_CACHE_TTL);
+        assert!(buf.refusals().is_empty());
     }
 
     /// The sweep cadence stays a derivation of the TTL, not an independent

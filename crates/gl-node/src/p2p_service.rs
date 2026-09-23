@@ -745,8 +745,9 @@ impl NodeSecretKey {
     ///
     /// Until then the mitigation is operational and already in place: the file
     /// is 0600, created `O_EXCL`, read through a single `fstat`ed handle
-    /// (L-04/L-32), zeroized here, and never logged (see the `Debug` impl
-    /// below).
+    /// (L-04/L-32) that is never reached through a symlink and must be owned
+    /// by the node's own uid (L-49), zeroized here, and never logged (see the
+    /// `Debug` impl below).
     pub(crate) fn bytes(&self) -> &[u8; 32] {
         &self.bytes
     }
@@ -780,8 +781,10 @@ enum KeyFileState {
 /// Open the key file **once** and read the key out of that same handle (L-04).
 ///
 /// Every check below is made against the open file description — the permission
-/// check `fstat`s the handle, the bytes come off the handle — so nothing between
-/// here and the parsed key can be swapped underneath us by relinking the path.
+/// and owner checks `fstat` the handle, the bytes come off the handle — so
+/// nothing between here and the parsed key can be swapped underneath us by
+/// relinking the path. The open itself refuses a symlink at the path (L-49; see
+/// [`open_secret_key_file`]).
 ///
 /// The permission check runs *before* the emptiness check on purpose. A
 /// zero-length file carries no key to leak, so the order is not about
@@ -789,18 +792,8 @@ enum KeyFileState {
 /// worth stopping on, whoever left it, and the artifact this function is
 /// tolerant of (a crashed `write_secret_key_file`) is 0600 by construction.
 fn read_secret_key_file(path: &Path) -> Result<KeyFileState, Box<dyn std::error::Error>> {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(KeyFileState::Missing)
-        }
-        Err(error) => {
-            return Err(format!(
-                "Secret key file {} could not be opened: {error}",
-                path.display()
-            )
-            .into())
-        }
+    let Some(mut file) = open_secret_key_file(path)? else {
+        return Ok(KeyFileState::Missing);
     };
 
     ensure_secret_key_permissions(&file, path)?;
@@ -879,20 +872,131 @@ pub(crate) fn load_or_create_secret_key(
     Ok(NodeSecretKey { bytes })
 }
 
-/// Refuse to use a secret key file that is group- or world-readable (C-2).
+/// Open the key file without following a symlink at its final component (L-49).
+///
+/// `Ok(None)` means nothing is at the path — the caller's cue to create a key.
+///
+/// The write path refuses an existing directory entry via `O_EXCL`; before L-49
+/// the read path had no counterpart, so a symlink planted at the key path was
+/// followed and whatever 0600 file it named was adopted as this node's identity.
+/// That key is both the QUIC identity and the ledger signing key, so adopting a
+/// file someone else chose is full node impersonation.
+///
+/// The textbook fix is `open(O_NOFOLLOW)`, but `std` exposes no portable
+/// constant for it and `gl-node` deliberately has no `libc` dependency (its
+/// value differs across Linux architectures, so hard-coding it is worse). The
+/// equivalent here is `lstat` → refuse anything that is not a regular file →
+/// `open` → require the opened handle's `(st_dev, st_ino)` to equal the
+/// `lstat`'s. If the path is relinked to a symlink (or anything else) between
+/// the two calls, the descriptor names a different inode and is refused, so the
+/// only file that can be read is one that was, at `lstat` time, a plain file at
+/// the path itself. Every later check still runs on the handle (L-04).
+#[cfg(unix)]
+fn open_secret_key_file(path: &Path) -> Result<Option<File>, Box<dyn std::error::Error>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let link_metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Secret key file {} could not be inspected: {error}",
+                path.display()
+            )
+            .into())
+        }
+    };
+    if link_metadata.file_type().is_symlink() {
+        return Err(format!(
+            "Secret key file {} is a symbolic link; refusing to follow it — the node key \
+             must be a regular file at the configured path (L-49)",
+            path.display()
+        )
+        .into());
+    }
+    if !link_metadata.file_type().is_file() {
+        return Err(format!(
+            "Secret key file {} is not a regular file; refusing to read it (L-49)",
+            path.display()
+        )
+        .into());
+    }
+
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            return Err(format!(
+                "Secret key file {} could not be opened: {error}",
+                path.display()
+            )
+            .into())
+        }
+    };
+
+    let handle_metadata = file.metadata()?;
+    if (handle_metadata.dev(), handle_metadata.ino()) != (link_metadata.dev(), link_metadata.ino())
+    {
+        return Err(format!(
+            "Secret key file {} was replaced while being opened; refusing to read it (L-49)",
+            path.display()
+        )
+        .into());
+    }
+    Ok(Some(file))
+}
+
+/// Non-Unix: a plain open. There is no `lstat`/inode identity to pin here, and
+/// the platform's ACLs are what govern the file — see the L-05 warning in
+/// [`ensure_secret_key_permissions`].
+#[cfg(not(unix))]
+fn open_secret_key_file(path: &Path) -> Result<Option<File>, Box<dyn std::error::Error>> {
+    match File::open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "Secret key file {} could not be opened: {error}",
+            path.display()
+        )
+        .into()),
+    }
+}
+
+/// Refuse to use a secret key file that is group- or world-readable (C-2), or
+/// that this process does not own (L-49).
 ///
 /// Takes the **open handle**, not the path: `File::metadata` is `fstat(2)` on the
-/// descriptor we are about to read, so the mode reported is the mode of the inode
-/// whose bytes become the key. A path-based `stat` would leave the classic
-/// check-then-use window, where the mode of one file licenses reading another
-/// (L-04).
+/// descriptor we are about to read, so the mode and owner reported are those of
+/// the inode whose bytes become the key. A path-based `stat` would leave the
+/// classic check-then-use window, where the metadata of one file licenses
+/// reading another (L-04).
+///
+/// The owner check is what makes the mode check meaningful. 0600 says "only the
+/// owner can read this", which protects us only if the owner is us: a 0600 key
+/// pre-planted by another account (in a shared or group-writable data
+/// directory) passes the mode check and would otherwise become this node's
+/// identity — the same impersonation the `O_EXCL` write path already refuses.
 #[cfg(unix)]
 fn ensure_secret_key_permissions(
     file: &File,
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = file.metadata()?.permissions().mode() & 0o777;
+    ensure_secret_key_permissions_for_uid(file, path, effective_uid())
+}
+
+/// [`ensure_secret_key_permissions`] with the expected owner passed in, so a
+/// test can run the real handle-based check as if the process were another
+/// account — the only way to exercise the owner refusal end to end without
+/// `chown`.
+#[cfg(unix)]
+fn ensure_secret_key_permissions_for_uid(
+    file: &File,
+    path: &Path,
+    effective_uid: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = file.metadata()?;
+    ensure_secret_key_owner(metadata.uid(), effective_uid, path)?;
+    let mode = metadata.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
         return Err(format!(
             "Secret key file {} has overly permissive mode {mode:o}; expected 0600",
@@ -901,6 +1005,44 @@ fn ensure_secret_key_permissions(
         .into());
     }
     Ok(())
+}
+
+/// The uid comparison behind the L-49 owner check, split out so it is testable
+/// without `chown` (which a non-root test run cannot do).
+///
+/// Strict equality, root included: a root-run node handed a key owned by some
+/// other account is exactly the "adopted someone else's identity" case, and the
+/// remedy (`chown` the file to the account that runs the node) is one command.
+#[cfg(unix)]
+fn ensure_secret_key_owner(
+    file_uid: u32,
+    effective_uid: u32,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if file_uid != effective_uid {
+        return Err(format!(
+            "Secret key file {} is owned by uid {file_uid}, but this node runs as uid \
+             {effective_uid}; refusing to adopt a key another account controls — chown it \
+             to the node's user (L-49)",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// `geteuid(2)`: the uid file ownership is checked against (L-49).
+///
+/// Declared directly, as `main.rs`'s test-only `umask` is, rather than adding a
+/// `libc` dependency for one call. `uid_t` is `u32` on every Unix this builds
+/// for (Linux, macOS, the BSDs), and `geteuid` takes no arguments, cannot fail
+/// and touches no memory, which is what makes it sound to declare `safe`.
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    unsafe extern "C" {
+        safe fn geteuid() -> u32;
+    }
+    geteuid()
 }
 
 /// Non-Unix: there is no mode to check, so say so instead of returning `Ok(())`
@@ -1589,6 +1731,11 @@ mod tests {
     /// ledger's `persist_atomically` temp file relies on). The old
     /// `create(true).truncate(true)` followed the link and created/overwrote the
     /// target with a fresh 32-byte identity.
+    ///
+    /// Since L-49 the load path refuses the dangling link before the writer is
+    /// ever reached, so this drives `write_secret_key_file` directly to keep the
+    /// `O_EXCL` property pinned on its own, and then checks the end-to-end path
+    /// too.
     #[cfg(unix)]
     #[test]
     fn test_secret_key_write_refuses_to_follow_a_planted_symlink() {
@@ -1597,19 +1744,160 @@ mod tests {
         let attacker_target = dir.path().join("attacker-owned");
         std::os::unix::fs::symlink(&attacker_target, &key_path).expect("plant symlink");
 
-        let error = load_or_create_secret_key(&key_path)
+        let error = write_secret_key_file(&key_path, &hex::encode([5u8; 32]))
             .expect_err("a planted symlink at the key path must not be written through");
+        let message = error.to_string();
+        assert!(
+            message.contains("exists"),
+            "expected an O_EXCL 'already exists' failure, got: {message}"
+        );
+
+        load_or_create_secret_key(&key_path)
+            .expect_err("the load-or-create path must refuse the planted symlink too");
 
         assert!(
             !attacker_target.exists(),
             "the key must not have been written to the symlink's target: {}",
             attacker_target.display()
         );
-        let message = error.to_string();
+    }
+
+    // ── L-49: the read path neither follows symlinks nor adopts foreign keys ──
+
+    /// A symlink at the key path pointing at a *valid*, 0600, same-uid key
+    /// must be refused, not adopted.
+    ///
+    /// This is the read-side twin of the `O_EXCL` write test above. Before L-49
+    /// the read used a plain `File::open`, which followed the link; the target
+    /// passed the mode check (0600, and ours), and its bytes became this node's
+    /// QUIC identity and signing key — a key whose location someone else chose.
+    /// Both loaders are checked, since `signing.enabled` without p2p uses the
+    /// load-only one.
+    #[cfg(unix)]
+    #[test]
+    fn test_secret_key_read_refuses_to_follow_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let planted_key = dir.path().join("elsewhere.secret");
+        write_secret_key_file(&planted_key, &hex::encode([0x42u8; 32]))
+            .expect("write a well-formed 0600 key to the symlink target");
+        let key_path = dir.path().join("node.secret");
+        std::os::unix::fs::symlink(&planted_key, &key_path).expect("plant symlink");
+
+        for (loader, result) in [
+            (
+                "load_or_create_secret_key",
+                load_or_create_secret_key(&key_path),
+            ),
+            ("load_secret_key", load_secret_key(&key_path)),
+        ] {
+            match result {
+                Ok(adopted) => panic!(
+                    "{loader} adopted the key through a symlink (adopted planted key: {})",
+                    adopted.bytes() == &[0x42u8; 32]
+                ),
+                Err(error) => assert!(
+                    error.to_string().contains("symbolic link"),
+                    "{loader}: expected a symlink refusal, got: {error}"
+                ),
+            }
+        }
         assert!(
-            message.contains("exists"),
-            "expected an O_EXCL 'already exists' failure, got: {message}"
+            std::fs::symlink_metadata(&key_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the refusal must leave the path untouched, not replace the link"
         );
+    }
+
+    /// A non-regular file (here a directory) at the key path is refused with a
+    /// clear message rather than an opaque read error — and, for a FIFO, rather
+    /// than an `open` that blocks boot forever.
+    #[cfg(unix)]
+    #[test]
+    fn test_secret_key_read_refuses_a_non_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("a-directory.secret");
+        std::fs::create_dir(&key_path).unwrap();
+
+        let error = load_secret_key(&key_path).expect_err("a directory is not a key file");
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "got: {error}"
+        );
+    }
+
+    /// The owner comparison: a key owned by any uid other than ours is refused,
+    /// root included; our own is accepted.
+    ///
+    /// A non-root test cannot `chown` a file to another account, so this drives
+    /// the extracted comparison directly. The next test pins that the uid it is
+    /// fed in production is really the process's effective uid.
+    #[cfg(unix)]
+    #[test]
+    fn test_secret_key_owned_by_another_uid_is_refused() {
+        let path = Path::new("/data/p2p.secret");
+        let ours = effective_uid();
+
+        ensure_secret_key_owner(ours, ours, path).expect("our own key must be accepted");
+
+        for foreign in [ours.wrapping_add(1), ours.wrapping_sub(1), 0, 65_534] {
+            if foreign == ours {
+                continue;
+            }
+            let error = ensure_secret_key_owner(foreign, ours, path)
+                .expect_err("a key owned by another uid must be refused");
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("owned by uid {foreign}")),
+                "got: {message}"
+            );
+        }
+    }
+
+    /// The owner check is wired to the **handle**: our own 0600 key, checked
+    /// as if the node ran as a different uid, is refused — the situation of a
+    /// node reading a 0600 key another account planted. (The reverse — a file
+    /// really owned by someone else — cannot be produced without root.)
+    #[cfg(unix)]
+    #[test]
+    fn test_permission_check_refuses_a_key_owned_by_another_uid() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("foreign.secret");
+        write_secret_key_file(&key_path, &hex::encode([6u8; 32])).unwrap();
+        let file = File::open(&key_path).unwrap();
+        let ours = effective_uid();
+
+        ensure_secret_key_permissions_for_uid(&file, &key_path, ours)
+            .expect("a 0600 key owned by the node's uid passes");
+        let error = ensure_secret_key_permissions_for_uid(&file, &key_path, ours.wrapping_add(1))
+            .expect_err("a 0600 key owned by another uid must be refused");
+        assert!(
+            error.to_string().contains(&format!("owned by uid {ours}")),
+            "got: {error}"
+        );
+    }
+
+    /// `effective_uid()` (the hand-declared `geteuid`) must agree with the
+    /// owner the kernel stamps on a file this process creates — otherwise the
+    /// L-49 check would refuse every legitimately created key, or accept every
+    /// foreign one. The full load path must then accept that file.
+    #[cfg(unix)]
+    #[test]
+    fn test_effective_uid_matches_the_owner_of_a_key_we_create() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("own.secret");
+        let created = load_or_create_secret_key(&key_path).expect("create");
+
+        assert_eq!(
+            std::fs::metadata(&key_path).unwrap().uid(),
+            effective_uid(),
+            "geteuid must match the owner of a file this process just created"
+        );
+        let reloaded = load_secret_key(&key_path).expect("our own key must load");
+        assert_eq!(created.bytes(), reloaded.bytes());
     }
 
     /// An empty key file — what a write that died between `create_new` and

@@ -7,6 +7,12 @@
 //! the browser as same-origin with the node, so even a strict CORS allowlist
 //! never gets consulted. The guard runs as the outermost layer of the GraphQL
 //! routes — before rate limiting and auth — and rejects those shapes.
+//!
+//! `/health` is behind it too (H-01 residual, T55): on a loopback bind the
+//! health body carries the version, head count and peer count, and without the
+//! Host check a rebound `evil.com` page could read them exactly as it once
+//! could `/graphql`. The Docker `HEALTHCHECK` is unaffected — it addresses
+//! the node as `127.0.0.1` or `::1`, which are always in the allowed set.
 
 use axum::body::Body;
 use axum::extract::State;
@@ -24,6 +30,10 @@ pub struct RequestGuardState {
     pub allowed_hosts: Arc<HashSet<String>>,
     /// Exact origin strings from `cors.allowedOrigins`.
     pub allowed_origins: Arc<HashSet<String>>,
+    /// `tls.mode == "terminated"`: the public origin of this node is `https`,
+    /// whatever scheme the hop from the terminator used (L-51). See
+    /// [`origin_allowed`].
+    pub tls_terminated: bool,
 }
 
 const HOST_REJECTION: &str = "request Host is not an allowed host for this node";
@@ -115,6 +125,7 @@ pub async fn request_guard(
                 &authority,
                 &guard_state.allowed_origins,
                 &guard_state.allowed_hosts,
+                guard_state.tls_terminated,
             ) {
                 warn!(%origin, "rejected cross-origin POST");
                 return reject(StatusCode::FORBIDDEN, ORIGIN_REJECTION);
@@ -138,32 +149,71 @@ fn reject(status: StatusCode, message: &'static str) -> Response {
 /// bound to loopback a writable ledger. Such a dev origin is admitted only by
 /// listing it in `cors.allowedOrigins`.
 ///
-/// `Origin: null` — sandboxed iframes, `data:` and `file:` documents — matches
-/// neither arm and is deliberately rejected: those contexts are opaque and are
-/// not trusted callers.
+/// **The scheme matters too (L-51).** An origin is scheme + host + port, and
+/// before T55 this arm stripped the scheme and compared the rest — so behind
+/// the TLS terminator a public bind is required to have, a page served over
+/// plaintext `http://<node-host>` read as same-origin with the node. That page
+/// is exactly the one an on-path attacker can inject script into, and the
+/// node's real origin never serves it. What "same origin" means here:
+///
+/// * **`tls.mode: "terminated"`** — the browser reached this node through the
+///   terminator, so its origin is `https://<host>[:port]`. The hop from the
+///   terminator to us is plaintext, but that hop is not what the browser sees,
+///   and the `Host` the terminator forwards names the public authority. So
+///   only `https` is same-origin — with one exception: a loopback host
+///   (`localhost`, `127.0.0.1`, `::1`) is also accepted over `http`, because
+///   such a page never crossed a network an attacker could sit on, and it is
+///   what an operator gets pointing a browser at the node's own port while a
+///   terminator fronts everyone else.
+/// * **`tls.mode: "disabled"`** — the node serves plaintext itself, so its own
+///   origin is `http`; `https` is also accepted, because a TLS origin is never
+///   the weaker of the two and a terminator the config was not told about may
+///   be in front. The node cannot be stricter here without knowing more, and
+///   the remedy for a node that *is* behind a terminator is to say so with
+///   `tls.mode: "terminated"`.
+///
+/// `Origin: null` — sandboxed iframes, `data:` and `file:` documents — is
+/// refused before either arm is consulted (L-52): those contexts are opaque,
+/// every one of them serializes to the same string, and they are not trusted
+/// callers. Config validation refuses `"null"` in `cors.allowedOrigins` as
+/// well, so this is the backstop, not the only line.
 fn origin_allowed(
     origin: &str,
     request_authority: &str,
     allowed_origins: &HashSet<String>,
     allowed_hosts: &HashSet<String>,
+    tls_terminated: bool,
 ) -> bool {
+    if origin.eq_ignore_ascii_case("null") {
+        return false;
+    }
     if allowed_origins.contains(origin) {
         return true;
     }
-    let authority = match origin
-        .strip_prefix("http://")
-        .or_else(|| origin.strip_prefix("https://"))
-    {
-        Some(authority) => authority,
-        None => return false,
+    let (secure, authority) = match origin.strip_prefix("https://") {
+        Some(authority) => (true, authority),
+        None => match origin.strip_prefix("http://") {
+            Some(authority) => (false, authority),
+            None => return false,
+        },
     };
     // A serialized origin is scheme + authority and nothing else.
     if authority.is_empty() || authority.contains('/') {
         return false;
     }
     let (origin_host, origin_port) = split_authority(authority);
+    let origin_host = origin_host.to_ascii_lowercase();
     let (_, request_port) = split_authority(request_authority);
-    allowed_hosts.contains(&origin_host.to_ascii_lowercase()) && origin_port == request_port
+    if !allowed_hosts.contains(&origin_host) || origin_port != request_port {
+        return false;
+    }
+    secure || !tls_terminated || is_loopback_host(&origin_host)
+}
+
+/// The built-in loopback names (L-51). Deliberately the literal set config
+/// always admits, not a resolver call: an origin host is attacker-chosen text.
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 /// Reduce an authority (`Host` header or origin authority) to a comparable host.
@@ -277,6 +327,7 @@ mod tests {
         RequestGuardState {
             allowed_hosts: Arc::new(config.allowed_host_set()),
             allowed_origins: Arc::new(config.cors.allowed_origins.iter().cloned().collect()),
+            tls_terminated: config.tls.mode == "terminated",
         }
     }
 
@@ -546,17 +597,198 @@ mod tests {
         assert_ne!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
+    // — H-01 residual / L-42: /health is Host-guarded and rate-limited —
+
     #[tokio::test]
-    async fn test_health_is_not_host_guarded() {
-        // /health stays outside the guard on purpose: Docker probes it over
-        // loopback with whatever Host it likes, and it discloses nothing
-        // writable. Gating it further is L-09 (T40).
+    async fn test_health_rejects_a_rebinding_host() {
+        // A loopback node's /health carries version, head count and peer
+        // count; a DNS-rebound `evil.example.com` page must not read them. The
+        // pre-T55 router answered this with 200 and the full body.
         let (_dir, application) = default_app();
         let request = Request::get("/health")
             .header(header::HOST, "evil.example.com")
             .body(Body::empty())
             .unwrap();
         let response = application.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_health_answers_every_host_the_docker_probe_can_send() {
+        // `probe_local_health` sends `Host: 127.0.0.1` for a 0.0.0.0 bind and
+        // `Host: ::1` (bare, unbracketed) for a `::` bind; an operator's curl
+        // sends `localhost:<port>`. All three must keep passing.
+        for host in ["127.0.0.1", "::1", "localhost:3000", "[::1]:3000"] {
+            let (_dir, application) = default_app();
+            let request = Request::get("/health")
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .unwrap();
+            let response = application.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "Host {host} must pass");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_health_is_rate_limited_on_its_own_budget() {
+        // L-42: unmetered, every /health call took the ledger read lock. It
+        // now has a limiter — a sibling of GraphQL's, so exhausting one does
+        // not spend the other (the Docker probe shares loopback with local
+        // GraphQL clients).
+        let (_dir, application) = default_app();
+        let health = || {
+            Request::get("/health")
+                .header(header::HOST, "127.0.0.1:4000")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Spend the whole GraphQL budget first.
+        for _ in 0..crate::rate_limit::GRAPHQL_RATE_LIMIT {
+            let response = application
+                .clone()
+                .oneshot(graphql_post().body(Body::from(VALID_BODY)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let response = application
+            .clone()
+            .oneshot(graphql_post().body(Body::from(VALID_BODY)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // /health still has all of its own.
+        for attempt in 0..crate::rate_limit::HEALTH_RATE_LIMIT {
+            let response = application.clone().oneshot(health()).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "health request {attempt} must not be charged to GraphQL's budget"
+            );
+        }
+        let response = application.clone().oneshot(health()).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "past its own budget /health is limited too (L-42)"
+        );
+    }
+
+    // — L-51: scheme-aware same-origin —
+
+    fn terminated_state() -> RequestGuardState {
+        let config = load_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "tls": { "mode": "terminated" }, "allowedHosts": ["ledger.example.com"] }"#,
+        );
+        let state = guard_state(&config);
+        assert!(state.tls_terminated);
+        state
+    }
+
+    #[test]
+    fn test_plaintext_origin_is_not_same_origin_behind_a_terminator() {
+        // The L-51 shape: Host is the public name the terminator forwarded, and
+        // a plaintext page on that name must not pass as same-origin.
+        let state = terminated_state();
+        let allowed = |origin: &str| {
+            origin_allowed(
+                origin,
+                "ledger.example.com",
+                &state.allowed_origins,
+                &state.allowed_hosts,
+                state.tls_terminated,
+            )
+        };
+        assert!(
+            !allowed("http://ledger.example.com"),
+            "a plaintext page is a different origin from the TLS-terminated node (L-51)"
+        );
+        assert!(allowed("https://ledger.example.com"));
+    }
+
+    #[test]
+    fn test_loopback_http_origin_still_passes_behind_a_terminator() {
+        // A loopback page never crossed a network, so it keeps working even
+        // when tls.mode says a terminator fronts everyone else.
+        let state = terminated_state();
+        for (origin, authority) in [
+            ("http://127.0.0.1:4000", "127.0.0.1:4000"),
+            ("http://localhost:4000", "localhost:4000"),
+            ("http://[::1]:4000", "[::1]:4000"),
+        ] {
+            assert!(
+                origin_allowed(
+                    origin,
+                    authority,
+                    &state.allowed_origins,
+                    &state.allowed_hosts,
+                    state.tls_terminated,
+                ),
+                "{origin} must stay same-origin on loopback"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plaintext_origin_post_is_rejected_behind_a_terminator() {
+        // The same rule through the real router.
+        let (_dir, application) = build_test_app(terminated_state());
+        let request = Request::post("/graphql")
+            .header(header::HOST, "ledger.example.com")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "http://ledger.example.com")
+            .body(Body::from(VALID_BODY))
+            .unwrap();
+        let response = application.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let (_dir, application) = build_test_app(terminated_state());
+        let request = Request::post("/graphql")
+            .header(header::HOST, "ledger.example.com")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "https://ledger.example.com")
+            .body(Body::from(VALID_BODY))
+            .unwrap();
+        let response = application.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_loopback_dev_keeps_plaintext_same_origin() {
+        // tls.mode "disabled": the node serves http itself, so its own http
+        // origin is same-origin (GraphiQL on loopback depends on this).
+        let state = guard_state(&default_config());
+        assert!(!state.tls_terminated);
+        assert!(origin_allowed(
+            "http://127.0.0.1:4000",
+            "127.0.0.1:4000",
+            &state.allowed_origins,
+            &state.allowed_hosts,
+            state.tls_terminated,
+        ));
+    }
+
+    // — L-52: `Origin: null` is refused even when configured —
+
+    #[test]
+    fn test_null_origin_is_refused_even_if_allowlisted() {
+        // Config validation refuses "null" in cors.allowedOrigins; this is the
+        // guard's own backstop for a state built some other way.
+        let allowed_origins: HashSet<String> = ["null".to_owned()].into_iter().collect();
+        let allowed_hosts: HashSet<String> = ["127.0.0.1".to_owned()].into_iter().collect();
+        for spelling in ["null", "NULL", "Null"] {
+            assert!(
+                !origin_allowed(
+                    spelling,
+                    "127.0.0.1:4000",
+                    &allowed_origins,
+                    &allowed_hosts,
+                    false
+                ),
+                "Origin: {spelling} must be refused (L-52)"
+            );
+        }
     }
 }

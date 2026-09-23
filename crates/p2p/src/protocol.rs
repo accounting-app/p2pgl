@@ -65,6 +65,63 @@ pub fn is_content_id(id: &str) -> bool {
 /// receive cap for CBOR framing overhead.
 pub const SUPPLY_FRAME_BUDGET_BYTES: usize = 15 * 1024 * 1024;
 
+/// Per-value cap on an envelope value, as `union_merge::MAX_ENVELOPE_VALUE_LEN`
+/// enforces it on every arriving entry (M-4). Restated here only because that
+/// constant is module-private; it feeds [`MAX_LEGAL_SUPPLY_ENTRY_BYTES`] and
+/// must be kept in step with it (making that one `pub(crate)` and aliasing it
+/// here would remove the restatement).
+const LEGAL_ENVELOPE_VALUE_BYTES: usize = 32 * 1024;
+
+/// Per-entry CBOR framing allowance, as `anti_entropy::estimated_entry_bytes`
+/// adds it (`SUPPLY_ENTRY_OVERHEAD_BYTES`). Restated for the same reason as
+/// [`LEGAL_ENVELOPE_VALUE_BYTES`].
+const LEGAL_SUPPLY_ENTRY_FRAMING_BYTES: usize = 128;
+
+/// Sum of the lengths of every envelope key a legal entry may carry.
+const fn envelope_key_bytes(keys: &[&str]) -> usize {
+    let mut total = 0;
+    let mut index = 0;
+    while index < keys.len() {
+        total += keys[index].len();
+        index += 1;
+    }
+    total
+}
+
+/// The largest single `SupplyEntry` any peer will accept, measured the way
+/// `anti_entropy::truncate_supply` measures it: the economic body at its cap,
+/// every allowed envelope key present with its value at the cap, a content id,
+/// and the per-entry CBOR framing allowance.
+const MAX_LEGAL_SUPPLY_ENTRY_BYTES: usize = ledger::service::MAX_ECONOMIC_BEAN_LENGTH
+    + envelope_key_bytes(ledger::service::ENVELOPE_KEYS)
+    + ledger::service::ENVELOPE_KEYS.len() * LEGAL_ENVELOPE_VALUE_BYTES
+    + CONTENT_ID_LEN
+    + LEGAL_SUPPLY_ENTRY_FRAMING_BYTES;
+
+// Pins the cross-crate coupling between the ledger's body cap and this frame
+// budget (T60; see the audit's §5 coupling note).
+//
+// `truncate_supply` never splits an entry: one whose estimated size exceeds
+// `SUPPLY_FRAME_BUDGET_BYTES` on its own is dropped, and the `Supply` goes out
+// *empty*. The requester (`gl-node`'s `fetch_want_chunk`) reads an empty answer as
+// `stalled` and ends the exchange; every later exchange ends the same way, so
+// that directive never propagates and the two ledgers diverge for good, quietly
+// — an H-03-class silent divergence.
+// It cannot happen today only because the largest legal entry (~1.1 MiB, set by
+// `ledger::service::MAX_ECONOMIC_BEAN_LENGTH`) is far below the 15 MiB budget,
+// and those two numbers live in different crates with nothing else tying them
+// together. This makes the build fail instead of the mesh.
+//
+// A Format-v2 (or any) raise of the bean cap, the envelope key set, or the
+// envelope value cap must revisit this: either keep the largest entry inside
+// the budget, or teach `truncate_supply`/the requester to carry an oversized
+// entry rather than silently dropping it.
+const _: () = assert!(
+    MAX_LEGAL_SUPPLY_ENTRY_BYTES <= SUPPLY_FRAME_BUDGET_BYTES,
+    "the largest legal SupplyEntry no longer fits SUPPLY_FRAME_BUDGET_BYTES: \
+     truncate_supply would send an empty Supply for it and the peer would abandon it (T60)"
+);
+
 /// CBOR bytes of the `"type": "supply"` map entry that opens a serialized
 /// `Supply` frame (M-16).
 ///

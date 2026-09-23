@@ -168,18 +168,33 @@ fn persist_atomically(path: &Path, content: &str) -> Result<(), std::io::Error> 
             Err(error) => return Err(error),
         };
         file.write_all(content.as_bytes())?;
+
+        // L-44: pin the mode through the HANDLE (`fchmod`), before the rename.
+        // `mode(0o600)` above is masked by the process umask, which can only
+        // clear bits, so an exact 0600 still needs a chmod — but this used to
+        // be `std::fs::metadata(path)` + `std::fs::set_permissions(path)` AFTER
+        // the rename, and both follow symlinks. Anyone who can write the
+        // ledger's directory could swap a symlink in at `path` between the
+        // rename and the chmod and have the node chmod an arbitrary target to
+        // 0600 — as root, in the shipped container. The handle names the inode
+        // this function created with O_EXCL and nothing else, and the rename
+        // moves that same inode into place, so the mode lands on exactly the
+        // file that becomes the ledger. The key writer in `gl-node`'s
+        // `p2p_service.rs` (L-32) does the same, for the same reason.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = file.metadata()?.permissions();
+            permissions.set_mode(0o600);
+            file.set_permissions(permissions)?;
+        }
+
+        // After the chmod, so the mode change is covered by the same fsync
+        // that makes the bytes durable.
         file.sync_all()?;
     }
 
     std::fs::rename(&temporary_path, path)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(path)?.permissions();
-        permissions.set_mode(0o600);
-        std::fs::set_permissions(path, permissions)?;
-    }
 
     let directory = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -1559,6 +1574,87 @@ impl CommitReceipt {
     }
 }
 
+/// An L-13 reload-from-disk, captured under the ledger lock so that the
+/// expensive part can run off it (L-43).
+///
+/// # The bug this closes
+///
+/// T44 moved the commit's write and fsync off the write lock and off the
+/// runtime. Its failure path did not follow: `recover_failed_commit` rebuilt
+/// the whole service with [`LedgerService::boot`] — up to a 64 MiB read, a
+/// parse, a DAG insert per directive and a `ReadModel::build` — synchronously,
+/// on a runtime worker, **with the write guard held**. So every failed commit
+/// (ENOSPC, EIO, a read-only remount) re-introduced exactly the full-ledger
+/// stall of every GraphQL read that T44 exists to remove, once per failure.
+///
+/// # The shape
+///
+/// ```text
+/// permit held throughout
+/// read lock  { reload = svc.begin_recovery() }       // O(1)
+/// spawn_blocking { reloaded = reload.load() }         // the boot; no lock
+/// write lock { svc.finish_recovery(reload, reloaded) } // the swap
+/// ```
+///
+/// Everything the load needs is owned here (a path and an author id), so it is
+/// `Send + 'static` and holds no borrow of the service — the same property
+/// [`PendingCommit`] relies on for the commit itself.
+///
+/// # Why the permit, not the lock, is what keeps it correct
+///
+/// A rebuild is only a faithful "memory := disk" if the files do not change
+/// between the read and the swap, and if nothing the swap would discard was
+/// added to memory in the meantime. The single-writer permit guarantees both:
+/// every write path in `gl-node` holds it across stage → prepare → commit →
+/// finish, and the recovery runs inside that same span. Readers are not
+/// excluded and need not be: during the rebuild they see the pre-recovery
+/// memory, which is what they could already see for the whole duration of the
+/// commit that failed.
+///
+/// The fingerprint is the belt to that pair of braces: a caller that mutates
+/// the service without the permit moves at least one of its fields, and
+/// [`LedgerService::finish_recovery`] then discards the stale rebuild and
+/// reloads synchronously instead of installing it.
+#[derive(Debug, Clone)]
+pub struct RecoveryReload {
+    file_path: PathBuf,
+    author_id: String,
+    fingerprint: RecoveryFingerprint,
+}
+
+impl RecoveryReload {
+    /// Rebuild a service from the files on disk. **Blocking** — the whole
+    /// point of the type is that this runs on a blocking thread with no ledger
+    /// lock held (L-43).
+    pub fn load(&self) -> Result<LedgerService, ServiceError> {
+        LedgerService::boot(self.file_path.clone(), self.author_id.clone())
+    }
+}
+
+/// The service state an L-13 rebuild would discard, reduced to counters
+/// (L-43).
+///
+/// A tripwire, not the guarantee — the permit is the guarantee. Every kind of
+/// write moves at least one of these: a local write bumps the Lamport clock and
+/// stages a pending id; a peer ingest adds a directive; any prepare, and so any
+/// commit, bumps the generation; a reconcile adopts directives or moves the
+/// counter or the quarantine. The DAG is grow-only between reloads, so counts
+/// suffice and no content comparison is needed. (The one write it can miss is
+/// a second `stamp_signature` on an already-forced service, which changes a
+/// directive's metadata and nothing countable — and which, like everything
+/// else, is only reachable here by a caller ignoring the permit.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecoveryFingerprint {
+    commit_generation: u64,
+    lamport_clock: u64,
+    directive_count: usize,
+    pending: usize,
+    quarantined: usize,
+    quarantined_text: usize,
+    external_reconcile_count: u64,
+    force_compaction: bool,
+}
+
 // ─── Ledger service ──────────────────────────────────────────────────────────
 
 /// Signs an adopted directive: `(content_id, is_transaction, parents, lamport)`
@@ -1785,6 +1881,15 @@ pub struct LedgerService {
     commit_gate: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// Test seam; `None` in production. See [`CommitObserver`].
     commit_observer: Option<CommitObserver>,
+    /// The last [`Self::sorted_directive_ids`] snapshot, keyed by the DAG size
+    /// it was taken at (L-35).
+    ///
+    /// The DAG is a grow-only set for the life of a service — nothing removes
+    /// a node, and an L-13 reload replaces the whole service, this field
+    /// included — so "same size" means "same set" and the size is a complete
+    /// invalidation key. Behind a `Mutex` because the snapshot is taken under
+    /// the ledger's READ lock, by any number of concurrent readers.
+    directive_id_snapshot: std::sync::Mutex<Option<(usize, std::sync::Arc<[String]>)>>,
 }
 
 impl LedgerService {
@@ -2207,6 +2312,7 @@ impl LedgerService {
             )),
             commit_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             commit_observer: None,
+            directive_id_snapshot: std::sync::Mutex::new(None),
         })
     }
 
@@ -2351,12 +2457,16 @@ impl LedgerService {
         // Validate (I1, I2, I3, I9). Returns resolved txn with elided posting filled.
         let mut resolved = validate_transaction(txn, &self.accounts)?;
 
+        // The content id hashes the economic body only — the envelope stamped
+        // next is excluded — so it is known before stamping, and the stamp
+        // needs it to choose parents that cannot close a cycle (L-40).
+        let content_id = compute_content_id(&Directive::Transaction(resolved.clone()));
+
         // Stamp envelope metadata (§3.3.1, §3.4.2). Refuses at the Lamport
         // ceiling (H-07); nothing has been mutated yet, so the refusal costs
         // the caller an error and nothing else.
-        self.stamp_transaction_envelope(&mut resolved.metadata)?;
+        self.stamp_transaction_envelope(&mut resolved.metadata, &content_id)?;
 
-        let content_id = compute_content_id(&Directive::Transaction(resolved.clone()));
         let (parents, lamport) = Self::envelope_parents_and_lamport(&resolved.metadata);
         if let Some(signature_hex) = sign(&content_id, parents, lamport) {
             resolved
@@ -2613,7 +2723,17 @@ impl LedgerService {
     /// at the point of writing instead. The check runs before any mutation, so
     /// a refusal leaves the clock and the metadata exactly as they were — the
     /// same rejection-ordering rule H-04 and L-02 follow.
-    fn stamp_transaction_envelope(&mut self, metadata: &mut Metadata) -> Result<(), ServiceError> {
+    ///
+    /// `content_id` is the id the transaction will be stored under: parents
+    /// are the current heads MINUS any head that already descends from that id
+    /// through a dangling `openledger-parents` (L-40) — see
+    /// [`LedgerDag::heads_admissible_as_parents_of`]. On every honest ledger
+    /// that is all the heads, exactly as before.
+    fn stamp_transaction_envelope(
+        &mut self,
+        metadata: &mut Metadata,
+        content_id: &str,
+    ) -> Result<(), ServiceError> {
         self.lamport_clock = checked_lamport(self.lamport_clock.saturating_add(1))?;
         metadata.insert(ENVELOPE_KEY_AUTHOR.to_owned(), self.author_id.clone());
         metadata.insert(
@@ -2621,8 +2741,9 @@ impl LedgerService {
             self.lamport_clock.to_string(),
         );
 
-        // Parents: current DAG heads, sorted ascending (§3.3.1).
-        let mut parents: Vec<&str> = self.dag.heads().iter().map(|s| s.as_str()).collect();
+        // Parents: current DAG heads, sorted ascending (§3.3.1) — the ones this
+        // transaction can name without closing a cycle (L-40).
+        let mut parents: Vec<&str> = self.dag.heads_admissible_as_parents_of(content_id);
         parents.sort();
         metadata.insert(ENVELOPE_KEY_PARENTS.to_owned(), parents.join(","));
         Ok(())
@@ -3143,9 +3264,83 @@ impl LedgerService {
     ///
     /// If the reload itself fails there is no better on-disk state to fall back
     /// to; memory is left as-is and the failure is logged, exactly as before.
+    ///
+    /// # Synchronous, and therefore for synchronous callers (L-43)
+    ///
+    /// This is [`Self::begin_recovery`] → [`RecoveryReload::load`] →
+    /// [`Self::finish_recovery`] run back to back on the calling thread, so the
+    /// whole `boot` — up to a 64 MiB read, a parse, a DAG insert per directive
+    /// and a read-model build — happens under whatever lock the caller holds.
+    /// That is right for `persist_or_reload`/`compact` (synchronous by
+    /// contract) and it is what `gl-node`'s `prepare_or_recover` still does for
+    /// a failed *prepare*. An async caller that holds the single-writer permit
+    /// should use the split form instead, as `gl-node`'s `commit_pending` does,
+    /// so the rebuild runs on a blocking thread with no ledger lock held.
     pub fn recover_failed_commit(&mut self) {
+        let reload = self.begin_recovery();
+        let reloaded = reload.load();
+        self.finish_recovery(reload, reloaded);
+    }
+
+    /// Capture what an L-13 reload needs, so the reload itself can run off the
+    /// ledger lock (L-43).
+    ///
+    /// Takes `&self`: a read guard is enough, and nothing about the service
+    /// changes until [`Self::finish_recovery`].
+    ///
+    /// # Caller contract
+    ///
+    /// Hold the single-writer permit ([`Self::commit_gate`]) from before this
+    /// call until after `finish_recovery`. That — not the ledger lock — is what
+    /// makes the split sound: while the rebuild runs no lock is held, so readers
+    /// proceed (they see the pre-recovery memory, exactly as they already could
+    /// for the duration of the commit that failed), but no other *writer* can
+    /// touch the files or the service, so the files the rebuild reads are still
+    /// the files when its result is installed.
+    ///
+    /// The reload also records a fingerprint of the service, and
+    /// `finish_recovery` refuses to install a rebuild if the service moved in
+    /// between — the one thing a writer that ignored the permit could do to
+    /// make the snapshot stale. See [`RecoveryReload`].
+    pub fn begin_recovery(&self) -> RecoveryReload {
+        RecoveryReload {
+            file_path: self.file_path.clone(),
+            author_id: self.author_id.clone(),
+            fingerprint: self.recovery_fingerprint(),
+        }
+    }
+
+    /// Install the result of a [`RecoveryReload::load`] (L-13, L-43).
+    ///
+    /// Does no I/O on the expected path: the rebuild was done by `load`, and
+    /// this is the same [`Self::adopt_reloaded`] swap `recover_failed_commit`
+    /// has always ended in. Takes the write lock at the call site.
+    ///
+    /// If the service changed since [`Self::begin_recovery`] — something
+    /// staged, committed or reconciled while the rebuild ran, which the
+    /// single-writer contract makes impossible — the rebuild is stale and
+    /// installing it could discard a write that is already durable (and a
+    /// later compaction would then erase it from disk). So it is thrown away
+    /// and the reload is redone here, synchronously, against the files as they
+    /// are *now*: exactly the pre-L-43 behaviour, reached only by a caller that
+    /// broke the contract, and logged as such.
+    pub fn finish_recovery(
+        &mut self,
+        reload: RecoveryReload,
+        reloaded: Result<LedgerService, ServiceError>,
+    ) {
         self.release_commit_in_flight();
-        match LedgerService::boot(self.file_path.clone(), self.author_id.clone()) {
+        let reloaded = if reload.fingerprint == self.recovery_fingerprint() {
+            reloaded
+        } else {
+            error!(
+                "the ledger changed while an L-13 reload was being rebuilt off the lock; \
+                 discarding the stale rebuild and reloading synchronously. The single-writer \
+                 contract on LedgerService::commit_gate was violated (L-43)"
+            );
+            LedgerService::boot(self.file_path.clone(), self.author_id.clone())
+        };
+        match reloaded {
             Ok(reloaded) => self.adopt_reloaded(reloaded),
             Err(reload_error) => {
                 error!(
@@ -3154,6 +3349,20 @@ impl LedgerService {
                      ahead of disk (L-13)"
                 );
             }
+        }
+    }
+
+    /// Everything a writer changes, cheaply (L-43) — see [`RecoveryReload`].
+    fn recovery_fingerprint(&self) -> RecoveryFingerprint {
+        RecoveryFingerprint {
+            commit_generation: self.commit_generation,
+            lamport_clock: self.lamport_clock,
+            directive_count: self.dag.len(),
+            pending: self.pending_ids.len(),
+            quarantined: self.quarantined.len(),
+            quarantined_text: self.quarantined_text.len(),
+            external_reconcile_count: self.external_reconcile_count,
+            force_compaction: self.force_compaction,
         }
     }
 
@@ -3197,6 +3406,12 @@ impl LedgerService {
     ///   while generations are never reused, and `boot` restarts them at zero —
     ///   which would make already-issued numbers issuable again. Carrying it
     ///   keeps the sequence monotonic for the life of the process.
+    /// * [`Self::author_id`] (L-43). It used to be carried by construction —
+    ///   `boot` is handed the current value — and on the synchronous path it
+    ///   still is. But since L-43 the rebuild can run off the lock, so a
+    ///   `set_author_id` can land between the snapshot `boot` was given and
+    ///   this swap; carrying the live value is what makes the later call win,
+    ///   exactly as it would have without the split.
     ///
     /// # What is deliberately NOT carried
     ///
@@ -3213,13 +3428,12 @@ impl LedgerService {
     /// re-derives the quarantine from the very bytes the old one was derived
     /// from — carrying the old set forward could only *add* entries the file no
     /// longer contains, which is how a "nothing is ever lost" rule turns into a
-    /// "deleted records come back" one. `author_id` and `file_path` are
-    /// configuration too, and are
-    /// already carried by construction — [`Self::recover_failed_commit`] passes
-    /// them into `boot`, so a `set_author_id` made after boot survives, and
-    /// `journal_path` is re-derived from the same path.
+    /// "deleted records come back" one. `file_path` is configuration too, and
+    /// is carried by construction — [`Self::begin_recovery`] passes it into
+    /// `boot`, and `journal_path` is re-derived from the same path.
     fn adopt_reloaded(&mut self, reloaded: LedgerService) {
         // Moved out of the old `self` before the assignment drops it.
+        let author_id = std::mem::take(&mut self.author_id);
         let signer = self.signer.take();
         let external_reconcile_count = self.external_reconcile_count;
         let commit_gate = std::sync::Arc::clone(&self.commit_gate);
@@ -3229,6 +3443,7 @@ impl LedgerService {
 
         *self = reloaded;
 
+        self.author_id = author_id;
         self.signer = signer;
         self.external_reconcile_count = external_reconcile_count;
         self.commit_gate = commit_gate;
@@ -3776,8 +3991,14 @@ impl LedgerService {
             self.lamport_clock = next_lamport;
 
             // For transactions: set parents to current heads if not already set.
+            //
+            // Provisionally ALL heads: the fan-in cap below is measured on
+            // this superset, and the set is narrowed (L-40) once the id the
+            // DAG will store the entry under is known — see `stamped_parents`.
+            let mut stamped_parents = false;
             if let Directive::Transaction(txn) = &mut directive {
                 if !txn.metadata.contains_key("openledger-parents") {
+                    stamped_parents = true;
                     let heads: Vec<String> = self.dag.heads().iter().cloned().collect();
                     let mut sorted = heads;
                     sorted.sort();
@@ -3807,6 +4028,23 @@ impl LedgerService {
                         // and a signature over the pre-resolution id would fail
                         // on every peer.
                         let stored_id = compute_content_id(&final_directive);
+                        // L-40: parents this node chose must not include a head
+                        // that already names `stored_id` through a dangling
+                        // `openledger-parents` — that is a cycle this node would
+                        // build itself, refused below and, had it landed,
+                        // quarantined with the operator's entry at next boot.
+                        // Chosen against `stored_id`, not `content_id`: the DAG
+                        // keys (and a planted pointer targets) the resolved
+                        // body. Identical to the provisional set on every
+                        // honest ledger. Parents the FILE spelled are the
+                        // operator's own and are left alone.
+                        if stamped_parents {
+                            let mut parents = self.dag.heads_admissible_as_parents_of(&stored_id);
+                            parents.sort();
+                            let parents = parents.join(",");
+                            directive_metadata_mut(&mut final_directive)
+                                .insert("openledger-parents".to_owned(), parents);
+                        }
                         // M-20 / L-02, the second application. The guard chain
                         // above measured the body as the FILE spells it; I2
                         // then resolved the elided posting, which is what the
@@ -4220,12 +4458,77 @@ impl LedgerService {
     }
 
     /// Get the set of all directive content IDs in the DAG (for anti-entropy exchange).
+    ///
+    /// **O(N) `String` clones per call** (L-35). Kept, with its signature, for
+    /// the callers that genuinely want an owned, mutable set; the anti-entropy
+    /// hot paths should use [`Self::contains_directive`] /
+    /// [`Self::is_head`] for membership and [`Self::sorted_directive_ids`] for
+    /// the advert.
     pub fn all_directive_ids(&self) -> std::collections::HashSet<String> {
         self.dag
             .content_ids()
             .into_iter()
             .map(|s| s.to_owned())
             .collect()
+    }
+
+    /// Is `content_id` in the DAG? O(1), no allocation (L-35).
+    ///
+    /// The membership half of what `all_directive_ids()` was being cloned for:
+    /// computing a Want list against a peer's advert, and `drain_orphans`'
+    /// "is this parent here yet?". Exact under the write lock too — a staged
+    /// directive is in the DAG from the moment it is staged — so a caller that
+    /// kept a cloned set in step with its own inserts can drop the set.
+    pub fn contains_directive(&self, content_id: &str) -> bool {
+        self.dag.get(content_id).is_some()
+    }
+
+    /// Is `txid` one of the current DAG heads? O(1), no allocation (L-35).
+    pub fn is_head(&self, txid: &str) -> bool {
+        self.dag.heads().contains(txid)
+    }
+
+    /// Every content id in the DAG, sorted ascending, as a shared snapshot
+    /// (L-35).
+    ///
+    /// # Why
+    ///
+    /// `all_directive_ids()` clones every id into a fresh `HashSet<String>`,
+    /// and anti-entropy called it twice per peer per tick plus once per
+    /// inbound advert — O(N) allocations each time, under the ledger's read
+    /// lock, whether or not anything had changed. The advert then copied the
+    /// set into a `Vec` and sorted it, a second O(N log N) pass.
+    ///
+    /// # What it costs now
+    ///
+    /// The snapshot is built — once, sorted, in exactly the order the advert
+    /// pages need — the first time it is asked for after the DAG has grown,
+    /// and every later call until the next insert is an `Arc` clone. On a mesh
+    /// at rest that is O(1) per tick instead of O(N); on a busy one it is at
+    /// most one rebuild per batch of arrivals, however many peers ask. The
+    /// invalidation key is the DAG's size, which is exact because the DAG is
+    /// grow-only (see `directive_id_snapshot`).
+    pub fn sorted_directive_ids(&self) -> std::sync::Arc<[String]> {
+        let size = self.dag.len();
+        let mut snapshot = self
+            .directive_id_snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((taken_at, ids)) = snapshot.as_ref() {
+            if *taken_at == size {
+                return std::sync::Arc::clone(ids);
+            }
+        }
+        let mut ids: Vec<String> = self
+            .dag
+            .content_ids()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        ids.sort_unstable();
+        let ids: std::sync::Arc<[String]> = ids.into();
+        *snapshot = Some((size, std::sync::Arc::clone(&ids)));
+        ids
     }
 
     /// Parent txids on `directive` that are not yet in the local DAG (§3.4.4).
@@ -7751,6 +8054,15 @@ mod tests {
         // - On "reconnect", they exchange directives via reconcile_file.
         // - After convergence, both have the same content ID set and
         //   matching trial balances — proving CRDT convergence (I6/FR-4).
+        //
+        // R-11 / M-24: the fixture carries a TIED PAIR — two same-day
+        // "Starbucks" / "Coffee" transactions that differ only in amount, so
+        // §3.3.2's (date, type priority, narration|payee) key cannot order
+        // them. Each node authors one, so each inserts its own first and the
+        // other's second: the pair reaches the two DAGs in OPPOSITE orders.
+        // Without M-24's content-id tie-break the serializer fell back to
+        // insertion order and the two `.bean` files differed; the original
+        // fixture had no ties, which is why this test never caught it.
 
         let path_a = test_file_path();
         let path_b = test_file_path();
@@ -7799,6 +8111,37 @@ mod tests {
         };
         let txid_alpha = node_a.append_transaction(input_alpha).unwrap().txid;
 
+        // One half of the tied pair on each side of the partition (R-11).
+        let coffee = |amount: rust_decimal::Decimal| TransactionInput {
+            date: make_date(2024, 2, 10),
+            flag: Flag::Complete,
+            payee: Some("Starbucks".to_owned()),
+            narration: Some("Coffee".to_owned()),
+            tags: vec![],
+            links: vec![],
+            postings: vec![
+                PostingInput {
+                    account: "Assets:Cash".to_owned(),
+                    amount: Some(Amount {
+                        number: -amount,
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                },
+                PostingInput {
+                    account: "Equity:Opening".to_owned(),
+                    amount: Some(Amount {
+                        number: amount,
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                },
+            ],
+        };
+        let txid_tie_a = node_a.append_transaction(coffee(dec!(3.50))).unwrap().txid;
+
         let input_beta = TransactionInput {
             date: make_date(2024, 2, 15),
             flag: Flag::Complete,
@@ -7828,10 +8171,12 @@ mod tests {
             ],
         };
         let txid_beta = node_b.append_transaction(input_beta).unwrap().txid;
+        let txid_tie_b = node_b.append_transaction(coffee(dec!(4.75))).unwrap().txid;
+        assert_ne!(txid_tie_a, txid_tie_b, "the tied pair is two directives");
 
         // Verify divergence.
-        assert_eq!(node_a.directive_count(), 3);
-        assert_eq!(node_b.directive_count(), 3);
+        assert_eq!(node_a.directive_count(), 4);
+        assert_eq!(node_b.directive_count(), 4);
         assert!(node_a.get_directive(&txid_alpha).is_some());
         assert!(node_a.get_directive(&txid_beta).is_none());
         assert!(node_b.get_directive(&txid_beta).is_some());
@@ -7868,6 +8213,24 @@ mod tests {
         assert!(node_a.get_directive(&txid_beta).is_some(), "A has Beta");
         assert!(node_b.get_directive(&txid_alpha).is_some(), "B has Alpha");
         assert!(node_b.get_directive(&txid_beta).is_some(), "B has Beta");
+
+        // The fixture really does exercise the tie: both nodes hold both
+        // halves, in opposite insertion orders (R-11).
+        let arrival = |node: &LedgerService, id: &str| {
+            node.dag()
+                .content_ids()
+                .iter()
+                .position(|candidate| *candidate == id)
+                .expect("both halves of the tied pair must be present on both nodes")
+        };
+        assert!(
+            arrival(&node_a, &txid_tie_a) < arrival(&node_a, &txid_tie_b),
+            "A must hold its own coffee first"
+        );
+        assert!(
+            arrival(&node_b, &txid_tie_b) < arrival(&node_b, &txid_tie_a),
+            "B must hold its own coffee first"
+        );
 
         // Content ID sets should be identical.
         let mut ids_a: Vec<&str> = node_a.dag().content_ids().into_iter().collect();
@@ -8016,6 +8379,83 @@ mod tests {
         std::fs::remove_file(&ledger_path).ok();
         std::fs::remove_file(&victim_path).ok();
         std::fs::remove_file(&tmp_path).ok();
+    }
+
+    /// L-44: the persist must never chmod anything but the file it wrote.
+    ///
+    /// The old code renamed the temp into place and THEN ran
+    /// `std::fs::metadata(path)` + `std::fs::set_permissions(path, 0600)` —
+    /// both symlink-following. An attacker who can write the ledger directory
+    /// swaps a symlink in at `path` in that window and the node chmods the
+    /// link's target. The window is microseconds wide, so the test is the
+    /// attack itself: a thread atomically re-planting a symlink over the ledger
+    /// path as fast as it can while the node persists in a loop. Against the
+    /// old code the target's mode flips to 0600 within a handful of persists;
+    /// with the mode set through the handle before the rename, no persist can
+    /// name the target at all, however the race falls.
+    #[cfg(unix)]
+    #[test]
+    fn l44_persist_never_chmods_a_symlink_planted_at_the_ledger_path() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let directory = test_file_path().with_extension("l44");
+        std::fs::create_dir_all(&directory).unwrap();
+        let ledger_path = directory.join("ledger.bean");
+        let target = directory.join("victim");
+        std::fs::write(&target, "not the ledger\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let attacker = {
+            let stop = Arc::clone(&stop);
+            let ledger_path = ledger_path.clone();
+            let target = target.clone();
+            let staging = directory.join("staging-link");
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    // symlink + rename: an atomic replace of whatever is at the
+                    // ledger path, exactly as a real attacker would do it.
+                    let _ = std::fs::remove_file(&staging);
+                    if std::os::unix::fs::symlink(&target, &staging).is_ok() {
+                        let _ = std::fs::rename(&staging, &ledger_path);
+                    }
+                }
+            })
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+        let mut persists = 0u32;
+        while std::time::Instant::now() < deadline {
+            // The persist itself may fail or succeed depending on how the race
+            // falls; what must never happen is the target's mode changing.
+            let _ = persist_atomically(&ledger_path, "ledger contents\n");
+            persists += 1;
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+            if mode != 0o644 {
+                stop.store(true, Ordering::Relaxed);
+                attacker.join().unwrap();
+                std::fs::remove_dir_all(&directory).ok();
+                panic!(
+                    "L-44: persist #{persists} chmod'd the symlink's target to {mode:o}; \
+                     the mode must be set through the handle, never by path"
+                );
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        attacker.join().unwrap();
+        assert!(persists > 0);
+
+        // And the ledger a persist leaves behind is still owner-only.
+        let _ = std::fs::remove_file(&ledger_path);
+        persist_atomically(&ledger_path, "ledger contents\n").unwrap();
+        let mode = std::fs::symlink_metadata(&ledger_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "the ledger itself must still be 0600");
+        std::fs::remove_dir_all(&directory).ok();
     }
 
     // ── H-04: dates the file grammar cannot read back ────────────────────
@@ -11054,6 +11494,294 @@ mod tests {
             "M-29: a hand edit must not be suppressed as a self-write"
         );
 
+        remove_ledger_and_journal(&path);
+    }
+
+    // ── T59: ledger and commit robustness (L-41, L-43) ───────────────────
+
+    /// L-41, end to end: a journal whose last header claims `usize::MAX`
+    /// bytes is a torn tail to the LIVE recovery path and to boot — the durable
+    /// records before it load, the next commit compacts, and nothing panics.
+    ///
+    /// This is the shape that mattered: `read_journal` is the body of
+    /// `recover_failed_commit`, which the node runs holding the ledger's write
+    /// guard, so the overflow panic used to land there.
+    #[test]
+    fn l41_an_overflowing_journal_header_is_torn_through_recovery_and_boot() {
+        let (mut svc, path) = boot_large_ledger();
+        svc.stage_remote_directive(remote_open("Assets:Vault", make_date(2024, 3, 1), 10))
+            .unwrap();
+        svc.persist_or_reload().unwrap();
+        assert!(svc.journal_bytes() > 0, "the fixture needs a real journal");
+        let durable_count = svc.directive_count();
+
+        let journal_path = svc.journal_path().to_path_buf();
+        let mut journal = std::fs::read(&journal_path).unwrap();
+        journal.extend_from_slice(
+            format!(";;olj {} {}\npartial", usize::MAX, "cd".repeat(32)).as_bytes(),
+        );
+        std::fs::write(&journal_path, &journal).unwrap();
+
+        svc.recover_failed_commit();
+        assert_eq!(
+            svc.directive_count(),
+            durable_count,
+            "the intact record before the bad header must survive the reload"
+        );
+        assert!(svc.accounts().is_open("Assets:Vault"));
+        assert!(
+            svc.force_compaction,
+            "a torn tail must force the next commit to compact, not append after it"
+        );
+
+        let rebooted = LedgerService::boot(path.clone(), "test-peer".to_owned())
+            .expect("boot must treat the overflowing header as a torn tail");
+        assert_eq!(rebooted.directive_count(), durable_count);
+
+        svc.stage_remote_directive(remote_open("Assets:Safe", make_date(2024, 3, 2), 11))
+            .unwrap();
+        svc.persist_or_reload().unwrap();
+        assert_eq!(
+            svc.journal_bytes(),
+            0,
+            "the forced compaction folded the journal"
+        );
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-43: a rebuild taken off the lock is never installed over a service
+    /// that moved after it was taken.
+    ///
+    /// The single-writer permit is what makes the off-lock rebuild sound; this
+    /// pins the tripwire behind it. A write that skips the permit and lands —
+    /// durably — between `begin_recovery` and `finish_recovery` must not be
+    /// rolled out of memory by the stale rebuild: that would leave memory
+    /// BEHIND disk, and the next compaction would serialize memory over the
+    /// file and erase an acknowledged write. `finish_recovery` reloads
+    /// synchronously instead, against the files as they now are.
+    #[test]
+    fn l43_a_stale_off_lock_rebuild_is_never_installed() {
+        let (mut svc, path) = setup_with_accounts();
+        svc.compact().unwrap();
+
+        let reload = svc.begin_recovery();
+        let stale = reload.load();
+
+        // The contract violation: a durable write with no permit, mid-rebuild.
+        svc.open_account("Assets:Late".to_owned(), make_date(2024, 2, 1), vec![])
+            .unwrap();
+
+        let (_, logged) = capture_warnings(|| svc.finish_recovery(reload, stale));
+        assert!(
+            svc.accounts().is_open("Assets:Late"),
+            "L-43: a stale rebuild must not roll a durable write out of memory"
+        );
+        let disk = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert_eq!(
+            svc.directive_count(),
+            disk.directive_count(),
+            "memory == disk"
+        );
+        assert!(
+            logged.contains("single-writer contract"),
+            "the violation must be reported, got: {logged}"
+        );
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-43: the split form, used as the node uses it, is the old reload —
+    /// the undurable mutation is discarded and the service keeps its identity.
+    #[test]
+    fn l43_the_split_reload_matches_the_synchronous_one() {
+        let (mut svc, path) = setup_with_accounts();
+        svc.compact().unwrap();
+        let durable = svc.directive_count();
+
+        // Undurable: staged, never committed.
+        svc.stage_remote_directive(remote_open("Assets:Undurable", make_date(2024, 3, 1), 50))
+            .unwrap();
+        let reload = svc.begin_recovery();
+        let reloaded = reload.load();
+        // A `set_author_id` between the snapshot and the swap is carried.
+        svc.set_author_id("renamed-peer".to_owned());
+        svc.finish_recovery(reload, reloaded);
+
+        assert_eq!(svc.directive_count(), durable);
+        assert!(!svc.accounts().is_open("Assets:Undurable"));
+        assert_eq!(svc.author_id(), "renamed-peer");
+        remove_ledger_and_journal(&path);
+    }
+
+    // ── L-40: a dangling parent naming a predictable future txid ─────────
+
+    /// A hand-edited transaction whose `openledger-parents` names `victim_id`,
+    /// which does not exist yet. Well-formed in every respect boot and
+    /// reconcile check (T47's cycle pre-scan finds no cycle — the id it names
+    /// is not in the file — and T51's parity checks see a well-formed
+    /// lowercase txid), so it loads, and it is a head: nothing points at it.
+    fn planted_dangling_parent(victim_id: &str) -> String {
+        format!(
+            "\n2024-01-10 * \"Mallory\" \"Planted\"\n  \
+             openledger-author: \"mallory\"\n  \
+             openledger-lamport: \"5\"\n  \
+             openledger-parents: \"{victim_id}\"\n  \
+             Assets:Cash                                          1.00 USD\n  \
+             Equity:Opening                                      -1.00 USD\n"
+        )
+    }
+
+    /// The id the victim's next append will get. Content ids hash the economic
+    /// body only, so anyone who can guess the body can compute it offline.
+    fn predicted_txid(input: TransactionInput) -> String {
+        let (mut probe, probe_path) = setup_with_accounts();
+        let txid = probe.append_transaction(input).unwrap().txid;
+        remove_ledger_and_journal(&probe_path);
+        txid
+    }
+
+    /// L-40: the local append of exactly the predicted transaction used to be
+    /// refused with `CYCLE_DETECTED` naming its own new txid — the append
+    /// picked every head as a parent, including the planted one, and the
+    /// planted one names the new txid as ITS parent: a genuine two-node cycle
+    /// the node built itself. And had it been admitted, the next boot's T47
+    /// pre-scan would have quarantined both.
+    #[test]
+    fn l40_a_dangling_parent_naming_a_future_txid_does_not_block_that_append() {
+        let victim_id = predicted_txid(balanced_input());
+
+        let (svc, path) = setup_with_accounts();
+        drop(svc);
+        append_to_file(&path, &planted_dangling_parent(&victim_id));
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert_eq!(
+            svc.quarantined_count(),
+            0,
+            "the planted entry loads normally"
+        );
+        let planted_id = svc
+            .head_txids()
+            .into_iter()
+            .next()
+            .expect("the planted entry is the only head");
+
+        let outcome = svc
+            .append_transaction(balanced_input())
+            .expect("L-40: the predicted append must not be refused as a cycle");
+        assert_eq!(outcome.txid, victim_id);
+        let parents = svc
+            .get_directive(&victim_id)
+            .unwrap()
+            .metadata()
+            .get("openledger-parents")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !parents.contains(&planted_id),
+            "the new transaction must not name the entry that names it: {parents:?}"
+        );
+        assert_eq!(
+            svc.dag().children_of(&victim_id).unwrap(),
+            std::slice::from_ref(&planted_id),
+            "the planted edge now resolves, in the one direction that is acyclic"
+        );
+
+        // The file this leaves behind is acyclic: a reboot quarantines nothing
+        // and holds both.
+        svc.compact().unwrap();
+        let rebooted = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert_eq!(rebooted.quarantined_count(), 0);
+        assert!(rebooted.get_directive(&victim_id).is_some());
+        assert!(rebooted.get_directive(&planted_id).is_some());
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-40, the reconcile path: an operator's own envelope-less hand edit is
+    /// stamped with the current heads as parents in exactly the same way, so a
+    /// planted pointer at ITS id must not get it refused either.
+    #[test]
+    fn l40_a_dangling_parent_does_not_block_a_reconciled_hand_edit() {
+        let victim_id = compute_content_id(
+            &parse_file(HAND_EDITED_TRANSACTION)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap(),
+        );
+
+        let (mut svc, path) = setup_with_accounts();
+        append_to_file(&path, &planted_dangling_parent(&victim_id));
+        assert_eq!(svc.reconcile_file().unwrap().new_directives, 1);
+
+        append_to_file(&path, HAND_EDITED_TRANSACTION);
+        let result = svc.reconcile_file().unwrap();
+        assert_eq!(
+            result.new_directives, 1,
+            "L-40: the hand edit must be adopted, not refused as a cycle ({} rejected)",
+            result.rejected
+        );
+        assert!(svc.get_directive(&victim_id).is_some());
+
+        let rebooted = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert_eq!(rebooted.quarantined_count(), 0);
+        assert_eq!(rebooted.directive_count(), svc.directive_count());
+        remove_ledger_and_journal(&path);
+    }
+
+    // ── L-35: cheap id views for anti-entropy ────────────────────────────
+
+    /// The new views agree with `all_directive_ids()` exactly, and the sorted
+    /// snapshot is reused until the DAG grows — then rebuilt, never stale.
+    #[test]
+    fn l35_id_views_agree_with_all_directive_ids_and_track_growth() {
+        let (mut svc, path) = setup_with_accounts();
+        svc.append_transaction(balanced_input()).unwrap();
+
+        let owned = svc.all_directive_ids();
+        let first = svc.sorted_directive_ids();
+        let mut expected: Vec<String> = owned.iter().cloned().collect();
+        expected.sort();
+        assert_eq!(&*first, expected.as_slice());
+        for id in &owned {
+            assert!(svc.contains_directive(id));
+        }
+        assert!(!svc.contains_directive(&"0".repeat(64)));
+        for head in svc.head_txids() {
+            assert!(svc.is_head(&head));
+        }
+        assert!(!svc.is_head(&"0".repeat(64)));
+
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &svc.sorted_directive_ids()),
+            "L-35: an unchanged DAG must be answered from the snapshot, not re-cloned"
+        );
+
+        svc.stage_remote_directive(remote_open("Assets:Later", make_date(2024, 3, 1), 40))
+            .unwrap();
+        let grown = svc.sorted_directive_ids();
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &grown),
+            "growth must invalidate"
+        );
+        assert_eq!(grown.len(), first.len() + 1);
+        let mut expected: Vec<String> = svc.all_directive_ids().into_iter().collect();
+        expected.sort();
+        assert_eq!(&*grown, expected.as_slice());
+        remove_ledger_and_journal(&path);
+    }
+
+    /// An L-13 reload that SHRINKS the DAG back to disk must not be answered
+    /// from a snapshot of the larger, rolled-back set.
+    #[test]
+    fn l35_the_snapshot_does_not_survive_a_reload() {
+        let (mut svc, path) = setup_with_accounts();
+        svc.compact().unwrap();
+        svc.stage_remote_directive(remote_open("Assets:Undurable", make_date(2024, 3, 1), 41))
+            .unwrap();
+        let before = svc.sorted_directive_ids();
+        svc.recover_failed_commit();
+        let after = svc.sorted_directive_ids();
+        assert_eq!(after.len(), before.len() - 1);
+        assert!(after.iter().all(|id| svc.contains_directive(id)));
         remove_ledger_and_journal(&path);
     }
 }

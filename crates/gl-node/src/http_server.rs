@@ -19,9 +19,18 @@
 //! exhaust the process regardless of how well the router above is hardened.
 //!
 //! This module replaces `axum::serve` with the documented manual-hyper pattern
-//! and adds the four missing bounds: a header-read timeout (which hyper re-arms
+//! and adds the missing bounds: a header-read timeout (which hyper re-arms
 //! before every request head, so it also bounds idle keep-alive), a whole-request
-//! timeout, HTTP/2 keep-alive probes, and a semaphore-backed connection ceiling.
+//! timeout, a semaphore-backed connection ceiling, and a per-IP share of that
+//! ceiling (M-33).
+//!
+//! It also speaks **HTTP/1.1 only** (M-22). hyper-util's `auto` builder sniffs
+//! the `PRI * HTTP/2.0` preface and would otherwise serve cleartext HTTP/2
+//! (h2c) on this port — a whole second protocol implementation reachable
+//! pre-auth, below the router where the API key, Host guard and limiter live,
+//! and the cleanest request-cancel primitive there is (`RST_STREAM`, T50). No
+//! client of this node needs it: the terminator speaks HTTP/1.1 upstream, and
+//! loopback clients are curl, GraphiQL and the health probe.
 //!
 //! **These are the backend's own backstops, not the primary control.** Public
 //! binds are required to sit behind a TLS-terminating reverse proxy (§ TLS
@@ -36,11 +45,12 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::pin;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower::Service;
@@ -56,8 +66,20 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Concurrent connections this process will hold open.
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 
-/// How long an unanswered HTTP/2 keep-alive PING may go unacknowledged.
-const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Concurrent connections one client address may hold (M-33).
+///
+/// A sixteenth of the default global cap, so one address can never be the
+/// reason nobody else is served. It is not tight for anything legitimate that
+/// reaches the node directly: a browser opens six per host, the health probe
+/// one, and a client pool beyond 64 concurrent requests would be refused by
+/// the 60-per-minute rate limit long before it needed the sockets. A reverse
+/// proxy fans *everyone* in through one address, which is why the configured
+/// trusted proxies are exempt (see [`serve_hardened`]).
+const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 64;
+
+/// Minimum gap between "per-IP cap reached" warnings, so a client hammering
+/// the cap costs one log line per interval rather than one per connection.
+const PER_IP_REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How long graceful shutdown waits for in-flight connections to drain.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -79,6 +101,9 @@ pub struct HttpServerSettings {
     pub request_timeout: Duration,
     /// Ceiling on concurrently served connections.
     pub max_connections: usize,
+    /// Ceiling on concurrently served connections from one client address
+    /// (M-33). Effective value is `min(this, max_connections)`.
+    pub max_connections_per_ip: usize,
 }
 
 impl Default for HttpServerSettings {
@@ -87,6 +112,105 @@ impl Default for HttpServerSettings {
             header_read_timeout: DEFAULT_HEADER_READ_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_connections_per_ip: DEFAULT_MAX_CONNECTIONS_PER_IP,
+        }
+    }
+}
+
+/// Live connection count per client address (M-33) — the HTTP analogue of
+/// the ALPN side's per-peer cap in `connection_limiter`.
+///
+/// Keyed on [`crate::rate_limit::bucket_key`], so "one client" means the same
+/// thing here as it does to the rate limiter: an IPv4 address (v4-mapped
+/// spellings folded in, M-30) or an IPv6 /64. Rotating addresses inside one
+/// allocation does not buy extra slots.
+struct PerIpConnections {
+    counts: Mutex<HashMap<IpAddr, usize>>,
+    max_per_ip: usize,
+    /// Canonical addresses never counted: the configured trusted proxies.
+    exempt: HashSet<IpAddr>,
+    /// When the last refusal was logged at `warn`.
+    last_refusal_log: Mutex<Option<Instant>>,
+}
+
+/// One admitted connection's share of its address's budget. Dropping it gives
+/// the share back; an exempt peer's slot counts nothing and releases nothing.
+struct PerIpSlot {
+    table: Arc<PerIpConnections>,
+    key: Option<IpAddr>,
+}
+
+impl PerIpConnections {
+    fn new(max_per_ip: usize, exempt: HashSet<IpAddr>) -> Arc<Self> {
+        Arc::new(Self {
+            counts: Mutex::new(HashMap::new()),
+            max_per_ip: max_per_ip.max(1),
+            exempt: exempt
+                .into_iter()
+                .map(crate::rate_limit::canonical_ip)
+                .collect(),
+            last_refusal_log: Mutex::new(None),
+        })
+    }
+
+    /// Admit one connection from `peer`, or `None` when its address already
+    /// holds `max_per_ip`. A refusal changes nothing.
+    fn try_admit(self: &Arc<Self>, peer: IpAddr) -> Option<PerIpSlot> {
+        if self.exempt.contains(&crate::rate_limit::canonical_ip(peer)) {
+            return Some(PerIpSlot {
+                table: Arc::clone(self),
+                key: None,
+            });
+        }
+        let key = crate::rate_limit::bucket_key(peer);
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = counts.get(&key).copied().unwrap_or(0);
+        if current >= self.max_per_ip {
+            return None;
+        }
+        counts.insert(key, current + 1);
+        Some(PerIpSlot {
+            table: Arc::clone(self),
+            key: Some(key),
+        })
+    }
+
+    /// Whether a refusal right now should be logged at `warn` (rate-limited).
+    fn should_log_refusal(&self, now: Instant) -> bool {
+        let mut last = self
+            .last_refusal_log
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match *last {
+            Some(previous) if now.duration_since(previous) < PER_IP_REFUSAL_LOG_INTERVAL => false,
+            _ => {
+                *last = Some(now);
+                true
+            }
+        }
+    }
+}
+
+impl Drop for PerIpSlot {
+    fn drop(&mut self) {
+        let Some(key) = self.key else {
+            return;
+        };
+        let mut counts = self
+            .table
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = counts.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                // Entries at 0 are removed, so the map is bounded by the
+                // number of live connections, never by addresses ever seen.
+                counts.remove(&key);
+            }
         }
     }
 }
@@ -98,10 +222,15 @@ impl Default for HttpServerSettings {
 /// .with_graceful_shutdown(shutdown)`, with the connection-level limits that
 /// call never had. `ConnectInfo<SocketAddr>` is still inserted per connection,
 /// so the per-IP rate limiter keeps seeing real peer addresses.
+///
+/// `per_ip_exempt` lists addresses the per-IP cap does not apply to (M-33) —
+/// in production, the configured trusted proxies, which carry every client
+/// behind them through one address. They remain bound by the global cap.
 pub async fn serve_hardened<S>(
     listener: TcpListener,
     application: Router,
     settings: HttpServerSettings,
+    per_ip_exempt: HashSet<IpAddr>,
     shutdown: S,
 ) -> std::io::Result<()>
 where
@@ -121,9 +250,30 @@ where
     // A zero cap would silently accept nothing; treat it as "one at a time".
     let max_connections = settings.max_connections.max(1);
     let connection_slots = Arc::new(Semaphore::new(max_connections));
+    let max_connections_per_ip = settings.max_connections_per_ip.clamp(1, max_connections);
+    let per_ip = PerIpConnections::new(max_connections_per_ip, per_ip_exempt);
     let graceful = GracefulShutdown::new();
 
-    let mut builder = auto::Builder::new(TokioExecutor::new());
+    // M-22: HTTP/1.1 only, and — the part that actually does it — served with
+    // `serve_connection`, NOT `serve_connection_with_upgrades`.
+    //
+    // ⚠ `http1_only()` ALONE IS A SILENT NO-OP. hyper-util documents it as
+    // "does not do anything if used with `serve_connection_with_upgrades`",
+    // and the vendored source agrees: `serve_connection` matches on the
+    // configured version, while `serve_connection_with_upgrades` goes
+    // unconditionally to `ReadVersion`, sniffs the h2 preface and serves h2c.
+    // The two changes only work together; the `h2_prior_knowledge_preface_is_
+    // refused` test fails if either is reverted.
+    //
+    // ⚠ WHOEVER ADDS A WEBSOCKET (GraphQL subscription) ENDPOINT: dropping the
+    // `_with_upgrades` variant dropped HTTP upgrade support, which is safe
+    // today only because nothing upgrades — the routes are `/graphql` and
+    // `/health`, and `SubscriptionRoot` is not exposed. Restoring
+    // `serve_connection_with_upgrades` for WebSockets RE-ENABLES CLEARTEXT
+    // HTTP/2 on this port regardless of `http1_only()`; if you need upgrades,
+    // keep the sniffing builder and refuse the h2 preface explicitly instead,
+    // and keep that test passing.
+    let mut builder = auto::Builder::new(TokioExecutor::new()).http1_only();
     // The timer is not optional: without one hyper logs
     // "timeout `header_read_timeout` has default, but no timer set" and drops
     // the timeout entirely, which is exactly how `axum::serve` ships. hyper
@@ -134,19 +284,16 @@ where
         .http1()
         .timer(TokioTimer::new())
         .header_read_timeout(settings.header_read_timeout);
-    // HTTP/2 multiplexes, so a head timeout does not apply; probe instead so an
-    // idle or black-holed h2 connection cannot be parked indefinitely.
-    builder
-        .http2()
-        .timer(TokioTimer::new())
-        .keep_alive_interval(settings.header_read_timeout)
-        .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT);
+    // No `.http2()` configuration: with HTTP/2 unreachable (M-22) its
+    // keep-alive probes would be dead settings that read as live protection.
 
     info!(
         header_read_timeout_ms = settings.header_read_timeout.as_millis(),
         request_timeout_ms = settings.request_timeout.as_millis(),
         max_connections,
-        "serving with connection limits (M-13)"
+        max_connections_per_ip,
+        per_ip_exempt = per_ip.exempt.len(),
+        "serving HTTP/1.1 with connection limits (M-13, M-22, M-33)"
     );
 
     let mut shutdown = pin!(shutdown);
@@ -167,6 +314,30 @@ where
             }
         };
 
+        // M-33: the per-IP share, checked *after* accept because it has to be
+        // — the peer address does not exist until then. The global permit
+        // above was still taken first, so a flood still waits in the kernel
+        // backlog rather than becoming process state; what this adds is that
+        // one address cannot be the reason nobody else gets a permit. An
+        // over-cap connection is closed on the spot: nothing is read from it,
+        // no task is spawned, and dropping `permit` hands its global slot
+        // straight back to the accept loop.
+        let Some(ip_slot) = per_ip.try_admit(remote_address.ip()) else {
+            if per_ip.should_log_refusal(Instant::now()) {
+                warn!(
+                    peer = %remote_address,
+                    max_connections_per_ip,
+                    "refusing connection: this client already holds its per-IP share of \
+                     connections (M-33); further refusals are logged at most every 10s"
+                );
+            } else {
+                debug!(peer = %remote_address, "refusing connection: per-IP cap reached (M-33)");
+            }
+            drop(stream);
+            drop(permit);
+            continue;
+        };
+
         // `IntoMakeServiceWithConnectInfo` is what inserts the
         // `ConnectInfo<SocketAddr>` extension the rate limiter reads. Its
         // `poll_ready` is unconditionally ready and its error is `Infallible`,
@@ -175,8 +346,9 @@ where
             .await
             .expect("connect-info make service is infallible");
 
+        // `serve_connection`, never `_with_upgrades` — see the M-22 note above.
         let connection = builder
-            .serve_connection_with_upgrades(
+            .serve_connection(
                 TokioIo::new(stream),
                 TowerToHyperService::new(connection_service),
             )
@@ -187,7 +359,8 @@ where
             if let Err(error) = watched.await {
                 debug!(%error, peer = %remote_address, "connection closed with error");
             }
-            // Frees the slot for the next accept.
+            // Frees the per-IP share and then the global slot.
+            drop(ip_slot);
             drop(permit);
         });
     }
@@ -255,7 +428,13 @@ mod tests {
     /// they must exclude the QUIC convergence tests too, not just each other.
     use crate::test_support::NET_TEST_LOCK;
 
-    const HEADER_TIMEOUT: Duration = Duration::from_millis(300);
+    /// Since M-22 the header-read timer starts at *accept*, not at the first
+    /// byte (see `silent_connection_is_closed_by_header_read_timeout`), so it
+    /// also bounds the gap between a test client's `connect` and its first
+    /// `write`. On a heavily loaded machine that gap alone has exceeded 300ms,
+    /// so the shared value is 1s: still far below the 30s production default,
+    /// and every "is it bounded at all" assertion keeps its 4x margin.
+    const HEADER_TIMEOUT: Duration = Duration::from_millis(1000);
     const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 
     /// Deadlines are asserted at 4x the configured timeout: the point is that
@@ -269,6 +448,19 @@ mod tests {
             header_read_timeout: HEADER_TIMEOUT,
             request_timeout: REQUEST_TIMEOUT,
             max_connections: 8,
+            max_connections_per_ip: 8,
+        }
+    }
+
+    /// For tests that assert a request is *served*, not that a timeout fires:
+    /// the head timer runs from accept (M-22), and on a saturated machine a
+    /// test client's `connect().await` has been observed resuming 2.7s after
+    /// the server accepted — so these give the head a budget no scheduler
+    /// stall reaches.
+    fn serving_settings() -> HttpServerSettings {
+        HttpServerSettings {
+            header_read_timeout: Duration::from_secs(10),
+            ..short_settings()
         }
     }
 
@@ -301,16 +493,78 @@ mod tests {
         handle: tokio::task::JoinHandle<std::io::Result<()>>,
     }
 
+    /// Absorb a host's per-process first-connection stall before any test
+    /// measures anything.
+    ///
+    /// Some development hosts run a per-process network filter — observed: the
+    /// LuLu network extension on the maintainer's Mac — that holds the FIRST
+    /// connection a freshly linked test binary makes while it reaches a
+    /// verdict. Measured at 1.5–27 s, once per process, keyed on the
+    /// executable's path (the identical binary copied elsewhere is not held).
+    ///
+    /// Before M-22 that stall was invisible: the sniffing builder parked a new
+    /// connection in `ReadVersion` with no timer, so the server simply waited.
+    /// The head timer now starts at accept — correctly; that is the
+    /// silent-socket fix — so a test whose first connection is held past its
+    /// head timeout was closed as a silent socket and failed with an empty
+    /// response, but only when it happened to be the first network test in the
+    /// process (a single-test run). One throwaway loopback connection per
+    /// process takes the stall instead. It asserts nothing and serves nothing,
+    /// so it cannot mask a server defect; CI hosts without such a filter pay a
+    /// sub-millisecond connect.
+    async fn warm_up_loopback() {
+        // Once a connect completes this fast, the host is no longer holding
+        // this process's connections, and the tests' own head timeouts (1 s
+        // and up) are safe. On a host with no filter the first iteration
+        // passes and this costs one loopback connect.
+        const PROMPT: Duration = Duration::from_millis(250);
+        // A fresh relink has been observed to have several connections held
+        // before the verdict is cached, not just the first, so keep going until
+        // one is prompt — bounded, so a host that never relents still runs the
+        // suite (and its tests then fail loudly rather than hang).
+        const DEADLINE: Duration = Duration::from_secs(90);
+        static WARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if WARMED.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind warm-up listener");
+        let address = listener.local_addr().expect("warm-up listener address");
+        let accepting = tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+        let started = Instant::now();
+        while started.elapsed() < DEADLINE {
+            let attempt = Instant::now();
+            let connected = TcpStream::connect(address).await.is_ok();
+            if connected && attempt.elapsed() < PROMPT {
+                break;
+            }
+        }
+        accepting.abort();
+        WARMED.store(true, std::sync::atomic::Ordering::Release);
+    }
+
     async fn spawn_server(application: Router, settings: HttpServerSettings) -> TestServer {
+        warm_up_loopback().await;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
+        spawn_on(listener, application, settings, HashSet::new())
+    }
+
+    fn spawn_on(
+        listener: TcpListener,
+        application: Router,
+        settings: HttpServerSettings,
+        per_ip_exempt: HashSet<IpAddr>,
+    ) -> TestServer {
         let address = listener.local_addr().expect("listener local address");
         let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
         let handle = tokio::spawn(serve_hardened(
             listener,
             application,
             settings,
+            per_ip_exempt,
             async move {
                 let _ = shutdown_receiver.await;
             },
@@ -393,6 +647,32 @@ mod tests {
         );
     }
 
+    /// A connection that never sends a single byte is closed too (M-22 side
+    /// effect, and an M-13/M-33 gap it closes).
+    ///
+    /// Pre-T55 the sniffing `serve_connection_with_upgrades` path parked every
+    /// new connection in hyper-util's `ReadVersion` future — which has no timer
+    /// — until enough bytes arrived to tell h1 from h2. The h1 header-read
+    /// timeout only started after that, so a client that connected and sent
+    /// nothing held its slot (and its task) forever: 1024 silent sockets, no
+    /// refresh needed, and the node accepted nothing ever again. Served as
+    /// HTTP/1.1 directly, the head timer is armed at accept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn silent_connection_is_closed_by_header_read_timeout() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+        let server = spawn_server(test_router(), short_settings()).await;
+
+        let mut stream = TcpStream::connect(server.address).await.expect("connect");
+        // Not one byte.
+        let outcome =
+            tokio::time::timeout(tolerant(HEADER_TIMEOUT), read_until_eof(&mut stream)).await;
+        assert!(
+            outcome.is_ok(),
+            "server held a connection that never sent a byte past 4x the header read timeout — \
+             silent sockets can hoard every slot (M-13/M-22)"
+        );
+    }
+
     // — 2. Slow body: complete head, then silence —
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -467,6 +747,7 @@ mod tests {
             header_read_timeout: capped_header_timeout,
             request_timeout: REQUEST_TIMEOUT,
             max_connections: 2,
+            max_connections_per_ip: 2,
         };
         let server = spawn_server(test_router(), settings).await;
 
@@ -516,6 +797,7 @@ mod tests {
                 header_read_timeout: capped_header_timeout,
                 request_timeout: REQUEST_TIMEOUT,
                 max_connections: 64,
+                max_connections_per_ip: 64,
             },
         )
         .await;
@@ -671,6 +953,337 @@ mod tests {
         }
     }
 
+    // — M-22: no cleartext HTTP/2 —
+
+    /// The HTTP/2 client connection preface (RFC 9113 §3.4) followed by an
+    /// empty SETTINGS frame — exactly what `curl --http2-prior-knowledge`
+    /// opens with.
+    const H2_PRIOR_KNOWLEDGE: &[u8] =
+        b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00";
+
+    /// M-22 bug-catch: the server must answer the h2 preface as HTTP/1.1 (a
+    /// 505 or a close), never with an HTTP/2 SETTINGS frame. An h2 server's
+    /// first bytes are a frame header whose fourth byte is type 0x04; an
+    /// HTTP/1.1 server's are `HTTP/1.1`.
+    ///
+    /// This is the test that catches the silent no-op: with `http1_only()` set
+    /// but `serve_connection_with_upgrades` restored, hyper-util still sniffs
+    /// the preface and serves h2c, and the assertion below fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn h2_prior_knowledge_preface_is_refused() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+        let server = spawn_server(test_router(), serving_settings()).await;
+
+        let mut stream = TcpStream::connect(server.address).await.expect("connect");
+        stream
+            .write_all(H2_PRIOR_KNOWLEDGE)
+            .await
+            .expect("write h2 preface");
+
+        // One read is enough: an h2 server sends SETTINGS immediately and then
+        // waits, so reading to EOF would hang on exactly the failure case.
+        let mut first = vec![0_u8; 256];
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut first))
+            .await
+            .expect("the server must answer or close within 2s, not sit on an h2 preface")
+            .unwrap_or(0);
+        first.truncate(read);
+
+        let is_h2_settings = first.len() >= 9 && first[3] == 0x04;
+        assert!(
+            !is_h2_settings,
+            "the server answered the prior-knowledge preface with an HTTP/2 SETTINGS frame — \
+             cleartext h2c is being served (M-22): {first:02x?}"
+        );
+        assert!(
+            first.is_empty() || first.starts_with(b"HTTP/1.1 "),
+            "expected an HTTP/1.1 refusal or a close, got: {:?}",
+            String::from_utf8_lossy(&first)
+        );
+        assert!(
+            !first.starts_with(b"HTTP/1.1 2"),
+            "the preface must be refused, not served: {:?}",
+            String::from_utf8_lossy(&first)
+        );
+    }
+
+    /// HTTP/1.1 upgrade requests are simply served as HTTP/1.1 — with the
+    /// upgrade machinery gone there is nothing to switch to (M-22).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn h2c_upgrade_header_is_ignored() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+        let server = spawn_server(test_router(), serving_settings()).await;
+
+        let mut stream = TcpStream::connect(server.address).await.expect("connect");
+        let request = format!(
+            "GET / HTTP/1.1\r\nHost: {}\r\nConnection: Upgrade, HTTP2-Settings, close\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAARAAAAAAAIAAAAA\r\n\r\n",
+            server.address
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write upgrade request");
+        let response = tokio::time::timeout(Duration::from_secs(2), read_until_eof(&mut stream))
+            .await
+            .expect("request should complete");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        assert!(!response.contains("101"), "no protocol switch: {response}");
+    }
+
+    // — M-33: per-IP connection cap —
+
+    #[test]
+    fn per_ip_table_admits_refuses_frees_and_prunes() {
+        let table = PerIpConnections::new(2, HashSet::new());
+        let peer: IpAddr = "203.0.113.7".parse().unwrap();
+        let first = table.try_admit(peer).expect("1st admitted");
+        let second = table.try_admit(peer).expect("2nd admitted");
+        assert!(table.try_admit(peer).is_none(), "3rd refused");
+        // Another address has its own share.
+        let other = table
+            .try_admit("198.51.100.1".parse().unwrap())
+            .expect("a second client is unaffected");
+        drop(first);
+        let third = table.try_admit(peer).expect("a freed share is reusable");
+        drop((second, third, other));
+        assert!(
+            table.counts.lock().unwrap().is_empty(),
+            "entries at 0 must be removed, so the map never outgrows live connections"
+        );
+    }
+
+    #[test]
+    fn per_ip_table_keys_like_the_rate_limiter() {
+        // v4-mapped and plain IPv4 are one client (M-30), and so are two
+        // addresses in one IPv6 /64 (M-04b).
+        let table = PerIpConnections::new(1, HashSet::new());
+        let _held = table
+            .try_admit("::ffff:203.0.113.7".parse().unwrap())
+            .unwrap();
+        assert!(table.try_admit("203.0.113.7".parse().unwrap()).is_none());
+
+        let _v6 = table.try_admit("2001:db8:1:2::1".parse().unwrap()).unwrap();
+        assert!(table
+            .try_admit("2001:db8:1:2:ffff::9".parse().unwrap())
+            .is_none());
+        assert!(table
+            .try_admit("2001:db8:1:3::1".parse().unwrap())
+            .is_some());
+    }
+
+    #[test]
+    fn per_ip_table_exempts_trusted_proxies_in_either_spelling() {
+        let exempt: HashSet<IpAddr> = ["172.18.0.9".parse().unwrap()].into_iter().collect();
+        let table = PerIpConnections::new(1, exempt);
+        let mapped: IpAddr = "::ffff:172.18.0.9".parse().unwrap();
+        let slots: Vec<_> = (0..10)
+            .map(|_| {
+                table
+                    .try_admit(mapped)
+                    .expect("a trusted proxy is not per-IP capped")
+            })
+            .collect();
+        assert!(
+            table.counts.lock().unwrap().is_empty(),
+            "exempt peers are not counted"
+        );
+        drop(slots);
+    }
+
+    /// Two loopback source addresses the test can connect *from*, and a
+    /// listener that accepts both. Prefers a dual-stack `[::]` listener
+    /// (`127.0.0.1` arrives v4-mapped, `::1` as itself — which also exercises
+    /// the M-30 folding); falls back to `127.0.0.2` where IPv6 is disabled
+    /// (Linux routes all of 127/8 to loopback). `None` if neither works.
+    async fn two_source_listener() -> Option<(TcpListener, SocketAddr, SocketAddr)> {
+        if let Ok(listener) = TcpListener::bind("[::]:0").await {
+            let port = listener.local_addr().ok()?.port();
+            let v6: SocketAddr = format!("[::1]:{port}").parse().ok()?;
+            if TcpStream::connect(v6).await.is_ok() {
+                return Some((listener, format!("127.0.0.1:{port}").parse().ok()?, v6));
+            }
+        }
+        let listener = TcpListener::bind("0.0.0.0:0").await.ok()?;
+        let port = listener.local_addr().ok()?.port();
+        let probe = tokio::net::TcpSocket::new_v4().ok()?;
+        probe.bind("127.0.0.2:0".parse().ok()?).ok()?;
+        probe
+            .connect(format!("127.0.0.1:{port}").parse().ok()?)
+            .await
+            .ok()?;
+        Some((
+            listener,
+            format!("127.0.0.1:{port}").parse().ok()?,
+            format!("127.0.0.2:{port}").parse().ok()?,
+        ))
+    }
+
+    /// Connect to `target`, from 127.0.0.2 when that is the second source.
+    async fn connect_from(target: SocketAddr, second_source: bool) -> TcpStream {
+        if second_source && target.is_ipv4() {
+            let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+            socket
+                .bind("127.0.0.2:0".parse().unwrap())
+                .expect("bind 127.0.0.2");
+            let port = target.port();
+            socket
+                .connect(format!("127.0.0.1:{port}").parse().unwrap())
+                .await
+                .expect("connect from 127.0.0.2")
+        } else {
+            TcpStream::connect(target).await.expect("connect")
+        }
+    }
+
+    /// M-33 bug-catch: one address opening more connections than its share
+    /// cannot take the slots another address needs. Global cap 4, per-IP 2;
+    /// the attacker opens 4 slowloris connections. Pre-T55 all 4 were accepted
+    /// and held until the header timeout (8s here), so the second client got
+    /// nothing inside the 4s probe window. Now the attacker's 3rd and 4th are
+    /// closed on the spot and the second client is served at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_ip_cannot_take_every_slot() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+        let Some((listener, attacker_target, victim_target)) = two_source_listener().await else {
+            eprintln!(
+                "SKIPPED: no second loopback source address (IPv6 and 127.0.0.2 both unavailable)"
+            );
+            return;
+        };
+        let second_source_is_v4 = victim_target.is_ipv4();
+        let long_head_timeout = Duration::from_secs(8);
+        warm_up_loopback().await;
+        let server = spawn_on(
+            listener,
+            test_router(),
+            HttpServerSettings {
+                header_read_timeout: long_head_timeout,
+                request_timeout: long_head_timeout,
+                max_connections: 4,
+                max_connections_per_ip: 2,
+            },
+            HashSet::new(),
+        );
+        let _ = server.address;
+
+        let mut holders = Vec::new();
+        for _ in 0..4 {
+            let mut holder = TcpStream::connect(attacker_target).await.expect("connect");
+            let _ = holder.write_all(b"GET / HTTP/1.1\r\nHos").await;
+            holders.push(holder);
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // The victim first: a second address is served at once, while the
+        // attacker is still holding everything it was allowed to keep. Pre-T55
+        // it would wait in the backlog until the attacker's 8s head timeout.
+        let mut victim = connect_from(victim_target, second_source_is_v4).await;
+        victim
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write request");
+        let response = tokio::time::timeout(Duration::from_secs(4), read_until_eof(&mut victim))
+            .await
+            .expect(
+                "a second client address was not served while one address held connections — \
+                 one IP consumed every slot (M-33)",
+            );
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"),
+            "got: {}",
+            String::from_utf8_lossy(&response)
+        );
+
+        // And the over-cap holders were closed on the spot — long before the
+        // 8s head timeout could have done it — while the two within the share
+        // are still open.
+        let mut closed = 0;
+        for holder in &mut holders {
+            let mut probe = [0_u8; 16];
+            if let Ok(Ok(0) | Err(_)) =
+                tokio::time::timeout(Duration::from_millis(300), holder.read(&mut probe)).await
+            {
+                closed += 1;
+            }
+        }
+        assert_eq!(
+            closed, 2,
+            "exactly the connections beyond the per-IP share must be closed at once (M-33)"
+        );
+        drop(holders);
+    }
+
+    // — H-01 residual: the Docker HEALTHCHECK still passes through the guard —
+
+    /// `gl-node --health-check` runs `probe_local_health` against the real
+    /// router, which now Host-guards and rate-limits `/health`. For a
+    /// `0.0.0.0` bind it probes `127.0.0.1` with `Host: 127.0.0.1`; for `::`
+    /// it probes `::1` with a bare `Host: ::1`. Both must still get a 200.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn docker_healthcheck_probe_passes_through_the_host_guard() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+        let (_ledger_directory, application) = build_real_application();
+
+        let listener = TcpListener::bind("0.0.0.0:0")
+            .await
+            .expect("bind v4 wildcard");
+        warm_up_loopback().await;
+        let server = spawn_on(
+            listener,
+            application.clone(),
+            serving_settings(),
+            HashSet::new(),
+        );
+        let port = server.address.port();
+        tokio::task::spawn_blocking(move || crate::health::probe_local_health("0.0.0.0", port))
+            .await
+            .expect("probe task")
+            .expect("the Docker HEALTHCHECK against a 0.0.0.0 bind must pass (H-01 residual)");
+
+        if let Ok(listener) = TcpListener::bind("[::]:0").await {
+            warm_up_loopback().await;
+            let server = spawn_on(listener, application, serving_settings(), HashSet::new());
+            let port = server.address.port();
+            match tokio::task::spawn_blocking(move || crate::health::probe_local_health("::", port))
+                .await
+                .expect("probe task")
+            {
+                Ok(()) => {}
+                // No ::1 on this host: nothing to assert about the guard.
+                Err(error) if error.contains("connect") => {
+                    eprintln!("SKIPPED the :: half: {error}");
+                }
+                Err(error) => panic!("the HEALTHCHECK against a :: bind must pass: {error}"),
+            }
+        }
+    }
+
+    /// And over a real socket a foreign `Host` is refused on `/health`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_over_the_wire_refuses_a_foreign_host() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+        let (_ledger_directory, application) = build_real_application();
+        let server = spawn_server(application, serving_settings()).await;
+
+        let mut stream = TcpStream::connect(server.address).await.expect("connect");
+        stream
+            .write_all(
+                b"GET /health HTTP/1.1\r\nHost: rebound.example.com\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("write request");
+        let response = tokio::time::timeout(Duration::from_secs(2), read_until_eof(&mut stream))
+            .await
+            .expect("request should complete");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 403"), "got: {response}");
+        assert!(
+            !response.contains("version"),
+            "no health detail may leak: {response}"
+        );
+    }
+
     /// Assemble the real router the same way `main` does (mirrors the helper in
     /// `request_guard.rs` tests).
     fn build_real_application() -> (tempfile::TempDir, Router) {
@@ -714,6 +1327,7 @@ mod tests {
             RequestGuardState {
                 allowed_hosts: Arc::new(config.allowed_host_set()),
                 allowed_origins: Arc::new(config.cors.allowed_origins.iter().cloned().collect()),
+                tls_terminated: false,
             },
             CorsLayer::new(),
             true,

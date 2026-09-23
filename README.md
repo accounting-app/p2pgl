@@ -10,7 +10,7 @@ All data lives in a single **`.bean` file** (plain-text, beancount-compatible). 
 
 ### Prerequisites
 
-- **Rust 1.87+** — [install via rustup](https://rustup.rs/)
+- **Rust 1.91+** (the workspace's `rust-version`) — [install via rustup](https://rustup.rs/)
 - **curl** (for testing the API) or a browser (for GraphiQL)
 
 ### 1. Clone & Build
@@ -23,7 +23,8 @@ cargo build --release
 
 ### 2. Create a Config File
 
-Create `gl-node.config.json` in the project root:
+The repository ships a minimal `gl-node.config.json` in the project root
+with GraphiQL off. Edit it, or replace it with:
 
 ```json
 {
@@ -44,8 +45,8 @@ The server starts on **http://127.0.0.1:4000** by default.
 You'll see:
 
 ```
-INFO  loading configuration path="gl-node.config.json"
-INFO  gl-node listening addr=127.0.0.1:4000
+INFO  loading configuration path=gl-node.config.json
+INFO  gl-node starting address=127.0.0.1:4000 version=0.1.0 ledger=my-ledger.bean auth_enabled=false p2p_enabled=false graphiql=false
 ```
 
 ### 4. Open GraphiQL
@@ -73,6 +74,14 @@ Response (loopback bind, or any bind with a valid `X-Api-Key`):
   "version": "0.1.0"
 }
 ```
+
+`/health` sits behind the same Host guard as `/graphql`: a request whose `Host`
+header is not in `allowedHosts` gets `403` (loopback names are always allowed,
+so the local probe above and the Docker `HEALTHCHECK` are unaffected). This is
+what stops a DNS-rebinding page from reading it. It also has its own rate
+limit — 120 requests per minute per client, separate from the GraphQL budget so
+a busy API client cannot fail your health probe — and answers `429` past it.
+Point monitors at a listed host name, not a raw IP that is not in `allowedHosts`.
 
 On a **non-loopback** `bindAddress`, an unauthenticated request gets the
 liveness answer and nothing else:
@@ -411,7 +420,8 @@ boot if it is missing — the node will not start half-hardened.
   "http": {
     "headerReadTimeoutSeconds": 30,
     "requestTimeoutSeconds": 30,
-    "maxConnections": 1024
+    "maxConnections": 1024,
+    "maxConnectionsPerIp": 64
   },
   "p2p": {
     "enabled": false,
@@ -419,10 +429,16 @@ boot if it is missing — the node will not start half-hardened.
     "bootstrapEndpointIds": [],
     "gossipIntervalMilliseconds": 5000,
     "antiEntropyIntervalMilliseconds": 5000,
-    "swarmTopic": "openledger/transactions"
+    "swarmTopic": "openledger/transactions",
+    "relayMode": "n0"
   }
 }
 ```
+
+`p2p.meshId` is the one option deliberately left out of the block: on an
+existing mesh, setting it changes the signature domain and invalidates every
+signature already held. Read [Mesh identity](#mesh-identity-p2pmeshid) before
+you set one.
 
 > `"apiKey": "change-me"` above is a **placeholder that this node refuses to
 > boot with**, on purpose — see [API keys](#api-keys) before you copy the block.
@@ -443,10 +459,14 @@ boot if it is missing — the node will not start half-hardened.
 | `http.headerReadTimeoutSeconds` | `30` | Time a client gets to send a complete request head; also bounds idle keep-alive. `1`–`300` |
 | `http.requestTimeoutSeconds` | `30` | Whole-request ceiling, body read and GraphQL execution included (`408` on expiry). `1`–`300` |
 | `http.maxConnections` | `1024` | Concurrently served connections; excess stays in the kernel backlog. `8`–`65536` |
+| `http.maxConnectionsPerIp` | `64` | Concurrent connections one client may hold (keyed per IPv4 address or IPv6 /64, like the rate limiter), so one address cannot take every slot. Addresses listed in `trustedProxies` are exempt — list your reverse proxy there, or every client behind it shares this cap. Clamped to `maxConnections`. `8`–`65536` |
 | `signing.enabled` | `false` | Sign transactions with Ed25519. Forced on when `p2p.enabled` |
 | `p2p.enabled` | `false` | Enable Iroh mesh replication |
+| `p2p.secretKeyPath` | `./data/iroh.secret` | The node's Ed25519 key — its QUIC identity **and** its signing key. Created `0600` if absent. An existing file is refused unless it is a regular file (not a symlink), owned by the uid the node runs as, and not readable by group or other |
 | `p2p.bootstrapEndpointIds` | `[]` | Allowlisted peer EndpointIds; empty drops inbound `Supply` |
+| `p2p.gossipIntervalMilliseconds` | `5000` | Accepted but currently unused (reserved for gossip pacing) |
 | `p2p.antiEntropyIntervalMilliseconds` | `5000` | ALPN head-exchange cadence; minimum `100` |
+| `p2p.relayMode` | `"n0"` | `"n0"` (public Iroh relays and discovery) or `"disabled"` (direct addresses only). Anything else is refused at boot — see [Relay mode](#relay-mode-p2prelaymode) |
 | `p2p.swarmTopic` | `openledger/transactions` | Gossip topic, and the signature domain while `meshId` is unset; required unique on a public bind. Same form as `meshId`: non-empty, no surrounding whitespace, ASCII letters, digits and `- _ . : /`, up to 128 bytes |
 | `p2p.meshId` | *(unset)* | Mesh identity bound into every signature. Use a random UUID. Unset falls back to `swarmTopic` — see below |
 
@@ -528,6 +548,23 @@ config file that carries a non-empty `apiKey` and is readable by group or other
 also draws a warning at boot; `chmod 600` it, or move the key to the
 environment.
 
+### Relay mode (`p2p.relayMode`)
+
+With the default, `"n0"`, the node's endpoint uses the public relay and
+discovery infrastructure run by n0 (the Iroh maintainers): it publishes a
+record under its EndpointId to n0's discovery service saying how to reach it,
+so peers can find it by id alone, and it falls back to n0's public relay
+servers when a direct connection cannot be made. Peer traffic stays end-to-end encrypted, so a relay
+cannot read directives, but it is **not private**: the operator of that
+infrastructure can see that your node exists and is online, its IP address,
+which EndpointIds it talks to, and when and how much. That is why a node on
+`"n0"` logs a warning at every boot.
+
+`"disabled"` builds the endpoint with no relay and no discovery, so nothing
+about the node is published anywhere. The cost is reachability: peers connect
+on direct addresses only, and nothing in the config supplies those addresses,
+so check that your peers can actually connect before relying on it.
+
 ### Mesh identity (`p2p.meshId`)
 
 The swarm topic is a *reachability* string: anyone holding it
@@ -601,7 +638,7 @@ curl -s -X POST http://127.0.0.1:4000/graphql \
   -d '{"query": "{ health { status } }"}'
 ```
 
-The `/health` endpoint never *requires* authentication — it always answers `200` so probes keep working. On a non-loopback bind it discloses its version/heads/peers detail only to a request carrying a valid `X-Api-Key`; see [Health Check](#health-check).
+The `/health` endpoint never *requires* authentication. On a non-loopback bind it discloses its version/heads/peers detail only to a request carrying a valid `X-Api-Key`. It is not unconditional, though: like `/graphql`, it answers `403` to a request whose `Host` is not in `allowedHosts`, and `429` past its own rate limit — see [Health Check](#health-check).
 
 ### Editing the `.bean` file by hand
 
@@ -706,12 +743,19 @@ cat > docker-config.json <<'JSON'
 }
 JSON
 
+# The image runs as uid 1000 (`glnode`). Create the data directory yourself
+# and hand it to that uid first: if `docker run` has to create it, it is
+# created root-owned and the node cannot write its ledger. (Docker Desktop on
+# macOS/Windows maps ownership for you; the `chown` is for a Linux host.)
+mkdir -p data
+sudo chown 1000:1000 data
+
 # Run with persistent data. The key comes from the environment, not the file.
 docker run -d \
   -p 127.0.0.1:4000:4000 \
   -e GL_NODE_API_KEY="$(openssl rand -hex 32)" \
-  -v $(pwd)/docker-config.json:/data/gl-node.config.json \
   -v $(pwd)/data:/data \
+  -v $(pwd)/docker-config.json:/data/gl-node.config.json:ro \
   openledger
 ```
 
@@ -789,8 +833,9 @@ cargo clippy --all-targets
 openledger-v2/
 ├── Cargo.toml                # Workspace root
 ├── Dockerfile                # Multi-stage Docker build
-├── gl-node.config.json       # Config file (create this)
-├── SPEC.md                   # Full specification
+├── gl-node.config.json       # Minimal local config (edit or replace)
+├── SECURITY_AUDIT_0922.md    # Current security audit register
+├── docs/                     # Task trackers, Format v2 design
 ├── crates/
 │   ├── gl-node/              # HTTP server (Axum + GraphQL)
 │   │   ├── src/main.rs       # Entrypoint, boot, graceful shutdown

@@ -94,7 +94,7 @@
 //! commit is in flight, so a caller that forgets the permit gets a loud
 //! `COMMIT_IN_FLIGHT` error rather than a silently interleaved write.
 
-use ledger::service::{LedgerService, PendingCommit, ServiceError};
+use ledger::service::{LedgerService, PendingCommit, RecoveryReload, ServiceError};
 use tokio::sync::OwnedMutexGuard;
 
 use crate::graphql::SharedLedger;
@@ -161,6 +161,25 @@ pub(crate) async fn commit_pending(
     pending: Option<PendingCommit>,
     permit: WritePermit,
 ) -> Result<(), ServiceError> {
+    commit_pending_with_reload(ledger, pending, permit, RecoveryReload::load).await
+}
+
+/// [`commit_pending`], with the blocking half of the L-13 reload supplied by
+/// the caller.
+///
+/// Production passes [`RecoveryReload::load`] and nothing else; the parameter
+/// exists so a test can park the rebuild and observe what the rest of the node
+/// can and cannot do while it runs (L-43). It is the same move as the
+/// service's commit observer: one seam, everything around it the real code.
+async fn commit_pending_with_reload<L>(
+    ledger: &SharedLedger,
+    pending: Option<PendingCommit>,
+    permit: WritePermit,
+    load: L,
+) -> Result<(), ServiceError>
+where
+    L: FnOnce(&RecoveryReload) -> Result<LedgerService, ServiceError> + Send + 'static,
+{
     let Some(pending) = pending else {
         // Nothing to write, so nothing to serialize against: release the slot
         // and let the next writer in immediately.
@@ -182,7 +201,7 @@ pub(crate) async fn commit_pending(
                 Ok(())
             }
             Ok(Err(error)) => {
-                ledger.write().await.recover_failed_commit();
+                recover_off_lock(&ledger, load).await;
                 Err(error)
             }
             // The blocking task panicked or the runtime is shutting down. We
@@ -190,7 +209,7 @@ pub(crate) async fn commit_pending(
             // failed commit: reload from disk, which is authoritative either
             // way.
             Err(join_error) => {
-                ledger.write().await.recover_failed_commit();
+                recover_off_lock(&ledger, load).await;
                 Err(ServiceError::Io(std::io::Error::other(join_error)))
             }
         };
@@ -212,6 +231,58 @@ pub(crate) async fn commit_pending(
         // actually hold.
         Err(join_error) => Err(ServiceError::Io(std::io::Error::other(join_error))),
     }
+}
+
+/// Restore memory == disk after a failed commit without rebuilding the ledger
+/// under its lock or on a runtime worker (L-43).
+///
+/// # The bug this closes
+///
+/// Both failure arms of [`commit_pending`] used to call
+/// `ledger.write().await.recover_failed_commit()`, which runs
+/// `LedgerService::boot` inline: up to a 64 MiB read, a parse, a DAG insert
+/// per directive and a read-model build, **on a runtime worker with the write
+/// guard held**. That is precisely the stall the module docs say T44 removed —
+/// every GraphQL read queued behind a full-ledger rebuild — re-introduced once
+/// per failed commit, and a failing disk fails every commit.
+///
+/// # The shape, and why it is safe
+///
+/// ```text
+/// read lock  { reload = svc.begin_recovery() }        // O(1) snapshot of path + author
+/// spawn_blocking { reloaded = load(&reload) }          // the boot — no lock, off the runtime
+/// write lock { svc.finish_recovery(reload, reloaded) } // the swap (adopt_reloaded)
+/// ```
+///
+/// Only ever called from inside [`commit_pending`]'s task, which owns the
+/// [`WritePermit`] until after this returns — so for the whole rebuild no other
+/// writer can stage, prepare, commit or reconcile. That is what makes a rebuild
+/// read at one moment still correct to install at a later one: the files it
+/// read are still the files, and nothing the swap discards was added in
+/// between. Readers are not excluded, and see the pre-recovery memory while the
+/// rebuild runs — exactly what they could already see for the whole duration
+/// of the commit that failed, so no new state becomes observable.
+///
+/// `finish_recovery` backs the permit with a fingerprint check: if the service
+/// moved anyway (a writer that skipped the permit), it discards the stale
+/// rebuild and reloads synchronously, i.e. falls back to the pre-L-43
+/// behaviour rather than installing something that could lose a durable write.
+///
+/// A panic in the rebuild (or the blocking pool going away at shutdown) is a
+/// failed reload, reported and logged as one — memory is left as it is, which
+/// is what a failed synchronous reload has always done. Before this change such
+/// a panic unwound through a task holding the write guard.
+async fn recover_off_lock<L>(ledger: &SharedLedger, load: L)
+where
+    L: FnOnce(&RecoveryReload) -> Result<LedgerService, ServiceError> + Send + 'static,
+{
+    let reload = ledger.read().await.begin_recovery();
+    let snapshot = reload.clone();
+    let reloaded = match tokio::task::spawn_blocking(move || load(&snapshot)).await {
+        Ok(reloaded) => reloaded,
+        Err(join_error) => Err(ServiceError::Io(std::io::Error::other(join_error))),
+    };
+    ledger.write().await.finish_recovery(reload, reloaded);
 }
 
 /// Prepare and run a full compaction: fold the journal back into the canonical
@@ -265,6 +336,20 @@ pub(crate) async fn compact(ledger: &SharedLedger) -> Result<(), ServiceError> {
 ///   stuck flag at the consumer would have left the two mechanisms that stick
 ///   it — the missing guard and the early-released permit — in place for the
 ///   next path that forgets them.
+///
+/// # L-43: this recovery is still synchronous, deliberately
+///
+/// Unlike [`commit_pending`]'s, the reload here still runs inline, under the
+/// caller's write guard. The function is synchronous and is handed
+/// `&mut LedgerService` from inside a guard its callers keep using, so it has
+/// no way to release the lock around the rebuild without changing every call
+/// site (the three GraphQL mutations, the ALPN supply batch, the watcher and
+/// [`compact`]). The trigger is narrower than the commit-failure one — a
+/// prepare fails before anything is written, on an over-cap write or on an
+/// adoption that could not read or parse the `.bean` — but it is the same
+/// stall, and at the size cap it repeats on every write attempt. Moving it
+/// off the lock needs an async form that takes the guard by value, drops it,
+/// and runs [`recover_off_lock`] while the caller's permit is still held.
 pub(crate) fn prepare_or_recover(
     service: &mut LedgerService,
     explicit_compaction: bool,
@@ -461,6 +546,121 @@ mod tests {
             next.errors.is_empty(),
             "H-11: a 408'd mutation must not wedge the mutations after it, got {:?}",
             next.errors
+        );
+    }
+
+    /// L-43: a failed commit's L-13 rebuild runs with NO ledger lock held, no
+    /// other writer interleaves with it, and it still ends memory == disk.
+    ///
+    /// The rebuild is parked through `commit_pending_with_reload`'s seam — the
+    /// only non-production piece; the failure, the permit, the locks and the
+    /// swap are all the real path. While it is parked the test proves three
+    /// things in turn:
+    ///
+    /// 1. the ledger's write lock is FREE — before L-43 the rebuild ran inside
+    ///    `ledger.write().await.recover_failed_commit()`, so every reader
+    ///    queued behind a full-ledger boot;
+    /// 2. a second writer is nonetheless held off, and has written nothing,
+    ///    because the recovering task still owns the single-writer permit;
+    /// 3. once released, memory == disk: the failed write is gone from memory,
+    ///    the durable one before it and the queued one after it are both in
+    ///    memory and on disk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn l43_a_failed_commit_rebuilds_off_the_lock_and_no_writer_interleaves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("l43-recovery.bean");
+        let fail_next_commit = Arc::new(AtomicBool::new(false));
+        let armed = Arc::clone(&fail_next_commit);
+        let ledger = ledger_with_commit_observer(&path, move |_kind, _bytes| {
+            if armed.swap(false, Ordering::SeqCst) {
+                panic!("deliberate commit failure (L-43 test)");
+            }
+        });
+
+        open_account(&ledger, "Assets:Durable", 1).await.unwrap();
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        fail_next_commit.store(true, Ordering::SeqCst);
+        let failing = tokio::spawn({
+            let ledger = Arc::clone(&ledger);
+            async move {
+                let permit = acquire_write_permit(&ledger).await;
+                let pending = {
+                    let mut service = ledger.write().await;
+                    service
+                        .open_account_staged(
+                            "Assets:Failed".to_owned(),
+                            chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+                            Vec::new(),
+                            |_, _, _| None,
+                        )
+                        .unwrap();
+                    prepare_or_recover(&mut service, false).unwrap()
+                };
+                commit_pending_with_reload(&ledger, pending, permit, move |reload| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    reload.load()
+                })
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(30), entered_rx)
+            .await
+            .expect("the failed commit must reach its rebuild")
+            .unwrap();
+
+        // ── 1. The rebuild holds no ledger lock ────────────────────────────
+        {
+            let guard = ledger
+                .try_write()
+                .expect("L-43: the ledger lock must be free while the rebuild runs");
+            assert!(
+                guard.accounts().is_open("Assets:Failed"),
+                "mid-rebuild, readers see the pre-recovery memory — exactly what they saw \
+                 during the commit that failed"
+            );
+        }
+
+        // ── 2. ...but the permit still excludes every other writer ─────────
+        let second = tokio::spawn({
+            let ledger = Arc::clone(&ledger);
+            async move { open_account(&ledger, "Assets:Second", 3).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !second.is_finished(),
+            "L-43: a writer must not interleave with an in-progress recovery"
+        );
+        let on_disk = LedgerService::boot(&path, "l43-probe".to_owned()).unwrap();
+        assert!(
+            !on_disk.accounts().is_open("Assets:Second"),
+            "the queued writer must not have written anything while the rebuild ran"
+        );
+
+        // ── 3. Release: memory == disk, and nothing was lost ───────────────
+        release_tx.send(()).unwrap();
+        let failed = failing.await.unwrap();
+        assert!(failed.is_err(), "a failed commit must never be acked");
+        second
+            .await
+            .unwrap()
+            .expect("the queued writer runs once the recovery is done");
+
+        let memory = ledger.read().await;
+        let disk = LedgerService::boot(&path, "l43-check".to_owned()).unwrap();
+        let mut memory_ids = memory.dag().content_ids();
+        let mut disk_ids = disk.dag().content_ids();
+        memory_ids.sort_unstable();
+        disk_ids.sort_unstable();
+        assert_eq!(memory_ids, disk_ids, "L-13: memory must equal disk");
+        assert!(memory.accounts().is_open("Assets:Durable"));
+        assert!(memory.accounts().is_open("Assets:Second"));
+        assert!(
+            !memory.accounts().is_open("Assets:Failed"),
+            "the undurable write must have been rolled out of memory"
         );
     }
 

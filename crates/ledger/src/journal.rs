@@ -211,10 +211,23 @@ pub fn read_journal(path: &Path, budget: u64) -> Result<JournalScan, JournalErro
             })?;
 
         // ── Payload ────────────────────────────────────────────────────
-        if cursor + payload_length > bytes.len() {
+        //
+        // L-41: compared against the bytes REMAINING, never as
+        // `cursor + payload_length`. The length is attacker-shaped (it is
+        // whatever digits the header holds), and the sum used to overflow for
+        // any length near `usize::MAX` — a panic (`overflow-checks = true` in
+        // release too) instead of this module's policy, landing inside
+        // `recover_failed_commit` with the ledger write lock held. The
+        // subtraction cannot underflow: `cursor` only ever advances past bytes
+        // that exist.
+        let remaining = bytes.len() - cursor;
+        if payload_length > remaining {
             // The header promised more bytes than the file holds. Only a crash
             // between `write_all` and `sync_all` (or a truncated file) produces
-            // this, and only ever at the end.
+            // this, and only ever at the end. A length too large to be real at
+            // all (L-41) takes this same branch: it is the same observation —
+            // "claims more than exists" — and the record is dropped as torn,
+            // exactly like any other over-long claim.
             scan.torn_tail_bytes = (bytes.len() - record_start) as u64;
             break;
         }
@@ -240,10 +253,22 @@ pub fn read_journal(path: &Path, budget: u64) -> Result<JournalScan, JournalErro
 }
 
 /// Parse `;;olj <len> <sha256hex>` into its two fields.
+///
+/// A length that is a well-formed number too large for `usize` saturates to
+/// `usize::MAX` rather than failing the parse (L-41). It is still a header that
+/// claims more bytes than the file can hold — the file is capped far below
+/// `usize::MAX` — so [`read_journal`] must classify it exactly as it classifies
+/// every other over-long claim, and that classification belongs in one place
+/// (the payload bound check), not split across a parse error here and a torn
+/// tail there depending on how many digits were written.
 fn parse_header(header: &str) -> Option<(usize, &str)> {
     let rest = header.strip_prefix(RECORD_TAG)?.strip_prefix(' ')?;
     let (length, hash) = rest.split_once(' ')?;
-    let length: usize = length.parse().ok()?;
+    let length: usize = match length.parse::<usize>() {
+        Ok(length) => length,
+        Err(error) if *error.kind() == std::num::IntErrorKind::PosOverflow => usize::MAX,
+        Err(_) => return None,
+    };
     if hash.len() != 64 || !hash.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
         return None;
     }
@@ -257,7 +282,20 @@ fn parse_header(header: &str) -> Option<(usize, &str)> {
 /// journal's directory entry even though the record's own bytes are on the
 /// platter.
 pub fn append_record(path: &Path, record: &str) -> Result<(u64, bool), std::io::Error> {
-    let created_now = !path.exists();
+    // L-44's sibling on the append path. `open(O_APPEND|O_CREAT)` follows a
+    // symlink planted at the journal path, so a directory-writable attacker
+    // could have the node create, and append ledger records to, any file it
+    // can reach. `lstat` first — it does not follow the link — and refuse a
+    // symlink outright; `Path::exists` (which this used to call) follows it,
+    // and so reported a dangling link as "absent, create it".
+    let created_now = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(refuse_non_regular_journal(path));
+        }
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => return Err(error),
+    };
 
     let mut options = std::fs::OpenOptions::new();
     options.append(true).create(true);
@@ -269,6 +307,26 @@ pub fn append_record(path: &Path, record: &str) -> Result<(u64, bool), std::io::
         options.mode(0o600);
     }
     let mut file = options.open(path)?;
+
+    // The `lstat` above and the `open` are two syscalls, so a link swapped in
+    // between them is still followed by the `open`. Close that window for the
+    // WRITE — the part that matters — by checking that the handle is the very
+    // inode now sitting at `path`, as a regular file, before a byte is
+    // appended. (A true `O_NOFOLLOW` would close it for the create too; std
+    // exposes no portable constant for it and this crate takes no `libc`.)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata()?;
+        let at_path = std::fs::symlink_metadata(path)?;
+        if !at_path.file_type().is_file()
+            || opened.dev() != at_path.dev()
+            || opened.ino() != at_path.ino()
+        {
+            return Err(refuse_non_regular_journal(path));
+        }
+    }
+
     file.write_all(record.as_bytes())?;
     file.sync_all()?;
     let length = file.metadata()?.len();
@@ -277,6 +335,20 @@ pub fn append_record(path: &Path, record: &str) -> Result<(u64, bool), std::io::
         sync_parent_directory(path);
     }
     Ok((length, created_now))
+}
+
+/// The error an append returns when the journal path is not a plain file this
+/// node can own (L-44). An I/O error, so the commit fails and the L-13 reload
+/// runs exactly as for any other failed append.
+fn refuse_non_regular_journal(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "refusing to append to ledger journal {}: it is a symlink or was replaced \
+             while being opened",
+            path.display()
+        ),
+    )
 }
 
 /// Delete the journal after its records have been folded into the canonical
@@ -409,6 +481,137 @@ mod tests {
             "expected corruption at offset 0, got {error}"
         );
         std::fs::remove_file(path).ok();
+    }
+
+    /// A syntactically valid header whose hash field is well-formed, so the
+    /// only thing wrong with it is the length it claims.
+    fn header_claiming(length: &str) -> String {
+        format!("{RECORD_TAG} {length} {}\n", "ab".repeat(32))
+    }
+
+    /// L-41: a header claiming `usize::MAX` bytes is an over-long claim like
+    /// any other — a torn tail — and never a panic.
+    ///
+    /// Before the fix `cursor + payload_length` overflowed (`attempt to add
+    /// with overflow`; release builds run `overflow-checks = true`), and
+    /// `read_journal` is the body of `recover_failed_commit`, so the panic
+    /// landed in a live node holding the ledger write lock.
+    #[test]
+    fn l41_a_usize_max_header_length_is_a_torn_tail_not_a_panic() {
+        let path = temp_journal("l41-usize-max");
+        let mut bytes = header_claiming(&usize::MAX.to_string()).into_bytes();
+        bytes.extend_from_slice(b"a few payload bytes\n");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let scan = read_journal(&path, 1 << 20).expect("an over-long claim is torn, not corrupt");
+        assert!(scan.payloads.is_empty());
+        assert_eq!(
+            scan.torn_tail_bytes,
+            bytes.len() as u64,
+            "the whole unreadable record is the torn tail, exactly as for any header \
+             that promises more bytes than exist"
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    /// L-41, the other shape: a length that is itself representable but that
+    /// overflows once added to a non-zero cursor. An intact record precedes it,
+    /// so it must survive exactly as it does in the ordinary torn-tail case.
+    #[test]
+    fn l41_a_header_length_that_overflows_the_cursor_is_a_torn_tail() {
+        let path = temp_journal("l41-cursor-overflow");
+        append_record(&path, &record_bytes("kept\n")).unwrap();
+        let kept = std::fs::read(&path).unwrap();
+
+        // Pick the length so that `cursor + length == usize::MAX + 1`, where
+        // `cursor` is the offset just past this header line. The claimed
+        // length has 20 digits, which fixes the header's own length.
+        let header_len = header_claiming(&usize::MAX.to_string()).len();
+        let cursor_after_header = kept.len() + header_len;
+        let length = usize::MAX - cursor_after_header + 1;
+        assert_eq!(length.to_string().len(), usize::MAX.to_string().len());
+        assert!(
+            cursor_after_header.checked_add(length).is_none(),
+            "the fixture must overflow the old `cursor + payload_length`"
+        );
+
+        let mut bytes = kept.clone();
+        bytes.extend_from_slice(header_claiming(&length.to_string()).as_bytes());
+        bytes.extend_from_slice(b"partial");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let scan = read_journal(&path, 1 << 20).expect("an over-long claim is torn, not corrupt");
+        assert_eq!(scan.payloads, vec!["kept\n"]);
+        assert_eq!(scan.torn_tail_bytes, (bytes.len() - kept.len()) as u64);
+        std::fs::remove_file(path).ok();
+    }
+
+    /// A length with more digits than `usize` can hold is the same claim, and
+    /// gets the same answer — not a parse error on one side of 20 digits and a
+    /// torn tail on the other.
+    #[test]
+    fn l41_a_length_wider_than_usize_is_a_torn_tail_too() {
+        let path = temp_journal("l41-wide");
+        append_record(&path, &record_bytes("kept\n")).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let kept = bytes.len();
+        bytes.extend_from_slice(header_claiming(&"9".repeat(40)).as_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let scan = read_journal(&path, 1 << 20).unwrap();
+        assert_eq!(scan.payloads, vec!["kept\n"]);
+        assert_eq!(scan.torn_tail_bytes, (bytes.len() - kept) as u64);
+        std::fs::remove_file(path).ok();
+    }
+
+    /// The saturation above is for OVERFLOW only: a length that is not a
+    /// number at all is still a malformed complete header, and fails closed.
+    #[test]
+    fn l41_a_non_numeric_length_still_fails_closed() {
+        let path = temp_journal("l41-not-a-number");
+        std::fs::write(&path, header_claiming("-1")).unwrap();
+        let error = read_journal(&path, 1 << 20).unwrap_err();
+        assert!(
+            matches!(error, JournalError::Corrupt { offset: 0, .. }),
+            "expected corruption at offset 0, got {error}"
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    /// L-44's sibling: a symlink planted at the journal path is refused, and
+    /// its target is neither created nor written.
+    #[cfg(unix)]
+    #[test]
+    fn l44_append_refuses_a_symlinked_journal() {
+        let directory = std::env::temp_dir().join(format!(
+            "openledger-journal-l44-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let journal = directory.join("ledger.bean.journal");
+
+        // A dangling link: the old `Path::exists` check followed it, saw
+        // nothing, and the `O_CREAT` open then created the target.
+        let dangling_target = directory.join("created-through-the-link");
+        std::os::unix::fs::symlink(&dangling_target, &journal).unwrap();
+        assert!(append_record(&journal, &record_bytes("x\n")).is_err());
+        assert!(
+            !dangling_target.exists(),
+            "the append must not create a file through the link"
+        );
+
+        // A link to an existing file: its bytes must be untouched.
+        std::fs::remove_file(&journal).unwrap();
+        let victim = directory.join("victim");
+        std::fs::write(&victim, b"precious\n").unwrap();
+        std::os::unix::fs::symlink(&victim, &journal).unwrap();
+        assert!(append_record(&journal, &record_bytes("x\n")).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious\n");
+
+        std::fs::remove_dir_all(directory).ok();
     }
 
     #[test]

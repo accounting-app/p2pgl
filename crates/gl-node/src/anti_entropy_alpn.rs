@@ -16,12 +16,13 @@ use iroh::EndpointId;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::connection_limiter::{AntiEntropyLimits, ConnectionLimiter};
+use crate::connection_limiter::{AntiEntropyLimits, ConnectionLimiter, FrameReservation};
 use crate::graphql::broadcast::TransactionBroadcast;
 use crate::graphql::query::domain_txn_to_graphql;
 use crate::graphql::SharedLedger;
 use crate::peer_connections::{AcquireError, PeerConnectionCache, Reuse};
 
+use ledger::service::ServiceError;
 use ledger::validate::ValidationError;
 use p2p::allowlist::PeerAllowlist;
 use p2p::gossip::make_supply_entry;
@@ -30,7 +31,9 @@ use p2p::protocol::{
     is_content_id, WireMessage, CONTENT_ID_LEN, MAX_HAVE_HEADS, MAX_MESSAGE_SIZE,
     MAX_SUPPLY_ENTRIES,
 };
-use p2p::union_merge::{validate_supply_entry, verify_author_allowlisted, verify_remote_signature};
+use p2p::union_merge::{
+    validate_supply_entry, verify_author_allowlisted, verify_remote_signature, MergeError,
+};
 
 /// Cap on DISTINCT ids accumulated across one peer's paginated `HaveHeads`
 /// advert (H-02).
@@ -467,7 +470,12 @@ async fn serve_anti_entropy(
                 budget_exhausted = true;
                 break;
             }
-            let message = match read_message(&mut recv, io_timeout).await {
+            // L-39: this frame's claim on the inbound byte budget. Held until
+            // the end of this iteration — i.e. until the decoded message has
+            // been handled — and released by `Drop` on every way out, including
+            // the error returns below.
+            let mut reservation = handler.limiter.frame_reservation(remote);
+            let message = match read_message(&mut recv, io_timeout, &mut reservation).await {
                 Ok(message) => message,
                 // T41: a typed clean shutdown, not a substring match on a
                 // formatted error — see `FrameError` and `classify_read_error`.
@@ -495,9 +503,8 @@ async fn serve_anti_entropy(
                     // One Supply per Want, trimmed to what the requester can
                     // decode (H-02); it re-Wants any tail we could not fit.
                     // Already 1:1, so the L-01 charge below is the same unit the
-                    // read already took.
-                    let entries = collect_supply(&handler.ledger, &ids).await;
-                    let reply = p2p::anti_entropy::truncate_supply(entries);
+                    // read already took. Trimmed WHILE collecting (L-33).
+                    let reply = collect_supply(&handler.ledger, &ids).await;
                     requests_handled = requests_handled.saturating_add(1);
                     write_message(&mut send, &reply, io_timeout).await?;
                 }
@@ -787,7 +794,7 @@ async fn run_head_exchange(
         write_message(send, &page, io).await?;
     }
     let (head_txids, directive_ids) = read_have_heads_advert(recv, remote, budget).await?;
-    let want = {
+    let mut want = {
         let svc = handler.ledger.read().await;
         p2p::anti_entropy::compute_want(
             &svc.head_txids(),
@@ -796,6 +803,17 @@ async fn run_head_exchange(
             &directive_ids,
         )
     };
+    // L-34: `compute_want` only diffs, so a directive this peer serves that we
+    // refused FOR GOOD would otherwise be re-wanted, re-sent and re-validated on
+    // every tick. Taken after the ledger guard is dropped, and only for a read.
+    let suppressed = handler.orphan_buffer.read().await.refusals().retain_wanted(
+        &remote.to_string(),
+        &mut want,
+        std::time::Instant::now(),
+    );
+    if suppressed > 0 {
+        debug!(peer = %remote, suppressed, "not re-wanting directives this peer served that were refused for good");
+    }
     for chunk in want.chunks(MAX_SUPPLY_ENTRIES) {
         fetch_want_chunk(send, recv, chunk, handler, remote, budget).await?;
     }
@@ -901,7 +919,7 @@ async fn read_have_heads_advert(
             directive_ids: page_directives,
             more,
             ..
-        } = read_message(recv, io_timeout)
+        } = read_message(recv, io_timeout, &mut FrameReservation::unmetered())
             .await
             .map_err(|error| error.to_string())?
         else {
@@ -969,7 +987,7 @@ async fn fetch_want_chunk(
         let io_timeout = budget.charge_frame()?;
         write_message(send, &WireMessage::want(remaining.clone()), io_timeout).await?;
         let io_timeout = budget.charge_frame()?;
-        let entries = match read_message(recv, io_timeout)
+        let entries = match read_message(recv, io_timeout, &mut FrameReservation::unmetered())
             .await
             .map_err(|error| error.to_string())?
         {
@@ -1002,18 +1020,38 @@ async fn local_have_heads_pages(ledger: &SharedLedger) -> Vec<WireMessage> {
     p2p::anti_entropy::paginate_have_heads(&svc.head_txids(), &svc.all_directive_ids())
 }
 
-async fn collect_supply(ledger: &SharedLedger, ids: &[String]) -> Vec<p2p::protocol::SupplyEntry> {
+/// Answer one `Want` from the local ledger: the `Supply` frame to send back.
+async fn collect_supply(ledger: &SharedLedger, ids: &[String]) -> WireMessage {
     let svc = ledger.read().await;
-    // L-21: a Want may list the same id more than once (every missing head is
-    // also a directive id upstream, so `compute_want` used to want it twice).
-    // Serve each distinct id at most once — preserving first-occurrence order —
-    // so the requester does not re-validate the same body per copy. Composes
-    // with `truncate_supply` (T18), which trims the deduped batch to the frame.
-    let mut seen: HashSet<&str> = HashSet::new();
-    ids.iter()
-        .filter(|id| seen.insert(id.as_str()))
-        .filter_map(|id| svc.get_directive(id).map(make_supply_entry))
-        .collect()
+    supply_for_want(&svc, ids, make_supply_entry)
+}
+
+/// [`collect_supply`]'s body, with the serializer injected so tests can count
+/// what it produces.
+///
+/// L-01 / L-33: this used to serialize and hash EVERY matched directive of a
+/// Want of up to 1,024 ids — all under the ledger read lock — and only then
+/// hand the batch to `truncate_supply`, which kept at most 256 entries / 15 MiB.
+/// A ~68 KiB request frame could cost up to ~64 MiB of allocation, and 32
+/// connections per peer could sustain that concurrently. `build_supply` stops
+/// producing at the entry cap and at the first entry past the byte budget, so
+/// the work is bounded by what the reply can carry.
+///
+/// The reply itself is unchanged, byte for byte — same L-21 dedup (each
+/// distinct id once, first occurrence wins, so the requester does not
+/// re-validate a body per copy), same skipping of ids we lack, same prefix rule.
+/// That is what keeps the requester's re-`Want` loop (`fetch_want_chunk`)
+/// making progress: every round serves a non-empty prefix of what it still
+/// lacks and we hold, until nothing we hold is left.
+fn supply_for_want<F>(
+    svc: &ledger::service::LedgerService,
+    ids: &[String],
+    mut serialize: F,
+) -> WireMessage
+where
+    F: FnMut(&ledger::model::Directive) -> p2p::protocol::SupplyEntry,
+{
+    p2p::anti_entropy::build_supply(ids, |id| svc.get_directive(id).map(&mut serialize))
 }
 
 /// Tally of what `apply_supply_entries` did with one `Supply` batch (M-14).
@@ -1052,6 +1090,13 @@ async fn apply_supply_entries(
 ) -> SupplyOutcome {
     let from_peer = remote.to_string();
     let mut outcome = SupplyOutcome::default();
+    // L-34: ids refused for good, by phase. Intake verdicts are pure functions
+    // of the served bytes and are recorded unconditionally; stage and drain
+    // verdicts read ledger state, so they are recorded only once the batch they
+    // were reached against is durable (see the end of this function).
+    let mut intake_refused: Vec<String> = Vec::new();
+    let mut stage_refused: Vec<(String, String)> = Vec::new();
+    let mut batch_durable = true;
 
     // ── Phase 1: validate off the ledger write lock (M-15) ──────────────
     //
@@ -1092,6 +1137,7 @@ async fn apply_supply_entries(
                 if let Err(error) = verify_author_allowlisted(&directive, &handler.allowlist) {
                     warn!(%error, peer = %remote, "rejected ALPN supply: author not allowlisted");
                     outcome.rejected += 1;
+                    note_intake_refusal(&mut intake_refused, &entry.id, &error);
                     continue;
                 }
                 if let Err(error) =
@@ -1099,6 +1145,7 @@ async fn apply_supply_entries(
                 {
                     warn!(%error, peer = %remote, "rejected ALPN supply: signature");
                     outcome.rejected += 1;
+                    note_intake_refusal(&mut intake_refused, &entry.id, &error);
                     continue;
                 }
                 // Preserve arrival order so an open/parent earlier in the batch is
@@ -1108,6 +1155,7 @@ async fn apply_supply_entries(
             Err(error) => {
                 warn!(%error, "invalid ALPN supply entry");
                 outcome.rejected += 1;
+                note_intake_refusal(&mut intake_refused, &entry.id, &error);
             }
         }
     }
@@ -1201,6 +1249,9 @@ async fn apply_supply_entries(
                         None => {
                             warn!(%error, "rejected remote directive from ALPN");
                             outcome.rejected += 1;
+                            if stage_refusal_is_permanent(&error) {
+                                stage_refused.push((from_peer.clone(), content_id));
+                            }
                         }
                     }
                 }
@@ -1211,7 +1262,7 @@ async fn apply_supply_entries(
             // Drain orphans this batch unblocked, then persist ONCE for the whole
             // batch plus the drained orphans (M-15). `drain_orphans` stages
             // (no persist), so this single commit covers everything.
-            drain_orphans(
+            let drain_refused = drain_orphans(
                 &handler.orphan_buffer,
                 &mut svc,
                 &handler.broadcast,
@@ -1220,6 +1271,7 @@ async fn apply_supply_entries(
                 &handler.mesh_id,
             )
             .await;
+            stage_refused.extend(drain_refused);
             // T44: prepare under the lock, commit off it. For a catch-up batch
             // on a ledger past the compaction threshold this is a single
             // journal record for the whole batch — O(batch), not O(ledger) —
@@ -1244,9 +1296,30 @@ async fn apply_supply_entries(
                 // was attempted, not what is stored; we return them without
                 // panicking.
                 warn!(%error, peer = %remote, "failed to persist ALPN supply batch; rolled back in memory, will re-pull");
+                batch_durable = false;
             }
         } else {
             drop(svc);
+        }
+    }
+
+    // L-34: remember what was refused for good, so the next exchange with the
+    // peer that served it does not ask for it again within the TTL. A stage or
+    // drain verdict is only as good as the state it was reached against: when
+    // the commit failed, the reload rolled that state back, so those verdicts
+    // are discarded — anti-entropy re-pulls the batch and they are re-derived.
+    if !batch_durable {
+        stage_refused.clear();
+    }
+    if !intake_refused.is_empty() || !stage_refused.is_empty() {
+        let now = std::time::Instant::now();
+        let mut buffer = handler.orphan_buffer.write().await;
+        let refusals = buffer.refusals_mut();
+        for id in &intake_refused {
+            refusals.record(&from_peer, id, now);
+        }
+        for (peer, id) in &stage_refused {
+            refusals.record(peer, id, now);
         }
     }
 
@@ -1272,6 +1345,97 @@ struct DrainContext<'a> {
     mesh_id: &'a str,
 }
 
+/// Record an intake refusal of `id` if it was a permanent one (L-34).
+fn note_intake_refusal(refused: &mut Vec<String>, id: &str, error: &MergeError) {
+    if intake_refusal_is_permanent(error) {
+        refused.push(id.to_owned());
+    }
+}
+
+/// Whether a refusal at INTAKE — `validate_supply_entry`, the author allowlist,
+/// the signature — is permanent for the peer that served the entry (L-34).
+///
+/// All of them are. Every intake check is a pure function of the bytes the
+/// peer served and of this process's fixed configuration (allowlist, signing
+/// flag, mesh id — none of which change at runtime), and a peer serves the
+/// same bytes for an id every time: its store is a G-Set keyed by that id.
+/// Asking again cannot produce a different answer.
+///
+/// That only holds PER PEER, which is why the cache is keyed by (peer, id): the
+/// content id covers the economic body alone, so a different peer's copy can
+/// carry a different envelope and pass where this one failed.
+///
+/// Spelled out as an exhaustive match, not `true`, so a new `MergeError`
+/// variant has to be classified before this compiles — the classification is
+/// the part of L-34 that silently loses data if it is wrong.
+fn intake_refusal_is_permanent(error: &MergeError) -> bool {
+    match error {
+        MergeError::ContentHashMismatch { .. }
+        | MergeError::ParseError(_)
+        | MergeError::ValidationError(_)
+        | MergeError::EnvelopeMissing(_)
+        | MergeError::InvalidSignature(_)
+        | MergeError::ResourceLimitExceeded(_)
+        | MergeError::CycleDetected
+        | MergeError::InvalidEnvelope(_)
+        | MergeError::BodyEnvelopeKey(_)
+        | MergeError::BodyControlCharacter(_)
+        | MergeError::ElidedPosting => true,
+    }
+}
+
+/// Whether a refusal from `stage_remote_directive` is permanent (L-34).
+///
+/// Permanent means content-determined: a verdict on the directive (body or
+/// envelope) that no later arrival can change. Everything that CAN change is
+/// excluded, because caching it would suppress a directive that was about to
+/// become acceptable — a delay the TTL bounds, but a loss for that long:
+///
+/// * the account-lifecycle verdicts ([`account_wait_target`]) — an `open` can
+///   still arrive; those entries are buffered, not refused, and are excluded
+///   here too as a second line;
+/// * `ServiceError::AccountNotOpen` / `AccountAlreadyOpen` — lifecycle again;
+/// * `Dag` — a cycle verdict depends on a DAG that is still growing, and L-40
+///   shows one that clears once another transaction lands; a missing parent is
+///   an orphan and is buffered before staging is ever tried;
+/// * `LamportCeiling` — reached against THIS node's clock, not the directive;
+/// * `Io`, `Journal`, `CommitInFlight`, `Parse` — transient or not a verdict on
+///   the directive at all.
+///
+/// `AccountHasLaterTransactions` — the backdated close, the M-09 residual this
+/// cache exists for — reads ledger state but is monotone in it: the later
+/// posting that refutes the close is in a G-Set DAG and can never leave, so the
+/// close can never become acceptable.
+fn stage_refusal_is_permanent(error: &ServiceError) -> bool {
+    match error {
+        ServiceError::Validation(validation) => match validation {
+            ValidationError::UnbalancedTransaction { .. }
+            | ValidationError::InvalidElision { .. }
+            | ValidationError::InvalidPosting { .. } => true,
+            ValidationError::AccountNotOpen { .. }
+            | ValidationError::AccountClosed { .. }
+            | ValidationError::AccountCurrencyMismatch { .. } => false,
+        },
+        ServiceError::AccountHasLaterTransactions { .. }
+        | ServiceError::ResourceLimitExceeded { .. }
+        | ServiceError::InvalidAccountName { .. }
+        | ServiceError::InvalidCurrency { .. }
+        | ServiceError::InvalidTag { .. }
+        | ServiceError::InvalidLink { .. }
+        | ServiceError::InvalidInput { .. }
+        | ServiceError::DateOutOfRange { .. }
+        | ServiceError::BodyEnvelopeKey { .. } => true,
+        ServiceError::AccountNotOpen { .. }
+        | ServiceError::AccountAlreadyOpen { .. }
+        | ServiceError::Dag(_)
+        | ServiceError::LamportCeiling { .. }
+        | ServiceError::Io(_)
+        | ServiceError::Journal { .. }
+        | ServiceError::CommitInFlight
+        | ServiceError::Parse(_) => false,
+    }
+}
+
 /// The account a rejected remote directive is waiting on, when the rejection
 /// was purely an account-lifecycle verdict (M-09).
 ///
@@ -1288,8 +1452,8 @@ struct DrainContext<'a> {
 /// Everything else (unbalanced, elided, malformed, resource limits, the
 /// backdated-close guard) is a verdict on the directive itself and stays a
 /// rejection.
-fn account_wait_target(error: &ledger::service::ServiceError) -> Option<String> {
-    let ledger::service::ServiceError::Validation(validation) = error else {
+fn account_wait_target(error: &ServiceError) -> Option<String> {
+    let ServiceError::Validation(validation) = error else {
         return None;
     };
     match validation {
@@ -1306,8 +1470,11 @@ enum Restaged {
     Staged,
     /// Still blocked; back in the buffer waiting on this account (M-09).
     Rebuffered { account: String },
-    /// Not in the buffer and not in the DAG.
+    /// Not in the buffer and not in the DAG, for a reason that can change — a
+    /// full buffer, or it was already present.
     Dropped,
+    /// Not in the buffer and not in the DAG, refused for good (L-34).
+    Refused,
 }
 
 /// Re-validate one freed orphan and stage it.
@@ -1325,13 +1492,13 @@ fn restage_freed_entry(
 ) -> Restaged {
     if let Err(error) = verify_author_allowlisted(&entry.directive, context.allowlist) {
         warn!(%error, "rejected resolved orphan: author");
-        return Restaged::Dropped;
+        return refused_if_permanent(intake_refusal_is_permanent(&error));
     }
     if let Err(error) =
         verify_remote_signature(&entry.directive, context.signing_enabled, context.mesh_id)
     {
         warn!(%error, "rejected resolved orphan: signature");
-        return Restaged::Dropped;
+        return refused_if_permanent(intake_refusal_is_permanent(&error));
     }
     match service.stage_remote_directive(entry.directive.clone()) {
         Ok(Some(content_id)) => {
@@ -1347,7 +1514,7 @@ fn restage_freed_entry(
         Err(error) => {
             let Some(account) = account_wait_target(&error) else {
                 warn!(%error, "rejected resolved orphan directive");
-                return Restaged::Dropped;
+                return refused_if_permanent(stage_refusal_is_permanent(&error));
             };
             match buffer.insert_awaiting_accounts(
                 entry.id.clone(),
@@ -1371,6 +1538,14 @@ fn restage_freed_entry(
     }
 }
 
+fn refused_if_permanent(permanent: bool) -> Restaged {
+    if permanent {
+        Restaged::Refused
+    } else {
+        Restaged::Dropped
+    }
+}
+
 /// Drain orphans whose parents have arrived, or whose account is now open
 /// (M-09). Re-checks signature and author.
 ///
@@ -1384,6 +1559,11 @@ fn restage_freed_entry(
 /// staging — or (b) a buffered entry moving to a blocking account it has not
 /// been tried against yet in this call, which `attempted` counts at most once
 /// per (entry, account) pair.
+///
+/// Returns the `(delivering peer, id)` of every freed entry that was then
+/// refused for good (L-34), for the caller to record once the batch is durable.
+/// An entry buffered without a known peer is not returned: the refusal cache is
+/// keyed by peer.
 pub async fn drain_orphans(
     orphan_buffer: &Arc<RwLock<OrphanBuffer>>,
     service: &mut ledger::service::LedgerService,
@@ -1391,7 +1571,7 @@ pub async fn drain_orphans(
     signing_enabled: bool,
     allowlist: &PeerAllowlist,
     mesh_id: &str,
-) {
+) -> Vec<(String, String)> {
     let context = DrainContext {
         broadcast,
         signing_enabled,
@@ -1401,6 +1581,7 @@ pub async fn drain_orphans(
     let mut dag_ids = service.all_directive_ids();
     let mut buffer = orphan_buffer.write().await;
     let mut attempted: HashSet<(String, String)> = HashSet::new();
+    let mut refused: Vec<(String, String)> = Vec::new();
     let mut resolved_any = true;
     while resolved_any {
         resolved_any = false;
@@ -1411,8 +1592,10 @@ pub async fn drain_orphans(
             }
             for entry in buffer.parent_arrived(&parent_id) {
                 let entry_id = entry.id.clone();
+                let from_peer = entry.from_peer.clone();
                 let outcome =
                     restage_freed_entry(&mut buffer, service, &context, entry, &mut dag_ids);
+                note_drain_refusal(&outcome, from_peer, &entry_id, &mut refused);
                 resolved_any |= made_progress(outcome, entry_id, &mut attempted);
             }
         }
@@ -1425,11 +1608,26 @@ pub async fn drain_orphans(
             }
             for entry in buffer.account_opened(&account) {
                 let entry_id = entry.id.clone();
+                let from_peer = entry.from_peer.clone();
                 let outcome =
                     restage_freed_entry(&mut buffer, service, &context, entry, &mut dag_ids);
+                note_drain_refusal(&outcome, from_peer, &entry_id, &mut refused);
                 resolved_any |= made_progress(outcome, entry_id, &mut attempted);
             }
         }
+    }
+    refused
+}
+
+/// Collect a drained entry that was refused for good (L-34).
+fn note_drain_refusal(
+    outcome: &Restaged,
+    from_peer: Option<String>,
+    entry_id: &str,
+    refused: &mut Vec<(String, String)>,
+) {
+    if let (Restaged::Refused, Some(peer)) = (outcome, from_peer) {
+        refused.push((peer, entry_id.to_owned()));
     }
 }
 
@@ -1445,7 +1643,7 @@ fn made_progress(
         // different unmet dependency — worth one more pass. A pair already seen
         // means the entry is going in circles, and does not.
         Restaged::Rebuffered { account } => attempted.insert((entry_id, account)),
-        Restaged::Dropped => false,
+        Restaged::Dropped | Restaged::Refused => false,
     }
 }
 
@@ -1586,11 +1784,17 @@ impl ExactReader for RecvStream {
     }
 }
 
+/// Read one frame, charging its body to `reservation` (L-39).
+///
+/// Inbound (serve-side) reads pass a reservation from the handler's
+/// `ConnectionLimiter`; outbound reads pass [`FrameReservation::unmetered`] —
+/// see there for why the client side is not charged to the inbound budget.
 async fn read_message(
     recv: &mut RecvStream,
     io_timeout: Duration,
+    reservation: &mut FrameReservation,
 ) -> Result<WireMessage, FrameError> {
-    read_frame(recv, io_timeout).await
+    read_frame(recv, io_timeout, reservation).await
 }
 
 /// Read one length-prefixed CBOR frame, applying the M-16 oversized-frame gate
@@ -1608,7 +1812,11 @@ async fn read_message(
 /// bytes to serde. Nothing changes at this call site: the gate lives at the
 /// shared inbound choke point so the gossip-side decode is covered by the same
 /// code.
-async fn read_frame<R>(recv: &mut R, io_timeout: Duration) -> Result<WireMessage, FrameError>
+async fn read_frame<R>(
+    recv: &mut R,
+    io_timeout: Duration,
+    reservation: &mut FrameReservation,
+) -> Result<WireMessage, FrameError>
 where
     R: ExactReader,
 {
@@ -1657,15 +1865,35 @@ where
     // 3. Incremental body read (L-19): grow the buffer chunk by chunk so a
     //    stalled stream pins only the bytes actually received — never `len`
     //    bytes reserved up front. Each chunk read is bounded by the I/O timeout.
+    //
+    //    L-39: every growth of the buffer's CAPACITY is charged to the inbound
+    //    byte budget before it is allocated, so what is charged is what is
+    //    actually held (the chunk is read straight into the buffer's tail, so
+    //    there is no second per-chunk allocation to account for). Capacity
+    //    doubles, capped at `len`, which keeps the copying linear and the charge
+    //    within 2× of the bytes received plus one chunk. A grow the budget
+    //    cannot cover tears the frame down at once — never waits for budget,
+    //    which would be H-10's wedge — and `reservation`'s owner releases it.
     while body.len() < len {
         let want = (len - body.len()).min(READ_CHUNK);
-        let mut chunk = vec![0u8; want];
-        match tokio::time::timeout(io_timeout, recv.read_exact_bytes(&mut chunk)).await {
+        let filled = body.len() + want;
+        if filled > body.capacity() {
+            let capacity = body.capacity().saturating_mul(2).clamp(filled, len);
+            if !reservation.grow_to(capacity) {
+                return Err(FrameError::Protocol(format!(
+                    "anti-entropy frame refused: in-flight frame byte budget exhausted \
+                     ({len}-byte frame)"
+                )));
+            }
+            body.reserve_exact(capacity - body.len());
+        }
+        let start = body.len();
+        body.resize(filled, 0);
+        match tokio::time::timeout(io_timeout, recv.read_exact_bytes(&mut body[start..])).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return Err(truncated_mid_frame(error)),
             Err(_elapsed) => return Err(FrameError::Timeout),
         }
-        body.extend_from_slice(&chunk);
     }
 
     // 4. Size + version + cardinality gates (H-7). Even a frame that passed the
@@ -1853,9 +2081,13 @@ pub(crate) mod tests {
         framed.extend_from_slice(&want_head);
 
         let mut reader = slice_reader(&framed);
-        let error = read_frame(&mut reader, Duration::from_secs(1))
-            .await
-            .expect_err("oversized non-supply frame must be rejected");
+        let error = read_frame(
+            &mut reader,
+            Duration::from_secs(1),
+            &mut FrameReservation::unmetered(),
+        )
+        .await
+        .expect_err("oversized non-supply frame must be rejected");
         assert!(
             matches!(&error, FrameError::Protocol(message) if message.contains("oversized non-supply")),
             "expected the oversized-frame gate to fire, got: {error:?}"
@@ -1888,9 +2120,13 @@ pub(crate) mod tests {
         );
 
         let mut reader = slice_reader(&wire);
-        let decoded = read_frame(&mut reader, Duration::from_secs(5))
-            .await
-            .expect("a genuine large Supply must be accepted");
+        let decoded = read_frame(
+            &mut reader,
+            Duration::from_secs(5),
+            &mut FrameReservation::unmetered(),
+        )
+        .await
+        .expect("a genuine large Supply must be accepted");
         assert_eq!(decoded, message, "round-trip mismatch on large Supply");
     }
 
@@ -1907,9 +2143,13 @@ pub(crate) mod tests {
         for message in messages {
             let wire = message.to_wire().expect("frame");
             let mut reader = slice_reader(&wire);
-            let decoded = read_frame(&mut reader, Duration::from_secs(2))
-                .await
-                .expect("read small frame");
+            let decoded = read_frame(
+                &mut reader,
+                Duration::from_secs(2),
+                &mut FrameReservation::unmetered(),
+            )
+            .await
+            .expect("read small frame");
             assert_eq!(decoded, message);
         }
     }
@@ -2418,7 +2658,10 @@ pub(crate) mod tests {
             .expect("open account")
         };
 
-        let entries = collect_supply(&ledger, &[id.clone(), id.clone(), id.clone()]).await;
+        let reply = collect_supply(&ledger, &[id.clone(), id.clone(), id.clone()]).await;
+        let WireMessage::Supply { entries, .. } = reply else {
+            panic!("a Want is answered with a Supply");
+        };
         assert_eq!(
             entries.len(),
             1,
@@ -2593,7 +2836,13 @@ pub(crate) mod tests {
             )
             .await
             .ok()?;
-            read_message(&mut recv, Duration::from_secs(2)).await.ok()
+            read_message(
+                &mut recv,
+                Duration::from_secs(2),
+                &mut FrameReservation::unmetered(),
+            )
+            .await
+            .ok()
         }
         .await;
         Some(exchanged.is_none())
@@ -2765,7 +3014,13 @@ pub(crate) mod tests {
             }
             // The client's own advert arrives first; anything AFTER it that is a
             // `Want` means the client acted on the 255-byte ids.
-            while let Ok(message) = read_message(&mut recv, Duration::from_secs(2)).await {
+            while let Ok(message) = read_message(
+                &mut recv,
+                Duration::from_secs(2),
+                &mut FrameReservation::unmetered(),
+            )
+            .await
+            {
                 if matches!(message, WireMessage::Want { .. }) {
                     self.wants_seen
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3187,6 +3442,7 @@ pub(crate) mod tests {
             max_total_connections: 256,
             max_connections_per_peer: 1,
             max_requests_per_connection: 100_000,
+            ..AntiEntropyLimits::default()
         };
         let timeouts = AntiEntropyTimeouts {
             connect: Duration::from_secs(5),
@@ -3261,6 +3517,7 @@ pub(crate) mod tests {
             max_total_connections: 256,
             max_connections_per_peer: 32,
             max_requests_per_connection: 2,
+            ..AntiEntropyLimits::default()
         };
         let handler_server = make_handler_with_limits(ledger_server, allow_server, limits);
         let router_server = Router::builder(endpoint_server.clone())
@@ -3284,7 +3541,12 @@ pub(crate) mod tests {
         // the tidy close exists to protect.
         assert!(
             matches!(
-                read_message(&mut recv, Duration::from_secs(5)).await,
+                read_message(
+                    &mut recv,
+                    Duration::from_secs(5),
+                    &mut FrameReservation::unmetered()
+                )
+                .await,
                 Ok(WireMessage::Supply { .. })
             ),
             "the budgeted reply must arrive before the connection closes"
@@ -3331,6 +3593,7 @@ pub(crate) mod tests {
             max_total_connections: 256,
             max_connections_per_peer: 2,
             max_requests_per_connection: 100_000,
+            ..AntiEntropyLimits::default()
         };
         let handler_server = make_handler_with_limits(ledger_server, allow_server, limits);
         let router_server = Router::builder(endpoint_server.clone())
@@ -3407,6 +3670,7 @@ pub(crate) mod tests {
             max_total_connections: 256,
             max_connections_per_peer: 32,
             max_requests_per_connection: 6,
+            ..AntiEntropyLimits::default()
         };
         let handler_server = make_handler_with_limits(ledger_server, allow_server, limits);
         let router_server = Router::builder(endpoint_server.clone())
@@ -3436,7 +3700,13 @@ pub(crate) mod tests {
             {
                 break;
             }
-            match read_message(&mut recv, Duration::from_secs(5)).await {
+            match read_message(
+                &mut recv,
+                Duration::from_secs(5),
+                &mut FrameReservation::unmetered(),
+            )
+            .await
+            {
                 Ok(WireMessage::Supply { .. }) => replies += 1,
                 Ok(_) => {}
                 Err(_) => break,
@@ -3487,6 +3757,7 @@ pub(crate) mod tests {
             max_total_connections: 256,
             max_connections_per_peer: 32,
             max_requests_per_connection: 6,
+            ..AntiEntropyLimits::default()
         };
         let handler_server = make_handler_with_limits(ledger_server, allow_server, limits);
         let router_server = Router::builder(endpoint_server.clone())
@@ -3596,6 +3867,7 @@ pub(crate) mod tests {
             max_total_connections: 256,
             max_connections_per_peer: 32,
             max_requests_per_connection: BUDGET,
+            ..AntiEntropyLimits::default()
         };
         let handler_server = make_handler_with_limits(ledger_server, allow_server, limits);
         let router_server = Router::builder(endpoint_server.clone())
@@ -3629,7 +3901,13 @@ pub(crate) mod tests {
             adverts_sent += 1;
             let mut drained = 0;
             loop {
-                match read_message(&mut recv, Duration::from_secs(2)).await {
+                match read_message(
+                    &mut recv,
+                    Duration::from_secs(2),
+                    &mut FrameReservation::unmetered(),
+                )
+                .await
+                {
                     Ok(WireMessage::HaveHeads { more, .. }) => {
                         frames_received += 1;
                         drained += 1;
@@ -3704,6 +3982,7 @@ pub(crate) mod tests {
             max_total_connections: 8,
             max_connections_per_peer: 4,
             max_requests_per_connection: 100_000,
+            ..AntiEntropyLimits::default()
         };
         let handler_source = make_handler_with_limits(ledger_source.clone(), allow_source, limits);
         let handler_client = make_handler_with_limits(ledger_client.clone(), allow_client, limits);
@@ -4787,6 +5066,640 @@ pub(crate) mod tests {
         assert!(
             svc.accounts().is_open_at("Assets:Cash", day(1, 15)),
             "the close does not retroactively invalidate the earlier transaction"
+        );
+    }
+
+    // ─── T58 / L-33: budget the Supply while collecting it ─────────────────
+
+    /// L-33 KEY TEST. A full 1,024-id `Want` against a ledger holding every one
+    /// of them serializes exactly the 256 entries one `Supply` can carry — not
+    /// 1,024 — and serves them as a prefix of the `Want`, which is what the
+    /// requester's re-`Want` loop needs. Counted, not timed: the serializer is
+    /// the production one, wrapped.
+    #[tokio::test]
+    async fn collect_supply_serializes_only_what_one_reply_can_carry() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("server.bean");
+        write_open_directive_ledger(&path, p2p::protocol::MAX_WANT_IDS, "author");
+        let svc = LedgerService::boot(path, "author".to_owned()).expect("boot ledger");
+        let mut want: Vec<String> = svc.all_directive_ids().into_iter().collect();
+        want.sort();
+        assert_eq!(want.len(), p2p::protocol::MAX_WANT_IDS);
+
+        let mut serialized = 0usize;
+        let reply = supply_for_want(&svc, &want, |directive| {
+            serialized += 1;
+            make_supply_entry(directive)
+        });
+        let WireMessage::Supply { entries, .. } = &reply else {
+            panic!("a Want is answered with a Supply");
+        };
+        assert_eq!(
+            serialized,
+            MAX_SUPPLY_ENTRIES,
+            "L-33: a {}-id Want must serialize only the {MAX_SUPPLY_ENTRIES} entries one \
+             Supply can carry",
+            want.len()
+        );
+        let served: Vec<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
+        let prefix: Vec<&str> = want[..MAX_SUPPLY_ENTRIES]
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(served, prefix, "the reply is a prefix of the Want");
+        reply.to_wire().expect("the reply frames");
+    }
+
+    /// `write_open_directive_ledger`, but each `open` carries a `memo` of
+    /// `memo_bytes` — so a handful of directives exceed the 15 MiB Supply byte
+    /// budget long before the 256-entry cap.
+    fn write_large_open_ledger(
+        path: &std::path::Path,
+        count: usize,
+        memo_bytes: usize,
+        author: &str,
+    ) {
+        use std::fmt::Write as _;
+
+        let memo = "m".repeat(memo_bytes);
+        let mut content = String::new();
+        for index in 0..count {
+            writeln!(content, "2024-01-01 open Assets:Big{index:03}").expect("write to String");
+            writeln!(content, "  memo: \"{memo}\"").expect("write to String");
+            writeln!(content, "  openledger-author: \"{author}\"").expect("write to String");
+            content.push('\n');
+        }
+        std::fs::write(path, content).expect("write source ledger");
+    }
+
+    /// L-33 end to end, on the BYTE budget: 20 directives of ~900 KiB is ~18
+    /// MiB, so the first reply is cut by the byte budget (not the entry cap)
+    /// and the client must re-`Want` the tail. It converges, and the server's
+    /// per-reply serialization stays within one entry of what it sends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn catchup_converges_when_the_byte_budget_cuts_each_reply() {
+        const COUNT: usize = 20;
+        const MEMO: usize = 900 * 1024;
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_source = bind_direct_endpoint().await;
+        let endpoint_sink = bind_direct_endpoint().await;
+        let id_source = endpoint_source.id();
+        let id_sink = endpoint_sink.id();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let source_path = temp_dir.path().join("source.bean");
+        write_large_open_ledger(&source_path, COUNT, MEMO, &id_source.to_string());
+        let source = LedgerService::boot(source_path, id_source.to_string()).expect("boot source");
+
+        // Deterministic half first: the byte budget, not the entry cap, cuts it.
+        let mut want: Vec<String> = source.all_directive_ids().into_iter().collect();
+        want.sort();
+        let mut serialized = 0usize;
+        let first = supply_for_want(&source, &want, |directive| {
+            serialized += 1;
+            make_supply_entry(directive)
+        });
+        let WireMessage::Supply { entries, .. } = &first else {
+            panic!("a Want is answered with a Supply");
+        };
+        assert!(
+            !entries.is_empty() && entries.len() < COUNT,
+            "the byte budget must cut the reply: {} of {COUNT}",
+            entries.len()
+        );
+        assert_eq!(
+            serialized,
+            entries.len() + 1,
+            "one entry past the budget, no more"
+        );
+        first.to_wire().expect("the cut reply frames");
+
+        let ledger_source: SharedLedger = Arc::new(RwLock::new(source));
+        let ledger_sink: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("sink.bean"), id_sink.to_string())
+                .expect("boot sink"),
+        ));
+        let handler_source = make_handler(
+            ledger_source,
+            PeerAllowlist::parse(&[id_sink.to_string()]).expect("allowlist source"),
+        );
+        let handler_sink = make_handler(
+            ledger_sink.clone(),
+            PeerAllowlist::parse(&[id_source.to_string()]).expect("allowlist sink"),
+        );
+        let router_source = Router::builder(endpoint_source.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler_source)
+            .spawn();
+        wait_until_dialable(&endpoint_source).await;
+        wait_until_dialable(&endpoint_sink).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+        loop {
+            exchange_with_peer(&endpoint_sink, endpoint_source.addr(), &handler_sink).await;
+            let count = ledger_sink.read().await.directive_count();
+            if count == COUNT {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                let _ = router_source.shutdown().await;
+                panic!("L-33: sink never caught up under the byte budget: {count} of {COUNT}");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let _ = router_source.shutdown().await;
+    }
+
+    // ─── T58 / L-34: the anti-entropy refusal cache ─────────────────────────
+
+    /// A seeded source, a sink holding its opens for Cash/Equity plus `txn1`,
+    /// and the three shapes L-34 must tell apart:
+    ///
+    /// * `poison` — a close of Assets:Cash dated 1970, before `txn1`: the M-09
+    ///   backdated close, refused FOR GOOD;
+    /// * `txn2` — posts to Expenses:Food, whose `open` the sink lacks: an
+    ///   ACCOUNT WAIT, acceptable the moment that open arrives;
+    /// * `txn3` — a child of `txn2`: an ORPHAN, acceptable once `txn2` lands.
+    struct RefusalFixture {
+        seeded: SeededSource,
+        poison: p2p::protocol::SupplyEntry,
+        txn3: String,
+        allow: PeerAllowlist,
+    }
+
+    fn refusal_fixture(
+        dir: &std::path::Path,
+        author: &str,
+        extra_allow: &[String],
+    ) -> RefusalFixture {
+        let mut seeded = seed_mixed_source(dir, author);
+        let txn3 = seeded
+            .source
+            .append_transaction(lifecycle_txn("Assets:Cash", day(1, 25), dec!(5)))
+            .expect("append txn3 (child of txn2)")
+            .txid;
+        let mut attacker = LedgerService::boot(dir.join("attacker.bean"), author.to_owned())
+            .expect("boot attacker");
+        attacker
+            .open_account("Assets:Cash".to_owned(), day(1, 1), vec!["USD".to_owned()])
+            .expect("attacker opens cash");
+        let poison_id = attacker
+            .close_account(
+                "Assets:Cash".to_owned(),
+                NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid date"),
+            )
+            .expect("attacker's own close is legal on its own ledger");
+        let mut allowed = vec![author.to_owned()];
+        allowed.extend_from_slice(extra_allow);
+        RefusalFixture {
+            poison: entry_for(&attacker, &poison_id),
+            seeded,
+            txn3,
+            allow: PeerAllowlist::parse(&allowed).expect("allowlist"),
+        }
+    }
+
+    /// Boot a sink already holding Cash/Equity opens and `txn1`.
+    async fn refusal_sink(dir: &std::path::Path, fixture: &RefusalFixture) -> AntiEntropyHandler {
+        let sink: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(dir.join("sink.bean"), "sink".to_owned()).expect("boot sink"),
+        ));
+        let handler = make_handler(sink, fixture.allow.clone());
+        let seeded = &fixture.seeded;
+        let seed = vec![
+            entry_for(&seeded.source, &seeded.open_cash),
+            entry_for(&seeded.source, &seeded.open_equity),
+            entry_for(&seeded.source, &seeded.txn1),
+        ];
+        let seeder = iroh::SecretKey::generate().public();
+        assert_eq!(apply_supply_entries(&handler, seed, seeder).await.merged, 3);
+        handler
+    }
+
+    /// L-34 KEY TEST (classification). Of one batch, only the permanent
+    /// refusals are cached — the backdated close and a body that fails intake —
+    /// while the account-wait and the orphan are NOT, and both still converge
+    /// once their dependency arrives. The cache is per peer.
+    #[tokio::test]
+    async fn only_permanent_refusals_are_cached_and_waits_still_converge() {
+        let author = iroh::SecretKey::generate().public();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let fixture = refusal_fixture(temp_dir.path(), &author.to_string(), &[]);
+        let handler = refusal_sink(temp_dir.path(), &fixture).await;
+        let seeded = &fixture.seeded;
+        let remote = iroh::SecretKey::generate().public();
+        let peer = remote.to_string();
+
+        // An intake failure under a well-formed id: permanent for this peer.
+        let garbage_id = format!("{:064x}", 0xdead_beefu64);
+        let garbage = p2p::protocol::SupplyEntry {
+            id: garbage_id.clone(),
+            kind: p2p::protocol::DirectiveKind::Open,
+            economic_bean: "this is not valid beancount".to_owned(),
+            envelope: std::collections::BTreeMap::new(),
+        };
+        let batch = vec![
+            fixture.poison.clone(),
+            entry_for(&seeded.source, &seeded.txn2),
+            entry_for(&seeded.source, &fixture.txn3),
+            garbage,
+        ];
+        let outcome = apply_supply_entries(&handler, batch, remote).await;
+        assert_eq!(
+            outcome.rejected, 2,
+            "the backdated close and the garbage body"
+        );
+        assert_eq!(outcome.buffered, 2, "the account-wait and the orphan");
+
+        let now = std::time::Instant::now();
+        {
+            let buffer = handler.orphan_buffer.read().await;
+            let refusals = buffer.refusals();
+            assert!(
+                refusals.is_refused(&peer, &fixture.poison.id, now),
+                "the backdated close is refused for good"
+            );
+            assert!(refusals.is_refused(&peer, &garbage_id, now));
+            assert!(
+                !refusals.is_refused(&peer, &seeded.txn2, now),
+                "an ACCOUNT-WAIT must never be cached: its open may still arrive"
+            );
+            assert!(
+                !refusals.is_refused(&peer, &fixture.txn3, now),
+                "an ORPHAN must never be cached: its parent may still arrive"
+            );
+            assert_eq!(refusals.len(), 2);
+            assert!(
+                !refusals.is_refused(
+                    &iroh::SecretKey::generate().public().to_string(),
+                    &fixture.poison.id,
+                    now
+                ),
+                "another peer's copy is not suppressed"
+            );
+        }
+
+        // The dependency arrives: the account-wait drains, which frees the
+        // orphan — both land, and the cache is unchanged.
+        let outcome = apply_supply_entries(
+            &handler,
+            vec![entry_for(&seeded.source, &seeded.open_food)],
+            remote,
+        )
+        .await;
+        assert_eq!(outcome.merged, 1);
+        let svc = handler.ledger.read().await;
+        assert!(
+            svc.get_directive(&seeded.txn2).is_some(),
+            "the account-wait converged"
+        );
+        assert!(
+            svc.get_directive(&fixture.txn3).is_some(),
+            "the orphan converged"
+        );
+        assert!(svc.get_directive(&fixture.poison.id).is_none());
+        drop(svc);
+        let buffer = handler.orphan_buffer.read().await;
+        assert!(buffer.is_empty(), "nothing is left waiting");
+        assert_eq!(buffer.refusals().len(), 2);
+    }
+
+    /// A stand-in peer that serves a fixed set of entries over the real wire
+    /// protocol and RECORDS every id it is asked for — the observable L-34's
+    /// end-to-end test counts. Serves streams until the connection ends, so
+    /// the client's pooled connection is reused across exchanges (T42).
+    #[derive(Clone)]
+    struct RecordingSource {
+        entries: Arc<std::sync::Mutex<Vec<p2p::protocol::SupplyEntry>>>,
+        wanted: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl std::fmt::Debug for RecordingSource {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("RecordingSource")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl ProtocolHandler for RecordingSource {
+        async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+            let io = Duration::from_secs(5);
+            while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                while let Ok(message) =
+                    read_message(&mut recv, io, &mut FrameReservation::unmetered()).await
+                {
+                    let reply = match message {
+                        WireMessage::HaveHeads { more: false, .. } => {
+                            let held = self.entries.lock().expect("entries").clone();
+                            let ids = held.iter().map(|entry| entry.id.clone()).collect();
+                            WireMessage::have_heads_page(Vec::new(), ids, false)
+                        }
+                        WireMessage::Want { ids, .. } => {
+                            self.wanted
+                                .lock()
+                                .expect("wanted")
+                                .extend(ids.iter().cloned());
+                            let held = self.entries.lock().expect("entries").clone();
+                            p2p::anti_entropy::build_supply(&ids, |id| {
+                                held.iter().find(|entry| entry.id == id).cloned()
+                            })
+                        }
+                        _ => continue,
+                    };
+                    if write_message(&mut send, &reply, io).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = send.finish();
+            }
+            Ok(())
+        }
+    }
+
+    /// L-34 KEY TEST (end to end). A peer advertising a directive this node
+    /// refuses for good is asked for it ONCE; the next exchanges, inside the
+    /// TTL, do not ask again. The account-wait and the orphan from the same
+    /// advert ARE asked for again every exchange — they are not cached — and
+    /// both converge once the missing `open` appears in the peer's advert.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn refused_directive_is_wanted_once_but_waits_are_rewanted_until_they_land() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_source = bind_direct_endpoint().await;
+        let endpoint_sink = bind_direct_endpoint().await;
+        let author = iroh::SecretKey::generate().public();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let fixture = refusal_fixture(
+            temp_dir.path(),
+            &author.to_string(),
+            &[endpoint_source.id().to_string()],
+        );
+        let handler_sink = refusal_sink(temp_dir.path(), &fixture).await;
+        let seeded = &fixture.seeded;
+
+        let held: Vec<p2p::protocol::SupplyEntry> = vec![
+            entry_for(&seeded.source, &seeded.open_cash),
+            entry_for(&seeded.source, &seeded.open_equity),
+            entry_for(&seeded.source, &seeded.txn1),
+            fixture.poison.clone(),
+            entry_for(&seeded.source, &seeded.txn2),
+            entry_for(&seeded.source, &fixture.txn3),
+        ];
+        let source = RecordingSource {
+            entries: Arc::new(std::sync::Mutex::new(held)),
+            wanted: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let router_source = Router::builder(endpoint_source.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, source.clone())
+            .spawn();
+        wait_until_dialable(&endpoint_source).await;
+        wait_until_dialable(&endpoint_sink).await;
+        let times_wanted = |id: &str| {
+            source
+                .wanted
+                .lock()
+                .expect("wanted")
+                .iter()
+                .filter(|wanted| wanted.as_str() == id)
+                .count()
+        };
+
+        for _ in 0..3 {
+            exchange_with_peer(&endpoint_sink, endpoint_source.addr(), &handler_sink).await;
+        }
+        assert_eq!(
+            times_wanted(&fixture.poison.id),
+            1,
+            "L-34: a directive refused for good is wanted once, not once per tick"
+        );
+        assert_eq!(
+            times_wanted(&seeded.txn2),
+            3,
+            "an account-wait is re-wanted"
+        );
+        assert_eq!(times_wanted(&fixture.txn3), 3, "an orphan is re-wanted");
+
+        // The missing open appears; the waits land on the next exchange.
+        source
+            .entries
+            .lock()
+            .expect("entries")
+            .push(entry_for(&seeded.source, &seeded.open_food));
+        exchange_with_peer(&endpoint_sink, endpoint_source.addr(), &handler_sink).await;
+        let _ = router_source.shutdown().await;
+
+        assert_eq!(times_wanted(&fixture.poison.id), 1, "still not re-wanted");
+        let svc = handler_sink.ledger.read().await;
+        assert!(svc.get_directive(&seeded.open_food).is_some());
+        assert!(
+            svc.get_directive(&seeded.txn2).is_some(),
+            "the account-wait converged"
+        );
+        assert!(
+            svc.get_directive(&fixture.txn3).is_some(),
+            "the orphan converged"
+        );
+        assert!(svc.get_directive(&fixture.poison.id).is_none());
+    }
+
+    // ─── T58 / L-39: the inbound frame byte budget ──────────────────────────
+
+    /// An [`ExactReader`] that delivers the first `stall_at` bytes of `data` and
+    /// then never delivers another — a peer that stopped mid-frame.
+    struct StallingReader {
+        data: Vec<u8>,
+        pos: usize,
+        stall_at: usize,
+    }
+
+    impl ExactReader for StallingReader {
+        async fn read_exact_bytes(&mut self, buf: &mut [u8]) -> Result<(), FrameError> {
+            let end = self.pos + buf.len();
+            if end > self.stall_at.min(self.data.len()) {
+                std::future::pending::<()>().await;
+            }
+            buf.copy_from_slice(&self.data[self.pos..end]);
+            self.pos = end;
+            Ok(())
+        }
+    }
+
+    /// A genuine `Supply` frame of about `entries × 120 KiB`.
+    fn supply_frame(entries: usize) -> Vec<u8> {
+        let entries = (0..entries)
+            .map(|index| p2p::protocol::SupplyEntry {
+                id: format!("{index:064x}"),
+                kind: p2p::protocol::DirectiveKind::Open,
+                economic_bean: "x".repeat(120 * 1024),
+                envelope: std::collections::BTreeMap::new(),
+            })
+            .collect();
+        WireMessage::supply(entries)
+            .to_wire()
+            .expect("frame supply")
+    }
+
+    fn byte_budget_limiter(total: usize, per_peer: usize) -> ConnectionLimiter {
+        ConnectionLimiter::new(AntiEntropyLimits {
+            max_frame_bytes_in_flight: total,
+            max_frame_bytes_in_flight_per_peer: per_peer,
+            ..AntiEntropyLimits::default()
+        })
+    }
+
+    fn is_budget_refusal(error: &FrameError) -> bool {
+        matches!(error, FrameError::Protocol(message) if message.contains("byte budget exhausted"))
+    }
+
+    /// L-39: a frame body is charged to the budget while it is held and
+    /// released when its reservation drops; a frame the budget cannot cover is
+    /// refused, not waited for, and leaves nothing charged behind.
+    #[tokio::test]
+    async fn frame_bodies_are_charged_while_held_and_refused_past_the_budget() {
+        let peer = iroh::SecretKey::generate().public();
+        let wire = supply_frame(12); // ~1.4 MiB: over the non-supply cap too
+        let limiter = byte_budget_limiter(4 * 1024 * 1024, 4 * 1024 * 1024);
+
+        let mut reservation = limiter.frame_reservation(peer);
+        let message = read_frame(
+            &mut slice_reader(&wire),
+            Duration::from_secs(5),
+            &mut reservation,
+        )
+        .await
+        .expect("a frame within the budget is read");
+        assert!(matches!(message, WireMessage::Supply { .. }));
+        let body = wire.len() - 4;
+        let charged = limiter.frame_bytes_in_flight();
+        assert!(
+            charged >= body && charged <= 2 * body,
+            "the body is charged while held: charged {charged} for a {body}-byte body"
+        );
+        assert_eq!(reservation.held(), charged);
+        drop(reservation);
+        assert_eq!(
+            limiter.frame_bytes_in_flight(),
+            0,
+            "released with the reservation"
+        );
+
+        // A per-peer budget smaller than the frame: refused mid-read, released.
+        let tight = byte_budget_limiter(4 * 1024 * 1024, 512 * 1024);
+        let mut reservation = tight.frame_reservation(peer);
+        let error = read_frame(
+            &mut slice_reader(&wire),
+            Duration::from_secs(5),
+            &mut reservation,
+        )
+        .await
+        .expect_err("a frame past the per-peer budget is refused");
+        assert!(is_budget_refusal(&error), "got {error:?}");
+        assert!(tight.frame_bytes_peak() <= 512 * 1024);
+        drop(reservation);
+        assert_eq!(tight.frame_bytes_in_flight(), 0);
+    }
+
+    /// L-39 KEY TEST. Six peers' frames stall mid-body at once against a 1 MiB
+    /// budget. Together they never hold more than the budget — the frames that
+    /// cannot get budget are refused immediately rather than waiting for it —
+    /// and once the stalled ones time out, every byte is released. Paused
+    /// time makes the timeouts deterministic.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_frames_cannot_exceed_the_byte_budget_and_release_it_all() {
+        const BUDGET: usize = 1024 * 1024;
+        const FRAMES: usize = 6;
+        let limiter = byte_budget_limiter(BUDGET, BUDGET);
+        let wire = supply_frame(5); // ~600 KiB
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..FRAMES {
+            let limiter = limiter.clone();
+            let data = wire.clone();
+            tasks.spawn(async move {
+                let peer = iroh::SecretKey::generate().public();
+                let mut reader = StallingReader {
+                    data,
+                    pos: 0,
+                    stall_at: 4 + 300 * 1024,
+                };
+                let mut reservation = limiter.frame_reservation(peer);
+                read_frame(&mut reader, Duration::from_secs(30), &mut reservation).await
+            });
+        }
+        let (mut refused, mut timed_out) = (0, 0);
+        while let Some(outcome) = tasks.join_next().await {
+            match outcome.expect("task") {
+                Err(error) if is_budget_refusal(&error) => refused += 1,
+                Err(FrameError::Timeout) => timed_out += 1,
+                other => panic!("a stalled frame cannot complete: {other:?}"),
+            }
+        }
+        assert!(refused >= 1, "frames past the budget must be refused");
+        assert!(timed_out >= 1, "frames within it stall until their timeout");
+        assert_eq!(refused + timed_out, FRAMES);
+        let peak = limiter.frame_bytes_peak();
+        assert!(peak > 0, "the stalled frames were charged");
+        assert!(
+            peak <= BUDGET,
+            "L-39: {peak} bytes in flight exceeds the {BUDGET} budget"
+        );
+        assert_eq!(
+            limiter.frame_bytes_in_flight(),
+            0,
+            "every byte is released after refusals and timeouts"
+        );
+    }
+
+    /// L-39 wiring: the SERVE loop charges inbound frames to the handler's
+    /// budget. A peer sending one legitimately-shaped ~540 KiB advert page to a
+    /// node whose budget is 256 KiB has its frame refused and its connection
+    /// closed, and nothing stays charged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn serve_loop_refuses_frames_past_the_byte_budget_and_releases_them() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_server = bind_direct_endpoint().await;
+        let endpoint_client = bind_direct_endpoint().await;
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ledger: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("server.bean"), "server".to_owned())
+                .expect("boot ledger"),
+        ));
+        let limits = AntiEntropyLimits {
+            max_frame_bytes_in_flight: 256 * 1024,
+            max_frame_bytes_in_flight_per_peer: 256 * 1024,
+            ..AntiEntropyLimits::default()
+        };
+        let handler = make_handler_with_limits(
+            ledger,
+            PeerAllowlist::parse(&[endpoint_client.id().to_string()]).expect("allowlist"),
+            limits,
+        );
+        let router = Router::builder(endpoint_server.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler.clone())
+            .spawn();
+        wait_until_dialable(&endpoint_server).await;
+        wait_until_dialable(&endpoint_client).await;
+
+        let connection = connect_retry(&endpoint_client, endpoint_server.addr()).await;
+        let (mut send, _recv) = connection.open_bi().await.expect("open stream");
+        let ids: Vec<String> = (0..MAX_HAVE_HEADS)
+            .map(|index| format!("{index:064x}"))
+            .collect();
+        let page = WireMessage::have_heads_page(ids.clone(), ids, false);
+        write_message(&mut send, &page, Duration::from_secs(5))
+            .await
+            .expect("send the page");
+        let closed = tokio::time::timeout(Duration::from_secs(20), connection.closed()).await;
+        let _ = router.shutdown().await;
+
+        assert!(closed.is_ok(), "the server must tear the connection down");
+        let peak = handler.limiter.frame_bytes_peak();
+        assert!(peak > 0, "the serve loop charged the frame");
+        assert!(peak <= 256 * 1024, "never past the budget: {peak}");
+        assert_eq!(
+            handler.limiter.frame_bytes_in_flight(),
+            0,
+            "nothing stays charged"
         );
     }
 }

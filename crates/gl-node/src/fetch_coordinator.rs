@@ -25,6 +25,15 @@
 //! `std::sync::Mutex` for its two maps (the critical sections are tiny and hold
 //! no `.await`, so the guard's `Drop` can lock synchronously) and tokio's
 //! `Semaphore` for the concurrency permit.
+//!
+//! Every lock recovers from poisoning rather than panicking (L-38), matching the
+//! rest of the tree. These run inside the gossip-loop task and inside
+//! `FetchGuard::drop`: a panic anywhere while a map is held would otherwise turn
+//! every later `try_begin` — and every later guard drop, i.e. every in-flight
+//! fetch's cleanup — into a second panic, ending announce-driven catch-up for
+//! the life of the process. Both maps stay consistent across a poisoning panic:
+//! each critical section is a single insert, remove or lookup, so there is no
+//! half-applied update for the recovered guard to observe.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -146,7 +155,7 @@ impl FetchCoordinator {
             let mut cache = self
                 .negative_cache
                 .lock()
-                .expect("negative-cache mutex poisoned");
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             cache.evict_expired();
             if cache.contains_fresh(id) {
                 return None;
@@ -155,7 +164,10 @@ impl FetchCoordinator {
 
         // 2. In-flight dedup: don't race duplicate announces of one id.
         {
-            let mut in_flight = self.in_flight.lock().expect("in-flight mutex poisoned");
+            let mut in_flight = self
+                .in_flight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if in_flight.contains(id) {
                 return None;
             }
@@ -174,7 +186,7 @@ impl FetchCoordinator {
             Err(_) => {
                 self.in_flight
                     .lock()
-                    .expect("in-flight mutex poisoned")
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .remove(id);
                 None
             }
@@ -219,7 +231,7 @@ impl Drop for FetchGuard {
                 .coordinator
                 .in_flight
                 .lock()
-                .expect("in-flight mutex poisoned");
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             in_flight.remove(&self.id);
         }
         if !self.succeeded {
@@ -227,7 +239,7 @@ impl Drop for FetchGuard {
                 .coordinator
                 .negative_cache
                 .lock()
-                .expect("negative-cache mutex poisoned");
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             cache.insert(self.id.clone());
         }
         // Release the concurrency permit back to the semaphore (reading the
@@ -317,6 +329,51 @@ mod tests {
             "a new id proceeds once a slot frees"
         );
         drop(guard_a);
+    }
+
+    /// L-38: a panic while a coordinator lock is held must not make every later
+    /// `try_begin` — and every guard drop — panic too.
+    #[test]
+    fn poisoned_locks_do_not_panic_the_gossip_loop() {
+        let coordinator = Arc::new(FetchCoordinator::new(8, TEST_TTL));
+        let live = coordinator
+            .try_begin("live")
+            .expect("begin before poisoning");
+        let poisons: [fn(&FetchCoordinator); 2] = [
+            |c: &FetchCoordinator| {
+                let _held = c.in_flight.lock().unwrap();
+                panic!("poison the in-flight set");
+            },
+            |c: &FetchCoordinator| {
+                let _held = c.negative_cache.lock().unwrap();
+                panic!("poison the negative cache");
+            },
+        ];
+        for poison in poisons {
+            let target = Arc::clone(&coordinator);
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| poison(&target)));
+            assert!(outcome.is_err(), "the helper must actually panic");
+        }
+        assert!(coordinator.in_flight.is_poisoned());
+        assert!(coordinator.negative_cache.is_poisoned());
+
+        // Dropping a live guard locks both maps; it must clean up, not panic.
+        drop(live);
+        assert!(
+            coordinator.try_begin("live").is_none(),
+            "the failed fetch was still negative-cached through the poisoned lock"
+        );
+        let mut guard = coordinator
+            .try_begin("fresh")
+            .expect("a new id still proceeds after poisoning");
+        assert!(
+            coordinator.try_begin("fresh").is_none(),
+            "dedup still works"
+        );
+        guard.mark_succeeded();
+        drop(guard);
+        assert!(coordinator.try_begin("fresh").is_some());
     }
 
     #[test]

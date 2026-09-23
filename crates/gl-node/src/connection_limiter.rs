@@ -10,6 +10,12 @@
 //!
 //! The limiter is cloneable and `Arc`-backed: every clone of the handler the
 //! router accepts on enforces one shared budget.
+//!
+//! Counting connections bounds memory only up to the size of what each one may
+//! have in flight, and that is up to a 16 MiB frame body: 256 connections of
+//! legitimately-shaped frames is 4–8 GiB (L-39). So the limiter also carries a
+//! BYTE budget for in-flight inbound frame bodies — global and per peer — that
+//! the frame reader draws on as bytes arrive; see [`FrameReservation`].
 
 use std::collections::HashMap;
 #[cfg(test)]
@@ -36,6 +42,23 @@ pub struct AntiEntropyLimits {
     pub max_connections_per_peer: usize,
     /// Max messages handled on one connection before it is closed (T24).
     pub max_requests_per_connection: usize,
+    /// Max inbound frame-body bytes in flight across all connections (L-39).
+    ///
+    /// The count caps above bound CONNECTIONS; this bounds what they hold.
+    /// Honest inbound traffic is small — a peer sends `HaveHeads` pages
+    /// (≤ ~540 KiB), `Want`s (≤ ~68 KiB) and nothing larger, and a connection
+    /// serves one frame at a time — so 256 MiB is past every honest connection
+    /// sending its largest page at once, while turning the 4–8 GiB the finding
+    /// measured into a fixed ceiling. What only an attacker sends is a frame
+    /// claiming the `Supply` discriminator at up to 16 MiB; this is what it
+    /// runs into.
+    pub max_frame_bytes_in_flight: usize,
+    /// Max inbound frame-body bytes in flight from ONE peer (L-39).
+    ///
+    /// Two maximum-size frames. Without it a single peer could take the whole
+    /// global budget and starve every other peer's frames — the per-peer
+    /// connection cap's reasoning, applied to bytes.
+    pub max_frame_bytes_in_flight_per_peer: usize,
 }
 
 impl Default for AntiEntropyLimits {
@@ -44,6 +67,8 @@ impl Default for AntiEntropyLimits {
             max_total_connections: 256,
             max_connections_per_peer: 32,
             max_requests_per_connection: 100_000,
+            max_frame_bytes_in_flight: 256 * 1024 * 1024,
+            max_frame_bytes_in_flight_per_peer: 32 * 1024 * 1024,
         }
     }
 }
@@ -71,6 +96,25 @@ struct LimiterInner {
     /// Test-only: it bounds nothing, so it does not exist in a real build.
     #[cfg(test)]
     accepted_total: AtomicUsize,
+    /// In-flight inbound frame-body bytes, globally and per peer (L-39).
+    ///
+    /// One mutex for both counts so a reservation is charged to both or to
+    /// neither — two atomics could leave a refused grow charged to one. The
+    /// critical section is a few integer operations per 64 KiB chunk.
+    frame_bytes: Mutex<FrameBytes>,
+    max_frame_bytes: usize,
+    max_frame_bytes_per_peer: usize,
+}
+
+/// The byte counts behind [`FrameReservation`] (L-39).
+#[derive(Default)]
+struct FrameBytes {
+    total: usize,
+    /// Entries at 0 are removed, never leaked (same rule as `per_peer`).
+    per_peer: HashMap<EndpointId, usize>,
+    /// High-water mark of `total`, the observable the L-39 tests assert on.
+    #[cfg(test)]
+    peak: usize,
 }
 
 impl ConnectionLimiter {
@@ -83,8 +127,33 @@ impl ConnectionLimiter {
                 max_connections_per_peer: limits.max_connections_per_peer,
                 #[cfg(test)]
                 accepted_total: AtomicUsize::new(0),
+                frame_bytes: Mutex::new(FrameBytes::default()),
+                max_frame_bytes: limits.max_frame_bytes_in_flight,
+                max_frame_bytes_per_peer: limits.max_frame_bytes_in_flight_per_peer,
             }),
         }
+    }
+
+    /// An empty frame-body reservation charged to `peer` (L-39).
+    ///
+    /// Holds nothing until the frame reader grows it; see [`FrameReservation`].
+    pub fn frame_reservation(&self, peer: EndpointId) -> FrameReservation {
+        FrameReservation {
+            metered: Some((Arc::clone(&self.inner), peer)),
+            held: 0,
+        }
+    }
+
+    /// Inbound frame-body bytes currently reserved across all peers (L-39).
+    #[cfg(test)]
+    pub(crate) fn frame_bytes_in_flight(&self) -> usize {
+        self.inner.lock_frame_bytes().total
+    }
+
+    /// The most frame-body bytes ever reserved at once (L-39).
+    #[cfg(test)]
+    pub(crate) fn frame_bytes_peak(&self) -> usize {
+        self.inner.lock_frame_bytes().peak
     }
 
     /// How many connections this limiter has admitted since it was built.
@@ -129,6 +198,111 @@ impl ConnectionLimiter {
     }
 }
 
+impl LimiterInner {
+    fn lock_frame_bytes(&self) -> std::sync::MutexGuard<'_, FrameBytes> {
+        self.frame_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// RAII claim on the inbound frame-body byte budget, for ONE frame (L-39).
+///
+/// The frame reader grows it as the body's buffer grows — BEFORE allocating —
+/// rather than charging the length prefix up front. Charging the claim would let
+/// a peer that announces 16 MiB and then trickles bytes pin 16 MiB of budget it
+/// never sent; charging what is actually buffered means a stalled frame costs
+/// only what it delivered, which is the L-19 property carried over to the
+/// budget.
+///
+/// A grow that cannot be covered FAILS rather than waits. Waiting would be the
+/// H-10 wedge again: every frame holding part of the budget while parked for
+/// more, with nothing that ever releases it. Refusing tears the frame (and so
+/// the session) down, the peer retries on its next tick, and anti-entropy is
+/// idempotent.
+///
+/// Release is by `Drop`, so no path — a decode error, a read timeout, a torn
+/// stream, the serve future being dropped — can leak budget. The serve loop
+/// keeps the reservation alive until the decoded message has been handled,
+/// using the body's size as the stand-in for what the decoded message holds.
+pub struct FrameReservation {
+    /// `None` for an unmetered reservation (outbound reads; see [`Self::unmetered`]).
+    metered: Option<(Arc<LimiterInner>, EndpointId)>,
+    held: usize,
+}
+
+impl FrameReservation {
+    /// A reservation that meters nothing and never refuses.
+    ///
+    /// For the OUTBOUND side, whose frames are replies to requests this node
+    /// chose to make and whose concurrency is bounded by its own loops (one
+    /// exchange per peer per tick, `FetchCoordinator`'s 16 fetches). Charging
+    /// them to the inbound budget would let inbound peers starve this node's own
+    /// replication.
+    pub fn unmetered() -> Self {
+        Self {
+            metered: None,
+            held: 0,
+        }
+    }
+
+    /// Bytes this reservation currently holds.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> usize {
+        self.held
+    }
+
+    /// Grow the reservation to `target` bytes in total.
+    ///
+    /// Returns false — holding exactly what it held before — when the global or
+    /// the per-peer budget cannot cover the difference. A `target` at or below
+    /// what is held is a no-op that succeeds.
+    pub fn grow_to(&mut self, target: usize) -> bool {
+        if target <= self.held {
+            return true;
+        }
+        let Some((inner, peer)) = &self.metered else {
+            self.held = target;
+            return true;
+        };
+        let extra = target - self.held;
+        let mut bytes = inner.lock_frame_bytes();
+        let peer_held = bytes.per_peer.get(peer).copied().unwrap_or(0);
+        let total = bytes.total.saturating_add(extra);
+        let peer_total = peer_held.saturating_add(extra);
+        if total > inner.max_frame_bytes || peer_total > inner.max_frame_bytes_per_peer {
+            return false;
+        }
+        bytes.total = total;
+        bytes.per_peer.insert(*peer, peer_total);
+        #[cfg(test)]
+        {
+            bytes.peak = bytes.peak.max(total);
+        }
+        self.held = target;
+        true
+    }
+}
+
+impl Drop for FrameReservation {
+    fn drop(&mut self) {
+        let Some((inner, peer)) = &self.metered else {
+            return;
+        };
+        if self.held == 0 {
+            return;
+        }
+        let mut bytes = inner.lock_frame_bytes();
+        bytes.total = bytes.total.saturating_sub(self.held);
+        if let Some(count) = bytes.per_peer.get_mut(peer) {
+            *count = count.saturating_sub(self.held);
+            if *count == 0 {
+                bytes.per_peer.remove(peer);
+            }
+        }
+    }
+}
+
 /// RAII guard held for the lifetime of one admitted connection. Its `Drop`
 /// releases the global permit and decrements (and prunes) the per-peer count.
 pub struct ConnectionGuard {
@@ -164,7 +338,65 @@ mod tests {
             max_total_connections: total,
             max_connections_per_peer: per_peer,
             max_requests_per_connection: 1,
+            ..AntiEntropyLimits::default()
         }
+    }
+
+    fn byte_limits(total: usize, per_peer: usize) -> AntiEntropyLimits {
+        AntiEntropyLimits {
+            max_frame_bytes_in_flight: total,
+            max_frame_bytes_in_flight_per_peer: per_peer,
+            ..AntiEntropyLimits::default()
+        }
+    }
+
+    /// L-39: reservations are charged to both budgets, refused past either,
+    /// and a refused grow leaves the reservation (and the counts) unchanged.
+    #[test]
+    fn frame_reservations_respect_global_and_per_peer_budgets() {
+        let limiter = ConnectionLimiter::new(byte_limits(1000, 600));
+        let peer_a = SecretKey::generate().public();
+        let peer_b = SecretKey::generate().public();
+
+        let mut a1 = limiter.frame_reservation(peer_a);
+        assert!(a1.grow_to(400));
+        let mut a2 = limiter.frame_reservation(peer_a);
+        assert!(!a2.grow_to(300), "peer a would hold 700 > its 600");
+        assert_eq!(a2.held(), 0, "a refused grow holds nothing new");
+        assert!(a2.grow_to(200), "up to the per-peer budget is fine");
+
+        let mut b1 = limiter.frame_reservation(peer_b);
+        assert!(!b1.grow_to(500), "global would be 1100 > 1000");
+        assert!(b1.grow_to(400));
+        assert_eq!(limiter.frame_bytes_in_flight(), 1000);
+        assert!(!b1.grow_to(401), "the global budget is exactly spent");
+        assert_eq!(b1.held(), 400);
+        assert!(b1.grow_to(100), "shrinking targets are no-ops");
+        assert_eq!(b1.held(), 400);
+
+        drop(a1);
+        assert_eq!(limiter.frame_bytes_in_flight(), 600);
+        assert!(b1.grow_to(600), "a release frees budget for others");
+        drop(a2);
+        drop(b1);
+        assert_eq!(limiter.frame_bytes_in_flight(), 0);
+        assert!(
+            limiter.inner.lock_frame_bytes().per_peer.is_empty(),
+            "per-peer byte map must not leak 0 entries"
+        );
+        assert_eq!(limiter.frame_bytes_peak(), 1000, "never above the budget");
+    }
+
+    /// L-39: an unmetered reservation (the outbound side) never refuses and
+    /// never touches the inbound counts.
+    #[test]
+    fn unmetered_reservation_is_free() {
+        let limiter = ConnectionLimiter::new(byte_limits(0, 0));
+        let mut outbound = FrameReservation::unmetered();
+        assert!(outbound.grow_to(16 * 1024 * 1024));
+        assert_eq!(limiter.frame_bytes_in_flight(), 0);
+        let mut inbound = limiter.frame_reservation(SecretKey::generate().public());
+        assert!(!inbound.grow_to(1), "a zero budget refuses everything");
     }
 
     /// A: the per-peer cap admits exactly `max_connections_per_peer`, refuses the

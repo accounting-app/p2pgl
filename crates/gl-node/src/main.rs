@@ -26,7 +26,7 @@ use rate_limit::RateLimiter;
 use request_guard::RequestGuardState;
 
 use axum::routing::{get, post};
-use axum::{middleware, Extension, Router};
+use axum::{middleware, Router};
 use p2p::node::PeerRegistry;
 use p2p::orphan_buffer::OrphanBuffer;
 use std::path::PathBuf;
@@ -215,15 +215,24 @@ async fn main() {
     // process where an operator actually looks, and because a node running with
     // a non-empty quarantine is serving an incomplete ledger — correct, but not
     // whole — until the file is repaired and the node restarted.
+    //
+    // R-12: the remedy names every reason a record can be held back, not only
+    // the one H-08 started with. T47 and T51 widened the quarantine to charset,
+    // fan-in and unparsable-block cases, and a banner that says "repair their
+    // openledger-parents" sends the operator of a charset or parse failure to
+    // look at a field that is fine.
     if quarantined_count > 0 {
         warn!(
             quarantined = quarantined_count,
+            unparsable_blocks = service.unparsable_block_count(),
             ids = %service.quarantined_ids().join(", "),
             path = %ledger_path.display(),
-            "this node booted with ledger directives quarantined out of the DAG: they stay in \
+            "this node booted with ledger records quarantined out of the DAG: they stay in \
              the .bean (every compaction rewrites them verbatim) but are NOT served, NOT in any \
-             balance and NOT replicated. Stop the node and repair their openledger-parents \
-             metadata (H-08)"
+             balance and NOT replicated. The per-record boot warnings above give each one's \
+             reason — its openledger-parents metadata, a disallowed character, excess fan-in, \
+             or a block that does not parse at all (named by line number; it has no id). Stop \
+             the node, repair those records in the file, and restart (H-08, L-45)"
         );
     }
 
@@ -525,6 +534,8 @@ async fn main() {
     let guard_state = RequestGuardState {
         allowed_hosts: Arc::new(config.allowed_host_set()),
         allowed_origins: Arc::new(config.cors.allowed_origins.iter().cloned().collect()),
+        // L-51: behind a terminator the node's public origin is https.
+        tls_terminated: config.tls.mode == "terminated",
     };
 
     // A non-loopback bind with auth disabled is rejected at config validation
@@ -537,11 +548,22 @@ async fn main() {
     // key is the TCP peer, which behind a terminator is the proxy itself — one
     // bucket for every client at once — so say so loudly rather than silently
     // rate-limiting the whole internet as a single caller.
+    //
+    // L-37: the boot-time half fires whenever the config says a proxy is (or
+    // must be) in front — `tls.mode: "terminated"` *or* a non-loopback bind —
+    // not on the terminated flag alone. (Validation makes the second imply the
+    // first today; keying on both keeps the warning honest if that rule ever
+    // moves.) A plain loopback dev node stays quiet. The case config cannot
+    // see — a loopback bind behind a same-host proxy — is caught at runtime by
+    // the limiter itself, the first time an untrusted peer sends
+    // X-Forwarded-For (`RateLimiter::note_untrusted_forwarder`).
     let trusted_proxies = config.trusted_proxy_set();
     if trusted_proxies.is_empty() {
-        if config.tls.mode == "terminated" {
+        if config.tls.mode == "terminated" || config.binds_non_loopback() {
             warn!(
-                "trustedProxies is empty while tls.mode is \"terminated\" — every client behind the proxy shares one rate-limit bucket (M-04); list the proxy address(es) in trustedProxies"
+                tls_mode = %config.tls.mode,
+                public_bind = config.binds_non_loopback(),
+                "trustedProxies is empty on a node that sits behind a reverse proxy — every client behind the proxy shares one rate-limit bucket (M-04), and the proxy is subject to the per-IP connection cap like any single client (M-33); list the proxy address(es) in trustedProxies"
             );
         }
     } else {
@@ -550,7 +572,7 @@ async fn main() {
             "X-Forwarded-For trusted from configured reverse proxies (rightmost untrusted entry wins)"
         );
     }
-    let rate_limiter = RateLimiter::graphql().with_trusted_proxies(trusted_proxies);
+    let rate_limiter = RateLimiter::graphql().with_trusted_proxies(trusted_proxies.clone());
 
     let application = build_application_with_limiter(
         schema,
@@ -587,10 +609,16 @@ async fn main() {
     // come from the optional `http` config section; with the section absent
     // every field is `HttpServerSettings::default()`'s own value, which is what
     // this call site used to pass literally.
+    //
+    // The trusted proxies are exempt from the per-IP connection cap (M-33): a
+    // terminator fans every client in through one address, so capping it as
+    // one client would cap the whole node. The global cap still binds it, and
+    // the terminator is required to enforce per-client limits of its own.
     let server = http_server::serve_hardened(
         listener,
         application,
         config.http_server_settings(),
+        trusted_proxies,
         shutdown_signal(),
     );
 
@@ -651,11 +679,18 @@ pub(crate) fn build_application(
 
 /// Assemble the full application router.
 ///
-/// Layer order, outermost first: CORS, body limit (H-05), rate-limiter
-/// extension, then — on the GraphQL routes only — the request guard (H-01),
-/// the rate limiter and auth. The guard is outermost among those so a rejected
-/// Host, Content-Type or Origin never reaches the limiter or the schema.
-/// `/health` stays outside the guard and outside auth (§2.9).
+/// Layer order, outermost first: CORS, body limit (H-05), then per route the
+/// request guard (H-01), the rate limiter and — on `/graphql` only — auth. The
+/// guard is outermost among those so a rejected Host, Content-Type or Origin
+/// never reaches the limiter or the schema.
+///
+/// `/health` is behind the guard and a limiter too (H-01 residual, L-42), and
+/// outside auth only (§2.9: it must answer an unauthenticated prober). Before
+/// T55 it was outside all three, so on a loopback bind — where L-09 serves the
+/// full body — a DNS-rebound page could read the version, head count and peer
+/// count with any `Host`, and every call took the ledger read lock unmetered.
+/// Its limiter is a [`RateLimiter::sibling`] of `limiter`: the same idea of
+/// who a client is, a budget of its own.
 ///
 /// `limiter` carries the trusted-proxy set, so how a client is identified is a
 /// boot-time decision rather than a per-request one (M-04).
@@ -676,23 +711,39 @@ pub(crate) fn build_application_with_limiter(
         info!("GraphiQL disabled — POST /graphql only");
         Router::new().route("/graphql", post(graphql_handler))
     };
+    let health_limiter = limiter.sibling(
+        rate_limit::HEALTH_RATE_LIMIT,
+        rate_limit::HEALTH_RATE_WINDOW,
+    );
     let graphql_routes = graphql_router
         .with_state(schema)
         .layer(middleware::from_fn_with_state(
             auth_state,
             auth::auth_middleware,
         ))
-        .layer(middleware::from_fn(rate_limit::graphql_rate_limit))
+        .layer(middleware::from_fn_with_state(
+            limiter,
+            rate_limit::rate_limit,
+        ))
+        .layer(middleware::from_fn_with_state(
+            guard_state.clone(),
+            request_guard::request_guard,
+        ));
+    let health_routes = Router::new()
+        .route("/health", get(health_handler))
+        .with_state(health_state)
+        .layer(middleware::from_fn_with_state(
+            health_limiter,
+            rate_limit::rate_limit,
+        ))
         .layer(middleware::from_fn_with_state(
             guard_state,
             request_guard::request_guard,
         ));
 
     Router::new()
-        .route("/health", get(health_handler))
-        .with_state(health_state)
+        .merge(health_routes)
         .merge(graphql_routes)
-        .layer(Extension(limiter))
         .layer(RequestBodyLimitLayer::new(GRAPHQL_MAX_BODY_BYTES))
         .layer(cors)
 }
