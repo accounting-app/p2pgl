@@ -73,6 +73,11 @@ pub struct AppendedTransaction {
 pub struct AccountBalance {
     pub account: String,
     pub balances: Vec<Amount>,
+    /// `true` when every figure in `balances` is exactly the account's sum.
+    /// `false` when one did not fit a `Decimal` at its usual scale and was
+    /// rounded once, half to even (T76) — reachable only through amounts at
+    /// widely different scales, such as `1000` plus `0.0000000000000000000000000001`.
+    pub exact: bool,
 }
 
 /// A single row in the trial balance report.
@@ -81,6 +86,9 @@ pub struct TrialBalanceRow {
     pub account: String,
     pub debit: DecimalScalar,
     pub credit: DecimalScalar,
+    /// `true` when `debit` and `credit` are exact; `false` when rounded once
+    /// (T76, see `AccountBalance.exact`).
+    pub exact: bool,
 }
 
 /// Full trial balance at a point in time.
@@ -90,6 +98,10 @@ pub struct TrialBalance {
     pub rows: Vec<TrialBalanceRow>,
     pub total_debit: DecimalScalar,
     pub total_credit: DecimalScalar,
+    /// `true` when every figure — each row and both totals — is exact (T76).
+    /// With a rounded figure, a total is the exact sum rounded once, so it
+    /// can differ from the sum of the displayed rows by that rounding.
+    pub exact: bool,
 }
 
 /// Balance sheet: Assets, Liabilities, Equity at a point in time.
@@ -99,6 +111,8 @@ pub struct BalanceSheet {
     pub assets: Vec<AccountBalance>,
     pub liabilities: Vec<AccountBalance>,
     pub equity: Vec<AccountBalance>,
+    /// `true` when every figure in the report is exact (T76).
+    pub exact: bool,
 }
 
 /// Income statement for a date range.
@@ -109,6 +123,8 @@ pub struct IncomeStatement {
     pub income: Vec<AccountBalance>,
     pub expenses: Vec<AccountBalance>,
     pub net: Vec<Amount>,
+    /// `true` when every figure in the report, `net` included, is exact (T76).
+    pub exact: bool,
 }
 
 /// A `balance` assertion that did not hold (§3.6, M-08).
@@ -120,8 +136,13 @@ pub struct BalanceAssertionFailure {
     pub date: DateScalar,
     /// The amount the `balance` directive claims.
     pub expected: DecimalScalar,
-    /// The amount the ledger actually holds on that date.
+    /// The amount the ledger actually holds on that date, as reported.
     pub actual: DecimalScalar,
+    /// `true` when `actual` is exactly the sum; `false` when it was rounded
+    /// once (T76). The assertion itself is always judged on the exact sum,
+    /// so an assertion can fail even when `expected` equals a rounded
+    /// `actual`.
+    pub actual_exact: bool,
     /// The currency both figures are in.
     pub currency: String,
 }

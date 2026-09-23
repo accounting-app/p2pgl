@@ -161,7 +161,10 @@ pub struct VerifyReport {
 /// [`crate::checkpoint::evaluate_balance_assertion`]). Failures are recorded in
 /// [`VerifyReport::assertions`]; nothing is rejected, no state is touched, and
 /// `pad` directives are not synthesized into balances — a gap a `pad` was meant
-/// to cover still reports as a failing assertion.
+/// to cover still reports as a failing assertion. Each claim is compared with
+/// the account's **exact** sum (T76, L-79), never with the reported figure,
+/// which is rounded once when the sum does not fit a `Decimal` at its usual
+/// scale; a failure's `actual_exact` says which the `actual` it shows is.
 ///
 /// `read_model` must be the model built from the same directives as `dag`
 /// (`LedgerService` keeps the two in step), otherwise the assertion results
@@ -890,9 +893,16 @@ mod tests {
 
         let report = verify_dag(&dag, &read_model_for(&dag));
         assert_eq!(report.assertions.evaluated, 3);
-        // Assets:Cash saturates at MAX, so only the MAX claim on it holds.
-        assert_eq!(report.assertions.passed(), 1);
-        assert_eq!(report.assertions.failures.len(), 2);
+        // Assets:Cash holds exactly 2 × MAX, which no `Decimal` is, so no
+        // claim holds (T76: claims are compared with the exact sum; before,
+        // the MAX claim "held" against a balance saturated to MAX).
+        assert_eq!(report.assertions.passed(), 0);
+        assert_eq!(report.assertions.failures.len(), 3);
+        assert!(report
+            .assertions
+            .failures
+            .iter()
+            .all(|failure| !failure.actual_exact));
         assert!(
             report.ok,
             "extremes are not DAG corruption: {:?}",

@@ -46,7 +46,7 @@ use ledger::hash::compute_content_id;
 use ledger::model::{Amount, Directive, Flag, Open, Posting, Transaction};
 use ledger::service::{
     DirectiveSigner, LedgerService, PostingInput, ServiceError, TransactionInput,
-    MAX_LAMPORT_ADVANCE, MAX_UNMERGED_HEADS_PER_AUTHOR,
+    MAX_LAMPORT_ADVANCE, MAX_PARENTS,
 };
 use ledger::validate::ValidationError;
 use p2p::allowlist::PeerAllowlist;
@@ -290,7 +290,6 @@ fn stage_refusal_is_permanent(error: &ServiceError) -> bool {
         | ServiceError::Dag(_)
         | ServiceError::LamportCeiling { .. }
         | ServiceError::LamportAdvance { .. }
-        | ServiceError::UnmergedHeadLimit { .. }
         | ServiceError::Io(_)
         | ServiceError::Journal { .. }
         | ServiceError::CommitInFlight
@@ -1265,23 +1264,25 @@ fn honest_history_converges_in_any_delivery_order() {
 
 // ─── Case 2 (X2 probe 3) ────────────────────────────────────────────────────
 
-/// One author's `MAX_UNMERGED_HEADS_PER_AUTHOR + 1` parentless transactions,
-/// served whole to a passive and an active replica: each refuses the last one
-/// at its cap; the active one's local append merges its heads and propagates,
-/// after which the passive one's cap clears too. Passes at HEAD.
+/// One author's `MAX_PARENTS + 1` parentless transactions, served whole to a
+/// passive and an active replica. Since T72 (H-21) there is no remote head
+/// bound: each replica holds all of them at once (at HEAD before T72 each
+/// refused the last one at its per-replica cap and the passive one's cap only
+/// cleared once the active one's local append propagated). The active
+/// replica's append still names at most `MAX_PARENTS` of them and propagates.
 #[test]
 fn single_subset_delivery_converges_once_any_local_append_propagates() {
     let mut mesh = seeded_mesh(2, 2);
     let (passive, active) = (0, 1);
     let attacker = key(200);
     mesh.allow_also(&attacker.public_key_hex());
-    let flood = parentless_flood(&mut mesh, &attacker, MAX_UNMERGED_HEADS_PER_AUTHOR + 1);
+    let flood = parentless_flood(&mut mesh, &attacker, MAX_PARENTS + 1);
     for replica in [passive, active] {
         mesh.deliver(replica, flood.clone(), Order::Causal);
         assert_eq!(
             mesh.held(replica, &flood),
-            MAX_UNMERGED_HEADS_PER_AUTHOR,
-            "each replica refuses exactly the one over the cap"
+            flood.len(),
+            "T72 / H-21: no remote head bound — every replica holds the whole flood"
         );
     }
     mesh.append(active, "active-local", 5, "Assets:Cash");
@@ -1297,29 +1298,26 @@ fn single_subset_delivery_converges_once_any_local_append_propagates() {
 
 /// The same flood, but the peer serves A `{0..255}` and B `{1..256}`; then A
 /// and B run anti-entropy with each other and nobody authors. Same available
-/// set, so the DAGs must be equal. FAILS at HEAD: each refuses the one it was
-/// not given first at its own per-replica cap, forever.
+/// set, so the DAGs must be equal. Failed at HEAD before T72: each refused the
+/// one it was not given first at its own per-replica cap
+/// (`UNMERGED_HEAD_LIMIT`), forever. T72 (H-21) dropped the bound: one
+/// anti-entropy round and both hold all 257, with equal heads and balances.
 #[test]
-#[ignore = "fails at HEAD: H-21; enabled by T72"]
 fn h21_disjoint_subset_delivery_of_a_parentless_flood_converges_without_local_authoring() {
     let mut mesh = seeded_mesh(3, 2);
     let (a, b) = (0, 1);
     let attacker = key(200);
     mesh.allow_also(&attacker.public_key_hex());
-    let flood = parentless_flood(&mut mesh, &attacker, MAX_UNMERGED_HEADS_PER_AUTHOR + 1);
+    let flood = parentless_flood(&mut mesh, &attacker, MAX_PARENTS + 1);
     let last = flood.len() - 1;
     mesh.deliver(a, flood[..last].to_vec(), Order::Causal);
     mesh.deliver(b, flood[1..].to_vec(), Order::Causal);
-    assert_eq!(mesh.held(a, &flood), MAX_UNMERGED_HEADS_PER_AUTHOR);
-    assert_eq!(mesh.held(b, &flood), MAX_UNMERGED_HEADS_PER_AUTHOR);
-    let counts = mesh.counts();
+    assert_eq!(mesh.held(a, &flood), MAX_PARENTS, "A was served 256");
+    assert_eq!(mesh.held(b, &flood), MAX_PARENTS, "B was served 256");
     let rounds = mesh.run_to_fixed_point(Order::Ascending);
     eprintln!("case 3 (H-21): anti-entropy rounds {rounds}, no local authoring");
-    assert_eq!(
-        mesh.counts().iter().sum::<usize>() - counts.iter().sum::<usize>(),
-        0,
-        "at HEAD nothing moves; once T72 lands this assertion is replaced by convergence"
-    );
+    assert_eq!(mesh.held(a, &flood), flood.len(), "A adopted B's one");
+    assert_eq!(mesh.held(b, &flood), flood.len(), "B adopted A's one");
     mesh.assert_converged_among("case 3 (H-21)", &[a, b], &[]);
 }
 
@@ -1340,7 +1338,7 @@ fn h21_disjoint_subset_delivery_of_a_parentless_flood_converges_without_local_au
 /// clock past the gap and it converges by luck. The test asserts convergence
 /// in every order and lists the stuck ones.
 #[test]
-#[ignore = "documented limitation (H-19): anti-entropy alone cannot join past a removed author's jump; join by bootstrap — see h19_fresh_node_bootstrapped_from_a_peers_file_converges"]
+#[ignore = "documented limitation (H-19, T72 decision (1) revised): the ratchet is judged against the joiner's own clock and no per-directive bound repairs that, so anti-entropy alone cannot join past a removed author's jump; the fix is the trusted-bootstrap join (README §Mesh identity, 'Joining a mesh / removing a peer'), pinned by h19_fresh_node_bootstrapped_from_a_peers_file_converges, plus the boot/adoption warning that names the jump's author"]
 fn h19_fresh_node_converges_after_a_maximal_legal_jump_and_allowlist_removal() {
     let mut stuck: Vec<String> = Vec::new();
     for (i, order) in ORDERS.into_iter().enumerate() {
@@ -1464,7 +1462,7 @@ fn h19_removed_authors_transaction_partitions_an_anti_entropy_join_by_missing_pa
 /// with both authors allowlisted. Stuck at HEAD: F adopts the two opens below
 /// the jump and nothing above it.
 #[test]
-#[ignore = "documented limitation (H-19): anti-entropy alone cannot join past a removed author's jump; join by bootstrap — see h19_fresh_node_bootstrapped_from_a_peers_file_converges"]
+#[ignore = "documented limitation (H-19, T72 decision (1) revised): a pre-T63 history with one jump ≥ 2^32 cannot be joined by anti-entropy alone, with or without the jump's author on the allowlist; the fix is the trusted-bootstrap join (README §Mesh identity, 'Joining a mesh / removing a peer'), pinned by h19_pre_t63_history_is_joinable_by_bootstrap; boot on such a history now warns, naming the jump's author"]
 fn h19_pre_t63_history_with_one_large_jump_is_joinable() {
     let mut mesh = Mesh::new(8);
     let jumper = key(202);
@@ -1660,5 +1658,146 @@ proptest! {
         mesh.run_to_fixed_point(Order::Random);
         let report = mesh.divergence_with_oracle();
         prop_assert!(report.is_none(), "{}", report.unwrap_or_default());
+    }
+}
+
+// ─── Case T76: exact balances over mixed-scale dust and cap-sized amounts ───
+
+/// Append a transaction moving each `(account, amount)` against
+/// `Equity:Opening`, authored and signed by `replica`, and record it in the
+/// pool. Decimal amounts at any scale (the harness's own `append` is integral).
+fn append_decimal(
+    mesh: &mut Mesh,
+    replica: usize,
+    narration: &str,
+    account: &str,
+    amount: Decimal,
+) {
+    let key = Arc::clone(&mesh.replicas[replica].key);
+    let usd = |number: Decimal| Amount {
+        number,
+        currency: "USD".to_owned(),
+    };
+    let input = TransactionInput {
+        date: day(15),
+        flag: Flag::Complete,
+        payee: None,
+        narration: Some(narration.to_owned()),
+        tags: vec![],
+        links: vec![],
+        postings: vec![
+            PostingInput {
+                account: account.to_owned(),
+                amount: Some(usd(amount)),
+                cost: None,
+                price: None,
+            },
+            PostingInput {
+                account: "Equity:Opening".to_owned(),
+                amount: Some(usd(-amount)),
+                cost: None,
+                price: None,
+            },
+        ],
+    };
+    let outcome = mesh.replicas[replica]
+        .svc
+        .append_transaction_signing(input, |content_id, parents, lamport| {
+            key.sign(&SignableMessage {
+                content_id,
+                is_transaction: true,
+                parents,
+                lamport,
+            })
+        })
+        .unwrap_or_else(|error| panic!("append {narration} ({amount}): {error}"));
+    let directive = mesh.replicas[replica]
+        .svc
+        .get_directive(&outcome.txid)
+        .expect("just appended")
+        .clone();
+    mesh.record(&directive);
+}
+
+/// T76 (M-50, L-79): replicas holding a history of amounts at the cap
+/// (`±10^21`, inclusive, also spelled with trailing zeros), `Decimal::MAX`'s
+/// mantissa at scale 8 (in cap: `7.9 × 10^20`) and mixed-scale dust
+/// (`10^-28`, `0.5` at scale 1) — so `Assets:Cash`'s exact total does not fit
+/// a `Decimal` at its printed scale and is reported rounded once — reach
+/// equal DAGs AND equal printed balances, the `exact` flags included
+/// (`balances_text` renders each `AccountBalanceEntry` whole), equal to the
+/// oracle, in every delivery order.
+#[test]
+fn t76_cap_sized_amounts_and_mixed_scale_dust_converge_to_equal_exact_balances() {
+    let cap = Decimal::from_i128_with_scale(
+        i128::try_from(ledger::limits::MAX_AMOUNT_MAGNITUDE).expect("fits"),
+        0,
+    );
+    let amounts: Vec<(&str, Decimal)> = vec![
+        ("Assets:Cash", cap),
+        ("Assets:Cash", Decimal::from_i128_with_scale(1, 28)),
+        ("Expenses:Food", -cap),
+        (
+            "Assets:Cash",
+            Decimal::from_str_exact("1000000000000000000000.0000000").expect("literal"),
+        ),
+        ("Expenses:Food", Decimal::new(5, 1)),
+        (
+            "Assets:Cash",
+            Decimal::from_i128_with_scale(Decimal::MAX.mantissa(), 8),
+        ),
+        ("Expenses:Food", Decimal::from_i128_with_scale(-7, 28)),
+        ("Assets:Cash", Decimal::new(100_000, 2)),
+    ];
+    for (i, order) in ORDERS.into_iter().enumerate() {
+        let mut mesh = seeded_mesh(7600 + u64::try_from(i).expect("small"), 3);
+        for (k, (account, amount)) in amounts.iter().enumerate() {
+            let author = mesh.rng.below(mesh.replicas.len());
+            if mesh.rng.coin() {
+                let ids = mesh.pool_ids();
+                let subset = mesh.rng.subset(&ids);
+                mesh.deliver(author, subset, order);
+            }
+            append_decimal(&mut mesh, author, &format!("t76-{k}"), account, *amount);
+        }
+        mesh.add("F", 9);
+        mesh.deliver_pool_to_fixed_point(order);
+        mesh.run_to_fixed_point(order);
+        mesh.assert_converged(&format!("case T76 / {order:?}"));
+
+        // What converged is rule R's figure, flagged: with the dust,
+        // `Assets:Cash` does not fit a `Decimal` at scale 28 and is rounded
+        // once to scale 7 (the independent value, by Python's `decimal`:
+        // `2792281625142643376935.43950335 + 10^-28` → `…935.4395034`), and
+        // every replica says so identically.
+        let entries: Vec<_> = mesh
+            .replicas
+            .iter()
+            .map(|replica| {
+                replica
+                    .svc
+                    .read_model()
+                    .account_balance("Assets:Cash", None)
+                    .expect("cash has postings")
+            })
+            .collect();
+        assert!(
+            entries.iter().all(|entry| !entry.exact),
+            "case T76 / {order:?}: the dust-carrying cash balance must be flagged inexact"
+        );
+        assert!(entries.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(
+            entries[0].balances["USD"].to_string(),
+            "2792281625142643376935.4395034",
+            "case T76 / {order:?}: rounded once, half to even"
+        );
+        let trial = mesh.replicas[0]
+            .svc
+            .read_model()
+            .trial_balance(far_future());
+        assert!(
+            !trial.exact,
+            "case T76 / {order:?}: the trial balance says so too"
+        );
     }
 }

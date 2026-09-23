@@ -10,7 +10,7 @@ use std::str::FromStr;
 use iroh::EndpointId;
 use ledger::hash::compute_content_id;
 use ledger::model::*;
-use ledger::parse::{parse_file_bounded, BoundedParseErrors};
+use ledger::parse::{parse_file_bounded, BoundedParseErrors, ParseLimits};
 
 use crate::allowlist::PeerAllowlist;
 use crate::protocol::{
@@ -166,6 +166,34 @@ const MAX_PARSE_ERROR_CHARS: usize = MAX_DECODE_ERROR_CHARS;
 /// each kept error rendered through a [`MAX_PARSE_ERROR_CHARS`]-character
 /// [`bounded_display`], so both the peak allocation and the error's size are
 /// constants the body's length cannot move.
+///
+/// ## Cardinality before anything is kept (T75 / M-48)
+///
+/// T66 bounded what a FAILING parse could hold; a body that parsed was still
+/// materialised in full — 41,941 postings with a metadata line each peaked at
+/// 41.7× the body, `Ok` with a correct id — and the §3.12 caps that refuse it
+/// ran only at `stage_remote_directive`, after `apply_supply_entries` had
+/// queued every entry of the frame (a 15-entry frame of them held 546 MB). Two
+/// changes close that, in this order:
+///
+/// * the parse runs under [`ParseLimits::RESOURCE`], so it STOPS at the first
+///   posting, tag, link, metadata key, currency or body line past its cap —
+///   what the body can make the parser hold is bounded by the caps, not by its
+///   length — and reports `ResourceLimitExceeded`;
+/// * [`ledger::service::enforce_resource_limits`] runs on the directive the
+///   moment it exists, before the hash, the body checks and the envelope, so
+///   nothing over a §3.12 cap (the length caps included, which no count sees)
+///   ever leaves this function to be queued. The envelope keys are not in the
+///   directive yet; `stage_remote_directive` runs the same function again on
+///   the merged metadata.
+///
+/// Both refusals are `ResourceLimitExceeded`, which the ALPN intake classifies
+/// as permanent for the serving peer — correctly: every intake verdict is a
+/// function of the bytes that peer serves for the id (L-34). The count caps
+/// are also a function of the id itself (the parsed body is what it hashes);
+/// the one body-line refusal that is not — a non-canonical body repeating a
+/// metadata key past the line cap — is only ever served by a peer that is not
+/// running the canonical serializer, and the cache is per peer.
 pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeError> {
     // 0. The id's form (H-18, M-41). Wants are built from form-checked adverts
     // (M-26) and the refusal cache records nothing else (L-34), so an entry
@@ -201,9 +229,19 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
         )));
     }
 
-    // 1. Parse the economic body — bounded (H-18).
-    let directives = parse_file_bounded(&entry.economic_bean, MAX_REPORTED_PARSE_ERRORS)
-        .map_err(|bounded| MergeError::ParseError(render_parse_errors(&bounded)))?;
+    // 1. Parse the economic body — bounded in its errors (H-18) and in its
+    // cardinalities (T75 / M-48): the parse stops at the first count past a
+    // §3.12 cap, so a 61,678-posting body is refused at its 1,201st body line
+    // (`ParseLimits::max_body_lines`) before a single posting is parsed.
+    let directives = parse_file_bounded(
+        &entry.economic_bean,
+        MAX_REPORTED_PARSE_ERRORS,
+        ParseLimits::RESOURCE,
+    )
+    .map_err(|bounded| match &bounded.limit {
+        Some(limit) => MergeError::ResourceLimitExceeded(limit.to_string()),
+        None => MergeError::ParseError(render_parse_errors(&bounded)),
+    })?;
 
     if directives.len() != 1 {
         return Err(MergeError::ParseError(
@@ -212,6 +250,17 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
     }
 
     let mut directive = directives.into_iter().next().unwrap();
+
+    // T75 / M-48: the §3.12 limits, the moment the directive exists — see the
+    // function docs. This is the same function every write path runs, so the
+    // wire refuses here exactly what `stage_remote_directive` would refuse
+    // later, before the entry can be queued behind the rest of its frame.
+    ledger::service::enforce_resource_limits(&directive).map_err(|error| {
+        MergeError::ResourceLimitExceeded(match error {
+            ledger::service::ServiceError::ResourceLimitExceeded { message } => message,
+            other => other.to_string(),
+        })
+    })?;
 
     if DirectiveKind::from_directive(&directive) != entry.kind {
         return Err(MergeError::InvalidEnvelope(
@@ -1703,6 +1752,27 @@ mod tests {
         std::env::temp_dir().join(format!("openledger-l11-{tag}-{nanos}.bean"))
     }
 
+    /// The per-call signing closure the `*_signing` mutation methods take,
+    /// for `provider` (T73: a signing node signs every directive it writes,
+    /// and boot now verifies its own history under the installed signer, so
+    /// an unsigned `open_account` on a signing service is quarantined by the
+    /// next L-13 reload).
+    fn sign_with(
+        provider: &std::sync::Arc<security::signing::PeerKeySignatureProvider>,
+        is_transaction: bool,
+    ) -> impl Fn(&str, &str, &str) -> Option<String> {
+        let provider = std::sync::Arc::clone(provider);
+        move |content_id: &str, parents: &str, lamport: &str| {
+            use security::signing::SignatureProvider;
+            provider.sign(&security::signing::SignableMessage {
+                content_id,
+                is_transaction,
+                parents,
+                lamport,
+            })
+        }
+    }
+
     /// A booted service whose reconcile signs with `key_seed`'s key, authored by
     /// that key — i.e. a node exactly as `main` wires one when signing is on.
     fn signing_service(
@@ -1831,17 +1901,32 @@ mod tests {
         let (mut service, provider) = signing_service(&path, 14);
         let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
         service
-            .open_account("Expenses:Food".to_owned(), date, vec![])
+            .open_account_signing(
+                "Expenses:Food".to_owned(),
+                date,
+                vec![],
+                sign_with(&provider, false),
+            )
             .unwrap();
         service
-            .open_account("Assets:Cash".to_owned(), date, vec![])
+            .open_account_signing(
+                "Assets:Cash".to_owned(),
+                date,
+                vec![],
+                sign_with(&provider, false),
+            )
             .unwrap();
         let durable = service.directive_count();
 
         // Fail a commit for real, and recover from it.
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
         let error = service
-            .open_account("Assets:Vault".to_owned(), date, vec![])
+            .open_account_signing(
+                "Assets:Vault".to_owned(),
+                date,
+                vec![],
+                sign_with(&provider, false),
+            )
             .unwrap_err();
         assert_eq!(error.error_code(), "IO_ERROR", "got {error}");
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1912,8 +1997,43 @@ mod tests {
 
         // A real, well-formed parent id — uppercased. `is_content_id` rejects
         // this spelling precisely because stored ids are lowercase and lookups
-        // are exact, so it would never resolve anywhere.
-        let lowercase = "ab".repeat(32);
+        // are exact, so it would never resolve anywhere. T73 / L-75: the
+        // lowercase control below must name a parent that EXISTS, so it is a
+        // transaction this node authored rather than an arbitrary hex string.
+        let lowercase = service
+            .append_transaction_signing(
+                ledger::service::TransactionInput {
+                    date,
+                    flag: ledger::model::Flag::Complete,
+                    payee: None,
+                    narration: Some("Real parent".to_owned()),
+                    tags: vec![],
+                    links: vec![],
+                    postings: vec![
+                        ledger::service::PostingInput {
+                            account: "Expenses:Food".to_owned(),
+                            amount: Some(ledger::model::Amount {
+                                number: rust_decimal::Decimal::new(100, 2),
+                                currency: "USD".to_owned(),
+                            }),
+                            cost: None,
+                            price: None,
+                        },
+                        ledger::service::PostingInput {
+                            account: "Assets:Cash".to_owned(),
+                            amount: Some(ledger::model::Amount {
+                                number: rust_decimal::Decimal::new(-100, 2),
+                                currency: "USD".to_owned(),
+                            }),
+                            cost: None,
+                            price: None,
+                        },
+                    ],
+                },
+                sign_with(&provider, true),
+            )
+            .unwrap()
+            .txid;
         let shouted = lowercase.to_uppercase();
         let mut content = std::fs::read_to_string(&path).unwrap();
         content.push_str(&format!(
@@ -2430,6 +2550,7 @@ mod tests {
                 ledger::error::ParseErrorKind::UnexpectedToken,
             )],
             total: 1,
+            limit: None,
         };
         let rendered = render_parse_errors(&bounded);
         assert!(
@@ -2488,5 +2609,215 @@ mod tests {
         };
         assert_eq!(claimed.len(), 64);
         assert!(error.to_string().len() < 512);
+    }
+
+    // ── T75 / M-48, L-78: cardinality caps before anything is queued ─────
+
+    /// A transaction body with `postings` postings, `tags` tags, `links`
+    /// links, `metadata` directive-level keys and `posting_metadata` keys
+    /// spread over its first posting — every other count at a harmless value.
+    fn capped_transaction_body(
+        postings: usize,
+        tags: usize,
+        links: usize,
+        metadata: usize,
+        posting_metadata: usize,
+    ) -> String {
+        let mut body = format!(
+            "2024-01-15 * \"Acme Corp\" \"caps\"{}{}\n",
+            " #t".repeat(tags),
+            " ^l".repeat(links)
+        );
+        for key in 0..metadata {
+            body.push_str(&format!("  k{key}: \"v\"\n"));
+        }
+        for posting in 0..postings {
+            body.push_str(&format!(
+                "  Assets:Cash  {} USD\n",
+                if posting == 0 { 1 } else { 0 }
+            ));
+            if posting == 0 {
+                for key in 0..posting_metadata {
+                    body.push_str(&format!("    p{key}: \"v\"\n"));
+                }
+            }
+        }
+        body
+    }
+
+    /// Validate `body` under an id that is its true hash, so nothing but the
+    /// caps can refuse it.
+    fn validate_body(kind: DirectiveKind, body: String) -> Result<Directive, MergeError> {
+        validate_supply_entry(&entry_for_body(kind, body))
+    }
+
+    fn assert_resource_refusal(result: Result<Directive, MergeError>, needle: &str) {
+        match result {
+            Err(MergeError::ResourceLimitExceeded(detail)) => {
+                assert!(detail.contains(needle), "{needle:?} not in {detail:?}");
+                assert!(detail.len() < 256, "{}", detail.len());
+            }
+            other => panic!(
+                "expected ResourceLimitExceeded({needle}), got {:?}",
+                other.map(|directive| DirectiveKind::from_directive(&directive))
+            ),
+        }
+    }
+
+    /// M-48: each §3.12 count is refused ON THE WIRE — by
+    /// `validate_supply_entry`, under a correct id — one past its cap, and
+    /// admitted at it. Before T75 every one of these returned `Ok` and was
+    /// refused only at `stage_remote_directive`, after the frame had queued it.
+    #[test]
+    fn test_validate_refuses_each_cardinality_cap_on_the_wire() {
+        use ledger::limits::{MAX_CURRENCIES_PER_OPEN, MAX_POSTING_METADATA_KEYS_PER_TRANSACTION};
+        use ledger::service::{
+            MAX_LINKS_PER_TRANSACTION, MAX_METADATA_KEYS_PER_DIRECTIVE,
+            MAX_POSTINGS_PER_TRANSACTION, MAX_TAGS_PER_TRANSACTION,
+        };
+        let postings = MAX_POSTINGS_PER_TRANSACTION;
+        let tags = MAX_TAGS_PER_TRANSACTION;
+        let links = MAX_LINKS_PER_TRANSACTION;
+        let metadata = MAX_METADATA_KEYS_PER_DIRECTIVE;
+        let posting_metadata = MAX_POSTING_METADATA_KEYS_PER_TRANSACTION;
+
+        // Every count at its cap at once: admitted.
+        validate_body(
+            DirectiveKind::Transaction,
+            capped_transaction_body(postings, tags, links, metadata, posting_metadata),
+        )
+        .expect("a body at every cap is admitted");
+
+        assert_resource_refusal(
+            validate_body(
+                DirectiveKind::Transaction,
+                capped_transaction_body(postings + 1, 0, 0, 0, 0),
+            ),
+            "Too many postings",
+        );
+        assert_resource_refusal(
+            validate_body(
+                DirectiveKind::Transaction,
+                capped_transaction_body(2, tags + 1, 0, 0, 0),
+            ),
+            "Too many tags",
+        );
+        assert_resource_refusal(
+            validate_body(
+                DirectiveKind::Transaction,
+                capped_transaction_body(2, 0, links + 1, 0, 0),
+            ),
+            "Too many links",
+        );
+        assert_resource_refusal(
+            validate_body(
+                DirectiveKind::Transaction,
+                capped_transaction_body(2, 0, 0, metadata + 1, 0),
+            ),
+            "Too many metadata keys",
+        );
+        assert_resource_refusal(
+            validate_body(
+                DirectiveKind::Transaction,
+                capped_transaction_body(2, 0, 0, 0, posting_metadata + 1),
+            ),
+            "Too many posting metadata keys",
+        );
+
+        // L-78: currencies in an `open`.
+        let open = |count: usize| {
+            let list: Vec<String> = (0..count).map(|i| format!("C{i:03}")).collect();
+            format!("2024-01-01 open Assets:Cash {}\n", list.join(","))
+        };
+        validate_body(DirectiveKind::Open, open(MAX_CURRENCIES_PER_OPEN))
+            .expect("an open at the currency cap is admitted");
+        assert_resource_refusal(
+            validate_body(DirectiveKind::Open, open(MAX_CURRENCIES_PER_OPEN + 1)),
+            "Too many currencies in one open",
+        );
+    }
+
+    /// L-78, the executed shape: a 786 KB `open` of 262,137 currencies — which
+    /// before T75 staged `Ok` and stayed on every replica at ~5.2 MB resident —
+    /// is refused on the wire, under its correct id, as a resource limit.
+    #[test]
+    fn test_validate_refuses_a_262k_currency_open() {
+        let body = format!(
+            "2024-01-01 open Assets:A US{}\n",
+            ",US".repeat((1024 * 1024 - 30) / 4)
+        );
+        assert!(body.len() > 786_000 && body.len() <= ledger::service::MAX_ECONOMIC_BEAN_LENGTH);
+        assert_resource_refusal(
+            validate_body(DirectiveKind::Open, body),
+            "Too many currencies in one open",
+        );
+    }
+
+    /// M-48: the audit's four parsed shapes, each `Ok` with a correct id
+    /// before T75, are refused on the wire as resource limits. (Their memory
+    /// is measured under the counting allocator in `tests/decode_memory.rs`.)
+    #[test]
+    fn test_validate_refuses_the_audited_flood_shapes() {
+        let mib = 1024 * 1024;
+        let line = "  Assets:A 1 USD\n";
+        let postings = format!("2024-01-01 *\n{}", line.repeat((mib - 40) / line.len()));
+        let with_meta = "  Assets:A 1 USD\n  k: \"\"\n";
+        let postings_meta = format!(
+            "2024-01-01 *\n{}",
+            with_meta.repeat((mib - 40) / with_meta.len())
+        );
+        let tags = format!("2024-01-01 *{}\n", " #a".repeat((mib - 20) / 3));
+        let currencies = format!(
+            "2024-01-01 open Assets:A US{}\n",
+            ",US".repeat((mib - 30) / 3)
+        );
+        for (kind, body, needle) in [
+            (DirectiveKind::Transaction, postings, "Too many body lines"),
+            (
+                DirectiveKind::Transaction,
+                postings_meta,
+                "Too many body lines",
+            ),
+            (DirectiveKind::Transaction, tags, "Too many tags"),
+            (DirectiveKind::Open, currencies, "Too many currencies"),
+        ] {
+            assert!(body.len() <= ledger::service::MAX_ECONOMIC_BEAN_LENGTH);
+            assert_resource_refusal(validate_body(kind, body), needle);
+        }
+    }
+
+    /// M-48: `enforce_resource_limits` runs inside `validate_supply_entry`, so
+    /// a cap no parse-time COUNT can see — the narration and payee lengths —
+    /// is refused on the wire too, before the entry can be queued. Only the
+    /// post-parse call refuses these: the parser caps counts, not lengths.
+    #[test]
+    fn test_validate_runs_the_resource_limits_after_the_parse() {
+        let narration = "n".repeat(ledger::service::MAX_NARRATION_LENGTH + 1);
+        assert_resource_refusal(
+            validate_body(
+                DirectiveKind::Transaction,
+                format!(
+                    "2024-01-15 * \"{narration}\"\n  Assets:Cash  1 USD\n  Equity:Open  -1 USD\n"
+                ),
+            ),
+            "Narration too long",
+        );
+        let payee = "p".repeat(ledger::service::MAX_PAYEE_LENGTH + 1);
+        assert_resource_refusal(
+            validate_body(
+                DirectiveKind::Transaction,
+                format!(
+                    "2024-01-15 * \"{payee}\" \"n\"\n  Assets:Cash  1 USD\n  Equity:Open  -1 USD\n"
+                ),
+            ),
+            "Payee too long",
+        );
+        // At the caps: admitted.
+        let narration = "n".repeat(ledger::service::MAX_NARRATION_LENGTH);
+        validate_body(
+            DirectiveKind::Transaction,
+            format!("2024-01-15 * \"{narration}\"\n  Assets:Cash  1 USD\n  Equity:Open  -1 USD\n"),
+        )
+        .expect("a narration at the cap is admitted");
     }
 }

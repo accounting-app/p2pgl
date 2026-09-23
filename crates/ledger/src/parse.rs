@@ -12,25 +12,71 @@ use crate::model::*;
 // ─── Scanner ─────────────────────────────────────────────────────────────────
 
 /// Character-level scanner for a single line of text.
-struct Scanner {
+///
+/// ## Materialised lazily (T75 / M-48)
+///
+/// `chars` holds only the characters the scanner has consumed or peeked at —
+/// it grows as the readers advance, and `rest` is the untouched remainder of
+/// the line. It used to be `line.chars().collect()` up front: four bytes per
+/// character of the WHOLE line, and up to six at the `Vec`'s last doubling,
+/// paid before the first token was read. That was the "6× floor" under every
+/// long-line shape on the wire — and it was paid in full even when the line
+/// was refused at its second character, or when the parser's cardinality caps
+/// ([`ParseLimits`]) stop reading at the 101st tag of a 349,518-tag header.
+/// Now a line costs what the scanner actually walks.
+///
+/// Every reader indexes `chars` only over what it has already consumed
+/// (`self.chars[start..self.position]`), so the lazy fill is invisible to
+/// them; the three methods that look ahead without consuming — [`Self::at_eol`],
+/// [`Self::rest_of_line`], [`Self::column_of_rest`] — walk a clone of `rest`
+/// instead of materialising it.
+struct Scanner<'line> {
+    /// The characters consumed or peeked at so far (see the type docs).
     chars: Vec<char>,
+    /// The part of the line not yet in `chars`.
+    rest: std::str::Chars<'line>,
     position: usize,
 }
 
-impl Scanner {
-    fn new(line: &str) -> Self {
+impl<'line> Scanner<'line> {
+    fn new(line: &'line str) -> Self {
         Scanner {
-            chars: line.chars().collect(),
+            chars: Vec::new(),
+            rest: line.chars(),
             position: 0,
         }
     }
 
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.position).copied()
+    /// Make `chars[index]` exist if the line is long enough; `false` if not.
+    fn fill_to(&mut self, index: usize) -> bool {
+        while self.chars.len() <= index {
+            match self.rest.next() {
+                Some(character) => self.chars.push(character),
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// The characters from the current position to the end of the line,
+    /// without materialising any of them.
+    fn remaining(&self) -> impl Iterator<Item = char> + '_ {
+        self.chars[self.position..]
+            .iter()
+            .copied()
+            .chain(self.rest.clone())
+    }
+
+    fn peek(&mut self) -> Option<char> {
+        if self.fill_to(self.position) {
+            Some(self.chars[self.position])
+        } else {
+            None
+        }
     }
 
     fn advance(&mut self) -> Option<char> {
-        let character = self.chars.get(self.position).copied();
+        let character = self.peek();
         if character.is_some() {
             self.position += 1;
         }
@@ -49,7 +95,7 @@ impl Scanner {
 
     /// True if remaining content is empty, whitespace-only, or a comment.
     fn at_eol(&self) -> bool {
-        for &character in &self.chars[self.position..] {
+        for character in self.remaining() {
             if character == ';' {
                 return true;
             }
@@ -71,11 +117,7 @@ impl Scanner {
     /// Only used to quote the offending text back to the operator; nothing
     /// parses it.
     fn rest_of_line(&self) -> String {
-        self.chars[self.position..]
-            .iter()
-            .collect::<String>()
-            .trim()
-            .to_owned()
+        self.remaining().collect::<String>().trim().to_owned()
     }
 
     /// 1-based column of the first unconsumed NON-blank character (M-25).
@@ -84,11 +126,11 @@ impl Scanner {
     /// last token from the junk after it, which is not where the operator
     /// needs to look.
     fn column_of_rest(&self) -> usize {
-        let mut offset = self.position;
-        while matches!(self.chars.get(offset), Some(' ') | Some('\t')) {
-            offset += 1;
-        }
-        offset + 1
+        let blanks = self
+            .remaining()
+            .take_while(|character| matches!(character, ' ' | '\t'))
+            .count();
+        self.position + blanks + 1
     }
 
     // ── Token readers ────────────────────────────────────────────────────
@@ -193,18 +235,9 @@ impl Scanner {
             .collect();
         // H-17: `from_str_exact`, not `from_str`. The latter silently rounds a
         // fraction longer than 28 digits, so the number held — and hashed, and
-        // judged against the cap below — was not the number the file says.
-        let number =
-            Decimal::from_str_exact(&number_string).map_err(|e| format!("Invalid number: {e}"))?;
-        // H-17: the amount cap, at the one reader every amount in a `.bean`
-        // body goes through — posting units, `{cost}`, `@`/`@@` price,
-        // `balance` and `price` directives. That makes it the gate on the wire
-        // (`validate_supply_entry` re-parses the body) and on the file path,
-        // where boot quarantines the refused block rather than loading it:
-        // boot applies no transaction-level validation, so this is the only
-        // check history passes through.
-        crate::validate::check_amount_cap("amount", number).map_err(|error| error.to_string())?;
-        Ok(number)
+        // judged against the cap in `read_summed_amount` — was not the number
+        // the file says.
+        Decimal::from_str_exact(&number_string).map_err(|e| format!("Invalid number: {e}"))
     }
 
     fn read_currency(&mut self) -> Result<String, String> {
@@ -230,11 +263,32 @@ impl Scanner {
         Ok(currency)
     }
 
+    /// An amount that is never summed — a `balance` assertion's or a `price`
+    /// directive's — so the amount cap does not apply (T76).
     fn read_amount(&mut self) -> Result<Amount, String> {
         let number = self.read_number()?;
         self.skip_whitespace();
         let currency = self.read_currency()?;
         Ok(Amount { number, currency })
+    }
+
+    /// An amount that is summed into a balance or feeds one — posting units,
+    /// `{cost}`, `@`/`@@` price — under the amount cap
+    /// ([`crate::limits::MAX_AMOUNT_MAGNITUDE`], `|amount| ≤ 10^21`, H-17 /
+    /// T76).
+    ///
+    /// Every `.bean` body is read here, so this is the cap on the wire
+    /// (`validate_supply_entry` re-parses the body), in journal replay and on
+    /// the file path at boot and on reconcile — where the refused block is
+    /// quarantined rather than loaded. Boot applies no transaction-level
+    /// validation to a whole-file load, so for history this is the check.
+    /// Checked on the number as held — spelling and scale untouched — and on
+    /// its magnitude, so trailing zeros are never counted against it.
+    fn read_summed_amount(&mut self, label: &'static str) -> Result<Amount, String> {
+        let amount = self.read_amount()?;
+        crate::validate::check_amount_cap(label, amount.number)
+            .map_err(|error| error.to_string())?;
+        Ok(amount)
     }
 
     /// Reject a just-read token that carries a character outside `allowed`, and
@@ -401,17 +455,23 @@ pub fn validate_account_name(name: &str) -> Result<(), String> {
 
 /// Validate currency per §2.3: `[A-Z][A-Z0-9'._-]{0,22}[A-Z0-9]` (min 2 chars).
 pub fn validate_currency(currency: &str) -> Result<(), String> {
-    let chars: Vec<char> = currency.chars().collect();
-    if chars.len() < 2 {
+    // T75: the length is decided before anything is collected, and an
+    // over-long code is excerpted rather than echoed. A 1 MiB currency on the
+    // wire used to cost a 4 MiB `Vec<char>` here plus a 1 MiB error message on
+    // top of the parser's own copy — 11× the body, for a refusal.
+    let length = currency.chars().count();
+    if length < 2 {
         return Err(format!(
             "Currency must be at least 2 characters, got: {currency}"
         ));
     }
-    if chars.len() > 24 {
+    if length > 24 {
         return Err(format!(
-            "Currency must be at most 24 characters, got: {currency}"
+            "Currency must be at most 24 characters, got {length}: {}",
+            excerpt_token(currency)
         ));
     }
+    let chars: Vec<char> = currency.chars().collect();
     if !chars[0].is_ascii_uppercase() {
         return Err(format!(
             "Currency must start with uppercase letter, got: {currency}"
@@ -558,8 +618,13 @@ pub fn strip_byte_order_mark(input: &str) -> &str {
 /// This is the FILE loader's entry point and it deliberately keeps every
 /// error: an operator fixing a hand-edited `.bean` wants the whole list. The
 /// remote path must not use it — see [`parse_file_bounded`] (H-18).
+///
+/// It applies no [`ParseLimits`] either (T75): a file is this ledger's own
+/// history, and boot's standing rule is that it applies no write caps. The
+/// write paths that admit NEW records from a file (`reconcile_content`) hold
+/// them to `service::enforce_resource_limits` after the parse instead.
 pub fn parse_file(input: &str) -> Result<Vec<Directive>, Vec<ParseError>> {
-    parse_file_with_cap(input, None).map_err(|bounded| bounded.errors)
+    parse_file_with_cap(input, None, ParseLimits::UNLIMITED).map_err(|bounded| bounded.errors)
 }
 
 /// The errors of a [`parse_file_bounded`] run: the first `max_errors` in
@@ -570,6 +635,134 @@ pub struct BoundedParseErrors {
     pub errors: Vec<ParseError>,
     /// Every block that failed, counted whether or not it was kept.
     pub total: usize,
+    /// The [`ParseLimits`] cap the parse stopped at, if it stopped at one
+    /// (T75). The parse ends there — no later block is read — so `errors` and
+    /// `total` describe only what came before it. A cap is not a syntax error
+    /// and is not counted in `total`.
+    pub limit: Option<ParseLimitExceeded>,
+}
+
+/// Cardinality caps the parser enforces WHILE it reads (T75 / M-48).
+///
+/// The §3.12 caps used to run only after a whole directive had been
+/// materialised — on the wire, not until `stage_remote_directive`, after
+/// `validate_supply_entry` had built the directive and the batch had queued it.
+/// A valid 1 MiB body of 41,941 postings with one metadata line each peaked at
+/// 41.7× its size in the parser and was refused only at stage; a 15-entry
+/// `Supply` of them held 546 MB. Counting inside the block loop stops the parse
+/// at the first item past a cap, so what a body can make the parser hold is
+/// bounded by the caps, not by the body's length.
+///
+/// Every cap here is one `service::enforce_resource_limits` also applies — the
+/// parser refuses sooner, never more: a directive this node may write through
+/// its local API can never be refused by a peer's parser (the L-02 rule).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseLimits {
+    /// Postings in one transaction.
+    pub max_postings: usize,
+    /// Tags on one transaction header.
+    pub max_tags: usize,
+    /// Links on one transaction header.
+    pub max_links: usize,
+    /// Distinct keys in one directive's own metadata map.
+    pub max_metadata_keys: usize,
+    /// Distinct posting-level metadata keys, summed over one transaction's
+    /// postings.
+    pub max_posting_metadata_keys: usize,
+    /// Currencies in one `open` directive's constraint list.
+    pub max_currencies: usize,
+}
+
+impl ParseLimits {
+    /// No caps — [`parse_file`], the file loader.
+    pub const UNLIMITED: ParseLimits = ParseLimits {
+        max_postings: usize::MAX,
+        max_tags: usize::MAX,
+        max_links: usize::MAX,
+        max_metadata_keys: usize::MAX,
+        max_posting_metadata_keys: usize::MAX,
+        max_currencies: usize::MAX,
+    };
+
+    /// The §3.12 resource limits, each the constant
+    /// `service::enforce_resource_limits` refuses by — referenced here, never
+    /// restated. The wire's parser (`validate_supply_entry`) uses this.
+    pub const RESOURCE: ParseLimits = ParseLimits {
+        max_postings: crate::service::MAX_POSTINGS_PER_TRANSACTION,
+        max_tags: crate::service::MAX_TAGS_PER_TRANSACTION,
+        max_links: crate::service::MAX_LINKS_PER_TRANSACTION,
+        max_metadata_keys: crate::service::MAX_METADATA_KEYS_PER_DIRECTIVE,
+        max_posting_metadata_keys: crate::limits::MAX_POSTING_METADATA_KEYS_PER_TRANSACTION,
+        max_currencies: crate::limits::MAX_CURRENCIES_PER_OPEN,
+    };
+
+    /// The most non-blank, non-comment body lines one block can have and still
+    /// be within every cap.
+    ///
+    /// Every such line is a posting, a directive metadata line or a posting
+    /// metadata line (anything else is a parse error), so a block with more
+    /// lines than the three caps together is over one of them, is a parse
+    /// error, or repeats a metadata key — which no canonical body does. The
+    /// block loop refuses it while COLLECTING the lines, before any of them is
+    /// parsed: the 16 bytes per line of `body_lines` were themselves 9× a body
+    /// of 262,144 four-byte lines.
+    fn max_body_lines(&self) -> usize {
+        self.max_postings
+            .saturating_add(self.max_metadata_keys)
+            .saturating_add(self.max_posting_metadata_keys)
+    }
+}
+
+/// Which [`ParseLimits`] cap a parse stopped at, and where (T75).
+///
+/// Carries no peer text — a fixed-size rendering whatever the body was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseLimitExceeded {
+    /// 1-based line the count went past the cap on.
+    pub line: usize,
+    /// What was counted, e.g. `"postings"`.
+    pub what: &'static str,
+    /// The cap.
+    pub max: usize,
+}
+
+impl std::fmt::Display for ParseLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Too many {}: more than {} (max {}), at line {}; parsing stopped there",
+            self.what, self.max, self.max, self.line
+        )
+    }
+}
+
+/// The [`ParseLimits`] of one parse run, and the cap it tripped (T75).
+///
+/// A tripped cap is returned up the parser as an ordinary `ParseError` so every
+/// reader's `?` carries it out unchanged; `tripped` is what tells the block
+/// loop that the error was a cap, and that the parse must stop.
+struct LimitGate {
+    limits: ParseLimits,
+    tripped: Option<ParseLimitExceeded>,
+}
+
+impl LimitGate {
+    /// Refuse once `count` exceeds `max`.
+    fn check(
+        &mut self,
+        count: usize,
+        max: usize,
+        what: &'static str,
+        line: usize,
+    ) -> Result<(), ParseError> {
+        if count <= max {
+            return Ok(());
+        }
+        let exceeded = ParseLimitExceeded { line, what, max };
+        let error = ParseError::new(line, 1, exceeded.to_string(), ParseErrorKind::BadStructure);
+        self.tripped = Some(exceeded);
+        Err(error)
+    }
 }
 
 /// [`parse_file`] for input a PEER wrote: keep at most `max_errors` errors,
@@ -586,11 +779,18 @@ pub struct BoundedParseErrors {
 /// were three.
 ///
 /// `max_errors == 0` keeps nothing and only counts.
+///
+/// `limits` (T75 / M-48) are counted inside the block loop: the parse STOPS at
+/// the first posting, tag, link, metadata key, currency or body line past its
+/// cap and reports it in [`BoundedParseErrors::limit`]. The wire passes
+/// [`ParseLimits::RESOURCE`]; [`ParseLimits::UNLIMITED`] is `parse_file`'s
+/// behaviour with the error cap.
 pub fn parse_file_bounded(
     input: &str,
     max_errors: usize,
+    limits: ParseLimits,
 ) -> Result<Vec<Directive>, BoundedParseErrors> {
-    parse_file_with_cap(input, Some(max_errors))
+    parse_file_with_cap(input, Some(max_errors), limits)
 }
 
 /// How many directive blocks [`parse_file`] would see in `input` (T66 / H-18).
@@ -621,12 +821,19 @@ pub fn count_directive_headers(input: &str) -> usize {
 /// The one block loop behind [`parse_file`] and [`parse_file_bounded`].
 ///
 /// `max_errors` of `None` keeps every error (the file loader); `Some(n)` keeps
-/// the first `n` and counts the rest (the wire path, H-18).
+/// the first `n` and counts the rest (the wire path, H-18). `limits` stop the
+/// parse at the first count past a cap (the wire path, T75).
 fn parse_file_with_cap(
     input: &str,
     max_errors: Option<usize>,
+    limits: ParseLimits,
 ) -> Result<Vec<Directive>, BoundedParseErrors> {
     let input = strip_byte_order_mark(input);
+    let mut gate = LimitGate {
+        limits,
+        tripped: None,
+    };
+    let max_body_lines = limits.max_body_lines();
 
     let mut directives = Vec::new();
     let mut errors = Vec::new();
@@ -670,6 +877,22 @@ fn parse_file_with_cap(
                 if body_line.starts_with(' ') || body_line.starts_with('\t') {
                     let body_trimmed = body_line.trim();
                     if !body_trimmed.is_empty() && !body_trimmed.starts_with(';') {
+                        // T75: refused while collecting, before a line is parsed.
+                        if gate
+                            .check(
+                                body_lines.len() + 1,
+                                max_body_lines,
+                                "body lines in one directive",
+                                body_index + 1,
+                            )
+                            .is_err()
+                        {
+                            return Err(BoundedParseErrors {
+                                errors,
+                                total: total_errors,
+                                limit: gate.tripped,
+                            });
+                        }
                         body_lines.push((body_index + 1, body_line));
                     }
                     lines.next();
@@ -679,8 +902,16 @@ fn parse_file_with_cap(
                 }
             }
 
-            match parse_directive_block(header, &body_lines, header_line_number) {
+            match parse_directive_block(header, &body_lines, header_line_number, &mut gate) {
                 Ok(directive) => directives.push(directive),
+                // T75: a cap is not a syntax error — the parse stops here.
+                Err(_) if gate.tripped.is_some() => {
+                    return Err(BoundedParseErrors {
+                        errors,
+                        total: total_errors,
+                        limit: gate.tripped,
+                    });
+                }
                 Err(error) => note_error(&mut errors, error),
             }
         } else {
@@ -702,6 +933,7 @@ fn parse_file_with_cap(
         Err(BoundedParseErrors {
             errors,
             total: total_errors,
+            limit: None,
         })
     }
 }
@@ -775,6 +1007,28 @@ fn parse_directive_block(
     header: &str,
     body_lines: &[(usize, &str)],
     line_number: usize,
+    gate: &mut LimitGate,
+) -> Result<Directive, ParseError> {
+    let directive = parse_directive_block_counted(header, body_lines, line_number, gate)?;
+    // T75: the directive-level metadata cap for every kind. Transactions are
+    // counted as their body is read (`parse_transaction_body`); the other kinds
+    // hold nothing but metadata in their body, which the block loop's body-line
+    // cap has already bounded, so checking the finished map is as early as it
+    // needs to be.
+    gate.check(
+        directive.metadata().len(),
+        gate.limits.max_metadata_keys,
+        "metadata keys",
+        line_number,
+    )?;
+    Ok(directive)
+}
+
+fn parse_directive_block_counted(
+    header: &str,
+    body_lines: &[(usize, &str)],
+    line_number: usize,
+    gate: &mut LimitGate,
 ) -> Result<Directive, ParseError> {
     let mut scanner = Scanner::new(header);
 
@@ -808,7 +1062,7 @@ fn parse_directive_block(
                 Flag::Incomplete
             };
             scanner.advance();
-            parse_transaction(&mut scanner, date, flag, body_lines, line_number)
+            parse_transaction(&mut scanner, date, flag, body_lines, line_number, gate)
                 .map(Directive::Transaction)
         }
         _ => {
@@ -833,13 +1087,17 @@ fn parse_directive_block(
             }
 
             match keyword.as_str() {
-                "txn" => {
-                    parse_transaction(&mut scanner, date, Flag::Complete, body_lines, line_number)
-                        .map(Directive::Transaction)
-                }
-                "open" => {
-                    parse_open(&mut scanner, date, body_lines, line_number).map(Directive::Open)
-                }
+                "txn" => parse_transaction(
+                    &mut scanner,
+                    date,
+                    Flag::Complete,
+                    body_lines,
+                    line_number,
+                    gate,
+                )
+                .map(Directive::Transaction),
+                "open" => parse_open(&mut scanner, date, body_lines, line_number, gate)
+                    .map(Directive::Open),
                 "close" => {
                     parse_close(&mut scanner, date, body_lines, line_number).map(Directive::Close)
                 }
@@ -878,6 +1136,7 @@ fn parse_transaction(
     flag: Flag,
     body_lines: &[(usize, &str)],
     line_number: usize,
+    gate: &mut LimitGate,
 ) -> Result<Transaction, ParseError> {
     scanner.skip_whitespace();
 
@@ -927,6 +1186,8 @@ fn parse_transaction(
                     )
                 })?;
                 tags.push(tag);
+                // T75: counted as read — a 349,518-tag header stops at the 101st.
+                gate.check(tags.len(), gate.limits.max_tags, "tags", line_number)?;
             }
             Some('^') => {
                 let link = scanner.read_link().map_err(|message| {
@@ -938,6 +1199,7 @@ fn parse_transaction(
                     )
                 })?;
                 links.push(link);
+                gate.check(links.len(), gate.limits.max_links, "links", line_number)?;
             }
             _ => break,
         }
@@ -949,7 +1211,7 @@ fn parse_transaction(
     reject_trailing_content(scanner, line_number, "a transaction header")?;
 
     // Parse body lines into transaction metadata and postings.
-    let (metadata, postings) = parse_transaction_body(body_lines)?;
+    let (metadata, postings) = parse_transaction_body(body_lines, gate)?;
 
     Ok(Transaction {
         date,
@@ -970,6 +1232,7 @@ fn parse_open(
     date: NaiveDate,
     body_lines: &[(usize, &str)],
     line_number: usize,
+    gate: &mut LimitGate,
 ) -> Result<Open, ParseError> {
     scanner.skip_whitespace();
     let account = scanner.read_account().map_err(|message| {
@@ -1011,6 +1274,14 @@ fn parse_open(
                     )
                 })?;
                 currencies.push(currency);
+                // T75 / L-78: counted as read — a 262,137-currency list stops
+                // at the first currency past the cap.
+                gate.check(
+                    currencies.len(),
+                    gate.limits.max_currencies,
+                    "currencies in one open",
+                    line_number,
+                )?;
             } else {
                 break;
             }
@@ -1321,21 +1592,49 @@ fn parse_price(
 /// Parse body lines for a transaction: split into directive-level metadata and postings.
 fn parse_transaction_body(
     body_lines: &[(usize, &str)],
+    gate: &mut LimitGate,
 ) -> Result<(Metadata, Vec<Posting>), ParseError> {
     let mut metadata = BTreeMap::new();
     let mut postings = Vec::new();
     let mut current_posting: Option<Posting> = None;
+    // T75: every count is checked as it grows, so the parse stops at the first
+    // item past a cap. Postings count the one being read (`current_posting`),
+    // metadata counts DISTINCT keys — what the map, and so
+    // `enforce_resource_limits`, will hold.
+    let mut posting_count = 0usize;
+    let mut posting_metadata_keys = 0usize;
 
     for &(line_number, line) in body_lines {
         let trimmed = line.trim();
         if is_metadata_line(trimmed) {
             let (key, value) = parse_metadata_line(trimmed, line_number)?;
             if let Some(ref mut posting) = current_posting {
-                posting.metadata.insert(key, value);
+                if posting.metadata.insert(key, value).is_none() {
+                    posting_metadata_keys += 1;
+                }
+                gate.check(
+                    posting_metadata_keys,
+                    gate.limits.max_posting_metadata_keys,
+                    "posting metadata keys in one transaction",
+                    line_number,
+                )?;
             } else {
                 metadata.insert(key, value);
+                gate.check(
+                    metadata.len(),
+                    gate.limits.max_metadata_keys,
+                    "metadata keys",
+                    line_number,
+                )?;
             }
         } else {
+            posting_count += 1;
+            gate.check(
+                posting_count,
+                gate.limits.max_postings,
+                "postings",
+                line_number,
+            )?;
             // Finish previous posting if any.
             if let Some(posting) = current_posting.take() {
                 postings.push(posting);
@@ -1486,14 +1785,16 @@ fn parse_posting_line(trimmed: &str, line_number: usize) -> Result<Posting, Pars
     }
 
     // Read amount.
-    let amount = scanner.read_amount().map_err(|message| {
-        ParseError::new(
-            line_number,
-            scanner.column(),
-            message,
-            ParseErrorKind::InvalidNumber,
-        )
-    })?;
+    let amount = scanner
+        .read_summed_amount("posting amount")
+        .map_err(|message| {
+            ParseError::new(
+                line_number,
+                scanner.column(),
+                message,
+                ParseErrorKind::InvalidNumber,
+            )
+        })?;
 
     scanner.skip_whitespace();
 
@@ -1544,7 +1845,7 @@ fn parse_cost_spec(scanner: &mut Scanner, line_number: usize) -> Result<CostSpec
     }
 
     // Read cost amount.
-    let amount = scanner.read_amount().map_err(|message| {
+    let amount = scanner.read_summed_amount("cost").map_err(|message| {
         ParseError::new(
             line_number,
             scanner.column(),
@@ -1619,7 +1920,7 @@ fn parse_price_spec(scanner: &mut Scanner, line_number: usize) -> Result<PriceSp
 
     scanner.skip_whitespace();
 
-    let amount = scanner.read_amount().map_err(|message| {
+    let amount = scanner.read_summed_amount("price").map_err(|message| {
         ParseError::new(
             line_number,
             scanner.column(),
@@ -2478,82 +2779,104 @@ mod tests {
         }
     }
 
-    /// H-17: the number parser refuses an amount past the cap, with an error
-    /// that names it, wherever in a body the amount sits — this reader is the
-    /// gate on the wire and at boot, where nothing else checks history.
+    /// H-17 / T76: the amount reader refuses a summed amount past the
+    /// magnitude cap (`|amount| ≤ 10^21`), with an error that names it,
+    /// wherever in a transaction the amount sits — this reader is the gate on
+    /// the wire and at boot, where nothing else checks history.
     #[test]
     fn test_parse_refuses_an_amount_over_the_cap() {
-        let over = "1000000000000000000000"; // 10^21: 22 significant digits
-        for (what, input) in [
-            (
-                "posting",
-                format!("2024-01-15 *\n  Assets:Cash {over} USD\n  Equity:Opening -1 USD\n"),
-            ),
-            (
-                "negative posting",
-                format!("2024-01-15 *\n  Assets:Cash 1 USD\n  Equity:Opening -{over} USD\n"),
-            ),
-            (
-                "cost",
-                format!(
-                    "2024-01-15 *\n  Assets:Stock 1 AAPL {{{over} USD}}\n  Assets:Cash -1 USD\n"
+        for over in ["1000000000000000000001", "1000000000000000000000.0000001"] {
+            for (what, input) in [
+                (
+                    "posting",
+                    format!("2024-01-15 *\n  Assets:Cash {over} USD\n  Equity:Opening -1 USD\n"),
                 ),
-            ),
-            (
-                "unit price",
-                format!("2024-01-15 *\n  Assets:Stock 1 AAPL @ {over} USD\n  Assets:Cash -1 USD\n"),
-            ),
-            (
-                "total price",
-                format!(
-                    "2024-01-15 *\n  Assets:Stock 1 AAPL @@ {over} USD\n  Assets:Cash -1 USD\n"
+                (
+                    "negative posting",
+                    format!("2024-01-15 *\n  Assets:Cash 1 USD\n  Equity:Opening -{over} USD\n"),
                 ),
-            ),
-            (
-                "balance",
-                format!("2024-01-15 balance Assets:Cash {over} USD\n"),
-            ),
-            (
-                "price directive",
-                format!("2024-01-15 price EUR {over} USD\n"),
-            ),
-            (
-                "Decimal::MAX",
-                "2024-01-15 balance Assets:Cash 79228162514264337593543950335 USD\n".to_owned(),
-            ),
-            (
-                "trailing zeros count",
-                "2024-01-15 balance Assets:Cash 10,000,000,000,000.00000000 USD\n".to_owned(),
-            ),
-        ] {
-            let errors = parse_file(&input).expect_err(&format!("{what} must be refused"));
-            assert!(
-                errors
-                    .iter()
-                    .any(|error| error.kind == ParseErrorKind::InvalidNumber
-                        && error.message.contains("H-17")),
-                "{what}: expected an H-17 InvalidNumber error, got {errors:?}"
-            );
+                (
+                    "cost",
+                    format!(
+                        "2024-01-15 *\n  Assets:Stock 1 AAPL {{{over} USD}}\n  Assets:Cash -1 USD\n"
+                    ),
+                ),
+                (
+                    "unit price",
+                    format!(
+                        "2024-01-15 *\n  Assets:Stock 1 AAPL @ {over} USD\n  Assets:Cash -1 USD\n"
+                    ),
+                ),
+                (
+                    "total price",
+                    format!(
+                        "2024-01-15 *\n  Assets:Stock 1 AAPL @@ {over} USD\n  Assets:Cash -1 USD\n"
+                    ),
+                ),
+                (
+                    "Decimal::MAX",
+                    "2024-01-15 *\n  Assets:Cash 79228162514264337593543950335 USD\n  \
+                     Equity:Opening -1 USD\n"
+                        .to_owned(),
+                ),
+            ] {
+                let errors =
+                    parse_file(&input).expect_err(&format!("{what} {over} must be refused"));
+                assert!(
+                    errors
+                        .iter()
+                        .any(|error| error.kind == ParseErrorKind::InvalidNumber
+                            && error.message.contains("H-17")),
+                    "{what}: expected an H-17 InvalidNumber error, got {errors:?}"
+                );
+            }
         }
     }
 
-    /// H-17: the largest in-cap amounts still parse, exactly as written, at
-    /// both ends of the scale range.
+    /// H-17 / T76: the largest in-cap amounts still parse, exactly as
+    /// written — `10^21` itself (inclusive), at any precision, trailing zeros
+    /// kept — and a `balance` or `price` directive's amount is not capped at
+    /// all, because it is never summed (the M-50 fixture's pre-T65
+    /// `balance … 1000000000000000000014 USD`).
     #[test]
     fn test_parse_accepts_the_largest_in_cap_amounts() {
         for number in [
-            "999999999999999999999",
-            "-999,999,999,999,999,999,999",
-            "9999999999999.99999999",
+            "1000000000000000000000",
+            "-1,000,000,000,000,000,000,000",
+            "1000000000000000000000.0000000",
+            "999999999999999999999.9999999",
+            "10000000000000.00000000",
+            "792281625142643.37593543950335",
             "0.0000000000000000000000000001",
         ] {
-            let input = format!("2024-01-15 balance Assets:Cash {number} USD\n");
+            let input =
+                format!("2024-01-15 *\n  Assets:Cash {number} USD\n  Equity:Opening -1 USD\n");
             let directives =
                 parse_file(&input).unwrap_or_else(|e| panic!("{number} must parse: {e:?}"));
-            let Directive::Balance(balance) = &directives[0] else {
-                panic!("expected a balance");
+            let Directive::Transaction(transaction) = &directives[0] else {
+                panic!("expected a transaction");
             };
-            assert_eq!(balance.amount.number.to_string(), number.replace(',', ""));
+            let amount = transaction.postings[0].amount.as_ref().expect("amount");
+            assert_eq!(amount.number.to_string(), number.replace(',', ""));
+        }
+        for number in [
+            "79228162514264337593543950335",
+            "-79228162514264337593543950335",
+            "1000000000000000000014",
+        ] {
+            for input in [
+                format!("2024-01-15 balance Assets:Cash {number} USD\n"),
+                format!("2024-01-15 price EUR {number} USD\n"),
+            ] {
+                let directives =
+                    parse_file(&input).unwrap_or_else(|e| panic!("{input} must parse: {e:?}"));
+                let spelled = match &directives[0] {
+                    Directive::Balance(balance) => balance.amount.number.to_string(),
+                    Directive::Price(price) => price.amount.number.to_string(),
+                    other => panic!("unexpected {other:?}"),
+                };
+                assert_eq!(spelled, number);
+            }
         }
     }
 
@@ -2954,7 +3277,7 @@ mod tests {
     #[test]
     fn parse_file_bounded_keeps_the_first_errors_and_counts_the_rest() {
         let body = "x\n".repeat(1000);
-        let bounded = parse_file_bounded(&body, 3).unwrap_err();
+        let bounded = parse_file_bounded(&body, 3, ParseLimits::RESOURCE).unwrap_err();
         assert_eq!(bounded.errors.len(), 3);
         assert_eq!(bounded.total, 1000);
         assert_eq!(
@@ -2967,16 +3290,26 @@ mod tests {
         assert_eq!(all.len(), 1000);
         assert_eq!(&all[..3], &bounded.errors[..]);
         // A cap of zero only counts.
-        let counted = parse_file_bounded(&body, 0).unwrap_err();
+        let counted = parse_file_bounded(&body, 0, ParseLimits::RESOURCE).unwrap_err();
         assert!(counted.errors.is_empty());
         assert_eq!(counted.total, 1000);
         // Fewer errors than the cap: the cap is invisible.
-        let two = parse_file_bounded("x\n2024-01-01 open Assets:Cash USD\ny\n", 3).unwrap_err();
+        let two = parse_file_bounded(
+            "x\n2024-01-01 open Assets:Cash USD\ny\n",
+            3,
+            ParseLimits::RESOURCE,
+        )
+        .unwrap_err();
         assert_eq!(two.errors.len(), 2);
         assert_eq!(two.total, 2);
         // A clean body is `Ok` on both.
         assert_eq!(
-            parse_file_bounded("2024-01-01 open Assets:Cash USD\n", 3).unwrap(),
+            parse_file_bounded(
+                "2024-01-01 open Assets:Cash USD\n",
+                3,
+                ParseLimits::RESOURCE
+            )
+            .unwrap(),
             parse_file("2024-01-01 open Assets:Cash USD\n").unwrap()
         );
     }
@@ -3012,7 +3345,7 @@ mod tests {
         let all_fail = [x50.as_str(), x_blank50.as_str()];
         for input in all_fail {
             let errors = parse_file(input).unwrap_err();
-            let bounded = parse_file_bounded(input, usize::MAX).unwrap_err();
+            let bounded = parse_file_bounded(input, usize::MAX, ParseLimits::RESOURCE).unwrap_err();
             assert_eq!(bounded.total, errors.len());
             assert_eq!(
                 count_directive_headers(input),
@@ -3064,5 +3397,222 @@ mod tests {
             errors[0].message.chars().count(),
             "Unsupported directive: ''".len() + 61
         );
+    }
+
+    // ── T75 / M-48, L-78: cardinality caps counted inside the block loop ─
+
+    use crate::limits::{MAX_CURRENCIES_PER_OPEN, MAX_POSTING_METADATA_KEYS_PER_TRANSACTION};
+    use crate::service::{
+        MAX_LINKS_PER_TRANSACTION, MAX_METADATA_KEYS_PER_DIRECTIVE, MAX_POSTINGS_PER_TRANSACTION,
+        MAX_TAGS_PER_TRANSACTION,
+    };
+
+    /// A transaction of `postings` single-unit postings under one header.
+    fn transaction_with_postings(postings: usize) -> String {
+        let mut body = String::from("2024-01-01 * \"n\"\n");
+        for _ in 0..postings {
+            body.push_str("  Assets:Cash  1 USD\n");
+        }
+        body
+    }
+
+    /// Parse `input` under [`ParseLimits::RESOURCE`] and return the cap it
+    /// stopped at, or `None` if it parsed.
+    fn tripped(input: &str) -> Option<ParseLimitExceeded> {
+        match parse_file_bounded(input, 3, ParseLimits::RESOURCE) {
+            Ok(_) => None,
+            Err(bounded) => Some(
+                bounded
+                    .limit
+                    .unwrap_or_else(|| panic!("a parse error, not a cap: {:?}", bounded.errors)),
+            ),
+        }
+    }
+
+    /// Each cap admits exactly its maximum and stops the parse at one more,
+    /// naming the cap and the line it was crossed on — the same constants
+    /// `service::enforce_resource_limits` refuses by, referenced, not restated.
+    #[test]
+    fn parse_limits_admit_the_cap_and_stop_one_past_it() {
+        // Postings.
+        assert_eq!(
+            tripped(&transaction_with_postings(MAX_POSTINGS_PER_TRANSACTION)),
+            None
+        );
+        let over = tripped(&transaction_with_postings(MAX_POSTINGS_PER_TRANSACTION + 1)).unwrap();
+        assert_eq!(
+            (over.what, over.max),
+            ("postings", MAX_POSTINGS_PER_TRANSACTION)
+        );
+        assert_eq!(
+            over.line,
+            MAX_POSTINGS_PER_TRANSACTION + 2,
+            "the 1,001st posting's line"
+        );
+
+        // Tags and links, on the header.
+        let header = |sigil: &str, count: usize| {
+            format!(
+                "2024-01-01 * \"n\"{}\n  Assets:Cash  1 USD\n  Equity:Open  -1 USD\n",
+                format!(" {sigil}t").repeat(count)
+            )
+        };
+        assert_eq!(tripped(&header("#", MAX_TAGS_PER_TRANSACTION)), None);
+        let over = tripped(&header("#", MAX_TAGS_PER_TRANSACTION + 1)).unwrap();
+        assert_eq!(
+            (over.what, over.max, over.line),
+            ("tags", MAX_TAGS_PER_TRANSACTION, 1)
+        );
+        assert_eq!(tripped(&header("^", MAX_LINKS_PER_TRANSACTION)), None);
+        let over = tripped(&header("^", MAX_LINKS_PER_TRANSACTION + 1)).unwrap();
+        assert_eq!((over.what, over.max), ("links", MAX_LINKS_PER_TRANSACTION));
+
+        // Directive metadata: a transaction's, counted as read, and an
+        // `open`'s, checked on the finished map.
+        let keys = |count: usize, indent: &str| -> String {
+            (0..count)
+                .map(|i| format!("{indent}k{i}: \"v\"\n"))
+                .collect()
+        };
+        let txn = |count: usize| {
+            format!(
+                "2024-01-01 * \"n\"\n{}  Assets:Cash  1 USD\n  Equity:Open  -1 USD\n",
+                keys(count, "  ")
+            )
+        };
+        assert_eq!(tripped(&txn(MAX_METADATA_KEYS_PER_DIRECTIVE)), None);
+        let over = tripped(&txn(MAX_METADATA_KEYS_PER_DIRECTIVE + 1)).unwrap();
+        assert_eq!(
+            (over.what, over.max),
+            ("metadata keys", MAX_METADATA_KEYS_PER_DIRECTIVE)
+        );
+        let open = |count: usize| format!("2024-01-01 open Assets:Cash USD\n{}", keys(count, "  "));
+        assert_eq!(tripped(&open(MAX_METADATA_KEYS_PER_DIRECTIVE)), None);
+        let over = tripped(&open(MAX_METADATA_KEYS_PER_DIRECTIVE + 1)).unwrap();
+        assert_eq!(
+            (over.what, over.max),
+            ("metadata keys", MAX_METADATA_KEYS_PER_DIRECTIVE)
+        );
+
+        // Posting metadata, summed over the postings: half on each of two.
+        let split = |count: usize| {
+            format!(
+                "2024-01-01 * \"n\"\n  Assets:Cash  1 USD\n{}  Equity:Open  -1 USD\n{}",
+                keys(count / 2, "    "),
+                keys(count - count / 2, "    ").replace("    k", "    j")
+            )
+        };
+        assert_eq!(
+            tripped(&split(MAX_POSTING_METADATA_KEYS_PER_TRANSACTION)),
+            None
+        );
+        let over = tripped(&split(MAX_POSTING_METADATA_KEYS_PER_TRANSACTION + 1)).unwrap();
+        assert_eq!(
+            (over.what, over.max),
+            (
+                "posting metadata keys in one transaction",
+                MAX_POSTING_METADATA_KEYS_PER_TRANSACTION
+            )
+        );
+
+        // Currencies in an `open` (L-78).
+        let currencies = |count: usize| {
+            let list: Vec<String> = (0..count).map(|i| format!("C{i:03}")).collect();
+            format!("2024-01-01 open Assets:Cash {}\n", list.join(","))
+        };
+        assert_eq!(tripped(&currencies(MAX_CURRENCIES_PER_OPEN)), None);
+        let over = tripped(&currencies(MAX_CURRENCIES_PER_OPEN + 1)).unwrap();
+        assert_eq!(
+            (over.what, over.max, over.line),
+            ("currencies in one open", MAX_CURRENCIES_PER_OPEN, 1)
+        );
+
+        // Body lines: a repeated key is ONE map entry, so only the line count
+        // can refuse this — and it does, while collecting.
+        let lines = ParseLimits::RESOURCE.max_body_lines();
+        let repeated = |count: usize| {
+            format!(
+                "2024-01-01 open Assets:Cash USD\n{}",
+                "  k: \"v\"\n".repeat(count)
+            )
+        };
+        assert_eq!(tripped(&repeated(lines)), None);
+        let over = tripped(&repeated(lines + 1)).unwrap();
+        assert_eq!(
+            (over.what, over.max),
+            ("body lines in one directive", lines)
+        );
+        assert_eq!(over.line, lines + 2);
+    }
+
+    /// A cap stops the parse: nothing after the refused block is read, and the
+    /// errors before it are kept. The rendering carries no body text.
+    #[test]
+    fn a_tripped_cap_stops_the_parse_and_renders_small() {
+        let input = format!(
+            "x\n{}{}",
+            transaction_with_postings(MAX_POSTINGS_PER_TRANSACTION + 1),
+            "y\n".repeat(50)
+        );
+        let bounded = parse_file_bounded(&input, 3, ParseLimits::RESOURCE).unwrap_err();
+        assert_eq!(
+            bounded.total, 1,
+            "the 50 blocks after the cap are never read"
+        );
+        assert_eq!(bounded.errors.len(), 1);
+        let limit = bounded.limit.expect("stopped at the postings cap");
+        assert!(limit.to_string().len() < 128, "{limit}");
+        assert!(
+            limit.to_string().starts_with("Too many postings"),
+            "{limit}"
+        );
+    }
+
+    /// `parse_file` — the file loader — applies no caps (boot applies no write
+    /// caps), and `ParseLimits::UNLIMITED` is exactly `parse_file`.
+    #[test]
+    fn the_file_loader_applies_no_parse_limits() {
+        let body = transaction_with_postings(MAX_POSTINGS_PER_TRANSACTION + 1);
+        let parsed = parse_file(&body).expect("the file path is unchanged");
+        let Directive::Transaction(transaction) = &parsed[0] else {
+            panic!("a transaction");
+        };
+        assert_eq!(transaction.postings.len(), MAX_POSTINGS_PER_TRANSACTION + 1);
+        assert_eq!(
+            parse_file_bounded(&body, 3, ParseLimits::UNLIMITED).unwrap(),
+            parsed
+        );
+    }
+
+    /// The lazy scanner reads only what it walks, and still sees everything a
+    /// look-ahead needs: trailing content far along a line is found, quoted
+    /// and located exactly as the eager scanner did (M-25), and the column is
+    /// the column of the first non-blank character after the last token.
+    #[test]
+    fn the_lazy_scanner_still_sees_the_rest_of_the_line() {
+        let input = format!("2024-01-01 close Assets:Cash{}junk\n", " ".repeat(5000));
+        let errors = parse_file(&input).unwrap_err();
+        assert_eq!(errors[0].kind, ParseErrorKind::UnexpectedToken);
+        assert_eq!(
+            errors[0].column,
+            "2024-01-01 close Assets:Cash".len() + 5000 + 1
+        );
+        assert!(
+            errors[0].message.contains("'junk'"),
+            "{}",
+            errors[0].message
+        );
+        // A comment after the last token is end-of-line, found lazily too.
+        assert!(parse_file("2024-01-01 close Assets:Cash   ; a comment\n").is_ok());
+    }
+
+    /// T75: an over-long currency is refused with an excerpt and its length,
+    /// never echoed whole.
+    #[test]
+    fn an_over_long_currency_is_excerpted() {
+        let error = validate_currency(&"U".repeat(100_000)).unwrap_err();
+        assert!(error.len() < 160, "{}", error.len());
+        assert!(error.contains("got 100000"), "{error}");
+        assert!(validate_currency(&"U".repeat(24)).is_ok());
     }
 }

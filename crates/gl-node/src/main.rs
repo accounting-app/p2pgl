@@ -430,6 +430,40 @@ async fn main() {
         ));
     }
 
+    // H-20: boot verifies what it loads. The verifier is the SAME check the
+    // wire applies to a peer's directive (`verify_remote_signature`, built
+    // from `security::signing::verify_signature` over the same message and
+    // the same mesh id), so a record this node serves and a record a peer
+    // would accept are held to one rule. Installed right after the signer;
+    // installing it runs the pass over every foreign-authored record the
+    // signer's own pass could not decide. Only with signing enabled: a
+    // signing-off node produces and expects no signatures, and its history
+    // stays unverified, which `verify_own_history` below says out loud.
+    if config.signing.enabled {
+        let mesh_id = signature_domain.clone();
+        shared_ledger.write().await.set_verifier(Arc::new(
+            move |content_id: &str,
+                  is_transaction: bool,
+                  parents: &str,
+                  lamport: &str,
+                  author: &str,
+                  signature: &str| {
+                security::signing::verify_signature(
+                    &security::signing::SignableMessage {
+                        content_id,
+                        is_transaction,
+                        parents,
+                        lamport,
+                    },
+                    signature,
+                    author,
+                    &mesh_id,
+                )
+                .is_ok()
+            },
+        ));
+    }
+
     // ── H-13: identity before the first write ──────────────────────────────
     //
     // The README's supported edit workflow is stop → edit → start, and boot
@@ -450,6 +484,25 @@ async fn main() {
                 signing_enabled = config.signing.enabled,
                 "operator input adopted at boot now carries this node's author id and \
                  signature; the startup compaction writes it to the .bean (H-13)"
+            );
+        }
+        // H-20: the identity is complete — author, signer, verifier, operator
+        // input finalised — so this is where the history's signatures are
+        // settled, before the compaction below persists anything and before
+        // any peer is served. The signer and verifier installs above already
+        // ran the pass; this call is the one that reports what could NOT be
+        // checked, and the banner for what was quarantined.
+        let quarantined_by_signature = service.verify_own_history();
+        if quarantined_by_signature > 0 {
+            warn!(
+                quarantined = quarantined_by_signature,
+                quarantined_total = service.quarantined_count(),
+                directives = service.directive_count(),
+                "ledger records QUARANTINED at boot because their signature does not verify \
+                 — was a record edited by hand? They stay in the .bean (every compaction \
+                 writes them back) but are NOT served and NOT in any balance. History is \
+                 append-only: restore the original line from a peer's copy of the ledger, \
+                 or delete the edited block and append a reversing entry instead (H-20)"
             );
         }
     }

@@ -52,14 +52,15 @@ pub struct DecimalScalar(pub Decimal);
 impl ScalarType for DecimalScalar {
     /// Parse a wire decimal, refusing one outside the ledger's amount cap.
     ///
-    /// (H-17) Every `Decimal` a client sends is an amount the ledger would
-    /// store — a posting's units, cost or price — so the cap
-    /// ([`ledger::validate::MAX_AMOUNT_MANTISSA`]) applies here, at the API
-    /// edge, with the same constant `validate_transaction` and the `.bean`
-    /// parser use. `validate_transaction` still re-checks it: this is the
-    /// early, typed refusal, not the only one. `from_str_exact` for the same
-    /// reason the parser uses it: `from_str` silently rounds a fraction past 28
-    /// digits, so the value checked and stored would not be the value sent.
+    /// (H-17, T76) Every `Decimal` a client sends is an amount the ledger
+    /// would store and sum — a posting's units, cost or price — so the cap
+    /// (`|amount| ≤` [`ledger::limits::MAX_AMOUNT_MAGNITUDE`], `10^21`, at any
+    /// precision) applies here, at the API edge, through the same
+    /// `check_amount_cap` `validate_transaction` and the `.bean` parser use.
+    /// `validate_transaction` still re-checks it: this is the early, typed
+    /// refusal, not the only one. `from_str_exact` for the same reason the
+    /// parser uses it: `from_str` silently rounds a fraction past 28 digits, so
+    /// the value checked and stored would not be the value sent.
     ///
     /// Output values (balances, report totals) are sums and may legitimately
     /// exceed the cap; they only ever go through [`Self::to_value`].
@@ -172,17 +173,17 @@ mod tests {
         assert!(result.is_err(), "Decimal must be a string on the wire (I4)");
     }
 
-    /// H-17: an amount past the cap is refused at the API edge — including the
-    /// `±Decimal::MAX` pair the B6 proof used — while the largest in-cap
-    /// values, at either end of the scale range, still parse.
+    /// H-17 / T76: an amount past the magnitude cap is refused at the API
+    /// edge — including the `±Decimal::MAX` pair the B6 proof used — while
+    /// `10^21` itself (inclusive) and any precision inside it parse: trailing
+    /// zeros are precision, not magnitude (M-50).
     #[test]
     fn test_decimal_scalar_enforces_the_amount_cap() {
         for over_cap in [
-            "79228162514264337593543950335",  // Decimal::MAX
-            "-79228162514264337593543950335", // Decimal::MIN
-            "1000000000000000000000",         // 10^21: 22 digits
-            "10000000000000.00000000",        // 22 digits: trailing zeros count
-            "1.000000000000000000000",        // 22 digits at scale 21
+            "79228162514264337593543950335",   // Decimal::MAX
+            "-79228162514264337593543950335",  // Decimal::MIN
+            "1000000000000000000001",          // 10^21 + 1
+            "-1000000000000000000000.0000001", // one ulp past −10^21
         ] {
             let error = DecimalScalar::parse(Value::String(over_cap.to_owned()))
                 .expect_err(&format!("{over_cap} must be refused"));
@@ -192,9 +193,13 @@ mod tests {
             );
         }
         for in_cap in [
-            "999999999999999999999",
-            "-999999999999999999999",
+            "1000000000000000000000",
+            "-1000000000000000000000",
+            "1000000000000000000000.0000000",
+            "10000000000000.00000000",
+            "1.000000000000000000000",
             "9999999999999.99999999",
+            "792281625142643.37593543950335",
             "0.0000000000000000000000000001",
         ] {
             let parsed = DecimalScalar::parse(Value::String(in_cap.to_owned()))

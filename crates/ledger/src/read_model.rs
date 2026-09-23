@@ -2,6 +2,18 @@
 //!
 //! Built on boot, updated incrementally on append. Reports never re-parse
 //! the file (FR-2 AC5).
+//!
+//! # Precision of a reported figure (T76, L-79)
+//!
+//! Every balance is held as its **exact** sum ([`ExactAmount`]). A figure is
+//! reported as a `Decimal` at the scale its amounts are spelled at; when that
+//! does not fit a `Decimal`'s 96-bit mantissa it is **rounded once, half to
+//! even,** to the finest scale that fits, and flagged `exact: false`. `balance`
+//! assertions and `verify` always compare against the exact sum, never the
+//! reported figure. With every summed amount capped at
+//! `|amount| ≤ 10^21` ([`crate::limits::MAX_AMOUNT_MAGNITUDE`]) every total
+//! fits at scale 0, so only mixed-scale dust (`1000 + 10^-28` needs 32
+//! digits) is ever rounded.
 
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
@@ -10,6 +22,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::hash::compute_content_id;
 use crate::model::*;
 use crate::validate::amount_within_cap;
+use crate::wide::I256;
 
 // ─── Core types ──────────────────────────────────────────────────────────────
 
@@ -20,7 +33,15 @@ pub type CurrencyBalances = BTreeMap<String, Decimal>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountBalanceEntry {
     pub account: String,
+    /// Each currency's balance as reported ([`ExactAmount::reported`]): the
+    /// exact sum whenever it fits a `Decimal` at its usual scale, otherwise
+    /// that sum rounded once, half to even.
     pub balances: CurrencyBalances,
+    /// Whether every figure in `balances` equals its exact sum (T76).
+    pub exact: bool,
+    /// The exact sum behind each figure in `balances` (T76) — what a `balance`
+    /// assertion is compared against.
+    pub exact_sums: BTreeMap<String, ExactAmount>,
 }
 
 /// A trial balance row.
@@ -29,6 +50,8 @@ pub struct TrialBalanceRow {
     pub account: String,
     pub debit: Decimal,
     pub credit: Decimal,
+    /// Whether `debit` and `credit` equal the exact sums (T76).
+    pub exact: bool,
 }
 
 /// Full trial balance report.
@@ -38,6 +61,11 @@ pub struct TrialBalanceReport {
     pub rows: Vec<TrialBalanceRow>,
     pub total_debit: Decimal,
     pub total_credit: Decimal,
+    /// Whether every figure in the report — each row and both totals — equals
+    /// its exact sum (T76). Each total is the exact sum of the exact rows,
+    /// reported once, so with an inexact figure a total can differ from the
+    /// sum of the displayed rows by that rounding.
+    pub exact: bool,
 }
 
 /// Balance sheet report (§3.7.1).
@@ -47,6 +75,8 @@ pub struct BalanceSheetReport {
     pub assets: Vec<AccountBalanceEntry>,
     pub liabilities: Vec<AccountBalanceEntry>,
     pub equity: Vec<AccountBalanceEntry>,
+    /// Whether every figure in the report equals its exact sum (T76).
+    pub exact: bool,
 }
 
 /// Income statement report.
@@ -57,6 +87,9 @@ pub struct IncomeStatementReport {
     pub income: Vec<AccountBalanceEntry>,
     pub expenses: Vec<AccountBalanceEntry>,
     pub net: CurrencyBalances,
+    /// Whether every figure in the report, `net` included, equals its exact
+    /// sum (T76).
+    pub exact: bool,
 }
 
 /// Result of one batched balances-at-date sweep ([`ReadModel::balances_at_dates`]).
@@ -88,158 +121,385 @@ pub struct IndexedTransaction {
     pub transaction: Transaction,
 }
 
-// ─── Exact accumulation (H-17) ───────────────────────────────────────────────
+// ─── Exact accumulation (H-17, T76) ──────────────────────────────────────────
 
-/// An exact, order-independent running sum of one currency's amounts (H-17).
+/// The largest mantissa magnitude a `Decimal` carries, `2^96 − 1`.
+const DECIMAL_MANTISSA_MAX: u128 = (1 << 96) - 1;
+
+/// The most postings one per-scale partial sum holds (T76).
 ///
-/// # The bug this replaces
+/// Every stored amount's mantissa is below `2^96`, so a partial of at most
+/// `2^31` of them is below `2^127` in magnitude **whatever order they arrive
+/// in**: no prefix of the sum can overflow an `i128`, so the partial is exact
+/// and order-free. The next posting marks the balance out of range instead —
+/// a verdict on a count, so order-free too. Unreachable in practice: `2^31`
+/// postings is over 32 GiB of posting text against a 64 MiB ledger.
+const PARTIAL_POSTING_LIMIT: u32 = 1 << 31;
+
+/// One scale's exact partial sum: the integer sum of the mantissas of every
+/// amount spelled at `scale`, and how many there were.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Partial {
+    scale: u8,
+    count: u32,
+    sum: i128,
+}
+
+/// An exact, order-independent running sum of one currency's amounts (H-17,
+/// T76).
+///
+/// # The bugs this replaces
 ///
 /// Balances used to be one `Decimal` per `(account, currency)`, advanced with
-/// `saturating_add` in whatever order the caller walked. Neither half of that
-/// is associative: saturation (`MAX + 1 − MAX = 0`, `MAX − MAX + 1 = 1`), and
-/// `Decimal` addition itself, which at any scale above zero does not fail on a
-/// 96-bit overflow but drops a digit and rounds. The live running totals
-/// folded in arrival order and `verify`'s sweep and boot in date order, so a
-/// peer holding `+MAX` / `−MAX` could erase an honest posting from one
-/// replica's live reports while `verify` passed on it (H-17).
+/// `saturating_add` in arrival order — neither half associative, so two
+/// `±Decimal::MAX` directives from a peer could erase an honest posting from
+/// one replica's live reports while `verify` passed on it (H-17). T65 then
+/// kept one `Decimal` partial per scale, exact only while every amount was
+/// inside a 21-significant-digit cap, and combined the partials in a fixed
+/// order that rounded at each step, so a total that did not fit was rounded
+/// twice and could be more than half a unit off (L-79); and the cap counted
+/// trailing zeros, so ordinary pre-T65 history was quarantined (M-50).
 ///
 /// # Why this is exact
 ///
-/// One partial sum is kept **per scale** present, so every addition is between
-/// two numbers of the same scale, and each partial is the exact integer sum of
-/// its amounts' mantissas. Every stored amount has `|mantissa| ≤ 10^21 − 1`
-/// ([`crate::validate::MAX_AMOUNT_MANTISSA`], enforced at every ingress), and
-/// no partial can hold more postings than a 64 MiB ledger has bytes, so every
-/// partial stays below `2^26 × 10^21 < 2^96`: no addition ever overflows, so
-/// none ever rounds, so the partials are the same whatever order the amounts
-/// arrived in. [`Self::total`] then combines the partials in ascending-scale
-/// order — a fixed order over order-independent inputs — so the reported
-/// balance, representation included, is a pure function of the set of amounts.
+/// One [`Partial`] per scale present, each the exact `i128` sum of its
+/// amounts' mantissas. `i128` addition is exact and associative while nothing
+/// overflows, and [`PARTIAL_POSTING_LIMIT`] guarantees nothing does, for **any**
+/// `Decimal` amount — the amount cap is not needed for exactness. So the
+/// partials are a function of the multiset of amounts alone: the incremental
+/// running total, `account(at:)`, every report and `verify`'s batched sweep
+/// reach the same partials from any order, including after a backdated
+/// [`ReadModel::index_directive`] append, and no path has to fold in a
+/// canonical order to agree with another.
 ///
-/// That is why no path has to fold in a canonical order to agree with another:
-/// the incremental running total, `account(at:)`, every report and `verify`'s
-/// batched sweep reach the same partials from any order, including after a
-/// backdated [`ReadModel::index_directive`] append. Re-folding in canonical
-/// `(date, type priority, content id)` order would have given the same answer
-/// at the cost of a per-account re-sort on every backdated arrival — which a
-/// gossip catch-up makes quadratic.
-///
-/// A single partial is also why keeping one per scale, rather than capping the
-/// scale, is enough: mixing scales was the other non-associativity (`10^20 +
-/// 10^-8` needs 29 digits), and here scales never meet until [`Self::total`].
-///
-/// # Outside the cap
-///
-/// An amount past the cap can only reach the read model from a caller that
-/// bypassed every ingress (a library caller building one from raw directives,
-/// as some overflow tests deliberately do). Such a partial falls back to the
-/// pre-H-17 saturating/rounding arithmetic rather than panic — T17/H1's
-/// no-panic contract — and [`ReadModel::over_cap_posting_count`] says so. The
-/// fallback is a `debug_assert` failure whenever that count is zero, because
-/// then it is unreachable by the arithmetic above.
+/// [`Self::exact`] turns the partials into one [`ExactAmount`] — still exact —
+/// and only [`ExactAmount::reported`] rounds, once.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ExactSum {
-    /// `(scale, partial)`, ascending by scale, one entry per scale seen. The
-    /// scale is the key the partial was opened under; inside the cap it is
-    /// also the partial's own scale.
-    partials: Vec<(u32, Decimal)>,
+    /// Ascending by scale, one entry per scale seen.
+    partials: Vec<Partial>,
+    /// Set once a partial passed [`PARTIAL_POSTING_LIMIT`]; sticky.
+    out_of_range: bool,
 }
 
 impl ExactSum {
     /// Add one amount into the partial for its scale.
-    ///
-    /// `exact_guaranteed` is `true` when every amount the model holds is inside
-    /// the cap — then this addition cannot overflow, and a failure is a bug.
-    fn add(&mut self, number: Decimal, exact_guaranteed: bool) {
-        let scale = number.scale();
-        match self.partials.binary_search_by_key(&scale, |&(key, _)| key) {
+    fn add(&mut self, number: Decimal) {
+        self.add_bounded(number, PARTIAL_POSTING_LIMIT);
+    }
+
+    /// [`Self::add`] with the per-partial posting limit as a parameter, so the
+    /// out-of-range arm is testable without `2^31` postings.
+    fn add_bounded(&mut self, number: Decimal, limit: u32) {
+        if self.out_of_range {
+            return;
+        }
+        // `Decimal` scales are 0..=28, so the cast is lossless.
+        let scale = number.scale() as u8;
+        let mantissa = number.mantissa();
+        match self
+            .partials
+            .binary_search_by_key(&scale, |partial| partial.scale)
+        {
             Ok(index) => {
-                let partial = &mut self.partials[index].1;
-                *partial = add_same_scale(*partial, number, exact_guaranteed);
+                let partial = &mut self.partials[index];
+                let sum = (partial.count < limit)
+                    .then(|| partial.sum.checked_add(mantissa))
+                    .flatten();
+                match sum {
+                    Some(sum) => {
+                        partial.sum = sum;
+                        partial.count += 1;
+                    }
+                    None => self.out_of_range = true,
+                }
             }
-            Err(index) => self
-                .partials
-                .insert(index, (scale, without_negative_zero(number))),
+            Err(_) if limit == 0 => self.out_of_range = true,
+            Err(index) => self.partials.insert(
+                index,
+                Partial {
+                    scale,
+                    count: 1,
+                    sum: mantissa,
+                },
+            ),
         }
     }
 
-    /// The balance: the partials combined in ascending-scale order.
+    /// The exact sum, spelled at today's scale rule.
     ///
-    /// Exact whenever the result fits 96 bits at the finest scale present —
-    /// every realistic balance. Past that, `Decimal` rounds the finest digits,
-    /// but in this one fixed order over order-independent partials, so every
-    /// path and every replica rounds identically.
-    fn total(&self, exact_guaranteed: bool) -> Decimal {
-        self.partials
+    /// The partials are combined in ascending scale with [`ExactAmount::plus`],
+    /// which reproduces the scale `rust_decimal`'s own addition gives — so a
+    /// balance that fits prints digit for digit as it did before T76.
+    fn exact(&self) -> ExactAmount {
+        let mut total = self
+            .partials
             .iter()
-            .fold(Decimal::ZERO, |total, &(_, partial)| {
-                add_in_fixed_order(total, partial, exact_guaranteed)
-            })
+            .fold(ExactAmount::ZERO, |total, partial| {
+                total.plus(ExactAmount::of_mantissa(
+                    I256::from_i128(partial.sum),
+                    partial.scale,
+                ))
+            });
+        total.out_of_range |= self.out_of_range;
+        total
     }
 }
 
-/// Same-scale addition that is exact or reports that it was not (H-17).
+/// A figure reported by rule R: the value, and whether it is exactly the sum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reported {
+    pub value: Decimal,
+    /// `true` when `value` equals the exact sum; `false` when it was rounded.
+    pub exact: bool,
+}
+
+/// A sum no `Decimal` can report even rounded to scale 0 (T76).
 ///
-/// `checked_add` is not enough on its own: it returns `None` only at scale 0,
-/// and at any other scale "overflow" means it quietly dropped a digit. Between
-/// two operands of one scale an exact sum keeps that scale (a zero operand
-/// returns the other, which has it too), so a changed scale is the rounding.
-fn add_same_scale(partial: Decimal, number: Decimal, exact_guaranteed: bool) -> Decimal {
-    match partial.checked_add(number) {
-        Some(sum) if sum.scale() == partial.scale() => without_negative_zero(sum),
-        _ => {
-            debug_assert!(
-                !exact_guaranteed,
-                "H-17: a same-scale partial of in-cap amounts overflowed 96 bits \
-                 ({partial} + {number}); MAX_AMOUNT_MANTISSA no longer bounds the sum"
-            );
-            partial.saturating_add(number)
+/// Unreachable for any ledger whose summed amounts are inside
+/// [`crate::limits::MAX_AMOUNT_MAGNITUDE`]: every total is then below
+/// `10^28 < 2^96`. It exists for the `2^31`-postings-per-partial bound
+/// ([`PARTIAL_POSTING_LIMIT`]) and for a library caller that builds a model
+/// from amounts no ingress would admit. The `try_*` report methods return it;
+/// the infallible ones report `±Decimal::MAX` flagged inexact instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutOfRange;
+
+impl std::fmt::Display for OutOfRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a balance is too large for any Decimal to report")
+    }
+}
+
+impl std::error::Error for OutOfRange {}
+
+/// The exact value of one reported figure and the scale it is spelled at
+/// (T76).
+///
+/// Held as an integer mantissa at the figure's own spelling scale, which is
+/// always at least the scale of every non-zero amount in it, so the value is
+/// exact. The spelling scale follows `rust_decimal`'s addition (see
+/// [`Self::plus`]), which is how balances have always printed: `1.50 + 2.5`
+/// is `4.00`, `2 − 1 + 0.1 − 0.1` is `1`, `1 − 1.0 + 0.00` is `0.00`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExactAmount {
+    /// The value × `10^scale`, an integer.
+    mantissa: I256,
+    scale: u8,
+    /// The value is unknown (a partial passed [`PARTIAL_POSTING_LIMIT`], or a
+    /// report-level sum passed 256 bits); `mantissa` keeps only its sign.
+    out_of_range: bool,
+}
+
+impl ExactAmount {
+    /// Zero at scale 0 — where every fold of balances starts.
+    pub const ZERO: ExactAmount = ExactAmount {
+        mantissa: I256::ZERO,
+        scale: 0,
+        out_of_range: false,
+    };
+
+    /// `number`, exactly, at its own scale.
+    pub fn from_decimal(number: Decimal) -> ExactAmount {
+        ExactAmount::of_mantissa(I256::from_i128(number.mantissa()), number.scale() as u8)
+    }
+
+    fn of_mantissa(mantissa: I256, scale: u8) -> ExactAmount {
+        ExactAmount {
+            mantissa,
+            scale,
+            out_of_range: false,
         }
     }
-}
 
-/// Addition in a caller-fixed order over order-independent inputs (H-17).
-///
-/// Used where the operands are already reported balances — a total across
-/// scales, currencies or accounts — each combined in one deterministic order
-/// (ascending scale, `BTreeMap` currency order, sorted account order). Such a
-/// sum may round when its operands' scales are far apart, identically
-/// everywhere; it cannot overflow while every amount is inside the cap,
-/// because the magnitude of any such sum is at most the sum of every posting's
-/// magnitude, `< 2^26 × 10^21 × 1.12 < 2^96`.
-fn add_in_fixed_order(left: Decimal, right: Decimal, exact_guaranteed: bool) -> Decimal {
-    match left.checked_add(right) {
-        Some(sum) => without_negative_zero(sum),
-        None => {
-            debug_assert!(
-                !exact_guaranteed,
-                "H-17: a report-level sum of in-cap balances overflowed ({left} + {right})"
-            );
-            left.saturating_add(right)
+    /// Whether the exact value is zero.
+    pub fn is_zero(&self) -> bool {
+        self.mantissa.is_zero()
+    }
+
+    /// Whether the exact value is below zero.
+    pub fn is_negative(&self) -> bool {
+        self.mantissa.is_negative()
+    }
+
+    /// The scale the figure is spelled at when it fits.
+    pub fn scale(&self) -> u32 {
+        u32::from(self.scale)
+    }
+
+    /// `self + other`, exactly, with the scale `rust_decimal` gives the sum
+    /// of two `Decimal`s: a zero left operand takes the right operand's scale,
+    /// a zero right operand leaves the left's, and two non-zero operands take
+    /// the finer of the two (`Decimal` addition's `0 + x = x` / `x + 0 = x`
+    /// fast paths and its rescale). Folding per-scale partials in ascending
+    /// scale with this is exactly the scale rule T65's fold printed with
+    /// whenever that fold was exact, so no balance that fits changes spelling.
+    pub(crate) fn plus(self, other: ExactAmount) -> ExactAmount {
+        let out_of_range = self.out_of_range || other.out_of_range;
+        let scale = if self.is_zero() {
+            other.scale
+        } else if other.is_zero() {
+            self.scale
+        } else {
+            self.scale.max(other.scale)
+        };
+        let aligned = |amount: ExactAmount| {
+            amount
+                .mantissa
+                .checked_mul_pow10(u32::from(scale.saturating_sub(amount.scale)))
+        };
+        // A zero operand is exactly representable at any scale, so aligning
+        // it "down" (scale below its own) is still exact: it is zero.
+        let sum = match (aligned(self), aligned(other)) {
+            (Some(left), Some(right)) => left.checked_add(right),
+            _ => None,
+        };
+        match sum {
+            Some(mantissa) => ExactAmount {
+                mantissa,
+                scale,
+                out_of_range,
+            },
+            // Past 256 bits: only a model of amounts no ingress admits, summed
+            // across an absurd number of accounts. Keep a sign to saturate to.
+            None => ExactAmount {
+                mantissa: if self.is_negative() && other.is_negative() {
+                    I256::from_i128(-1)
+                } else {
+                    I256::from_i128(1)
+                },
+                scale,
+                out_of_range: true,
+            },
         }
     }
-}
 
-/// `-0` and `0` are equal but print differently; a balance must not depend on
-/// which of them an addition order happened to produce.
-fn without_negative_zero(mut number: Decimal) -> Decimal {
-    if number.is_zero() {
-        number.set_sign_positive(true);
+    /// `-self`, spelled at the same scale (a zero stays a non-negative zero).
+    pub(crate) fn negated(self) -> ExactAmount {
+        ExactAmount {
+            mantissa: self.mantissa.negated(),
+            ..self
+        }
     }
-    number
+
+    /// Whether `claim` is exactly this value — the rule a `balance` assertion
+    /// follows (T76, L-79). Scale is not compared: `100.00` claims `100`.
+    pub fn equals(&self, claim: Decimal) -> bool {
+        if self.out_of_range {
+            return false;
+        }
+        let claim = ExactAmount::from_decimal(claim);
+        let common = self.scale.max(claim.scale);
+        let at_common = |amount: &ExactAmount| {
+            amount
+                .mantissa
+                .checked_mul_pow10(u32::from(common - amount.scale))
+        };
+        match (at_common(self), at_common(&claim)) {
+            (Some(ours), Some(theirs)) => ours == theirs,
+            // Only `self` can overflow (a claim is a `Decimal`), and then it
+            // is larger than any claim.
+            _ => false,
+        }
+    }
+
+    /// The figure to report for this sum — rule R (T76, L-79):
+    ///
+    /// 1. if the exact value fits a `Decimal` at its spelling scale, that
+    ///    value, **exact**;
+    /// 2. otherwise the exact value rounded **once**, half to even, at the
+    ///    finest scale below it at which the result fits, flagged inexact
+    ///    unless the digits dropped were all zero;
+    /// 3. otherwise [`OutOfRange`].
+    ///
+    /// Half to even is `rust_decimal`'s own single-step rounding, so a total
+    /// the old per-scale fold rounded once is unchanged; only the ones it
+    /// rounded twice move, by one unit in the last place. A pure function of
+    /// the exact sum, so identical on every path and every replica.
+    pub fn reported(&self) -> Result<Reported, OutOfRange> {
+        if self.out_of_range {
+            return Err(OutOfRange);
+        }
+        let scale = self.scale();
+        if let Some(mantissa) = self.mantissa.to_i128_within(DECIMAL_MANTISSA_MAX) {
+            return Ok(Reported {
+                value: Decimal::from_i128_with_scale(mantissa, scale),
+                exact: true,
+            });
+        }
+        for coarser in (0..scale).rev() {
+            let dropped = scale - coarser;
+            let rounded = self.mantissa.div_pow10_round_half_even(dropped);
+            if let Some(mantissa) = rounded.to_i128_within(DECIMAL_MANTISSA_MAX) {
+                return Ok(Reported {
+                    value: Decimal::from_i128_with_scale(mantissa, coarser),
+                    exact: rounded.checked_mul_pow10(dropped) == Some(self.mantissa),
+                });
+            }
+        }
+        Err(OutOfRange)
+    }
+
+    /// [`Self::reported`] for the infallible report methods: an out-of-range
+    /// figure reads as `±Decimal::MAX`, inexact, and `out_of_range` is set so
+    /// the `try_*` forms can refuse the report instead.
+    fn figure(&self, out_of_range: &mut bool) -> Reported {
+        self.reported().unwrap_or_else(|OutOfRange| {
+            *out_of_range = true;
+            Reported {
+                value: if self.is_negative() {
+                    Decimal::MIN
+                } else {
+                    Decimal::MAX
+                },
+                exact: false,
+            }
+        })
+    }
 }
 
 /// Per-currency exact sums for one account.
 type ExactBalances = BTreeMap<String, ExactSum>;
 
-/// The reported form of an account's exact sums.
-fn report_balances(balances: &ExactBalances, exact_guaranteed: bool) -> CurrencyBalances {
+/// The exact value of each of an account's per-currency sums.
+fn exact_balances(balances: &ExactBalances) -> BTreeMap<String, ExactAmount> {
     balances
         .iter()
-        .map(|(currency, sum)| (currency.clone(), sum.total(exact_guaranteed)))
+        .map(|(currency, sum)| (currency.clone(), sum.exact()))
         .collect()
 }
 
+/// The report entry for one account's exact sums.
+fn balance_entry(
+    account: &str,
+    exact_sums: BTreeMap<String, ExactAmount>,
+    out_of_range: &mut bool,
+) -> AccountBalanceEntry {
+    let mut exact = true;
+    let balances = exact_sums
+        .iter()
+        .map(|(currency, sum)| {
+            let figure = sum.figure(out_of_range);
+            exact &= figure.exact;
+            (currency.clone(), figure.value)
+        })
+        .collect();
+    AccountBalanceEntry {
+        account: account.to_owned(),
+        balances,
+        exact,
+        exact_sums,
+    }
+}
+
+/// A report, or [`OutOfRange`] if any figure in it was.
+fn in_range<T>((report, out_of_range): (T, bool)) -> Result<T, OutOfRange> {
+    if out_of_range {
+        Err(OutOfRange)
+    } else {
+        Ok(report)
+    }
+}
 // ─── Read model ──────────────────────────────────────────────────────────────
 
 /// The in-memory read model. Built from directives; queried by the GraphQL layer.
@@ -267,9 +527,8 @@ pub struct ReadModel {
     /// [`Self::index_directive`], and the DAG is grow-only (nothing is ever
     /// removed), so the index cannot go stale in either direction.
     latest_posting_dates: HashMap<String, NaiveDate>,
-    /// Indexed postings whose amount is outside the H-17 cap.
-    ///
-    /// Zero for every model built from directives that passed an ingress; see
+    /// Indexed postings whose amount is outside the amount cap
+    /// ([`crate::limits::MAX_AMOUNT_MAGNITUDE`]); informational — see
     /// [`Self::over_cap_posting_count`].
     over_cap_postings: usize,
 }
@@ -331,17 +590,12 @@ impl ReadModel {
             }
 
             // Update running balances — exactly, so arrival order cannot
-            // matter (H-17; see `ExactSum`).
+            // matter (H-17, T76; see `ExactSum`).
             for posting in &txn.postings {
                 if let Some(ref amount) = posting.amount {
                     if !amount_within_cap(amount.number) {
                         self.over_cap_postings += 1;
                     }
-                }
-            }
-            let exact_guaranteed = self.exact_guaranteed();
-            for posting in &txn.postings {
-                if let Some(ref amount) = posting.amount {
                     // Use the raw posting amount (not weight) for account balances.
                     // Account balances track commodity units, not converted amounts.
                     self.account_balances
@@ -349,7 +603,7 @@ impl ReadModel {
                         .or_default()
                         .entry(amount.currency.clone())
                         .or_default()
-                        .add(amount.number, exact_guaranteed);
+                        .add(amount.number);
                 }
             }
 
@@ -376,100 +630,150 @@ impl ReadModel {
         }
     }
 
+    /// Replace the stored copy of an already-indexed transaction with
+    /// `directive` — same txid, same postings, a changed envelope (L-74).
+    ///
+    /// `finalize_operator_input` rewrites the envelope of a DAG directive in
+    /// place after boot indexed a clone of it here, so `journal` served the
+    /// hand-typed record as `author: "local"`, unsigned, until the next
+    /// restart while `transaction(txid)` served the finalised copy. The body
+    /// is what the txid and every balance are computed from, and the body is
+    /// unchanged, so nothing but the stored copy moves: no balance, no
+    /// posting index, no date index. A directive this model has not indexed,
+    /// or a non-transaction, is indexed as [`Self::index_directive`] would.
+    pub fn reindex_directive(&mut self, directive: &Directive) {
+        let Directive::Transaction(txn) = directive else {
+            return;
+        };
+        let txid = compute_content_id(directive);
+        match self.txid_index.get(&txid) {
+            Some(&index) => {
+                debug_assert_eq!(
+                    self.transactions[index].transaction.postings, txn.postings,
+                    "reindex_directive is for an envelope change; the body is the txid"
+                );
+                self.transactions[index].transaction = txn.clone();
+            }
+            None => self.index_directive(directive),
+        }
+    }
+
     // ── Report queries ───────────────────────────────────────────────────
+    //
+    // Each report has an infallible form, whose signature predates T76, and a
+    // `try_*` form. They compute the same figures; an out-of-range figure
+    // ([`OutOfRange`], unreachable inside the amount cap) reads as
+    // `±Decimal::MAX` flagged inexact in the first and refuses the report in
+    // the second. Every figure is one exact sum reported once by rule R
+    // ([`ExactAmount::reported`]).
 
     /// Trial balance at a given date (FR-2 AC1).
     ///
     /// Returns every account's debit/credit balance. For multi-currency accounts,
     /// positive amounts are debits and negative are credits (as Decimal sums).
     pub fn trial_balance(&self, at: NaiveDate) -> TrialBalanceReport {
-        let exact_guaranteed = self.exact_guaranteed();
-        let balances = self.balances_at(at);
+        self.trial_balance_checked(at).0
+    }
+
+    /// [`Self::trial_balance`], refusing a report with an out-of-range figure.
+    pub fn try_trial_balance(&self, at: NaiveDate) -> Result<TrialBalanceReport, OutOfRange> {
+        in_range(self.trial_balance_checked(at))
+    }
+
+    fn trial_balance_checked(&self, at: NaiveDate) -> (TrialBalanceReport, bool) {
+        let sums = self.sums_where(None, |date| date <= at);
+        let mut out_of_range = false;
+        let mut exact = true;
         let mut rows = Vec::new();
-        let mut total_debit = Decimal::ZERO;
-        let mut total_credit = Decimal::ZERO;
+        let mut total_debit = ExactAmount::ZERO;
+        let mut total_credit = ExactAmount::ZERO;
 
         // Collect all accounts, sorted.
-        let mut accounts: Vec<&str> = balances.keys().map(|s| s.as_str()).collect();
+        let mut accounts: Vec<&str> = sums.keys().copied().collect();
         accounts.sort();
 
         for account in accounts {
-            if let Some(currency_balances) = balances.get(account) {
-                // Sum all currencies into a single debit/credit per account.
-                // This is a simplification — in practice, debit/credit is per currency,
-                // but the GraphQL type uses a single Decimal.
-                let mut net = Decimal::ZERO;
-                for &amount in currency_balances.values() {
-                    net = add_in_fixed_order(net, amount, exact_guaranteed);
-                }
+            // Sum all currencies into a single debit/credit per account.
+            // This is a simplification — in practice, debit/credit is per currency,
+            // but the GraphQL type uses a single Decimal. Exact, in currency
+            // order, then reported once (T76).
+            let net = sums[account]
+                .values()
+                .fold(ExactAmount::ZERO, |net, sum| net.plus(sum.exact()));
 
-                let (debit, credit) = if net >= Decimal::ZERO {
-                    (net, Decimal::ZERO)
-                } else {
-                    (Decimal::ZERO, -net)
-                };
+            let (debit, credit) = if net.is_negative() {
+                (ExactAmount::ZERO, net.negated())
+            } else {
+                (net, ExactAmount::ZERO)
+            };
 
-                total_debit = add_in_fixed_order(total_debit, debit, exact_guaranteed);
-                total_credit = add_in_fixed_order(total_credit, credit, exact_guaranteed);
+            total_debit = total_debit.plus(debit);
+            total_credit = total_credit.plus(credit);
 
-                rows.push(TrialBalanceRow {
-                    account: account.to_owned(),
-                    debit,
-                    credit,
-                });
-            }
+            let debit = debit.figure(&mut out_of_range);
+            let credit = credit.figure(&mut out_of_range);
+            let row_exact = debit.exact && credit.exact;
+            exact &= row_exact;
+            rows.push(TrialBalanceRow {
+                account: account.to_owned(),
+                debit: debit.value,
+                credit: credit.value,
+                exact: row_exact,
+            });
         }
 
-        TrialBalanceReport {
+        let total_debit = total_debit.figure(&mut out_of_range);
+        let total_credit = total_credit.figure(&mut out_of_range);
+        let report = TrialBalanceReport {
             at,
             rows,
-            total_debit,
-            total_credit,
-        }
+            total_debit: total_debit.value,
+            total_credit: total_credit.value,
+            exact: exact && total_debit.exact && total_credit.exact,
+        };
+        (report, out_of_range)
     }
 
     /// Balance sheet at a given date (FR-2 AC2, §3.7.1).
     ///
     /// Includes the Net-Income closing entry into Equity.
     pub fn balance_sheet(&self, at: NaiveDate) -> BalanceSheetReport {
-        let exact_guaranteed = self.exact_guaranteed();
-        let balances = self.balances_at(at);
+        self.balance_sheet_checked(at).0
+    }
+
+    /// [`Self::balance_sheet`], refusing a report with an out-of-range figure.
+    pub fn try_balance_sheet(&self, at: NaiveDate) -> Result<BalanceSheetReport, OutOfRange> {
+        in_range(self.balance_sheet_checked(at))
+    }
+
+    fn balance_sheet_checked(&self, at: NaiveDate) -> (BalanceSheetReport, bool) {
+        let sums = self.sums_where(None, |date| date <= at);
+        let mut out_of_range = false;
 
         let mut assets = Vec::new();
         let mut liabilities = Vec::new();
         let mut equity = Vec::new();
 
         // Collect Net-Income (Income − Expenses) for the closing rule.
-        let mut net_income: CurrencyBalances = BTreeMap::new();
+        let mut net_income: BTreeMap<String, ExactAmount> = BTreeMap::new();
 
-        let mut sorted_accounts: Vec<&String> = balances.keys().collect();
+        let mut sorted_accounts: Vec<&str> = sums.keys().copied().collect();
         sorted_accounts.sort();
 
         for account in sorted_accounts {
-            let currency_balances = &balances[account];
-            let root = account_root(account);
-
-            let entry = AccountBalanceEntry {
-                account: account.clone(),
-                balances: currency_balances.clone(),
-            };
-
-            match root {
-                "Assets" => assets.push(entry),
-                "Liabilities" => liabilities.push(entry),
-                "Equity" => equity.push(entry),
-                "Income" => {
-                    for (currency, &amount) in currency_balances {
-                        // Income is stored as negative (credit); negate to get positive contribution.
-                        let running = net_income.entry(currency.clone()).or_insert(Decimal::ZERO);
-                        *running = add_in_fixed_order(*running, -amount, exact_guaranteed);
-                    }
+            let exact_sums = exact_balances(&sums[account]);
+            match account_root(account) {
+                "Assets" => assets.push(balance_entry(account, exact_sums, &mut out_of_range)),
+                "Liabilities" => {
+                    liabilities.push(balance_entry(account, exact_sums, &mut out_of_range))
                 }
-                "Expenses" => {
-                    for (currency, &amount) in currency_balances {
-                        // Expenses are stored as positive (debit); subtract from net income.
-                        let running = net_income.entry(currency.clone()).or_insert(Decimal::ZERO);
-                        *running = add_in_fixed_order(*running, -amount, exact_guaranteed);
+                "Equity" => equity.push(balance_entry(account, exact_sums, &mut out_of_range)),
+                // Income is stored as negative (credit) and expenses as
+                // positive (debit): both are negated into net income.
+                "Income" | "Expenses" => {
+                    for (currency, amount) in exact_sums {
+                        let running = net_income.entry(currency).or_insert(ExactAmount::ZERO);
+                        *running = running.plus(amount.negated());
                     }
                 }
                 _ => {} // Other account types are not included in balance sheet.
@@ -477,74 +781,102 @@ impl ReadModel {
         }
 
         // §3.7.1: Add net_income as Equity:Net-Income (negated to credit/equity sign).
-        if net_income.values().any(|&v| v != Decimal::ZERO) {
-            let equity_balances: CurrencyBalances = net_income
+        if net_income.values().any(|amount| !amount.is_zero()) {
+            let equity_sums = net_income
                 .into_iter()
-                .map(|(currency, amount)| (currency, -amount))
+                .map(|(currency, amount)| (currency, amount.negated()))
                 .collect();
-            equity.push(AccountBalanceEntry {
-                account: "Equity:Net-Income".to_owned(),
-                balances: equity_balances,
-            });
+            equity.push(balance_entry(
+                "Equity:Net-Income",
+                equity_sums,
+                &mut out_of_range,
+            ));
         }
 
-        BalanceSheetReport {
+        let exact = assets
+            .iter()
+            .chain(&liabilities)
+            .chain(&equity)
+            .all(|entry| entry.exact);
+        let report = BalanceSheetReport {
             at,
             assets,
             liabilities,
             equity,
-        }
+            exact,
+        };
+        (report, out_of_range)
     }
 
     /// Income statement for a date range (FR-2 AC3).
     pub fn income_statement(&self, from: NaiveDate, to: NaiveDate) -> IncomeStatementReport {
-        let exact_guaranteed = self.exact_guaranteed();
-        let balances = self.balances_in_range(from, to);
+        self.income_statement_checked(from, to).0
+    }
+
+    /// [`Self::income_statement`], refusing a report with an out-of-range
+    /// figure.
+    pub fn try_income_statement(
+        &self,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<IncomeStatementReport, OutOfRange> {
+        in_range(self.income_statement_checked(from, to))
+    }
+
+    fn income_statement_checked(
+        &self,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> (IncomeStatementReport, bool) {
+        let sums = self.sums_where(None, |date| from <= date && date <= to);
+        let mut out_of_range = false;
 
         let mut income = Vec::new();
         let mut expenses = Vec::new();
-        let mut net: CurrencyBalances = BTreeMap::new();
+        let mut net: BTreeMap<String, ExactAmount> = BTreeMap::new();
 
-        let mut sorted_accounts: Vec<&String> = balances.keys().collect();
+        let mut sorted_accounts: Vec<&str> = sums.keys().copied().collect();
         sorted_accounts.sort();
 
         for account in sorted_accounts {
-            let currency_balances = &balances[account];
             let root = account_root(account);
-
-            let entry = AccountBalanceEntry {
-                account: account.clone(),
-                balances: currency_balances.clone(),
-            };
-
-            match root {
-                "Income" => {
-                    for (currency, &amount) in currency_balances {
-                        // Income is negative (credit); negate for net.
-                        let running = net.entry(currency.clone()).or_insert(Decimal::ZERO);
-                        *running = add_in_fixed_order(*running, -amount, exact_guaranteed);
-                    }
-                    income.push(entry);
-                }
-                "Expenses" => {
-                    for (currency, &amount) in currency_balances {
-                        // Expenses are positive (debit); subtract from net.
-                        let running = net.entry(currency.clone()).or_insert(Decimal::ZERO);
-                        *running = add_in_fixed_order(*running, -amount, exact_guaranteed);
-                    }
-                    expenses.push(entry);
-                }
-                _ => {} // Other types not included in income statement.
+            if root != "Income" && root != "Expenses" {
+                continue; // Other types not included in income statement.
+            }
+            let exact_sums = exact_balances(&sums[account]);
+            // Income is negative (credit), expenses positive (debit): both
+            // are negated into net.
+            for (currency, amount) in &exact_sums {
+                let running = net.entry(currency.clone()).or_insert(ExactAmount::ZERO);
+                *running = running.plus(amount.negated());
+            }
+            let entry = balance_entry(account, exact_sums, &mut out_of_range);
+            if root == "Income" {
+                income.push(entry);
+            } else {
+                expenses.push(entry);
             }
         }
 
-        IncomeStatementReport {
+        let mut exact = income.iter().chain(&expenses).all(|entry| entry.exact);
+        let net = net
+            .into_iter()
+            .map(|(currency, amount)| {
+                let figure = amount.figure(&mut out_of_range);
+                exact &= figure.exact;
+                (currency, figure.value)
+            })
+            .collect();
+
+        let report = IncomeStatementReport {
             from,
             to,
             income,
             expenses,
             net,
-        }
+            exact,
+        };
+        (report, out_of_range)
     }
 
     /// Journal of transactions, optionally filtered (FR-2 AC4).
@@ -598,18 +930,35 @@ impl ReadModel {
         account: &str,
         at: Option<NaiveDate>,
     ) -> Option<AccountBalanceEntry> {
-        let balances = match at {
-            Some(date) => {
-                let all = self.balances_at(date);
-                all.get(account).cloned()?
-            }
-            None => report_balances(self.account_balances.get(account)?, self.exact_guaranteed()),
-        };
+        self.account_balance_checked(account, at).0
+    }
 
-        Some(AccountBalanceEntry {
-            account: account.to_owned(),
-            balances,
-        })
+    /// [`Self::account_balance`], refusing an out-of-range figure.
+    pub fn try_account_balance(
+        &self,
+        account: &str,
+        at: Option<NaiveDate>,
+    ) -> Result<Option<AccountBalanceEntry>, OutOfRange> {
+        in_range(self.account_balance_checked(account, at))
+    }
+
+    fn account_balance_checked(
+        &self,
+        account: &str,
+        at: Option<NaiveDate>,
+    ) -> (Option<AccountBalanceEntry>, bool) {
+        let exact_sums = match at {
+            // Only this account's postings are summed; the cut is the same
+            // `date <= at` every date-cut report uses.
+            Some(date) => self
+                .sums_where(Some(account), |posted| posted <= date)
+                .get(account)
+                .map(exact_balances),
+            None => self.account_balances.get(account).map(exact_balances),
+        };
+        let mut out_of_range = false;
+        let entry = exact_sums.map(|sums| balance_entry(account, sums, &mut out_of_range));
+        (entry, out_of_range)
     }
 
     /// Balances for many `(account, date)` pairs, from **one** date-ordered
@@ -658,7 +1007,7 @@ impl ReadModel {
     /// - **Unknown accounts** yield `None`, which callers read as `0` — so
     ///   `balance Assets:Unknown 0 USD` still passes.
     /// - Postings with no amount contribute nothing and create no entry, as in
-    ///   [`Self::balances_at`].
+    ///   [`Self::account_balance`] (`sums_where`).
     pub fn balances_at_dates(&self, queries: &[(&str, NaiveDate)]) -> BatchedBalances {
         let mut entries: Vec<Option<AccountBalanceEntry>> = vec![None; queries.len()];
         if queries.is_empty() {
@@ -681,7 +1030,6 @@ impl ReadModel {
         visit.sort_by_key(|&i| queries[i].1);
 
         let order = self.date_ordered_transactions();
-        let exact_guaranteed = self.exact_guaranteed();
         let mut running: HashMap<&str, ExactBalances> = HashMap::new();
         let mut cursor = 0usize;
         let mut postings_visited = 0usize;
@@ -710,24 +1058,17 @@ impl ReadModel {
                     };
                     // H-17: the same exact accumulator the live running
                     // totals use, so the two agree by construction.
-                    let balances = running.entry(key).or_default();
-                    match balances.get_mut(&amount.currency) {
-                        Some(sum) => sum.add(amount.number, exact_guaranteed),
-                        // Only the first sighting of a currency allocates.
-                        None => {
-                            let mut sum = ExactSum::default();
-                            sum.add(amount.number, exact_guaranteed);
-                            balances.insert(amount.currency.clone(), sum);
-                        }
-                    }
+                    add_to(running.entry(key).or_default(), amount);
                 }
                 cursor += 1;
             }
 
-            entries[query] = running.get(account).map(|balances| AccountBalanceEntry {
-                account: account.to_owned(),
-                balances: report_balances(balances, exact_guaranteed),
-            });
+            // The entry carries the exact sums, so an assertion answered from
+            // it is compared exactly (T76, L-79); an out-of-range figure is
+            // reported saturated and can equal no claim.
+            entries[query] = running
+                .get(account)
+                .map(|balances| balance_entry(account, exact_balances(balances), &mut false));
         }
 
         BatchedBalances {
@@ -750,23 +1091,17 @@ impl ReadModel {
         self.latest_posting_dates.get(account).copied()
     }
 
-    /// Indexed postings whose amount is outside the H-17 amount cap
-    /// ([`crate::validate::MAX_AMOUNT_MANTISSA`]).
+    /// Indexed postings whose amount is outside the amount cap
+    /// ([`crate::limits::MAX_AMOUNT_MAGNITUDE`]).
     ///
-    /// Zero whenever every directive reached the model through an ingress —
-    /// the local API, peer ingest, reconcile, or the `.bean` parser at boot
-    /// all refuse such an amount — and then every balance and report this
-    /// model returns is exact and independent of the order the directives
-    /// arrived in. Non-zero only for a model a library caller built from
-    /// unvalidated directives; see [`ExactSum`] for what the reports then do.
+    /// Informational. Zero whenever every directive reached the model through
+    /// an ingress — the local API, peer ingest, reconcile, journal replay and
+    /// the `.bean` parser at boot all refuse such an amount. Non-zero only for
+    /// a model a library caller built from unvalidated directives. Balances
+    /// stay exact either way ([`ExactSum`]); only such a model can hold a sum
+    /// that is [`OutOfRange`].
     pub fn over_cap_posting_count(&self) -> usize {
         self.over_cap_postings
-    }
-
-    /// Whether every indexed amount is inside the cap, so every accumulation
-    /// is provably exact (the condition the H-17 debug assertions check).
-    fn exact_guaranteed(&self) -> bool {
-        self.over_cap_postings == 0
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────
@@ -797,31 +1132,18 @@ impl ReadModel {
         order
     }
 
-    /// Compute account balances at a given date (transactions with date ≤ at).
+    /// Exact per-account sums over the transactions whose date passes
+    /// `included` — the one fold every date-cut report shares (H-17) — for
+    /// every account, or only `account`.
     ///
     /// Walks the vector in arrival order, which is safe because the fold is
-    /// exact ([`ExactSum`], H-17): it equals the running totals and the batched
+    /// exact ([`ExactSum`]): it equals the running totals and the batched
     /// sweep whatever order either of them walked.
-    fn balances_at(&self, at: NaiveDate) -> HashMap<String, CurrencyBalances> {
-        self.balances_where(|date| date <= at)
-    }
-
-    /// Compute account balances in a date range [from, to] inclusive.
-    fn balances_in_range(
+    fn sums_where(
         &self,
-        from: NaiveDate,
-        to: NaiveDate,
-    ) -> HashMap<String, CurrencyBalances> {
-        self.balances_where(|date| from <= date && date <= to)
-    }
-
-    /// Exact per-account balances over the transactions whose date passes
-    /// `included` — the one fold every date-cut report shares (H-17).
-    fn balances_where(
-        &self,
+        account: Option<&str>,
         included: impl Fn(NaiveDate) -> bool,
-    ) -> HashMap<String, CurrencyBalances> {
-        let exact_guaranteed = self.exact_guaranteed();
+    ) -> HashMap<&str, ExactBalances> {
         let mut sums: HashMap<&str, ExactBalances> = HashMap::new();
 
         for indexed in &self.transactions {
@@ -829,28 +1151,28 @@ impl ReadModel {
                 continue;
             }
             for posting in &indexed.transaction.postings {
+                if account.is_some_and(|wanted| wanted != posting.account) {
+                    continue;
+                }
                 if let Some(ref amount) = posting.amount {
-                    let account_sums = sums.entry(posting.account.as_str()).or_default();
-                    match account_sums.get_mut(&amount.currency) {
-                        Some(sum) => sum.add(amount.number, exact_guaranteed),
-                        None => {
-                            let mut sum = ExactSum::default();
-                            sum.add(amount.number, exact_guaranteed);
-                            account_sums.insert(amount.currency.clone(), sum);
-                        }
-                    }
+                    add_to(sums.entry(posting.account.as_str()).or_default(), amount);
                 }
             }
         }
+        sums
+    }
+}
 
-        sums.into_iter()
-            .map(|(account, balances)| {
-                (
-                    account.to_owned(),
-                    report_balances(&balances, exact_guaranteed),
-                )
-            })
-            .collect()
+/// Add `amount` into an account's per-currency sums; only the first sighting
+/// of a currency allocates its key.
+fn add_to(balances: &mut ExactBalances, amount: &Amount) {
+    match balances.get_mut(&amount.currency) {
+        Some(sum) => sum.add(amount.number),
+        None => {
+            let mut sum = ExactSum::default();
+            sum.add(amount.number);
+            balances.insert(amount.currency.clone(), sum);
+        }
     }
 }
 
@@ -1543,11 +1865,12 @@ mod tests {
 
     // ── H-17: exact, order-independent balances ─────────────────────────
 
-    use crate::validate::MAX_AMOUNT_MANTISSA;
     use proptest::prelude::*;
 
-    /// The largest in-cap mantissa, as the signed type `Decimal` builds from.
-    const CAP: i128 = MAX_AMOUNT_MANTISSA as i128;
+    /// The amount cap's magnitude (`10^21`), as the signed type `Decimal`
+    /// builds from: the largest in-cap integer, and an in-cap mantissa at any
+    /// scale.
+    const CAP: i128 = crate::limits::MAX_AMOUNT_MAGNITUDE as i128;
 
     fn at_scale(mantissa: i128, scale: u32) -> Decimal {
         Decimal::from_i128_with_scale(mantissa, scale)
@@ -1665,10 +1988,25 @@ mod tests {
         );
         let model = ReadModel::build(&[over, again]);
         assert_eq!(model.over_cap_posting_count(), 4);
+        let entry = model.account_balance("Assets:A", None).unwrap();
         assert_eq!(
-            model.account_balance("Assets:A", None).unwrap().balances["USD"],
+            entry.balances["USD"],
             Decimal::MAX,
-            "saturates, as before H-17, instead of panicking"
+            "2 × MAX is out of range: reported saturated, instead of panicking"
+        );
+        assert!(!entry.exact, "and flagged inexact (T76)");
+        assert_eq!(
+            model.try_account_balance("Assets:A", None),
+            Err(OutOfRange),
+            "the typed form refuses it (T76)"
+        );
+        assert_eq!(
+            model.try_trial_balance(make_date(2024, 12, 31)).err(),
+            Some(OutOfRange)
+        );
+        assert_eq!(
+            model.try_balance_sheet(make_date(2024, 12, 31)).err(),
+            Some(OutOfRange)
         );
         let in_cap = ReadModel::build(&sample_directives());
         assert_eq!(in_cap.over_cap_posting_count(), 0);
@@ -1832,6 +2170,191 @@ mod tests {
             };
             prop_assert_eq!(income(&live), income(&replica));
         }
+    }
+
+    // ── T76: rule R, the spelling rule and the count bound ───────────────
+
+    fn exact_of(amounts: &[Decimal]) -> ExactAmount {
+        let mut sum = ExactSum::default();
+        for amount in amounts {
+            sum.add(*amount);
+        }
+        sum.exact()
+    }
+
+    fn reported_text(amounts: &[Decimal]) -> Result<(String, bool), OutOfRange> {
+        exact_of(amounts)
+            .reported()
+            .map(|reported| (reported.value.to_string(), reported.exact))
+    }
+
+    /// Rule R, branch 1: a sum that fits at its spelling scale is that sum,
+    /// exact, spelled as `Decimal` addition spells it.
+    #[test]
+    fn test_t76_rule_r_reports_a_fitting_sum_exactly() {
+        for (amounts, spelled) in [
+            (vec![dec!(1.50), dec!(2.5)], "4.00"),
+            (vec![dec!(2), dec!(-1), dec!(0.1), dec!(-0.1)], "1"),
+            (vec![dec!(1), dec!(-1.0), dec!(0.00)], "0.00"),
+            (vec![dec!(0.1), dec!(-0.10), dec!(3)], "3.00"),
+            (
+                vec![Decimal::MAX, Decimal::MAX, -Decimal::MAX],
+                "79228162514264337593543950335",
+            ),
+        ] {
+            assert_eq!(
+                reported_text(&amounts),
+                Ok((spelled.to_owned(), true)),
+                "{amounts:?}"
+            );
+        }
+    }
+
+    /// Rule R, branch 2: a sum that does not fit at its spelling scale is
+    /// rounded ONCE, half to even, at the finest scale that fits — ties both
+    /// ways — and flagged inexact.
+    #[test]
+    fn test_t76_rule_r_rounds_a_non_fitting_sum_once_half_to_even() {
+        let dust = Decimal::from_i128_with_scale(1, 28);
+        assert_eq!(
+            reported_text(&[dec!(1000), dust]),
+            Ok(("1000.0000000000000000000000000".to_owned(), false))
+        );
+        // A tie at the cut rounds to the even neighbour: `…334.5` → `…334`,
+        // `…333.5` → `…334`.
+        let near_max =
+            |last: i128| Decimal::from_i128_with_scale(Decimal::MAX.mantissa() - 335 + last, 0);
+        assert_eq!(
+            reported_text(&[near_max(334), dec!(0.5)]),
+            Ok((near_max(334).to_string(), false))
+        );
+        assert_eq!(
+            reported_text(&[near_max(333), dec!(0.5)]),
+            Ok((near_max(334).to_string(), false))
+        );
+        assert_eq!(
+            reported_text(&[Decimal::MAX, dec!(-0.5)]),
+            Ok((near_max(334).to_string(), false))
+        );
+        // L-79's double-rounding case: the exact sum rounds UP at the last
+        // kept digit; folding per scale rounded it down first.
+        let amounts = [
+            Decimal::from_i128_with_scale(999_999_999_999_999_999_999, 0),
+            "0.0000000163569815000000000001".parse().unwrap(),
+            "-93902.1645112500000001".parse().unwrap(),
+        ];
+        assert_eq!(
+            reported_text(&amounts),
+            Ok(("999999999999999906096.8354888".to_owned(), false))
+        );
+        // Dropped digits that are all zero: coarser, but still the sum.
+        let many = vec![Decimal::from_i128_with_scale(CAP, 0); 100];
+        let mut padded = many.clone();
+        padded.push(dec!(0.00000001));
+        padded.push(dec!(-0.00000001));
+        padded.push(dec!(0.5000000));
+        padded.push(dec!(0.5000000));
+        let (text, exact) = reported_text(&padded).unwrap();
+        assert!(exact, "{text}: only zeros were dropped");
+        assert_eq!(
+            text.parse::<Decimal>().unwrap(),
+            Decimal::from_i128_with_scale(100 * CAP + 1, 0)
+        );
+    }
+
+    /// Rule R, branch 3: past every scale — `MAX + 0.5` rounds up past `MAX`,
+    /// `MAX + 1` needs 97 bits — the sum is `OutOfRange`.
+    #[test]
+    fn test_t76_rule_r_refuses_a_sum_no_decimal_holds() {
+        assert_eq!(reported_text(&[Decimal::MAX, dec!(0.5)]), Err(OutOfRange));
+        assert_eq!(
+            reported_text(&[Decimal::MAX, Decimal::ONE]),
+            Err(OutOfRange)
+        );
+        assert_eq!(
+            reported_text(&[Decimal::MIN, -Decimal::ONE]),
+            Err(OutOfRange)
+        );
+        let mut flag = false;
+        let figure = exact_of(&[Decimal::MIN, -Decimal::ONE]).figure(&mut flag);
+        assert!(flag);
+        assert_eq!(
+            figure,
+            Reported {
+                value: Decimal::MIN,
+                exact: false
+            }
+        );
+    }
+
+    /// The `2^31`-postings bound, with the limit injected: the posting past
+    /// the limit marks the sum out of range (sticky, order-free: it is a count),
+    /// and every posting up to it is summed exactly.
+    #[test]
+    fn test_t76_a_partial_past_its_posting_limit_is_out_of_range() {
+        let limit = 3;
+        let mut within = ExactSum::default();
+        for _ in 0..limit {
+            within.add_bounded(Decimal::MAX, limit);
+        }
+        assert!(!within.out_of_range);
+        assert_eq!(within.partials[0].count, limit);
+        assert_eq!(within.partials[0].sum, 3 * Decimal::MAX.mantissa());
+        let mut past = within.clone();
+        past.add_bounded(dec!(1.0), limit);
+        assert!(
+            !past.out_of_range,
+            "a different scale's partial has its own count"
+        );
+        past.add_bounded(Decimal::ZERO, limit);
+        assert!(
+            past.out_of_range,
+            "the fourth scale-0 posting passes the limit"
+        );
+        assert_eq!(past.exact().reported(), Err(OutOfRange));
+        past.add_bounded(dec!(-1), limit);
+        assert!(past.out_of_range, "sticky");
+        // A limit of zero refuses the first posting at a new scale.
+        let mut none = ExactSum::default();
+        none.add_bounded(dec!(1), 0);
+        assert!(none.out_of_range);
+        // The real bound keeps every prefix inside an `i128`.
+        assert!(
+            i128::try_from(u128::from(PARTIAL_POSTING_LIMIT) * DECIMAL_MANTISSA_MAX).is_ok(),
+            "2^31 × (2^96 − 1) must fit an i128"
+        );
+    }
+
+    /// `ExactAmount::equals` is value equality at any scale, and a model's
+    /// entries carry the exact sums behind their reported figures.
+    #[test]
+    fn test_t76_entries_carry_the_exact_sum_behind_each_figure() {
+        let dust = Decimal::from_i128_with_scale(1, 28);
+        let model = ReadModel::build(&[
+            make_txn(
+                make_date(2024, 1, 1),
+                "big",
+                vec![("Assets:A", dec!(1000), "USD")],
+            ),
+            make_txn(
+                make_date(2024, 1, 2),
+                "dust",
+                vec![("Assets:A", dust, "USD")],
+            ),
+        ]);
+        let entry = model.account_balance("Assets:A", None).unwrap();
+        assert!(!entry.exact);
+        let sum = entry.exact_sums["USD"];
+        assert!(!sum.equals(dec!(1000)));
+        assert!(
+            !sum.equals(entry.balances["USD"]),
+            "the rounded figure is not the sum"
+        );
+        assert!(ExactAmount::from_decimal(dec!(100.00)).equals(dec!(100)));
+        let report = model.trial_balance(make_date(2024, 12, 31));
+        assert!(!report.exact && !report.rows[0].exact);
+        let sheet = model.balance_sheet(make_date(2024, 12, 31));
+        assert!(!sheet.exact && !sheet.assets[0].exact);
     }
 
     /// No queries: no answers, and no walk.

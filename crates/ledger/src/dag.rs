@@ -444,22 +444,6 @@ impl LedgerDag {
         &self.heads
     }
 
-    /// How many current heads carry `openledger-author == author` (T64 / H-16).
-    ///
-    /// `None` counts the heads with no author at all. One pass over the heads,
-    /// which the per-author bound this feeds keeps small; heads are always
-    /// transactions, so only a transaction's author is read.
-    pub fn heads_authored_by(&self, author: Option<&str>) -> usize {
-        self.heads
-            .iter()
-            .filter_map(|id| self.nodes.get(id))
-            .filter(|node| match &node.directive {
-                Directive::Transaction(transaction) => transaction.author() == author,
-                _ => false,
-            })
-            .count()
-    }
-
     /// Total number of directives in the G-Set.
     pub fn len(&self) -> usize {
         self.nodes.len()
@@ -509,6 +493,13 @@ impl LedgerDag {
     /// Get the child txids for a given content ID.
     pub fn children_of(&self, content_id: &str) -> Option<&[String]> {
         self.nodes.get(content_id).map(|n| n.children.as_slice())
+    }
+
+    /// Every content ID in the G-Set, in no particular order, without
+    /// allocating — for membership sweeps such as the L-13 rebuild check
+    /// (M-46), where [`Self::content_ids`]' insertion order is not needed.
+    pub fn ids(&self) -> impl Iterator<Item = &str> + '_ {
+        self.nodes.keys().map(String::as_str)
     }
 
     /// All content IDs in the G-Set.
@@ -1134,5 +1125,12 @@ mod tests {
 
         let ids = dag.content_ids();
         assert_eq!(ids.len(), 2);
+
+        // `ids()` is the same set, unordered.
+        let mut unordered: Vec<&str> = dag.ids().collect();
+        let mut ordered = ids.clone();
+        unordered.sort_unstable();
+        ordered.sort_unstable();
+        assert_eq!(unordered, ordered);
     }
 }

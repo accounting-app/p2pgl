@@ -69,11 +69,18 @@ pub struct QueryRoot;
 impl QueryRoot {
     /// Trial balance at a given date (FR-2 AC1).
     #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
-    async fn trial_balance(&self, ctx: &Context<'_>, at: DateScalar) -> TrialBalance {
+    async fn trial_balance(
+        &self,
+        ctx: &Context<'_>,
+        at: DateScalar,
+    ) -> async_graphql::Result<TrialBalance> {
         if let Ok(ledger) = ctx.data::<SharedLedger>() {
             let svc = ledger.read().await;
-            let report = svc.read_model().trial_balance(at.0);
-            TrialBalance {
+            let report = svc
+                .read_model()
+                .try_trial_balance(at.0)
+                .map_err(|error| out_of_range_error("trialBalance", error))?;
+            Ok(TrialBalance {
                 at,
                 rows: report
                     .rows
@@ -82,58 +89,52 @@ impl QueryRoot {
                         account: r.account.clone(),
                         debit: DecimalScalar(r.debit),
                         credit: DecimalScalar(r.credit),
+                        exact: r.exact,
                     })
                     .collect(),
                 total_debit: DecimalScalar(report.total_debit),
                 total_credit: DecimalScalar(report.total_credit),
-            }
+                exact: report.exact,
+            })
         } else {
-            TrialBalance {
+            Ok(TrialBalance {
                 at,
                 rows: Vec::new(),
                 total_debit: DecimalScalar(Decimal::ZERO),
                 total_credit: DecimalScalar(Decimal::ZERO),
-            }
+                exact: true,
+            })
         }
     }
 
     /// Balance sheet at a given date (FR-2 AC2).
     #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
-    async fn balance_sheet(&self, ctx: &Context<'_>, at: DateScalar) -> BalanceSheet {
+    async fn balance_sheet(
+        &self,
+        ctx: &Context<'_>,
+        at: DateScalar,
+    ) -> async_graphql::Result<BalanceSheet> {
         if let Ok(ledger) = ctx.data::<SharedLedger>() {
             let svc = ledger.read().await;
-            let report = svc.read_model().balance_sheet(at.0);
-            fn convert_balances(
-                entries: &[ledger::read_model::AccountBalanceEntry],
-            ) -> Vec<AccountBalance> {
-                entries
-                    .iter()
-                    .map(|entry| AccountBalance {
-                        account: entry.account.clone(),
-                        balances: entry
-                            .balances
-                            .iter()
-                            .map(|(currency, amount)| Amount {
-                                number: DecimalScalar(*amount),
-                                currency: currency.clone(),
-                            })
-                            .collect(),
-                    })
-                    .collect()
-            }
-            BalanceSheet {
+            let report = svc
+                .read_model()
+                .try_balance_sheet(at.0)
+                .map_err(|error| out_of_range_error("balanceSheet", error))?;
+            Ok(BalanceSheet {
                 at,
-                assets: convert_balances(&report.assets),
-                liabilities: convert_balances(&report.liabilities),
-                equity: convert_balances(&report.equity),
-            }
+                assets: account_balances_to_graphql(&report.assets),
+                liabilities: account_balances_to_graphql(&report.liabilities),
+                equity: account_balances_to_graphql(&report.equity),
+                exact: report.exact,
+            })
         } else {
-            BalanceSheet {
+            Ok(BalanceSheet {
                 at,
                 assets: Vec::new(),
                 liabilities: Vec::new(),
                 equity: Vec::new(),
-            }
+                exact: true,
+            })
         }
     }
 
@@ -144,50 +145,30 @@ impl QueryRoot {
         ctx: &Context<'_>,
         from: DateScalar,
         to: DateScalar,
-    ) -> IncomeStatement {
+    ) -> async_graphql::Result<IncomeStatement> {
         if let Ok(ledger) = ctx.data::<SharedLedger>() {
             let svc = ledger.read().await;
-            let report = svc.read_model().income_statement(from.0, to.0);
-            fn convert_entries(
-                entries: &[ledger::read_model::AccountBalanceEntry],
-            ) -> Vec<AccountBalance> {
-                entries
-                    .iter()
-                    .map(|entry| AccountBalance {
-                        account: entry.account.clone(),
-                        balances: entry
-                            .balances
-                            .iter()
-                            .map(|(currency, amount)| Amount {
-                                number: DecimalScalar(*amount),
-                                currency: currency.clone(),
-                            })
-                            .collect(),
-                    })
-                    .collect()
-            }
-            IncomeStatement {
+            let report = svc
+                .read_model()
+                .try_income_statement(from.0, to.0)
+                .map_err(|error| out_of_range_error("incomeStatement", error))?;
+            Ok(IncomeStatement {
                 from,
                 to,
-                income: convert_entries(&report.income),
-                expenses: convert_entries(&report.expenses),
-                net: report
-                    .net
-                    .iter()
-                    .map(|(currency, amount)| Amount {
-                        number: DecimalScalar(*amount),
-                        currency: currency.clone(),
-                    })
-                    .collect(),
-            }
+                income: account_balances_to_graphql(&report.income),
+                expenses: account_balances_to_graphql(&report.expenses),
+                net: amounts_to_graphql(&report.net),
+                exact: report.exact,
+            })
         } else {
-            IncomeStatement {
+            Ok(IncomeStatement {
                 from,
                 to,
                 income: Vec::new(),
                 expenses: Vec::new(),
                 net: Vec::new(),
-            }
+                exact: true,
+            })
         }
     }
 
@@ -255,24 +236,16 @@ impl QueryRoot {
         ctx: &Context<'_>,
         name: String,
         at: Option<DateScalar>,
-    ) -> Option<AccountBalance> {
+    ) -> async_graphql::Result<Option<AccountBalance>> {
         if let Ok(ledger) = ctx.data::<SharedLedger>() {
             let svc = ledger.read().await;
-            if let Some(entry) = svc.read_model().account_balance(&name, at.map(|d| d.0)) {
-                return Some(AccountBalance {
-                    account: name,
-                    balances: entry
-                        .balances
-                        .iter()
-                        .map(|(currency, amount)| Amount {
-                            number: DecimalScalar(*amount),
-                            currency: currency.clone(),
-                        })
-                        .collect(),
-                });
-            }
+            let entry = svc
+                .read_model()
+                .try_account_balance(&name, at.map(|d| d.0))
+                .map_err(|error| out_of_range_error("account", error))?;
+            return Ok(entry.as_ref().map(account_balance_to_graphql));
         }
-        None
+        Ok(None)
     }
 
     /// Verify DAG integrity and balance assertions (FR-5 AC1, §3.6).
@@ -368,6 +341,49 @@ impl QueryRoot {
     }
 }
 
+/// The error a report resolver returns for a figure no `Decimal` can hold
+/// (T76). Unreachable while every summed amount is inside the amount cap —
+/// every total then fits at scale 0 — so it is logged loudly and surfaced as
+/// a generic internal error rather than a client-facing code.
+fn out_of_range_error(
+    resolver: &'static str,
+    error: ledger::read_model::OutOfRange,
+) -> async_graphql::Error {
+    tracing::error!(
+        resolver,
+        %error,
+        "a report figure is out of range for any Decimal; this should be unreachable \
+         inside the amount cap (T76)"
+    );
+    async_graphql::Error::new("internal error")
+}
+
+/// A currency → figure map as GraphQL amounts.
+fn amounts_to_graphql(balances: &ledger::read_model::CurrencyBalances) -> Vec<Amount> {
+    balances
+        .iter()
+        .map(|(currency, amount)| Amount {
+            number: DecimalScalar(*amount),
+            currency: currency.clone(),
+        })
+        .collect()
+}
+
+/// One account's balances as their GraphQL shape.
+fn account_balance_to_graphql(entry: &ledger::read_model::AccountBalanceEntry) -> AccountBalance {
+    AccountBalance {
+        account: entry.account.clone(),
+        balances: amounts_to_graphql(&entry.balances),
+        exact: entry.exact,
+    }
+}
+
+fn account_balances_to_graphql(
+    entries: &[ledger::read_model::AccountBalanceEntry],
+) -> Vec<AccountBalance> {
+    entries.iter().map(account_balance_to_graphql).collect()
+}
+
 /// Convert the ledger's balance-assertion summary to its GraphQL shape (M-08).
 ///
 /// Only the failures carry per-assertion detail; the counts cover the rest, so
@@ -386,6 +402,7 @@ fn assertion_report(summary: &ledger::verify::BalanceAssertionSummary) -> Balanc
                 date: DateScalar(failure.date),
                 expected: DecimalScalar(failure.expected),
                 actual: DecimalScalar(failure.actual),
+                actual_exact: failure.actual_exact,
                 currency: failure.currency.clone(),
             })
             .collect(),
@@ -839,5 +856,89 @@ mod tests {
         assert_eq!(data["full"][0]["postings"].as_array().unwrap().len(), 2);
         assert_eq!(data["one"]["postings"].as_array().unwrap().len(), 2);
         assert_eq!(data["full"][0]["postings"][0]["account"], "Assets:Cash");
+    }
+
+    // ── T76: the `exact` flags ────────────────────────────────────────────
+
+    /// T76 (L-79): `exact` is exposed on every balance-carrying type and is
+    /// `false` for mixed-scale dust — `1000 + 10^-28` does not fit a
+    /// `Decimal` at scale 28, so it is reported rounded once — and `true`
+    /// beside it for an ordinary balance; a `balance` claim of the rounded
+    /// figure fails, with `actualExact: false`.
+    #[tokio::test]
+    async fn t76_exact_is_exposed_and_false_for_mixed_scale_dust() {
+        let dir = tempfile::tempdir().unwrap();
+        let bean_path = dir.path().join("test.bean");
+        std::fs::write(
+            &bean_path,
+            "2024-01-01 open Assets:Cash\n2024-01-01 open Assets:Bank\n\
+             2024-01-01 open Income:Salary\n2024-01-01 open Equity:Opening\n\
+             2024-01-02 * \"pay\"\n  Assets:Cash 1000 USD\n  Income:Salary -1000 USD\n\
+             2024-01-03 * \"dust\"\n  Assets:Cash 0.0000000000000000000000000001 USD\n  \
+             Income:Salary -0.0000000000000000000000000001 USD\n\
+             2024-01-04 * \"plain\"\n  Assets:Bank 5.00 USD\n  Equity:Opening -5.00 USD\n\
+             2024-01-05 balance Assets:Cash 1000.0000000000000000000000000 USD\n",
+        )
+        .unwrap();
+        let service =
+            ledger::service::LedgerService::boot(&bean_path, "test-node".to_owned()).unwrap();
+        let ledger: SharedLedger = std::sync::Arc::new(tokio::sync::RwLock::new(service));
+        let schema = crate::graphql::build_schema_with_service(
+            ledger,
+            crate::graphql::broadcast::TransactionBroadcast::new(),
+            p2p::node::PeerRegistry::new(),
+            std::sync::Arc::new(security::signing::NoopSignatureProvider),
+            true,
+            None,
+        );
+        let response = schema
+            .execute(
+                r#"{
+                    cash: account(name: "Assets:Cash") { balances { number } exact }
+                    bank: account(name: "Assets:Bank") { balances { number } exact }
+                    trialBalance(at: "2024-12-31") { exact rows { account exact } }
+                    balanceSheet(at: "2024-12-31") { exact assets { account exact } }
+                    incomeStatement(from: "2024-01-01", to: "2024-12-31") {
+                        exact net { number }
+                    }
+                    verify { balanceAssertions { failed failures { actual actualExact } } }
+                }"#,
+            )
+            .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let data = response.data.into_json().unwrap();
+        assert_eq!(
+            data["cash"]["balances"][0]["number"],
+            "1000.0000000000000000000000000"
+        );
+        assert_eq!(data["cash"]["exact"], false);
+        assert_eq!(data["bank"]["balances"][0]["number"], "5.00");
+        assert_eq!(data["bank"]["exact"], true);
+        assert_eq!(data["trialBalance"]["exact"], false);
+        let rows = data["trialBalance"]["rows"].as_array().unwrap();
+        let row = |account: &str| {
+            rows.iter()
+                .find(|row| row["account"] == account)
+                .unwrap_or_else(|| panic!("{account} row"))["exact"]
+                .clone()
+        };
+        assert_eq!(row("Assets:Cash"), false);
+        assert_eq!(row("Assets:Bank"), true);
+        assert_eq!(data["balanceSheet"]["exact"], false);
+        assert_eq!(data["incomeStatement"]["exact"], false);
+        assert_eq!(
+            data["incomeStatement"]["net"][0]["number"],
+            "1000.0000000000000000000000000"
+        );
+        let assertions = &data["verify"]["balanceAssertions"];
+        assert_eq!(
+            assertions["failed"], 1,
+            "the rounded figure is not the balance"
+        );
+        assert_eq!(
+            assertions["failures"][0]["actual"],
+            "1000.0000000000000000000000000"
+        );
+        assert_eq!(assertions["failures"][0]["actualExact"], false);
     }
 }

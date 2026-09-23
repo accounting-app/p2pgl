@@ -141,11 +141,24 @@ const READ_CHUNK: usize = 64 * 1024;
 /// (floor 5 s, ceiling 1 h — see `config.rs`).
 pub const SUPPLY_HEADROOM_BACKOFF: Duration = Duration::from_secs(60);
 
-/// Upper bound on [`SupplyBackoff`]'s entries. Keys are allowlisted peers (the
-/// only ones whose `Supply` is ever applied), so this is never reached by an
-/// honest configuration; it exists so that the map is bounded by construction
-/// rather than by the allowlist's size.
+/// Upper bound on [`SupplyBackoff`]'s per-peer entries (each of its maps).
+/// Keys are allowlisted peers (the only ones whose `Supply` is ever applied),
+/// so this is never reached by an honest configuration; it exists so that the
+/// maps are bounded by construction rather than by the allowlist's size.
 const SUPPLY_BACKOFF_MAX_PEERS: usize = 4_096;
+
+/// Upper bound on ratchet-deferred ids remembered per peer (T72 / L-69).
+///
+/// The audit's measured shape was 4,096 manufactured refusals per hostile
+/// peer; at one 64-hex id plus a `u64` each this is ~400 KiB per peer at the
+/// cap, and past it a peer's further refusals are simply re-fetched as before
+/// (bounded degradation, no eviction of what is already known).
+const RATCHET_DEFERRED_MAX_IDS_PER_PEER: usize = 4_096;
+
+/// One "rejected remote directive" warn line per peer per this interval
+/// (T72 / L-69) — the M-40 rule (`ConnectionLimiter::should_log_refusal`)
+/// applied to stage refusals, which a peer can manufacture at will.
+const STAGE_REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Transient, per-peer "do not apply this peer's `Supply` yet" (M-39, T69).
 ///
@@ -163,15 +176,152 @@ const SUPPLY_BACKOFF_MAX_PEERS: usize = 4_096;
 /// entry in the refusal cache is a verdict on an id; this is a verdict on the
 /// ledger's current size, so it is keyed by peer, expires on its own, and
 /// records no id.
+///
+/// # Two more per-peer deferrals live here (T72 / L-69)
+///
+/// Same shape — transient, per peer, not a verdict on the directive — so they
+/// share the type rather than adding fields to [`AntiEntropyHandler`]:
+///
+/// * **The ratchet short-circuit** ([`Self::defer_ratcheted`],
+///   [`Self::retain_not_ratcheted`]). `ServiceError::LamportAdvance` is
+///   state-dependent, so the L-34 cache must not hold it — but it is a pure
+///   function of `(remote lamport, local clock)`: refused iff `remote − local
+///   ≥ MAX_LAMPORT_ADVANCE`, and the local clock only rises. So the verdict
+///   for an id this peer served cannot change until the clock reaches
+///   `remote − MAX_LAMPORT_ADVANCE + 1`, and until then re-Wanting it buys
+///   nothing but the fetch, parse, verify and validate it cost the first time
+///   (the audit measured 32 × 1 MiB manufactured refusals at 2.73 s per tick
+///   plus 30 MiB of transfer, per hostile peer, indefinitely). Each refused id
+///   is remembered with that clock threshold and dropped from the Want while
+///   the clock is below it. This is exact, not a heuristic: a node climbing
+///   through a history re-Wants each id on the first tick at which it can be
+///   adopted. Keyed by peer for the L-34 reason (a different peer's copy can
+///   carry a different envelope).
+/// * **The stage-refusal warn throttle** ([`Self::should_log_stage_refusal`]).
+///   One line per peer per [`STAGE_REFUSAL_LOG_INTERVAL`], carrying the count
+///   suppressed since the last — the M-40 rule, since a peer can manufacture
+///   refusals as fast as it can serve them.
 #[derive(Clone, Debug, Default)]
 pub struct SupplyBackoff {
     until: Arc<std::sync::Mutex<std::collections::HashMap<EndpointId, std::time::Instant>>>,
+    /// L-69: per peer, id → the local clock at which the ratchet verdict can
+    /// change (`remote − MAX_LAMPORT_ADVANCE + 1`).
+    ratcheted: Arc<std::sync::Mutex<std::collections::HashMap<EndpointId, RatchetDeferred>>>,
+    /// L-69: per peer, the stage-refusal warn throttle.
+    refusal_log: Arc<std::sync::Mutex<std::collections::HashMap<EndpointId, StageRefusalLog>>>,
+}
+
+/// Per-peer state behind [`SupplyBackoff::defer_ratcheted`].
+type RatchetDeferred = std::collections::HashMap<String, u64>;
+
+/// Per-peer state behind [`SupplyBackoff::should_log_stage_refusal`].
+#[derive(Debug, Default)]
+struct StageRefusalLog {
+    last_logged: Option<std::time::Instant>,
+    suppressed: u64,
 }
 
 impl SupplyBackoff {
     /// Whether `peer`'s `Supply` is currently deferred.
     pub fn is_active(&self, peer: EndpointId, now: std::time::Instant) -> bool {
         self.lock().get(&peer).is_some_and(|until| *until > now)
+    }
+
+    /// Remember that `peer`'s copy of `id` was refused by the adoption ratchet
+    /// against `remote_lamport` (T72 / L-69): it is not worth re-Wanting until
+    /// the local clock reaches `remote_lamport − MAX_LAMPORT_ADVANCE + 1`.
+    ///
+    /// Exact by construction: adoption refuses iff `remote − local ≥
+    /// MAX_LAMPORT_ADVANCE` (`ledger::service::check_lamport_advance`), so the
+    /// first clock at which it can succeed is that threshold. Bounded per peer
+    /// by [`RATCHET_DEFERRED_MAX_IDS_PER_PEER`] and across peers by
+    /// [`SUPPLY_BACKOFF_MAX_PEERS`]; at either cap nothing is recorded, which
+    /// only costs the re-fetch this exists to avoid.
+    pub fn defer_ratcheted(&self, peer: EndpointId, id: String, remote_lamport: u64) {
+        let acceptable_at = remote_lamport
+            .saturating_sub(ledger::service::MAX_LAMPORT_ADVANCE)
+            .saturating_add(1);
+        let mut peers = self.lock_ratcheted();
+        if peers.len() >= SUPPLY_BACKOFF_MAX_PEERS && !peers.contains_key(&peer) {
+            return;
+        }
+        let deferred = peers.entry(peer).or_default();
+        if deferred.len() >= RATCHET_DEFERRED_MAX_IDS_PER_PEER && !deferred.contains_key(&id) {
+            return;
+        }
+        deferred.insert(id, acceptable_at);
+    }
+
+    /// Drop from `want` every id whose ratchet refusal from `peer` cannot yet
+    /// have changed at `local_clock` (T72 / L-69), returning how many were
+    /// dropped. Entries the clock has reached are forgotten here, so an id
+    /// becomes Wantable on the first tick at which it is adoptable.
+    pub fn retain_not_ratcheted(
+        &self,
+        peer: EndpointId,
+        want: &mut Vec<String>,
+        local_clock: u64,
+    ) -> usize {
+        let mut peers = self.lock_ratcheted();
+        let Some(deferred) = peers.get_mut(&peer) else {
+            return 0;
+        };
+        deferred.retain(|_, acceptable_at| *acceptable_at > local_clock);
+        if deferred.is_empty() {
+            peers.remove(&peer);
+            return 0;
+        }
+        let before = want.len();
+        want.retain(|id| !deferred.contains_key(id));
+        before - want.len()
+    }
+
+    /// How many ids `peer`'s ratchet short-circuit currently holds (tests).
+    #[cfg(test)]
+    fn ratcheted_count(&self, peer: EndpointId) -> usize {
+        self.lock_ratcheted()
+            .get(&peer)
+            .map_or(0, |deferred| deferred.len())
+    }
+
+    /// Whether a stage refusal from `peer` happening at `now` should be logged
+    /// (T72 / L-69), and if so how many were swallowed since the last logged
+    /// one. One line per peer per [`STAGE_REFUSAL_LOG_INTERVAL`].
+    pub fn should_log_stage_refusal(
+        &self,
+        peer: EndpointId,
+        now: std::time::Instant,
+    ) -> Option<u64> {
+        let mut logs = self
+            .refusal_log
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if logs.len() >= SUPPLY_BACKOFF_MAX_PEERS && !logs.contains_key(&peer) {
+            // Unreachable with any real allowlist; an unthrottled peer at the
+            // cap is one line per refusal, which is what M-40 accepted before.
+            return Some(0);
+        }
+        let log = logs.entry(peer).or_default();
+        match log.last_logged {
+            Some(previous)
+                if now.saturating_duration_since(previous) < STAGE_REFUSAL_LOG_INTERVAL =>
+            {
+                log.suppressed = log.suppressed.saturating_add(1);
+                None
+            }
+            _ => {
+                log.last_logged = Some(now);
+                Some(std::mem::take(&mut log.suppressed))
+            }
+        }
+    }
+
+    fn lock_ratcheted(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<EndpointId, RatchetDeferred>> {
+        self.ratcheted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Defer `peer`'s `Supply` for `backoff` from `now` — the handler's
@@ -1077,12 +1227,15 @@ async fn run_head_exchange(
     // a remote head is now checked against the whole DAG rather than our
     // heads alone (the T59 note), so a head we hold as an interior directive
     // is no longer re-wanted.
-    let mut want = {
+    let (mut want, local_clock) = {
         let svc = handler.ledger.read().await;
-        p2p::anti_entropy::compute_want_by_membership(
-            |id| svc.contains_directive(id),
-            &head_txids,
-            &directive_ids,
+        (
+            p2p::anti_entropy::compute_want_by_membership(
+                |id| svc.contains_directive(id),
+                &head_txids,
+                &directive_ids,
+            ),
+            svc.lamport_clock(),
         )
     };
     // L-34: `compute_want` only diffs, so a directive this peer serves that we
@@ -1095,6 +1248,15 @@ async fn run_head_exchange(
     );
     if suppressed > 0 {
         debug!(peer = %remote, suppressed, "not re-wanting directives this peer served that were refused for good");
+    }
+    // T72 / L-69: likewise for ids the adoption ratchet refused, while the
+    // clock read above has not reached the point where that verdict can
+    // change. Read under the same guard as the diff, so the two agree.
+    let ratcheted = handler
+        .supply_backoff
+        .retain_not_ratcheted(remote, &mut want, local_clock);
+    if ratcheted > 0 {
+        debug!(peer = %remote, ratcheted, local_clock, "not re-wanting directives this peer served that the adoption ratchet refused at this clock");
     }
     for chunk in want.chunks(MAX_SUPPLY_ENTRIES) {
         fetch_want_chunk(send, recv, chunk, handler, remote, budget).await?;
@@ -1515,6 +1677,9 @@ async fn apply_supply_entries_from(
     // neither is recorded at all for a pushed batch — see `SupplyOrigin`.
     let mut intake_refused: Vec<String> = Vec::new();
     let mut stage_refused: Vec<(String, String)> = Vec::new();
+    // T72 / L-69: `(id, remote lamport)` of every entry the adoption ratchet
+    // refused, for the per-peer short-circuit — see `SupplyBackoff`.
+    let mut ratcheted: Vec<(String, u64)> = Vec::new();
     let mut batch_durable = true;
 
     // ── Phase 1: validate off the ledger write lock (M-15) ──────────────
@@ -1595,6 +1760,7 @@ async fn apply_supply_entries_from(
             remote,
             &mut outcome,
             &mut stage_refused,
+            &mut ratcheted,
         )
         .await;
     }
@@ -1614,6 +1780,15 @@ async fn apply_supply_entries_from(
     if origin == SupplyOrigin::Pushed {
         intake_refused.clear();
         stage_refused.clear();
+        ratcheted.clear();
+    }
+    // T72 / L-69: a ratchet verdict survives a rolled-back batch — the reload
+    // can only lower the clock, and the verdict is monotone in it — so it is
+    // recorded whether or not the batch was durable.
+    for (id, remote_lamport) in ratcheted {
+        handler
+            .supply_backoff
+            .defer_ratcheted(remote, id, remote_lamport);
     }
     if !intake_refused.is_empty() || !stage_refused.is_empty() {
         let now = std::time::Instant::now();
@@ -1659,6 +1834,7 @@ async fn stage_and_commit_batch(
     remote: EndpointId,
     outcome: &mut SupplyOutcome,
     stage_refused: &mut Vec<(String, String)>,
+    ratcheted: &mut Vec<(String, u64)>,
 ) -> bool {
     let from_peer = remote.to_string();
     let permit = crate::ledger_commit::acquire_write_permit(&handler.ledger).await;
@@ -1770,8 +1946,23 @@ async fn stage_and_commit_batch(
                         outcome.buffered += 1;
                     }
                     None => {
-                        warn!(error = %log_error(&error), peer = %remote, "rejected remote directive from ALPN");
+                        // T72 / L-69: one line per peer per interval; the
+                        // rest are counted and reported on the next line.
+                        match handler
+                            .supply_backoff
+                            .should_log_stage_refusal(remote, std::time::Instant::now())
+                        {
+                            Some(suppressed) => {
+                                warn!(error = %log_error(&error), peer = %remote, suppressed, "rejected remote directive from ALPN");
+                            }
+                            None => {
+                                debug!(error = %log_error(&error), peer = %remote, "rejected remote directive from ALPN (warn throttled)");
+                            }
+                        }
                         outcome.rejected += 1;
+                        if let ServiceError::LamportAdvance { remote, .. } = &error {
+                            ratcheted.push((content_id.clone(), *remote));
+                        }
                         if stage_refusal_is_permanent(&error) {
                             stage_refused.push((from_peer.clone(), content_id));
                         }
@@ -1785,7 +1976,7 @@ async fn stage_and_commit_batch(
         // Drain orphans this batch unblocked, then persist ONCE for the whole
         // batch plus the drained orphans (M-15). `drain_orphans` stages
         // (no persist), so this single commit covers everything.
-        let drain_refused = drain_orphans(
+        let drained = drain_orphans(
             &handler.orphan_buffer,
             &mut svc,
             &handler.broadcast,
@@ -1794,7 +1985,17 @@ async fn stage_and_commit_batch(
             &handler.mesh_id,
         )
         .await;
-        stage_refused.extend(drain_refused);
+        stage_refused.extend(drained.permanent);
+        // T72 / L-69: a freed orphan the ratchet refused is dropped from the
+        // buffer and would be re-Wanted by membership next tick; only the
+        // ones this peer delivered are this peer's to short-circuit.
+        ratcheted.extend(
+            drained
+                .ratcheted
+                .into_iter()
+                .filter(|(peer, _, _)| *peer == from_peer)
+                .map(|(_, id, remote_lamport)| (id, remote_lamport)),
+        );
         // T44: prepare under the lock, commit off it. For a catch-up batch
         // on a ledger past the compaction threshold this is a single
         // journal record for the whole batch — O(batch), not O(ledger) —
@@ -1897,9 +2098,13 @@ fn intake_refusal_is_permanent(error: &MergeError) -> bool {
 /// * `LamportAdvance` (T63 / H-12, the adoption ratchet) — judged against this
 ///   node's clock, which rises as the intervening history arrives; caching it
 ///   would stop a node that is catching up from ever adopting the top of the
-///   history it is climbing toward;
-/// * `UnmergedHeadLimit` (T64 / H-16) — judged against the author's current
-///   heads here, which the next local append merges;
+///   history it is climbing toward. It is not re-fetched pointlessly either:
+///   the verdict is a pure function of `(remote, local clock)`, so
+///   [`SupplyBackoff::defer_ratcheted`] holds the id out of the Want exactly
+///   until the clock can change it (T72 / L-69);
+/// * there is no per-author head bound any more — T64's `UnmergedHeadLimit`
+///   was judged against this replica's heads and made DAG membership depend
+///   on delivery order (T72 / H-21);
 /// * `Io`, `Journal`, `CommitInFlight`, `Parse` — transient or not a verdict on
 ///   the directive at all.
 ///
@@ -1931,7 +2136,6 @@ fn stage_refusal_is_permanent(error: &ServiceError) -> bool {
         | ServiceError::Dag(_)
         | ServiceError::LamportCeiling { .. }
         | ServiceError::LamportAdvance { .. }
-        | ServiceError::UnmergedHeadLimit { .. }
         | ServiceError::Io(_)
         | ServiceError::Journal { .. }
         | ServiceError::CommitInFlight
@@ -1978,6 +2182,10 @@ enum Restaged {
     Dropped,
     /// Not in the buffer and not in the DAG, refused for good (L-34).
     Refused,
+    /// Not in the buffer and not in the DAG, refused by the adoption ratchet
+    /// against this remote lamport — re-fetching it is pointless until the
+    /// clock reaches it (T72 / L-69). Otherwise as `Dropped`.
+    Ratcheted { remote_lamport: u64 },
 }
 
 /// Re-validate one freed orphan and stage it.
@@ -2017,6 +2225,11 @@ fn restage_freed_entry(
         Err(error) => {
             let Some(account) = account_wait_target(&error) else {
                 warn!(error = %log_error(&error), "rejected resolved orphan directive");
+                if let ServiceError::LamportAdvance { remote, .. } = &error {
+                    return Restaged::Ratcheted {
+                        remote_lamport: *remote,
+                    };
+                }
                 return refused_if_permanent(stage_refusal_is_permanent(&error));
             };
             match buffer.insert_awaiting_accounts(
@@ -2064,9 +2277,10 @@ fn refused_if_permanent(permanent: bool) -> Restaged {
 /// per (entry, account) pair.
 ///
 /// Returns the `(delivering peer, id)` of every freed entry that was then
-/// refused for good (L-34), for the caller to record once the batch is durable.
-/// An entry buffered without a known peer is not returned: the refusal cache is
-/// keyed by peer.
+/// refused for good (L-34), for the caller to record once the batch is durable,
+/// and the `(delivering peer, id, remote lamport)` of every one the adoption
+/// ratchet refused (T72 / L-69). An entry buffered without a known peer is not
+/// returned: both records are keyed by peer.
 pub async fn drain_orphans(
     orphan_buffer: &Arc<RwLock<OrphanBuffer>>,
     service: &mut ledger::service::LedgerService,
@@ -2074,7 +2288,7 @@ pub async fn drain_orphans(
     signing_enabled: bool,
     allowlist: &PeerAllowlist,
     mesh_id: &str,
-) -> Vec<(String, String)> {
+) -> DrainRefusals {
     let context = DrainContext {
         broadcast,
         signing_enabled,
@@ -2088,7 +2302,7 @@ pub async fn drain_orphans(
     // it is staged.
     let mut buffer = orphan_buffer.write().await;
     let mut attempted: HashSet<(String, String)> = HashSet::new();
-    let mut refused: Vec<(String, String)> = Vec::new();
+    let mut refused = DrainRefusals::default();
     let mut resolved_any = true;
     while resolved_any {
         resolved_any = false;
@@ -2124,15 +2338,31 @@ pub async fn drain_orphans(
     refused
 }
 
-/// Collect a drained entry that was refused for good (L-34).
+/// What [`drain_orphans`] reports back for the caller's per-peer records.
+#[derive(Debug, Default)]
+pub struct DrainRefusals {
+    /// `(delivering peer, id)` refused for good (L-34).
+    pub permanent: Vec<(String, String)>,
+    /// `(delivering peer, id, remote lamport)` refused by the ratchet (L-69).
+    pub ratcheted: Vec<(String, String, u64)>,
+}
+
+/// Collect a drained entry that was refused for good (L-34) or by the
+/// adoption ratchet (L-69).
 fn note_drain_refusal(
     outcome: &Restaged,
     from_peer: Option<String>,
     entry_id: &str,
-    refused: &mut Vec<(String, String)>,
+    refused: &mut DrainRefusals,
 ) {
-    if let (Restaged::Refused, Some(peer)) = (outcome, from_peer) {
-        refused.push((peer, entry_id.to_owned()));
+    match (outcome, from_peer) {
+        (Restaged::Refused, Some(peer)) => refused.permanent.push((peer, entry_id.to_owned())),
+        (Restaged::Ratcheted { remote_lamport }, Some(peer)) => {
+            refused
+                .ratcheted
+                .push((peer, entry_id.to_owned(), *remote_lamport));
+        }
+        _ => {}
     }
 }
 
@@ -2148,7 +2378,7 @@ fn made_progress(
         // different unmet dependency — worth one more pass. A pair already seen
         // means the entry is going in circles, and does not.
         Restaged::Rebuffered { account } => attempted.insert((entry_id, account)),
-        Restaged::Dropped | Restaged::Refused => false,
+        Restaged::Dropped | Restaged::Refused | Restaged::Ratcheted { .. } => false,
     }
 }
 
@@ -2427,12 +2657,10 @@ pub(crate) mod tests {
     /// import, and so no test module owns the lock the others depend on.
     pub(crate) use crate::test_support::NET_TEST_LOCK;
 
-    /// T63 / T64 (H-12, H-16): the two new refusals are judged against THIS
-    /// node's state — its clock, the author's current heads — so the L-34
-    /// refusal cache must not keep them. Caching the ratchet's refusal would
-    /// stop a node that is climbing through a history from ever adopting its
-    /// top; caching the head bound would suppress a transaction that the next
-    /// local append makes admissible.
+    /// T63 (H-12): the ratchet's refusal is judged against THIS node's clock,
+    /// so the L-34 refusal cache must not keep it — caching it would stop a
+    /// node that is climbing through a history from ever adopting its top.
+    /// (T64's head bound, once listed here too, is gone: T72 / H-21.)
     #[test]
     fn test_state_dependent_stage_refusals_are_not_cached() {
         for error in [
@@ -2440,10 +2668,6 @@ pub(crate) mod tests {
                 remote: 1 << 40,
                 local: 0,
                 author: Some("peer".to_owned()),
-            },
-            ServiceError::UnmergedHeadLimit {
-                author: Some("peer".to_owned()),
-                heads: 256,
             },
             ServiceError::LamportCeiling {
                 next: ledger::service::LAMPORT_CEILING,
@@ -6424,6 +6648,228 @@ pub(crate) mod tests {
         let buffer = handler.orphan_buffer.read().await;
         assert!(buffer.is_empty(), "nothing is left waiting");
         assert_eq!(buffer.refusals().len(), 2);
+    }
+
+    // ─── T72 / L-69: the ratchet short-circuit and the refusal warn throttle ──
+
+    /// The unit: an id refused against `remote` is held out of the Want while
+    /// the clock is below `remote − MAX_LAMPORT_ADVANCE + 1`, is released on
+    /// exactly that clock (the first at which adoption succeeds), is keyed by
+    /// peer, and is bounded per peer.
+    #[test]
+    fn ratchet_deferral_holds_an_id_exactly_until_the_clock_can_adopt_it() {
+        let backoff = SupplyBackoff::default();
+        let peer = iroh::SecretKey::generate().public();
+        let other = iroh::SecretKey::generate().public();
+        let id = format!("{:064x}", 0x1u64);
+        let remote = ledger::service::MAX_LAMPORT_ADVANCE + 10;
+        // Refused at local clock 5 (remote − local = 2^32 + 5 ≥ 2^32).
+        backoff.defer_ratcheted(peer, id.clone(), remote);
+
+        let want_at = |clock: u64, who: EndpointId| {
+            let mut want = vec![id.clone()];
+            let dropped = backoff.retain_not_ratcheted(who, &mut want, clock);
+            (dropped, want.len())
+        };
+        assert_eq!(want_at(5, peer), (1, 0), "held at the refusing clock");
+        assert_eq!(
+            want_at(10, peer),
+            (1, 0),
+            "held at remote − 2^32: still refused"
+        );
+        assert_eq!(want_at(5, other), (0, 1), "keyed by peer");
+        // At clock 11, remote − local = 2^32 − 1 < 2^32: adoptable, so wanted.
+        assert_eq!(
+            want_at(11, peer),
+            (0, 1),
+            "released on the first adoptable clock"
+        );
+        assert_eq!(backoff.ratcheted_count(peer), 0, "and forgotten");
+        assert_eq!(want_at(5, peer), (0, 1), "not re-held once forgotten");
+
+        // Bounded per peer: the cap stops recording, never evicts.
+        for n in 0..(RATCHET_DEFERRED_MAX_IDS_PER_PEER + 5) {
+            backoff.defer_ratcheted(peer, format!("{n:064x}"), remote);
+        }
+        assert_eq!(
+            backoff.ratcheted_count(peer),
+            RATCHET_DEFERRED_MAX_IDS_PER_PEER
+        );
+        let mut want = vec![format!("{:064x}", RATCHET_DEFERRED_MAX_IDS_PER_PEER + 1)];
+        assert_eq!(backoff.retain_not_ratcheted(peer, &mut want, 5), 0);
+    }
+
+    /// The throttle: one line per peer per `STAGE_REFUSAL_LOG_INTERVAL`, the
+    /// next line carrying the suppressed count; peers are independent.
+    #[test]
+    fn stage_refusal_warn_is_one_line_per_peer_per_interval_with_a_count() {
+        let backoff = SupplyBackoff::default();
+        let peer = iroh::SecretKey::generate().public();
+        let other = iroh::SecretKey::generate().public();
+        let start = std::time::Instant::now();
+        assert_eq!(backoff.should_log_stage_refusal(peer, start), Some(0));
+        for i in 1..=5 {
+            assert_eq!(
+                backoff.should_log_stage_refusal(peer, start + Duration::from_secs(i)),
+                None,
+                "inside the interval"
+            );
+        }
+        assert_eq!(
+            backoff.should_log_stage_refusal(other, start + Duration::from_secs(3)),
+            Some(0),
+            "another peer has its own line"
+        );
+        assert_eq!(
+            backoff.should_log_stage_refusal(peer, start + STAGE_REFUSAL_LOG_INTERVAL),
+            Some(5),
+            "the next line carries the suppressed count"
+        );
+        assert_eq!(
+            backoff.should_log_stage_refusal(peer, start + 2 * STAGE_REFUSAL_LOG_INTERVAL),
+            Some(0)
+        );
+    }
+
+    /// The property, end to end (the audit's L-69 shape): a peer advertising
+    /// a directive `2^32` above this node's clock is asked for it ONCE; the
+    /// following exchanges do not re-fetch it while the clock has not moved,
+    /// and it is still not in the L-34 cache (the verdict is not permanent).
+    /// Then the history the node needs arrives from the same peer, the clock
+    /// climbs, and the same id is Wanted and adopted — the short-circuit
+    /// never turns a delay into a loss.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ratchet_refused_directive_is_wanted_once_until_the_clock_moves() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_source = bind_direct_endpoint().await;
+        let endpoint_sink = bind_direct_endpoint().await;
+        let author = iroh::SecretKey::generate().public();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let fixture = refusal_fixture(
+            temp_dir.path(),
+            &author.to_string(),
+            &[endpoint_source.id().to_string()],
+        );
+        let handler_sink = refusal_sink(temp_dir.path(), &fixture).await;
+        let seeded = &fixture.seeded;
+        let local = handler_sink.ledger.read().await.lamport_clock();
+
+        // The jump: the source's `open_food`, re-enveloped one ratchet step
+        // above the sink's clock (signing is off in this harness, so the
+        // envelope needs no signature; the author is allowlisted).
+        let jump_lamport = local + ledger::service::MAX_LAMPORT_ADVANCE;
+        let mut jump = seeded
+            .source
+            .get_directive(&seeded.open_food)
+            .expect("open food")
+            .clone();
+        let ledger::model::Directive::Open(open) = &mut jump else {
+            panic!("open_food is an open")
+        };
+        open.metadata
+            .insert("openledger-lamport".to_owned(), jump_lamport.to_string());
+        let jump_entry = make_supply_entry(&jump);
+        // A bridge the sink can adopt, at exactly the largest legal step, so
+        // that once it lands the jump is within reach.
+        let mut bridge = seeded
+            .source
+            .get_directive(&seeded.open_equity)
+            .expect("open equity")
+            .clone();
+        let ledger::model::Directive::Open(open) = &mut bridge else {
+            panic!("open_equity is an open")
+        };
+        open.account = "Assets:Bridge".to_owned();
+        open.metadata.insert(
+            "openledger-lamport".to_owned(),
+            (local + ledger::service::MAX_LAMPORT_ADVANCE - 1).to_string(),
+        );
+        let bridge_entry = make_supply_entry(&bridge);
+
+        let source = RecordingSource {
+            entries: Arc::new(std::sync::Mutex::new(vec![jump_entry.clone()])),
+            wanted: Arc::new(std::sync::Mutex::new(Vec::new())),
+            unsolicited: Vec::new(),
+        };
+        let router_source = Router::builder(endpoint_source.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, source.clone())
+            .spawn();
+        wait_until_dialable(&endpoint_source).await;
+        wait_until_dialable(&endpoint_sink).await;
+        let times_wanted = |id: &str| {
+            source
+                .wanted
+                .lock()
+                .expect("wanted")
+                .iter()
+                .filter(|wanted| wanted.as_str() == id)
+                .count()
+        };
+
+        for _ in 0..3 {
+            exchange_with_peer(&endpoint_sink, endpoint_source.addr(), &handler_sink).await;
+        }
+        assert_eq!(
+            times_wanted(&jump_entry.id),
+            1,
+            "L-69: a ratchet-refused directive is fetched once while the clock has not moved"
+        );
+        {
+            let svc = handler_sink.ledger.read().await;
+            assert!(svc.get_directive(&jump_entry.id).is_none());
+            assert_eq!(svc.lamport_clock(), local, "the refusal moved nothing");
+        }
+        assert_eq!(
+            handler_sink.orphan_buffer.read().await.refusals().len(),
+            0,
+            "not a permanent verdict: the L-34 cache holds nothing"
+        );
+        assert_eq!(
+            handler_sink
+                .supply_backoff
+                .ratcheted_count(endpoint_source.id()),
+            1
+        );
+
+        // The bridge appears; the clock climbs; the jump is Wanted again and
+        // adopted on the very next exchange.
+        source
+            .entries
+            .lock()
+            .expect("entries")
+            .push(bridge_entry.clone());
+        exchange_with_peer(&endpoint_sink, endpoint_source.addr(), &handler_sink).await;
+        {
+            let svc = handler_sink.ledger.read().await;
+            assert!(
+                svc.get_directive(&bridge_entry.id).is_some(),
+                "the bridge landed"
+            );
+            assert!(
+                svc.lamport_clock() > jump_lamport - ledger::service::MAX_LAMPORT_ADVANCE,
+                "the clock is now within one step of the jump"
+            );
+        }
+        exchange_with_peer(&endpoint_sink, endpoint_source.addr(), &handler_sink).await;
+        let _ = router_source.shutdown().await;
+        assert!(
+            times_wanted(&jump_entry.id) >= 2,
+            "re-Wanted once the clock could adopt it: {}",
+            times_wanted(&jump_entry.id)
+        );
+        let svc = handler_sink.ledger.read().await;
+        assert!(
+            svc.get_directive(&jump_entry.id).is_some(),
+            "the short-circuit delayed nothing the node could adopt"
+        );
+        assert_eq!(
+            handler_sink
+                .supply_backoff
+                .ratcheted_count(endpoint_source.id()),
+            0,
+            "forgotten once the clock reached it"
+        );
     }
 
     /// T66 / L-60 (unit): the wanted-set filter keeps exactly the entries whose

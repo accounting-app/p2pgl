@@ -21,6 +21,8 @@ covers only what is open: seven new Highs, eleven new Mediums, twelve new Lows, 
 > one path, not around patching six symptoms. Every task keeps the campaign's rule: revert the fix → the
 > named test fails → restore; residuals go in this file, not in code comments.
 
+> **Superseded 2026-09-23:** the T63 residual "a mesh already holding a single >2^32 jump cannot be joined until that directive is removed" and the T64 residual "costs frontier size only, capped per author" were found wrong by the 0923 audit (H-19, H-21); the per-author head bound is removed and joins across a jump use the bootstrap procedure — see [OUTSTANDING_TASKS_09_23.md](OUTSTANDING_TASKS_09_23.md) T72.
+
 > **Decisions taken 2026-09-22** (user), recorded once here and referenced from the tasks: work lands in
 > the tree uncommitted; the H-12 ratchet is **in scope** (2^32 per-directive advance); envelope-less file
 > records are **adopted and signed at boot**; the remote per-author unmerged-head bound is **in scope**

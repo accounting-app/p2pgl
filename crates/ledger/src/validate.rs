@@ -109,69 +109,29 @@ impl ValidationError {
     }
 }
 
-// ─── Amount magnitude cap (H-17) ─────────────────────────────────────────────
+// ─── Amount magnitude cap (H-17, T76) ────────────────────────────────────────
 
-/// The most significant digits any amount the ledger stores may carry (H-17).
-///
-/// Counted on the amount's *mantissa* — the unscaled integer `m` of
-/// `m × 10^-scale` — so trailing zeros count: `100.00` has five, `1.50` three.
-/// See [`MAX_AMOUNT_MANTISSA`] for what the bound buys and why it is 21.
-pub const MAX_AMOUNT_SIGNIFICANT_DIGITS: u32 = 21;
+use crate::limits::MAX_AMOUNT_MAGNITUDE;
 
-/// The largest `|mantissa|` an amount may carry: `10^21 − 1` (H-17).
+/// Whether `number` is inside the amount cap: `|number| ≤`
+/// [`MAX_AMOUNT_MAGNITUDE`] (`10^21`), at any precision (T76).
 ///
-/// # Why a cap at all
-///
-/// `Decimal` addition is exact only while the result's mantissa fits 96 bits;
-/// past that, `checked_add` does not fail — at any scale above zero it
-/// silently drops a digit and rounds (and at scale 0 it returns `None`, which
-/// the read model used to answer with `saturating_add`). Neither is
-/// associative, so a balance folded in one order differed from the same
-/// balance folded in another: two ~120-byte `±Decimal::MAX` directives from a
-/// peer zeroed an honest account's live balance on a chosen replica while
-/// `verify`'s date-ordered sweep still passed (H-17, B6
-/// `saturating_sums_are_order_dependent`). Capping every stored amount makes
-/// every sum the read model forms exact, and an exact sum is the same in every
-/// order.
-///
-/// # Why 21 digits
-///
-/// The read model sums postings per `(account, currency)` in one exact
-/// partial sum **per scale** (`read_model::ExactSum`), so the bound that
-/// matters is `N × MAX_AMOUNT_MANTISSA < 2^96`, where `N` is the most postings
-/// one partial can ever hold. Every posting occupies at least one byte of a
-/// ledger capped at 64 MiB = 2^26 bytes, so `N ≤ 2^26 = 67,108,864`, and
-///
-/// ```text
-/// 2^26 × (10^21 − 1) ≈ 6.71 × 10^28  <  2^96 − 1 ≈ 7.92 × 10^28
-/// ```
-///
-/// The one-byte bound is deliberately crude: a real posting line with an
-/// amount is at least 15 bytes (`" Assets:X 1 AB\n"`), so even the M-35 boot
-/// worst case — a 64 MiB canonical file plus a 64 MiB journal of distinct
-/// records — holds under 9 × 10^6 postings, 8× inside the bound. 22 digits
-/// (the audit's `~10^22`) would fit 64 MiB of 15-byte postings with 1.8× to
-/// spare but not that worst case; 21 fits every case with the trivial argument
-/// alone and still admits `9,999,999,999,999.99999999` or
-/// `999,999,999,999,999,999,999` in a single posting.
-///
-/// # Why no scale bound
-///
-/// Mixing scales is the other non-associativity (`10^20 + 10^-8` needs 29
-/// digits). It is neutralised by keeping one partial per scale rather than by
-/// refusing fine scales: a unit × rate product legitimately lands at scale 10+
-/// (`0.12345678 BTC @ 45123.45 USD` resolves its elided USD leg at scale 10),
-/// so a scale cap would make ordinary purchases unrecordable and quarantine
-/// history that already holds them. Combining the per-scale partials happens
-/// in one fixed order at read time, so it is deterministic by construction.
-pub const MAX_AMOUNT_MANTISSA: u128 = 999_999_999_999_999_999_999;
-
-/// Whether `number` is inside the H-17 amount cap ([`MAX_AMOUNT_MANTISSA`]).
+/// Compared exactly on the integers: `|mantissa| ≤ 10^21 × 10^scale`. From
+/// scale 8 on, `10^(21 + scale)` exceeds every mantissa a `Decimal` can hold,
+/// so every such amount is inside the cap.
 pub fn amount_within_cap(number: Decimal) -> bool {
-    number.mantissa().unsigned_abs() <= MAX_AMOUNT_MANTISSA
+    let magnitude = number.mantissa().unsigned_abs();
+    match 10u128.checked_pow(number.scale()) {
+        Some(unit) => match MAX_AMOUNT_MAGNITUDE.checked_mul(unit) {
+            Some(bound) => magnitude <= bound,
+            // `10^(21 + scale)` past `u128` is past every mantissa too.
+            None => true,
+        },
+        None => true,
+    }
 }
 
-/// An amount outside the H-17 cap, naming which amount it was.
+/// An amount outside the cap, naming which amount it was.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AmountCapError {
     /// Which amount: `"posting amount"`, `"cost"`, `"unit price"`, ….
@@ -184,9 +144,8 @@ impl std::fmt::Display for AmountCapError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} {} exceeds the amount cap of {MAX_AMOUNT_SIGNIFICANT_DIGITS} significant \
-             digits (trailing zeros count); balances over larger amounts cannot be kept \
-             exact (H-17)",
+            "{} {} exceeds the amount cap: an amount that is summed into a balance must \
+             have magnitude at most {MAX_AMOUNT_MAGNITUDE} (10^21) (H-17, M-50)",
             self.label, self.number
         )
     }
@@ -194,7 +153,7 @@ impl std::fmt::Display for AmountCapError {
 
 impl std::error::Error for AmountCapError {}
 
-/// Refuse `number` if it is outside the H-17 amount cap.
+/// Refuse `number` if it is outside the amount cap.
 pub fn check_amount_cap(label: &'static str, number: Decimal) -> Result<(), AmountCapError> {
     if amount_within_cap(number) {
         Ok(())
@@ -203,7 +162,8 @@ pub fn check_amount_cap(label: &'static str, number: Decimal) -> Result<(), Amou
     }
 }
 
-/// Every amount one posting stores — units, cost, price — against the cap.
+/// Every amount one posting stores and sums — units, cost, price — against
+/// the cap.
 fn check_posting_amounts(posting: &Posting) -> Result<(), AmountCapError> {
     if let Some(ref amount) = posting.amount {
         check_amount_cap("posting amount", amount.number)?;
@@ -218,19 +178,21 @@ fn check_posting_amounts(posting: &Posting) -> Result<(), AmountCapError> {
     }
 }
 
-/// Every amount `directive` stores, against the H-17 cap.
+/// Every capped amount `directive` carries: a transaction's posting units,
+/// costs and prices.
 ///
-/// Covers each directive type that carries a number: a transaction's posting
-/// units, costs and prices, a `balance` assertion's amount and a `price`
-/// directive's amount. `pad`, `open`, `close` and the rest carry none.
+/// `balance` and `price` directive amounts are **not** capped (T76): neither
+/// is ever summed — a `balance` is compared exactly against a sum, a `price`
+/// is a quote — so neither can make a total unrepresentable, and pre-T65
+/// history holds `balance` lines over `10^21` that must keep loading (the M-50
+/// fixture's `balance … 1000000000000000000014 USD`).
 ///
-/// [`validate_transaction`] already runs this for transactions on every path
-/// that validates one (local API, peer ingest, reconcile / operator-input
-/// adoption), and the `.bean` number parser refuses the same bound, which
-/// covers every directive type on the wire (`validate_supply_entry` re-parses
-/// the body) and on the file path — where boot quarantines the block. This
-/// `pub` form is for the ingress checks that see a non-transaction directive
-/// without parsing it (`enforce_resource_limits`) and for boot's
+/// [`validate_transaction`] runs the same check for transactions on every
+/// path that validates one (local API, peer ingest, reconcile and
+/// operator-input adoption, boot's salvage path), and the `.bean` number
+/// reader applies it to every posting amount it reads, which covers the wire
+/// (`validate_supply_entry` re-parses the body), journal replay and the file
+/// path, where boot quarantines the block. This `pub` form is boot's
 /// directive-level quarantine arm.
 pub fn check_directive_amounts(directive: &Directive) -> Result<(), AmountCapError> {
     match directive {
@@ -238,9 +200,9 @@ pub fn check_directive_amounts(directive: &Directive) -> Result<(), AmountCapErr
             .postings
             .iter()
             .try_for_each(check_posting_amounts),
-        Directive::Balance(balance) => check_amount_cap("balance amount", balance.amount.number),
-        Directive::Price(price) => check_amount_cap("price amount", price.amount.number),
-        Directive::Open(_)
+        Directive::Balance(_)
+        | Directive::Price(_)
+        | Directive::Open(_)
         | Directive::Close(_)
         | Directive::Commodity(_)
         | Directive::Pad(_)
@@ -269,15 +231,16 @@ fn amount_cap_violation(error: AmountCapError) -> ValidationError {
 /// If the transaction has an elided posting, this resolves it in-place.
 /// Returns the resolved transaction (with elided posting filled in, if any).
 ///
-/// Also enforces the H-17 amount cap ([`MAX_AMOUNT_MANTISSA`]) on every amount
-/// the transaction carries — units, cost, price — and on the resolved elided
-/// amount. Every path that admits a transaction runs this function, so the cap
-/// holds on each of them without a second call site.
+/// Also enforces the amount cap ([`MAX_AMOUNT_MAGNITUDE`], `|amount| ≤ 10^21`
+/// at any precision) on every amount the transaction carries — units, cost,
+/// price — and on the resolved elided amount. Every path that admits a
+/// transaction runs this function, so the cap holds on each of them without a
+/// second call site.
 pub fn validate_transaction(
     txn: &Transaction,
     accounts: &AccountState,
 ) -> Result<Transaction, ValidationError> {
-    // ── H-17: the amount cap, before any arithmetic ─────────────────────
+    // ── H-17 / T76: the amount cap, before any arithmetic ───────────────
     //
     // First, so an over-cap amount is refused by name rather than surfacing
     // as whatever overflow the weight arithmetic below happens to hit.
@@ -319,10 +282,13 @@ pub fn validate_transaction(
             },
         })?;
 
-        // H-17: the resolved amount is stored, hashed and replicated like
-        // any other, and it is a SUM — of up to every other posting's weight,
-        // and a weight is a unit × rate product — so every posting being
-        // inside the cap does not put the fill inside it.
+        // H-17 / T76: the resolved amount is stored, hashed, replicated and
+        // summed into a balance like any other, and it is a SUM — of up to
+        // every other posting's weight, and a weight is a unit × rate product
+        // — so every posting being inside the cap does not put the fill
+        // inside it. It is capped as stored: its spelling (trailing zeros
+        // included) is part of the content id, and the cap is a magnitude, so
+        // `-100000.0000000000000000` is as far inside it as `-100000`.
         check_amount_cap("resolved elided amount", resolved_amount.number)
             .map_err(amount_cap_violation)?;
 
@@ -827,40 +793,60 @@ mod tests {
         assert!(error.to_string().contains("H-17"), "{what}: {error}");
     }
 
-    /// The boundary is exact: 21 significant digits pass, 22 do not, at any
-    /// scale — trailing zeros included, since they are mantissa too.
+    /// `10^21 × 10^-scale`-units: the cap itself as a mantissa at `scale`.
+    fn cap_mantissa_at(scale: u32) -> i128 {
+        (MAX_AMOUNT_MAGNITUDE * 10u128.pow(scale)) as i128
+    }
+
+    /// T76: the boundary is a magnitude, inclusive, at any precision:
+    /// `|amount| ≤ 10^21` passes and one unit in the last place beyond it does
+    /// not, at every scale where the bound is below `Decimal::MAX`; from scale
+    /// 8 on every `Decimal` is inside it. Trailing zeros are just precision.
     #[test]
     fn test_h17_cap_boundary() {
         let accounts = setup_accounts();
-        let cap = MAX_AMOUNT_MANTISSA as i128;
-        for scale in [0u32, 2, 8, 21, 28] {
-            let largest = Decimal::from_i128_with_scale(cap, scale);
+        for scale in 0u32..=7 {
+            let largest = Decimal::from_i128_with_scale(cap_mantissa_at(scale), scale);
             assert!(amount_within_cap(largest) && amount_within_cap(-largest));
             validate_transaction(&pair(largest), &accounts)
                 .unwrap_or_else(|e| panic!("{largest} is inside the cap: {e}"));
+            let over = Decimal::from_i128_with_scale(cap_mantissa_at(scale) + 1, scale);
+            assert!(
+                !amount_within_cap(over) && !amount_within_cap(-over),
+                "{over}"
+            );
+            assert_cap_refusal(validate_transaction(&pair(over), &accounts), "cap + 1 ulp");
         }
-        for scale in [0u32, 2, 8] {
-            let over = Decimal::from_i128_with_scale(cap + 1, scale);
-            assert!(!amount_within_cap(over) && !amount_within_cap(-over));
-            assert_cap_refusal(validate_transaction(&pair(over), &accounts), "cap + 1");
+        for scale in [8u32, 21, 28] {
+            let widest = Decimal::from_i128_with_scale(Decimal::MAX.mantissa(), scale);
+            assert!(amount_within_cap(widest) && amount_within_cap(-widest));
+            validate_transaction(&pair(widest), &accounts)
+                .unwrap_or_else(|e| panic!("{widest} is below 10^21: {e}"));
         }
-        // `100.000…0` is small, but 22 digits of mantissa is 22 digits.
-        let padded: Decimal = "10000000000000.00000000".parse().unwrap();
-        assert_cap_refusal(validate_transaction(&pair(padded), &accounts), "padded");
+        // `10000000000000.00000000` is 10^13: 22 digits of mantissa are
+        // precision, not magnitude (M-50's trailing-zero case).
+        for padded in ["10000000000000.00000000", "1000000000000000000000.0000000"] {
+            let padded: Decimal = padded.parse().unwrap();
+            validate_transaction(&pair(padded), &accounts)
+                .unwrap_or_else(|e| panic!("{padded} is inside the cap: {e}"));
+        }
         // The B6 pair itself.
         assert_cap_refusal(validate_transaction(&pair(Decimal::MAX), &accounts), "MAX");
         assert_cap_refusal(validate_transaction(&pair(Decimal::MIN), &accounts), "MIN");
     }
 
-    /// Cost and both price spellings are stored amounts too.
+    /// Cost and both price spellings are summed amounts too. The units are
+    /// tiny, so the weight — and the elided leg it resolves — stays far inside
+    /// the cap: only the cost / price check itself can refuse these.
     #[test]
     fn test_h17_cap_covers_cost_and_price() {
         let mut accounts = setup_accounts();
         accounts
             .open_account("Assets:Stock", make_date(2024, 1, 1), &[])
             .unwrap();
+        // 10^21 + 0.01.
         let over = Amount {
-            number: Decimal::from_i128_with_scale(MAX_AMOUNT_MANTISSA as i128 + 1, 2),
+            number: Decimal::from_i128_with_scale(cap_mantissa_at(2) + 1, 2),
             currency: "USD".to_owned(),
         };
         let stock = |cost: Option<CostSpec>, price: Option<PriceSpec>| Transaction {
@@ -868,7 +854,7 @@ mod tests {
                 Posting {
                     cost,
                     price,
-                    ..posting("Assets:Stock", dec!(1), "AAPL")
+                    ..posting("Assets:Stock", dec!(0.000001), "AAPL")
                 },
                 Posting {
                     amount: None,
@@ -902,16 +888,16 @@ mod tests {
     }
 
     /// The elided leg is a sum, so in-cap postings can resolve it past the
-    /// cap; it is stored and replicated like any other amount, so it is
-    /// refused rather than stored.
+    /// cap; it is stored, replicated and summed like any other amount, so it
+    /// is refused rather than stored.
     #[test]
     fn test_h17_cap_covers_the_resolved_elided_amount() {
         let accounts = setup_accounts();
-        let near = Decimal::from_i128_with_scale(MAX_AMOUNT_MANTISSA as i128, 0);
+        let at_cap = Decimal::from_i128_with_scale(cap_mantissa_at(0), 0);
         let mut txn = simple_balanced_txn();
         txn.postings = vec![
-            posting("Assets:Cash", near, "USD"),
-            posting("Assets:Cash", near, "USD"),
+            posting("Assets:Cash", at_cap, "USD"),
+            posting("Assets:Cash", at_cap, "USD"),
             Posting {
                 amount: None,
                 ..posting("Equity:Opening", dec!(0), "USD")
@@ -922,12 +908,16 @@ mod tests {
             error.to_string().contains("resolved elided amount"),
             "{error}"
         );
+        // One of them resolves to exactly −10^21: inside (inclusive).
+        txn.postings.remove(0);
+        validate_transaction(&txn, &accounts).expect("−10^21 is inside the cap");
     }
 
-    /// Every directive type that stores a number is covered by the `pub`
-    /// check the non-transaction ingress hooks call.
+    /// T76: the check boot's quarantine arm calls caps what is summed — a
+    /// transaction's amounts — and never a `balance` or `price` amount, which
+    /// are compared or quoted, never summed.
     #[test]
-    fn test_h17_check_directive_amounts_covers_every_numbered_directive() {
+    fn test_h17_check_directive_amounts_covers_every_summed_amount() {
         let date = make_date(2024, 1, 1);
         let amount = |number| Amount {
             number,
@@ -949,15 +939,12 @@ mod tests {
                 metadata: BTreeMap::new(),
             })
         };
+        let error =
+            check_directive_amounts(&Directive::Transaction(pair(Decimal::MAX))).unwrap_err();
+        assert!(error.to_string().contains("H-17"), "{error}");
         for directive in [
             balance(Decimal::MAX),
             price(-Decimal::MAX),
-            Directive::Transaction(pair(Decimal::MAX)),
-        ] {
-            let error = check_directive_amounts(&directive).unwrap_err();
-            assert!(error.to_string().contains("H-17"), "{error}");
-        }
-        for directive in [
             balance(dec!(100.00)),
             price(dec!(1.10)),
             Directive::Transaction(pair(dec!(1))),
@@ -998,8 +985,8 @@ mod tests {
 
         let opens = "2024-01-01 open Assets:Cash\n\n2024-01-01 open Equity:Opening\n";
         let over_cap_block =
-            "2024-01-02 * \"too big\"\n  Assets:Cash 1000000000000000000000 USD\n  \
-                              Equity:Opening -1000000000000000000000 USD\n";
+            "2024-01-02 * \"too big\"\n  Assets:Cash 1000000000000000000000.0000001 USD\n  \
+                              Equity:Opening -1000000000000000000000.0000001 USD\n";
         let honest_block = "2024-01-03 * \"honest\"\n  Assets:Cash 7 USD\n  \
                             Equity:Opening -7 USD\n";
         let cash = |svc: &LedgerService| {
@@ -1086,7 +1073,7 @@ mod tests {
         assert_eq!(svc.read_model().over_cap_posting_count(), 0);
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert!(
-            on_disk.contains("1000000000000000000000 USD"),
+            on_disk.contains("1000000000000000000000.0000001 USD"),
             "quarantined, not deleted (H-08)"
         );
         drop(svc);

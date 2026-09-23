@@ -24,16 +24,15 @@
 //! `finalize_operator_input` → startup compaction → and a second run of the
 //! same pipeline, which must serve exactly the same set (the fixed point).
 //!
-//! ## What fails at HEAD
+//! ## What this pins
 //!
-//! The per-operator tests marked `#[ignore = "fails at HEAD: …"]` pin H-20
-//! (doors (a) edited record and (b) split record), M-47 (half envelope), L-74
-//! (stale read model), L-75 (hand parents honoured verbatim), L-76 (raw copy
-//! replaces a quarantined signed record) and L-77 (re-open adopted). Run them
-//! with `cargo test -p p2p --test boot_fuzz -- --ignored` to see each one name
-//! the served-but-refused id and the wire error. [`OPERATORS_ENABLED_AT_HEAD`]
-//! gates the proptest to the operators that hold today; `boot_fuzz_all_operators`
-//! (ignored) runs every operator and every check, and is what T73 enables.
+//! The per-operator tests pin H-20 (doors (a) edited record and (b) split
+//! record), M-47 (half envelope), L-74 (stale read model), L-75 (hand parents
+//! honoured verbatim), L-76 (raw copy replaces a quarantined signed record) and
+//! L-77 (re-open adopted). They failed at HEAD `48665b8`, each naming the
+//! served-but-refused id and the wire error, and T73 made them pass:
+//! [`OPERATORS_ENABLED`] holds every operator and `boot_fuzz_all_operators`
+//! runs each one under every check.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -445,18 +444,14 @@ struct Effect {
 #[derive(Clone, Copy, Debug)]
 struct Checks {
     /// L-74: the read model (`journal`) must agree with `get_directive` on the
-    /// envelope of every served transaction. Fails at HEAD for every operator
-    /// that adopts operator input, so the HEAD-gated proptest turns it off.
+    /// envelope of every served transaction. Failed at HEAD for every operator
+    /// that adopts operator input; T73 re-indexes the finalised copy.
     read_model_parity: bool,
 }
 
 impl Checks {
     const ALL: Checks = Checks {
         read_model_parity: true,
-    };
-    /// The checks that hold at HEAD for [`OPERATORS_ENABLED_AT_HEAD`].
-    const AT_HEAD: Checks = Checks {
-        read_model_parity: false,
     };
 }
 
@@ -874,7 +869,9 @@ enum Operator {
     Identity,
 }
 
-const ALL_OPERATORS: [Operator; 18] = [
+/// Every operator, under every check (T73: H-20 (a)–(e), (h); M-47 (f), (g);
+/// L-74 (i); L-75 (k); L-76 (l); L-77 (j)). Nothing is gated any more.
+const OPERATORS_ENABLED: [Operator; 18] = [
     Operator::EditNarration,
     Operator::EditAmountBalanced,
     Operator::EditAmountUnbalanced,
@@ -889,22 +886,6 @@ const ALL_OPERATORS: [Operator; 18] = [
     Operator::AppendHandTransactionDanglingParent,
     Operator::DuplicateSignedBlockRaw,
     Operator::DuplicateRawOfCycleMember,
-    Operator::DeleteSignedBlock,
-    Operator::Crlf,
-    Operator::LeadingBom,
-    Operator::Identity,
-];
-
-/// The operators whose invariant holds at HEAD, under [`Checks::AT_HEAD`].
-///
-/// Everything else is pinned by an ignored per-operator test below and joins
-/// this list when T73 lands (H-20: (a)–(e), (h); M-47: (f), (g); L-75: (k);
-/// L-76: (l); L-77: (j)). `AppendHandTransaction` holds at HEAD only without
-/// the L-74 read-model check, which is why the HEAD proptest runs
-/// [`Checks::AT_HEAD`].
-const OPERATORS_ENABLED_AT_HEAD: [Operator; 6] = [
-    Operator::AppendHandTransaction,
-    Operator::DuplicateSignedBlockRaw,
     Operator::DeleteSignedBlock,
     Operator::Crlf,
     Operator::LeadingBom,
@@ -1123,25 +1104,21 @@ fn assert_holds(operator: Operator, seed: u64, position: usize, checks: Checks) 
 // ─── Per-operator tests (named failures) ─────────────────────────────────────
 
 #[test]
-#[ignore = "fails at HEAD: H-20 door (a); enabled by T73"]
 fn op_a_edit_narration_of_signed_record() {
     assert_holds(Operator::EditNarration, 1, 0, Checks::ALL);
 }
 
 #[test]
-#[ignore = "fails at HEAD: H-20 door (a); enabled by T73"]
 fn op_b_edit_amount_balanced() {
     assert_holds(Operator::EditAmountBalanced, 2, 1, Checks::ALL);
 }
 
 #[test]
-#[ignore = "fails at HEAD: H-20 door (a); enabled by T73"]
 fn op_b_edit_amount_unbalanced() {
     assert_holds(Operator::EditAmountUnbalanced, 3, 2, Checks::ALL);
 }
 
 #[test]
-#[ignore = "fails at HEAD: H-20 door (b); enabled by T73"]
 fn op_c_dedent_posting() {
     // `position % postings` picks the dedented line; whichever it is, the head
     // fragment loses at least one leg and is loaded truncated (door (b)).
@@ -1149,38 +1126,33 @@ fn op_c_dedent_posting() {
 }
 
 #[test]
-#[ignore = "fails at HEAD: H-20 door (b); enabled by T73"]
 fn op_d_bom_before_posting() {
     assert_holds(Operator::BomBeforePosting, 5, 1, Checks::ALL);
 }
 
 #[test]
-#[ignore = "fails at HEAD: H-20 door (b); enabled by T73"]
 fn op_e_stray_word_line() {
     assert_holds(Operator::StrayWordLine, 6, 1, Checks::ALL);
 }
 
 #[test]
-#[ignore = "fails at HEAD: M-47; enabled by T73"]
 fn op_f_delete_lamport_line() {
     assert_holds(Operator::DeleteLamportLine, 7, 0, Checks::ALL);
 }
 
 #[test]
-#[ignore = "fails at HEAD: M-47; enabled by T73"]
 fn op_g_delete_author_line() {
     assert_holds(Operator::DeleteAuthorLine, 8, 1, Checks::ALL);
 }
 
 #[test]
-#[ignore = "fails at HEAD: H-20 (an own record missing its signature is served unsigned); enabled by T73"]
 fn op_h_delete_signature_line() {
     assert_holds(Operator::DeleteSignatureLine, 9, 2, Checks::ALL);
 }
 
 #[test]
 fn op_i_append_hand_transaction_is_adopted_and_signed() {
-    let report = assert_holds(Operator::AppendHandTransaction, 10, 0, Checks::AT_HEAD);
+    let report = assert_holds(Operator::AppendHandTransaction, 10, 0, Checks::ALL);
     assert_eq!(report.adopted.len(), 1, "exactly the hand record is new");
     let (id, directive) = report.adopted.iter().next().unwrap();
     let Directive::Transaction(txn) = directive else {
@@ -1197,25 +1169,22 @@ fn op_i_append_hand_transaction_is_adopted_and_signed() {
 }
 
 #[test]
-#[ignore = "fails at HEAD: L-74; enabled by T73"]
 fn op_i_append_hand_transaction_read_model_agrees() {
     assert_holds(Operator::AppendHandTransaction, 10, 0, Checks::ALL);
 }
 
 #[test]
-#[ignore = "fails at HEAD: L-77; enabled by T73"]
 fn op_j_append_reopen_of_open_account() {
-    assert_holds(Operator::AppendReopen, 11, 0, Checks::AT_HEAD);
+    assert_holds(Operator::AppendReopen, 11, 0, Checks::ALL);
 }
 
 #[test]
-#[ignore = "fails at HEAD: L-75; enabled by T73"]
 fn op_k_append_hand_transaction_with_dangling_parent() {
     assert_holds(
         Operator::AppendHandTransactionDanglingParent,
         12,
         0,
-        Checks::AT_HEAD,
+        Checks::ALL,
     );
 }
 
@@ -1226,7 +1195,6 @@ fn op_l0_duplicate_signed_block_raw_collapses_to_the_signed_copy() {
 }
 
 #[test]
-#[ignore = "fails at HEAD: L-76; enabled by T73"]
 fn op_l_duplicate_raw_of_cycle_member() {
     assert_holds(Operator::DuplicateRawOfCycleMember, 14, 0, Checks::ALL);
 }
@@ -1420,29 +1388,11 @@ proptest! {
         .. ProptestConfig::default()
     })]
 
-    /// The operators that hold at HEAD, under the checks that hold at HEAD.
+    /// Every operator, every check.
     #[test]
-    fn boot_fuzz_operators_enabled_at_head(
-        seed in any::<u64>(),
-        operator in any_operator(&OPERATORS_ENABLED_AT_HEAD),
-        position in 0..64usize,
-    ) {
-        let truth = generate_fixture(seed);
-        let report = run_case(&truth, operator, position, Checks::AT_HEAD);
-        prop_assert!(report.applied, "{operator:?} did not apply");
-        prop_assert!(
-            report.failures.is_empty(),
-            "{operator:?} (seed {seed}, position {position}):\n  {}",
-            report.failures.join("\n  ")
-        );
-    }
-
-    /// Every operator, every check. Enabled by T73.
-    #[test]
-    #[ignore = "fails at HEAD: H-20, M-47, L-74, L-75, L-76, L-77; enabled by T73"]
     fn boot_fuzz_all_operators(
         seed in any::<u64>(),
-        operator in any_operator(&ALL_OPERATORS),
+        operator in any_operator(&OPERATORS_ENABLED),
         position in 0..64usize,
     ) {
         let truth = generate_fixture(seed);

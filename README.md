@@ -234,6 +234,21 @@ curl -s -X POST http://127.0.0.1:4000/graphql \
 
 ---
 
+#### Amounts and precision
+
+Any amount that is added into a balance (posting units, `{cost}`, `@`/`@@` price, and the auto-calculated
+elided amount) must have magnitude at most **10^21** (`1000000000000000000000`). The limit includes 10^21
+itself and allows any precision up to 28 fractional digits, and trailing zeros are free. The API, peers
+and the `.bean` file all apply the same rule. `balance` and `price` directive amounts are not limited.
+
+Every balance is kept as its exact sum. A reported figure is that exact sum whenever it fits a
+`Decimal`'s 96-bit mantissa at the scale its amounts are written in. If it does not fit, which only
+happens when amounts of very different scales are mixed (such as `1000` and
+`0.0000000000000000000000000001`), the figure is rounded once, half to even, to the finest scale that
+fits, and the report says so with `exact: false`. `balance` assertions and `verify` always compare
+against the exact sum. With the 10^21 limit, no total in a ledger of any size the node accepts can be
+too large to report.
+
 ### Queries (Reading Data)
 
 #### Trial Balance
@@ -683,6 +698,83 @@ the domain *is* the gossip join credential. All nodes must report
 
 Rolling back is the same procedure in reverse, with the same window.
 
+#### Joining a mesh / removing a peer
+
+Replication has one bound it applies to *this node's own clock*: a directive
+whose `openledger-lamport` would move the node's clock by 2^32 or more in one
+step is refused (`LAMPORT_ADVANCE`, the adoption ratchet) until the node has
+caught up through the directives in between. On a dense history a fresh node
+therefore joins by anti-entropy alone, in any delivery order: each round adopts
+what is within reach, the clock rises, the next round adopts the rest. That
+stops holding the moment the history carries **one gap of the size the ratchet
+permits** — a single legal directive at `clock + 2^32 − 1`, adopted by every
+node at the time, or a jump of any size in a history written before the ratchet
+existed (a hand-typed `openledger-lamport`, say). Every node that adopted the
+jump carries on normally, and its own writes are accepted everywhere. But a
+node that joins **later**, or is **rebuilt from an empty disk**, climbs to the
+clock just below the jump and finds the first honest directive after it a full
+step away. The only bridge is the jumping directive itself — and if its author
+has since been **removed from the allowlist** (the remedy the `LAMPORT_CEILING`
+text prescribes), that bridge is refused at intake, permanently. The same holds
+without any lamport rule when the removed author's directive is a
+*transaction*: everything authored on top of it names it as a parent, and a
+node that refuses the parent buffers all of it as orphans forever
+(`MISSING_PARENT`).
+
+The node **tells you** when it is in this state: at boot, and after an
+adoption, it logs *"ledger clock is far above the number of directives this
+node holds"* naming the author whose directive carried the clock there (a
+clock is bounded by the events it has folded; a clock of 5 × 10⁹ over a few
+thousand directives is a jump). A `LAMPORT_ADVANCE` refusal that repeats tick
+after tick on a fresh node is the same state seen from the other side.
+
+**Removing a peer from the allowlist** is therefore a two-part decision. Its
+directives already in the history stay there (the mesh keeps what it accepted,
+and peers keep re-supplying anything you delete), and from then on **every
+later joiner must be joined by bootstrap, not by anti-entropy alone**:
+
+1. **Pick a current peer** — any node that already holds the whole history —
+   and stop it cleanly. A node folds its `<ledgerPath>.journal` into the `.bean`
+   at shutdown (and at startup and every full rewrite), so a stopped node's
+   `.bean` is complete and canonical. Do not copy a live node's file (its latest
+   writes may still be in the journal), and do not copy the journal itself: it
+   is that node's own crash-recovery sidecar, and the compacted `.bean` already
+   holds everything it did.
+2. **Copy that peer's compacted `.bean`** to the joiner's `ledgerPath`. Copy
+   only the `.bean`; the joiner creates its own `.lock`, `.journal` and key.
+3. **Boot the joiner under its own key and its own author id** — its own
+   `p2p.secretKeyPath`, the same `meshId`, its own EndpointId on everyone's allowlist
+   as for any new node. Nothing in the copied file belongs to the joiner: boot
+   loads every enveloped record as *history* (author, lamport, parents and
+   signature verified as they were written, whoever wrote them) and the
+   joiner's clock **resumes above the highest lamport in the file**, so the gap
+   is behind it. The removed author's records load too, exactly as they sit in
+   every other node, because a file is history, not intake — the allowlist
+   governs what a peer may *send*, not what a node already holds.
+4. **Start the peer again and let anti-entropy finish the join.** Everything
+   authored since the copy is within one ratchet step of the joiner's clock and
+   arrives normally; the joiner's own writes are accepted by every node. The
+   boot warning above fires on the joiner once, naming the jump's author; that
+   is expected, and it is your confirmation that the copy carried the gap.
+
+This is the join the test `h19_fresh_node_bootstrapped_from_a_peers_file_converges`
+performs (`crates/p2p/tests/convergence.rs`): the copy boots with the peer's
+whole history, the removed author's directive included, every node authors on
+top, and the mesh converges — equal DAGs, heads and balances — with the joiner's
+own directive accepted everywhere. The anti-entropy-only join of the same mesh
+is the ignored case beside it, a documented limitation rather than a defect to
+be fixed by a looser bound: any exemption from the ratchet for a "first
+contact" is exactly the unbounded jump the ratchet exists to remove, on the
+nodes least able to notice.
+
+Two related rules that do **not** change: a transaction's parents are chosen
+so that no author's heads can crowd out another's (at most `256 / authors` per
+author, then smallest id — so a peer that grinds content ids cannot keep an
+honest head unmerged), and a peer's transaction is never refused for the number
+of heads its author holds on this node (that bound made DAG membership depend on
+which subset a peer chose to serve first; frontier size is a cost every replica
+pays alike, divergence is not).
+
 ### Using Auth
 
 When `auth.enabled` is `true`, add the header to all requests. Keep the key in
@@ -704,20 +796,60 @@ The `/health` endpoint never *requires* authentication. On a non-loopback bind i
 **Editing a `.bean` file while the node that owns it is running is not
 supported. Stop the node, edit the file, start it again.**
 
+**Never edit an existing record. Append a reversing entry instead.** History is
+append-only across the whole mesh: every peer holds the record the node wrote,
+under its content id, with its signature. A line you change is a *different*
+record (the content id covers the economic body) still carrying the *old*
+signature, and no peer will ever accept it. Since T73, boot verifies the
+signature of every record that carries an envelope — with this node's own key
+for its own records, and with the author's key for everyone's once signing is
+enabled — and a record that does not verify is **quarantined**: kept in the
+file exactly as it is, kept out of the ledger, not served, not in any balance,
+named in the boot banner as *"quarantined: signature does not verify — was this
+record edited? (H-20)"*. To repair it, restore the original line from a peer's
+copy of the ledger (or from the node's `.journal`/backup), or delete the edited
+block; then append a new transaction that reverses the mistake. A record you
+**delete** from the file is not gone either: peers re-supply it on the next
+anti-entropy round, because the mesh keeps what it accepted. Adoption is
+one-way: the file is how records get *into* this node, never how they leave it.
+
+Three edits an editor makes by accident are caught the same way: a stray
+dedent, a byte-order mark glued to a posting, or a stray word inside a
+node-written transaction used to load the parsable head as a *shorter*
+transaction (one posting, its counter-posting dropped). Such a block is now held
+whole, as unparsable text, and written back byte-for-byte until you repair it.
+
 That stop → edit → start path is the supported one, and this is what it does.
-At boot, a directive that carries neither `openledger-author` nor
-`openledger-lamport` was not written by a node, so it is treated as **operator
-input** rather than history: it goes through the same checks a live hand edit
-goes through (lifecycle, balance, body size, envelope keys), is stamped with
-this node's author id, Lamport value and parents, is **signed with this node's
-key once the key is loaded** — which happens before the startup compaction and
-before any peer is served — and the startup compaction writes it to the file in
-canonical form. From then on it replicates like any other local write. A
-hand-typed entry the checks refuse is **quarantined**: kept in the file exactly
-as you wrote it, kept out of the ledger, named in the boot banner with its
-reason, until you repair it and restart (boot never drops what it read). The
-same rule adopts, once, the envelope-less `open`/`close` lines a very old build
-wrote before it stamped non-transaction directives.
+At boot, a directive that lacks `openledger-author` **or** `openledger-lamport`
+was not written by a node, so it is treated as **operator input** rather than
+history: it goes through the same checks a live hand edit goes through
+(lifecycle, balance, body size, envelope keys), is stamped with this node's
+author id, Lamport value and parents, is **signed with this node's key once the
+key is loaded** — which happens before the startup compaction and before any
+peer is served — and the startup compaction writes it to the file in canonical
+form. From then on it replicates like any other local write. A hand-typed entry
+the checks refuse is **quarantined**: kept in the file exactly as you wrote it,
+kept out of the ledger, named in the boot banner with its reason, until you
+repair it and restart (boot never drops what it read). The same rule adopts,
+once, the envelope-less `open`/`close` lines a very old build wrote before it
+stamped non-transaction directives.
+
+The half-envelope cases follow from "lacks either": an entry with only an
+`openledger-lamport` line is operator input — the lamport is not a clock value
+this node issued, so it is re-stamped, this node's author is stamped, and any
+`openledger-signature` on it is discarded (a signature under a fresh lamport
+verifies nowhere). An entry with only an `openledger-author` line is re-stamped
+the same way; if that author is **this node**, it is signed and replicates, and
+if it names **another node** it is adopted unsigned with a warning (this node
+cannot sign for it — drop the author line to adopt it as your own). A hand-typed
+`openledger-parents` line must name records this ledger holds; one that names a
+parent that exists nowhere is refused, because a signed record with a parent
+nobody can resolve orphans everything written after it. A hand-typed `open` of
+an account that is already open is refused exactly as the API refuses it. And a
+node that **enables signing over a history it wrote unsigned** finds that
+history quarantined at the first signing boot — it never replicated to a signing
+mesh anyway; delete the `openledger-*` lines from those blocks to re-adopt them
+as this node's own, signed, operator input.
 
 The node treats its ledger file as something it writes, and a persist is a
 full-file atomic rewrite. Two mechanisms make a concurrent hand edit *less*
@@ -768,9 +900,12 @@ same trust boundary:
   you pasted something in the file does not change the result.
 - An entry with no signature is signed as this node's own before the first
   persist, so it replicates like any other local write. Two exceptions: an entry
-  that already carries a signature is adopted untouched (it came from a peer),
-  and one whose author names a different node is adopted unsigned with a warning
-  (signing it here would produce a signature that verifies nowhere).
+  that carries a **full** envelope (author, lamport and signature) is adopted
+  untouched if its signature verifies and refused if it does not (it came from
+  a peer, or it was edited), and one whose author names a different node is
+  adopted unsigned with a warning (signing it here would produce a signature
+  that verifies nowhere). A signature on a half envelope is discarded and a new
+  one made, as described under the stop → edit → start path above.
 - Entries that fail validation are dropped, each logged with its content id and
   the reason, before the canonical rewrite removes them from the file — and that
   rewrite runs even when *every* entry in the edit was refused, so a refused
@@ -788,7 +923,10 @@ same trust boundary:
   everywhere they were before.
 - Removing or renaming the `.bean` under a running node does not lose anything:
   the next write recreates it from memory with every directive in it, and a
-  failed write never installs an emptier ledger over the one in memory.
+  failed write never replaces what is in memory with a file that lacks a record
+  the node already wrote. That includes a backup copied over the live file. Only
+  lines you added since the node last rewrote the file may be dropped by that
+  recovery.
 
 ### The commit journal (`<ledgerPath>.journal`)
 
@@ -806,7 +944,8 @@ cases where you might:
 - **A `.bean` missing beside a journal refuses boot** rather than starting an
   empty ledger with the journal's writes on top.
 - **A torn final record** — a crash mid-append — is dropped with a warning, and
-  the journal is kept as `<ledgerPath>.journal.torn-<unix-seconds>` instead of
+  so is a journal whose recovery reload after a failed write could not read the
+  files; the journal is kept as `<ledgerPath>.journal.torn-<unix-seconds>` instead of
   being deleted. No boot reads it; inspect it, then remove it.
 - **Damage anywhere else refuses boot**, naming the byte offset. It cannot be a
   crash, so the node will not guess which records to keep.

@@ -656,7 +656,11 @@ fn the_bounded_parser_peaks_within_budget_on_a_body_the_block_count_admits() {
 
     // And `parse_file_bounded` directly, without the wire path's other checks.
     let (bounded, parser_peak) = peak_allocated_during(|| {
-        ledger::parse::parse_file_bounded(&entry.economic_bean, MAX_REPORTED_PARSE_ERRORS)
+        ledger::parse::parse_file_bounded(
+            &entry.economic_bean,
+            MAX_REPORTED_PARSE_ERRORS,
+            ledger::parse::ParseLimits::RESOURCE,
+        )
     });
     let bounded = bounded.expect_err("must fail");
     println!(
@@ -668,4 +672,245 @@ fn the_bounded_parser_peaks_within_budget_on_a_body_the_block_count_admits() {
     assert_eq!(bounded.errors.len(), MAX_REPORTED_PARSE_ERRORS);
     assert_eq!(bounded.total, mib / 3);
     assert!(parser_peak <= budget);
+}
+
+// ─── T75 / M-48: bodies that PARSE, and the frame that queues them ──────────
+
+const MIB: usize = 1024 * 1024;
+
+/// A `Supply` entry for `body` under its TRUE id and a transaction envelope,
+/// so nothing but a cardinality cap can refuse it — exactly the entry the
+/// audit measured `Ok` at 41.7×.
+fn entry_with_true_id(body: String) -> SupplyEntry {
+    let parsed = ledger::parse::parse_file(&body).expect("the shape parses on the file path");
+    assert_eq!(parsed.len(), 1);
+    SupplyEntry {
+        id: ledger::hash::compute_content_id(&parsed[0]),
+        kind: DirectiveKind::from_directive(&parsed[0]),
+        economic_bean: body,
+        envelope: std::collections::BTreeMap::from([
+            ("openledger-author".to_owned(), "author".to_owned()),
+            ("openledger-lamport".to_owned(), "1".to_owned()),
+            ("openledger-parents".to_owned(), String::new()),
+        ]),
+    }
+}
+
+/// 41,941 postings with one metadata line each — the audit's worst shape.
+fn postings_with_metadata_body(narration: &str) -> String {
+    let line = "  Assets:A 1 USD\n  k: \"\"\n";
+    format!(
+        "2024-01-01 * \"{narration}\"\n{}",
+        line.repeat((MIB - 60) / line.len())
+    )
+}
+
+/// M-48: the four valid 1 MiB bodies the audit measured — every one `Ok` with
+/// a correct id and refused only at stage — plus the two floods it found
+/// beside them, validated under the counting allocator. Each must now be
+/// REFUSED, as a resource limit, within the same 4× bar the refused shapes
+/// above are held to.
+///
+/// Measured before T75 (release, same allocator): 61,678 postings 19.94×;
+/// 41,941 postings + meta 41.72×; 349,518 tags 30.63×; 349,515 currencies
+/// 24.00×; 74,896 posting-metadata keys 10.21×; 262,144 junk body lines 9.00×.
+/// After: every one ≤ 0.08× — the parse stops at the first item past a cap,
+/// and the lazy scanner no longer materialises the rest of a flooded header.
+///
+/// Reverting the parse-time limits (`ParseLimits::UNLIMITED` in
+/// `validate_supply_entry`) fails this test on the peak for all four audited
+/// shapes, even though the post-parse `enforce_resource_limits` still refuses
+/// them: the refusal comes after the directive was built. Reverting the lazy
+/// scanner (`Scanner::new` collecting the whole line up front) fails it on the
+/// tag and currency floods at 6.00×: the counts stop at the 101st tag and the
+/// 65th currency, but an eager scanner has already paid four to six bytes per
+/// character of the 1 MiB header.
+#[test]
+fn parsed_flood_bodies_are_refused_within_the_entry_budget() {
+    let _measuring = measurement_lock();
+    let posting = "  Assets:A 1 USD\n";
+    let mut posting_metadata = String::from("2024-01-01 *\n  Assets:A 1 USD\n");
+    let mut key = 0usize;
+    while posting_metadata.len() + 14 < MIB {
+        posting_metadata.push_str(&format!("  k{key:06}: \"\"\n"));
+        key += 1;
+    }
+    let shapes = [
+        (
+            "61678 postings",
+            format!(
+                "2024-01-01 *\n{}",
+                posting.repeat((MIB - 40) / posting.len())
+            ),
+        ),
+        (
+            "41941 postings + 1 meta each",
+            postings_with_metadata_body("x"),
+        ),
+        (
+            "349518 tags",
+            format!("2024-01-01 *{}\n", " #a".repeat((MIB - 20) / 3)),
+        ),
+        (
+            "open + 349515 currencies",
+            format!(
+                "2024-01-01 open Assets:A US{}\n",
+                ",US".repeat((MIB - 30) / 3)
+            ),
+        ),
+        ("74896 posting metadata keys", posting_metadata),
+    ];
+    // Every shape is measured before anything is asserted, so a failure
+    // reports all of them rather than the first.
+    let mut failures = Vec::new();
+    for (name, body) in shapes {
+        let body_len = body.len();
+        assert!(
+            body_len <= ledger::service::MAX_ECONOMIC_BEAN_LENGTH,
+            "{name}"
+        );
+        let entry = entry_with_true_id(body);
+        let budget = body_len * ENTRY_PEAK_BUDGET_MULTIPLE;
+        let (result, peak) = peak_allocated_during(|| validate_supply_entry(&entry));
+        let verdict = result.as_ref().map(|_| "Ok").map_err(ToString::to_string);
+        println!(
+            "{name}: body {body_len} bytes, peak {peak} bytes ({:.2}× body, budget {budget}): \
+             {verdict:?}",
+            peak as f64 / body_len as f64,
+        );
+        if !matches!(result, Err(MergeError::ResourceLimitExceeded(_))) {
+            failures.push(format!(
+                "{name}: not refused as a resource limit: {verdict:?}"
+            ));
+        }
+        if peak > budget {
+            failures.push(format!(
+                "{name}: validating a {body_len}-byte body peaked at {peak} bytes ({:.2}×), \
+                 over the {ENTRY_PEAK_BUDGET_MULTIPLE}× budget of {budget}",
+                peak as f64 / body_len as f64
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    // The refused-path flood beside them: 262k junk body lines under one
+    // header (the audit's 9.0×), stopped while the lines are collected.
+    let junk = format!(
+        "2024-01-01 open Assets:A\n{}",
+        "  x\n".repeat((MIB - 30) / 4)
+    );
+    let junk_len = junk.len();
+    let entry = entry_with_body(junk);
+    let (result, peak) = peak_allocated_during(|| validate_supply_entry(&entry));
+    println!(
+        "262k junk body lines: body {junk_len} bytes, peak {peak} bytes ({:.2}× body)",
+        peak as f64 / junk_len as f64
+    );
+    assert!(matches!(result, Err(MergeError::ResourceLimitExceeded(_))));
+    assert!(peak <= junk_len * ENTRY_PEAK_BUDGET_MULTIPLE);
+}
+
+/// Peak permitted while phase 1 of `apply_supply_entries` runs over an
+/// HONEST maximal frame, as a multiple of the frame.
+///
+/// Not the 4× bar, and deliberately stated separately rather than loosening
+/// it: honest entries are ACCEPTED, so phase 1 keeps every parsed directive for
+/// phase 2, and a parsed directive is larger than its body — a 1000-posting
+/// transaction's `Vec<Posting>` alone is 184 B a posting against ~36 B of text.
+/// The audit measured 6.1× for 256 honest 1000-posting transactions; T75
+/// cannot and does not change that (nothing honest is refused). 8× is that
+/// measurement plus headroom for allocator-growth jitter. The hostile bound
+/// below stays at 4×.
+const HONEST_FRAME_PEAK_MULTIPLE: usize = 8;
+
+/// Run phase 1 of `apply_supply_entries` over `entries` — validate each and
+/// keep what passes — and report `(staged, peak)`. The entries stay live
+/// throughout (the decoded frame), which is the conservative accounting: the
+/// node frees each entry as it goes, so its real peak is at most this.
+fn phase_one(entries: &[SupplyEntry]) -> (usize, usize) {
+    let (staged, peak) = peak_allocated_during(|| {
+        let mut staged = Vec::new();
+        for entry in entries {
+            if let Ok(directive) = validate_supply_entry(entry) {
+                staged.push(directive);
+            }
+        }
+        staged
+    });
+    (staged.len(), peak)
+}
+
+/// M-48: a 15 MiB `Supply` of fifteen distinct 41,941-posting bodies held
+/// **546 MB (34.7×)** through phase 1 before T75, because every entry parsed
+/// `Ok` and was queued for phase 2, where the caps finally refused them. It
+/// must now peak within 4× the frame, with nothing queued.
+///
+/// Two mechanisms each close this on their own, and this test fails only with
+/// BOTH reverted: the parse-time limits refuse every entry before it is built,
+/// and the post-parse `enforce_resource_limits` refuses it before it is queued
+/// (with only the latter, each entry still peaks at ~42× its own body inside
+/// the parser — which `parsed_flood_bodies_are_refused_within_the_entry_budget`
+/// catches — but none accumulates, so the frame stays at ~2.8×).
+///
+/// The honest control is 256 real 1000-posting transactions — the largest
+/// honest entry the caps allow, the most of them a frame carries — held to
+/// [`HONEST_FRAME_PEAK_MULTIPLE`] and every one staged.
+#[test]
+fn a_frame_of_flood_bodies_is_refused_within_the_frame_budget() {
+    let _measuring = measurement_lock();
+
+    // ── The attack ──────────────────────────────────────────────────────────
+    let entries: Vec<SupplyEntry> = (0..15)
+        .map(|index| entry_with_true_id(postings_with_metadata_body(&format!("{index:03}"))))
+        .collect();
+    let frame = WireMessage::supply(entries.clone()).to_cbor().unwrap();
+    assert!(frame.len() <= MAX_MESSAGE_SIZE as usize);
+    let budget = frame.len() * ENTRY_PEAK_BUDGET_MULTIPLE;
+    let (staged, peak) = phase_one(&entries);
+    println!(
+        "15 x 41941-posting frame: {} bytes, phase-1 peak {peak} bytes ({:.2}× frame, \
+         budget {budget}), staged {staged}",
+        frame.len(),
+        peak as f64 / frame.len() as f64,
+    );
+    assert_eq!(staged, 0, "no flood entry may be queued for phase 2");
+    assert!(
+        peak <= budget,
+        "phase 1 over a {}-byte flood frame peaked at {peak} bytes, over the \
+         {ENTRY_PEAK_BUDGET_MULTIPLE}× budget of {budget}",
+        frame.len(),
+    );
+    drop(entries);
+
+    // ── Honest traffic ──────────────────────────────────────────────────────
+    let honest: Vec<SupplyEntry> = (0..MAX_SUPPLY_ENTRIES)
+        .map(|index| {
+            let mut body = format!("2024-01-01 * \"Grocer\" \"weekly shop {index}\"\n");
+            for item in 0..ledger::service::MAX_POSTINGS_PER_TRANSACTION - 1 {
+                body.push_str(&format!("  Expenses:Food:Item{item:04}   1.00 USD\n"));
+            }
+            body.push_str("  Assets:Cash  -999.00 USD\n");
+            entry_with_true_id(body)
+        })
+        .collect();
+    let honest_frame = WireMessage::supply(honest.clone()).to_cbor().unwrap();
+    assert!(honest_frame.len() <= MAX_MESSAGE_SIZE as usize);
+    let honest_budget = honest_frame.len() * HONEST_FRAME_PEAK_MULTIPLE;
+    let (honest_staged, honest_peak) = phase_one(&honest);
+    println!(
+        "256 x honest 1000-posting frame: {} bytes, phase-1 peak {honest_peak} bytes \
+         ({:.2}× frame, budget {honest_budget}), staged {honest_staged}",
+        honest_frame.len(),
+        honest_peak as f64 / honest_frame.len() as f64,
+    );
+    assert_eq!(
+        honest_staged, MAX_SUPPLY_ENTRIES,
+        "every honest entry is staged"
+    );
+    assert!(
+        honest_peak <= honest_budget,
+        "an honest {}-byte frame peaked at {honest_peak} bytes, over the \
+         {HONEST_FRAME_PEAK_MULTIPLE}× budget of {honest_budget}",
+        honest_frame.len(),
+    );
 }

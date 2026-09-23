@@ -18,7 +18,7 @@ use rust_decimal::Decimal;
 use std::collections::BTreeMap;
 
 use crate::model::*;
-use crate::read_model::ReadModel;
+use crate::read_model::{AccountBalanceEntry, ExactAmount, ReadModel};
 
 /// A balance assertion check result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,11 +29,17 @@ pub struct AssertionResult {
     pub account: String,
     /// The expected balance (from the `balance` directive).
     pub expected: Decimal,
-    /// The actual balance (from the read model).
+    /// The actual balance (from the read model), as reported: the exact sum
+    /// whenever it fits a `Decimal` at its usual scale, else that sum rounded
+    /// once ([`crate::read_model::ExactAmount::reported`]).
     pub actual: Decimal,
+    /// Whether `actual` is exactly the sum (T76). When it is not, `actual` is
+    /// the rounded figure and `ok` was still decided on the exact sum.
+    pub actual_exact: bool,
     /// The currency.
     pub currency: String,
-    /// Whether the assertion passed.
+    /// Whether the assertion passed: the claimed amount **is** the exact sum
+    /// (T76, L-79) — never merely equal to the rounded `actual`.
     pub ok: bool,
 }
 
@@ -43,7 +49,7 @@ pub struct AssertionResult {
 /// - A `balance` directive asserts that `account` holds exactly
 ///   `amount.number` of `amount.currency` **on** `date` — the read model sums
 ///   every transaction with `date <= the assertion date` (see
-///   `ReadModel::balances_at`). Beancount instead asserts the balance at the
+///   `ReadModel::account_balance`). Beancount instead asserts the balance at the
 ///   *start* of the day, before that day's postings; an assertion dated the
 ///   same day as a posting therefore evaluates differently here.
 /// - Only the asserted currency is compared; other currencies held by the
@@ -51,31 +57,48 @@ pub struct AssertionResult {
 ///   `balance Assets:Unknown 0 USD` passes.
 /// - Evaluation is **read-only reporting**: per §3.6 a failed assertion is
 ///   surfaced (see `crate::verify`), never used to reject or mutate anything.
+/// - The claim is compared with the **exact** sum (T76, L-79). A sum that
+///   does not fit a `Decimal` at its usual scale is *reported* rounded, but
+///   `balance Assets:Cash 1000 USD` does not hold on `1000 + 10^-28` just
+///   because the rounded figure prints `1000.0000000000000000000000000`.
 pub fn evaluate_balance_assertion(balance: &Balance, read_model: &ReadModel) -> AssertionResult {
-    let actual = read_model
-        .account_balance(&balance.account, Some(balance.date))
-        .and_then(|entry| entry.balances.get(&balance.amount.currency).copied())
-        .unwrap_or(Decimal::ZERO);
-
-    assertion_result(balance, actual)
+    let entry = read_model.account_balance(&balance.account, Some(balance.date));
+    assertion_result(balance, entry.as_ref())
 }
 
-/// Build the [`AssertionResult`] for `balance` from the account's `actual`
-/// holding of the asserted currency.
+/// Build the [`AssertionResult`] for `balance` from the account's balance
+/// entry on the assertion date (`None`: never posted to, which reads as `0`).
 ///
 /// Shared by the per-assertion path ([`evaluate_balance_assertion`]) and the
 /// batched one ([`evaluate_all_assertions`]) so the two cannot drift (M-23):
-/// the *only* difference between them is how `actual` is obtained, which is
+/// the *only* difference between them is how the entry is obtained, which is
 /// what makes "the fast path answers what the slow path answered" a testable
 /// claim about one lookup rather than about two copies of the comparison.
-fn assertion_result(balance: &Balance, actual: Decimal) -> AssertionResult {
+fn assertion_result(balance: &Balance, entry: Option<&AccountBalanceEntry>) -> AssertionResult {
+    let sum = entry
+        .and_then(|entry| entry.exact_sums.get(&balance.amount.currency))
+        .copied()
+        .unwrap_or(ExactAmount::ZERO);
+    let (actual, actual_exact) = match sum.reported() {
+        Ok(reported) => (reported.value, reported.exact),
+        // Unreachable inside the amount cap; reported saturated, as the
+        // entry's own figure is, and equal to no claim.
+        Err(_) => (
+            entry
+                .and_then(|entry| entry.balances.get(&balance.amount.currency))
+                .copied()
+                .unwrap_or(Decimal::ZERO),
+            false,
+        ),
+    };
     AssertionResult {
         date: balance.date,
         account: balance.account.clone(),
         expected: balance.amount.number,
         actual,
+        actual_exact,
         currency: balance.amount.currency.clone(),
-        ok: actual == balance.amount.number,
+        ok: sum.equals(balance.amount.number),
     }
 }
 
@@ -94,19 +117,23 @@ pub fn generate_pad_transaction(
     let target_amount = balance.amount.number;
 
     // Step 1: current balance of the account in the currency, as of just before
-    // the balance date (§3.6 step 1).
+    // the balance date (§3.6 step 1) — the exact sum, not its reported figure
+    // (T76), so the pad makes the assertion hold exactly.
     let current = read_model
         .account_balance(&pad.account, Some(balance.date))
-        .and_then(|entry| entry.balances.get(currency).copied())
-        .unwrap_or(Decimal::ZERO);
+        .and_then(|entry| entry.exact_sums.get(currency).copied())
+        .unwrap_or(ExactAmount::ZERO);
 
-    // Step 2: delta = target - current. Checked (H1): every ingress caps both
-    // operands' inputs since H-17 (`validate::MAX_AMOUNT_MANTISSA`), but this
-    // is a `pub` function over any directives and any read model, and a model
-    // built from unvalidated input can still sit at ±Decimal::MAX (its
-    // over-cap fallback saturates), where a bare `-` panics. An overflowing
-    // delta means an absurd assertion; synthesize no pad rather than panic.
-    let delta = target_amount.checked_sub(current)?;
+    // Step 2: delta = target - current, exactly, spelled as `Decimal`
+    // subtraction spells it. A delta no `Decimal` holds exactly means an
+    // absurd assertion (or a model built from amounts no ingress admits);
+    // synthesize no pad rather than a pad that would not balance it (H1).
+    let delta = ExactAmount::from_decimal(target_amount).plus(current.negated());
+    let delta = delta
+        .reported()
+        .ok()
+        .filter(|reported| reported.exact)?
+        .value;
 
     // Step 3: if delta = 0, no pad transaction.
     if delta == Decimal::ZERO {
@@ -208,10 +235,7 @@ where
             // `None` (account never posted to on or before the date) reads as
             // 0, so `balance Assets:Unknown 0 USD` still passes — the same
             // `unwrap_or` the per-assertion path applies.
-            let actual = entry
-                .and_then(|entry| entry.balances.get(&balance.amount.currency).copied())
-                .unwrap_or(Decimal::ZERO);
-            assertion_result(balance, actual)
+            assertion_result(balance, entry.as_ref())
         })
         .collect()
 }

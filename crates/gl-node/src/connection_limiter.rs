@@ -70,18 +70,30 @@ pub struct AntiEntropyLimits {
     /// turns into while its [`FrameReservation`] is alive is not charged:
     ///
     /// ```text
-    /// body (charged)                                   1×
-    /// decoded message (e.g. Vec<SupplyEntry>)         ~1×
+    /// body (charged)                                          1×
+    /// decoded message (e.g. Vec<SupplyEntry>)                ~1×
     /// ciborium `Content` buffering (internally-tagged
-    ///   enum decode, R-4)                              up to 4×
-    /// staged Vec<Directive> for a Supply batch         ~1×
+    ///   enum decode, R-4; transient, before phase 1)          up to 4×
+    /// Supply phase 1 (validate, then stage), measured (T75):
+    ///   a frame of entries over a §3.12 count — refused
+    ///     inside the parser, nothing staged                   < 0.1×
+    ///     (before T75: 20–42× per body, 34.7× a frame)
+    ///   one entry with a 1 MiB token (narration, metadata
+    ///     value: the parser's 4 B/char scan)                  ≤ 6.5× that body
+    ///   256 honest 1000-posting transactions, staged           ~6×
+    ///   densest frame inside every cap (256 × 1000 postings,
+    ///     every count at its cap, ~19 KB bodies), staged       ~13× (≈ 63 MB)
     /// ```
     ///
-    /// So the REAL resident ceiling under the 256 MiB default is ≈ 0.5–1.5 GiB
-    /// (2–6× the charged bytes, depending on how much of the budget is Supply
-    /// bodies — the only frames the decode multiplies badly). The budget is a
-    /// fixed ceiling, not an exact one; size any host against the multiple,
-    /// not the nominal figure.
+    /// The staged directives are bounded per frame by `MAX_SUPPLY_ENTRIES` ×
+    /// the §3.12 caps (≈ 63 MB), not by the frame's bytes, so small dense
+    /// frames multiply most. The REAL resident ceiling under the 256 MiB
+    /// default is therefore ≈ 2 GiB when the budget is full of honest maximal
+    /// `Supply` frames and ≈ 3.5 GiB (~14×) when an allowlisted peer fills it
+    /// with the densest in-cap frames — `Supply` being the only frame the
+    /// decode multiplies badly, and one honest peers rarely send inbound. The
+    /// budget is a fixed ceiling, not an exact one; size any host against the
+    /// multiple, not the nominal figure.
     pub max_frame_bytes_in_flight: usize,
     /// Max inbound frame-body bytes in flight from ONE peer (L-39).
     ///
