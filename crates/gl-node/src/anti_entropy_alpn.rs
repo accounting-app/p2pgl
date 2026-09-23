@@ -108,6 +108,17 @@ const NON_SUPPLY_FRAME_CAP: usize = 1024 * 1024;
 /// finished receiving is simply re-Wanted on the next exchange.
 const CLOSE_DRAIN: Duration = Duration::from_secs(5);
 
+/// Application close code for an inbound session ended by its deadline (M-40).
+///
+/// Distinct from the others this module sends (1 not allowlisted, 2 connection
+/// limit, 3 `accept_bi` timeout, 4 request budget, 6 accept rate — see
+/// [`crate::connection_limiter::Refusal`]) so a peer, and a test, can tell a
+/// session that ran out of wall-clock from every other ending.
+const SESSION_DEADLINE_CLOSE_CODE: u32 = 5;
+
+/// Close reason sent with [`SESSION_DEADLINE_CLOSE_CODE`].
+const SESSION_DEADLINE_CLOSE_REASON: &[u8] = b"session-deadline";
+
 /// Chunk size for the incremental body read (L-19).
 ///
 /// The body is appended chunk by chunk so a stalled stream pins only the bytes
@@ -178,6 +189,15 @@ pub struct AntiEntropyTimeouts {
     /// file-size cap is tens of seconds of transfer), and cutting one short
     /// costs nothing anyway: anti-entropy is idempotent and incremental, so the
     /// next tick resumes where this one stopped.
+    ///
+    /// Since T70 it bounds the INBOUND side too (M-40): `serve_anti_entropy`
+    /// builds a [`SessionBudget`] from this at accept, and every `accept_bi`
+    /// wait and every frame it reads or writes runs under `min(io, time left)`.
+    /// Before that the server had only the per-frame `io` and the frame budget,
+    /// so one ~30-byte `Announce` every 29 s held a serve task and an M-16 slot
+    /// for 100,000 × 29 s ≈ 34 days, and eight peers could pin all 256 slots.
+    /// One value for both sides, so "the client mirrors the server" (M-28) holds
+    /// in both directions; `p2p.antiEntropySessionSeconds` sets it (R-7).
     pub session: Duration,
     /// Pages one peer's `HaveHeads` advert may span — see [`MAX_ADVERT_PAGES`].
     pub max_advert_pages: usize,
@@ -257,17 +277,33 @@ impl SessionBudget {
     /// precisely the shape H-10 exploited — every frame refreshing the only
     /// bound there was.
     fn charge_frame(&mut self) -> Result<Duration, String> {
-        let remaining = self
-            .deadline
-            .saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
+        let Some(timeout) = self.clamped_io() else {
             return Err("anti-entropy session deadline reached".to_owned());
-        }
+        };
         if self.frames_left == 0 {
             return Err("anti-entropy session frame budget exhausted".to_owned());
         }
         self.frames_left -= 1;
-        Ok(self.io.min(remaining))
+        Ok(timeout)
+    }
+
+    /// `min(io, time left)` WITHOUT charging a frame, or `None` once the
+    /// deadline has passed.
+    ///
+    /// The one place the clamp is computed: [`Self::charge_frame`] uses it, and
+    /// so does the server (M-40), which counts frames against its own T24/L-01
+    /// request budget rather than `frames_left` — charging both would count
+    /// every inbound frame twice against two limits meant to be one.
+    fn clamped_io(&self) -> Option<Duration> {
+        let remaining = self
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        (!remaining.is_zero()).then(|| self.io.min(remaining))
+    }
+
+    /// True once the deadline has passed (M-40).
+    fn expired(&self) -> bool {
+        self.clamped_io().is_none()
     }
 }
 
@@ -325,17 +361,33 @@ impl ProtocolHandler for AntiEntropyHandler {
                 "anti-entropy peer not allowlisted",
             )));
         }
-        // M-16: bound concurrent inbound connections, globally and per peer.
-        // The guard is held for the whole serve duration; its `Drop` releases
-        // the global permit and decrements the per-peer count. Rejecting closes
-        // the connection with a distinct code, matching the not-allowlisted
-        // branch's shape (warn, close, return `Err`).
-        let Some(_connection_guard) = self.limiter.try_acquire(remote) else {
-            warn!(peer = %remote, "rejecting anti-entropy connection: inbound connection limit reached");
-            connection.close(2u32.into(), b"connection-limit");
-            return Err(AcceptError::from_err(std::io::Error::other(
-                "anti-entropy inbound connection limit reached",
-            )));
+        // M-16: bound concurrent inbound connections, globally and per peer;
+        // M-40: and how often one peer may open them (the accept bucket). The
+        // guard is held for the whole serve duration; its `Drop` releases the
+        // global permit and decrements the per-peer count.
+        //
+        // A refusal must cost nothing past the handshake iroh already did: no
+        // stream accepted, no byte read, no serve future, and — because a
+        // reconnect loop can provoke refusals as fast as it can dial — no
+        // per-refusal log line either. So it closes with the refusal's own code
+        // and returns `Ok`: returning `Err` would make iroh's router emit an
+        // unthrottled `warn!` for every refused connection, which is exactly
+        // the log stream the throttle below exists to deny.
+        let _connection_guard = match self.limiter.try_acquire(remote) {
+            Ok(guard) => guard,
+            Err(refusal) => {
+                connection.close(refusal.close_code().into(), refusal.close_reason());
+                if let Some(suppressed) = self.limiter.should_log_refusal(std::time::Instant::now())
+                {
+                    warn!(
+                        peer = %remote,
+                        reason = ?refusal,
+                        suppressed,
+                        "rejecting anti-entropy connection: inbound limit reached"
+                    );
+                }
+                return Ok(());
+            }
         };
         if let Err(error) = serve_anti_entropy(self, connection, remote).await {
             warn!(peer = %remote, error = %log_error(&error), "anti-entropy inbound session failed");
@@ -350,7 +402,22 @@ async fn serve_anti_entropy(
     connection: Connection,
     remote: EndpointId,
 ) -> Result<(), String> {
-    let io_timeout = handler.timeouts.io;
+    // M-40: the session's wall-clock bound, started at accept. `io` alone is
+    // per-frame and every frame refreshes it, so before this a peer that never
+    // stalled — one ~30-byte `Announce` every `io - 1` — held this task and its
+    // M-16 slot for 100,000 frames × `io` ≈ 34 days. Every wait below (the
+    // `accept_bi` for the next stream, each frame read, each reply written) now
+    // runs under `min(io, time left)` from this budget, exactly as the client's
+    // frames do via `charge_frame`, and a whole frame read is additionally cut
+    // AT the deadline — see the read below. Its frame counter is unused here:
+    // `requests_handled` is this side's frame budget (T24/L-01).
+    //
+    // Local work between I/O (`collect_supply`, the advert build, applying a
+    // pushed `Supply`) is not interrupted — it is bounded by its own caps, and
+    // ending a session only at an I/O boundary is the gentler shape
+    // `AntiEntropyTimeouts::session` explains — so the worst case is the
+    // deadline, plus one piece of that local work, plus `CLOSE_DRAIN`.
+    let session = SessionBudget::new(&handler.timeouts);
     // T24: bound how many messages one connection may issue. This is a backstop
     // against an infinite/absurd flood on a single stream, not a tight limit —
     // the default (100_000) is far past any legitimate catch-up. A peer cut off
@@ -403,7 +470,7 @@ async fn serve_anti_entropy(
     // connection it is done with by CLOSING it (handled above, nothing left for
     // us to say) or by leaving it idle, so there is no third "session complete"
     // ending left to describe.
-    let (close_code, close_reason): (u32, &[u8]) = loop {
+    let (close_code, close_reason): (u32, &[u8]) = 'streams: loop {
         // T41: bound the wait for the peer's next bi-stream. `accept_bi()` has
         // no deadline of its own, so a peer that completes the QUIC handshake
         // and then opens nothing parked this serve task forever — and with it
@@ -419,7 +486,13 @@ async fn serve_anti_entropy(
         // too, which is what stops a reused connection from being parked
         // indefinitely — and what makes a pooled connection idle for longer
         // than this one dead on the client's next use of it.
-        let (mut send, mut recv) = match tokio::time::timeout(io_timeout, connection.accept_bi())
+        //
+        // M-40: clamped to the session's time left. A deadline reached HERE,
+        // between streams, is routine — see `session_deadline_between_streams`.
+        let Some(accept_wait) = session.clamped_io() else {
+            break session_deadline_between_streams(remote, streams_served);
+        };
+        let (mut send, mut recv) = match tokio::time::timeout(accept_wait, connection.accept_bi())
             .await
         {
             Ok(Ok(streams)) => streams,
@@ -431,6 +504,9 @@ async fn serve_anti_entropy(
                 // connection. That is an ordinary end of session, not a
                 // failure, and there is nothing left to close.
                 return Ok(());
+            }
+            Err(_elapsed) if session.expired() => {
+                break session_deadline_between_streams(remote, streams_served);
             }
             Err(_elapsed) => {
                 if streams_served == 0 {
@@ -459,30 +535,62 @@ async fn serve_anti_entropy(
         // operation on top of that operation's own frames, against a budget of
         // 100,000.
         requests_handled = requests_handled.saturating_add(1);
-        let mut budget_exhausted = false;
-        loop {
+        // How this stream ended the CONNECTION, if it did: the request budget
+        // (T24) or the session deadline (M-40). `None` is an ordinary end of
+        // stream, after which the peer may open another.
+        let mut ended: Option<(u32, &[u8])> = None;
+        'frames: loop {
             if requests_handled >= handler.limits.max_requests_per_connection {
                 warn!(
                     peer = %remote,
                     limit = handler.limits.max_requests_per_connection,
                     "anti-entropy request budget exhausted; closing connection"
                 );
-                budget_exhausted = true;
+                ended = Some((4u32, b"request-budget-exhausted".as_slice()));
                 break;
             }
+            // M-40: no new frame once the deadline has passed.
+            let Some(frame_timeout) = session.clamped_io() else {
+                ended = Some(session_deadline_mid_stream(handler, remote, streams_served));
+                break;
+            };
             // L-39: this frame's claim on the inbound byte budget. Held until
             // the end of this iteration — i.e. until the decoded message has
             // been handled — and released by `Drop` on every way out, including
             // the error returns below.
             let mut reservation = handler.limiter.frame_reservation(remote);
-            let message = match read_message(&mut recv, io_timeout, &mut reservation).await {
-                Ok(message) => message,
+            // M-40: `frame_timeout` bounds each wait INSIDE the read (the length
+            // prefix, the peek, every 64 KiB chunk), so on its own a frame
+            // trickled one chunk per `io - 1` could outlive the deadline by up
+            // to (1 MiB / 64 KiB) × `io` for a non-`Supply`, or 256 × `io` for a
+            // `Supply`. `timeout_at` makes the deadline hard for the frame as a
+            // whole. Dropping a half-read frame is safe — it is pure I/O into a
+            // local buffer, its byte reservation is released by `Drop`, and the
+            // connection is closed straight after — which is not true of the
+            // handling below, and is why only the read is wrapped.
+            let read = tokio::time::timeout_at(
+                session.deadline,
+                read_message(&mut recv, frame_timeout, &mut reservation),
+            )
+            .await;
+            let message = match read {
+                Ok(Ok(message)) => message,
                 // T41: a typed clean shutdown, not a substring match on a
                 // formatted error — see `FrameError` and `classify_read_error`.
                 // Since T42 this ends the STREAM, not the connection: the peer
                 // may open another one for its next operation.
-                Err(FrameError::Eof) => break,
-                Err(error) => return Err(error.to_string()),
+                Ok(Err(FrameError::Eof)) => break,
+                // A read timeout that the deadline clamp caused, or the deadline
+                // itself, is the session ending — not a stalled peer.
+                Err(_elapsed) => {
+                    ended = Some(session_deadline_mid_stream(handler, remote, streams_served));
+                    break;
+                }
+                Ok(Err(FrameError::Timeout)) if session.expired() => {
+                    ended = Some(session_deadline_mid_stream(handler, remote, streams_served));
+                    break;
+                }
+                Ok(Err(error)) => return Err(error.to_string()),
             };
             requests_handled += 1;
             match message {
@@ -496,7 +604,11 @@ async fn serve_anti_entropy(
                     // L-01: charge for the whole advert before writing it.
                     requests_handled = requests_handled.saturating_add(pages.len());
                     for page in pages {
-                        write_message(&mut send, &page, io_timeout).await?;
+                        if !write_within_session(&mut send, &page, &session).await? {
+                            ended =
+                                Some(session_deadline_mid_stream(handler, remote, streams_served));
+                            break 'frames;
+                        }
                     }
                 }
                 WireMessage::Want { ids, .. } => {
@@ -506,7 +618,10 @@ async fn serve_anti_entropy(
                     // read already took. Trimmed WHILE collecting (L-33).
                     let reply = collect_supply(&handler.ledger, &ids).await;
                     requests_handled = requests_handled.saturating_add(1);
-                    write_message(&mut send, &reply, io_timeout).await?;
+                    if !write_within_session(&mut send, &reply, &session).await? {
+                        ended = Some(session_deadline_mid_stream(handler, remote, streams_served));
+                        break 'frames;
+                    }
                 }
                 WireMessage::Supply { entries, .. } => {
                     // A PUSHED Supply: this node Wanted none of it. Applied,
@@ -525,8 +640,8 @@ async fn serve_anti_entropy(
         // straight to the close below).
         let _ = send.finish();
         last_send = Some(send);
-        if budget_exhausted {
-            break (4u32, b"request-budget-exhausted".as_slice());
+        if let Some(ending) = ended {
+            break 'streams ending;
         }
     };
     // Give the peer a BOUNDED window to acknowledge what we already wrote, then
@@ -535,11 +650,78 @@ async fn serve_anti_entropy(
     // must not be able to hold the serve task — and the M-16 limiter slot with
     // it — for a full I/O timeout on the way out, which is the very thing the
     // `accept_bi` timeout above exists to prevent.
+    //
+    // Unchanged by the session deadline (M-40): a session that ran out of time
+    // gets the same short drain after it, which is what bounds the whole serve
+    // at `session + CLOSE_DRAIN` plus one piece of local work.
     if let Some(send) = last_send {
         let _ = tokio::time::timeout(CLOSE_DRAIN, send.stopped()).await;
     }
     connection.close(close_code.into(), close_reason);
     Ok(())
+}
+
+/// The session deadline ended an inbound session while it waited for the
+/// peer's next stream (M-40): log it and name the close.
+///
+/// `debug!` only. This is where an honest pooled connection meets the deadline
+/// — a tick interval shorter than `io` keeps it from ever idling out, so it
+/// lives until the deadline and is closed here between operations — and the
+/// peer's pool simply redials on its next use (T42). Nothing to warn about.
+fn session_deadline_between_streams(
+    remote: EndpointId,
+    streams_served: usize,
+) -> (u32, &'static [u8]) {
+    debug!(
+        peer = %remote,
+        streams_served,
+        "anti-entropy session deadline reached between streams; closing connection"
+    );
+    (SESSION_DEADLINE_CLOSE_CODE, SESSION_DEADLINE_CLOSE_REASON)
+}
+
+/// The session deadline ended an inbound session in the middle of a stream
+/// (M-40): log it and name the close.
+///
+/// `warn!` rather than the `debug!` a deadline between streams gets, because an
+/// honest operation is seconds long and meets the deadline mid-stream only by
+/// the bad luck of straddling it, while a peer holding a stream open frame by
+/// frame always does. Bounded twice: the fields are fixed-size, and one line per
+/// connection at most, so its rate is at most `max_total_connections / session`.
+fn session_deadline_mid_stream(
+    handler: &AntiEntropyHandler,
+    remote: EndpointId,
+    streams_served: usize,
+) -> (u32, &'static [u8]) {
+    warn!(
+        peer = %remote,
+        session_secs = handler.timeouts.session.as_secs(),
+        streams_served,
+        "anti-entropy session deadline reached mid-stream; closing connection"
+    );
+    (SESSION_DEADLINE_CLOSE_CODE, SESSION_DEADLINE_CLOSE_REASON)
+}
+
+/// Write one reply under the inbound session's deadline (M-40).
+///
+/// `Ok(true)` once written; `Ok(false)` when the session deadline ended it —
+/// before it started, or by the clamped timeout (or a failure that coincided
+/// with the deadline) part way through — so the caller closes with the session
+/// code rather than reporting a failed session; `Err` for any other failure,
+/// exactly as `write_message` reported it before.
+async fn write_within_session(
+    send: &mut SendStream,
+    message: &WireMessage,
+    session: &SessionBudget,
+) -> Result<bool, String> {
+    let Some(timeout) = session.clamped_io() else {
+        return Ok(false);
+    };
+    match write_message(send, message, timeout).await {
+        Ok(()) => Ok(true),
+        Err(_) if session.expired() => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// One outbound operation's stream pair, plus the connection it runs over.
@@ -2991,6 +3173,250 @@ pub(crate) mod tests {
         }
         .await;
         Some(exchanged.is_none())
+    }
+
+    // ─── T70 / M-40: server session deadline and accept rate (network) ─────
+
+    /// One allowlisting server under `timeouts`/`limits` and a client endpoint
+    /// that can dial it. The `TempDir` holds the server's ledger alive.
+    struct ServePair {
+        router: Router,
+        client: Endpoint,
+        addr: iroh::EndpointAddr,
+        handler: AntiEntropyHandler,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn serve_pair(timeouts: AntiEntropyTimeouts, limits: AntiEntropyLimits) -> ServePair {
+        let endpoint_server = bind_direct_endpoint().await;
+        let client = bind_direct_endpoint().await;
+        let allow_server =
+            PeerAllowlist::parse(&[client.id().to_string()]).expect("allowlist server");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ledger_server: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(
+                dir.path().join("server.bean"),
+                endpoint_server.id().to_string(),
+            )
+            .expect("boot server ledger"),
+        ));
+        let handler = make_handler_full(ledger_server, allow_server, timeouts, limits);
+        let router = Router::builder(endpoint_server.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler.clone())
+            .spawn();
+        wait_until_dialable(&endpoint_server).await;
+        wait_until_dialable(&client).await;
+        ServePair {
+            router,
+            client,
+            addr: endpoint_server.addr(),
+            handler,
+            _dir: dir,
+        }
+    }
+
+    /// A short session over a short `io`, so the M-40 tests finish in seconds.
+    fn short_session() -> AntiEntropyTimeouts {
+        AntiEntropyTimeouts {
+            connect: Duration::from_secs(5),
+            io: Duration::from_millis(600),
+            session: Duration::from_secs(2),
+            ..AntiEntropyTimeouts::default()
+        }
+    }
+
+    /// M-40: a peer that is never silent — one tiny `Announce` every `io / 2`,
+    /// each refreshing the per-frame timeout — is closed by the server's
+    /// session deadline, with the session's own close code, and the slot it
+    /// held is released. Before T70 nothing but the 100,000-frame budget ended
+    /// this session: with the default `io` that is ~34 days.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn announce_every_half_io_is_closed_at_the_session_deadline() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+        let timeouts = short_session();
+        let limits = AntiEntropyLimits {
+            max_connections_per_peer: 1,
+            ..AntiEntropyLimits::default()
+        };
+        let pair = serve_pair(timeouts, limits).await;
+
+        let conn = connect_retry(&pair.client, pair.addr.clone()).await;
+        let started = tokio::time::Instant::now();
+        let (mut send, _recv) = conn.open_bi().await.expect("open_bi");
+        let announce = WireMessage::announce("a".repeat(64), p2p::protocol::DirectiveKind::Open);
+        let writer = async {
+            // Up to 6 s of announces — three times the session — then stop;
+            // the assertion below is on the close, not on this loop.
+            let give_up = started + Duration::from_secs(6);
+            while tokio::time::Instant::now() < give_up {
+                if write_message(&mut send, &announce, Duration::from_secs(2))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(timeouts.io / 2).await;
+            }
+        };
+        let ((), reason) = tokio::join!(writer, async {
+            tokio::time::timeout(Duration::from_secs(20), conn.closed()).await
+        });
+        let elapsed = started.elapsed();
+        let reason = reason.expect("the server must end a never-silent session");
+        assert!(
+            format!("{reason}").contains("session-deadline"),
+            "the close must carry the session code, got: {reason}"
+        );
+        assert!(
+            elapsed >= timeouts.session - Duration::from_millis(200),
+            "closed before the session ran out ({elapsed:?})"
+        );
+        assert!(
+            elapsed < timeouts.session + CLOSE_DRAIN + Duration::from_secs(4),
+            "the close must come at session + CLOSE_DRAIN, not later ({elapsed:?})"
+        );
+        drop(conn);
+
+        // The slot is back: with a per-peer cap of 1, a fresh session from the
+        // same peer completes an advert exchange.
+        let mut admitted = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while tokio::time::Instant::now() < deadline {
+            if let Some(refused) = probe_refused(&pair.client, pair.addr.clone()).await {
+                admitted = !refused;
+                if admitted {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let _ = pair.router.shutdown().await;
+        assert!(
+            admitted,
+            "the expired session's connection slot was never released"
+        );
+    }
+
+    /// M-40: the deadline is hard for a frame as a whole, not only between
+    /// frames. A 1,000,000-byte frame (under the non-`Supply` cap, so it is
+    /// read in full) trickled one 64 KiB chunk every `io / 2` refreshes every
+    /// sub-read's timeout and would take 16 × 300 ms ≈ 4.8 s — more than twice
+    /// the 2 s session. It must be cut at the deadline with the session code,
+    /// not read to the end and then failed as an undecodable frame.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_frame_trickled_past_the_deadline_is_cut_at_the_deadline() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+        let timeouts = short_session();
+        let pair = serve_pair(timeouts, AntiEntropyLimits::default()).await;
+
+        let conn = connect_retry(&pair.client, pair.addr.clone()).await;
+        let started = tokio::time::Instant::now();
+        let (mut send, _recv) = conn.open_bi().await.expect("open_bi");
+        let frame_len: u32 = 1_000_000;
+        let writer = async {
+            if send.write_all(&frame_len.to_be_bytes()).await.is_err() {
+                return;
+            }
+            let chunk = vec![0u8; READ_CHUNK];
+            let mut sent = 0usize;
+            while sent < frame_len as usize {
+                let take = (frame_len as usize - sent).min(chunk.len());
+                if send.write_all(&chunk[..take]).await.is_err() {
+                    return;
+                }
+                sent += take;
+                tokio::time::sleep(timeouts.io / 2).await;
+            }
+        };
+        let ((), reason) = tokio::join!(writer, async {
+            tokio::time::timeout(Duration::from_secs(20), conn.closed()).await
+        });
+        let elapsed = started.elapsed();
+        let _ = pair.router.shutdown().await;
+        let reason = reason.expect("the server must close the connection");
+        assert!(
+            format!("{reason}").contains("session-deadline"),
+            "a frame straddling the deadline must end the session with its code, got: {reason}"
+        );
+        assert!(
+            elapsed < timeouts.session + CLOSE_DRAIN + Duration::from_secs(4),
+            "cut at the deadline, not after the whole frame ({elapsed:?})"
+        );
+    }
+
+    /// M-40: a peer reconnecting in a tight loop is admitted at the accept
+    /// bucket's rate and no faster, every refused connection is closed with
+    /// the rate code, and a refused connection never reaches the serve loop —
+    /// the limiter's admission count is exactly the client's admitted count,
+    /// so no guard, no serve future and no stream was spent on the rest. The
+    /// bucket then refills and the same peer is admitted again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_tight_reconnect_loop_is_admitted_only_at_the_bucket_rate() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+        let burst = 3u32;
+        let refill = Duration::from_secs(3);
+        let limits = AntiEntropyLimits {
+            accept_burst: burst,
+            accept_refill_interval: refill,
+            ..AntiEntropyLimits::default()
+        };
+        let pair = serve_pair(short_timeouts(), limits).await;
+
+        // Ask for a verdict on one fresh connection: `true` when the server
+        // refused it for rate. An admitted connection is left open by the
+        // server (it waits for a stream), so no close within the window means
+        // admitted; the client then closes it itself.
+        async fn dial_verdict(pair: &ServePair) -> bool {
+            let conn = connect_retry(&pair.client, pair.addr.clone()).await;
+            match tokio::time::timeout(Duration::from_millis(400), conn.closed()).await {
+                Ok(reason) => {
+                    assert!(
+                        format!("{reason}").contains("accept-rate-limit"),
+                        "the only refusal in play is the rate, got: {reason}"
+                    );
+                    true
+                }
+                Err(_still_open) => {
+                    conn.close(0u32.into(), b"done");
+                    false
+                }
+            }
+        }
+
+        let attempts = 12;
+        let started = tokio::time::Instant::now();
+        let mut admitted = 0usize;
+        let mut refused = 0usize;
+        for _ in 0..attempts {
+            if dial_verdict(&pair).await {
+                refused += 1;
+            } else {
+                admitted += 1;
+            }
+        }
+        let elapsed = started.elapsed();
+        let refills = (elapsed.as_secs_f64() / refill.as_secs_f64()).ceil() as usize;
+        assert!(
+            admitted >= burst as usize,
+            "the burst must be admitted ({admitted} of {attempts})"
+        );
+        assert!(
+            admitted <= burst as usize + refills,
+            "admitted {admitted} in {elapsed:?}: more than burst {burst} + {refills} refills"
+        );
+        assert!(refused > 0, "a tight loop must hit the bucket");
+        assert_eq!(
+            pair.handler.limiter.accepted_total(),
+            admitted,
+            "only admitted connections may reach the serve loop"
+        );
+
+        tokio::time::sleep(refill).await;
+        assert!(
+            !dial_verdict(&pair).await,
+            "after a refill interval the peer is admitted again"
+        );
+        let _ = pair.router.shutdown().await;
     }
 
     // ─── T41: EOF classification is by variant, not by substring ───────────

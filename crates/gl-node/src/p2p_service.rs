@@ -778,6 +778,10 @@ enum KeyFileState {
     Material(Zeroizing<[u8; 32]>),
 }
 
+/// Upper bound on a key file's size (T67): 64 hex characters plus generous
+/// room for surrounding whitespace.
+const MAX_SECRET_KEY_FILE_BYTES: u64 = 4096;
+
 /// Open the key file **once** and read the key out of that same handle (L-04).
 ///
 /// Every check below is made against the open file description — the permission
@@ -798,8 +802,21 @@ fn read_secret_key_file(path: &Path) -> Result<KeyFileState, Box<dyn std::error:
 
     ensure_secret_key_permissions(&file, path)?;
 
+    // T67: read through a cap, like every other ledger-side read. A key file
+    // is 64 hex characters; the bound leaves room for whitespace and refuses a
+    // file that is (or grew into) something else before it is buffered whole.
     let mut hex_content = Zeroizing::new(String::new());
-    file.read_to_string(&mut hex_content)?;
+    (&mut file)
+        .take(MAX_SECRET_KEY_FILE_BYTES + 1)
+        .read_to_string(&mut hex_content)?;
+    if hex_content.len() as u64 > MAX_SECRET_KEY_FILE_BYTES {
+        return Err(format!(
+            "Secret key file {} is larger than {MAX_SECRET_KEY_FILE_BYTES} bytes; a node key \
+             is 64 hex characters (T67)",
+            path.display()
+        )
+        .into());
+    }
     let trimmed = hex_content.trim();
     if trimmed.is_empty() {
         return Ok(KeyFileState::Empty);
@@ -872,7 +889,8 @@ pub(crate) fn load_or_create_secret_key(
     Ok(NodeSecretKey { bytes })
 }
 
-/// Open the key file without following a symlink at its final component (L-49).
+/// Open the key file without following a symlink at its final component (L-49),
+/// without blocking, and only as a node-private regular file (T67).
 ///
 /// `Ok(None)` means nothing is at the path — the caller's cue to create a key.
 ///
@@ -882,67 +900,30 @@ pub(crate) fn load_or_create_secret_key(
 /// That key is both the QUIC identity and the ledger signing key, so adopting a
 /// file someone else chose is full node impersonation.
 ///
-/// The textbook fix is `open(O_NOFOLLOW)`, but `std` exposes no portable
-/// constant for it and `gl-node` deliberately has no `libc` dependency (its
-/// value differs across Linux architectures, so hard-coding it is worse). The
-/// equivalent here is `lstat` → refuse anything that is not a regular file →
-/// `open` → require the opened handle's `(st_dev, st_ino)` to equal the
-/// `lstat`'s. If the path is relinked to a symlink (or anything else) between
-/// the two calls, the descriptor names a different inode and is refused, so the
-/// only file that can be read is one that was, at `lstat` time, a plain file at
-/// the path itself. Every later check still runs on the handle (L-04).
+/// L-49 closed that with `lstat` → regular file → `File::open` → same
+/// `(st_dev, st_ino)`, because `gl-node` had no `libc` for `O_NOFOLLOW`. That
+/// left a narrow race (M-36): a FIFO swapped in between the `lstat` and the
+/// blocking `open` parked boot. Since T67 the open is
+/// [`ledger::journal::open_checked`] with
+/// [`ledger::journal::FileTrust::NodePrivate`] — the same helper every
+/// ledger-side file uses: `O_NOFOLLOW | O_NONBLOCK`, the inode comparison, and
+/// on the handle a regular file owned by this uid, with one link (a hard link
+/// is a second name someone else may read it through) and mode 0600.
+/// [`ensure_secret_key_permissions`] still runs on the handle afterwards; on
+/// Unix it re-states the owner and mode checks, and it is where the non-Unix
+/// warning lives.
 #[cfg(unix)]
 fn open_secret_key_file(path: &Path) -> Result<Option<File>, Box<dyn std::error::Error>> {
-    use std::os::unix::fs::MetadataExt;
-
-    let link_metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(format!(
-                "Secret key file {} could not be inspected: {error}",
-                path.display()
-            )
-            .into())
-        }
-    };
-    if link_metadata.file_type().is_symlink() {
-        return Err(format!(
-            "Secret key file {} is a symbolic link; refusing to follow it — the node key \
-             must be a regular file at the configured path (L-49)",
-            path.display()
-        )
-        .into());
+    match ledger::journal::open_checked(
+        path,
+        std::fs::OpenOptions::new().read(true),
+        ledger::journal::FileTrust::NodePrivate,
+        "Secret key file",
+    ) {
+        Ok(checked) => Ok(Some(checked.file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("{error} (L-49)").into()),
     }
-    if !link_metadata.file_type().is_file() {
-        return Err(format!(
-            "Secret key file {} is not a regular file; refusing to read it (L-49)",
-            path.display()
-        )
-        .into());
-    }
-
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) => {
-            return Err(format!(
-                "Secret key file {} could not be opened: {error}",
-                path.display()
-            )
-            .into())
-        }
-    };
-
-    let handle_metadata = file.metadata()?;
-    if (handle_metadata.dev(), handle_metadata.ino()) != (link_metadata.dev(), link_metadata.ino())
-    {
-        return Err(format!(
-            "Secret key file {} was replaced while being opened; refusing to read it (L-49)",
-            path.display()
-        )
-        .into());
-    }
-    Ok(Some(file))
 }
 
 /// Non-Unix: a plain open. There is no `lstat`/inode identity to pin here, and
@@ -1033,16 +1014,14 @@ fn ensure_secret_key_owner(
 
 /// `geteuid(2)`: the uid file ownership is checked against (L-49).
 ///
-/// Declared directly, as `main.rs`'s test-only `umask` is, rather than adding a
-/// `libc` dependency for one call. `uid_t` is `u32` on every Unix this builds
-/// for (Linux, macOS, the BSDs), and `geteuid` takes no arguments, cannot fail
-/// and touches no memory, which is what makes it sound to declare `safe`.
+/// R-17: this was a hand-written `unsafe extern "C" { safe fn geteuid() }`
+/// declaration — the workspace's only production FFI declaration. It now
+/// delegates to the ledger crate's [`ledger::journal::effective_uid`], which
+/// calls the `libc` crate's binding (a direct dependency since T67) and is the
+/// same uid every other node-owned file is checked against.
 #[cfg(unix)]
 fn effective_uid() -> u32 {
-    unsafe extern "C" {
-        safe fn geteuid() -> u32;
-    }
-    geteuid()
+    ledger::journal::effective_uid()
 }
 
 /// Non-Unix: there is no mode to check, so say so instead of returning `Ok(())`
@@ -1827,6 +1806,57 @@ mod tests {
         );
     }
 
+    /// M-36 / T67: a FIFO at the key path. L-49's `lstat` refused one that was
+    /// already there, but a FIFO swapped in between the `lstat` and the
+    /// blocking `File::open` parked boot. The open is now `O_NONBLOCK |
+    /// O_NOFOLLOW` through `ledger::journal::open_checked`, so both loaders
+    /// return `Err` at once.
+    #[cfg(unix)]
+    #[test]
+    fn test_secret_key_read_refuses_a_fifo_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("fifo.secret");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&key_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let polled = key_path.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send((
+                load_secret_key(&polled)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+                load_or_create_secret_key(&polled)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+            ));
+        });
+        let (load, load_or_create) = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("M-36: the key load blocked on a FIFO");
+        for outcome in [load, load_or_create] {
+            let error = outcome.expect_err("a FIFO is not a key file");
+            assert!(error.contains("not a regular file"), "{error}");
+        }
+    }
+
+    /// T67 (L-58's rule, applied to the key): a hard link from the key path to
+    /// a 0600 key file elsewhere is a second name for the node's identity, and
+    /// is refused.
+    #[cfg(unix)]
+    #[test]
+    fn test_secret_key_read_refuses_a_hard_linked_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.secret");
+        write_secret_key_file(&original, &hex::encode([3u8; 32])).unwrap();
+        let key_path = dir.path().join("node.secret");
+        std::fs::hard_link(&original, &key_path).unwrap();
+        let error = load_secret_key(&key_path).expect_err("a hard-linked key is refused");
+        assert!(error.to_string().contains("hard links"), "{error}");
+    }
+
     /// The owner comparison: a key owned by any uid other than ours is refused,
     /// root included; our own is accepted.
     ///
@@ -1878,7 +1908,7 @@ mod tests {
         );
     }
 
-    /// `effective_uid()` (the hand-declared `geteuid`) must agree with the
+    /// `effective_uid()` (`libc::geteuid` via the ledger crate, R-17) must agree with the
     /// owner the kernel stamps on a file this process creates — otherwise the
     /// L-49 check would refuse every legitimately created key, or accept every
     /// foreign one. The full load path must then accept that file.

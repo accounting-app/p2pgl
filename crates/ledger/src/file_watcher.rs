@@ -87,6 +87,17 @@ impl FileState {
     /// it does: `read_ledger_file` returns `ResourceLimitExceeded` and the
     /// watcher logs it. Hiding the change here instead would be worse — the
     /// operator would get silence rather than the error that names the cap.
+    ///
+    /// # What is read (T67, M-36)
+    ///
+    /// Only a regular file (or a symlink to one — the `.bean` policy in
+    /// [`crate::journal::FileTrust::OperatorLedger`]), opened without blocking
+    /// and read through a cap enforced by the read itself. A FIFO at the path
+    /// used to pass the `stat` cap at length 0 and then block this runtime
+    /// worker in `read`, or stream past the cap. Anything that is not a regular
+    /// file is reported like an over-cap one — size and mtime, no hash — so the
+    /// change is still seen and the reconcile's `read_ledger_file` is the one
+    /// that refuses it by name.
     pub fn from_path(path: &Path) -> Self {
         let Ok(metadata) = std::fs::metadata(path) else {
             return FileState {
@@ -96,7 +107,7 @@ impl FileState {
             };
         };
         let modified = metadata.modified().ok();
-        if metadata.len() > crate::service::MAX_LEDGER_FILE_BYTES {
+        if !metadata.is_file() || metadata.len() > crate::service::MAX_LEDGER_FILE_BYTES {
             return FileState {
                 size: Some(metadata.len()),
                 modified,
@@ -104,8 +115,21 @@ impl FileState {
             };
         }
         // Read once and derive both size and hash from the same bytes so they
-        // stay consistent. The `stat` above bounds the read.
-        match std::fs::read(path) {
+        // stay consistent. The handle's `fstat` and the capped read bound it.
+        let read = crate::journal::open_checked(
+            path,
+            std::fs::OpenOptions::new().read(true),
+            crate::journal::FileTrust::OperatorLedger,
+            "ledger file",
+        )
+        .and_then(|checked| {
+            crate::journal::read_to_end_capped(
+                &checked.file,
+                checked.metadata.len(),
+                crate::service::MAX_LEDGER_FILE_BYTES,
+            )
+        });
+        match read {
             Ok(bytes) => {
                 let digest = Sha256::digest(&bytes);
                 let mut content_hash = [0u8; 32];
@@ -451,6 +475,39 @@ mod tests {
             state.content_hash_hex().unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// M-36: the watcher polls `from_path` on a runtime worker four times a
+    /// second. A FIFO at the `.bean` passed the `stat` cap at length 0 and then
+    /// blocked that worker in `std::fs::read`. It now returns at once, with no
+    /// hash (the reconcile's `read_ledger_file` names the refusal).
+    ///
+    /// Bug-catch: read with `std::fs::read` again and this times out.
+    #[cfg(unix)]
+    #[test]
+    fn m36_from_path_does_not_block_on_a_fifo() {
+        let path = std::env::temp_dir().join(format!(
+            "openledger-watcher-fifo-{}.bean",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let polled = path.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(FileState::from_path(&polled));
+        });
+        let state = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("M-36: from_path blocked on a FIFO");
+        assert!(state.content_hash.is_none(), "a FIFO is never hashed");
         std::fs::remove_file(&path).ok();
     }
 }

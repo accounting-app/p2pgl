@@ -105,8 +105,15 @@ struct FileMarker {
 }
 
 impl FileMarker {
+    /// `None` — "cannot vouch for it", which escalates the next commit to a
+    /// compaction and its exact check — for anything that is not a regular
+    /// file (T67): a FIFO's `stat` never changes, so a marker for one would
+    /// report "untouched" forever. Only a `stat`, which cannot block.
     fn of(path: &Path) -> Option<FileMarker> {
         let metadata = std::fs::metadata(path).ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
         Some(FileMarker {
             length: metadata.len(),
             modified: metadata.modified().ok(),
@@ -114,7 +121,106 @@ impl FileMarker {
     }
 }
 
-/// Write `content` via a sibling `.tmp` file, fsync, then POSIX rename (H-10 / CAP-1).
+/// Infix of every temporary a full rewrite creates beside the ledger (L-57):
+/// `<name>.tmp.<pid>.<nonce>`. The pre-T67 name was exactly `<name>.tmp`, which
+/// [`sweep_stale_temporaries`] still recognises.
+const TEMPORARY_INFIX: &str = ".tmp";
+
+/// A temp name nobody can pre-plant (L-57).
+///
+/// The fixed `<name>.tmp` let anyone who can write the ledger's directory put a
+/// **directory** there: `create_new` failed `AlreadyExists`, `remove_file` then
+/// failed `EISDIR`/`EPERM`, and every compaction, reconcile and the startup
+/// compaction failed until an operator removed it. The name now carries the pid
+/// and a per-call nonce (wall-clock nanoseconds mixed with a process-wide
+/// counter — no new dependency, and nothing here needs to be unpredictable to a
+/// local attacker: an `O_EXCL` collision just draws another name). No stale
+/// entry is ever unlinked on this path; [`sweep_stale_temporaries`] does that
+/// once, at boot.
+fn temporary_path_for(path: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0);
+    let nonce = nanos.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ sequence.rotate_left(40);
+    path.with_file_name(format!(
+        "{}{TEMPORARY_INFIX}.{}.{nonce:016x}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ))
+}
+
+/// Remove the temporaries crashed rewrites left beside `path` (L-57).
+///
+/// Runs once, from a process-start boot — under `gl-node` that is after
+/// `ledger_lock::acquire`, so no sibling process can be mid-persist on this
+/// ledger and every match is a crashed leftover. Matches `<name>.tmp` (the
+/// pre-T67 fixed name) and `<name>.tmp.*`. Removes only what a crashed persist
+/// could have left: a regular file or a symlink, owned by this uid. Anything
+/// else — a directory, a FIFO, a file another account owns — is logged and
+/// left alone: it is not ours to delete, and it no longer blocks a write,
+/// because writes never reuse a name. Best effort: a failure here never fails
+/// the boot. (Library users that run several writers on one ledger without
+/// that lock keep the pre-T30 exposure, as `persist_atomically` documents.)
+fn sweep_stale_temporaries(path: &Path) {
+    let Some(file_name) = path.file_name() else {
+        return;
+    };
+    let exact = format!("{}{TEMPORARY_INFIX}", file_name.to_string_lossy());
+    let prefix = format!("{exact}.");
+    let directory = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name != exact && !name.starts_with(&prefix) {
+            continue;
+        }
+        let candidate = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&candidate) else {
+            continue;
+        };
+        let file_type = metadata.file_type();
+        #[cfg(unix)]
+        let ours = {
+            use std::os::unix::fs::MetadataExt;
+            metadata.uid() == crate::journal::effective_uid()
+        };
+        #[cfg(not(unix))]
+        let ours = true;
+        if (file_type.is_file() || file_type.is_symlink()) && ours {
+            // `remove_file` unlinks the entry itself, never a link's target.
+            match std::fs::remove_file(&candidate) {
+                Ok(()) => info!(
+                    path = %candidate.display(),
+                    "removed a temporary file left by an interrupted ledger rewrite (L-57)"
+                ),
+                Err(error) => warn!(
+                    path = %candidate.display(),
+                    %error,
+                    "could not remove a stale ledger temporary file (L-57)"
+                ),
+            }
+        } else {
+            warn!(
+                path = %candidate.display(),
+                "an entry named like a ledger temporary file is not a file this node could \
+                 have left (a directory, a special file, or another account's); leaving it \
+                 alone — it no longer blocks writes, but remove it if you do not recognise \
+                 it (L-57)"
+            );
+        }
+    }
+}
+
+/// Write `content` via a sibling temp file, fsync, then POSIX rename (H-10 / CAP-1).
 fn persist_atomically(path: &Path, content: &str) -> Result<(), std::io::Error> {
     if content.len() as u64 > MAX_LEDGER_FILE_BYTES {
         return Err(std::io::Error::new(
@@ -132,69 +238,44 @@ fn persist_atomically(path: &Path, content: &str) -> Result<(), std::io::Error> 
             "ledger path has no file name",
         )
     })?;
-    let temporary_path = path.with_file_name(format!("{}.tmp", file_name.to_string_lossy()));
 
+    let mut options = std::fs::OpenOptions::new();
+    // `create_new` sets O_CREAT|O_EXCL, which refuses to open (and therefore
+    // to follow) anything already at the temp name — a pre-planted symlink
+    // included — closing the race where a persist would truncate a link's
+    // target.
+    options.write(true).create_new(true);
+    #[cfg(unix)]
     {
-        let mut options = std::fs::OpenOptions::new();
-        // `create_new` sets O_CREAT|O_EXCL, which refuses to open (and therefore
-        // to follow) a pre-planted `<name>.tmp` symlink — closing the symlink
-        // race where the next persist would truncate the link's target.
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        // A leftover temp from a previously crashed persist is unlinked once and
-        // retried. `remove_file` unlinks the entry itself (never a symlink's
-        // target); if a symlink is re-planted in the race window, the retry's
-        // O_EXCL create fails again and the persist errors out rather than
-        // writing through the link.
-        //
-        // Whose temp is it? Under `gl-node`, which holds an exclusive
-        // inter-process lock on the ledger for the life of the process
-        // (M-17/T30, `gl-node/src/ledger_lock.rs`), no sibling process can be
-        // mid-persist on this file — so the temp found here is always our own
-        // crashed leftover and unlinking it is safe. Library users that call the
-        // service directly without taking that lock keep the pre-T30 exposure:
-        // a concurrent process's in-flight temp could be deleted here. Take the
-        // same lock if you run more than one writer on a ledger.
-        let mut file = match options.open(&temporary_path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                std::fs::remove_file(&temporary_path)?;
-                options.open(&temporary_path)?
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    // L-57: a fresh name per call, and on the (astronomically unlikely, or
+    // planted) collision another fresh name — never an unlink of whatever is
+    // there. Eight draws bound the loop; exhausting them means something is
+    // creating these names on purpose, and the write fails loudly.
+    let mut attempts = 0;
+    let (temporary_path, mut file) = loop {
+        let candidate = temporary_path_for(path, file_name);
+        match options.open(&candidate) {
+            Ok(file) => break (candidate, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempts < 8 => {
+                attempts += 1;
             }
             Err(error) => return Err(error),
-        };
-        file.write_all(content.as_bytes())?;
-
-        // L-44: pin the mode through the HANDLE (`fchmod`), before the rename.
-        // `mode(0o600)` above is masked by the process umask, which can only
-        // clear bits, so an exact 0600 still needs a chmod — but this used to
-        // be `std::fs::metadata(path)` + `std::fs::set_permissions(path)` AFTER
-        // the rename, and both follow symlinks. Anyone who can write the
-        // ledger's directory could swap a symlink in at `path` between the
-        // rename and the chmod and have the node chmod an arbitrary target to
-        // 0600 — as root, in the shipped container. The handle names the inode
-        // this function created with O_EXCL and nothing else, and the rename
-        // moves that same inode into place, so the mode lands on exactly the
-        // file that becomes the ledger. The key writer in `gl-node`'s
-        // `p2p_service.rs` (L-32) does the same, for the same reason.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = file.metadata()?.permissions();
-            permissions.set_mode(0o600);
-            file.set_permissions(permissions)?;
         }
+    };
 
-        // After the chmod, so the mode change is covered by the same fsync
-        // that makes the bytes durable.
-        file.sync_all()?;
+    // From here on the temp is ours; a failure removes it, so a failing write
+    // does not leave one behind per attempt now that names are never reused.
+    let written = write_temporary(&mut file, content).and_then(|()| {
+        drop(file);
+        std::fs::rename(&temporary_path, path)
+    });
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(error);
     }
-
-    std::fs::rename(&temporary_path, path)?;
 
     let directory = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -206,6 +287,35 @@ fn persist_atomically(path: &Path, content: &str) -> Result<(), std::io::Error> 
     Ok(())
 }
 
+/// Fill, chmod and fsync the temp `persist_atomically` created.
+fn write_temporary(file: &mut std::fs::File, content: &str) -> Result<(), std::io::Error> {
+    file.write_all(content.as_bytes())?;
+
+    // L-44: pin the mode through the HANDLE (`fchmod`), before the rename.
+    // `mode(0o600)` above is masked by the process umask, which can only
+    // clear bits, so an exact 0600 still needs a chmod — but this used to
+    // be `std::fs::metadata(path)` + `std::fs::set_permissions(path)` AFTER
+    // the rename, and both follow symlinks. Anyone who can write the
+    // ledger's directory could swap a symlink in at `path` between the
+    // rename and the chmod and have the node chmod an arbitrary target to
+    // 0600 — as root, in the shipped container. The handle names the inode
+    // this function created with O_EXCL and nothing else, and the rename
+    // moves that same inode into place, so the mode lands on exactly the
+    // file that becomes the ledger. The key writer in `gl-node`'s
+    // `p2p_service.rs` (L-32) does the same, for the same reason.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = file.metadata()?.permissions();
+        permissions.set_mode(0o600);
+        file.set_permissions(permissions)?;
+    }
+
+    // After the chmod, so the mode change is covered by the same fsync
+    // that makes the bytes durable.
+    file.sync_all()
+}
+
 /// Read the ledger file, capped at [`MAX_LEDGER_FILE_BYTES`], with a leading
 /// UTF-8 BOM stripped (L-28).
 ///
@@ -215,14 +325,48 @@ fn persist_atomically(path: &Path, content: &str) -> Result<(), std::io::Error> 
 /// ([`LedgerService::last_file_hash`]) must be taken over the BOM-free form —
 /// otherwise a BOM'd-but-otherwise-identical file would read as a hand edit and
 /// trigger a pointless reconcile on the next persist.
+///
+/// # What may be read (T67, M-36)
+///
+/// The open is [`crate::journal::open_checked`] with
+/// [`crate::journal::FileTrust::OperatorLedger`]: a regular file, or a symlink
+/// whose target is one — never a FIFO, device, socket or directory, and never
+/// through a blocking `open`. This used to be `metadata().len()` then
+/// `read_to_string`: a FIFO has length 0, passed the cap, and then either
+/// blocked the caller forever (under the ledger write lock, on the compaction
+/// path) or streamed past the cap (73 MB loaded through 64 MiB). The size is
+/// now checked on the handle and enforced again by the read itself, through
+/// `take(MAX + 1)`. A missing file is still `NotFound` — the H-15 callers
+/// depend on telling absence from every other failure.
 fn read_ledger_file(path: &Path) -> Result<String, ServiceError> {
-    let length = std::fs::metadata(path)?.len();
+    let checked = crate::journal::open_checked(
+        path,
+        std::fs::OpenOptions::new().read(true),
+        crate::journal::FileTrust::OperatorLedger,
+        "ledger file",
+    )?;
+    let over_cap = |length: String| ServiceError::ResourceLimitExceeded {
+        message: format!("ledger file is {length} bytes (max {MAX_LEDGER_FILE_BYTES})"),
+    };
+    let length = checked.metadata.len();
     if length > MAX_LEDGER_FILE_BYTES {
-        return Err(ServiceError::ResourceLimitExceeded {
-            message: format!("ledger file is {length} bytes (max {MAX_LEDGER_FILE_BYTES})"),
-        });
+        return Err(over_cap(length.to_string()));
     }
-    let content = std::fs::read_to_string(path)?;
+    let bytes =
+        match crate::journal::read_to_end_capped(&checked.file, length, MAX_LEDGER_FILE_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::FileTooLarge => {
+                return Err(over_cap(format!("more than {MAX_LEDGER_FILE_BYTES}")));
+            }
+            Err(error) => return Err(ServiceError::Io(error)),
+        };
+    // Same error `read_to_string` gave for non-UTF-8 content.
+    let content = String::from_utf8(bytes).map_err(|_| {
+        ServiceError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        ))
+    })?;
     Ok(match content.strip_prefix(crate::parse::BYTE_ORDER_MARK) {
         Some(stripped) => stripped.to_owned(),
         None => content,
@@ -1733,6 +1877,10 @@ pub struct PendingCommit {
     canonical: String,
     /// [`CommitKind::Append`] only: the framed journal record.
     record: String,
+    /// [`CommitKind::Compact`] only: rename the journal to a `.torn-*`
+    /// sidecar instead of deleting it, because the boot that loaded it dropped
+    /// a torn tail (M-43).
+    retire_torn_journal: bool,
     observer: Option<CommitObserver>,
     /// Releases the service's in-flight flag however this value ends its life
     /// (H-11). Never read; the whole point is the `Drop`. See
@@ -1787,7 +1935,22 @@ impl PendingCommit {
         match self.kind {
             CommitKind::Compact => {
                 persist_atomically(&self.ledger_path, &self.canonical)?;
-                crate::journal::remove_journal(&self.journal_path)?;
+                if self.retire_torn_journal {
+                    // M-43: the records boot could read are now in the
+                    // `.bean`; the bytes it dropped as torn are kept.
+                    if let Some(sidecar) = crate::journal::retire_torn_journal(&self.journal_path)?
+                    {
+                        warn!(
+                            journal = %self.journal_path.display(),
+                            sidecar = %sidecar.display(),
+                            "ledger commit journal with a torn tail folded into the .bean and \
+                             kept as a sidecar, not deleted; no boot reads it — inspect it, \
+                             then remove it (M-43)"
+                        );
+                    }
+                } else {
+                    crate::journal::remove_journal(&self.journal_path)?;
+                }
                 Ok(CommitReceipt {
                     generation: self.generation,
                     kind: self.kind,
@@ -2233,6 +2396,15 @@ pub struct LedgerService {
     /// to *remove* refused entries from the file; and a journal whose tail was
     /// torn by a crash, which cannot be safely appended to.
     force_compaction: bool,
+    /// The boot that built this service dropped a torn journal tail (M-43).
+    ///
+    /// The compaction that folds that journal renames it to
+    /// `<journal>.torn-<unix-seconds>` instead of deleting it
+    /// ([`crate::journal::retire_torn_journal`]): "torn" is a judgement about
+    /// bytes, and the bytes it dropped are never destroyed on the strength of
+    /// it. Cleared by the first compaction's receipt; re-derived by every
+    /// boot, so an L-13 reload of a still-torn journal sets it again.
+    journal_torn_at_boot: bool,
     /// Bumped by every [`Self::prepare_commit`]; stamped into the
     /// [`PendingCommit`] and checked by [`Self::finish_commit`].
     commit_generation: u64,
@@ -2335,9 +2507,19 @@ impl LedgerService {
         // threshold, so this is a ledger whose `.bean` was removed or renamed,
         // and an empty file here would silently fold the journal's records
         // into a ledger holding nothing else.
-        let content = match std::fs::metadata(&file_path) {
-            Ok(_) => read_ledger_file(&file_path)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        //
+        // T67: `read_ledger_file` refuses anything at the path that is not a
+        // regular file (or a symlink to one) without blocking, so a FIFO
+        // `.bean` fails the boot instead of parking it after the lock is
+        // taken, and a dangling symlink is refused rather than read as
+        // "absent" and replaced by an empty ledger.
+        if matches!(mode, BootMode::Fresh) {
+            // L-57: once per process start, clear what crashed rewrites left.
+            sweep_stale_temporaries(&file_path);
+        }
+        let content = match read_ledger_file(&file_path) {
+            Ok(content) => content,
+            Err(ServiceError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 let journal_exists = journal_path.exists();
                 match mode {
                     BootMode::Reload => {
@@ -2377,7 +2559,7 @@ impl LedgerService {
                     }
                 }
             }
-            Err(error) => return Err(ServiceError::Io(error)),
+            Err(error) => return Err(error),
         };
         let canonical_bytes = content.len() as u64;
         let canonical_marker = FileMarker::of(&file_path);
@@ -2398,13 +2580,33 @@ impl LedgerService {
         let journal_budget = MAX_LEDGER_FILE_BYTES;
         let scan = crate::journal::read_journal(&journal_path, journal_budget)?;
         if scan.torn_tail_bytes > 0 {
+            // M-43: say only what the bytes show. "The node crashed mid-append"
+            // and "its commit never reported success" are true of a genuine
+            // torn tail and false of a truncated or edited journal, which
+            // looks the same from here — so the warning names both, and the
+            // dropped bytes are kept rather than deleted.
             warn!(
                 dropped_bytes = scan.torn_tail_bytes,
                 intact_records = scan.payloads.len(),
                 journal = %journal_path.display(),
-                "ledger commit journal ends in a torn record — the node crashed mid-append; \
-                 the torn record is DROPPED (its commit never reported success) and the rest \
-                 of the journal loads normally. The next commit will compact."
+                "ledger commit journal ends in a torn record; its {} trailing bytes are NOT \
+                 loaded, the {} intact records before it are. This is what a crash mid-append \
+                 leaves (that commit never reported success), and also what a truncated or \
+                 edited journal looks like. Nothing is deleted: the next commit compacts and \
+                 renames the journal to {}{}<unix-seconds> for inspection (M-43).",
+                scan.torn_tail_bytes,
+                scan.payloads.len(),
+                journal_path.display(),
+                crate::journal::TORN_JOURNAL_SUFFIX,
+            );
+        }
+        if scan.readable_by_others {
+            // L-58: loaded (only this uid could have written it), but never
+            // appended to; the forced compaction below folds and deletes it.
+            warn!(
+                journal = %journal_path.display(),
+                "ledger commit journal is readable by other accounts; its records are loaded, \
+                 and the next commit compacts it away instead of appending to it (L-58)"
             );
         }
 
@@ -2807,7 +3009,11 @@ impl LedgerService {
             // the truncated payload's bytes as the next record's header. The
             // next commit rewrites the canonical file and deletes the journal,
             // which is the only safe way to make the file appendable again.
-            force_compaction: scan.torn_tail_bytes > 0,
+            // L-58: likewise a journal others can read — `append_record`
+            // refuses it, so only a compaction can make appending possible.
+            force_compaction: scan.torn_tail_bytes > 0 || scan.readable_by_others,
+            // M-43: the compaction that folds a torn journal renames it.
+            journal_torn_at_boot: scan.torn_tail_bytes > 0,
             commit_generation: 0,
             commit_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 IDLE_COMMIT_GENERATION,
@@ -3752,6 +3958,7 @@ impl LedgerService {
             kind,
             ledger_path: self.file_path.clone(),
             journal_path: self.journal_path.clone(),
+            retire_torn_journal: kind == CommitKind::Compact && self.journal_torn_at_boot,
             canonical,
             record,
             observer: self.commit_observer.clone(),
@@ -3981,6 +4188,8 @@ impl LedgerService {
             self.canonical_bytes = bytes;
         }
         if receipt.kind == CommitKind::Compact {
+            // M-43: the torn journal, if there was one, is a sidecar now.
+            self.journal_torn_at_boot = false;
             self.canonical_marker = receipt.canonical_marker;
             // The `.bean` now holds exactly the bytes this service wrote.
             self.canonical_is_current = true;
@@ -13331,14 +13540,16 @@ mod tests {
     // ── T59: ledger and commit robustness (L-41, L-43) ───────────────────
 
     /// L-41, end to end: a journal whose last header claims `usize::MAX`
-    /// bytes is a torn tail to the LIVE recovery path and to boot — the durable
-    /// records before it load, the next commit compacts, and nothing panics.
+    /// bytes is handled — not a panic — by the LIVE recovery path and by boot.
     ///
     /// This is the shape that mattered: `read_journal` is the body of
     /// `recover_failed_commit`, which the node runs holding the ledger's write
-    /// guard, so the overflow panic used to land there.
+    /// guard, so the overflow panic used to land there. L-41 made the header a
+    /// torn tail; M-43 (T68) makes it `Corrupt`, since no journal this node
+    /// writes claims more than the budget: the recovery keeps memory (its
+    /// reload fails, logged) and boot refuses, naming the record's offset.
     #[test]
-    fn l41_an_overflowing_journal_header_is_torn_through_recovery_and_boot() {
+    fn l41_an_overflowing_journal_header_fails_closed_through_recovery_and_boot() {
         let (mut svc, path) = boot_large_ledger();
         svc.stage_remote_directive(remote_open("Assets:Vault", make_date(2024, 3, 1), 10))
             .unwrap();
@@ -13348,6 +13559,7 @@ mod tests {
 
         let journal_path = svc.journal_path().to_path_buf();
         let mut journal = std::fs::read(&journal_path).unwrap();
+        let bad_offset = journal.len();
         journal.extend_from_slice(
             format!(";;olj {} {}\npartial", usize::MAX, "cd".repeat(32)).as_bytes(),
         );
@@ -13357,25 +13569,17 @@ mod tests {
         assert_eq!(
             svc.directive_count(),
             durable_count,
-            "the intact record before the bad header must survive the reload"
+            "the failed reload keeps memory, the durable record included"
         );
         assert!(svc.accounts().is_open("Assets:Vault"));
+
+        let Err(error) = LedgerService::boot(path.clone(), "test-peer".to_owned()) else {
+            panic!("M-43: an over-budget header must fail boot closed");
+        };
+        assert_eq!(error.error_code(), "LEDGER_JOURNAL", "got {error}");
         assert!(
-            svc.force_compaction,
-            "a torn tail must force the next commit to compact, not append after it"
-        );
-
-        let rebooted = LedgerService::boot(path.clone(), "test-peer".to_owned())
-            .expect("boot must treat the overflowing header as a torn tail");
-        assert_eq!(rebooted.directive_count(), durable_count);
-
-        svc.stage_remote_directive(remote_open("Assets:Safe", make_date(2024, 3, 2), 11))
-            .unwrap();
-        svc.persist_or_reload().unwrap();
-        assert_eq!(
-            svc.journal_bytes(),
-            0,
-            "the forced compaction folded the journal"
+            error.to_string().contains(&format!("at byte {bad_offset}")),
+            "the refusal names the offset: {error}"
         );
         remove_ledger_and_journal(&path);
     }
@@ -14358,6 +14562,424 @@ mod tests {
             "L-64: a reload that read the bytes this service wrote must not force a compaction"
         );
         drop(pending);
+        remove_ledger_and_journal(&path);
+    }
+
+    // ── T67: file-type discipline for every ledger-side open ─────────────
+
+    /// Run `body` on its own thread and fail — rather than hang the suite — if
+    /// it has not returned within `seconds` (M-36: every regression here is an
+    /// `open` parked on a FIFO, so the thread is abandoned, not joined).
+    fn within<T: Send + 'static>(seconds: u64, body: impl FnOnce() -> T + Send + 'static) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(body());
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(seconds))
+            .expect("M-36: the call blocked (an open parked on a FIFO?)")
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mkfifo {}", path.display());
+    }
+
+    /// A fresh directory for fixtures that plant things beside the ledger.
+    fn t67_directory(name: &str) -> PathBuf {
+        let directory = test_file_path().with_extension(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    fn boot_error_within(path: PathBuf) -> String {
+        within(5, move || {
+            match LedgerService::boot(path, "test-peer".to_owned()) {
+                Ok(_) => "booted".to_owned(),
+                Err(error) => format!("Err: {error}"),
+            }
+        })
+    }
+
+    /// M-36: `mkfifo ledger.bean` used to hang boot after the lock was taken
+    /// (`metadata().len() == 0` passed the cap, then `read_to_string` blocked).
+    /// Boot now refuses it at once, naming the file type.
+    ///
+    /// Bug-catch: skip `open_checked` in `read_ledger_file` and this blocks.
+    #[cfg(unix)]
+    #[test]
+    fn m36_boot_refuses_a_fifo_bean_without_blocking() {
+        let directory = t67_directory("m36-fifo-bean");
+        let path = directory.join("ledger.bean");
+        mkfifo(&path);
+        let outcome = boot_error_within(path);
+        assert!(
+            outcome.starts_with("Err:") && outcome.contains("not a regular file"),
+            "{outcome}"
+        );
+        std::fs::remove_dir_all(directory).ok();
+    }
+
+    /// M-36: a FIFO at the journal path hung boot in `read_journal`.
+    #[cfg(unix)]
+    #[test]
+    fn m36_boot_refuses_a_fifo_journal_without_blocking() {
+        let directory = t67_directory("m36-fifo-journal");
+        let path = directory.join("ledger.bean");
+        std::fs::write(&path, "2024-01-01 open Assets:Cash USD\n").unwrap();
+        mkfifo(&crate::journal::journal_path_for(&path));
+        let outcome = boot_error_within(path);
+        assert!(
+            outcome.starts_with("Err:") && outcome.contains("not a regular file"),
+            "{outcome}"
+        );
+        std::fs::remove_dir_all(directory).ok();
+    }
+
+    /// M-36, the runtime shape (B8 `fifo-runtime`): the `.bean` replaced by a
+    /// FIFO under a running service. The next write's hand-edit check used to
+    /// block in `read_ledger_file` under the write lock; it now fails the write
+    /// (and the L-13 reload) at once, and memory is kept.
+    #[cfg(unix)]
+    #[test]
+    fn m36_a_fifo_swapped_in_for_the_bean_fails_the_next_write_without_blocking() {
+        let directory = t67_directory("m36-fifo-runtime");
+        let path = directory.join("ledger.bean");
+        std::fs::write(&path, "").unwrap();
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.open_account("Assets:A".into(), make_date(2024, 1, 1), vec!["USD".into()])
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        mkfifo(&path);
+
+        let (outcome, count) = within(5, move || {
+            let outcome =
+                svc.open_account("Assets:B".into(), make_date(2024, 1, 1), vec!["USD".into()]);
+            (
+                outcome.map_err(|error| error.to_string()),
+                svc.directive_count(),
+            )
+        });
+        let error = outcome.expect_err("a FIFO .bean must fail the write");
+        assert!(error.contains("not a regular file"), "{error}");
+        assert!(count >= 1, "memory is kept");
+        std::fs::remove_dir_all(directory).ok();
+    }
+
+    /// The symlinked-`.bean` policy (T67): FOLLOWED when the target is a
+    /// regular file; refused, without blocking, when the target is a FIFO; and
+    /// a dangling link is refused rather than read as "no ledger" — which used
+    /// to create an empty file over the link.
+    #[cfg(unix)]
+    #[test]
+    fn t67_a_symlinked_bean_is_followed_only_to_a_regular_file() {
+        let directory = t67_directory("t67-bean-link");
+        let path = directory.join("ledger.bean");
+
+        let target = directory.join("real.bean");
+        std::fs::write(&target, "2024-01-01 open Assets:Cash USD\n").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let svc = LedgerService::boot(path.clone(), "test-peer".to_owned())
+            .expect("a symlink to a regular file is followed");
+        assert!(svc.accounts().is_open("Assets:Cash"));
+        drop(svc);
+
+        std::fs::remove_file(&path).unwrap();
+        let fifo = directory.join("fifo-target");
+        mkfifo(&fifo);
+        std::os::unix::fs::symlink(&fifo, &path).unwrap();
+        let outcome = boot_error_within(path.clone());
+        assert!(outcome.contains("not a regular file"), "{outcome}");
+
+        std::fs::remove_file(&path).unwrap();
+        let missing = directory.join("not-there.bean");
+        std::os::unix::fs::symlink(&missing, &path).unwrap();
+        let outcome = boot_error_within(path.clone());
+        assert!(outcome.contains("symbolic link"), "{outcome}");
+        assert!(!missing.exists(), "nothing is created through the link");
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "and the link is not replaced by an empty ledger"
+        );
+        std::fs::remove_dir_all(directory).ok();
+    }
+
+    /// T67: a symlink at the journal path is refused at boot (it was already
+    /// refused on append, L-44).
+    #[cfg(unix)]
+    #[test]
+    fn t67_boot_refuses_a_symlinked_journal() {
+        let directory = t67_directory("t67-journal-link");
+        let path = directory.join("ledger.bean");
+        std::fs::write(&path, "2024-01-01 open Assets:Cash USD\n").unwrap();
+        let elsewhere = directory.join("elsewhere");
+        crate::journal::append_record(
+            &elsewhere,
+            &crate::journal::record_bytes("2024-01-02 open Assets:Planted USD\n"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&elsewhere, crate::journal::journal_path_for(&path)).unwrap();
+        let outcome = boot_error_within(path);
+        assert!(outcome.contains("symbolic link"), "{outcome}");
+        std::fs::remove_dir_all(directory).ok();
+    }
+
+    /// L-57: a directory at the old fixed `<name>.tmp` wedged every full
+    /// rewrite (`remove_file` → EISDIR/EPERM). Writes now use a fresh
+    /// `<name>.tmp.<pid>.<nonce>` and succeed; the boot sweep removes stale
+    /// `.tmp.*` files and symlinks this uid left (never a link's target), and
+    /// logs — does not remove — the directory. No temp is left behind.
+    ///
+    /// Bug-catch: restore the fixed `.tmp` name and both writes fail.
+    #[cfg(unix)]
+    #[test]
+    fn l57_a_directory_at_the_old_tmp_name_does_not_block_writes() {
+        let directory = t67_directory("l57-tmp");
+        let path = directory.join("ledger.bean");
+        std::fs::write(&path, "2024-01-01 open Assets:Cash USD\n").unwrap();
+        let planted_dir = directory.join("ledger.bean.tmp");
+        std::fs::create_dir(&planted_dir).unwrap();
+        let stale_file = directory.join("ledger.bean.tmp.1234.00000000deadbeef");
+        std::fs::write(&stale_file, "half-written").unwrap();
+        let victim = directory.join("victim");
+        std::fs::write(&victim, "precious").unwrap();
+        let stale_link = directory.join("ledger.bean.tmp.1234.00000000cafef00d");
+        std::os::unix::fs::symlink(&victim, &stale_link).unwrap();
+        let unrelated = directory.join("ledger.bean.tmpl");
+        std::fs::write(&unrelated, "not ours").unwrap();
+
+        let (booted, logged) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "test-peer".to_owned()));
+        let mut svc = booted.unwrap();
+        assert!(!stale_file.exists(), "a stale temp file is swept");
+        assert!(
+            std::fs::symlink_metadata(&stale_link).is_err(),
+            "a stale temp symlink is swept"
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        assert!(planted_dir.is_dir(), "a directory is never removed");
+        assert!(logged.contains("L-57"), "the directory is logged: {logged}");
+        assert!(unrelated.exists(), "only <name>.tmp and <name>.tmp.* match");
+
+        svc.open_account(
+            "Assets:New".into(),
+            make_date(2024, 1, 2),
+            vec!["USD".into()],
+        )
+        .expect("L-57: the first full rewrite succeeds");
+        svc.open_account(
+            "Assets:New2".into(),
+            make_date(2024, 1, 3),
+            vec!["USD".into()],
+        )
+        .expect("and the next");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("Assets:New2"));
+        let leftovers: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("ledger.bean.tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp left behind: {leftovers:?}");
+        std::fs::remove_dir_all(directory).ok();
+    }
+
+    /// L-58 at boot: a journal restored as 0644 (ours, nobody else can write
+    /// it) still loads, but `append_record` refuses to add to it, so boot
+    /// forces the next commit to be a compaction — which folds it and deletes
+    /// it — and the append after that creates a fresh 0600 journal. No wedge.
+    #[cfg(unix)]
+    #[test]
+    fn l58_a_world_readable_journal_is_folded_away_not_appended_to() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut svc, path) = boot_large_ledger();
+        svc.stage_remote_directive(remote_open("Assets:Vault", make_date(2024, 3, 1), 10))
+            .unwrap();
+        svc.persist_or_reload().unwrap();
+        let journal_path = svc.journal_path().to_path_buf();
+        drop(svc);
+        std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert!(svc.accounts().is_open("Assets:Vault"), "its records load");
+        assert!(svc.force_compaction, "and it is folded, not appended to");
+        svc.stage_remote_directive(remote_open("Assets:Safe", make_date(2024, 3, 2), 11))
+            .unwrap();
+        svc.persist_or_reload().unwrap();
+        assert!(!journal_path.exists(), "the compaction removed it");
+        svc.stage_remote_directive(remote_open("Assets:Third", make_date(2024, 3, 3), 12))
+            .unwrap();
+        svc.persist_or_reload().unwrap();
+        assert_eq!(
+            std::fs::metadata(&journal_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        remove_ledger_and_journal(&path);
+    }
+
+    // ── T68: journal policy (M-43 / R-18, M-44) ──────────────────────────
+
+    /// M-43 / R-18 end to end (the B8 `r18` shape): three appended,
+    /// acknowledged records; the second header's length damaged. Boot used to
+    /// load one, drop two with a "crashed mid-append" warning, and the startup
+    /// compaction erased them. Boot now refuses, naming the byte offset.
+    #[test]
+    fn m43_a_damaged_mid_journal_length_refuses_boot_naming_the_offset() {
+        let (mut svc, path) = boot_large_ledger();
+        let journal_path = svc.journal_path().to_path_buf();
+        let mut second = 0;
+        for (index, name) in ["Assets:One", "Assets:Two", "Assets:Three"]
+            .into_iter()
+            .enumerate()
+        {
+            if index == 1 {
+                second = std::fs::metadata(&journal_path).unwrap().len() as usize;
+            }
+            svc.stage_remote_directive(remote_open(name, make_date(2024, 3, 1), 10 + index as u64))
+                .unwrap();
+            svc.persist_or_reload().unwrap();
+        }
+        drop(svc);
+        let bytes = std::fs::read(&journal_path).unwrap();
+        let end = second + bytes[second..].iter().position(|b| *b == b'\n').unwrap();
+        let header = std::str::from_utf8(&bytes[second..end]).unwrap().to_owned();
+        let damaged_header = header.replacen(";;olj ", ";;olj 9", 1);
+        let mut damaged = bytes[..second].to_vec();
+        damaged.extend_from_slice(damaged_header.as_bytes());
+        damaged.extend_from_slice(&bytes[end..]);
+        std::fs::write(&journal_path, &damaged).unwrap();
+
+        let Err(error) = LedgerService::boot(path.clone(), "test-peer".to_owned()) else {
+            panic!("M-43: a damaged mid-journal length must refuse boot");
+        };
+        assert_eq!(error.error_code(), "LEDGER_JOURNAL", "got {error}");
+        assert!(
+            error.to_string().contains(&format!("at byte {second}")),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&journal_path).unwrap(),
+            damaged,
+            "the journal is left exactly as found"
+        );
+        remove_ledger_and_journal(&path);
+    }
+
+    /// M-44 (the B8 `zero-fill` fixture): the final record's payload reads
+    /// back as NULs — a metadata-first filesystem after a power cut. It used to
+    /// be `Corrupt` and refuse boot on a file the node wrote; it now boots with
+    /// the torn warning, the record before it intact.
+    #[test]
+    fn m44_a_zero_filled_final_record_boots_with_a_torn_warning() {
+        let path = test_file_path();
+        std::fs::write(&path, "2024-01-01 open Assets:Cash USD\n").unwrap();
+        let journal_path = crate::journal::journal_path_for(&path);
+        crate::journal::append_record(
+            &journal_path,
+            &crate::journal::record_bytes("2024-01-02 open Assets:Kept USD\n"),
+        )
+        .unwrap();
+        let record = crate::journal::record_bytes("2024-01-03 open Assets:Lost USD\n");
+        crate::journal::append_record(&journal_path, &record).unwrap();
+        let mut bytes = std::fs::read(&journal_path).unwrap();
+        let payload_start = bytes.len() - (record.len() - (record.find('\n').unwrap() + 1));
+        bytes[payload_start..].fill(0);
+        std::fs::write(&journal_path, &bytes).unwrap();
+
+        let (booted, logged) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "test-peer".to_owned()));
+        let booted = booted.expect("M-44: a zero-filled final record must not brick boot");
+        assert!(logged.contains("torn record"), "{logged}");
+        assert!(booted.accounts().is_open("Assets:Kept"));
+        assert!(!booted.accounts().is_open("Assets:Lost"));
+        remove_ledger_and_journal(&path);
+    }
+
+    /// The `.torn-*` sidecar files beside `journal_path`.
+    fn torn_sidecars(journal_path: &Path) -> Vec<PathBuf> {
+        let prefix = format!(
+            "{}{}",
+            journal_path.file_name().unwrap().to_string_lossy(),
+            crate::journal::TORN_JOURNAL_SUFFIX
+        );
+        std::fs::read_dir(journal_path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .map(|entry| entry.path())
+            .collect()
+    }
+
+    /// M-43, decision taken: torn journals are renamed, never unlinked. After a
+    /// boot that dropped a torn tail, the compaction that folds the journal
+    /// leaves it as `<journal>.torn-<unix-seconds>` holding the exact bytes —
+    /// including the dropped ones — and says where; the next boot ignores the
+    /// sidecar (no torn warning, same directives). A compaction with nothing
+    /// torn still deletes the journal.
+    ///
+    /// Bug-catch: call `remove_journal` unconditionally in `commit` and no
+    /// sidecar exists.
+    #[test]
+    fn m43_a_torn_journal_is_renamed_not_deleted_and_the_next_boot_ignores_it() {
+        let (mut svc, path) = boot_large_ledger();
+        let journal_path = svc.journal_path().to_path_buf();
+        for (index, name) in ["Assets:Vault", "Assets:Safe"].into_iter().enumerate() {
+            svc.stage_remote_directive(remote_open(name, make_date(2024, 3, 1), 10 + index as u64))
+                .unwrap();
+            svc.persist_or_reload().unwrap();
+        }
+        drop(svc);
+        let both = std::fs::read(&journal_path).unwrap();
+        let torn = both[..both.len() - 30].to_vec();
+        std::fs::write(&journal_path, &torn).unwrap();
+
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        let (compacted, logged) = capture_warnings(|| svc.compact());
+        compacted.unwrap();
+        assert!(!journal_path.exists(), "the journal is folded");
+        let sidecars = torn_sidecars(&journal_path);
+        assert_eq!(sidecars.len(), 1, "exactly one sidecar: {sidecars:?}");
+        assert_eq!(
+            std::fs::read(&sidecars[0]).unwrap(),
+            torn,
+            "the sidecar holds the journal byte-for-byte, torn tail included"
+        );
+        assert!(
+            logged.contains(&sidecars[0].display().to_string()),
+            "the sidecar's path is logged: {logged}"
+        );
+        let count = svc.directive_count();
+
+        let (rebooted, logged) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "test-peer".to_owned()));
+        let rebooted = rebooted.expect("the sidecar is ignored");
+        assert!(!logged.contains("torn record"), "{logged}");
+        assert_eq!(rebooted.directive_count(), count);
+
+        // A healthy journal is still simply deleted by its compaction.
+        let mut svc = rebooted;
+        svc.stage_remote_directive(remote_open("Assets:Later", make_date(2024, 3, 3), 20))
+            .unwrap();
+        svc.persist_or_reload().unwrap();
+        svc.compact().unwrap();
+        assert!(!journal_path.exists());
+        assert_eq!(torn_sidecars(&journal_path).len(), 1, "no new sidecar");
+
+        for sidecar in torn_sidecars(&journal_path) {
+            std::fs::remove_file(sidecar).ok();
+        }
         remove_ledger_and_journal(&path);
     }
 }

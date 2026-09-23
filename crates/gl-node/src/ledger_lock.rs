@@ -25,14 +25,16 @@
 //! A process-level lock in `main` covers the real threat — two *processes* on
 //! one ledger — while leaving the library unlocked.
 //!
-//! # Bonus: it makes the stale-temp cleanup in `persist_atomically` safe
+//! # Bonus: it makes the stale-temp sweep at boot safe
 //!
-//! `persist_atomically` recovers from `AlreadyExists` on `<name>.tmp` by
-//! unlinking it and retrying. Without a process lock that could delete a
-//! *sibling* process's in-flight temp. With this lock held no sibling can be
-//! mid-persist on this ledger, so any temp encountered is our own crashed
-//! leftover. (Library users that do not take the lock keep the old exposure —
-//! documented at that call site.)
+//! Since T67 (L-57) `persist_atomically` writes to a fresh
+//! `<name>.tmp.<pid>.<nonce>` per call and never unlinks what it finds; boot
+//! sweeps the `<name>.tmp*` leftovers of crashed rewrites once, at process
+//! start. Without a process lock that sweep could delete a *sibling* process's
+//! in-flight temp. `main` takes this lock before it boots, so no sibling can be
+//! mid-persist on this ledger and every temp the sweep finds is a crashed
+//! leftover. (Library users that do not take the lock keep that exposure —
+//! documented at the sweep.)
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
@@ -83,6 +85,17 @@ fn lock_path_for(ledger_path: &Path) -> Result<PathBuf, String> {
 ///
 /// Returns `Err` with an operator-readable message when another `gl-node`
 /// instance already holds the ledger, or when the sidecar cannot be opened.
+///
+/// # What is locked (L-59, T67)
+///
+/// The sidecar is opened through [`ledger::journal::open_checked`] as a
+/// node-private file: never through a symlink (`lstat` refusal, then
+/// `O_NOFOLLOW`), never blocking (`O_NONBLOCK`), and only if the handle is a
+/// regular file owned by this uid with one link and mode 0600. The old
+/// `create(true)` open followed a symlink at `<ledger>.bean.lock`, so the flock
+/// landed on the link's TARGET — re-pointing the link between two starts
+/// admitted two nodes onto one ledger (the M-17 silent-loss shape), and a FIFO
+/// target blocked the start.
 pub fn acquire(ledger_path: &Path) -> Result<LedgerLock, String> {
     let lock_path = lock_path_for(ledger_path)?;
 
@@ -96,12 +109,14 @@ pub fn acquire(ledger_path: &Path) -> Result<LedgerLock, String> {
         options.mode(0o600);
     }
 
-    let file = options.open(&lock_path).map_err(|error| {
-        format!(
-            "failed to open ledger lock file {}: {error}",
-            lock_path.display()
-        )
-    })?;
+    let file = ledger::journal::open_checked(
+        &lock_path,
+        &options,
+        ledger::journal::FileTrust::NodePrivate,
+        "ledger lock file",
+    )
+    .map_err(|error| format!("failed to open the ledger lock: {error}"))?
+    .file;
 
     match file.try_lock() {
         Ok(()) => Ok(LedgerLock {
@@ -235,5 +250,78 @@ mod tests {
             error.contains("no file name"),
             "got unexpected error: {error}"
         );
+    }
+
+    /// L-59: a symlink at `<ledger>.bean.lock` used to be followed, so the
+    /// flock landed on the link's TARGET (B8 `lock-symlink`). `acquire` now
+    /// refuses it, the link is left as it was, and the target is not locked.
+    ///
+    /// Bug-catch: open the sidecar with plain `OpenOptions::open` again and
+    /// `acquire` succeeds with the target locked.
+    #[cfg(unix)]
+    #[test]
+    fn l59_acquire_refuses_a_symlinked_lock_and_leaves_the_target_unlocked() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ledger_path = temp_dir.path().join("ledger.bean");
+        let victim = temp_dir.path().join("victim-file");
+        std::fs::write(&victim, "").unwrap();
+        std::os::unix::fs::symlink(&victim, temp_dir.path().join("ledger.bean.lock")).unwrap();
+
+        let error = acquire(&ledger_path).expect_err("a symlinked lock must be refused");
+        assert!(error.contains("symbolic link"), "{error}");
+        let probe = File::open(&victim).unwrap();
+        probe
+            .try_lock()
+            .expect("L-59: the symlink's target must not be locked");
+        assert!(
+            std::fs::symlink_metadata(temp_dir.path().join("ledger.bean.lock"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    /// M-36's shape at the lock: a FIFO at the sidecar path is refused at
+    /// once rather than blocking the start (an `O_RDWR` open of a FIFO does
+    /// not block on Linux, but nothing was ever going to lock it usefully).
+    #[cfg(unix)]
+    #[test]
+    fn t67_acquire_refuses_a_fifo_lock_without_blocking() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ledger_path = temp_dir.path().join("ledger.bean");
+        let status = std::process::Command::new("mkfifo")
+            .arg(temp_dir.path().join("ledger.bean.lock"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(acquire(&ledger_path).map(|_| ()));
+        });
+        let outcome = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("M-36: acquire blocked on a FIFO");
+        let error = outcome.expect_err("a FIFO is not a lock file");
+        assert!(error.contains("not a regular file"), "{error}");
+    }
+
+    /// L-58's rule for the lock sidecar: a pre-planted world-readable or
+    /// hard-linked sidecar is not one this node created, and is refused.
+    #[cfg(unix)]
+    #[test]
+    fn t67_acquire_refuses_a_planted_or_hard_linked_lock_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ledger_path = temp_dir.path().join("ledger.bean");
+        let lock_path = temp_dir.path().join("ledger.bean.lock");
+        std::fs::write(&lock_path, "").unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = acquire(&ledger_path).expect_err("0644 is not a node-private file");
+        assert!(error.contains("overly permissive"), "{error}");
+
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(&lock_path, temp_dir.path().join("second-name")).unwrap();
+        let error = acquire(&ledger_path).expect_err("a second name is refused");
+        assert!(error.contains("hard links"), "{error}");
     }
 }

@@ -38,10 +38,10 @@ covers only what is open: seven new Highs, eleven new Mediums, twelve new Lows, 
 | T64 | H-16 — bounded parent choice, per-author head bound | **High** | S | ☑ |
 | T65 | H-17 — exact, order-independent balances (magnitude cap) | **High** | M | ☑ |
 | T66 | H-18 + M-41 + L-60 — bounded errors and unsolicited input on the wire | **High** | S–M | ☑ |
-| T67 | M-36 + L-57 + L-58 + L-59 + R-17 — file-type discipline for every ledger-side open | Med | S–M | ☐ |
-| T68 | M-43 + M-44 (R-18) — journal policy | Med | S | ☐ |
-| T69 | M-39 + M-42 + M-45 + L-63 + L-65 + L-35/R-19 + L-43/R-20 — cost bounds on read, watch, near-cap | Med | M | ☐ |
-| T70 | M-40 + M-06 + R-5 + R-7 — server-side session deadline, cross-peer cap | Med | S–M | ☐ |
+| T67 | M-36 + L-57 + L-58 + L-59 + R-17 — file-type discipline for every ledger-side open | Med | S–M | ☑ |
+| T68 | M-43 + M-44 (R-18) — journal policy | Med | S | ☑ |
+| T69 | M-39 + M-42 + M-45 + L-63 + L-65 + L-35/R-19 + L-43/R-20 + R-5 (from T70) — cost bounds on read, watch, near-cap | Med | M | ☐ |
+| T70 | M-40 + M-06 + R-5 + R-7 — server-side session deadline, cross-peer cap | Med | S–M | ◐ |
 | T71 | L-56 + L-61 + L-66 + L-23/R-9 + R-13 + §5 items — docs, config, hygiene | Low | S | ☐ |
 
 **Coverage check — every open register entry maps to exactly one task:**
@@ -285,7 +285,8 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
 
 ## Tier 2 — the filesystem boundary and the journal
 
-### ☐ T67 — File-type discipline for every ledger-side open (M-36, L-57, L-58, L-59, R-17) — S/M
+### ☑ T67 — File-type discipline for every ledger-side open (M-36, L-57, L-58, L-59, R-17) — S/M
+> **Done 2026-09-23 (working tree, not committed).** One helper, `journal::open_checked` with a `FileTrust` level, for the `.bean` read, journal read and append, watcher read, `.lock` and key file: `lstat` (plain `stat` for the `.bean`) → regular file → open `O_NONBLOCK`, plus `O_NOFOLLOW` except for the `.bean` → `fstat` `is_file` and `(dev, ino)`; node-owned files additionally require `uid == geteuid()`, `nlink == 1`, and mode `& 0o077 == 0` (journal read only refuses group/world-*writable*; a readable-by-others journal loads with a warning and is compacted away). Reads go through `read_to_end_capped` (`take(cap + 1)`). `persist_atomically` uses `<name>.tmp.<pid>.<nonce>` and never unlinks what it finds at the temp name; `sweep_stale_temporaries` at process start removes this uid's stale temp files and symlinks and logs anything else. `ledger_lock` and the key reader use the helper; key files over 4 KiB are refused. **R-17 closed as "no hand-written extern declaration":** `libc` 0.2.189 is a direct dependency of `ledger` only (no new crate fetched); the single production `unsafe` is a documented `libc::geteuid()` call at `journal.rs:870`, which gl-node reaches through the ledger crate. **Symlinked `.bean` policy:** followed, target must be a regular file; a dangling link is refused (before, boot created an empty ledger over it); the first compaction replaces the link with a regular file. Orchestrator re-ran the B1 and B8 FIFO probes: every FIFO case refused in < 200 µs. **Behaviour changes:** FIFO/socket/device/directory/dangling link at `.bean` or journal refuses boot; journal, lock and key must be regular, unlinked, node-owned, single-link, and lock/key 0600; temp file naming changed. **Residuals:** a hard-linked or foreign-owned journal wedges writes (fail-closed, message names the remedy); the `.bean` has no owner/mode/link check by policy; `O_NONBLOCK` stays set on journal/lock descriptors (ignored for regular files on Linux, macOS, BSD).
 - **Why:** `append_record` ([journal.rs:291-306](../crates/ledger/src/journal.rs#L291-L306)) refuses only a
   symlink, then `open(O_WRONLY|O_APPEND|O_CREAT)` — on a FIFO this blocks before the post-open `is_file()`
   runs, **on the blocking thread that owns the `WritePermit`**: every writer waits on the gate forever,
@@ -320,7 +321,8 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
   symlink at `.lock` → `acquire` is `Err` and the target is not locked; a 64 MiB + 1 stream →
   `ResourceLimitExceeded`; `grep unsafe crates/*/src` outside `#[cfg(test)]` is empty.
 
-### ☐ T68 — Journal policy (M-43, M-44) — S
+### ☑ T68 — Journal policy (M-43, M-44) — S
+> **Done 2026-09-23 (working tree, not committed).** A header whose length exceeds the remainder is `Corrupt` (boot refuses, naming the byte offset) when the claim exceeds the budget or a later record header follows; otherwise it is a torn tail. A final record that fails its checksum and contains a NUL is torn (M-44), as is a NUL-bearing header with no later record. After a boot that saw a torn tail, the folding compaction renames the journal to `<journal>.torn-<unix-secs>` (with `-N` on collision) and logs the path; boot ignores `.torn-*`. Warning text and module doc corrected (the hash is an unkeyed checksum). The `l41_*` tests were renamed `*_fails_closed*`: `usize::MAX` is over the budget and is now `Corrupt`, by the R-18 decision. Orchestrator re-ran the R-18 probe (`Corrupt at byte 163 … a later record header follows it`) and zero-fill (boots, torn warning, sidecar named). **Behaviour changes:** mid-journal damage and over-budget lengths refuse boot; zero-filled final records no longer do; torn journals are kept as `.torn-*` sidecars for the operator to inspect and remove. **Residual:** a damaged length on the *last* record that stays within budget is indistinguishable from a crash and is treated as torn — the sidecar keeps its bytes.
 - **Why:** R-18 confirmed three times: a mid-file header whose length exceeds the remainder is classified as
   a torn tail ([journal.rs:224-233](../crates/ledger/src/journal.rs#L224-L233)), boot loads only the prefix,
   the warning ([service.rs:1957-1966](../crates/ledger/src/service.rs#L1957-L1966)) says the node "crashed
@@ -379,7 +381,8 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
   selection is refused while a dashboard call still fits; `verify` on the 4,000 × 256 fixture returns ≤ 1,000
   errors + a count; `l35_*` plus a test that the advert equals `all_directive_ids()` after every insert path.
 
-### ☐ T70 — Server-side session deadline and cross-peer cap (M-40, M-06, R-5, R-7) — S/M
+### ◐ T70 — Server-side session deadline and cross-peer cap (M-40, M-06, R-5, R-7) — S/M
+> **Done 2026-09-23 except the outbound semaphore (working tree, not committed).** Server `SessionBudget` built at accept (default 300 s); `accept_bi` and every frame clamped to `min(io, time left)`, the whole read additionally bounded by `timeout_at(deadline)` so a trickled frame cannot run 16–256 × `io` past it; close code 5 `session-deadline`. Per-peer GCRA accept bucket in `ConnectionLimiter::try_acquire` (burst 8, one per 2 s — honest pooled peers redial at most every ~30 s; a token is spent only when every other budget admits), refusal close code 6 `accept-rate-limit`; buckets survive disconnect so a reconnect loop cannot refill them; refusals logged once per 10 s and `accept` returns `Ok` so iroh does not log each one. R-7: six `p2p.antiEntropy*` keys with documented floors/ceilings, validated at boot, wired in `main.rs` by the orchestrator. **R-5 (cross-peer outbound semaphore) moves to T69**, which owns `p2p_service.rs`. **Behaviour changes:** inbound anti-entropy connections are closed after `antiEntropySessionSeconds`; per-peer accept rate; six new config keys (older binaries refuse them). **Residuals:** an honest pooled connection is now cut every 300 s (clean redial, at worst one failed tick); a refused connection still costs the QUIC handshake; the not-allowlisted refusal still returns `Err` and is logged unthrottled by iroh; `io` has no config key.
 - **Why:** `serve_anti_entropy` uses only the per-frame `io` ([anti_entropy_alpn.rs:353](../crates/gl-node/src/anti_entropy_alpn.rs#L353),
   `accept_bi` :422, reads :478) and `max_requests_per_connection`; `timeouts.session` is consumed by the
   client only ([:245](../crates/gl-node/src/anti_entropy_alpn.rs#L245)). A ~30 B `Announce` every 29 s holds

@@ -11,6 +11,10 @@ chrono = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# T67 / R-17: `O_NOFOLLOW`, `O_NONBLOCK`, `ELOOP`/`ENXIO` and `geteuid` for the
+# checked opens in `journal.rs`. Pinned to the version already in Cargo.lock —
+# it was compiled in transitively (tokio → mio), so this adds no new crate.
+libc = "0.2.189"
 
 [lints]
 workspace = true

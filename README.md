@@ -466,6 +466,12 @@ you set one.
 | `p2p.bootstrapEndpointIds` | `[]` | Allowlisted peer EndpointIds; empty drops inbound `Supply` |
 | `p2p.gossipIntervalMilliseconds` | `5000` | Accepted but currently unused (reserved for gossip pacing) |
 | `p2p.antiEntropyIntervalMilliseconds` | `5000` | ALPN head-exchange cadence; minimum `100` |
+| `p2p.antiEntropySessionSeconds` | `300` | Wall-clock cap on one anti-entropy session, inbound and outbound; the server closes an expired connection with code 5 `session-deadline`. `30`–`3600` |
+| `p2p.antiEntropyMaxAdvertPages` | `512` | Pages one peer's `HaveHeads` advert may span. `256`–`1024` |
+| `p2p.antiEntropyMaxAdvertIdBytes` | `67108864` | Distinct advertised id bytes one exchange may hold (64 MiB). Lower it to trade catch-up headroom for memory. `16777216`–`67108864` |
+| `p2p.antiEntropyMaxSessionFrames` | `100000` | Frames one anti-entropy connection may cost, on either side. `10000`–`1000000` |
+| `p2p.antiEntropyAcceptBurst` | `8` | New inbound anti-entropy connections one peer may open back to back; beyond it, one per refill interval (refusals close with code 6 `accept-rate-limit`). `2`–`256` |
+| `p2p.antiEntropyAcceptRefillMilliseconds` | `2000` | One accept token back per this interval. `100`–`30000` |
 | `p2p.relayMode` | `"n0"` | `"n0"` (public Iroh relays and discovery) or `"disabled"` (direct addresses only). Anything else is refused at boot — see [Relay mode](#relay-mode-p2prelaymode) |
 | `p2p.swarmTopic` | `openledger/transactions` | Gossip topic, and the signature domain while `meshId` is unset; required unique on a public bind. Same form as `meshId`: non-empty, no surrounding whitespace, ASCII letters, digits and `- _ . : /`, up to 128 bytes |
 | `p2p.meshId` | *(unset)* | Mesh identity bound into every signature. Use a random UUID. Unset falls back to `swarmTopic` — see below |

@@ -344,8 +344,9 @@ async fn main() {
                     );
                 }
 
-                // Generous defaults; a config surface follows in T38 (M-06, M-16).
-                let limits = connection_limiter::AntiEntropyLimits::default();
+                // R-7 (T70): the anti-entropy bounds come from `p2p.antiEntropy*`,
+                // validated at boot; an absent key keeps the built-in default.
+                let limits = config.p2p.anti_entropy_limits();
                 let handler = anti_entropy_alpn::AntiEntropyHandler {
                     ledger: shared_ledger.clone(),
                     broadcast: broadcast.clone(),
@@ -353,7 +354,7 @@ async fn main() {
                     allowlist: peer_node.allowlist().clone(),
                     signing_enabled: config.signing.enabled,
                     mesh_id: signature_domain.clone(),
-                    timeouts: anti_entropy_alpn::AntiEntropyTimeouts::default(),
+                    timeouts: config.p2p.anti_entropy_timeouts(),
                     limits,
                     limiter: connection_limiter::ConnectionLimiter::new(limits),
                     // T42: one cache for the whole node — the router's clone,

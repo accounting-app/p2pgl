@@ -1,3 +1,5 @@
+use crate::anti_entropy_alpn::AntiEntropyTimeouts;
+use crate::connection_limiter::AntiEntropyLimits;
 use crate::http_server::HttpServerSettings;
 use axum::http::{header, HeaderName, HeaderValue, Method};
 use serde::Deserialize;
@@ -329,6 +331,42 @@ pub struct P2pConfig {
     /// Iroh relay/discovery profile: `"n0"` (public relays) or `"disabled"` (direct-only).
     #[serde(default = "default_relay_mode")]
     pub relay_mode: String,
+
+    // — Anti-entropy session bounds (R-7) —
+    //
+    // The T49/T58/T70 bounds had no config surface; these give them one. Every
+    // default is read off `AntiEntropyTimeouts::default()` /
+    // `AntiEntropyLimits::default()` rather than restated, so an absent key is
+    // provably today's behaviour, and every key is bounded from BOTH sides at
+    // boot (see the `MIN_`/`MAX_ANTI_ENTROPY_*` constants): too small cuts off
+    // honest catch-up, too large is the protection switched off.
+    /// Wall-clock cap on one anti-entropy session, inbound and outbound
+    /// (H-10, M-28, M-40), in seconds.
+    #[serde(default = "default_anti_entropy_session_seconds")]
+    pub anti_entropy_session_seconds: u64,
+
+    /// Pages one peer's `HaveHeads` advert may span (H-10, M-26).
+    #[serde(default = "default_anti_entropy_max_advert_pages")]
+    pub anti_entropy_max_advert_pages: usize,
+
+    /// Distinct advertised id bytes one exchange may retain (M-26).
+    #[serde(default = "default_anti_entropy_max_advert_id_bytes")]
+    pub anti_entropy_max_advert_id_bytes: usize,
+
+    /// Frames one anti-entropy session may cost, on either side (T24, L-01,
+    /// M-28). One key for both, so the client's budget keeps mirroring the
+    /// server's by construction.
+    #[serde(default = "default_anti_entropy_max_session_frames")]
+    pub anti_entropy_max_session_frames: usize,
+
+    /// New inbound anti-entropy connections one peer may open back to back
+    /// (M-40): its accept bucket's capacity.
+    #[serde(default = "default_anti_entropy_accept_burst")]
+    pub anti_entropy_accept_burst: u32,
+
+    /// One accept token back per this many milliseconds (M-40).
+    #[serde(default = "default_anti_entropy_accept_refill_milliseconds")]
+    pub anti_entropy_accept_refill_milliseconds: u64,
 }
 
 /// Hand-written so the two quasi-credentials this struct carries are not
@@ -360,6 +398,27 @@ impl std::fmt::Debug for P2pConfig {
             .field("swarm_topic", &crate::auth::redact(&self.swarm_topic))
             .field("mesh_id", &self.mesh_id.as_deref().map(crate::auth::redact))
             .field("relay_mode", &self.relay_mode)
+            .field(
+                "anti_entropy_session_seconds",
+                &self.anti_entropy_session_seconds,
+            )
+            .field(
+                "anti_entropy_max_advert_pages",
+                &self.anti_entropy_max_advert_pages,
+            )
+            .field(
+                "anti_entropy_max_advert_id_bytes",
+                &self.anti_entropy_max_advert_id_bytes,
+            )
+            .field(
+                "anti_entropy_max_session_frames",
+                &self.anti_entropy_max_session_frames,
+            )
+            .field("anti_entropy_accept_burst", &self.anti_entropy_accept_burst)
+            .field(
+                "anti_entropy_accept_refill_milliseconds",
+                &self.anti_entropy_accept_refill_milliseconds,
+            )
             .finish()
     }
 }
@@ -381,6 +440,38 @@ impl P2pConfig {
             Some(mesh_id) => mesh_id,
             // Pre-L-23 behaviour, preserved on purpose: see `mesh_id`.
             None => &self.swarm_topic,
+        }
+    }
+
+    /// The outbound session bounds these keys configure (R-7), over
+    /// [`AntiEntropyTimeouts::default`] for everything without a key.
+    ///
+    /// With none of the keys set this is exactly `AntiEntropyTimeouts::default()`.
+    /// `main.rs` builds the handler from this (T70 wiring).
+    pub fn anti_entropy_timeouts(&self) -> AntiEntropyTimeouts {
+        AntiEntropyTimeouts {
+            session: Duration::from_secs(self.anti_entropy_session_seconds),
+            max_advert_pages: self.anti_entropy_max_advert_pages,
+            max_advert_id_bytes: self.anti_entropy_max_advert_id_bytes,
+            max_session_frames: self.anti_entropy_max_session_frames,
+            ..AntiEntropyTimeouts::default()
+        }
+    }
+
+    /// The inbound limits these keys configure (R-7), over
+    /// [`AntiEntropyLimits::default`] for everything without a key.
+    ///
+    /// `antiEntropyMaxSessionFrames` lands in BOTH this and
+    /// [`Self::anti_entropy_timeouts`] — the server's per-connection request
+    /// budget and the client's per-session frame budget are one limit (M-28).
+    pub fn anti_entropy_limits(&self) -> AntiEntropyLimits {
+        AntiEntropyLimits {
+            max_requests_per_connection: self.anti_entropy_max_session_frames,
+            accept_burst: self.anti_entropy_accept_burst,
+            accept_refill_interval: Duration::from_millis(
+                self.anti_entropy_accept_refill_milliseconds,
+            ),
+            ..AntiEntropyLimits::default()
         }
     }
 
@@ -433,6 +524,13 @@ impl Default for P2pConfig {
             swarm_topic: default_swarm_topic(),
             mesh_id: None,
             relay_mode: default_relay_mode(),
+            anti_entropy_session_seconds: default_anti_entropy_session_seconds(),
+            anti_entropy_max_advert_pages: default_anti_entropy_max_advert_pages(),
+            anti_entropy_max_advert_id_bytes: default_anti_entropy_max_advert_id_bytes(),
+            anti_entropy_max_session_frames: default_anti_entropy_max_session_frames(),
+            anti_entropy_accept_burst: default_anti_entropy_accept_burst(),
+            anti_entropy_accept_refill_milliseconds:
+                default_anti_entropy_accept_refill_milliseconds(),
         }
     }
 }
@@ -472,6 +570,103 @@ fn default_anti_entropy_interval() -> u64 {
 /// of the whole peer allowlist besides, so the floor is set where a cadence
 /// stops being plausible rather than at 1.
 const MIN_ANTI_ENTROPY_INTERVAL_MILLISECONDS: u64 = 100;
+
+// — Anti-entropy session bounds (R-7) —
+//
+// Defaults read off the serve/exchange layer's own `Default`s, for the reason
+// the `http` defaults are: one set of numbers, so the config layer cannot drift
+// from the code it configures by being edited on its own.
+
+fn default_anti_entropy_session_seconds() -> u64 {
+    AntiEntropyTimeouts::default().session.as_secs()
+}
+
+fn default_anti_entropy_max_advert_pages() -> usize {
+    AntiEntropyTimeouts::default().max_advert_pages
+}
+
+fn default_anti_entropy_max_advert_id_bytes() -> usize {
+    AntiEntropyTimeouts::default().max_advert_id_bytes
+}
+
+fn default_anti_entropy_max_session_frames() -> usize {
+    AntiEntropyTimeouts::default().max_session_frames
+}
+
+fn default_anti_entropy_accept_burst() -> u32 {
+    AntiEntropyLimits::default().accept_burst
+}
+
+fn default_anti_entropy_accept_refill_milliseconds() -> u64 {
+    u64::try_from(
+        AntiEntropyLimits::default()
+            .accept_refill_interval
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// Bounds on `p2p.antiEntropySessionSeconds` (M-40, R-7).
+///
+/// Floor: the per-frame `io` (30 s). A session shorter than one frame's own
+/// timeout is not a session bound, it is a second, tighter frame timeout — and
+/// it would cut an honest full catch-up (tens of seconds of transfer at the
+/// file-size cap) on every tick. Ceiling: one hour. The deadline is what stops
+/// one peer pinning an inbound slot indefinitely (M-40); at an hour, eight
+/// colluding peers still pin every slot for an hour per connection, and past
+/// that the bound stops meaning anything.
+const MIN_ANTI_ENTROPY_SESSION_SECONDS: u64 = 30;
+const MAX_ANTI_ENTROPY_SESSION_SECONDS: u64 = 3_600;
+
+/// Bounds on `p2p.antiEntropyMaxAdvertPages` (M-26, R-7).
+///
+/// Floor: 256 — exactly the full pages (4,096 ids each) the advert count cap
+/// (2^20 ids) takes, so no lower value lets an honest peer at that cap finish
+/// its advert. The default (512) is twice that for a sender that pages less
+/// tightly than ours. Ceiling: 1,024, four times the floor; every page is a
+/// frame the peer sends for free, so past that the cap is a flood allowance.
+const MIN_ANTI_ENTROPY_MAX_ADVERT_PAGES: usize = 256;
+const MAX_ANTI_ENTROPY_MAX_ADVERT_PAGES: usize = 1_024;
+
+/// Bounds on `p2p.antiEntropyMaxAdvertIdBytes` (M-26, R-7).
+///
+/// Floor: 16 MiB. A ledger at the file-size cap holds a few hundred thousand
+/// directives, ~15 MiB of 64-hex id text; below this an honest full advert is
+/// refused. Ceiling: the default, 64 MiB — the form rule admits only 64-byte
+/// ids, so 2^20 of them (the count cap) is exactly 64 MiB and a larger value
+/// buys nothing but a bigger R-5 worst case per exchange. Lowering it is the
+/// supported direction: it trades catch-up headroom for resident memory.
+const MIN_ANTI_ENTROPY_MAX_ADVERT_ID_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ANTI_ENTROPY_MAX_ADVERT_ID_BYTES: usize = 64 * 1024 * 1024;
+
+/// Bounds on `p2p.antiEntropyMaxSessionFrames` (T24, L-01, M-28, R-7).
+///
+/// Floor: 10,000. An honest full catch-up at the accumulation cap spends
+/// ~8,700 frames (256 advert pages each way, then one `Want` and one `Supply`
+/// per 256-id chunk). Ceiling: 1,000,000 — ten times the default. The session
+/// deadline is now the primary bound on a long session (M-40); this one stops a
+/// fast peer from doing unbounded work inside it, and a million frames of
+/// full-advert replies is already far past anything that bounds.
+const MIN_ANTI_ENTROPY_MAX_SESSION_FRAMES: usize = 10_000;
+const MAX_ANTI_ENTROPY_MAX_SESSION_FRAMES: usize = 1_000_000;
+
+/// Bounds on `p2p.antiEntropyAcceptBurst` (M-40, R-7).
+///
+/// Floor: 2 — a stale pooled connection's one re-dial plus the dial behind it,
+/// the smallest honest burst (T42). Ceiling: 256, the default global connection
+/// cap; a burst larger than every slot on the node bounds nothing.
+const MIN_ANTI_ENTROPY_ACCEPT_BURST: u32 = 2;
+const MAX_ANTI_ENTROPY_ACCEPT_BURST: u32 = 256;
+
+/// Bounds on `p2p.antiEntropyAcceptRefillMilliseconds` (M-40, R-7).
+///
+/// Floor: 100 ms, i.e. 10 new connections a second per peer, the same floor as
+/// the anti-entropy interval — below it the bucket admits a reconnect loop at
+/// a rate no honest peer approaches. Ceiling: 30 s, the per-frame `io`: an
+/// honest peer's steady redial rate is at most one per server idle close, which
+/// happens once per `io`, so a slower refill would ration honest traffic.
+const MIN_ANTI_ENTROPY_ACCEPT_REFILL_MILLISECONDS: u64 = 100;
+const MAX_ANTI_ENTROPY_ACCEPT_REFILL_MILLISECONDS: u64 = 30_000;
 
 fn default_swarm_topic() -> String {
     "openledger/transactions".to_owned()
@@ -974,6 +1169,10 @@ impl NodeConfig {
             )));
         }
 
+        // R-7: the anti-entropy session bounds, unconditionally for L-22's
+        // reason — a typo is a typo whether or not `p2p.enabled` is set yet.
+        self.validate_anti_entropy_bounds()?;
+
         // M-04: a trusted proxy entry that does not parse would be silently
         // dropped from the trust set, leaving the operator believing
         // `X-Forwarded-For` is honoured while every client still shares the
@@ -1087,6 +1286,70 @@ impl NodeConfig {
     }
 
     /// One bounds check for both `http` timeouts, so they cannot drift apart.
+    /// Refuse any anti-entropy session bound outside its floor and ceiling
+    /// (R-7); see the `MIN_`/`MAX_ANTI_ENTROPY_*` constants for each pair.
+    fn validate_anti_entropy_bounds(&self) -> Result<(), ConfigError> {
+        let p2p = &self.p2p;
+        let bounds: [(&str, u64, u64, u64, &str); 6] = [
+            (
+                "p2p.antiEntropySessionSeconds",
+                p2p.anti_entropy_session_seconds,
+                MIN_ANTI_ENTROPY_SESSION_SECONDS,
+                MAX_ANTI_ENTROPY_SESSION_SECONDS,
+                "below the floor an honest catch-up is cut off every tick; above the \
+                 ceiling one peer may pin an inbound connection slot for that long",
+            ),
+            (
+                "p2p.antiEntropyMaxAdvertPages",
+                p2p.anti_entropy_max_advert_pages as u64,
+                MIN_ANTI_ENTROPY_MAX_ADVERT_PAGES as u64,
+                MAX_ANTI_ENTROPY_MAX_ADVERT_PAGES as u64,
+                "below the floor an honest advert at the id-count cap cannot finish; \
+                 above the ceiling a peer may stream pages for free",
+            ),
+            (
+                "p2p.antiEntropyMaxAdvertIdBytes",
+                p2p.anti_entropy_max_advert_id_bytes as u64,
+                MIN_ANTI_ENTROPY_MAX_ADVERT_ID_BYTES as u64,
+                MAX_ANTI_ENTROPY_MAX_ADVERT_ID_BYTES as u64,
+                "below the floor an honest advert of a full ledger is refused; above \
+                 the ceiling the id-count cap binds first and only memory grows",
+            ),
+            (
+                "p2p.antiEntropyMaxSessionFrames",
+                p2p.anti_entropy_max_session_frames as u64,
+                MIN_ANTI_ENTROPY_MAX_SESSION_FRAMES as u64,
+                MAX_ANTI_ENTROPY_MAX_SESSION_FRAMES as u64,
+                "below the floor an honest full catch-up runs out of frames; above the \
+                 ceiling one connection may do unbounded work",
+            ),
+            (
+                "p2p.antiEntropyAcceptBurst",
+                u64::from(p2p.anti_entropy_accept_burst),
+                u64::from(MIN_ANTI_ENTROPY_ACCEPT_BURST),
+                u64::from(MAX_ANTI_ENTROPY_ACCEPT_BURST),
+                "below the floor a pooled connection's re-dial is refused; above the \
+                 ceiling the burst exceeds every inbound slot and bounds nothing",
+            ),
+            (
+                "p2p.antiEntropyAcceptRefillMilliseconds",
+                p2p.anti_entropy_accept_refill_milliseconds,
+                MIN_ANTI_ENTROPY_ACCEPT_REFILL_MILLISECONDS,
+                MAX_ANTI_ENTROPY_ACCEPT_REFILL_MILLISECONDS,
+                "below the floor a reconnect loop is admitted at a rate no honest peer \
+                 needs; above the ceiling an honest peer's re-dials are rationed",
+            ),
+        ];
+        for (field, value, min, max, why) in bounds {
+            if !(min..=max).contains(&value) {
+                return Err(ConfigError::Validation(format!(
+                    "{field} must be between {min} and {max}, got {value}; {why}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_http_timeout(field: &str, seconds: u64, why: &str) -> Result<(), ConfigError> {
         if !(MIN_HTTP_TIMEOUT_SECONDS..=MAX_HTTP_TIMEOUT_SECONDS).contains(&seconds) {
             return Err(ConfigError::Validation(format!(
@@ -2111,10 +2374,148 @@ mod tests {
                     path.display(),
                     config.http.max_connections
                 );
+                // R-7: the anti-entropy bounds, the newest validation surface.
+                config
+                    .validate_anti_entropy_bounds()
+                    .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
                 checked += 1;
             }
         }
         assert!(checked >= 4, "expected to find the shipped sample configs");
+    }
+
+    // ── R-7: anti-entropy session bounds ───────────────────────────────
+
+    /// A config setting one `p2p` anti-entropy key to `value`.
+    fn load_with_p2p_key(key: &str, value: u64) -> Result<NodeConfig, ConfigError> {
+        let file = write_temp_config(&format!(
+            r#"{{ "ledgerPath": "./data/ledger.bean", "p2p": {{ "{key}": {value} }} }}"#
+        ));
+        NodeConfig::load_from_path(&file.path().to_path_buf())
+    }
+
+    /// Every R-7 key with its floor and ceiling.
+    fn anti_entropy_keys() -> [(&'static str, u64, u64); 6] {
+        [
+            (
+                "antiEntropySessionSeconds",
+                MIN_ANTI_ENTROPY_SESSION_SECONDS,
+                MAX_ANTI_ENTROPY_SESSION_SECONDS,
+            ),
+            (
+                "antiEntropyMaxAdvertPages",
+                MIN_ANTI_ENTROPY_MAX_ADVERT_PAGES as u64,
+                MAX_ANTI_ENTROPY_MAX_ADVERT_PAGES as u64,
+            ),
+            (
+                "antiEntropyMaxAdvertIdBytes",
+                MIN_ANTI_ENTROPY_MAX_ADVERT_ID_BYTES as u64,
+                MAX_ANTI_ENTROPY_MAX_ADVERT_ID_BYTES as u64,
+            ),
+            (
+                "antiEntropyMaxSessionFrames",
+                MIN_ANTI_ENTROPY_MAX_SESSION_FRAMES as u64,
+                MAX_ANTI_ENTROPY_MAX_SESSION_FRAMES as u64,
+            ),
+            (
+                "antiEntropyAcceptBurst",
+                u64::from(MIN_ANTI_ENTROPY_ACCEPT_BURST),
+                u64::from(MAX_ANTI_ENTROPY_ACCEPT_BURST),
+            ),
+            (
+                "antiEntropyAcceptRefillMilliseconds",
+                MIN_ANTI_ENTROPY_ACCEPT_REFILL_MILLISECONDS,
+                MAX_ANTI_ENTROPY_ACCEPT_REFILL_MILLISECONDS,
+            ),
+        ]
+    }
+
+    /// R-7: each key is refused at boot one below its floor, at 0 and one
+    /// above its ceiling — with an error naming the key — and accepted at both
+    /// bounds.
+    #[test]
+    fn test_anti_entropy_bounds_refused_outside_floor_and_ceiling() {
+        for (key, min, max) in anti_entropy_keys() {
+            for bad in [0, min - 1, max + 1] {
+                let error = load_with_p2p_key(key, bad)
+                    .map(|_| ())
+                    .expect_err(&format!("{key} = {bad} must be refused at boot"));
+                let message = error.to_string();
+                assert!(
+                    message.contains(&format!("p2p.{key}")),
+                    "the refusal must name the key: {message}"
+                );
+            }
+            for good in [min, max] {
+                load_with_p2p_key(key, good)
+                    .unwrap_or_else(|error| panic!("{key} = {good} must be accepted: {error}"));
+            }
+        }
+    }
+
+    /// R-7: an absent key is exactly today's behaviour — the built settings
+    /// equal the serve layer's own defaults, which lie inside their bounds.
+    #[test]
+    fn test_anti_entropy_defaults_are_todays_constants() {
+        let config = NodeConfig::load_from_path(
+            &write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean" }"#)
+                .path()
+                .to_path_buf(),
+        )
+        .expect("defaults validate");
+        let timeouts = config.p2p.anti_entropy_timeouts();
+        let expected = AntiEntropyTimeouts::default();
+        assert_eq!(timeouts.session, expected.session);
+        assert_eq!(timeouts.session, Duration::from_secs(300));
+        assert_eq!(timeouts.io, expected.io);
+        assert_eq!(timeouts.connect, expected.connect);
+        assert_eq!(timeouts.open_stream, expected.open_stream);
+        assert_eq!(timeouts.max_advert_pages, expected.max_advert_pages);
+        assert_eq!(timeouts.max_advert_id_bytes, expected.max_advert_id_bytes);
+        assert_eq!(timeouts.max_session_frames, expected.max_session_frames);
+
+        let limits = config.p2p.anti_entropy_limits();
+        let expected = AntiEntropyLimits::default();
+        assert_eq!(
+            limits.max_requests_per_connection,
+            expected.max_requests_per_connection
+        );
+        assert_eq!(limits.max_total_connections, expected.max_total_connections);
+        assert_eq!(
+            limits.max_connections_per_peer,
+            expected.max_connections_per_peer
+        );
+        assert_eq!(limits.accept_burst, expected.accept_burst);
+        assert_eq!(
+            limits.accept_refill_interval,
+            expected.accept_refill_interval
+        );
+    }
+
+    /// R-7: a set key reaches the settings the handler is built from, and the
+    /// frame key reaches BOTH sides' budgets (M-28's mirror).
+    #[test]
+    fn test_anti_entropy_keys_reach_the_built_settings() {
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "p2p": {
+                "antiEntropySessionSeconds": 120,
+                "antiEntropyMaxAdvertPages": 300,
+                "antiEntropyMaxAdvertIdBytes": 33554432,
+                "antiEntropyMaxSessionFrames": 20000,
+                "antiEntropyAcceptBurst": 4,
+                "antiEntropyAcceptRefillMilliseconds": 5000 } }"#,
+        );
+        let config =
+            NodeConfig::load_from_path(&file.path().to_path_buf()).expect("in-bounds values");
+        let timeouts = config.p2p.anti_entropy_timeouts();
+        assert_eq!(timeouts.session, Duration::from_secs(120));
+        assert_eq!(timeouts.max_advert_pages, 300);
+        assert_eq!(timeouts.max_advert_id_bytes, 32 * 1024 * 1024);
+        assert_eq!(timeouts.max_session_frames, 20_000);
+        let limits = config.p2p.anti_entropy_limits();
+        assert_eq!(limits.max_requests_per_connection, 20_000);
+        assert_eq!(limits.accept_burst, 4);
+        assert_eq!(limits.accept_refill_interval, Duration::from_secs(5));
     }
 
     // ── L-23: p2p.meshId ─────────────────────────────────────────────────

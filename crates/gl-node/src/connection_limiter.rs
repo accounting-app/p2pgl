@@ -16,11 +16,18 @@
 //! legitimately-shaped frames is 4–8 GiB (L-39). So the limiter also carries a
 //! BYTE budget for in-flight inbound frame bodies — global and per peer — that
 //! the frame reader draws on as bytes arrive; see [`FrameReservation`].
+//!
+//! Counting CONCURRENT connections does not bound how OFTEN a peer may open
+//! them, and a fresh connection is not free: it costs a QUIC handshake, and its
+//! first `HaveHeads{more:false}` costs a full O(N) local advert under the ledger
+//! read lock (M-40). So admission also runs a per-peer accept token bucket — see
+//! [`AntiEntropyLimits::accept_burst`].
 
 use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use iroh::EndpointId;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -33,7 +40,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// gossip fetches at 16, plus periodic head exchanges), so a per-peer cap of 32
 /// never trips on a legitimate burst, and 100_000 requests on one connection is
 /// far past any real catch-up (paginated `HaveHeads` + thousands of `Want`
-/// chunks + re-`Want`s for a 64 MiB ledger). These get a config surface in T38.
+/// chunks + re-`Want`s for a 64 MiB ledger). The request budget and the accept
+/// bucket have a config surface (`p2p.antiEntropyMaxSessionFrames`,
+/// `p2p.antiEntropyAcceptBurst`, `p2p.antiEntropyAcceptRefillMilliseconds`;
+/// R-7), built by `P2pConfig::anti_entropy_limits`.
 #[derive(Clone, Copy, Debug)]
 pub struct AntiEntropyLimits {
     /// Max concurrent inbound anti-entropy connections across all peers.
@@ -59,6 +69,33 @@ pub struct AntiEntropyLimits {
     /// global budget and starve every other peer's frames — the per-peer
     /// connection cap's reasoning, applied to bytes.
     pub max_frame_bytes_in_flight_per_peer: usize,
+    /// NEW connections one peer may open back to back before the accept rate
+    /// applies (M-40): the capacity of its accept token bucket.
+    ///
+    /// The concurrent caps above bound what a peer HOLDS, not how often it may
+    /// open and drop. Every fresh connection costs a handshake, and its first
+    /// 40-byte `HaveHeads{more:false}` costs a full O(N) local advert under the
+    /// ledger read lock (~36 MB out on a 300k-directive ledger) — L-01's frame
+    /// budget bounds that per connection, which a free reconnect resets.
+    ///
+    /// Sized against the honest pattern, which is small because outbound
+    /// connections are POOLED (T42, `peer_connections.rs`): one connection per
+    /// peer carries every anti-entropy tick and all of the up-to-16
+    /// (`MAX_CONCURRENT_FETCHES`) gossip fetches as bi-streams, concurrent
+    /// callers share one in-flight dial, and a peer redials only when the pooled
+    /// connection is gone — the server's idle close (`io`, 30 s), its session
+    /// deadline (300 s), a failed operation, or a restart. The worst honest
+    /// burst is a stale-pool redial plus the fresh dial behind it (≈ 2), or a
+    /// restart of both ends at once (a handful). Eight is several times that.
+    pub accept_burst: u32,
+    /// One accept token is returned to a peer's bucket per this interval (M-40).
+    ///
+    /// Two seconds admits a sustained 30 connections a minute per peer, against
+    /// an honest steady state of ONE per `io` idle close (≤ 2/min at the 30 s
+    /// default) or one per session deadline (0.2/min) — 15× headroom — while
+    /// capping a reconnect loop at a sustained ~0.5 handshakes + adverts per
+    /// second per allowlisted peer instead of however many the network allows.
+    pub accept_refill_interval: Duration,
 }
 
 impl Default for AntiEntropyLimits {
@@ -69,6 +106,55 @@ impl Default for AntiEntropyLimits {
             max_requests_per_connection: 100_000,
             max_frame_bytes_in_flight: 256 * 1024 * 1024,
             max_frame_bytes_in_flight_per_peer: 32 * 1024 * 1024,
+            accept_burst: DEFAULT_ACCEPT_BURST,
+            accept_refill_interval: DEFAULT_ACCEPT_REFILL_INTERVAL,
+        }
+    }
+}
+
+/// Default [`AntiEntropyLimits::accept_burst`] (M-40); see there for the sizing.
+pub const DEFAULT_ACCEPT_BURST: u32 = 8;
+
+/// Default [`AntiEntropyLimits::accept_refill_interval`] (M-40).
+pub const DEFAULT_ACCEPT_REFILL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How often a refused inbound connection may produce a `warn!` (M-40).
+///
+/// The same ten seconds as the HTTP side's `PER_IP_REFUSAL_LOG_INTERVAL`, for
+/// the same reason: a refusal is cheap to provoke, so logging each one would
+/// hand a reconnect loop an unbounded log stream the limiter exists to deny it.
+/// Refusals in between are counted and reported on the next logged line.
+const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Why [`ConnectionLimiter::try_acquire`] refused a connection (M-16, M-40).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The global concurrent-connection budget is spent.
+    Global,
+    /// This peer already holds `max_connections_per_peer` connections.
+    PerPeer,
+    /// This peer is opening connections faster than its accept bucket refills.
+    AcceptRate,
+}
+
+impl Refusal {
+    /// The QUIC application close code the refused connection is closed with.
+    ///
+    /// The two concurrency refusals keep the code they always had (2); the rate
+    /// refusal gets its own so a peer — and a test — can tell "come back when a
+    /// slot frees" from "slow down".
+    pub fn close_code(self) -> u32 {
+        match self {
+            Self::Global | Self::PerPeer => 2,
+            Self::AcceptRate => 6,
+        }
+    }
+
+    /// The close reason sent alongside [`Self::close_code`].
+    pub fn close_reason(self) -> &'static [u8] {
+        match self {
+            Self::Global | Self::PerPeer => b"connection-limit",
+            Self::AcceptRate => b"accept-rate-limit",
         }
     }
 }
@@ -104,6 +190,30 @@ struct LimiterInner {
     frame_bytes: Mutex<FrameBytes>,
     max_frame_bytes: usize,
     max_frame_bytes_per_peer: usize,
+    /// Per-peer accept buckets (M-40), as a GCRA "theoretical arrival time":
+    /// the instant at which the peer's bucket is full again. Admitting advances
+    /// it by one refill interval; a peer is admitted while doing so leaves it no
+    /// more than `burst` intervals ahead of now. One `Instant` per peer, no
+    /// floating point, and "bucket full" is simply `tat <= now`.
+    ///
+    /// Deliberately NOT pruned when the peer's connection count drops to 0,
+    /// unlike `per_peer`: forgetting the bucket on disconnect would hand a
+    /// reconnect loop a full bucket every time. Entries whose bucket is full are
+    /// indistinguishable from absent ones and are pruned on insert instead, so
+    /// the map holds only peers that connected within the last
+    /// `burst × interval` — and every caller has already checked the allowlist.
+    accept_rate: Mutex<HashMap<EndpointId, Instant>>,
+    accept_burst: u32,
+    accept_refill_interval: Duration,
+    /// Throttle for the refusal `warn!` (M-40); see [`REFUSAL_LOG_INTERVAL`].
+    refusal_log: Mutex<RefusalLog>,
+}
+
+/// State behind [`ConnectionLimiter::should_log_refusal`].
+#[derive(Default)]
+struct RefusalLog {
+    last_logged: Option<Instant>,
+    suppressed: u64,
 }
 
 /// The byte counts behind [`FrameReservation`] (L-39).
@@ -130,7 +240,34 @@ impl ConnectionLimiter {
                 frame_bytes: Mutex::new(FrameBytes::default()),
                 max_frame_bytes: limits.max_frame_bytes_in_flight,
                 max_frame_bytes_per_peer: limits.max_frame_bytes_in_flight_per_peer,
+                accept_rate: Mutex::new(HashMap::new()),
+                accept_burst: limits.accept_burst,
+                accept_refill_interval: limits.accept_refill_interval,
+                refusal_log: Mutex::new(RefusalLog::default()),
             }),
+        }
+    }
+
+    /// Whether a refusal happening now should be logged (M-40), and if so how
+    /// many were swallowed since the last logged one.
+    ///
+    /// At most one `Some` per [`REFUSAL_LOG_INTERVAL`] across ALL peers and
+    /// reasons, so a reconnect loop's log cost is fixed however fast it loops.
+    pub fn should_log_refusal(&self, now: Instant) -> Option<u64> {
+        let mut log = self
+            .inner
+            .refusal_log
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match log.last_logged {
+            Some(previous) if now.saturating_duration_since(previous) < REFUSAL_LOG_INTERVAL => {
+                log.suppressed = log.suppressed.saturating_add(1);
+                None
+            }
+            _ => {
+                log.last_logged = Some(now);
+                Some(std::mem::take(&mut log.suppressed))
+            }
         }
     }
 
@@ -166,14 +303,28 @@ impl ConnectionLimiter {
 
     /// Try to admit one inbound connection from `peer`.
     ///
-    /// Returns a guard that must be held for the connection's lifetime, or
-    /// `None` when either the global or the per-peer budget is exhausted. On
-    /// `None` no state changes: the global permit taken for the check is
-    /// released and no per-peer entry is created (a rejected peer never leaves a
-    /// spurious 0-count entry behind).
-    pub fn try_acquire(&self, peer: EndpointId) -> Option<ConnectionGuard> {
+    /// Returns a guard that must be held for the connection's lifetime, or the
+    /// [`Refusal`] naming which budget is exhausted: the global or per-peer
+    /// concurrency cap (M-16), or the peer's accept rate (M-40). Refusal is
+    /// all-or-nothing — the global permit taken for the check is released, no
+    /// per-peer entry is created (a rejected peer never leaves a spurious
+    /// 0-count entry behind) and no accept token is spent, so a peer refused
+    /// for a full slot does not also lose rate it never used.
+    pub fn try_acquire(&self, peer: EndpointId) -> Result<ConnectionGuard, Refusal> {
+        self.try_acquire_at(peer, Instant::now())
+    }
+
+    /// [`Self::try_acquire`] against an explicit clock, so the bucket's
+    /// arithmetic is testable without sleeping.
+    pub(crate) fn try_acquire_at(
+        &self,
+        peer: EndpointId,
+        now: Instant,
+    ) -> Result<ConnectionGuard, Refusal> {
         // Global budget first: an owned permit released by the guard's `Drop`.
-        let permit = Arc::clone(&self.inner.global).try_acquire_owned().ok()?;
+        let permit = Arc::clone(&self.inner.global)
+            .try_acquire_owned()
+            .map_err(|_| Refusal::Global)?;
         // Per-peer budget under the mutex. Check before incrementing.
         {
             let mut per_peer = self
@@ -184,21 +335,58 @@ impl ConnectionLimiter {
             let current = per_peer.get(&peer).copied().unwrap_or(0);
             if current >= self.inner.max_connections_per_peer {
                 // `permit` drops here, returning the global slot we just took.
-                return None;
+                return Err(Refusal::PerPeer);
             }
+            // M-40: the accept rate, checked LAST so that only a connection
+            // every other budget would admit spends a token. Lock order is
+            // always `per_peer` then `accept_rate`, and nothing else takes both.
+            self.inner.take_accept_token(peer, now)?;
             per_peer.insert(peer, current + 1);
         }
         #[cfg(test)]
         self.inner.accepted_total.fetch_add(1, Ordering::Relaxed);
-        Some(ConnectionGuard {
+        Ok(ConnectionGuard {
             inner: Arc::clone(&self.inner),
             peer,
             _permit: permit,
         })
     }
+
+    /// Peers with a partly drained accept bucket (M-40), for the bound test.
+    #[cfg(test)]
+    pub(crate) fn accept_buckets_tracked(&self) -> usize {
+        self.inner
+            .accept_rate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
 }
 
 impl LimiterInner {
+    /// Spend one of `peer`'s accept tokens at `now`, or refuse without changing
+    /// anything (M-40). GCRA: see [`LimiterInner::accept_rate`].
+    fn take_accept_token(&self, peer: EndpointId, now: Instant) -> Result<(), Refusal> {
+        let interval = self.accept_refill_interval;
+        let horizon = interval.saturating_mul(self.accept_burst);
+        let mut buckets = self
+            .accept_rate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tat = buckets.get(&peer).copied().map_or(now, |tat| tat.max(now));
+        let next = tat + interval;
+        if next.saturating_duration_since(now) > horizon {
+            return Err(Refusal::AcceptRate);
+        }
+        if !buckets.contains_key(&peer) {
+            // A new entry: first drop every bucket that has refilled to full,
+            // which is state an absent entry already describes.
+            buckets.retain(|_, tat| *tat > now);
+        }
+        buckets.insert(peer, next);
+        Ok(())
+    }
+
     fn lock_frame_bytes(&self) -> std::sync::MutexGuard<'_, FrameBytes> {
         self.frame_bytes
             .lock()
@@ -409,7 +597,7 @@ mod tests {
         let guard_one = limiter.try_acquire(peer).expect("1st acquire admitted");
         let guard_two = limiter.try_acquire(peer).expect("2nd acquire admitted");
         assert!(
-            limiter.try_acquire(peer).is_none(),
+            limiter.try_acquire(peer).is_err(),
             "3rd acquire for the same peer must be refused by the per-peer cap"
         );
 
@@ -419,7 +607,7 @@ mod tests {
             .try_acquire(peer)
             .expect("after a drop, a slot is free again");
         assert!(
-            limiter.try_acquire(peer).is_none(),
+            limiter.try_acquire(peer).is_err(),
             "still capped at 2 after the replacement acquire"
         );
 
@@ -440,7 +628,7 @@ mod tests {
         let peer_y = SecretKey::generate().public();
 
         let _x = limiter.try_acquire(peer_x).expect("peer x admitted");
-        assert!(limiter.try_acquire(peer_x).is_none(), "peer x capped at 1");
+        assert!(limiter.try_acquire(peer_x).is_err(), "peer x capped at 1");
         // peer y has its own budget.
         let _y = limiter.try_acquire(peer_y).expect("peer y admitted");
     }
@@ -457,7 +645,7 @@ mod tests {
         let _a = limiter.try_acquire(peer_a).expect("global slot 1");
         let _b = limiter.try_acquire(peer_b).expect("global slot 2");
         assert!(
-            limiter.try_acquire(peer_c).is_none(),
+            limiter.try_acquire(peer_c).is_err(),
             "global cap of 2 must refuse a 3rd distinct peer"
         );
     }
@@ -468,12 +656,164 @@ mod tests {
         let limiter = ConnectionLimiter::new(limits(0, 100));
         let peer = SecretKey::generate().public();
         assert!(
-            limiter.try_acquire(peer).is_none(),
+            limiter.try_acquire(peer).is_err(),
             "global cap of 0 refuses everything"
         );
         assert!(
             limiter.inner.per_peer.lock().unwrap().is_empty(),
             "a refused acquire must not create a per-peer entry"
         );
+    }
+
+    fn rate_limits(burst: u32, refill: Duration) -> AntiEntropyLimits {
+        AntiEntropyLimits {
+            accept_burst: burst,
+            accept_refill_interval: refill,
+            ..AntiEntropyLimits::default()
+        }
+    }
+
+    /// M-40: a reconnect loop gets exactly `burst` admissions at once, then one
+    /// per refill interval — and a full `burst` again once it has been quiet
+    /// for `burst` intervals. Dropping the guards (the loop's connections
+    /// ending) does not refill anything: the bucket outlives the connections.
+    #[test]
+    fn accept_bucket_admits_burst_then_the_refill_rate() {
+        let limiter = ConnectionLimiter::new(rate_limits(3, Duration::from_secs(2)));
+        let peer = SecretKey::generate().public();
+        let start = Instant::now();
+
+        for attempt in 0..3 {
+            drop(
+                limiter
+                    .try_acquire_at(peer, start)
+                    .unwrap_or_else(|refusal| panic!("burst admit {attempt}: {refusal:?}")),
+            );
+        }
+        assert_eq!(
+            limiter.try_acquire_at(peer, start).err(),
+            Some(Refusal::AcceptRate),
+            "the 4th back-to-back connection is over the burst"
+        );
+        assert_eq!(
+            limiter
+                .try_acquire_at(peer, start + Duration::from_millis(1999))
+                .err(),
+            Some(Refusal::AcceptRate),
+            "no token before a full refill interval"
+        );
+        drop(
+            limiter
+                .try_acquire_at(peer, start + Duration::from_secs(2))
+                .expect("one token back after one interval"),
+        );
+        assert_eq!(
+            limiter
+                .try_acquire_at(peer, start + Duration::from_secs(2))
+                .err(),
+            Some(Refusal::AcceptRate),
+            "and only one"
+        );
+        // Quiet for burst × interval: the whole burst is available again.
+        let later = start + Duration::from_secs(2 + 6);
+        for _ in 0..3 {
+            drop(limiter.try_acquire_at(peer, later).expect("refilled burst"));
+        }
+        assert!(limiter.try_acquire_at(peer, later).is_err());
+        assert_eq!(limiter.accepted_total(), 3 + 1 + 3);
+    }
+
+    /// M-40: a rate refusal is all-or-nothing like the other two — it returns
+    /// the global permit and creates no per-peer entry — and a refusal by a
+    /// concurrency cap spends no accept token.
+    #[test]
+    fn accept_rate_refusals_change_nothing_and_cap_refusals_spend_no_token() {
+        let limiter = ConnectionLimiter::new(AntiEntropyLimits {
+            max_total_connections: 8,
+            max_connections_per_peer: 1,
+            ..rate_limits(2, Duration::from_secs(60))
+        });
+        let peer = SecretKey::generate().public();
+        let now = Instant::now();
+
+        let held = limiter.try_acquire_at(peer, now).expect("first admit");
+        // Refused by the per-peer cap, repeatedly: none of these may spend the
+        // peer's second token.
+        for _ in 0..5 {
+            assert_eq!(
+                limiter.try_acquire_at(peer, now).err(),
+                Some(Refusal::PerPeer),
+                "the peer's single slot is held"
+            );
+        }
+        drop(held);
+        drop(
+            limiter
+                .try_acquire_at(peer, now)
+                .expect("the second token was never spent by the cap refusals"),
+        );
+        assert_eq!(
+            limiter.try_acquire_at(peer, now).err(),
+            Some(Refusal::AcceptRate)
+        );
+        assert!(
+            limiter.inner.per_peer.lock().unwrap().is_empty(),
+            "a rate refusal must not leave a per-peer entry"
+        );
+        assert_eq!(
+            limiter.inner.global.available_permits(),
+            8,
+            "a rate refusal must return the global permit it took"
+        );
+    }
+
+    /// M-40: buckets are per peer, and the map holds only peers whose bucket
+    /// is not full — a peer that has been quiet for `burst × interval` is
+    /// forgotten on the next insert, so the map cannot grow without bound.
+    #[test]
+    fn accept_buckets_are_per_peer_and_pruned_once_full() {
+        let limiter = ConnectionLimiter::new(rate_limits(1, Duration::from_secs(2)));
+        let now = Instant::now();
+        let peer_a = SecretKey::generate().public();
+        let peer_b = SecretKey::generate().public();
+
+        drop(limiter.try_acquire_at(peer_a, now).expect("a admitted"));
+        assert!(limiter.try_acquire_at(peer_a, now).is_err(), "a is spent");
+        drop(
+            limiter
+                .try_acquire_at(peer_b, now)
+                .expect("b has its own bucket"),
+        );
+        assert_eq!(limiter.accept_buckets_tracked(), 2);
+
+        let later = now + Duration::from_secs(2);
+        let peer_c = SecretKey::generate().public();
+        drop(limiter.try_acquire_at(peer_c, later).expect("c admitted"));
+        assert_eq!(
+            limiter.accept_buckets_tracked(),
+            1,
+            "a and b refilled to full and were pruned when c was inserted"
+        );
+    }
+
+    /// M-40: refusals log at most once per interval, and the line that does
+    /// log carries how many were swallowed since the last one.
+    #[test]
+    fn refusal_logging_is_rate_limited_and_counts_what_it_suppressed() {
+        let limiter = ConnectionLimiter::new(AntiEntropyLimits::default());
+        let now = Instant::now();
+        assert_eq!(limiter.should_log_refusal(now), Some(0));
+        for step in 1..=5 {
+            assert_eq!(
+                limiter.should_log_refusal(now + Duration::from_secs(step)),
+                None
+            );
+        }
+        assert_eq!(
+            limiter.should_log_refusal(now + REFUSAL_LOG_INTERVAL),
+            Some(5),
+            "the next logged line reports the five suppressed refusals"
+        );
+        assert_eq!(limiter.should_log_refusal(now + REFUSAL_LOG_INTERVAL), None);
     }
 }
