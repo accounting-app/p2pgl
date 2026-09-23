@@ -2148,6 +2148,32 @@ struct RecoveryFingerprint {
 pub type DirectiveSigner =
     std::sync::Arc<dyn Fn(&str, bool, &str, &str) -> Option<String> + Send + Sync>;
 
+/// Verifies the signature a file directive carries (H-20).
+///
+/// Arguments, in order: `content_id`, `is_transaction`, `parents`, `lamport`
+/// — the four `SignableMessage` fields, exactly as [`DirectiveSigner`] takes
+/// them — then `author` (the public key the signature must verify against;
+/// the author id *is* the key) and `signature` (the hex value on the
+/// envelope). Returns `true` only when the signature verifies. The same
+/// dependency inversion as the signer: this crate does not depend on
+/// `security`, so `gl-node` builds this from
+/// `security::signing::verify_signature` and installs it with
+/// [`LedgerService::set_verifier`].
+pub type DirectiveVerifier =
+    std::sync::Arc<dyn Fn(&str, bool, &str, &str, &str, &str) -> bool + Send + Sync>;
+
+/// What [`LedgerService::verify_history_directive`] concluded about one
+/// directive's signature (H-20).
+enum HistoryVerdict {
+    /// The signature verifies, or the directive carries no envelope.
+    Verified,
+    /// This service has no means to check it: no verifier, and either no
+    /// signer or a foreign author, or a signer that has signing disabled.
+    Unverifiable,
+    /// Refused, with the reason the operator sees.
+    Refused(String),
+}
+
 /// The unified ledger service — owns DAG, account state, and file persistence.
 ///
 /// All write operations go through this service. Reads query the DAG directly.

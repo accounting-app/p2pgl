@@ -22,14 +22,21 @@ partials (L-64, L-66, L-23).
 > patching the symptoms one at a time. Every task keeps the campaign's rule: revert the fix → the named
 > test fails → restore; residuals go in this file, not in code comments.
 
-> **Decisions pending** (the audit puts these to the user; each task below names the one it waits on):
-> (1) H-19 — the ratchet's reference point: causal predecessor (recommended) vs adopter clock, and whether
-> to add a trusted-bootstrap join for meshes that already carry a jump; (2) H-21 — whether to keep any
-> remote frontier cap at all (recommended: none); (3) H-20 — quarantine vs refuse for an own record whose
-> signature does not verify at boot (recommended: quarantine), and the rating; (4) M-50 — exact `i128`
-> accumulation now vs interim tooling, and the rating for the intended deployments; (5) M-48 — rating
-> against the 4× bar (fix is the same either way). **Until (1)–(2) are taken, T72 can land its (c) and
-> (d) halves only.**
+> **Decisions taken 2026-09-23** (user), recorded once here and referenced from the tasks: work lands in
+> the tree uncommitted, at wave boundaries; **two harnesses are built first** and must fail at HEAD before
+> T72/T73 land against them — a multi-replica convergence harness (N services, one directive set,
+> randomised and adversarial delivery orders and subsets, equal DAGs and balances at the fixed point) and a
+> boot file-edit fuzzer (mutate a node-written `.bean`, boot, assert nothing served would be refused by a
+> peer); (1) H-19 — **revised after the first choice was shown not to close it**: no per-directive bound can
+> let a fresh node cross a removed author's jump by anti-entropy alone (an honest node that adopted a
+> 2^32 jump legitimately stamps 2^32 + 1 above its parents; an attacker *transaction* already partitions
+> joiners through `MissingParent`), so the ratchet **stays as it is**; the fix is a **trusted-bootstrap
+> join** (a fresh node boots from a peer's `.bean`, which loads as history — works at HEAD and is pinned by
+> the harness), a boot/adoption **warning** when the clock is far above the directive count, and remedy and
+> residual text stating that removing an in-history author requires bootstrap joins; (2) H-21 — the remote per-author head bound is **dropped**; (3) H-20 — an own record whose
+> signature does not verify at boot is **quarantined**, rating stays High; (4) M-50 — **exact `i128`
+> accumulation now**, the 21-digit cap becomes an authoring rule; (5) M-48 — rating stays Medium, fix as
+> specified. Scope of the first wave: the two harnesses, then T72 and T73.
 
 ## Priority order at a glance
 
@@ -96,13 +103,16 @@ sequentially; T75, T76, T77 can run alongside.
   cost 2.73 s/tick plus 30 MiB of transfer per hostile peer, indefinitely.
 - **Decisions (pending):** (1) the ratchet's reference point; a trusted-bootstrap join. (2) whether any
   remote frontier cap survives.
-- **Change:** (a) state the advance bound on the *content*: refuse a directive whose lamport exceeds its
-  causal predecessor — the largest lamport among its parents, or among the directives it must already hold —
-  by ≥ 2^32, so every replica gives the same verdict and a fresh node can always climb; keep the local-clock
-  check only as a warning; warn at boot and at adoption whenever `clock > 2 × directive_count`; correct the
-  `LamportAdvance` message ("accepted once the intervening directives have arrived" is false when they never
-  can) and the T63 residual text; optionally an operator-driven trusted-bootstrap join for a mesh that
-  already carries a jump. (b) drop the remote `UnmergedHeadLimit` refusal; if a frontier cap is wanted it must
+- **Change:** (a) **the ratchet stays** (decision (1), revised): no per-directive bound lets a fresh node
+  cross a removed author's jump by anti-entropy alone, so the fix is procedural — document and pin the
+  **trusted-bootstrap join** (a fresh node copies a peer's `.bean` and boots it as history; the harness case
+  `h19_fresh_node_bootstrapped_from_a_peers_file_converges` pins that it works); add a `warn!` at boot and at
+  adoption whenever `lamport_clock > 2 × directive_count` (honest clocks are bounded by events seen), naming
+  the author of the highest lamport; correct the `LamportAdvance` message ("accepted once the intervening
+  directives have arrived" is false when they never can), the `LamportCeiling`/boot remedy text (removing an
+  in-history author from the allowlist requires every *later* joiner to bootstrap from a peer's file, and
+  for an attacker *transaction* the same holds through `MissingParent`), and the T63 residual; README §Mesh
+  identity gains the join procedure. (b) drop the remote `UnmergedHeadLimit` refusal; if a frontier cap is wanted it must
   be content-deterministic (every replica drops the same heads, e.g. lexicographically largest above the cap);
   choose parents by author diversity (at most N per author) or newest-lamport-first so an id-grinder cannot
   starve honest heads. (c) cache `LamportAdvance` refusals keyed on `(peer, id, local clock)` and invalidate
@@ -114,8 +124,9 @@ sequentially; T75, T76, T77 can run alongside.
   [anti_entropy_alpn.rs:1866-1940](../crates/gl-node/src/anti_entropy_alpn.rs#L1866), README §Mesh identity
   (the remedy text).
 - **Verify:** the `h1b` shape — A and B adopt `local + 2^32 − 1` from X, author on top, X is dropped from the
-  allowlist and the served set, a fresh node **converges** (fails at HEAD); the `h1a` pre-T63 shape converges
-  or boots with a warning naming the gap; a dense history still converges in ascending, descending and
+  allowlist and the served set: a fresh node **bootstrapped from A's file converges** (harness case; passes at
+  HEAD and must keep passing), the anti-entropy-only join stays a documented, ignored harness case, and the
+  new warning fires on A, B and the joiner; the `h1a` pre-T63 shape boots with the warning naming the gap; a dense history still converges in ascending, descending and
   interleaved order (`X2 probe 4`); the `3b` disjoint-subset two-replica shape gives **equal DAG membership**
   with no local authoring (fails at HEAD; every `test_h16_*` today is single-replica); 256 planted small-id
   heads plus one honest head → the local append names the honest head; 4,096 ratchet-refused ids cost one
