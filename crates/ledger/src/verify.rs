@@ -21,8 +21,19 @@ pub enum VerifyError {
         stored_id: String,
         computed_id: String,
     },
-    /// A parent txid references a node not in the DAG.
-    MissingParent { txid: String, parent: String },
+    /// A node's parent links name nodes not in the DAG.
+    ///
+    /// ONE error per node, not per dangling edge (L-63): `parent` is the first
+    /// unknown parent in the node's own order and `missing` counts all of them
+    /// (always ≥ 1). A node may carry up to [`crate::service::MAX_PARENTS`]
+    /// (256) links, so the per-edge form let a file writer turn 4,000
+    /// transactions into 1,024,000 errors and a 166 MiB `verify` response. The
+    /// node is what an operator has to repair; the count says how badly.
+    MissingParent {
+        txid: String,
+        parent: String,
+        missing: usize,
+    },
     /// Cycle detected in the DAG.
     CycleDetected { txid: String },
 }
@@ -39,11 +50,19 @@ impl std::fmt::Display for VerifyError {
                     "Content hash mismatch: stored={stored_id}, computed={computed_id}"
                 )
             }
-            VerifyError::MissingParent { txid, parent } => {
+            VerifyError::MissingParent {
+                txid,
+                parent,
+                missing,
+            } => {
                 write!(
                     f,
                     "Missing parent: {txid} references unknown parent {parent}"
-                )
+                )?;
+                if *missing > 1 {
+                    write!(f, " and {} more unknown parent(s)", missing - 1)?;
+                }
+                Ok(())
             }
             VerifyError::CycleDetected { txid } => {
                 write!(f, "Cycle detected involving {txid}")
@@ -75,6 +94,36 @@ impl BalanceAssertionSummary {
     }
 }
 
+/// Most structural errors a [`VerifyReport`] carries (L-63).
+///
+/// Errors past this are counted in [`VerifyReport::truncated`], not stored.
+/// A rendered error is ~200 bytes, so 1,000 is ~200 KiB per `verify` response
+/// (202,000 bytes on the 4,000 × 256 fixture) — enough to see the shape of any
+/// real corruption, and to fix it a thousand nodes at a time. The uncapped
+/// list was one entry per dangling edge: 1,024,000 errors / 166 MiB of strings
+/// on that fixture, twice per GraphQL request (`MAX_VERIFY_PER_REQUEST`), all
+/// built under the ledger read lock.
+pub const MAX_REPORTED_ERRORS: usize = 1_000;
+
+/// Collects structural errors up to [`MAX_REPORTED_ERRORS`] and counts the
+/// rest (L-63). Detection is unchanged — every node and edge is still visited,
+/// so `verify_dag` stays O(N + E) and `ok` stays exact; only storage is capped.
+#[derive(Default)]
+struct ErrorLog {
+    errors: Vec<VerifyError>,
+    truncated: usize,
+}
+
+impl ErrorLog {
+    fn push(&mut self, error: VerifyError) {
+        if self.errors.len() < MAX_REPORTED_ERRORS {
+            self.errors.push(error);
+        } else {
+            self.truncated = self.truncated.saturating_add(1);
+        }
+    }
+}
+
 /// Result of a full DAG verification.
 #[derive(Debug, Clone)]
 pub struct VerifyReport {
@@ -89,8 +138,11 @@ pub struct VerifyReport {
     pub ok: bool,
     /// Number of nodes checked.
     pub nodes_checked: usize,
-    /// Any errors found.
+    /// The first [`MAX_REPORTED_ERRORS`] errors found, in detection order.
     pub errors: Vec<VerifyError>,
+    /// How many further errors were found and not stored (L-63). `0` means
+    /// `errors` is the complete list.
+    pub truncated: usize,
     /// Balance assertions evaluated during this verification (§3.6).
     pub assertions: BalanceAssertionSummary,
 }
@@ -138,7 +190,7 @@ pub struct VerifyReport {
 /// The GraphQL weight is sized on these numbers and pinned by
 /// `gl-node`'s `graphql::query::tests::test_verify_complexity_matches_measured_cost_model`.
 pub fn verify_dag(dag: &LedgerDag, read_model: &ReadModel) -> VerifyReport {
-    let mut errors = Vec::new();
+    let mut errors = ErrorLog::default();
     let mut nodes_checked = 0;
 
     let content_ids = dag.content_ids();
@@ -157,23 +209,24 @@ pub fn verify_dag(dag: &LedgerDag, read_model: &ReadModel) -> VerifyReport {
             }
         }
 
-        // 2. Parent link resolution (I8).
+        // 2. Parent link resolution (I8). Every edge is still checked; the
+        // node gets one error naming its first unknown parent and the count
+        // (L-63), not one error per dangling edge.
         if let Some(parents) = dag.parents_of(stored_id) {
-            for parent in parents {
-                if dag.get(parent).is_none() {
-                    errors.push(VerifyError::MissingParent {
-                        txid: stored_id.to_owned(),
-                        parent: parent.clone(),
-                    });
-                }
+            let mut unknown = parents.iter().filter(|parent| dag.get(parent).is_none());
+            if let Some(first) = unknown.next() {
+                errors.push(VerifyError::MissingParent {
+                    txid: stored_id.to_owned(),
+                    parent: first.clone(),
+                    missing: 1 + unknown.count(),
+                });
             }
         }
     }
 
     // 3. Cycle detection via topological sort (Kahn's algorithm).
     // If we can't sort all transaction nodes, there's a cycle.
-    let cycle_errors = detect_cycles(dag);
-    errors.extend(cycle_errors);
+    detect_cycles(dag, &mut errors);
 
     // 4. Balance assertions (§3.6, M-08). Evaluated over the DAG's own
     // directives — the borrowed view, so no clone of the ledger — and reported
@@ -192,25 +245,26 @@ pub fn verify_dag(dag: &LedgerDag, read_model: &ReadModel) -> VerifyReport {
         failures: results.into_iter().filter(|result| !result.ok).collect(),
     };
 
+    // `truncated > 0` implies `errors` is full, so this is exact either way.
     VerifyReport {
-        ok: errors.is_empty(),
+        ok: errors.errors.is_empty(),
         nodes_checked,
-        errors,
+        errors: errors.errors,
+        truncated: errors.truncated,
         assertions,
     }
 }
 
 /// Detect cycles in the transaction DAG using DFS coloring.
 ///
-/// Returns any cycle errors found.
-fn detect_cycles(dag: &LedgerDag) -> Vec<VerifyError> {
+/// Pushes any cycle errors found into `errors` (capped there; L-63).
+fn detect_cycles(dag: &LedgerDag, errors: &mut ErrorLog) {
     use std::collections::HashMap;
 
     let content_ids = dag.content_ids();
 
     // Track visit state: 0 = unvisited, 1 = in-progress, 2 = done.
     let mut state: HashMap<&str, u8> = content_ids.iter().map(|id| (*id, 0u8)).collect();
-    let mut errors = Vec::new();
 
     // Iterative DFS coloring with an explicit heap work-stack (M-5). The DAG
     // depth is attacker-controlled (a long parent chain), so native recursion
@@ -258,8 +312,6 @@ fn detect_cycles(dag: &LedgerDag) -> Vec<VerifyError> {
             }
         }
     }
-
-    errors
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -572,6 +624,99 @@ mod tests {
             )),
             "Should report missing parent for dangling link: {:?}",
             report.errors
+        );
+    }
+
+    // ── L-63: the error list is per node and capped ──────────────────────
+
+    /// `count` distinct 64-hex ids that name no node, starting at `seed`.
+    fn dangling_ids(seed: usize, count: usize) -> Vec<String> {
+        (0..count)
+            .map(|offset| format!("{:064x}", (seed + offset) as u128 + 0xdead_beef))
+            .collect()
+    }
+
+    /// L-63: a node with several dangling parents is ONE error that names the
+    /// first and counts them all, and it renders the count.
+    #[test]
+    fn l63_missing_parents_are_reported_once_per_node() {
+        let mut dag = LedgerDag::new();
+        let genesis = make_txn(make_date(2024, 1, 1), "Genesis", "");
+        let genesis_id = compute_content_id(&genesis);
+        dag.insert(genesis, false).unwrap();
+
+        let dangling = dangling_ids(0, 3);
+        // One known parent among the dangling ones: it must not be counted.
+        let parents = format!("{genesis_id},{}", dangling.join(","));
+        dag.insert(make_txn(make_date(2024, 1, 2), "Child", &parents), false)
+            .unwrap();
+
+        let report = verify_dag(&dag, &read_model_for(&dag));
+        assert!(!report.ok);
+        assert_eq!(report.truncated, 0);
+        assert_eq!(
+            report.errors.len(),
+            1,
+            "one node with three dangling parents is one error: {:?}",
+            report.errors
+        );
+        match &report.errors[0] {
+            VerifyError::MissingParent {
+                parent, missing, ..
+            } => {
+                assert!(dangling.contains(parent), "names a dangling parent");
+                assert_eq!(*missing, 3, "counts every dangling edge of the node");
+            }
+            other => panic!("expected MissingParent, got {other:?}"),
+        }
+        assert!(
+            report.errors[0]
+                .to_string()
+                .ends_with(" and 2 more unknown parent(s)"),
+            "the rendered error carries the count: {}",
+            report.errors[0]
+        );
+    }
+
+    /// L-63, the finding's own fixture: 4,000 transactions × 256 dangling
+    /// parents was 1,024,000 errors and 166 MiB of rendered strings. Now it is
+    /// at most [`MAX_REPORTED_ERRORS`] per-node errors plus the count of the
+    /// rest, and nothing is lost from the verdict or the node count.
+    #[test]
+    fn l63_dangling_parent_fixture_is_capped_with_a_truncated_count() {
+        const NODES: usize = 4_000;
+        const PARENTS: usize = 256;
+        let mut dag = LedgerDag::new();
+        for index in 0..NODES {
+            let parents = dangling_ids(index * 1_000, PARENTS).join(",");
+            dag.insert(
+                make_txn(make_date(2024, 1, 1), &format!("t{index}"), &parents),
+                false,
+            )
+            .unwrap();
+        }
+
+        let report = verify_dag(&dag, &read_model_for(&dag));
+        assert!(!report.ok, "dangling parents must still fail verification");
+        assert_eq!(report.nodes_checked, NODES);
+        assert_eq!(
+            report.errors.len(),
+            MAX_REPORTED_ERRORS,
+            "the stored list is capped (was one entry per dangling edge)"
+        );
+        assert_eq!(
+            report.truncated,
+            NODES - MAX_REPORTED_ERRORS,
+            "every node past the cap is counted — per node, not per edge"
+        );
+        assert!(report.errors.iter().all(|error| matches!(
+            error,
+            VerifyError::MissingParent { missing, .. } if *missing == PARENTS
+        )));
+        let rendered: usize = report.errors.iter().map(|e| e.to_string().len()).sum();
+        assert!(
+            rendered < 256 * 1024,
+            "rendered errors must stay small, got {rendered} bytes"
         );
     }
 

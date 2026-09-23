@@ -201,6 +201,192 @@ impl FileState {
     }
 }
 
+/// How many polls may go by without re-reading an unchanged-looking file
+/// (M-42, T69). At the node's 250 ms cadence, 40 polls is 10 s.
+///
+/// # The trade
+///
+/// A [`FilePoller`] re-reads and re-hashes the file only when its `stat`
+/// identity ([`StatKey`]: size, mtime, and on Unix ctime, inode and device)
+/// has changed, when the last read was *racy* (the file had been modified
+/// within [`RACY_WINDOW`] of that read, so a rewrite inside the same timestamp
+/// granule could follow it unseen), or once every `FULL_READ_EVERY` polls
+/// regardless. The last is the backstop for the one case the other two cannot
+/// see: a rewrite that keeps the size, lands in the same timestamp granule as
+/// the previous write, and whose mtime *and* ctime still read as older than
+/// the racy window — in practice a filesystem whose clock is behind this
+/// host's (a network mount). Such an edit is still detected, at most
+/// `FULL_READ_EVERY` polls (≈10 s) late, instead of within one poll; every
+/// other edit is detected at the next poll exactly as before.
+///
+/// What it buys: an unchanged 59 MiB `.bean` is read once per 10 s instead of
+/// four times a second — measured 215.8 ms of read + SHA-256 per poll before
+/// (86 % of a core, forever), one `stat` per poll after.
+pub const FULL_READ_EVERY: u32 = 40;
+
+/// How recent a file's mtime may be, relative to the moment it was read, for
+/// that read to be treated as racy and repeated at the next poll (M-42).
+///
+/// Two seconds covers the coarsest timestamp granularity in use (FAT's 2 s;
+/// HFS+ and ext3 are 1 s): an edit that lands in the same granule as the
+/// previous one, after we read it, is otherwise invisible to `stat`. The cost
+/// is a few extra reads right after a write — the node's own compactions and
+/// an operator's saves — never on a file at rest.
+pub const RACY_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The `stat` identity of the `.bean`, compared poll to poll to decide whether
+/// the file has to be re-read (M-42).
+///
+/// Size and mtime alone miss an edit that preserves both (L7), which is why
+/// the watcher hashed on every poll. On Unix the ctime is included too: it is
+/// set by the kernel on every write and cannot be restored by `utimes`, so a
+/// same-size rewrite followed by `touch -d <old mtime>` still changes the key.
+/// Inode and device catch a replace-by-rename (an editor's save, or this
+/// node's own `persist_atomically`) even when every timestamp matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatKey {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    /// `(ctime seconds, ctime nanoseconds, inode, device)`; `None` off Unix.
+    unix: Option<(i64, i64, u64, u64)>,
+}
+
+impl StatKey {
+    /// The key for `metadata`.
+    pub fn of(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let unix = {
+            use std::os::unix::fs::MetadataExt;
+            Some((
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+                metadata.ino(),
+                metadata.dev(),
+            ))
+        };
+        #[cfg(not(unix))]
+        let unix = None;
+        StatKey {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            unix,
+        }
+    }
+
+    /// Was a read taken at `read_at` racy — could a same-granule rewrite
+    /// follow it without changing this key? See [`RACY_WINDOW`].
+    ///
+    /// An mtime in the future (a skewed clock) is racy; no mtime at all is
+    /// not — the `FULL_READ_EVERY` backstop covers that platform.
+    fn is_racy_at(&self, read_at: std::time::SystemTime) -> bool {
+        match self.modified {
+            Some(modified) => match read_at.duration_since(modified) {
+                Ok(age) => age < RACY_WINDOW,
+                Err(_) => true,
+            },
+            None => false,
+        }
+    }
+}
+
+/// A stateful poller over one file: [`FileState::from_path`], but reading and
+/// hashing the file only when it may have changed (M-42, T69).
+///
+/// # The bug this closes
+///
+/// The node's watcher called `FileState::from_path` every 250 ms, and every
+/// call read and SHA-256'd the whole `.bean` whether or not anything had
+/// changed: 215.8 ms per poll on a 59 MiB ledger in a release build (86 % of a
+/// core, 240 MiB/s hashed, forever), on a runtime worker, with the interval's
+/// default `Burst` catch-up running polls back to back once one poll took
+/// longer than the period (4.17 s per poll in a debug build).
+///
+/// # The shape
+///
+/// `stat` every poll; read + hash only when the [`StatKey`] changed, the last
+/// read was racy, or [`FULL_READ_EVERY`] polls have passed since the last
+/// read. Otherwise the previous [`FileState`] is returned as is, which
+/// [`FileState::detect_change`] classifies as `Unchanged` (equal hashes). The
+/// read itself is T67's: `journal::open_checked` + `read_to_end_capped`, via
+/// `from_path`, unchanged. The poller is `Send` and owns no runtime resources,
+/// so a caller can move it into `spawn_blocking` for each poll (the node does).
+#[derive(Debug)]
+pub struct FilePoller {
+    path: PathBuf,
+    full_read_every: u32,
+    last: Option<(StatKey, FileState)>,
+    polls_since_read: u32,
+    racy: bool,
+    reads: u64,
+}
+
+impl FilePoller {
+    /// A poller over `path` with the production backstop, [`FULL_READ_EVERY`].
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self::with_full_read_every(path, FULL_READ_EVERY)
+    }
+
+    /// A poller that re-reads at least every `full_read_every` polls (a value
+    /// of 0 or 1 reads on every poll, which is the pre-M-42 behaviour).
+    pub fn with_full_read_every(path: impl Into<PathBuf>, full_read_every: u32) -> Self {
+        FilePoller {
+            path: path.into(),
+            full_read_every: full_read_every.max(1),
+            last: None,
+            polls_since_read: 0,
+            racy: false,
+            reads: 0,
+        }
+    }
+
+    /// The file's state now, reading it only if it may have changed.
+    pub fn poll(&mut self) -> FileState {
+        match std::fs::metadata(&self.path) {
+            Ok(metadata) => {
+                self.poll_with_key(StatKey::of(&metadata), std::time::SystemTime::now())
+            }
+            Err(_) => {
+                // Absent (or not even stat-able): nothing to read, and the
+                // next time it is there it must be read.
+                self.last = None;
+                FileState {
+                    size: None,
+                    modified: None,
+                    content_hash: None,
+                }
+            }
+        }
+    }
+
+    /// How many times this poller has read the file (a full
+    /// [`FileState::from_path`]). For tests and diagnostics.
+    pub fn reads(&self) -> u64 {
+        self.reads
+    }
+
+    /// [`Self::poll`] with the `stat` result and the clock supplied — the seam
+    /// that lets a test hold the key still across a real rewrite, which no
+    /// filesystem will do on demand.
+    fn poll_with_key(&mut self, key: StatKey, now: std::time::SystemTime) -> FileState {
+        if let Some((last_key, state)) = &self.last {
+            let due = self.polls_since_read.saturating_add(1) >= self.full_read_every;
+            if *last_key == key && !self.racy && !due {
+                self.polls_since_read += 1;
+                return state.clone();
+            }
+        }
+        // The key was taken BEFORE this read, so an edit racing the read
+        // leaves the stored key older than the file and the next poll reads
+        // again — the safe direction.
+        let state = FileState::from_path(&self.path);
+        self.reads = self.reads.saturating_add(1);
+        self.polls_since_read = 0;
+        self.racy = key.is_racy_at(now);
+        self.last = Some((key, state.clone()));
+        state
+    }
+}
+
 /// A file watcher handle (for cancellation).
 ///
 /// The actual watching loop is spawned as a background task. This handle
@@ -509,5 +695,159 @@ mod tests {
             .expect("M-36: from_path blocked on a FIFO");
         assert!(state.content_hash.is_none(), "a FIFO is never hashed");
         std::fs::remove_file(&path).ok();
+    }
+
+    // ─── M-42 (T69): read only when the file may have changed ────────────
+
+    /// Removes the fixture file when the test ends, pass or fail.
+    struct Cleanup(PathBuf);
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.0).ok();
+        }
+    }
+
+    fn poller_fixture(name: &str, content: &str) -> (Cleanup, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "openledger-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, content).unwrap();
+        (Cleanup(path.clone()), path)
+    }
+
+    /// Put the file's mtime an hour in the past, so a read of it is not racy.
+    fn age(path: &Path) -> std::time::SystemTime {
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        old
+    }
+
+    /// M-42 KEY TEST: two consecutive polls of an unchanged file perform ONE
+    /// read.
+    ///
+    /// Bug-catch: make `poll_with_key` read unconditionally (the pre-T69
+    /// `from_path`-per-tick shape) and `reads()` is 2.
+    #[test]
+    fn m42_two_polls_of_an_unchanged_file_read_it_once() {
+        let (_dir, path) = poller_fixture("m42-unchanged.bean", "2024-01-01 open Assets:Cash\n");
+        age(&path);
+        let mut poller = FilePoller::new(&path);
+        let first = poller.poll();
+        let second = poller.poll();
+        assert_eq!(poller.reads(), 1, "M-42: the unchanged file was read again");
+        assert_eq!(second.detect_change(&first), FileChangeKind::Unchanged);
+        assert!(
+            second.content_hash.is_some(),
+            "the cached state keeps its hash"
+        );
+    }
+
+    /// A change the `stat` identity shows is read at the very next poll.
+    #[test]
+    fn m42_a_changed_file_is_read_at_the_next_poll() {
+        let (_dir, path) = poller_fixture("m42-changed.bean", "AAAA");
+        age(&path);
+        let mut poller = FilePoller::new(&path);
+        let before = poller.poll();
+        std::fs::write(&path, "AAAAAA").unwrap();
+        let after = poller.poll();
+        assert_eq!(poller.reads(), 2);
+        assert_eq!(after.detect_change(&before), FileChangeKind::Modified);
+    }
+
+    /// L7 through the poller: a same-size rewrite whose mtime is then put
+    /// back is still seen at the next poll — the ctime moved, and nothing can
+    /// put that back.
+    ///
+    /// Bug-catch: drop the ctime from `StatKey` and the rewrite is cached as
+    /// `Unchanged` (until the every-Nth backstop).
+    #[cfg(unix)]
+    #[test]
+    fn m42_a_same_size_rewrite_with_its_mtime_restored_is_seen_at_the_next_poll() {
+        let (_dir, path) = poller_fixture("m42-restored.bean", "AAAA");
+        let old = age(&path);
+        let mut poller = FilePoller::new(&path);
+        let before = poller.poll();
+        // ctime has 1 ns resolution on APFS/ext4, but make sure the clock has
+        // visibly moved on a coarser filesystem too.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&path, "BBBB").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let after = poller.poll();
+        assert_eq!(
+            poller.reads(),
+            2,
+            "the ctime changed, so the file was re-read"
+        );
+        assert_eq!(after.detect_change(&before), FileChangeKind::Modified);
+    }
+
+    /// The backstop: a rewrite `stat` cannot see at all (same size, same
+    /// mtime, same ctime — a filesystem whose clock is behind ours) is still
+    /// detected within `full_read_every` polls.
+    ///
+    /// Driven through the `poll_with_key` seam, holding the key still across
+    /// a real rewrite, because no real filesystem will do that on demand.
+    ///
+    /// Bug-catch: drop the `due` arm and the rewrite is `Unchanged` forever.
+    #[test]
+    fn m42_a_rewrite_invisible_to_stat_is_caught_within_n_polls() {
+        const N: u32 = 4;
+        let (_dir, path) = poller_fixture("m42-invisible.bean", "AAAA");
+        let key = StatKey::of(&std::fs::metadata(&path).unwrap());
+        let later = std::time::SystemTime::now() + Duration::from_secs(3600);
+        let mut poller = FilePoller::with_full_read_every(&path, N);
+        let before = poller.poll_with_key(key, later);
+        assert_eq!(poller.reads(), 1);
+
+        std::fs::write(&path, "BBBB").unwrap();
+        for poll in 1..N {
+            let state = poller.poll_with_key(key, later);
+            assert_eq!(
+                state.detect_change(&before),
+                FileChangeKind::Unchanged,
+                "poll {poll}: cached while the key holds still"
+            );
+        }
+        let caught = poller.poll_with_key(key, later);
+        assert_eq!(poller.reads(), 2, "the Nth poll re-read");
+        assert_eq!(caught.detect_change(&before), FileChangeKind::Modified);
+    }
+
+    /// A read taken while the file was freshly modified is racy and repeated
+    /// at the next poll, so an edit inside the same timestamp granule is not
+    /// left to the backstop.
+    #[test]
+    fn m42_a_read_of_a_freshly_written_file_is_repeated() {
+        let (_dir, path) = poller_fixture("m42-racy.bean", "AAAA");
+        let mut poller = FilePoller::new(&path);
+        poller.poll();
+        poller.poll();
+        assert_eq!(poller.reads(), 2, "a racy read must be repeated");
+    }
+
+    /// The production backstop, spelled out: ~10 s at the node's 250 ms poll.
+    #[test]
+    fn m42_the_backstop_is_ten_seconds_at_the_node_cadence() {
+        assert_eq!(
+            Duration::from_millis(250) * FULL_READ_EVERY,
+            Duration::from_secs(10)
+        );
     }
 }

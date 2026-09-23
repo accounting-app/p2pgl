@@ -3787,6 +3787,32 @@ impl LedgerService {
         self.canonical_bytes
     }
 
+    /// How many more bytes of journal record a commit may add before
+    /// `prepare`'s cap projection refuses it (M-39, T69).
+    ///
+    /// `MAX_LEDGER_FILE_BYTES − canonical − journal`, saturating at zero: the
+    /// exact left-hand side of the append arm's refusal, so a batch whose
+    /// record is larger than this is **known** to fail its prepare. A caller
+    /// that can estimate a batch before staging it (anti-entropy, which holds
+    /// the `Supply` entries) asks here first and defers the batch instead of
+    /// staging it, failing the prepare, and paying an L-13 reload to roll it
+    /// back — which near the cap it would otherwise do once per tick per peer,
+    /// forever.
+    ///
+    /// Conservative in both of the ways that matter. The compaction arm is
+    /// bounded by the same number (the compacted file is at most canonical +
+    /// journal + the staged bytes, and `persist_atomically` refuses past the
+    /// cap). `canonical_bytes` is what this service last wrote or read, so a
+    /// hand edit since then is not reflected: one that shrank the file only
+    /// makes this pessimistic, and one that grew it is still refused by the
+    /// prepare that adopts it — it is just not predicted here. O(1): two field
+    /// reads.
+    pub fn append_headroom(&self) -> u64 {
+        MAX_LEDGER_FILE_BYTES
+            .saturating_sub(self.canonical_bytes)
+            .saturating_sub(self.canonical_journal_bytes)
+    }
+
     /// The commit journal's path (`<ledger>.bean.journal`).
     pub fn journal_path(&self) -> &Path {
         &self.journal_path
@@ -4222,10 +4248,10 @@ impl LedgerService {
     /// whole `boot` — up to a 64 MiB read, a parse, a DAG insert per directive
     /// and a read-model build — happens under whatever lock the caller holds.
     /// That is right for `persist_or_reload`/`compact` (synchronous by
-    /// contract) and it is what `gl-node`'s `prepare_or_recover` still does for
-    /// a failed *prepare*. An async caller that holds the single-writer permit
-    /// should use the split form instead, as `gl-node`'s `commit_pending` does,
-    /// so the rebuild runs on a blocking thread with no ledger lock held.
+    /// contract). An async caller that holds the single-writer permit should
+    /// use the split form instead, as `gl-node`'s `commit_pending` (a failed
+    /// commit, L-43) and `prepare_or_recover` (a failed prepare, M-39) both
+    /// do, so the rebuild runs on a blocking thread with no ledger lock held.
     pub fn recover_failed_commit(&mut self) {
         let reload = self.begin_recovery();
         let reloaded = reload.load();
@@ -14980,6 +15006,28 @@ mod tests {
         for sidecar in torn_sidecars(&journal_path) {
             std::fs::remove_file(sidecar).ok();
         }
+        remove_ledger_and_journal(&path);
+    }
+
+    /// M-39 (T69): `append_headroom` is exactly the room the append arm's cap
+    /// projection leaves — `MAX − canonical − journal` — and it shrinks by what
+    /// each append adds to the journal.
+    #[test]
+    fn m39_append_headroom_is_the_cap_minus_canonical_and_journal() {
+        let (mut svc, path) = boot_large_ledger();
+        assert_eq!(svc.journal_bytes(), 0);
+        assert_eq!(
+            svc.append_headroom(),
+            MAX_LEDGER_FILE_BYTES - svc.canonical_bytes()
+        );
+        svc.stage_remote_directive(remote_open("Assets:Headroom", make_date(2024, 3, 1), 10))
+            .unwrap();
+        svc.persist_or_reload().unwrap();
+        assert!(svc.journal_bytes() > 0, "premise: the write appended");
+        assert_eq!(
+            svc.append_headroom(),
+            MAX_LEDGER_FILE_BYTES - svc.canonical_bytes() - svc.journal_bytes()
+        );
         remove_ledger_and_journal(&path);
     }
 }

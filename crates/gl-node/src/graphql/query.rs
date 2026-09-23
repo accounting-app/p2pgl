@@ -192,7 +192,10 @@ impl QueryRoot {
     }
 
     /// Journal of transactions, optionally filtered (FR-2 AC4).
-    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
+    ///
+    /// Weighted by the page it returns, not as one flat scan (M-45); see
+    /// [`journal_complexity`].
+    #[graphql(complexity = "journal_complexity(limit, child_complexity)")]
     async fn journal(
         &self,
         ctx: &Context<'_>,
@@ -203,6 +206,10 @@ impl QueryRoot {
         #[graphql(default = 0)] offset: i32,
     ) -> Vec<Transaction> {
         if let Ok(ledger) = ctx.data::<SharedLedger>() {
+            // M-45: postings are the bulk of a row (up to 1,000 each), so they
+            // are materialized only when the query selects them. The weight
+            // charges them only when selected, and this keeps the two in step.
+            let with_postings = ctx.look_ahead().field("postings").exists();
             let svc = ledger.read().await;
             let entries = svc.read_model().journal(
                 account.as_deref(),
@@ -211,9 +218,11 @@ impl QueryRoot {
                 clamp_journal_limit(limit),
                 clamp_journal_offset(offset),
             );
+            // M-45: the read model already holds each row's content id; the
+            // old path cloned the whole transaction and re-hashed it per row.
             entries
                 .into_iter()
-                .map(|e| domain_txn_to_graphql(&e.transaction, &svc))
+                .map(|entry| txn_to_graphql(&entry.transaction, entry.txid.clone(), with_postings))
                 .collect()
         } else {
             Vec::new()
@@ -224,8 +233,10 @@ impl QueryRoot {
     async fn transaction(&self, ctx: &Context<'_>, txid: TransactionId) -> Option<Transaction> {
         if let Ok(ledger) = ctx.data::<SharedLedger>() {
             let svc = ledger.read().await;
+            // The DAG is keyed by content id, so the id that found the
+            // directive IS its content id — no need to re-hash it (M-45).
             if let Some(ledger::model::Directive::Transaction(txn)) = svc.get_directive(&txid.0) {
-                return Some(domain_txn_to_graphql(txn, &svc));
+                return Some(txn_to_graphql(txn, txid.0, true));
             }
         }
         None
@@ -305,6 +316,7 @@ impl QueryRoot {
                 ok: report.ok,
                 nodes_checked: report.nodes_checked as i32,
                 errors: report.errors.iter().map(|e| e.to_string()).collect(),
+                truncated: i32::try_from(report.truncated).unwrap_or(i32::MAX),
                 balance_assertions: assertion_report(&report.assertions),
             }
         } else {
@@ -312,6 +324,7 @@ impl QueryRoot {
                 ok: true,
                 nodes_checked: 0,
                 errors: Vec::new(),
+                truncated: 0,
                 balance_assertions: assertion_report(&Default::default()),
             }
         }
@@ -379,15 +392,19 @@ fn assertion_report(summary: &ledger::verify::BalanceAssertionSummary) -> Balanc
     }
 }
 
-/// Convert a domain Transaction to the GraphQL Transaction type.
-pub fn domain_txn_to_graphql(
+/// Convert a domain Transaction whose content id the caller already holds
+/// (M-45).
+///
+/// `txid` must be `txn`'s content id — the read model's `IndexedTransaction`
+/// and the DAG's key both are. With `with_postings` false the `postings` list
+/// is left empty: pass it only when the query does not select the field.
+pub fn txn_to_graphql(
     txn: &ledger::model::Transaction,
-    _svc: &ledger::service::LedgerService,
+    txid: String,
+    with_postings: bool,
 ) -> Transaction {
-    let content_id =
-        ledger::hash::compute_content_id(&ledger::model::Directive::Transaction(txn.clone()));
     Transaction {
-        txid: TransactionId(content_id),
+        txid: TransactionId(txid),
         date: DateScalar(txn.date),
         flag: match txn.flag {
             ledger::model::Flag::Complete => "*".to_owned(),
@@ -397,37 +414,11 @@ pub fn domain_txn_to_graphql(
         narration: txn.narration.clone(),
         tags: txn.tags.clone(),
         links: txn.links.clone(),
-        postings: txn
-            .postings
-            .iter()
-            .map(|p| {
-                let amt = p.amount.as_ref().map(|a| Amount {
-                    number: DecimalScalar(a.number),
-                    currency: a.currency.clone(),
-                });
-                Posting {
-                    account: p.account.clone(),
-                    amount: amt.unwrap_or(Amount {
-                        number: DecimalScalar(Decimal::ZERO),
-                        currency: String::new(),
-                    }),
-                    cost: p.cost.as_ref().and_then(|c| {
-                        c.amount.as_ref().map(|a| Amount {
-                            number: DecimalScalar(a.number),
-                            currency: a.currency.clone(),
-                        })
-                    }),
-                    price: p.price.as_ref().map(|pr| match pr {
-                        ledger::model::PriceSpec::Unit(a) | ledger::model::PriceSpec::Total(a) => {
-                            Amount {
-                                number: DecimalScalar(a.number),
-                                currency: a.currency.clone(),
-                            }
-                        }
-                    }),
-                }
-            })
-            .collect(),
+        postings: if with_postings {
+            txn.postings.iter().map(posting_to_graphql).collect()
+        } else {
+            Vec::new()
+        },
         author: txn
             .metadata
             .get("openledger-author")
@@ -448,6 +439,69 @@ pub fn domain_txn_to_graphql(
             })
             .unwrap_or_default(),
     }
+}
+
+/// Convert one domain posting to its GraphQL shape.
+fn posting_to_graphql(p: &ledger::model::Posting) -> Posting {
+    let amt = p.amount.as_ref().map(|a| Amount {
+        number: DecimalScalar(a.number),
+        currency: a.currency.clone(),
+    });
+    Posting {
+        account: p.account.clone(),
+        amount: amt.unwrap_or(Amount {
+            number: DecimalScalar(Decimal::ZERO),
+            currency: String::new(),
+        }),
+        cost: p.cost.as_ref().and_then(|c| {
+            c.amount.as_ref().map(|a| Amount {
+                number: DecimalScalar(a.number),
+                currency: a.currency.clone(),
+            })
+        }),
+        price: p.price.as_ref().map(|pr| match pr {
+            ledger::model::PriceSpec::Unit(a) | ledger::model::PriceSpec::Total(a) => Amount {
+                number: DecimalScalar(a.number),
+                currency: a.currency.clone(),
+            },
+        }),
+    }
+}
+
+/// Rows per unit of `journal` weight (M-45).
+const JOURNAL_ROWS_PER_WEIGHT_UNIT: usize = 100;
+
+/// The `journal` field's complexity weight (M-45).
+///
+/// It used to be a flat [`HEAVY_RESOLVER_COMPLEXITY`], whatever the `limit`
+/// and whatever the selection — so eight aliased `journal(limit: 10000)
+/// { postings { … } }` cost exactly the 4096 budget and were admitted, every
+/// alias resolving concurrently: against ~3,600 planted 1,000-posting
+/// transactions, ~3.6M posting objects (~1.8 GB) per alias. Now it is
+///
+/// ```text
+/// max(HEAVY_RESOLVER_COMPLEXITY, (limit / 100).max(1) × (1 + child_complexity))
+/// ```
+///
+/// * The product charges the page: each hundred rows costs what one row's
+///   selection costs. With the finding's selection (`postings { account
+///   amount { number currency } }`, child complexity 5) a 10,000-row page
+///   weighs 600 as measured on the real schema, so at most six such aliases
+///   fit — seven or eight are refused. A whole-row selection (every scalar
+///   plus postings with cost and price) weighs 2,200: one full page per
+///   request.
+/// * The [`HEAVY_RESOLVER_COMPLEXITY`] floor is the scan: the read model
+///   filters EVERY transaction before it applies `limit`/`offset`, so even a
+///   one-row page is one whole-ledger pass, and a small selection must never
+///   make `journal` cheaper than it was — without the floor, twenty
+///   `journal(limit: 10000) { txid }` would have fit where eight did before.
+///
+/// A dashboard page (`limit` ≤ a few hundred, any selection) stays at the
+/// floor, so the documented "one of every report in a dashboard call" still
+/// fits; pinned by the tests below against the real schema.
+fn journal_complexity(limit: i32, child_complexity: usize) -> usize {
+    let hundreds = (clamp_journal_limit(limit) / JOURNAL_ROWS_PER_WEIGHT_UNIT).max(1);
+    HEAVY_RESOLVER_COMPLEXITY.max(hundreds.saturating_mul(child_complexity.saturating_add(1)))
 }
 
 /// Clamp GraphQL `limit` to `[0, MAX_JOURNAL_LIMIT]` before the `i32 as usize` cast.
@@ -626,5 +680,164 @@ mod tests {
              {GRAPHQL_MAX_COMPLEXITY} budget: {:?}",
             result.errors
         );
+    }
+
+    // ── M-45: `journal` is weighted by its page and selection ────────────
+
+    /// The finding's selection: every posting with its amount.
+    const POSTINGS_SELECTION: &str = "postings { account amount { number currency } }";
+
+    /// The complexity async-graphql computes for `query` against the real
+    /// schema (its `Analyzer` extension), or `None` if the query was refused.
+    async fn measured_complexity(query: &str) -> Option<u64> {
+        let schema = super::super::schema_builder(true)
+            .extension(async_graphql::extensions::Analyzer)
+            .finish();
+        let response = schema.execute(query).await;
+        if !response.errors.is_empty() {
+            return None;
+        }
+        let analyzer = response.extensions.get("analyzer")?;
+        match analyzer.clone().into_json().ok()?.get("complexity")? {
+            serde_json::Value::Number(number) => number.as_u64(),
+            _ => None,
+        }
+    }
+
+    async fn aliased(count: usize, field: &str) -> Vec<async_graphql::ServerError> {
+        let mut query = String::from("{");
+        for index in 0..count {
+            query.push_str(&format!(" a{index}: {field}"));
+        }
+        query.push('}');
+        crate::graphql::build_schema().execute(query).await.errors
+    }
+
+    fn refused_on_complexity(errors: &[async_graphql::ServerError]) -> bool {
+        errors
+            .iter()
+            .any(|error| error.message.to_lowercase().contains("complex"))
+    }
+
+    /// M-45 regression: eight aliased 10,000-row pages WITH postings were
+    /// exactly the 4096 budget and admitted — ~14 GB of posting values per
+    /// request against planted 1,000-posting transactions. Refused now, with
+    /// the weights pinned as measured by the real schema.
+    #[tokio::test]
+    async fn m45_eight_aliased_full_journal_pages_with_postings_are_refused() {
+        let page = format!("journal(limit: 10000) {{ {POSTINGS_SELECTION} }}");
+        let weight = measured_complexity(&format!("{{ {page} }}"))
+            .await
+            .expect("one full page with postings is admitted");
+        assert_eq!(
+            weight,
+            (MAX_JOURNAL_LIMIT as u64 / 100) * (1 + 5),
+            "10,000 rows × (1 + postings {{ account amount {{ number currency }} }} = 5)"
+        );
+        assert!(8 * weight > GRAPHQL_MAX_COMPLEXITY as u64);
+
+        let refused = aliased(8, &page).await;
+        assert!(
+            refused_on_complexity(&refused),
+            "eight aliased journal(limit: 10000) with postings must be refused \
+             on complexity (M-45), got: {refused:?}"
+        );
+    }
+
+    /// M-45: the page weight must not undercut the scan it replaced. The read
+    /// model filters every transaction before `limit`, so each `journal` is at
+    /// least one whole-ledger pass — a tiny selection keeps the old weight
+    /// and the old cap of eight per request.
+    #[tokio::test]
+    async fn m45_small_selection_keeps_the_heavy_scan_floor() {
+        let tiny = "journal(limit: 10000) { txid }";
+        assert_eq!(
+            measured_complexity(&format!("{{ {tiny} }}")).await,
+            Some(HEAVY_RESOLVER_COMPLEXITY as u64),
+            "100 × (1 + 1) = 200 is under the floor; the floor applies"
+        );
+        assert!(
+            aliased(8, tiny).await.is_empty(),
+            "eight admitted, as before"
+        );
+        assert!(
+            refused_on_complexity(&aliased(9, tiny).await),
+            "a ninth is refused, as before — the fix must not raise the cap"
+        );
+    }
+
+    /// M-45: a dashboard — `verify` plus one of every report plus a normal
+    /// 100-row journal page with its postings — still fits the budget.
+    #[tokio::test]
+    async fn m45_dashboard_journal_page_with_postings_still_fits() {
+        let query = format!(
+            r#"{{
+                verify {{ ok }}
+                trialBalance(at: "2024-12-31") {{ totalDebit }}
+                balanceSheet(at: "2024-12-31") {{ assets {{ account }} }}
+                incomeStatement(from: "2024-01-01", to: "2024-12-31") {{ net {{ currency }} }}
+                journal(limit: 100) {{ txid date narration {POSTINGS_SELECTION} }}
+            }}"#
+        );
+        let errors = crate::graphql::build_schema().execute(query).await.errors;
+        assert!(
+            errors.is_empty(),
+            "a dashboard with a 100-row journal page must fit the \
+             {GRAPHQL_MAX_COMPLEXITY} budget: {errors:?}"
+        );
+    }
+
+    /// M-45: the resolvers hand out the content id the read model / DAG
+    /// already hold instead of re-hashing — and it IS the content id — and
+    /// `journal` materializes postings only when they are selected.
+    #[tokio::test]
+    async fn m45_journal_and_transaction_use_the_stored_txid() {
+        let dir = tempfile::tempdir().unwrap();
+        let bean_path = dir.path().join("test.bean");
+        std::fs::write(
+            &bean_path,
+            "2024-01-01 open Assets:Cash USD\n2024-01-01 open Equity:Opening USD\n\
+             2024-01-02 * \"seed\"\n  Assets:Cash 10 USD\n  Equity:Opening -10 USD\n",
+        )
+        .unwrap();
+        let service =
+            ledger::service::LedgerService::boot(&bean_path, "test-node".to_owned()).unwrap();
+        let expected = service
+            .read_model()
+            .journal(None, None, None, 10, 0)
+            .first()
+            .map(|entry| {
+                ledger::hash::compute_content_id(&ledger::model::Directive::Transaction(
+                    entry.transaction.clone(),
+                ))
+            })
+            .expect("one transaction");
+        let ledger: SharedLedger = std::sync::Arc::new(tokio::sync::RwLock::new(service));
+        let schema = crate::graphql::build_schema_with_service(
+            ledger,
+            crate::graphql::broadcast::TransactionBroadcast::new(),
+            p2p::node::PeerRegistry::new(),
+            std::sync::Arc::new(security::signing::NoopSignatureProvider),
+            true,
+            None,
+        );
+
+        let response = schema
+            .execute(format!(
+                r#"{{
+                    bare: journal {{ txid }}
+                    full: journal {{ txid {POSTINGS_SELECTION} }}
+                    one: transaction(txid: "{expected}") {{ txid {POSTINGS_SELECTION} }}
+                }}"#
+            ))
+            .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let data = response.data.into_json().unwrap();
+        assert_eq!(data["bare"][0]["txid"], expected.as_str());
+        assert_eq!(data["full"][0]["txid"], expected.as_str());
+        assert_eq!(data["one"]["txid"], expected.as_str());
+        assert_eq!(data["full"][0]["postings"].as_array().unwrap().len(), 2);
+        assert_eq!(data["one"]["postings"].as_array().unwrap().len(), 2);
+        assert_eq!(data["full"][0]["postings"][0]["account"], "Assets:Cash");
     }
 }

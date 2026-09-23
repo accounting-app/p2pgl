@@ -155,7 +155,12 @@ pub struct VerifyResult {
     /// assertions must also read `balanceAssertions`.
     pub ok: bool,
     pub nodes_checked: i32,
+    /// The first 1,000 structural errors (`ledger::verify::MAX_REPORTED_ERRORS`),
+    /// one per offending node (L-63).
     pub errors: Vec<String>,
+    /// How many further errors were found and not listed in `errors` (L-63);
+    /// `0` means `errors` is complete. Saturates at `i32::MAX`.
+    pub truncated: i32,
     /// Balance assertions evaluated during this verification (§3.6, M-08).
     pub balance_assertions: BalanceAssertionReport,
 }

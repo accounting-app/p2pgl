@@ -24,9 +24,16 @@
 //!
 //! ```text
 //! let permit = acquire_write_permit(&ledger).await;   // single writer
-//! let pending = { let mut svc = ledger.write().await; mutate(&mut svc); svc.prepare_commit()? };
+//! let mut svc = ledger.write().await;
+//! mutate(&mut svc);
+//! let (svc, pending, permit) = prepare_or_recover(&ledger, svc, false, permit).await?;
+//! drop(svc);
 //! commit_pending(&ledger, pending, permit).await?;    // spawn_blocking; owns the permit
 //! ```
+//!
+//! Neither half rebuilds the ledger under its lock: a failed commit and a
+//! failed prepare both reload off the lock while the permit is held (L-43,
+//! M-39).
 //!
 //! # Why the permit exists, and why it is not the write lock
 //!
@@ -95,7 +102,7 @@
 //! `COMMIT_IN_FLIGHT` error rather than a silently interleaved write.
 
 use ledger::service::{LedgerService, PendingCommit, RecoveryReload, ServiceError};
-use tokio::sync::OwnedMutexGuard;
+use tokio::sync::{OwnedMutexGuard, RwLockWriteGuard};
 
 use crate::graphql::SharedLedger;
 
@@ -254,7 +261,8 @@ where
 /// write lock { svc.finish_recovery(reload, reloaded) } // the swap (adopt_reloaded)
 /// ```
 ///
-/// Only ever called from inside [`commit_pending`]'s task, which owns the
+/// Only ever called from inside [`commit_pending`]'s task or
+/// [`prepare_or_recover`]'s recovery task, each of which owns the
 /// [`WritePermit`] until after this returns — so for the whole rebuild no other
 /// writer can stage, prepare, commit or reconcile. That is what makes a rebuild
 /// read at one moment still correct to install at a later one: the files it
@@ -293,17 +301,37 @@ where
 /// file an operator inspects is the canonical one).
 pub(crate) async fn compact(ledger: &SharedLedger) -> Result<(), ServiceError> {
     let permit = acquire_write_permit(ledger).await;
-    let pending = {
-        let mut service = ledger.write().await;
-        // `?` here drops the permit on the way out, which is correct: a prepare
-        // that failed left no commit to serialize against.
-        prepare_or_recover(&mut service, true)?
-    };
+    let service = ledger.write().await;
+    // A failed prepare consumed the permit (its recovery, if it needed one,
+    // held it to the end), so `?` has nothing left to release.
+    let (service, pending, permit) = prepare_or_recover(ledger, service, true, permit).await?;
+    drop(service);
     commit_pending(ledger, pending, permit).await
 }
 
 /// `prepare_commit` / `prepare_compaction` with the L-13 recovery a failed
-/// prepare needs.
+/// prepare needs — run **off** the ledger lock (M-39, R-20).
+///
+/// Takes the caller's write guard and [`WritePermit`] by value. On success
+/// both are handed straight back with the prepared commit, so the caller keeps
+/// reading the service under the same lock it staged under (the mutations look
+/// up what they just inserted) and then drops the guard and hands the permit
+/// to [`commit_pending`], exactly as before. On failure the guard is **dropped
+/// before** any recovery runs, the permit goes to the recovery, and only the
+/// error comes back.
+///
+/// # Cancellation (H-11), applied to the recovery
+///
+/// The synchronous form could not be cancelled mid-recovery: there was no
+/// `await` in it. This one has three, so it gets [`commit_pending`]'s
+/// treatment: the recovery runs on a task of its own that **owns the permit**,
+/// and this function only awaits its `JoinHandle`. A caller dropped mid-reload
+/// (a 408, an `RST_STREAM`, a lost `select!`) stops waiting; the rebuild still
+/// finishes and installs, and the next writer is admitted only after it has.
+/// Borrowing the permit instead would have let a cancel release the
+/// single-writer slot with the failed batch still staged in memory and the
+/// rebuild abandoned — memory ahead of disk, and the next writer's commit
+/// writing a batch whose own write had failed.
 ///
 /// A prepare can fail after it has already changed memory — adoption reconciles
 /// a hand edit in before it serializes over it — so the reload belongs here and
@@ -337,19 +365,26 @@ pub(crate) async fn compact(ledger: &SharedLedger) -> Result<(), ServiceError> {
 ///   it — the missing guard and the early-released permit — in place for the
 ///   next path that forgets them.
 ///
-/// # L-43: this recovery is still synchronous, deliberately
+/// # M-39 / R-20: the recovery is off the lock
 ///
-/// Unlike [`commit_pending`]'s, the reload here still runs inline, under the
-/// caller's write guard. The function is synchronous and is handed
-/// `&mut LedgerService` from inside a guard its callers keep using, so it has
-/// no way to release the lock around the rebuild without changing every call
-/// site (the three GraphQL mutations, the ALPN supply batch, the watcher and
-/// [`compact`]). The trigger is narrower than the commit-failure one — a
-/// prepare fails before anything is written, on an over-cap write or on an
-/// adoption that could not read or parse the `.bean` — but it is the same
-/// stall, and at the size cap it repeats on every write attempt. Moving it
-/// off the lock needs an async form that takes the guard by value, drops it,
-/// and runs [`recover_off_lock`] while the caller's permit is still held.
+/// Until T69 this function was synchronous and ran `recover_failed_commit` —
+/// a full `LedgerService::boot`: up to a 64 MiB read, a parse, a DAG insert per
+/// directive and a read-model build — inline, **under the caller's write
+/// guard**, so every GraphQL read queued behind it. L-43 had moved the
+/// commit-failure arm off the lock; this arm was left behind because it was
+/// handed `&mut LedgerService` from inside a guard it could not release. Near
+/// the size cap that became M-39: the append arm's projection refuses a peer's
+/// batch deterministically, the batch is re-Wanted every tick, and each refusal
+/// re-booted the ledger under the write lock — measured 3.65 s of write-lock
+/// hold per tick per peer on a 64 MiB ledger, forever.
+///
+/// Now the guard is dropped and [`recover_off_lock`] runs the same
+/// `begin_recovery` → `spawn_blocking` load → `finish_recovery` sequence the
+/// commit path uses, while the caller's permit keeps every other writer out.
+/// Readers proceed and, for the duration of the rebuild, see the staged but
+/// never-durable batch — the same exposure they already had for the duration
+/// of every commit (the lock is released between prepare and commit on the
+/// success path), and it is rolled out by the install exactly as before.
 ///
 /// # M-37(a): a `.bean` that does not parse is returned, not recovered from
 ///
@@ -368,23 +403,152 @@ pub(crate) async fn compact(ledger: &SharedLedger) -> Result<(), ServiceError> {
 /// commit after the repair (a retry of the same mutation dedups by content
 /// id). `LedgerService::commit_inline` carries the same arm for the
 /// synchronous callers.
-pub(crate) fn prepare_or_recover(
-    service: &mut LedgerService,
+pub(crate) async fn prepare_or_recover<'a>(
+    ledger: &'a SharedLedger,
+    service: RwLockWriteGuard<'a, LedgerService>,
     explicit_compaction: bool,
-) -> Result<Option<PendingCommit>, ServiceError> {
+    permit: WritePermit,
+) -> Result<Prepared<'a>, ServiceError> {
+    prepare_or_recover_with_reload(
+        ledger,
+        service,
+        explicit_compaction,
+        permit,
+        RecoveryReload::load,
+    )
+    .await
+}
+
+/// What a successful [`prepare_or_recover`] hands back: the caller's write
+/// guard, the prepared commit (`None` = nothing to write) and the permit it
+/// owes to [`commit_pending`].
+pub(crate) type Prepared<'a> = (
+    RwLockWriteGuard<'a, LedgerService>,
+    Option<PendingCommit>,
+    WritePermit,
+);
+
+/// [`prepare_or_recover`], with the blocking half of the reload supplied by the
+/// caller — the same test seam as [`commit_pending_with_reload`] (L-43), so a
+/// test can park the rebuild and observe the lock while it runs.
+async fn prepare_or_recover_with_reload<'a, L>(
+    ledger: &'a SharedLedger,
+    mut service: RwLockWriteGuard<'a, LedgerService>,
+    explicit_compaction: bool,
+    permit: WritePermit,
+    load: L,
+) -> Result<Prepared<'a>, ServiceError>
+where
+    L: FnOnce(&RecoveryReload) -> Result<LedgerService, ServiceError> + Send + 'static,
+{
     let prepared = if explicit_compaction {
         service.prepare_compaction()
     } else {
         service.prepare_commit()
     };
     match prepared {
-        Ok(pending) => Ok(pending),
+        Ok(pending) => Ok((service, pending, permit)),
         Err(ServiceError::CommitInFlight) => Err(ServiceError::CommitInFlight),
         Err(error @ ServiceError::Parse(_)) => Err(error),
         Err(error) => {
-            service.recover_failed_commit();
+            // M-39: release the lock BEFORE the rebuild; the permit, moved into
+            // the recovery task, is what keeps the files and the service still
+            // for it (and outlives a cancelled caller — see above).
+            drop(service);
+            let ledger = std::sync::Arc::clone(ledger);
+            let recovery = tokio::spawn(async move {
+                recover_off_lock(&ledger, load).await;
+                drop(permit);
+            });
+            // A `JoinError` here is a panic in the recovery's own bookkeeping
+            // or a runtime shutting down; either way the prepare's error is
+            // still the answer, and the permit went with the task.
+            let _ = recovery.await;
             Err(error)
         }
+    }
+}
+
+/// A ledger within a chosen number of bytes of `MAX_LEDGER_FILE_BYTES`, in
+/// the append-arm state a running node is in (M-39 test fixture).
+#[cfg(test)]
+pub(crate) mod near_cap {
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use ledger::service::{LedgerService, MAX_LEDGER_FILE_BYTES};
+    use tokio::sync::RwLock;
+
+    use crate::graphql::SharedLedger;
+
+    /// Boot a ledger whose canonical `.bean` is exactly
+    /// `MAX_LEDGER_FILE_BYTES − headroom` bytes, compacted once so the next
+    /// write takes the append arm, and return it with its
+    /// `append_headroom() == headroom`.
+    ///
+    /// The bytes are leading `;` comment lines, 1 MiB each: the parser skips
+    /// them per line, and a compaction writes them back verbatim, so the file
+    /// is at the cap for the append projection without paying to parse,
+    /// content-hash and index 64 MiB of directives (the `m35_*` fixture's
+    /// trick; a fixture of real directives costs ~20 s per boot in a debug
+    /// build). What is still paid per byte is the SHA-256 of the file, at boot,
+    /// at the compaction and in every L-13 reload — which is exactly what makes
+    /// a reload slow enough here to be observed from a concurrent reader.
+    pub(crate) fn near_cap_ledger(path: &Path, headroom: u64) -> SharedLedger {
+        const LINE: usize = 1 << 20;
+        let target = usize::try_from(MAX_LEDGER_FILE_BYTES - headroom).unwrap();
+        let mut text = String::with_capacity(target);
+        let mut remaining = target;
+        while remaining > 0 {
+            // Every line is "; " + filler + "\n", so at least 3 bytes.
+            let len = if remaining == LINE || remaining >= LINE + 3 {
+                LINE
+            } else {
+                remaining
+            };
+            text.push_str("; ");
+            text.extend(std::iter::repeat_n('x', len - 3));
+            text.push('\n');
+            remaining -= len;
+        }
+        std::fs::write(path, &text).unwrap();
+        drop(text);
+        let mut service = LedgerService::boot(path, "near-cap".to_owned()).unwrap();
+        // Boot read a file it did not write, so the first commit would be a
+        // compaction; take it here, as the node's startup compaction does.
+        service.compact().unwrap();
+        assert_eq!(service.canonical_bytes(), target as u64, "fixture size");
+        assert_eq!(service.append_headroom(), headroom, "fixture headroom");
+        Arc::new(RwLock::new(service))
+    }
+
+    /// Longest wait for a `read()` of `ledger`, sampled every few ms until
+    /// `stop` fires — the "is the write lock ever held for long" probe.
+    pub(crate) fn spawn_read_latency_probe(
+        ledger: &SharedLedger,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<(Duration, usize)>,
+    ) {
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let ledger = Arc::clone(ledger);
+        let probe = tokio::spawn(async move {
+            let mut worst = Duration::ZERO;
+            let mut samples = 0usize;
+            loop {
+                let started = tokio::time::Instant::now();
+                drop(ledger.read().await);
+                worst = worst.max(started.elapsed());
+                samples += 1;
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    () = tokio::time::sleep(Duration::from_millis(2)) => {}
+                }
+            }
+            (worst, samples)
+        });
+        (stop_tx, probe)
     }
 }
 
@@ -435,16 +599,15 @@ mod tests {
     /// commit shape all four production write paths use.
     async fn open_account(ledger: &SharedLedger, name: &str, day: u32) -> Result<(), ServiceError> {
         let permit = acquire_write_permit(ledger).await;
-        let pending = {
-            let mut service = ledger.write().await;
-            service.open_account_staged(
-                name.to_owned(),
-                chrono::NaiveDate::from_ymd_opt(2024, 1, day).unwrap(),
-                Vec::new(),
-                |_, _, _| None,
-            )?;
-            prepare_or_recover(&mut service, false)?
-        };
+        let mut service = ledger.write().await;
+        service.open_account_staged(
+            name.to_owned(),
+            chrono::NaiveDate::from_ymd_opt(2024, 1, day).unwrap(),
+            Vec::new(),
+            |_, _, _| None,
+        )?;
+        let (service, pending, permit) = prepare_or_recover(ledger, service, false, permit).await?;
+        drop(service);
         commit_pending(ledger, pending, permit).await
     }
 
@@ -605,18 +768,20 @@ mod tests {
             let ledger = Arc::clone(&ledger);
             async move {
                 let permit = acquire_write_permit(&ledger).await;
-                let pending = {
-                    let mut service = ledger.write().await;
-                    service
-                        .open_account_staged(
-                            "Assets:Failed".to_owned(),
-                            chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
-                            Vec::new(),
-                            |_, _, _| None,
-                        )
+                let mut service = ledger.write().await;
+                service
+                    .open_account_staged(
+                        "Assets:Failed".to_owned(),
+                        chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+                        Vec::new(),
+                        |_, _, _| None,
+                    )
+                    .unwrap();
+                let (service, pending, permit) =
+                    prepare_or_recover(&ledger, service, false, permit)
+                        .await
                         .unwrap();
-                    prepare_or_recover(&mut service, false).unwrap()
-                };
+                drop(service);
                 commit_pending_with_reload(&ledger, pending, permit, move |reload| {
                     entered_tx.send(()).unwrap();
                     release_rx.recv().unwrap();
@@ -719,19 +884,21 @@ mod tests {
         let panicking = tokio::spawn({
             let ledger = Arc::clone(&ledger);
             async move {
-                let _permit = acquire_write_permit(&ledger).await;
-                let _prepared = {
-                    let mut service = ledger.write().await;
-                    service
-                        .open_account_staged(
-                            "Assets:Panic".to_owned(),
-                            chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
-                            Vec::new(),
-                            |_, _, _| None,
-                        )
+                let permit = acquire_write_permit(&ledger).await;
+                let mut service = ledger.write().await;
+                service
+                    .open_account_staged(
+                        "Assets:Panic".to_owned(),
+                        chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+                        Vec::new(),
+                        |_, _, _| None,
+                    )
+                    .unwrap();
+                let (service, _prepared, _permit) =
+                    prepare_or_recover(&ledger, service, false, permit)
+                        .await
                         .unwrap();
-                    prepare_or_recover(&mut service, false).unwrap()
-                };
+                drop(service);
                 panic!("deliberate panic holding a prepared commit (H-11 test)");
             }
         });
@@ -792,19 +959,18 @@ mod tests {
         std::fs::write(&path, &content).unwrap();
 
         let permit = acquire_write_permit(&ledger).await;
-        let error = {
-            let mut service = ledger.write().await;
-            service
-                .open_account_staged(
-                    "Assets:Staged".to_owned(),
-                    chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
-                    Vec::new(),
-                    |_, _, _| None,
-                )
-                .unwrap();
-            prepare_or_recover(&mut service, false).expect_err("a broken file refuses the prepare")
+        let mut service = ledger.write().await;
+        service
+            .open_account_staged(
+                "Assets:Staged".to_owned(),
+                chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+                Vec::new(),
+                |_, _, _| None,
+            )
+            .unwrap();
+        let Err(error) = prepare_or_recover(&ledger, service, false, permit).await else {
+            panic!("a broken file refuses the prepare");
         };
-        drop(permit);
         assert_eq!(error.error_code(), "PARSE_ERROR");
 
         let service = ledger.read().await;
@@ -838,18 +1004,19 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         let permit = acquire_write_permit(&ledger).await;
-        let prepared = {
-            let mut service = ledger.write().await;
-            let result = service
-                .reconcile_file_staged()
-                .expect("H-15: a missing file is nothing to reconcile, not an error");
-            assert_eq!((result.new_directives, result.rejected), (0, 0));
-            assert!(
-                service.compaction_pending(),
-                "the watcher must be told to drive the commit that recreates the file"
-            );
-            prepare_or_recover(&mut service, true).unwrap()
-        };
+        let mut service = ledger.write().await;
+        let result = service
+            .reconcile_file_staged()
+            .expect("H-15: a missing file is nothing to reconcile, not an error");
+        assert_eq!((result.new_directives, result.rejected), (0, 0));
+        assert!(
+            service.compaction_pending(),
+            "the watcher must be told to drive the commit that recreates the file"
+        );
+        let (service, prepared, permit) = prepare_or_recover(&ledger, service, true, permit)
+            .await
+            .unwrap();
+        drop(service);
         commit_pending(&ledger, prepared, permit).await.unwrap();
 
         assert!(path.exists(), "the compaction recreated the file");
@@ -858,5 +1025,172 @@ mod tests {
         assert!(on_disk.accounts().is_open("Assets:One"));
         assert!(on_disk.accounts().is_open("Assets:Two"));
         assert_eq!(ledger.read().await.directive_count(), 2);
+    }
+
+    /// M-39 / R-20: a prepare refused at the size cap rebuilds the ledger with
+    /// NO lock held, while the permit still keeps every other writer out —
+    /// the L-43 shape, now on the prepare-failure arm too.
+    ///
+    /// The rebuild is parked through `prepare_or_recover_with_reload`'s seam;
+    /// the cap, the refusal, the permit, the locks and the install are the
+    /// real path.
+    ///
+    /// Bug-catch: make the failure arm call `service.recover_failed_commit()`
+    /// under the guard again (the pre-T69 body) and the parked loader is never
+    /// reached — the test times out waiting for it — and `try_write` would
+    /// fail for the whole rebuild.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn m39_a_prepare_refused_at_the_cap_rebuilds_off_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m39-prepare.bean");
+        let ledger = near_cap::near_cap_ledger(&path, 64);
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let failing = tokio::spawn({
+            let ledger = Arc::clone(&ledger);
+            async move {
+                let permit = acquire_write_permit(&ledger).await;
+                let mut service = ledger.write().await;
+                service
+                    .open_account_staged(
+                        "Assets:Over".to_owned(),
+                        chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+                        Vec::new(),
+                        |_, _, _| None,
+                    )
+                    .unwrap();
+                let prepared = prepare_or_recover_with_reload(
+                    &ledger,
+                    service,
+                    false,
+                    permit,
+                    move |reload| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        reload.load()
+                    },
+                )
+                .await;
+                prepared.err().map(|error| error.error_code())
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(120), entered_rx)
+            .await
+            .expect("the refused prepare must reach its rebuild")
+            .unwrap();
+
+        // ── 1. The rebuild holds no ledger lock ────────────────────────────
+        {
+            let guard = ledger
+                .try_write()
+                .expect("M-39: the ledger lock must be free while the rebuild runs");
+            assert!(
+                guard.accounts().is_open("Assets:Over"),
+                "mid-rebuild, readers see the staged batch the install will roll out"
+            );
+        }
+
+        // ── 2. ...but the permit still excludes every other writer ─────────
+        let second = tokio::spawn({
+            let ledger = Arc::clone(&ledger);
+            async move { open_account(&ledger, "Assets:Second", 3).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !second.is_finished(),
+            "M-39: a writer must not interleave with an in-progress recovery"
+        );
+
+        // ── 3. Release: refused, rolled back, and the node still compacts ──
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            failing.await.unwrap(),
+            Some("RESOURCE_LIMIT_EXCEEDED"),
+            "a write that cannot fit is refused, never acked"
+        );
+        let second = second.await.unwrap();
+        assert_eq!(
+            second.map_err(|error| error.error_code()),
+            Err("RESOURCE_LIMIT_EXCEEDED"),
+            "the queued writer does not fit either"
+        );
+        {
+            let service = ledger.read().await;
+            assert!(!service.accounts().is_open("Assets:Over"));
+            assert!(!service.accounts().is_open("Assets:Second"));
+            assert_eq!(service.uncommitted_count(), 0, "memory == disk again");
+            assert_eq!(service.append_headroom(), 64);
+        }
+        compact(&ledger)
+            .await
+            .expect("near the cap the node still accepts a compaction");
+    }
+
+    /// M-39 / R-20 through the real GraphQL mutation: a write refused at the
+    /// cap pays its L-13 reload with the write lock RELEASED, so a concurrent
+    /// reader never waits more than 100 ms — measured with a timed `read()`
+    /// probe across the whole mutation, reload included.
+    ///
+    /// The fixture's reload is a full boot of a 64 MiB file (a SHA-256 of all
+    /// of it, seconds in a debug build), so a reload under the lock is
+    /// unmistakable here.
+    ///
+    /// Bug-catch: the pre-T69 synchronous body (`service.recover_failed_commit()`
+    /// under the guard) and the probe's worst wait is the whole reload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn m39_a_mutation_refused_at_the_cap_does_not_hold_the_lock_across_its_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m39-mutation.bean");
+        let ledger = near_cap::near_cap_ledger(&path, 64);
+        let schema = build_schema_with_service(
+            Arc::clone(&ledger),
+            TransactionBroadcast::new(),
+            p2p::node::PeerRegistry::new(),
+            Arc::new(security::signing::NoopSignatureProvider),
+            true,
+            None,
+        );
+
+        let (stop, probe) = near_cap::spawn_read_latency_probe(&ledger);
+        let started = std::time::Instant::now();
+        let response = schema
+            .execute(r#"mutation { openAccount(name: "Assets:Over", date: "2024-01-01") }"#)
+            .await;
+        let mutation_took = started.elapsed();
+        stop.send(()).unwrap();
+        let (worst_read_wait, samples) = probe.await.unwrap();
+
+        let codes: Vec<String> = response
+            .errors
+            .iter()
+            .filter_map(|error| {
+                error
+                    .extensions
+                    .as_ref()
+                    .and_then(|ext| ext.get("code"))
+                    .map(|code| code.to_string())
+            })
+            .collect();
+        assert!(
+            codes
+                .iter()
+                .any(|code| code.contains("RESOURCE_LIMIT_EXCEEDED")),
+            "the write must be refused at the cap, got {:?}",
+            response.errors
+        );
+        eprintln!(
+            "m39 mutation: refused + reloaded in {mutation_took:?}; worst read wait \
+             {worst_read_wait:?} over {samples} samples"
+        );
+        assert!(
+            worst_read_wait < Duration::from_millis(100),
+            "M-39: a reader waited {worst_read_wait:?} during a refused write's reload \
+             ({mutation_took:?} total)"
+        );
+        let service = ledger.read().await;
+        assert!(!service.accounts().is_open("Assets:Over"), "rolled back");
+        assert_eq!(service.uncommitted_count(), 0);
     }
 }

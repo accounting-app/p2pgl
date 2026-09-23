@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use super::broadcast::TransactionBroadcast;
 use super::inputs;
-use super::query::domain_txn_to_graphql;
+use super::query::txn_to_graphql;
 use super::scalars::DateScalar;
 use super::types::AppendedTransaction;
 use super::{GossipSender, SharedLedger, HEAVY_RESOLVER_COMPLEXITY};
@@ -109,14 +109,20 @@ impl MutationRoot {
             })
             .map_err(service_error_to_graphql)?;
         let content_id = outcome.txid;
-        let pending = prepare_or_recover(&mut svc, false).map_err(service_error_to_graphql)?;
+        // M-39: a failed prepare releases the write lock BEFORE its L-13
+        // reload runs, so readers are not queued behind a full-ledger rebuild;
+        // the permit rides back out for the commit.
+        let (svc, pending, permit) = prepare_or_recover(ledger, svc, false, permit)
+            .await
+            .map_err(service_error_to_graphql)?;
 
         // Look up the just-inserted transaction to return it.
         let txn = svc
             .get_directive(&content_id)
             .and_then(|d| {
                 if let ledger::model::Directive::Transaction(t) = d {
-                    Some(domain_txn_to_graphql(t, &svc))
+                    // M-45: `content_id` is this transaction's id; no re-hash.
+                    Some(txn_to_graphql(t, content_id.clone(), true))
                 } else {
                     None
                 }
@@ -214,7 +220,10 @@ impl MutationRoot {
                 },
             )
             .map_err(service_error_to_graphql)?;
-        let pending = prepare_or_recover(&mut svc, false).map_err(service_error_to_graphql)?;
+        // M-39: see `append_transaction`.
+        let (svc, pending, permit) = prepare_or_recover(ledger, svc, false, permit)
+            .await
+            .map_err(service_error_to_graphql)?;
 
         // L-18: take the directive out, drop the write lock, THEN gossip —
         // exactly as `append_transaction` does. See [`gossip_after_unlock`].
@@ -271,7 +280,10 @@ impl MutationRoot {
                 })
             })
             .map_err(service_error_to_graphql)?;
-        let pending = prepare_or_recover(&mut svc, false).map_err(service_error_to_graphql)?;
+        // M-39: see `append_transaction`.
+        let (svc, pending, permit) = prepare_or_recover(ledger, svc, false, permit)
+            .await
+            .map_err(service_error_to_graphql)?;
 
         // L-18: see `open_account`.
         let to_gossip = svc.get_directive(&content_id).cloned();

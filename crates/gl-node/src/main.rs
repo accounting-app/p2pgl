@@ -86,6 +86,36 @@ fn ensure_ledger_parent_directory(ledger_path: &std::path::Path) -> std::io::Res
     }
 }
 
+/// One watcher poll of the `.bean`, on the blocking pool (M-42, T67).
+///
+/// The poller is moved into `spawn_blocking` and handed back with the state,
+/// so its memory of the last `stat` identity survives from poll to poll while
+/// the `stat` and any read + hash stay off the runtime's worker threads. A
+/// panic in the poll (or the blocking pool going away at shutdown) loses that
+/// memory: a fresh poller is returned, whose first poll simply reads again,
+/// and `None` tells the caller to skip this tick.
+async fn poll_ledger_file(
+    poller: ledger::file_watcher::FilePoller,
+    path: &std::path::Path,
+) -> (
+    ledger::file_watcher::FilePoller,
+    Option<ledger::file_watcher::FileState>,
+) {
+    let polled = tokio::task::spawn_blocking(move || {
+        let mut poller = poller;
+        let state = poller.poll();
+        (poller, state)
+    })
+    .await;
+    match polled {
+        Ok((poller, state)) => (poller, Some(state)),
+        Err(error) => {
+            warn!(%error, "ledger file poll failed; retrying at the next tick");
+            (ledger::file_watcher::FilePoller::new(path), None)
+        }
+    }
+}
+
 fn run_health_check() -> ! {
     let config_path =
         std::env::var("GL_NODE_CONFIG").unwrap_or_else(|_| "gl-node.config.json".to_owned());
@@ -360,6 +390,8 @@ async fn main() {
                     // T42: one cache for the whole node — the router's clone,
                     // the gossip loop's and the anti-entropy tick's all share it.
                     connections: peer_connections::PeerConnectionCache::new(),
+                    // M-39 (T69): one map for the node, shared by every clone.
+                    supply_backoff: anti_entropy_alpn::SupplyBackoff::default(),
                 };
                 Some((peer_node, handler))
             }
@@ -469,13 +501,31 @@ async fn main() {
         let watcher_ledger = shared_ledger.clone();
         let watcher_path = ledger_path.clone();
         let handle = tokio::spawn(async move {
-            use ledger::file_watcher::{FileChangeKind, FileState};
-            let mut last_state = FileState::from_path(&watcher_path);
+            use ledger::file_watcher::{FileChangeKind, FilePoller, FileState};
+            // M-42: a stateful poller that reads + hashes the file only when
+            // its stat identity changed (or every `FULL_READ_EVERY` polls,
+            // ≈10 s), and every poll runs on the blocking pool rather than on
+            // a runtime worker.
+            let (mut poller, first) =
+                poll_ledger_file(FilePoller::new(watcher_path.clone()), &watcher_path).await;
+            let mut last_state = first.unwrap_or(FileState {
+                size: None,
+                modified: None,
+                content_hash: None,
+            });
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+            // M-42: a poll slower than the period (a large file being read, a
+            // slow disk) must not be followed by a burst of catch-up polls
+            // back to back — the default `Burst` did exactly that.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
                 interval.tick().await;
-                let current = FileState::from_path(&watcher_path);
+                let (next_poller, current) = poll_ledger_file(poller, &watcher_path).await;
+                poller = next_poller;
+                let Some(current) = current else {
+                    continue;
+                };
                 let change = current.detect_change(&last_state);
                 // H-15: a `Deleted` is handled like a `Modified`. The
                 // reconcile finds nothing to read, arms a forced compaction,
@@ -513,49 +563,60 @@ async fn main() {
                     // rest), and that rewrite is exactly the kind of write that
                     // must not run under the read-blocking write lock.
                     let permit = ledger_commit::acquire_write_permit(&watcher_ledger).await;
-                    let prepared = {
-                        let mut svc = watcher_ledger.write().await;
-                        match svc.reconcile_file_staged() {
-                            Ok(result) => {
-                                // M-37(b): a rejected-ONLY edit compacts too.
-                                // The L-12 warning promises the canonical
-                                // re-persist drops what was refused; without
-                                // this arm the refused entry stayed on disk
-                                // and the next boot loaded it. H-15: and so
-                                // does a reconcile that found the file gone.
-                                if result.new_directives > 0
-                                    || result.rejected > 0
-                                    || svc.compaction_pending()
+                    let mut svc = watcher_ledger.write().await;
+                    let committed = match svc.reconcile_file_staged() {
+                        Ok(result) => {
+                            // M-37(b): a rejected-ONLY edit compacts too. The
+                            // L-12 warning promises the canonical re-persist
+                            // drops what was refused; without this arm the
+                            // refused entry stayed on disk and the next boot
+                            // loaded it. H-15: and so does a reconcile that
+                            // found the file gone.
+                            if result.new_directives > 0
+                                || result.rejected > 0
+                                || svc.compaction_pending()
+                            {
+                                info!(
+                                    new = result.new_directives,
+                                    duplicates = result.duplicates,
+                                    rejected = result.rejected,
+                                    "reconciled external edit"
+                                );
+                                // M-39: a failed prepare reloads with the
+                                // lock released. H-11: on success the permit
+                                // goes WITH the commit; on failure it went
+                                // with the recovery.
+                                match ledger_commit::prepare_or_recover(
+                                    &watcher_ledger,
+                                    svc,
+                                    true,
+                                    permit,
+                                )
+                                .await
                                 {
-                                    info!(
-                                        new = result.new_directives,
-                                        duplicates = result.duplicates,
-                                        rejected = result.rejected,
-                                        "reconciled external edit"
-                                    );
-                                    ledger_commit::prepare_or_recover(&mut svc, true)
-                                } else {
-                                    Ok(None)
+                                    Ok((svc, pending, permit)) => {
+                                        drop(svc);
+                                        ledger_commit::commit_pending(
+                                            &watcher_ledger,
+                                            pending,
+                                            permit,
+                                        )
+                                        .await
+                                    }
+                                    Err(error) => Err(error),
                                 }
-                            }
-                            // H-14 / M-37(a): a file that does not parse left
-                            // every fact the service holds about the `.bean`
-                            // untouched, so the next commit re-detects it and
-                            // refuses too; nothing to restore here.
-                            Err(error) => {
-                                warn!(%error, "failed to reconcile external edit");
-                                Ok(None)
+                            } else {
+                                Ok(())
                             }
                         }
-                    };
-                    let committed = match prepared {
-                        // H-11: the permit goes WITH the commit. The `Err` arm
-                        // drops it here instead, which is correct — a prepare
-                        // that failed left no commit to serialize against.
-                        Ok(pending) => {
-                            ledger_commit::commit_pending(&watcher_ledger, pending, permit).await
+                        // H-14 / M-37(a): a file that does not parse left
+                        // every fact the service holds about the `.bean`
+                        // untouched, so the next commit re-detects it and
+                        // refuses too; nothing to restore here.
+                        Err(error) => {
+                            warn!(%error, "failed to reconcile external edit");
+                            Ok(())
                         }
-                        Err(error) => Err(error),
                     };
                     if let Err(error) = committed {
                         warn!(%error, "failed to persist a reconciled external edit");
@@ -1265,6 +1326,7 @@ mod tests {
                     connection_limiter::AntiEntropyLimits::default(),
                 ),
                 connections: peer_connections::PeerConnectionCache::new(),
+                supply_backoff: anti_entropy_alpn::SupplyBackoff::default(),
             }
             .mesh_id;
             assert_eq!(

@@ -61,6 +61,48 @@ pub fn compute_want(
     want
 }
 
+/// [`compute_want`] against a membership lookup instead of two cloned sets
+/// (L-35 / R-19, T69).
+///
+/// # Why
+///
+/// The node used to build both `HashSet<String>` arguments of
+/// [`compute_want`] for every head exchange — `head_txids()` and
+/// `all_directive_ids()`, the latter an O(N) `String` clone of the whole DAG,
+/// under the ledger read lock, per peer per tick. What the diff actually needs
+/// is membership, which the ledger answers in O(1) without allocating
+/// (`LedgerService::contains_directive`).
+///
+/// # One deliberate difference: heads are checked for membership (T59 note)
+///
+/// [`compute_want`] checks a remote *head* against the local *heads*, so a
+/// remote head this node holds as an interior directive (it has since built on
+/// it) is wanted, served and re-validated only to be skipped as present. Here
+/// every remote id, head or not, is checked against the DAG. The result is
+/// [`compute_want`]'s output minus exactly those locally present ids — same
+/// order, same first-occurrence dedup (L-21) — which
+/// `want_by_membership_is_the_old_want_minus_present_ids` pins.
+///
+/// The dedup set borrows the remote ids rather than cloning them; only the
+/// ids actually wanted are cloned, once, into the result.
+pub fn compute_want_by_membership<F>(
+    is_local: F,
+    remote_head_txids: &[String],
+    remote_directive_ids: &[String],
+) -> Vec<String>
+where
+    F: Fn(&str) -> bool,
+{
+    let mut want = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for id in remote_head_txids.iter().chain(remote_directive_ids) {
+        if seen.insert(id.as_str()) && !is_local(id) {
+            want.push(id.clone());
+        }
+    }
+    want
+}
+
 /// Compute the `have_heads` message for our local state.
 ///
 /// This advertises our DAG frontier to the remote peer so they can
@@ -113,6 +155,74 @@ pub fn paginate_have_heads(
         .collect()
 }
 
+/// [`paginate_have_heads`] over already-sorted ids, one page at a time (L-35 /
+/// R-19, T69).
+///
+/// `directive_ids` is the ledger's shared sorted snapshot
+/// (`LedgerService::sorted_directive_ids`), taken with an `Arc` clone — O(1)
+/// under the read lock on a ledger at rest — instead of cloning every id into
+/// a `HashSet` and then again into a `Vec` to sort it. The pages are produced
+/// lazily, so at most one page of ids is copied out at a time rather than the
+/// whole advert being materialised up front; the page count is known in
+/// advance (`ExactSizeIterator`) for the serve loop's L-01 charge.
+///
+/// Byte-identical to [`paginate_have_heads`] for the same sets:
+/// `sorted_pagination_is_identical_to_the_set_pagination` pins it. Both inputs
+/// must be sorted ascending and duplicate-free — the old function's own sort of
+/// a set, which the ledger's snapshot and a sorted `head_txids()` both are.
+pub fn paginate_have_heads_sorted(
+    head_txids: Vec<String>,
+    directive_ids: std::sync::Arc<[String]>,
+) -> HaveHeadsPages {
+    debug_assert!(head_txids.windows(2).all(|pair| pair[0] < pair[1]));
+    debug_assert!(directive_ids.windows(2).all(|pair| pair[0] < pair[1]));
+    let page_count = head_txids
+        .len()
+        .div_ceil(MAX_HAVE_HEADS)
+        .max(directive_ids.len().div_ceil(MAX_HAVE_HEADS))
+        .max(1);
+    HaveHeadsPages {
+        head_txids,
+        directive_ids,
+        page_count,
+        next: 0,
+    }
+}
+
+/// The lazy advert [`paginate_have_heads_sorted`] returns.
+#[derive(Debug, Clone)]
+pub struct HaveHeadsPages {
+    head_txids: Vec<String>,
+    directive_ids: std::sync::Arc<[String]>,
+    page_count: usize,
+    next: usize,
+}
+
+impl Iterator for HaveHeadsPages {
+    type Item = WireMessage;
+
+    fn next(&mut self) -> Option<WireMessage> {
+        if self.next >= self.page_count {
+            return None;
+        }
+        let index = self.next;
+        self.next += 1;
+        let start = index * MAX_HAVE_HEADS;
+        Some(WireMessage::have_heads_page(
+            page_slice(&self.head_txids, start),
+            page_slice(&self.directive_ids, start),
+            index + 1 < self.page_count,
+        ))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = self.page_count - self.next;
+        (left, Some(left))
+    }
+}
+
+impl ExactSizeIterator for HaveHeadsPages {}
+
 /// One `MAX_HAVE_HEADS`-sized window of `ids` starting at `start` (empty past the end).
 fn page_slice(ids: &[String], start: usize) -> Vec<String> {
     if start >= ids.len() {
@@ -122,7 +232,12 @@ fn page_slice(ids: &[String], start: usize) -> Vec<String> {
 }
 
 /// Estimated encoded size of one supply entry (H-02). An over-approximation.
-fn estimated_entry_bytes(entry: &SupplyEntry) -> usize {
+///
+/// Public since T69: the receiver uses the same number to bound the journal
+/// record a batch would become before it stages it (M-39) — the record holds
+/// the same economic body and the same envelope pairs, one metadata line each,
+/// well inside the 128-byte per-entry allowance plus the id's 64.
+pub fn estimated_entry_bytes(entry: &SupplyEntry) -> usize {
     let envelope: usize = entry
         .envelope
         .iter()
@@ -969,5 +1084,114 @@ mod tests {
         assert!(!cache.record("peer-c", &"z".repeat(4096), now));
         assert!(!cache.record("peer-c", &format!("{:064X}", 0xabcdusize), now));
         assert_eq!(cache.len(), 8);
+    }
+
+    // ─── L-35 / R-19 (T69): the lookup/sorted-slice variants ─────────────
+
+    fn sorted_arc(ids: &HashSet<String>) -> std::sync::Arc<[String]> {
+        sorted(ids).into()
+    }
+
+    /// The advert is byte-identical: every page the lazy, sorted-slice
+    /// pagination yields encodes to exactly the bytes the set-based one does,
+    /// for empty, single-page, boundary and multi-page shapes, with uneven
+    /// head and directive counts in both directions.
+    ///
+    /// Bug-catch: compute `page_count` from the directive count alone, or
+    /// mark the last page `more: true`, and the frames differ.
+    #[test]
+    fn sorted_pagination_is_identical_to_the_set_pagination() {
+        let shapes = [
+            (0, 0),
+            (1, 1),
+            (0, 7),
+            (3, MAX_HAVE_HEADS),
+            (2, MAX_HAVE_HEADS + 1),
+            (MAX_HAVE_HEADS + 5, 10),
+            (17, 3 * MAX_HAVE_HEADS + 123),
+        ];
+        for (head_count, directive_count) in shapes {
+            let directives = hex_ids(directive_count);
+            // Heads come from a disjoint range so a shape can have more heads
+            // than directives; pagination treats the two lists independently.
+            let heads: HashSet<String> = (0..head_count)
+                .map(|index| format!("{:064x}", index * 7 + 1_000_000))
+                .collect();
+
+            let old: Vec<WireMessage> = paginate_have_heads(&heads, &directives);
+            let lazy = paginate_have_heads_sorted(sorted(&heads), sorted_arc(&directives));
+            assert_eq!(
+                lazy.len(),
+                old.len(),
+                "page count, shape {head_count}/{directive_count}"
+            );
+            let new: Vec<WireMessage> = lazy.collect();
+            assert_eq!(new, old, "shape {head_count}/{directive_count}");
+            for (new_page, old_page) in new.iter().zip(&old) {
+                assert_eq!(
+                    new_page.to_wire().unwrap(),
+                    old_page.to_wire().unwrap(),
+                    "byte-identical frames, shape {head_count}/{directive_count}"
+                );
+            }
+        }
+    }
+
+    /// The Want set: identical to [`compute_want`] whenever the old function
+    /// was right, and differing only by the T59 fix — a remote head this node
+    /// holds as an interior (non-head) directive is no longer wanted.
+    ///
+    /// Bug-catch: check remote heads against the local HEADS again (the old
+    /// rule) and `interior` reappears in the Want.
+    #[test]
+    fn want_by_membership_is_the_old_want_minus_present_ids() {
+        let local_all = hex_ids(50);
+        let local_heads: HashSet<String> = sorted(&local_all).into_iter().rev().take(3).collect();
+        let interior = sorted(&local_all)[10].clone();
+        assert!(!local_heads.contains(&interior));
+        let missing: Vec<String> = (100..110).map(|index| format!("{index:064x}")).collect();
+
+        // The remote advertises: a missing head, a local head, our interior
+        // directive as ITS head, a repeat, and a mix of present and missing ids.
+        let remote_heads = vec![
+            missing[0].clone(),
+            sorted(&local_heads)[0].clone(),
+            interior.clone(),
+            missing[0].clone(),
+        ];
+        let mut remote_ids: Vec<String> = sorted(&local_all).into_iter().step_by(5).collect();
+        remote_ids.extend(missing.iter().cloned());
+        remote_ids.push(missing[3].clone());
+
+        let old = compute_want(&local_heads, &local_all, &remote_heads, &remote_ids);
+        let new =
+            compute_want_by_membership(|id| local_all.contains(id), &remote_heads, &remote_ids);
+
+        let expected: Vec<String> = old
+            .iter()
+            .filter(|id| !local_all.contains(*id))
+            .cloned()
+            .collect();
+        assert_eq!(
+            new, expected,
+            "the old Want minus locally present ids, order kept"
+        );
+        assert!(
+            old.contains(&interior),
+            "premise: the old rule re-wanted a held head"
+        );
+        assert!(!new.contains(&interior), "T59: a held id is never wanted");
+        assert_eq!(
+            new, missing,
+            "every missing id exactly once, first-occurrence order"
+        );
+
+        // Where the old rule was right (no remote head is a local interior
+        // directive), the two are identical.
+        let honest_heads = vec![missing[0].clone(), sorted(&local_heads)[1].clone()];
+        assert_eq!(
+            compute_want_by_membership(|id| local_all.contains(id), &honest_heads, &remote_ids),
+            compute_want(&local_heads, &local_all, &honest_heads, &remote_ids)
+        );
     }
 }

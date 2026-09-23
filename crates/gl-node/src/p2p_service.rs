@@ -422,16 +422,46 @@ pub fn spawn_gossip_loop(
 /// Spawn the anti-entropy periodic exchange as a background tokio task.
 ///
 /// Every `anti_entropy_interval_ms`, opens an ALPN session with each
-/// configured bootstrap peer and pulls missing directives.
+/// configured bootstrap peer and pulls missing directives — at most
+/// `handler.limits.max_concurrent_outbound_exchanges` at once (R-5).
 pub fn spawn_anti_entropy_loop(peer_node: &PeerNode, handler: AntiEntropyHandler) {
     let interval_ms = floor_anti_entropy_interval(peer_node.config().anti_entropy_interval_ms);
     let endpoint = peer_node.endpoint().clone();
     let allowlist = peer_node.allowlist().clone();
+    let max_concurrent = handler.limits.max_concurrent_outbound_exchanges;
 
+    spawn_anti_entropy_loop_with(
+        Duration::from_millis(interval_ms),
+        allowlist,
+        max_concurrent,
+        move |peer_id| {
+            let endpoint = endpoint.clone();
+            let handler = handler.clone();
+            async move { exchange_with_peer(&endpoint, peer_id, &handler).await }
+        },
+    );
+}
+
+/// The body of [`spawn_anti_entropy_loop`], with the per-peer exchange
+/// injected so the scheduling — the per-peer claim, the cross-peer bound and
+/// the drain — is testable without a network. Production passes
+/// `exchange_with_peer`; the handle is returned for tests to stop the loop.
+fn spawn_anti_entropy_loop_with<F, Fut>(
+    tick: Duration,
+    allowlist: PeerAllowlist,
+    max_concurrent: usize,
+    exchange: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Fn(iroh::EndpointId) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
     tokio::spawn(async move {
-        let tick = Duration::from_millis(interval_ms);
         let mut interval = tokio::time::interval(tick);
-        info!(interval_ms = interval_ms, "anti-entropy loop started");
+        info!(
+            interval_ms = tick.as_millis() as u64,
+            max_concurrent, "anti-entropy loop started"
+        );
 
         // Both live ACROSS ticks (H-10). An exchange may outlive the tick that
         // started it, and the two together are what stop that from either
@@ -439,6 +469,11 @@ pub fn spawn_anti_entropy_loop(peer_node: &PeerNode, handler: AntiEntropyHandler
         // handle, `in_flight` keeps its peer from being handed a second one.
         let mut set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         let in_flight: InFlightPeers = Arc::new(Mutex::new(HashSet::new()));
+        // R-5: the cross-peer bound. `in_flight` stops a peer getting two
+        // exchanges; nothing stopped every allowlisted peer getting one each,
+        // at ≈ 130–150 MiB resident apiece against hostile peers. Sized and
+        // justified on `AntiEntropyLimits::max_concurrent_outbound_exchanges`.
+        let exchange_slots = Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1)));
 
         loop {
             interval.tick().await;
@@ -494,13 +529,36 @@ pub fn spawn_anti_entropy_loop(peer_node: &PeerNode, handler: AntiEntropyHandler
                     skipped += 1;
                     continue;
                 };
-                let endpoint = endpoint.clone();
-                let handler = handler.clone();
+                let run = exchange(peer_id);
+                let slots = Arc::clone(&exchange_slots);
                 set.spawn(async move {
                     // Held for the whole exchange; its `Drop` is what releases
                     // the peer, on every path including a panic.
                     let _claim = claim;
-                    exchange_with_peer(&endpoint, peer_id, &handler).await;
+                    // R-5: a slot is acquired HERE, inside the task, so the
+                    // tick loop never waits on it — a saturated bound only
+                    // means this task parks, is carried by the drain below
+                    // like any straggler, and its peer is skipped by `claim`
+                    // until it has run.
+                    //
+                    // It WAITS rather than `try_acquire`s and gives up. The
+                    // allowlist iterates in a fixed order, and the semaphore
+                    // queue is FIFO: a peer refused this tick would re-race the
+                    // same peers in the same order next tick, so a set of
+                    // stalled peers that always re-acquire first could starve a
+                    // healthy one for as long as they keep stalling. Queued, the
+                    // healthy peer takes the FIRST slot that frees — at most
+                    // one exchange's session deadline away — ahead of any peer
+                    // that re-queues after it. The queue itself is bounded by
+                    // `claim`: one waiter per allowlisted peer.
+                    //
+                    // The permit is RAII like the claim: every exit — success,
+                    // error, panic, the task being aborted — returns it.
+                    let Ok(_slot) = slots.acquire_owned().await else {
+                        // Closed: never, the semaphore is never closed.
+                        return;
+                    };
+                    run.await;
                 });
             }
             if skipped > 0 {
@@ -568,7 +626,7 @@ pub fn spawn_anti_entropy_loop(peer_node: &PeerNode, handler: AntiEntropyHandler
                 }
             }
         }
-    });
+    })
 }
 
 /// The peers whose anti-entropy exchange has not finished yet (H-10).
@@ -1555,6 +1613,259 @@ mod tests {
             converged,
             "H-10: the empty-page flood stopped anti-entropy with the healthy \
              peer — client has {} of {source_count} directives",
+            ledger_client.read().await.directive_count()
+        );
+    }
+
+    // ── R-5: the cross-peer outbound bound ───────────────────────────────
+
+    /// Tracks how many injected exchanges are running at once, and the peak.
+    #[derive(Clone, Default)]
+    struct Concurrency {
+        running: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// Counts one running exchange; `Drop` uncounts it on every exit.
+    struct Running(Concurrency);
+
+    impl Concurrency {
+        fn enter(&self) -> Running {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.running.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            Running(self.clone())
+        }
+
+        fn peak(&self) -> usize {
+            self.peak.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for Running {
+        fn drop(&mut self) {
+            self.0
+                .running
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// R-5: with N + 1 allowlisted peers and the bound at N, at most N
+    /// exchanges ever run at once — and a healthy peer still converges while
+    /// the other N stall in every slot.
+    ///
+    /// Drives the real scheduler (`spawn_anti_entropy_loop_with`, the body
+    /// `spawn_anti_entropy_loop` runs) with the exchange injected, so the
+    /// count is exact rather than inferred from network timing. The shape is
+    /// the H-10 money test's: the healthy peer's exchanges achieve nothing
+    /// until the stalled peers already hold every slot, so a pass cannot come
+    /// from a sync that ran before the bound was saturated. And the healthy
+    /// peer is picked as the one the allowlist yields LAST, so it is the peer
+    /// a `try_acquire`-and-give-up bound would lose the race for a freed slot
+    /// with every tick — the starvation the FIFO wait exists to prevent.
+    ///
+    /// Current-thread with paused time, so it is deterministic: tasks run in
+    /// spawn order (the multi-thread scheduler's LIFO slot would run the
+    /// last-spawned peer first and hide the race), and the clock advances only
+    /// when every task is parked.
+    #[tokio::test(start_paused = true)]
+    async fn r5_outbound_exchanges_are_bounded_across_peers_and_a_healthy_peer_converges() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+
+        const BOUND: usize = 3;
+        let ids: Vec<String> = (0..=BOUND)
+            .map(|_| SecretKey::generate().public().to_string())
+            .collect();
+        let allowlist = PeerAllowlist::parse(&ids).expect("allowlist");
+        let order = allowlist.bootstrap_peers();
+        assert_eq!(order.len(), BOUND + 1, "N + 1 admitted peers");
+        let healthy = *order.last().expect("a last peer");
+
+        let concurrency = Concurrency::default();
+        let reachable = Arc::new(AtomicBool::new(false));
+        let converged = Arc::new(AtomicUsize::new(0));
+        let exchange = {
+            let concurrency = concurrency.clone();
+            let reachable = Arc::clone(&reachable);
+            let converged = Arc::clone(&converged);
+            move |peer: iroh::EndpointId| {
+                let concurrency = concurrency.clone();
+                let reachable = Arc::clone(&reachable);
+                let converged = Arc::clone(&converged);
+                async move {
+                    let _running = concurrency.enter();
+                    if peer == healthy {
+                        // Unreachable at first, like the H-10 test's source:
+                        // a quick failed exchange.
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        if reachable.load(SeqCst) {
+                            converged.fetch_add(1, SeqCst);
+                        }
+                    } else {
+                        // A stalled peer: holds its slot for eight ticks, then
+                        // ends (its session deadline) and is re-run next tick.
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                    }
+                }
+            }
+        };
+
+        let tick = Duration::from_millis(50);
+        let handle = spawn_anti_entropy_loop_with(tick, allowlist, BOUND, exchange);
+
+        // Let the stalled peers take every slot.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        reachable.store(true, SeqCst);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while converged.load(SeqCst) == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Keep running through several more stall cycles for the peak.
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        assert!(
+            concurrency.peak() <= BOUND,
+            "R-5: {} outbound exchanges ran at once with the bound at {BOUND}",
+            concurrency.peak()
+        );
+        assert_eq!(
+            concurrency.peak(),
+            BOUND,
+            "the bound must be reached (the stalled peers saturate it), or this \
+             test proves nothing"
+        );
+        assert!(
+            converged.load(SeqCst) > 0,
+            "R-5: the healthy peer never ran an exchange while {BOUND} stalled \
+             peers held the bound — starved"
+        );
+    }
+
+    /// R-5 over the real network: two allowlisted empty-page flooders fill a
+    /// bound of two, and the healthy peer — made reachable only once they
+    /// hold both slots — still converges through the real
+    /// `spawn_anti_entropy_loop`. Mirrors
+    /// `empty_page_flood_peer_cannot_stop_anti_entropy_with_healthy_peers`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn saturated_outbound_bound_still_lets_a_healthy_peer_converge() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_source = bind_direct_endpoint().await;
+        let endpoint_flood_a = bind_direct_endpoint().await;
+        let endpoint_flood_b = bind_direct_endpoint().await;
+        let source_id = endpoint_source.id();
+
+        let address_lookup = MemoryLookup::new();
+        let endpoint_client = iroh::Endpoint::builder(presets::Minimal)
+            .alpns(vec![p2p::protocol::ANTI_ENTROPY_ALPN.to_vec()])
+            .address_lookup(address_lookup.clone())
+            .bind()
+            .await
+            .expect("bind client endpoint with memory address lookup");
+        let client_id = endpoint_client.id();
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let source_path = temp_dir.path().join("source.bean");
+        write_open_directive_ledger(&source_path, 5, &source_id.to_string());
+        let ledger_source: SharedLedger = Arc::new(RwLock::new(
+            ledger::service::LedgerService::boot(source_path, source_id.to_string())
+                .expect("boot source ledger"),
+        ));
+        let source_count = ledger_source.read().await.directive_count();
+
+        let allow_source =
+            PeerAllowlist::parse(&[client_id.to_string()]).expect("source allowlist");
+        let router_source = Router::builder(endpoint_source.clone())
+            .accept(
+                p2p::protocol::ANTI_ENTROPY_ALPN,
+                make_handler(ledger_source, allow_source),
+            )
+            .spawn();
+        let router_flood_a = Router::builder(endpoint_flood_a.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, EmptyPageFloodHandler)
+            .spawn();
+        let router_flood_b = Router::builder(endpoint_flood_b.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, EmptyPageFloodHandler)
+            .spawn();
+
+        let ledger_client: SharedLedger = Arc::new(RwLock::new(
+            ledger::service::LedgerService::boot(
+                temp_dir.path().join("client.bean"),
+                client_id.to_string(),
+            )
+            .expect("boot client ledger"),
+        ));
+        let allow_client = PeerAllowlist::parse(&[
+            source_id.to_string(),
+            endpoint_flood_a.id().to_string(),
+            endpoint_flood_b.id().to_string(),
+        ])
+        .expect("client allowlist");
+        let mut handler_client = make_handler_with_timeouts(
+            ledger_client.clone(),
+            allow_client.clone(),
+            AntiEntropyTimeouts {
+                connect: Duration::from_secs(1),
+                io: Duration::from_secs(1),
+                // Each flood exchange holds its slot this long, many ticks.
+                session: Duration::from_secs(2),
+                ..AntiEntropyTimeouts::default()
+            },
+        );
+        // N + 1 = 3 admitted peers, bound N = 2.
+        handler_client.limits.max_concurrent_outbound_exchanges = 2;
+
+        wait_until_dialable(&endpoint_client).await;
+        wait_until_dialable(&endpoint_source).await;
+        wait_until_dialable(&endpoint_flood_a).await;
+        wait_until_dialable(&endpoint_flood_b).await;
+
+        // Only the flooders resolve at first, so they take both slots.
+        address_lookup.add_endpoint_info(endpoint_flood_a.addr());
+        address_lookup.add_endpoint_info(endpoint_flood_b.addr());
+
+        let gossip_client = iroh_gossip::net::Gossip::builder().spawn(endpoint_client.clone());
+        let client_node = PeerNode::new(
+            endpoint_client,
+            gossip_client,
+            PeerNodeConfig {
+                swarm_topic: "openledger/r5-outbound-bound".to_owned(),
+                anti_entropy_interval_ms: 200,
+            },
+            allow_client,
+        );
+        spawn_anti_entropy_loop(&client_node, handler_client);
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            ledger_client.read().await.directive_count(),
+            0,
+            "precondition: the healthy peer is still unreachable"
+        );
+        address_lookup.add_endpoint_info(endpoint_source.addr());
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+        let converged = loop {
+            if ledger_client.read().await.directive_count() == source_count {
+                break true;
+            }
+            if tokio::time::Instant::now() > deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+
+        let _ = router_source.shutdown().await;
+        let _ = router_flood_a.shutdown().await;
+        let _ = router_flood_b.shutdown().await;
+
+        assert!(
+            converged,
+            "R-5: with both outbound slots held by flooders the healthy peer \
+             never converged — client has {} of {source_count} directives",
             ledger_client.read().await.directive_count()
         );
     }

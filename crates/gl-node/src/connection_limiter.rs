@@ -62,6 +62,26 @@ pub struct AntiEntropyLimits {
     /// measured into a fixed ceiling. What only an attacker sends is a frame
     /// claiming the `Supply` discriminator at up to 16 MiB; this is what it
     /// runs into.
+    ///
+    /// # What it charges, and what it does not (L-65)
+    ///
+    /// It charges the frame BODY only — exactly: `grow_to` reserves what the
+    /// reader then `reserve_exact`s, with no growth-policy slack. What the body
+    /// turns into while its [`FrameReservation`] is alive is not charged:
+    ///
+    /// ```text
+    /// body (charged)                                   1×
+    /// decoded message (e.g. Vec<SupplyEntry>)         ~1×
+    /// ciborium `Content` buffering (internally-tagged
+    ///   enum decode, R-4)                              up to 4×
+    /// staged Vec<Directive> for a Supply batch         ~1×
+    /// ```
+    ///
+    /// So the REAL resident ceiling under the 256 MiB default is ≈ 0.5–1.5 GiB
+    /// (2–6× the charged bytes, depending on how much of the budget is Supply
+    /// bodies — the only frames the decode multiplies badly). The budget is a
+    /// fixed ceiling, not an exact one; size any host against the multiple,
+    /// not the nominal figure.
     pub max_frame_bytes_in_flight: usize,
     /// Max inbound frame-body bytes in flight from ONE peer (L-39).
     ///
@@ -96,6 +116,26 @@ pub struct AntiEntropyLimits {
     /// capping a reconnect loop at a sustained ~0.5 handshakes + adverts per
     /// second per allowlisted peer instead of however many the network allows.
     pub accept_refill_interval: Duration,
+    /// Max OUTBOUND anti-entropy exchanges this node runs at once, across all
+    /// peers (R-5). Read by `p2p_service::spawn_anti_entropy_loop`; the fields
+    /// above bound what OTHER nodes may make this one do, this bounds what
+    /// this node's own scheduler starts.
+    ///
+    /// The loop fans out one exchange per allowlisted peer per tick, and the
+    /// per-peer in-flight guard (H-10) stops only a peer getting two. Each
+    /// exchange against a hostile peer can hold ≈ 130–150 MiB resident at its
+    /// worst (a 1M-id advert in a `Vec` + `HashSet` + the `compute_want`
+    /// clone, plus one 16 MiB `Supply` and its decode), so without a cross-peer
+    /// bound the ceiling was that × the allowlist size.
+    ///
+    /// Eight caps it at ≈ 1.0–1.2 GiB whatever the allowlist, while leaving
+    /// honest catch-up its parallelism: a mesh of up to eight bootstrap peers
+    /// (the usual deployment) never meets the bound, and convergence needs only
+    /// ONE honest exchange to run — peers past the bound queue FIFO for the
+    /// next free slot (see the loop), so a set of stalled peers can delay an
+    /// honest one by at most one exchange's session deadline, never starve it.
+    /// Values below 1 are treated as 1.
+    pub max_concurrent_outbound_exchanges: usize,
 }
 
 impl Default for AntiEntropyLimits {
@@ -108,9 +148,14 @@ impl Default for AntiEntropyLimits {
             max_frame_bytes_in_flight_per_peer: 32 * 1024 * 1024,
             accept_burst: DEFAULT_ACCEPT_BURST,
             accept_refill_interval: DEFAULT_ACCEPT_REFILL_INTERVAL,
+            max_concurrent_outbound_exchanges: DEFAULT_MAX_CONCURRENT_OUTBOUND_EXCHANGES,
         }
     }
 }
+
+/// Default [`AntiEntropyLimits::max_concurrent_outbound_exchanges`] (R-5); see
+/// there for the sizing.
+pub const DEFAULT_MAX_CONCURRENT_OUTBOUND_EXCHANGES: usize = 8;
 
 /// Default [`AntiEntropyLimits::accept_burst`] (M-40); see there for the sizing.
 pub const DEFAULT_ACCEPT_BURST: u32 = 8;
@@ -413,6 +458,11 @@ impl LimiterInner {
 /// stream, the serve future being dropped — can leak budget. The serve loop
 /// keeps the reservation alive until the decoded message has been handled,
 /// using the body's size as the stand-in for what the decoded message holds.
+///
+/// That stand-in is a 1× charge for a 2–6× footprint (L-65): the decoded
+/// message, ciborium's `Content` buffering (up to 4×) and a `Supply` batch's
+/// staged directives all live under the reservation uncharged. See
+/// [`AntiEntropyLimits::max_frame_bytes_in_flight`] for the measured multiple.
 pub struct FrameReservation {
     /// `None` for an unmetered reservation (outbound reads; see [`Self::unmetered`]).
     metered: Option<(Arc<LimiterInner>, EndpointId)>,
