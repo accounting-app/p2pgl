@@ -350,6 +350,24 @@ pub(crate) async fn compact(ledger: &SharedLedger) -> Result<(), ServiceError> {
 /// stall, and at the size cap it repeats on every write attempt. Moving it
 /// off the lock needs an async form that takes the guard by value, drops it,
 /// and runs [`recover_off_lock`] while the caller's permit is still held.
+///
+/// # M-37(a): a `.bean` that does not parse is returned, not recovered from
+///
+/// The second exception. A prepare that fails with `ServiceError::Parse` is
+/// the adoption refusing a hand-edited file it cannot read, and since H-14
+/// that refusal happens **before** the adoption records anything — the hash,
+/// the size, the `stat` marker and the canonical flag are all written only
+/// once the text has parsed — so the prepare left memory exactly as the
+/// caller staged it and the files untouched. There is nothing for a reload to
+/// restore. What the reload *did* do was the finding: `boot` on that file
+/// succeeded (L-45 salvages block by block) and loaded every parseable
+/// hand-typed block raw — no I3, no body cap, no envelope stamp, no signature
+/// — after which the very next write persisted and served it. The write stays
+/// refused until the operator repairs the file, exactly as the README says;
+/// the caller's staged batch stays in memory and is written by the first
+/// commit after the repair (a retry of the same mutation dedups by content
+/// id). `LedgerService::commit_inline` carries the same arm for the
+/// synchronous callers.
 pub(crate) fn prepare_or_recover(
     service: &mut LedgerService,
     explicit_compaction: bool,
@@ -362,6 +380,7 @@ pub(crate) fn prepare_or_recover(
     match prepared {
         Ok(pending) => Ok(pending),
         Err(ServiceError::CommitInFlight) => Err(ServiceError::CommitInFlight),
+        Err(error @ ServiceError::Parse(_)) => Err(error),
         Err(error) => {
             service.recover_failed_commit();
             Err(error)
@@ -750,5 +769,94 @@ mod tests {
             "H-11: a panic inside the commit must not wedge later writes, got \
              {after_commit_panic:?}"
         );
+    }
+
+    /// M-37(a): a prepare refused because the `.bean` does not parse returns
+    /// `PARSE_ERROR` and does NOT reload. The staged write stays in memory,
+    /// awaiting the repair; the broken file is untouched; and — the finding —
+    /// nothing from the broken file is loaded raw.
+    ///
+    /// Bug-catch: remove the `Parse` arm from `prepare_or_recover` and the
+    /// reload runs: the staged open is rolled out of memory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn m37a_a_prepare_refused_by_an_unparsable_file_does_not_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m37a.bean");
+        let ledger = ledger_with_commit_observer(&path, |_kind, _bytes| {});
+        open_account(&ledger, "Assets:Durable", 1).await.unwrap();
+
+        // A hand edit the parser refuses, plus a valid hand-typed open that a
+        // recovery boot would have loaded raw.
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str("\n2024-02-01 open Assets:Typed USD\n\n2024-03-03 open\n");
+        std::fs::write(&path, &content).unwrap();
+
+        let permit = acquire_write_permit(&ledger).await;
+        let error = {
+            let mut service = ledger.write().await;
+            service
+                .open_account_staged(
+                    "Assets:Staged".to_owned(),
+                    chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+                    Vec::new(),
+                    |_, _, _| None,
+                )
+                .unwrap();
+            prepare_or_recover(&mut service, false).expect_err("a broken file refuses the prepare")
+        };
+        drop(permit);
+        assert_eq!(error.error_code(), "PARSE_ERROR");
+
+        let service = ledger.read().await;
+        assert!(
+            service.accounts().is_open("Assets:Staged"),
+            "M-37(a): no reload ran — the staged write is still in memory, awaiting the repair"
+        );
+        assert_eq!(service.uncommitted_count(), 1);
+        assert!(
+            !service.accounts().is_open("Assets:Typed"),
+            "M-37(a): nothing from the broken file was loaded raw"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            content,
+            "the broken file is untouched"
+        );
+    }
+
+    /// H-15 through the watcher-shaped path: the `.bean` is removed under the
+    /// node, `reconcile_file_staged` reports nothing to reconcile and arms a
+    /// compaction, and the commit the watcher drives recreates the file from
+    /// memory with every directive in it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn h15_a_removed_bean_is_recreated_by_the_watcher_shaped_reconcile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h15.bean");
+        let ledger = ledger_with_commit_observer(&path, |_kind, _bytes| {});
+        open_account(&ledger, "Assets:One", 1).await.unwrap();
+        open_account(&ledger, "Assets:Two", 2).await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let permit = acquire_write_permit(&ledger).await;
+        let prepared = {
+            let mut service = ledger.write().await;
+            let result = service
+                .reconcile_file_staged()
+                .expect("H-15: a missing file is nothing to reconcile, not an error");
+            assert_eq!((result.new_directives, result.rejected), (0, 0));
+            assert!(
+                service.compaction_pending(),
+                "the watcher must be told to drive the commit that recreates the file"
+            );
+            prepare_or_recover(&mut service, true).unwrap()
+        };
+        commit_pending(&ledger, prepared, permit).await.unwrap();
+
+        assert!(path.exists(), "the compaction recreated the file");
+        let on_disk = LedgerService::boot(&path, "h15-check".to_owned()).unwrap();
+        assert_eq!(on_disk.directive_count(), 2);
+        assert!(on_disk.accounts().is_open("Assets:One"));
+        assert!(on_disk.accounts().is_open("Assets:Two"));
+        assert_eq!(ledger.read().await.directive_count(), 2);
     }
 }

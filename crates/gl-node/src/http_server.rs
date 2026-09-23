@@ -81,6 +81,31 @@ const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 64;
 /// the cap costs one log line per interval rather than one per connection.
 const PER_IP_REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Largest HTTP/1 request head hyper will buffer before answering 431 (M-41).
+///
+/// hyper's default is 417,792 bytes (`hyper-1.11.0 proto/h1/io.rs:23`,
+/// `8192 + 4096 × 100`), and `serve_hardened` never lowered it — so a single
+/// `Host`, `Origin` or `Content-Type` header could carry ~400 KB, all of which
+/// the request guard then echoed into one `warn!` line (the measured 100–190
+/// MB/s of log from one client). The node's own requests are a JSON body
+/// behind a handful of short headers; the largest honest head is a `Cookie`-
+/// less browser request under 2 KiB. 64 KiB matches what nginx (`8k × 4`
+/// `large_client_header_buffers`) and Apache (`LimitRequestFieldSize 8190`
+/// per field) admit, and is 8× hyper's floor of 8,192 (`MINIMUM_MAX_BUFFER_SIZE`,
+/// below which `max_buf_size` panics). The same value caps hyper's write
+/// buffer coalescing: responses larger than this are written as separate
+/// buffers rather than copied, which is not a limit on response size.
+///
+/// It is a ceiling on the order of magnitude, not an exact byte: hyper reads
+/// into the whole spare capacity of its `BytesMut` (`poll_read_from_io`), and
+/// `reserve` doubles, so a head that arrives in one burst can land up to
+/// ~1.75× this value (114,688 bytes here) before the `len >= max` check runs
+/// — measured: a 100 KiB `Host` parses, a 200 KiB one is 431'd. What bounds
+/// the LOG LINE is therefore the guard's 128-character excerpt
+/// (`request_guard::MAX_ECHOED_HEADER_CHARS`); this bounds what the guard can
+/// ever be handed, and what an idle connection can make hyper hold.
+pub(crate) const HTTP1_MAX_BUF_SIZE: usize = 64 * 1024;
+
 /// How long graceful shutdown waits for in-flight connections to drain.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -283,7 +308,8 @@ where
     builder
         .http1()
         .timer(TokioTimer::new())
-        .header_read_timeout(settings.header_read_timeout);
+        .header_read_timeout(settings.header_read_timeout)
+        .max_buf_size(HTTP1_MAX_BUF_SIZE);
     // No `.http2()` configuration: with HTTP/2 unreachable (M-22) its
     // keep-alive probes would be dead settings that read as live protection.
 
@@ -670,6 +696,45 @@ mod tests {
             outcome.is_ok(),
             "server held a connection that never sent a byte past 4x the header read timeout — \
              silent sockets can hoard every slot (M-13/M-22)"
+        );
+    }
+
+    // — 1b. M-41: a request head hyper will not buffer —
+
+    /// T66 / M-41: a 200 KiB `Host` value never reaches the request guard —
+    /// hyper refuses the head at `HTTP1_MAX_BUF_SIZE` with a 431 (or closes
+    /// the connection), so there is nothing for the guard to echo. Before
+    /// `max_buf_size` was set, hyper buffered up to 417,792 bytes and the
+    /// guard logged the whole value, once per request, outside every limiter.
+    /// 200 KiB, not 100: hyper's read over-shoots the cap by up to ~1.75× in a
+    /// burst (see the constant's doc), and the value must also stay under the
+    /// old default so that reverting the cap makes this test fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oversized_request_head_is_refused_before_the_guard_sees_it() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+        let server = spawn_server(test_router(), short_settings()).await;
+
+        let mut stream = TcpStream::connect(server.address).await.expect("connect");
+        let host = format!("evil.example.{}", "a".repeat(200 * 1024));
+        assert!(host.len() > 2 * HTTP1_MAX_BUF_SIZE && host.len() < 417_792);
+        let head = format!("GET /health HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        // The server may close mid-write once it has seen enough; that is the
+        // refusal, not a test failure.
+        let _ = stream.write_all(head.as_bytes()).await;
+
+        let outcome =
+            tokio::time::timeout(tolerant(HEADER_TIMEOUT), read_until_eof(&mut stream)).await;
+        let response = outcome.expect("server held an oversized head open past the header timeout");
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.is_empty() || response.starts_with("HTTP/1.1 431"),
+            "expected a 431 or a close, got: {}",
+            &response[..response.len().min(200)]
+        );
+        assert!(
+            !response.contains("403"),
+            "the guard answered, so the head was buffered whole: {}",
+            &response[..response.len().min(200)]
         );
     }
 

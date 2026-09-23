@@ -10,10 +10,12 @@ use std::str::FromStr;
 use iroh::EndpointId;
 use ledger::hash::compute_content_id;
 use ledger::model::*;
-use ledger::parse::parse_file;
+use ledger::parse::{parse_file_bounded, BoundedParseErrors};
 
 use crate::allowlist::PeerAllowlist;
-use crate::protocol::{is_content_id, DirectiveKind, SupplyEntry};
+use crate::protocol::{
+    bounded_display, is_content_id, DirectiveKind, SupplyEntry, MAX_DECODE_ERROR_CHARS,
+};
 
 /// Closed set of envelope keys accepted on remote `Supply` (§3.3.1).
 ///
@@ -133,13 +135,50 @@ pub enum MergeResult {
     },
 }
 
+/// How many of a body's parse errors the wire path keeps and reports (H-18).
+///
+/// Three is enough to see the shape of a broken body; the total is reported
+/// alongside, so nothing is hidden by the cap — only not materialised.
+pub const MAX_REPORTED_PARSE_ERRORS: usize = 3;
+
+/// Longest rendering of any one parse error in a `MergeError` (H-18).
+///
+/// One number with `protocol::MAX_DECODE_ERROR_CHARS`, for one reason: this is
+/// the text a `warn!` on the intake path carries, and it is the peer's text.
+const MAX_PARSE_ERROR_CHARS: usize = MAX_DECODE_ERROR_CHARS;
+
 /// Parse and validate a supply entry from a remote peer.
 ///
 /// This is the first half of the merge process: parse the economic body,
 /// verify the content hash (I5), and attach envelope metadata.
 ///
 /// Returns the fully-assembled directive ready for DAG insertion.
+///
+/// ## Order of checks (T66 / H-18)
+///
+/// Everything that can be decided without parsing runs FIRST, cheapest first:
+/// the id's form, the body's length, the envelope's key set and value lengths,
+/// and the number of directive blocks in the body. A 1 MiB body used to be
+/// parsed, re-serialised and hashed before any of these were looked at
+/// (audit §5), and the parse itself was the H-18 amplifier — one `ParseError`
+/// per failed block, all of them kept and Debug-rendered. It is now
+/// [`ledger::parse::parse_file_bounded`] with [`MAX_REPORTED_PARSE_ERRORS`],
+/// each kept error rendered through a [`MAX_PARSE_ERROR_CHARS`]-character
+/// [`bounded_display`], so both the peak allocation and the error's size are
+/// constants the body's length cannot move.
 pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeError> {
+    // 0. The id's form (H-18, M-41). Wants are built from form-checked adverts
+    // (M-26) and the refusal cache records nothing else (L-34), so an entry
+    // under a malformed id can never have been asked for and can never be
+    // remembered; refusing it here, before the body is even looked at, also
+    // means `ContentHashMismatch` below only ever carries 64 hex characters.
+    if !is_content_id(&entry.id) {
+        return Err(MergeError::InvalidEnvelope(format!(
+            "entry id is not a content id ({} bytes; expected 64 lowercase hex characters)",
+            entry.id.len()
+        )));
+    }
+
     if entry.economic_bean.len() > ledger::service::MAX_ECONOMIC_BEAN_LENGTH {
         return Err(MergeError::ResourceLimitExceeded(format!(
             "economic_bean is {} bytes (max {})",
@@ -148,11 +187,23 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
         )));
     }
 
-    // 1. Parse the economic body.
-    let directives = parse_file(&entry.economic_bean).map_err(|errors| {
-        let msgs: Vec<String> = errors.iter().map(|e| format!("{e:?}")).collect();
-        MergeError::ParseError(msgs.join("; "))
-    })?;
+    // Envelope key set, value lengths and control characters: a map lookup and
+    // a length per key, before the body costs anything (audit §5).
+    validate_supply_envelope(&entry.envelope)?;
+
+    // Exactly one directive block, counted without parsing (H-18). A body of
+    // 524,288 two-byte blocks is refused here in one pass over the bytes, so
+    // the bounded parser below is the second line, not the first.
+    let header_count = ledger::parse::count_directive_headers(&entry.economic_bean);
+    if header_count != 1 {
+        return Err(MergeError::ParseError(format!(
+            "economic_bean must contain exactly one directive ({header_count} directive blocks)"
+        )));
+    }
+
+    // 1. Parse the economic body — bounded (H-18).
+    let directives = parse_file_bounded(&entry.economic_bean, MAX_REPORTED_PARSE_ERRORS)
+        .map_err(|bounded| MergeError::ParseError(render_parse_errors(&bounded)))?;
 
     if directives.len() != 1 {
         return Err(MergeError::ParseError(
@@ -168,7 +219,9 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
         ));
     }
 
-    // 2. Verify content hash (I5): id == hash(economic_bean).
+    // 2. Verify content hash (I5): id == hash(economic_bean). `claimed` is
+    // carried verbatim because step 0 proved it is 64 hex characters (M-41);
+    // it is not a length because an operator diffing two ids wants both.
     let computed = compute_content_id(&directive);
     if computed != entry.id {
         return Err(MergeError::ContentHashMismatch {
@@ -176,8 +229,6 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
             computed,
         });
     }
-
-    validate_supply_envelope(&entry.envelope)?;
 
     // 3. Canonicalize the wire body, on the freshly parsed directive and BEFORE
     // the envelope merge below. The ordering is load-bearing: once the envelope
@@ -278,21 +329,24 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
         // garbage string is silently persisted verbatim, and a huge value pins
         // every replica's saturating clock permanently.
         //
-        // EXCLUSIVE since T46 (H-07). The receiver adopts
-        // `max(local, remote) + 1`, so a value accepted *at* the cap lands the
-        // receiver's clock above it — and every directive that receiver goes on
-        // to stamp is then rejected here, on this very line, by every peer it
-        // has. The cap and the arithmetic around it are one rule, stated once on
-        // `ledger::service::LAMPORT_CEILING`; the ledger re-checks the same
-        // bound as it adopts, for the callers that reach it without the wire.
+        // T63 / H-12: `value + 1 < LAMPORT_CEILING`, by calling the ledger's
+        // `lamport_value_is_legal` rather than restating the inequality. The
+        // receiver adopts `max(local, remote) + 1`, so a legal value is one
+        // whose adopter's clock stays below the cap. Until T63 this line read
+        // `value < LAMPORT_CEILING` while the ledger's adoption bounded
+        // `value + 1`: `CEILING - 1` passed here, was a legal stamp, and was
+        // refused by every peer's adoption — the gap H-12 walked through. The
+        // one rule is stated on `ledger::service::LAMPORT_CEILING`. The
+        // per-directive ADVANCE bound (the ratchet) is not here: it depends on
+        // the receiver's clock, so it lives where the clock does.
         let lamport_ok = !lamport.is_empty()
             && lamport.bytes().all(|b| b.is_ascii_digit())
             && lamport
                 .parse::<u64>()
-                .is_ok_and(|value| value < LAMPORT_CEILING);
+                .is_ok_and(ledger::service::lamport_value_is_legal);
         if !lamport_ok {
             return Err(MergeError::InvalidEnvelope(format!(
-                "openledger-lamport must be a decimal u64 < {LAMPORT_CEILING}"
+                "openledger-lamport must be a decimal u64 with value + 1 < {LAMPORT_CEILING}"
             )));
         }
     }
@@ -300,12 +354,50 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
     Ok(directive)
 }
 
+/// Render a bounded parse failure as "N parse errors; first: …" (H-18).
+///
+/// Each kept error goes through [`bounded_display`] as it is formatted, so a
+/// single error whose message is most of the body (a long token, say) is cut
+/// at [`MAX_PARSE_ERROR_CHARS`] and never exists in full outside the
+/// `ParseError` itself. The result is at most `MAX_REPORTED_PARSE_ERRORS` such
+/// renderings plus a count — a constant, whatever the body was.
+fn render_parse_errors(bounded: &BoundedParseErrors) -> String {
+    use std::fmt::Write as _;
+    let mut rendered = format!("{} parse error(s); first: ", bounded.total);
+    for (index, error) in bounded.errors.iter().enumerate() {
+        if index > 0 {
+            rendered.push_str("; ");
+        }
+        rendered.push_str(&bounded_display(error, MAX_PARSE_ERROR_CHARS));
+    }
+    if bounded.total > bounded.errors.len() {
+        let _ = write!(
+            rendered,
+            " (+{} more)",
+            bounded.total - bounded.errors.len()
+        );
+    }
+    rendered
+}
+
+/// Longest envelope key quoted back verbatim in a refusal (M-41).
+///
+/// Every legitimate key is under 32 characters; a longer one is peer-chosen
+/// text and is reported by length.
+const MAX_ECHOED_ENVELOPE_KEY_CHARS: usize = 64;
+
 fn validate_supply_envelope(envelope: &BTreeMap<String, String>) -> Result<(), MergeError> {
     for (key, value) in envelope {
         if !ALLOWED_ENVELOPE_KEYS.contains(&key.as_str()) {
-            return Err(MergeError::InvalidEnvelope(format!(
-                "unsupported envelope key: {key}"
-            )));
+            // M-41: the key is peer-chosen. Short ones are quoted (Debug-
+            // escaped, so a control character cannot break the log line);
+            // anything longer is described by its length.
+            let shown = if key.chars().count() <= MAX_ECHOED_ENVELOPE_KEY_CHARS {
+                format!("unsupported envelope key: {key:?}")
+            } else {
+                format!("unsupported envelope key ({} bytes long)", key.len())
+            };
+            return Err(MergeError::InvalidEnvelope(shown));
         }
         // Reject oversized values before any downstream parsing (M-4). This
         // caps the giant `openledger-parents` blobs cheaply, before the parent
@@ -467,6 +559,7 @@ fn directive_metadata_mut(directive: &mut Directive) -> &mut BTreeMap<String, St
 mod tests {
     use super::*;
     use ledger::hash::compute_content_id;
+    use ledger::parse::parse_file;
     use ledger::serialize::economic_canonical_serialize;
     use rust_decimal_macros::dec;
     use std::collections::BTreeMap;
@@ -603,10 +696,17 @@ mod tests {
         ));
     }
 
+    /// A well-formed but wrong id: the body checks are what these two tests
+    /// are about, and since T66 a malformed id is refused before the body
+    /// (see `test_validate_rejects_malformed_entry_id`).
+    fn well_formed_wrong_id() -> String {
+        "0".repeat(64)
+    }
+
     #[test]
     fn test_validate_empty_body() {
         let entry = SupplyEntry {
-            id: "abc".to_owned(),
+            id: well_formed_wrong_id(),
             kind: DirectiveKind::Transaction,
             economic_bean: "".to_owned(),
             envelope: BTreeMap::new(),
@@ -619,7 +719,7 @@ mod tests {
     #[test]
     fn test_validate_unparseable_body() {
         let entry = SupplyEntry {
-            id: "abc".to_owned(),
+            id: well_formed_wrong_id(),
             kind: DirectiveKind::Transaction,
             economic_bean: "this is not valid beancount".to_owned(),
             envelope: BTreeMap::new(),
@@ -2151,11 +2251,31 @@ mod tests {
             validate_supply_entry(&entry)
         );
 
-        // One step lower is still accepted on the wire — a bound, not a blanket
-        // refusal.
+        // T63 (H-12): `CEILING - 1` is refused on the wire too. This test used
+        // to assert it was "still accepted" here while
+        // `test_remote_lamport_at_the_ceiling_is_refused_not_adopted` asserted
+        // the ledger refused it at adoption — the two halves of the H-12
+        // contradiction, pinned. The wire now calls the ledger's
+        // `lamport_value_is_legal` (`value + 1 < CEILING`), so a value is legal
+        // on every path or on none.
+        let entry = crate::gossip::make_supply_entry(&hostile_open(
+            "Assets:Edge",
+            ledger::service::LAMPORT_CEILING - 1,
+        ));
+        assert!(
+            matches!(
+                validate_supply_entry(&entry),
+                Err(MergeError::InvalidEnvelope(_))
+            ),
+            "CEILING - 1 is not a legal value on any path since T63: {:?}",
+            validate_supply_entry(&entry)
+        );
+
+        // `CEILING - 2`, the largest legal value, is accepted — a bound, not a
+        // blanket refusal — and it is exactly the largest value a node stamps.
         let entry = crate::gossip::make_supply_entry(&hostile_open(
             "Assets:Fine",
-            ledger::service::LAMPORT_CEILING - 1,
+            ledger::service::LAMPORT_CEILING - 2,
         ));
         assert!(validate_supply_entry(&entry).is_ok());
 
@@ -2233,5 +2353,140 @@ mod tests {
             matches!(error, MergeError::InvalidEnvelope(ref reason) if reason.contains("openledger-custom")),
             "expected the unsupported-envelope-key rejection, got {error:?}"
         );
+    }
+
+    // ── T66: H-18 bounded parse errors, M-41 bounded echoes ─────────────
+
+    /// T66: a malformed id is refused first, before the body is looked at.
+    #[test]
+    fn test_validate_rejects_malformed_entry_id() {
+        let mut entry = make_valid_supply_entry();
+        entry.id = "abc".to_owned();
+        let error = validate_supply_entry(&entry).unwrap_err();
+        assert!(matches!(error, MergeError::InvalidEnvelope(_)), "{error}");
+        // Uppercase hex is malformed too (L-29).
+        let mut entry = make_valid_supply_entry();
+        entry.id = entry.id.to_ascii_uppercase();
+        assert!(matches!(
+            validate_supply_entry(&entry),
+            Err(MergeError::InvalidEnvelope(_))
+        ));
+    }
+
+    /// H-18: the `"x\n"` × 512k body is refused with a SMALL error. The
+    /// memory bound is measured under the counting allocator in
+    /// `tests/decode_memory.rs`; this pins the rendering.
+    #[test]
+    fn test_many_block_body_renders_a_bounded_parse_error() {
+        let mut entry = make_valid_supply_entry();
+        entry.economic_bean = "x\n".repeat(512 * 1024);
+        let error = validate_supply_entry(&entry).unwrap_err();
+        assert!(matches!(error, MergeError::ParseError(_)), "{error}");
+        let rendered = error.to_string();
+        assert!(rendered.len() < 1024, "{}", rendered.len());
+        assert!(rendered.contains("524288 directive blocks"), "{rendered}");
+    }
+
+    /// H-18: a body that passes the block-count gate and then fails many
+    /// times inside the bounded parser reports the first three plus a count,
+    /// each rendering cut at `MAX_PARSE_ERROR_CHARS`.
+    #[test]
+    fn test_bounded_parser_reports_first_errors_plus_a_count() {
+        let mut entry = make_valid_supply_entry();
+        // 100,000 stray indented lines are errors but not blocks (they never
+        // reach the header count), then one bad header with a 1 MiB keyword.
+        entry.economic_bean = format!(
+            "{}2024-01-01 {}\n",
+            " stray\n".repeat(100_000),
+            "k".repeat(256 * 1024)
+        );
+        assert!(entry.economic_bean.len() <= ledger::service::MAX_ECONOMIC_BEAN_LENGTH);
+        assert_eq!(
+            ledger::parse::count_directive_headers(&entry.economic_bean),
+            1
+        );
+        let error = validate_supply_entry(&entry).unwrap_err();
+        let MergeError::ParseError(detail) = &error else {
+            panic!("expected a parse error, got {error}");
+        };
+        assert!(
+            detail.starts_with("100001 parse error(s); first: "),
+            "{detail}"
+        );
+        assert!(detail.ends_with(" (+99998 more)"), "{detail}");
+        assert_eq!(detail.matches("Unexpected indented line").count(), 3);
+        assert!(
+            error.to_string().len() < 1024,
+            "{}",
+            error.to_string().len()
+        );
+
+        // The kept rendering of a single long error is itself cut.
+        let bounded = ledger::parse::BoundedParseErrors {
+            errors: vec![ledger::error::ParseError::new(
+                1,
+                1,
+                "m".repeat(10_000),
+                ledger::error::ParseErrorKind::UnexpectedToken,
+            )],
+            total: 1,
+        };
+        let rendered = render_parse_errors(&bounded);
+        assert!(
+            rendered.ends_with(crate::protocol::TRUNCATION_MARKER),
+            "{rendered}"
+        );
+        assert!(rendered.chars().count() < MAX_PARSE_ERROR_CHARS + 64);
+    }
+
+    /// M-41: every echo shape renders under 512 characters — a 2 MiB id, a
+    /// 15 MiB envelope key, a 1 MiB keyword body — and a short unsupported key
+    /// is quoted Debug-escaped so it cannot break a log line.
+    #[test]
+    fn test_every_refusal_renders_under_512_chars() {
+        let mib = 1024 * 1024;
+
+        let mut entry = make_valid_supply_entry();
+        entry.id = "0".repeat(2 * mib);
+        let error = validate_supply_entry(&entry).unwrap_err();
+        assert!(matches!(error, MergeError::InvalidEnvelope(_)), "{error}");
+        assert!(error.to_string().len() < 512, "{}", error.to_string().len());
+
+        let mut entry = make_valid_supply_entry();
+        entry.envelope.insert("K".repeat(15 * mib), "v".to_owned());
+        let error = validate_supply_entry(&entry).unwrap_err();
+        assert!(matches!(error, MergeError::InvalidEnvelope(_)), "{error}");
+        assert!(error.to_string().len() < 512, "{}", error.to_string().len());
+        assert!(error.to_string().contains("15728640 bytes long"), "{error}");
+
+        let mut entry = make_valid_supply_entry();
+        entry.economic_bean = format!("2024-01-01 {}", "k".repeat(mib - 12));
+        let error = validate_supply_entry(&entry).unwrap_err();
+        assert!(matches!(error, MergeError::ParseError(_)), "{error}");
+        assert!(error.to_string().len() < 512, "{}", error.to_string().len());
+
+        let mut entry = make_valid_supply_entry();
+        entry.envelope.insert(
+            "evil\n2024-01-01 open Assets:Hacked".to_owned(),
+            "x".to_owned(),
+        );
+        let error = validate_supply_entry(&entry).unwrap_err();
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains('\n'),
+            "a control character reached the message: {rendered:?}"
+        );
+        assert!(rendered.contains("\\n"), "{rendered}");
+
+        // A content-hash mismatch carries the claimed id whole — it is 64 hex
+        // characters by construction after the id-form check.
+        let mut entry = make_valid_supply_entry();
+        entry.id = "0".repeat(64);
+        let error = validate_supply_entry(&entry).unwrap_err();
+        let MergeError::ContentHashMismatch { claimed, .. } = &error else {
+            panic!("{error}");
+        };
+        assert_eq!(claimed.len(), 64);
+        assert!(error.to_string().len() < 512);
     }
 }

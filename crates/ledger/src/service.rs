@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::dag::{DagError, InsertResult, LedgerDag};
 use crate::error::ParseError;
@@ -386,7 +386,7 @@ fn salvage_unparsable_blocks(content: &str) -> (Vec<Directive>, Vec<UnparsableBl
     let mut refused = Vec::new();
 
     for block in split_ledger_blocks(content) {
-        match parse_file(&block.text) {
+        match parse_block(&block.text) {
             Ok(parsed) => directives.extend(parsed),
             Err(errors) => refused.push(UnparsableBlock {
                 line: block.line,
@@ -401,6 +401,43 @@ fn salvage_unparsable_blocks(content: &str) -> (Vec<Directive>, Vec<UnparsableBl
     }
 
     (directives, refused)
+}
+
+/// Parse ONE block of a `.bean` file exactly as the whole-file parser would
+/// have read it in place (L-62).
+///
+/// [`parse_file`] strips a byte-order mark at offset 0 of whatever it is
+/// given — right for a file, wrong for a block cut out of the middle of one:
+/// the whole-file pass strips only the file's first character, so a `U+FEFF`
+/// glued to a mid-file header (a `cat` of two BOM'd files, a paste from an
+/// editor that writes one) makes the whole-file parse fail on that line
+/// while a per-block parse quietly succeeds. That disagreement was reachable
+/// two ways, both bad: as the file's only defect it made every block parse
+/// after the whole file had failed, which is the fail-closed `Err` arm in
+/// [`LedgerService::boot`] — `exit(1)` — and with any other broken block
+/// present the BOM'd directive was **loaded** although the whole-file parser
+/// had refused it.
+///
+/// So a block that begins with a BOM is refused here, with a reason naming
+/// it, and never handed to `parse_file`. [`split_ledger_blocks`] has already
+/// stripped the file-level BOM (offset 0), so the only way a block can start
+/// with one is the mid-file shape above — or a doubled BOM at the very start,
+/// which the whole-file parser refuses too. Both callers of a per-block parse
+/// ([`salvage_unparsable_blocks`] and
+/// [`LedgerService::parse_around_quarantined_text`]) go through this one
+/// function so they cannot disagree with each other either.
+fn parse_block(text: &str) -> Result<Vec<Directive>, Vec<ParseError>> {
+    if text.starts_with(crate::parse::BYTE_ORDER_MARK) {
+        return Err(vec![ParseError {
+            line: 1,
+            column: 1,
+            message: "block begins with a byte-order mark (U+FEFF) after the start of the file; \
+                      the whole-file parser does not accept one there (L-62)"
+                .to_owned(),
+            kind: crate::error::ParseErrorKind::UnexpectedToken,
+        }]);
+    }
+    parse_file(text)
 }
 
 /// Content ids of the file's transactions that sit on — or descend from — a
@@ -499,6 +536,17 @@ pub fn enforce_resource_limits(directive: &Directive) -> Result<(), ServiceError
     }
 
     let Directive::Transaction(transaction) = directive else {
+        // H-17 (T65): the amount cap for the directive kinds that are not
+        // transactions. A library caller can hand `stage_remote_directive` an
+        // in-memory `balance`/`price` whose amount never went through the
+        // parser's cap, and `validate_transaction` only sees transactions.
+        // Transactions are left to `validate_transaction`, which applies the
+        // same cap on every path and keeps its `INVALID_POSTING` code.
+        crate::validate::check_directive_amounts(directive).map_err(|error| {
+            ServiceError::ResourceLimitExceeded {
+                message: error.to_string(),
+            }
+        })?;
         return Ok(());
     };
 
@@ -852,24 +900,47 @@ pub const ENVELOPE_KEYS: &[&str] = &[
 /// decoy transaction does, naming every id in the chain that follows it.
 pub const MAX_PARENTS: usize = 256;
 
-/// Exclusive ceiling on every Lamport value in the mesh (0820-M3, H-07).
+/// Most unmerged DAG heads one author may own on this node before a remote
+/// transaction of theirs that names no current head is refused (T64 / H-16;
+/// decided 2026-09-22).
 ///
-/// **One rule.** No `openledger-lamport` value may reach `LAMPORT_CEILING` —
-/// not one a peer sends us, not one we fold into our own clock, not one we
-/// stamp. The bound is EXCLUSIVE, and that is forced by the arithmetic rather
-/// than chosen: adoption is `max(local, remote) + 1`, so a value accepted *at*
-/// the cap carries the clock past it, and the node then stamps directives its
-/// own peers refuse. The one-step difference between "a stamped value below the
-/// cap" and "a clock below the cap" is not slack to spend: the clock is always
-/// one step ahead of the value it will next stamp, so the two checks are the
-/// same rule applied to quantities one `+1` apart.
+/// An honest author holds about one unmerged head at a time: every append
+/// names the heads it sees, so its previous head stops being one. Heads only
+/// multiply through concurrency, and 256 is far beyond what concurrent honest
+/// writers produce. Without the bound, one allowlisted peer sending 257 valid
+/// parentless transactions (~64 KB) grew the head set past [`MAX_PARENTS`], and
+/// the victim's next append named all of them — see
+/// [`LedgerService::choose_parents`] for the local half of the fix.
 ///
-/// Three sites enforce it, all reading this constant: [`checked_lamport`] on
-/// the author path ([`LedgerService::stamp_transaction_envelope`],
-/// [`LedgerService::stamp_directive_envelope`], reconcile) and on the adopt
-/// path ([`LedgerService::stage_remote_directive`]), and `p2p::union_merge`'s
-/// wire check, which aliases this constant and applies `value <
-/// LAMPORT_CEILING` to the stamped value on the way in.
+/// Equal to [`MAX_PARENTS`] on purpose: one local append can then merge every
+/// head one author is able to plant.
+pub const MAX_UNMERGED_HEADS_PER_AUTHOR: usize = MAX_PARENTS;
+
+/// Exclusive ceiling on every Lamport value in the mesh (0820-M3, H-07, H-12).
+///
+/// **One rule (T63 / H-12).** A Lamport value `v` is *legal* when `v + 1 <
+/// LAMPORT_CEILING` — i.e. when the clock of a node that adopts `v` still sits
+/// below the ceiling. Every site applies exactly that predicate,
+/// [`lamport_value_is_legal`], to the value it is about to write or read:
+///
+/// * **stamp** — the value to be stamped must be legal, so the largest value
+///   this node ever stamps is `LAMPORT_CEILING - 2`;
+/// * **wire** — `p2p::union_merge` requires `value + 1 < LAMPORT_CEILING` of
+///   every inbound `openledger-lamport`, by calling the same function;
+/// * **adoption** — the ledger requires `max(local, remote)` to be legal, so the
+///   clock it moves to (`max + 1` on the peer path, `max` on the file path) is
+///   at most `LAMPORT_CEILING - 1`;
+/// * **boot** — warns when the value the node would stamp next is not legal,
+///   i.e. exactly when the stamp site is going to refuse.
+///
+/// Before T63 the three checks bounded *different* quantities against the same
+/// number (stamp: the value; wire: the value; adoption: the value plus one), so
+/// `LAMPORT_CEILING - 1` was a legal stamp, passed every peer's wire check and
+/// was refused by every peer's adoption: a node one peer directive away from
+/// the ceiling authored exactly one silently unreplicable record and then
+/// bricked on restart (H-12). With one predicate a value is either legal
+/// everywhere or nowhere, and the only way to meet the ceiling is loudly, at
+/// this node's own stamp site, before anything is emitted.
 ///
 /// Why a cap, and why `2^53`: the clock update saturates, so without an inbound
 /// bound a single peer sending `u64::MAX` would pin every replica's clock at
@@ -882,40 +953,52 @@ pub const MAX_PARENTS: usize = 256;
 /// Single-sourced here and aliased by `p2p::union_merge`, for the same reason
 /// [`ENVELOPE_KEYS`] and [`MAX_PARENTS`] are. It lived in `p2p` alone until
 /// T46, and that split *was* H-07: the cap bounded what a node **accepted** and
-/// nothing bounded what it **stamped**, so one directive at the cap walked a
-/// victim's clock above it — past the unguarded stamp sites, into the file, and
-/// across every later boot — after which every directive the victim authored
-/// was refused by every peer, silently, forever.
+/// nothing bounded what it **stamped**.
 ///
-/// ## What a hard ceiling cannot close, stated plainly (T46 residual)
+/// ## Reachability, and the ratchet that closes it (T63)
 ///
-/// A hard cap on a clock that adopts peer values is *always* reachable by the
-/// peers: an allowlisted node that sends `LAMPORT_CEILING - 2` still lands a
-/// receiver's clock on `LAMPORT_CEILING - 1`, the last legal value, after which
-/// that receiver can no longer author. The ceiling does not make that
-/// unreachable and no choice of number would — the two requirements "every
-/// value I stamp is one my peers accept" and "no peer can stamp a value that
-/// exhausts my range" cannot both hold below a finite cap.
+/// A hard cap on a clock that adopts peer values is always reachable by the
+/// peers *if a single directive may carry the clock any distance*: one legal
+/// directive at `LAMPORT_CEILING - 2` stopped authoring on every node that
+/// adopted it, survived restarts through the file, and came back with the next
+/// anti-entropy round after an operator removed it. T46 made that failure loud;
+/// T63 makes it expensive. Adoption also refuses a directive that would advance
+/// this node's clock by more than [`MAX_LAMPORT_ADVANCE`] (2^32) in one step —
+/// see [`check_lamport_advance`] — so walking a node from an honest clock to the
+/// ceiling now takes on the order of 2^21 accepted directives, each of which is
+/// ordinary, attributable, allowlisted traffic, rather than one.
 ///
-/// What T46 changes is the *shape* of that failure, which is the part that
-/// mattered: it is now **loud and local** instead of silent and replicating.
-/// The node refuses the write with [`ServiceError::LamportCeiling`], says so at
-/// boot, and never emits a directive the mesh will refuse — where before it
-/// returned success on every mutation while its whole output was discarded by
-/// every peer, and its own `.bean` became the medium that carried the poisoned
-/// clock through restarts. The remedy is also now visible: remove the offending
-/// directive from the file and restart.
-///
-/// Closing the remainder means bounding how far a *single* directive may
-/// advance the clock (a plausibility ratchet on adoption) rather than bounding
-/// only where it may end up. That is a change to §3.4.2's adoption rule with
-/// real failure modes of its own — a replica that has been offline while the
-/// mesh advanced would start refusing honest traffic — so it is deliberately
-/// not smuggled in here. Until then the compensating control is the allowlist:
-/// only an admitted peer can send any `openledger-lamport` at all.
+/// Remedy when a node does meet the ceiling (the error and the boot warning both
+/// say this): the directive that carried the clock there is legal and every
+/// replica that holds it re-serves it, so removing it from one `.bean` is undone
+/// by the next anti-entropy round. Remove its author from the allowlist on every
+/// node, then remove the directive from every node's file.
 pub const LAMPORT_CEILING: u64 = 1 << 53;
 
-/// Apply the [`LAMPORT_CEILING`] rule to a prospective clock value (H-07).
+/// Largest advance one adopted directive may make to this node's Lamport clock
+/// (T63 / H-12 — the adoption ratchet; decided 2026-09-22).
+///
+/// Honest traffic advances a clock by one per stamp or adoption, so the gap
+/// between any two honest clocks in a mesh is bounded by the number of events
+/// the mesh has ever seen — far below 2^32 (≈ 4.3 × 10^9) given the 64 MiB
+/// file cap, even for a replica that has been offline for years. A directive
+/// that claims a larger jump is not ordinary causality; it is the one-shot
+/// H-12 move, and it is refused. See [`check_lamport_advance`] for the rule and
+/// for why it deliberately has no first-contact exemption.
+pub const MAX_LAMPORT_ADVANCE: u64 = 1 << 32;
+
+/// THE Lamport rule (T63 / H-12): a value is legal when a node that adopts it
+/// still has a clock below [`LAMPORT_CEILING`], i.e. `value + 1 < CEILING`.
+///
+/// Public so the wire check in `p2p::union_merge` calls this function rather
+/// than restating the inequality — the restated copy is how the stamp, the
+/// wire and adoption came to bound three different quantities (H-12).
+pub const fn lamport_value_is_legal(value: u64) -> bool {
+    value < LAMPORT_CEILING - 1
+}
+
+/// Apply the [`LAMPORT_CEILING`] rule to a value this node is about to stamp,
+/// or to the `max(local, remote)` it is about to adopt (H-07, H-12).
 ///
 /// The single place the ceiling is enforced inside this crate: every write to
 /// `lamport_clock` on an author or an adopt path goes through here, so a new
@@ -925,12 +1008,135 @@ pub const LAMPORT_CEILING: u64 = 1 << 53;
 /// It does NOT clamp. Saturating at the cap would stamp two directives with the
 /// same `(author, lamport)` pair — the uniqueness M-18 depends on — and would
 /// do it silently, which is the shape of the original defect. The caller is told
-/// instead, and refuses the write.
-fn checked_lamport(next: u64) -> Result<u64, ServiceError> {
-    if next >= LAMPORT_CEILING {
-        return Err(ServiceError::LamportCeiling { next });
+/// instead, and refuses the write. `author` is the author whose directive
+/// carried the clock this far, where the caller knows it; it goes into the
+/// error so the operator knows whom to remove from the allowlist.
+fn checked_lamport(value: u64, author: Option<&str>) -> Result<u64, ServiceError> {
+    if !lamport_value_is_legal(value) {
+        return Err(ServiceError::LamportCeiling {
+            next: value,
+            author: author.map(str::to_owned),
+        });
     }
-    Ok(next)
+    Ok(value)
+}
+
+/// The adoption ratchet (T63 / H-12): refuse a directive whose adoption would
+/// move this node's clock from `local` to more than `local +`
+/// [`MAX_LAMPORT_ADVANCE`].
+///
+/// Adoption moves the clock to `max(local, remote) + 1` on the peer path (and
+/// to `max(local, remote)` on the file path, which is never further), so the
+/// refusal is `max(local, remote) + 1 > local + MAX_LAMPORT_ADVANCE`, which is
+/// `remote - local >= MAX_LAMPORT_ADVANCE`. A remote value at or below the local
+/// clock can never trip it.
+///
+/// # Relative to THIS node's clock — and no first-contact exemption
+///
+/// The obvious worry is a fresh node (clock 0) joining a mesh whose history is
+/// already far above 0. It is not refused, for three reasons, and the design
+/// deliberately stays this simple:
+///
+/// 1. **Honest histories fit.** Every honest Lamport value is bounded by the
+///    number of events the mesh has ever seen, and that is orders of magnitude
+///    below 2^32 — a fresh node admits a whole honest history *in any arrival
+///    order*, its highest directive first. The test
+///    `test_fresh_node_converges_with_a_history_reaching_1e9` pins this at
+///    lamport 10^9, a thousand times what the file cap allows.
+/// 2. **A history with larger totals still converges, by climbing.** The
+///    refusal is state-dependent — it is [`ServiceError::LamportAdvance`],
+///    which the node's refusal cache classifies as NOT permanent — so a
+///    directive refused now is asked for again on the next anti-entropy
+///    round. A directive's parents always carry smaller lamports than it does
+///    (a stamp is `max(everything seen) + 1`), so the lower part of any history
+///    never waits on the higher part: each round adopts everything within 2^32
+///    of the clock, the clock rises, and the next round adopts the rest.
+///    `test_ratchet_refusal_is_retried_and_a_stepped_history_converges`.
+/// 3. **An exemption would be the attack.** "No bound on first contact" (or
+///    while the clock is 0, or for an author not seen before) gives an
+///    allowlisted peer exactly the single unbounded jump the ratchet exists to
+///    remove, on precisely the nodes least able to notice — new ones.
+///
+/// What remains (recorded as a residual, not closed here): a mesh that already
+/// carries ONE jump larger than 2^32 — only possible from a pre-T63 peer, or a
+/// hostile one — cannot be joined by a fresh node until that directive is
+/// removed mesh-wide, which is the H-12 remedy anyway.
+fn check_lamport_advance(
+    local: u64,
+    remote: u64,
+    author: Option<&str>,
+) -> Result<(), ServiceError> {
+    if remote.saturating_sub(local) >= MAX_LAMPORT_ADVANCE {
+        return Err(ServiceError::LamportAdvance {
+            remote,
+            local,
+            author: author.map(str::to_owned),
+        });
+    }
+    Ok(())
+}
+
+/// The highest Lamport value boot's clock must resume above (M-18, T63 / H-12).
+///
+/// # Which directives count
+///
+/// * **Every directive boot inserts into the DAG** — whatever its author. The
+///   clock is a Lamport clock over the history this node holds and serves, so
+///   it must sit above every value in it; that is the M-18 rule, unchanged.
+/// * **A directive that does NOT reach the DAG** (quarantined by the cycle
+///   scan, the fan-in / envelope-form checks or a DAG refusal, or dropped as a
+///   duplicate body) counts **only if its `openledger-author` is this node**.
+///
+/// # Why that still keeps `(author, lamport)` unique
+///
+/// M-18's uniqueness is about the pairs THIS node signs: the next value it
+/// stamps must differ from every value it has already stamped that still
+/// exists anywhere. A pair `(other, n)` can never collide with `(self, m)`,
+/// whatever `n` is, because the author component differs — so a foreign
+/// directive outside the DAG constrains nothing this node will stamp, and
+/// neither does it constrain causality: nothing in the DAG descends from it, so
+/// no directive this node stamps needs to order after it. This node's OWN
+/// records are all still counted, wherever they landed: a quarantined one stays
+/// in the file (H-08) and may already be on peers, and ignoring its value
+/// could re-issue its pair. Before T63 every quarantined directive counted,
+/// which is how a foreign directive the node refused to load still set its
+/// clock — and, since the quarantine is written back by every compaction,
+/// kept setting it forever (H-12 fact 3).
+///
+/// Unparsable blocks (L-45) are not directives and never counted, before or
+/// after T63.
+#[derive(Default)]
+struct BootLamportHigh {
+    value: u64,
+    /// Author of the directive carrying `value`, for the H-12 boot warning.
+    author: Option<String>,
+}
+
+impl BootLamportHigh {
+    /// Fold a directive that is in the DAG.
+    fn note(&mut self, directive: &Directive) {
+        if let Some(lamport) = directive.lamport_clock() {
+            if lamport > self.value || self.author.is_none() && lamport == self.value {
+                self.value = lamport;
+                self.author = directive_author(directive).map(str::to_owned);
+            }
+        }
+    }
+
+    /// Fold a directive that is NOT in the DAG: only this node's own count.
+    fn note_if_own(&mut self, directive: &Directive, own_author: &str) {
+        if directive_author(directive) == Some(own_author) {
+            self.note(directive);
+        }
+    }
+}
+
+/// A directive's `openledger-author`, for any kind.
+fn directive_author(directive: &Directive) -> Option<&str> {
+    directive
+        .metadata()
+        .get(ENVELOPE_KEY_AUTHOR)
+        .map(String::as_str)
 }
 
 /// Reject a directive whose `openledger-parents` fan-in exceeds
@@ -1144,10 +1350,34 @@ pub enum ServiceError {
     /// [`LedgerService::prepare_commit`]; it exists so a caller that violates it
     /// gets a loud refusal instead of an interleaved write.
     CommitInFlight,
-    /// H-07: a Lamport value at or above [`LAMPORT_CEILING`]. Stamping or
+    /// H-07 / H-12: a Lamport value that is not legal under
+    /// [`lamport_value_is_legal`] (`value + 1 >= LAMPORT_CEILING`). Stamping or
     /// adopting it would take this node's clock outside the range every peer
     /// accepts, so the write is refused rather than made invisibly.
-    LamportCeiling { next: u64 },
+    ///
+    /// `author` names the author whose directive carried the value this far,
+    /// where it is known (always on adoption; on a stamp, the author of the
+    /// highest-lamport directive this node holds), because the remedy is
+    /// mesh-wide and starts with that author — see the `Display` text.
+    LamportCeiling { next: u64, author: Option<String> },
+    /// T63 / H-12: the adoption ratchet. Adopting this directive would advance
+    /// this node's clock from `local` by more than [`MAX_LAMPORT_ADVANCE`] in
+    /// one step. State-dependent — it is judged against this node's clock, and
+    /// becomes acceptable once the clock has caught up through the intervening
+    /// history — so it is never a permanent verdict on the directive.
+    LamportAdvance {
+        remote: u64,
+        local: u64,
+        author: Option<String>,
+    },
+    /// T64 / H-16: a remote transaction that names no current head, from an
+    /// author that already owns [`MAX_UNMERGED_HEADS_PER_AUTHOR`] heads here.
+    /// State-dependent — the author's heads are merged by the next append that
+    /// names them — so never a permanent verdict on the directive.
+    UnmergedHeadLimit {
+        author: Option<String>,
+        heads: usize,
+    },
 }
 
 impl std::fmt::Display for ServiceError {
@@ -1209,12 +1439,53 @@ impl std::fmt::Display for ServiceError {
             ServiceError::CommitInFlight => {
                 write!(f, "a durable ledger commit is already in flight")
             }
-            ServiceError::LamportCeiling { next } => {
+            ServiceError::LamportCeiling { next, author } => {
                 write!(
                     f,
-                    "Lamport clock would reach {next}, at or above the ceiling \
-                     {LAMPORT_CEILING}: a directive stamped there is refused by every \
-                     peer, so this node will not author or adopt one"
+                    "openledger-lamport {next} is past the last legal value {} (ceiling \
+                     {LAMPORT_CEILING}): a directive stamped there is refused by every \
+                     peer, so this node will not author or adopt one. ",
+                    LAMPORT_CEILING - 2
+                )?;
+                match author {
+                    Some(author) => write!(
+                        f,
+                        "The clock was carried there by a directive from author {author}. "
+                    )?,
+                    None => write!(f, "The author that carried the clock there is unknown. ")?,
+                }
+                write!(
+                    f,
+                    "Remedy, mesh-wide: remove that author from the allowlist on every node, \
+                     then stop every node and remove the directive(s) carrying that \
+                     openledger-lamport from each node's .bean — removing it on one node \
+                     alone is undone by the next anti-entropy round from any peer that still \
+                     holds it (H-12)"
+                )
+            }
+            ServiceError::LamportAdvance {
+                remote,
+                local,
+                author,
+            } => {
+                let author = author.as_deref().unwrap_or("(unknown)");
+                write!(
+                    f,
+                    "openledger-lamport {remote} from author {author} would advance this \
+                     node's clock from {local} by more than {MAX_LAMPORT_ADVANCE} in one step; \
+                     refused (H-12 adoption ratchet). Honest traffic advances clocks one step \
+                     at a time, so this is either a peer jumping the mesh toward the Lamport \
+                     ceiling or history this node has not caught up with yet — in the second \
+                     case it is accepted once the intervening directives have arrived"
+                )
+            }
+            ServiceError::UnmergedHeadLimit { author, heads } => {
+                let author = author.as_deref().unwrap_or("(unknown)");
+                write!(
+                    f,
+                    "author {author} already owns {heads} unmerged DAG heads on this node \
+                     (max {MAX_UNMERGED_HEADS_PER_AUTHOR}) and this transaction names none of \
+                     the current heads; refused until those heads are merged (H-16)"
                 )
             }
         }
@@ -1250,6 +1521,8 @@ impl ServiceError {
             ServiceError::Journal { .. } => "LEDGER_JOURNAL",
             ServiceError::CommitInFlight => "COMMIT_IN_FLIGHT",
             ServiceError::LamportCeiling { .. } => "LAMPORT_CEILING",
+            ServiceError::LamportAdvance { .. } => "LAMPORT_ADVANCE",
+            ServiceError::UnmergedHeadLimit { .. } => "UNMERGED_HEAD_LIMIT",
         }
     }
 }
@@ -1626,9 +1899,48 @@ impl RecoveryReload {
     /// Rebuild a service from the files on disk. **Blocking** — the whole
     /// point of the type is that this runs on a blocking thread with no ledger
     /// lock held (L-43).
+    ///
+    /// H-15: a rebuild is a *reload*, and a reload never creates the `.bean`.
+    /// The service being recovered had a file; if it is gone now, rebuilding
+    /// an empty ledger and installing it over memory is exactly the loss this
+    /// mode exists to refuse — see [`BootMode::Reload`].
     pub fn load(&self) -> Result<LedgerService, ServiceError> {
-        LedgerService::boot(self.file_path.clone(), self.author_id.clone())
+        LedgerService::boot_with(
+            self.file_path.clone(),
+            self.author_id.clone(),
+            BootMode::Reload,
+        )
     }
+}
+
+/// Why [`LedgerService::boot_with`] is being asked to read the files (H-15).
+///
+/// The one thing the mode changes is what an **absent** `.bean` means:
+///
+/// * [`Self::Fresh`] — a process start. No file and no journal is a new ledger
+///   and the file is created (§3.3). No file but a journal beside it is not:
+///   a journal only ever exists next to a `.bean` past the compaction
+///   threshold, so this shape is a ledger whose `.bean` was removed or renamed
+///   out from under it, and starting an empty ledger there would fold the
+///   journal's records into a file holding nothing else. Refused, naming both
+///   files.
+/// * [`Self::Reload`] — an L-13 recovery of a service that already holds the
+///   ledger in memory. An absent file is refused outright: before this mode
+///   existed, `mv ledger.bean ledger.bak` under a running node made the next
+///   failed commit's reload *create an empty file* and install it over the
+///   complete in-memory DAG, with nothing logged on the way.
+///
+/// The `.lock` sidecar is deliberately NOT a signal. `gl-node` takes it before
+/// `boot` runs (M-17), so from the node's point of view "the lock exists" is
+/// true on every first boot of a brand-new ledger and discriminates nothing;
+/// a library caller takes no lock at all. The journal and the mode are the two
+/// facts boot can actually stand on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootMode {
+    /// A process start: an absent `.bean` with no journal beside it is created.
+    Fresh,
+    /// An L-13 rebuild of a live service: an absent `.bean` is an error.
+    Reload,
 }
 
 /// The service state an L-13 rebuild would discard, reduced to counters
@@ -1653,6 +1965,9 @@ struct RecoveryFingerprint {
     quarantined_text: usize,
     external_reconcile_count: u64,
     force_compaction: bool,
+    /// H-13: a `finalize_operator_input` drains this without touching any
+    /// other counter, so it needs its own entry.
+    unsigned_operator_input: usize,
 }
 
 // ─── Ledger service ──────────────────────────────────────────────────────────
@@ -1822,6 +2137,61 @@ pub struct LedgerService {
     /// Installed once, it stays installed: it is carried across every L-13
     /// reload by [`Self::adopt_reloaded`] (T44b).
     signer: Option<DirectiveSigner>,
+    /// Content ids of the directives [`Self::boot`] adopted as **operator
+    /// input** whose envelope is not final yet (H-13).
+    ///
+    /// # The finding
+    ///
+    /// The README's only supported edit workflow is *stop the node, edit the
+    /// file, start it again* — and boot treated whatever it read as history:
+    /// a hand-typed block was inserted with the metadata it had (none), the
+    /// file's hash became the baseline, the startup compaction found nothing
+    /// to adopt and rewrote the record **without an envelope**, and the signer
+    /// was installed after all of that anyway. Every peer refused the record
+    /// (`EnvelopeMissing`), the node's next transaction named it as a parent,
+    /// and everything this node authored from then on lived on this node
+    /// alone. The operator had done exactly what the README said.
+    ///
+    /// # The decision: envelope-less file directives are operator input
+    ///
+    /// Boot has one signal to tell history from input, and it is exact: a
+    /// node never writes a directive without `openledger-author` and
+    /// `openledger-lamport`, so a directive carrying **neither** was typed by
+    /// a human (or written by a build older than M-18, which stamped only
+    /// transactions — the README's standing policy, *operator input is a
+    /// local append*, covers those too: they are adopted as this node's own,
+    /// once, and canonicalised by the compaction that follows). Such a
+    /// directive goes through the same adoption
+    /// [`Self::reconcile_content`] applies to a live hand edit —
+    /// [`Self::adopt_file_directive`]: the validators, the author/lamport
+    /// stamp, parents via `heads_admissible_as_parents_of`, the resolved-body
+    /// cap, the insert — and a refusal is **quarantined**, not dropped: boot's
+    /// standing rule is that it loses nothing, so the raw text stays in the
+    /// file and out of the DAG until the operator repairs it (H-08).
+    ///
+    /// # Why the signature is deferred, and only the signature
+    ///
+    /// This crate does not depend on `security`; the signer reaches the
+    /// service through [`Self::set_signer`] after the node has loaded its key
+    /// — after `boot`, and after `set_author_id` has replaced the placeholder
+    /// author `gl-node` boots with. So boot adopts (the DAG, the account
+    /// state, the parents and the lamport are all fixed here, where every
+    /// caller that asserts on `directive_count` after boot expects them) and
+    /// records the stored ids; [`Self::finalize_operator_input`] then, once
+    /// the identity is known, writes the real author id over the placeholder
+    /// and signs. Nothing in the signed message (`content_id`,
+    /// `is_transaction`, `parents`, `lamport`) changes between the two steps,
+    /// so the signature covers exactly what boot stamped.
+    ///
+    /// `gl-node` calls `finalize_operator_input` right after `set_signer` and
+    /// before the startup compaction and the P2P tasks; [`Self::prepare`]
+    /// calls it before any compaction for library callers, which is where a
+    /// service with no signer installed adopts unsigned — exactly as a
+    /// reconcile with no signer does today. An L-13 reload re-derives this
+    /// set from the file (the raw entries are still there until a compaction
+    /// succeeds) and [`Self::finish_recovery`] finalises it again with the
+    /// carried signer.
+    unsigned_operator_input: Vec<String>,
 
     // ── T44: append-only persistence ──────────────────────────────────────
     /// `<ledger>.bean.journal` — the append-only sidecar, derived once at boot.
@@ -1930,29 +2300,102 @@ impl LedgerService {
     /// failed. A journal present at boot is simply carried; the first commit —
     /// or an explicit [`Self::compact`] from the node's startup path — folds it
     /// in.
+    ///
+    /// # Operator input (H-13)
+    ///
+    /// A directive with neither `openledger-author` nor `openledger-lamport`
+    /// was never written by a node. It is adopted here through the same path
+    /// a live hand edit takes — validated, stamped with this node's author,
+    /// lamport and parents, inserted — and its signature is added by
+    /// [`Self::finalize_operator_input`] once the node key is installed. A
+    /// refusal is quarantined. See [`Self::unsigned_operator_input`].
     pub fn boot(file_path: impl Into<PathBuf>, author_id: String) -> Result<Self, ServiceError> {
+        Self::boot_with(file_path, author_id, BootMode::Fresh)
+    }
+
+    /// [`Self::boot`] with the caller saying whether this is a process start
+    /// or an L-13 reload — the one thing that decides what an absent `.bean`
+    /// means (H-15). See [`BootMode`].
+    fn boot_with(
+        file_path: impl Into<PathBuf>,
+        author_id: String,
+        mode: BootMode,
+    ) -> Result<Self, ServiceError> {
         let file_path = file_path.into();
         let journal_path = crate::journal::journal_path_for(&file_path);
 
-        // Read or create the file.
-        let content = if file_path.exists() {
-            read_ledger_file(&file_path)?
-        } else {
-            // Create parent dirs + empty file (§3.3).
-            if let Some(parent) = file_path.parent() {
-                std::fs::create_dir_all(parent)?;
+        // Read the file, or — on a process start with nothing beside it —
+        // create it.
+        //
+        // H-15: an absent file is created in exactly one case, a fresh start
+        // with no journal. A reload never creates it (the service being
+        // recovered had one; recreating it empty and installing that over
+        // memory was the finding), and a fresh start next to a journal refuses
+        // too: a journal exists only beside a `.bean` past the compaction
+        // threshold, so this is a ledger whose `.bean` was removed or renamed,
+        // and an empty file here would silently fold the journal's records
+        // into a ledger holding nothing else.
+        let content = match std::fs::metadata(&file_path) {
+            Ok(_) => read_ledger_file(&file_path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let journal_exists = journal_path.exists();
+                match mode {
+                    BootMode::Reload => {
+                        return Err(ServiceError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!(
+                                "ledger file {} is missing (journal {}: {}); refusing to rebuild \
+                                 an empty ledger over the one in memory during a failed-commit \
+                                 recovery — restore the .bean, the next commit recreates it from \
+                                 memory otherwise (H-15)",
+                                file_path.display(),
+                                journal_path.display(),
+                                if journal_exists { "present" } else { "absent" },
+                            ),
+                        )));
+                    }
+                    BootMode::Fresh if journal_exists => {
+                        return Err(ServiceError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!(
+                                "ledger file {} is missing but its commit journal {} exists; \
+                                 refusing to start an empty ledger beside a journal that belonged \
+                                 to one — restore the .bean, or move the journal away to start a \
+                                 new ledger deliberately (H-15)",
+                                file_path.display(),
+                                journal_path.display(),
+                            ),
+                        )));
+                    }
+                    BootMode::Fresh => {
+                        // Create parent dirs + empty file (§3.3).
+                        if let Some(parent) = file_path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        persist_atomically(&file_path, "")?;
+                        String::new()
+                    }
+                }
             }
-            persist_atomically(&file_path, "")?;
-            String::new()
+            Err(error) => return Err(ServiceError::Io(error)),
         };
         let canonical_bytes = content.len() as u64;
         let canonical_marker = FileMarker::of(&file_path);
 
-        // T44 invariant 5: the journal's budget is whatever `MAX_LEDGER_FILE_BYTES`
-        // has left after the canonical file, so canonical ∪ journal — and hence
-        // the file a compaction would write — is bounded by the same constant
-        // that has always bounded the `.bean`.
-        let journal_budget = MAX_LEDGER_FILE_BYTES.saturating_sub(canonical_bytes);
+        // M-35: the journal is read under the full `MAX_LEDGER_FILE_BYTES`, not
+        // under what the canonical file leaves of it. T44 invariant 5 —
+        // canonical ∪ journal fits the cap — is enforced where the bytes are
+        // produced: the append path projects `canonical + journal + record`
+        // before every append, and `persist_atomically` refuses to write a
+        // compacted file over the cap. Budgeting the journal at `MAX −
+        // canonical` here as well turned a crash between the compaction's
+        // rename and its `remove_journal` into a boot brick: the new `.bean`
+        // is ≈ canonical + journal, so the post-crash state is
+        // `canonical + 2·journal`, over the old budget on a journal the new
+        // `.bean` already contains in full. Reading it costs one dedup pass
+        // through the G-Set; the compaction that follows rewrites nothing
+        // larger than it would have anyway.
+        let journal_budget = MAX_LEDGER_FILE_BYTES;
         let scan = crate::journal::read_journal(&journal_path, journal_budget)?;
         if scan.torn_tail_bytes > 0 {
             warn!(
@@ -2069,24 +2512,24 @@ impl LedgerService {
         // Build account state and insert into DAG.
         let mut accounts = AccountState::new();
         let mut dag = LedgerDag::new();
-        let mut max_lamport: u64 = 0;
+        // M-18 / T63: the highest Lamport value this node's clock must resume
+        // above, and the author of the directive that carries it (named in the
+        // H-12 boot warning). See `BootLamportHigh` for which directives count.
+        let mut lamport_high = BootLamportHigh::default();
         // H-08: every directive this loop refuses, so the next compaction can
         // write it back instead of deleting it. See `LedgerService::quarantined`
         // for why a skip that reaches a rewrite destroys the record.
         let mut quarantined: BTreeMap<String, Directive> = BTreeMap::new();
+        // H-13: directives with no envelope at all — operator input, adopted
+        // through the reconcile path once the history below is in place, in
+        // this same canonical order. See `LedgerService::unsigned_operator_input`.
+        let mut operator_input: Vec<Directive> = Vec::new();
 
         for directive in &sorted {
-            // Track max Lamport across all directives (M-18).
-            //
-            // `stamp_directive_envelope` stamps `openledger-lamport` on opens
-            // and closes too, so scanning transactions alone lets a restart
-            // resume *below* the highest value already persisted — the next
-            // mutation would then sign and persist a duplicate
-            // `(author, lamport)` pair and move the clock backwards relative
-            // to history.
-            if let Some(lamport) = directive.lamport_clock() {
-                max_lamport = max_lamport.max(lamport);
-            }
+            // M-18 / T63: the clock is folded at each FATE below, not here.
+            // Every directive that reaches the DAG counts; a directive that
+            // does not (quarantined, or a duplicate body) counts only when it is
+            // this node's own — see `BootLamportHigh`.
 
             // Insert into DAG (lenient mode: parents may not be present yet),
             // then record any lifecycle event it carries under the content id
@@ -2111,9 +2554,26 @@ impl LedgerService {
             if !cycle_blocked.is_empty() && matches!(directive, Directive::Transaction(_)) {
                 let content_id = compute_content_id(directive);
                 if cycle_blocked.contains(&content_id) {
+                    lamport_high.note_if_own(directive, &author_id);
                     quarantined.insert(content_id, (*directive).clone());
                     continue;
                 }
+            }
+
+            // H-13: no author AND no lamport means no node wrote this — it is
+            // operator input, not history, and history's tolerant load below
+            // is the wrong path for it: that path applies no lifecycle rule,
+            // no body cap, no stamp and no signature, which is exactly how a
+            // hand-typed record became an envelope-less, peer-refused parent
+            // of everything this node authored afterwards. Parked here, in
+            // canonical order, and adopted after the history loop so its
+            // parents are the heads of the whole ledger, as a live append's
+            // would be. After the cycle scan on purpose: a hand-written
+            // `openledger-parents` that closes a cycle is quarantined with its
+            // partner (M-38's union), never adopted.
+            if Self::is_operator_input(directive) {
+                operator_input.push((*directive).clone());
+                continue;
             }
 
             // T41: `MAX_PARENTS` applied at the FILE ingress, tolerantly.
@@ -2157,12 +2617,22 @@ impl LedgerService {
             //   the residual it leaves.
             // * [`LAMPORT_CEILING`]. T46 owns that bound and deliberately chose
             //   warn-and-load at boot, so a poisoned clock stops *authoring*
-            //   loudly while reads, reports and the file stay intact.
-            //   Re-deciding it here would also buy nothing: `max_lamport` above
-            //   is scanned before every skip in this loop, so a quarantined
-            //   directive still carries its value into the clock.
+            //   loudly while reads, reports and the file stay intact. Since
+            //   T63 a directive quarantined here no longer feeds the clock
+            //   unless it is this node's own (`BootLamportHigh`), so a
+            //   quarantined FOREIGN value cannot poison authoring either.
             if let Err(error) = validate_parent_fan_in(directive)
                 .and_then(|()| validate_file_envelope_form(directive))
+                // H-17 (T65): the amount cap as a directive-level quarantine
+                // arm too, so an over-cap amount stays out of the DAG even if
+                // the parser's own check is ever loosened.
+                .and_then(|()| {
+                    crate::validate::check_directive_amounts(directive).map_err(|error| {
+                        ServiceError::ResourceLimitExceeded {
+                            message: error.to_string(),
+                        }
+                    })
+                })
             {
                 let content_id = compute_content_id(directive);
                 warn!(
@@ -2173,6 +2643,7 @@ impl LedgerService {
                      kept in the file, kept out of the DAG; the rest of the file still loads \
                      (H-08, M-20)"
                 );
+                lamport_high.note_if_own(directive, &author_id);
                 quarantined.insert(content_id, (*directive).clone());
                 continue;
             }
@@ -2199,42 +2670,71 @@ impl LedgerService {
                         "quarantining a directive the DAG refused at boot — kept in the file, \
                          kept out of the DAG; the rest of the file still loads (H-08)"
                     );
+                    lamport_high.note_if_own(directive, &author_id);
                     quarantined.insert(content_id, (*directive).clone());
                     continue;
                 }
             };
             match insert_result {
                 InsertResult::Inserted { content_id } => {
+                    lamport_high.note(directive);
                     accounts.record_lifecycle(directive, &content_id);
                 }
                 // A duplicate body is the same directive: its event is already
-                // recorded, under the same content id.
-                InsertResult::Duplicate { .. } => {}
+                // recorded, under the same content id. Its ENVELOPE is not in
+                // the DAG, so its lamport counts only if it is this node's own
+                // pair (T63; see `BootLamportHigh`).
+                InsertResult::Duplicate { .. } => {
+                    lamport_high.note_if_own(directive, &author_id);
+                }
             }
         }
 
+        let max_lamport = lamport_high.value;
         let lamport_clock = if max_lamport > 0 {
             max_lamport.saturating_add(1)
         } else {
             0
         };
 
-        // H-07: nothing this node stamps or adopts can reach `LAMPORT_CEILING`,
-        // so a file that re-derives a clock at or above it was hand-edited, or
-        // written before T46 by a node a peer had already poisoned. Boot does
-        // not clamp — walking the clock backwards would re-issue
-        // `(author, lamport)` pairs the file already contains, the one thing
-        // M-18 forbids — and it does not refuse to boot either: the ledger still
-        // reads, reports and replicates correctly, and only *authoring* stops,
-        // loudly, at the stamp sites. Say it here so the operator learns it at
-        // boot rather than from the first refused mutation.
-        if lamport_clock >= LAMPORT_CEILING {
+        // H-07 / H-12: warn exactly when the stamp site is going to refuse —
+        // the SAME predicate, applied to the value this node would stamp next
+        // (`lamport_clock + 1`). Before T63 this tested `lamport_clock >=
+        // LAMPORT_CEILING` while the stamp refused one step earlier, so the
+        // state a peer can actually reach (a legal directive at `CEILING - 2`,
+        // clock `CEILING - 1`) booted with zero WARN lines and the operator
+        // learnt of it from the first refused mutation (H-12 fact 1). Boot
+        // still neither clamps (walking the clock backwards would re-issue
+        // `(author, lamport)` pairs the file already holds — M-18) nor refuses
+        // to boot: reads, reports and replication carry on; only authoring
+        // stops, loudly, at the stamp sites.
+        if !lamport_value_is_legal(lamport_clock.saturating_add(1)) {
             warn!(
                 lamport_clock,
                 ceiling = LAMPORT_CEILING,
+                author = lamport_high.author.as_deref().unwrap_or("(unknown)"),
                 file = %file_path.display(),
-                "ledger file carries an openledger-lamport at or above the ceiling; this node \
-                 will refuse to author new directives until that directive is removed (H-07)"
+                "ledger file carries an openledger-lamport at the Lamport ceiling; this node \
+                 will refuse to author new directives. The directive was carried in by the \
+                 author named here. Remedy, mesh-wide: remove that author from the allowlist \
+                 on every node, then stop every node and remove the directive from each \
+                 node's .bean — removing it here alone is undone by the next anti-entropy \
+                 round (H-07, H-12)"
+            );
+        } else if LAMPORT_CEILING - lamport_clock <= MAX_LAMPORT_ADVANCE {
+            // T63: the ratchet bounds one step at 2^32, so a clock this close
+            // to the ceiling is one ordinary-looking peer directive away from
+            // the state above. Honest clocks are nowhere near here; say so
+            // while the node can still author.
+            warn!(
+                lamport_clock,
+                ceiling = LAMPORT_CEILING,
+                max_advance = MAX_LAMPORT_ADVANCE,
+                author = lamport_high.author.as_deref().unwrap_or("(unknown)"),
+                file = %file_path.display(),
+                "ledger clock is within one adoption step (2^32) of the Lamport ceiling; no \
+                 honest mesh gets here, and one more peer directive can stop authoring on \
+                 this node. Investigate the author named here (H-12)"
             );
         }
 
@@ -2265,7 +2765,7 @@ impl LedgerService {
         let all_directives: Vec<Directive> = dag.directives().into_iter().cloned().collect();
         let read_model = ReadModel::build(&all_directives);
 
-        Ok(LedgerService {
+        let mut service = LedgerService {
             dag,
             accounts,
             read_model,
@@ -2288,9 +2788,11 @@ impl LedgerService {
             // artefact a human edits.
             last_file_hash: file_content_hash(&content),
             external_reconcile_count: 0,
-            // L-11: installed by the node after the key is loaded; boot itself
-            // adopts nothing, it only loads what is already persisted.
+            // L-11: installed by the node after the key is loaded. H-13: which
+            // is why the operator input adopted below is signed later, by
+            // `finalize_operator_input`, and tracked here until then.
             signer: None,
+            unsigned_operator_input: Vec::new(),
             journal_path,
             canonical_bytes,
             canonical_marker,
@@ -2313,7 +2815,176 @@ impl LedgerService {
             commit_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             commit_observer: None,
             directive_id_snapshot: std::sync::Mutex::new(None),
-        })
+        };
+
+        // H-13: adopt the operator input, now that the whole history is in
+        // place. Same path as a live hand edit, same order boot itself used.
+        service.adopt_operator_input_at_boot(operator_input);
+
+        Ok(service)
+    }
+
+    /// Is this file directive operator input rather than node-written history?
+    /// (H-13) — see [`Self::unsigned_operator_input`] for why "neither key"
+    /// is the exact test.
+    fn is_operator_input(directive: &Directive) -> bool {
+        let metadata = directive.metadata();
+        !metadata.contains_key(ENVELOPE_KEY_AUTHOR) && !metadata.contains_key(ENVELOPE_KEY_LAMPORT)
+    }
+
+    /// The second half of [`Self::boot`] (H-13): adopt the envelope-less
+    /// directives the load loop parked, through [`Self::adopt_file_directive`].
+    ///
+    /// Runs on the constructed service so that the adoption sees the complete
+    /// history — the parents it stamps are `heads_admissible_as_parents_of`
+    /// over the whole ledger, and a hand-typed transaction is validated
+    /// against every open the file holds, hand-typed opens earlier in
+    /// canonical order included (the input arrives in boot's sorted order).
+    ///
+    /// A refusal is quarantined, not dropped. The live reconcile drops what it
+    /// refuses because the operator is at the keyboard and the L-12 warning
+    /// tells them what went; boot's contract is that it destroys nothing it
+    /// read (H-08), so the raw block stays in the file, out of the DAG, named
+    /// in the banner, until the operator repairs it and restarts. A refused
+    /// entry is quarantined as the FILE spelled it — never a half-stamped
+    /// copy, which the next boot would mistake for history.
+    ///
+    /// Everything adopted is recorded in [`Self::unsigned_operator_input`]
+    /// under its *stored* id (which differs from the file's content id when I2
+    /// resolved an elided posting) and forces the next commit to be a
+    /// compaction: the file spells these records raw, and only a rewrite gives
+    /// them their envelope.
+    fn adopt_operator_input_at_boot(&mut self, operator_input: Vec<Directive>) {
+        if operator_input.is_empty() {
+            return;
+        }
+        let mut tally = AdoptionTally::default();
+        for directive in operator_input {
+            let content_id = compute_content_id(&directive);
+            if self.dag.get(&content_id).is_some() {
+                tally.duplicates += 1;
+                continue;
+            }
+            // Kept as the file spelled it, for the quarantine on refusal.
+            let as_written = directive.clone();
+            match self.adopt_file_directive(directive, content_id.clone(), &mut tally) {
+                FileAdoption::Inserted(stored_id) => {
+                    self.unsigned_operator_input.push(stored_id);
+                }
+                FileAdoption::Duplicate => {}
+                FileAdoption::Refused => {
+                    self.quarantined.entry(content_id).or_insert(as_written);
+                }
+            }
+        }
+        if !self.unsigned_operator_input.is_empty() {
+            // The file holds these raw; the rewrite is what canonicalises them.
+            self.force_compaction = true;
+            info!(
+                adopted = self.unsigned_operator_input.len(),
+                duplicates = tally.duplicates,
+                author = %self.author_id,
+                file = %self.file_path.display(),
+                "ledger file holds directives with no openledger envelope; adopted as OPERATOR \
+                 INPUT — this node's author, lamport and parents stamped — and signed once the \
+                 node key is installed, before the first compaction canonicalises them (H-13)"
+            );
+        }
+        if !tally.rejections.is_empty() {
+            warn!(
+                refused = tally.rejections.len(),
+                entries = %tally
+                    .rejections
+                    .iter()
+                    .map(|(id, reason)| format!("{id}: {reason}"))
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+                file = %self.file_path.display(),
+                "ledger file holds operator input this node refuses to adopt; the entries are \
+                 QUARANTINED — kept in the file as written, kept out of the DAG, NOT served — \
+                 stop the node, repair them, and restart (H-13, H-08)"
+            );
+        }
+    }
+
+    /// Give every directive [`Self::boot`] adopted as operator input its
+    /// final envelope: this node's author id and, when a signer is installed,
+    /// its signature (H-13).
+    ///
+    /// Call it after [`Self::set_author_id`] and [`Self::set_signer`] and
+    /// before the first compaction — `gl-node` does exactly that, and
+    /// [`Self::prepare`] does it for any compaction a library caller reaches
+    /// first. Idempotent and cheap: the set is drained, so a second call does
+    /// nothing, and an empty set costs one `is_empty`.
+    ///
+    /// # What it may and may not change
+    ///
+    /// * `openledger-author` — overwritten with the current author id. Boot
+    ///   stamped whatever author it was booted with (`gl-node` boots with a
+    ///   placeholder and learns its `EndpointId` from the P2P layer
+    ///   afterwards), and only ids this node itself stamped are tracked here,
+    ///   so no foreign author is ever rewritten.
+    /// * `openledger-signature` — added, never replaced, and only when a
+    ///   signer is installed. Without one the entry stays unsigned, which is
+    ///   precisely what [`Self::reconcile_content`] does without a signer.
+    /// * Nothing else. Parents and lamport are the DAG's edges and this
+    ///   node's clock and were fixed at boot; the signed message is built
+    ///   from them exactly as `sign_adopted_entry` builds it.
+    ///
+    /// An in-place edit of a directive that is on disk in raw form cannot be
+    /// expressed by an append (the G-Set drops a journal record whose id it
+    /// already holds — the same argument as [`Self::stamp_signature`]), so
+    /// the next commit is forced to be a compaction. Returns how many entries
+    /// were finalised.
+    pub fn finalize_operator_input(&mut self) -> usize {
+        if self.unsigned_operator_input.is_empty() {
+            return 0;
+        }
+        let ids = std::mem::take(&mut self.unsigned_operator_input);
+        let author_id = self.author_id.clone();
+        let signer = self.signer.clone();
+        let mut finalized = 0usize;
+        let mut signed = 0usize;
+        for content_id in &ids {
+            let Some(directive) = self.dag.get_mut(content_id) else {
+                continue;
+            };
+            let is_transaction = matches!(directive, Directive::Transaction(_));
+            let metadata = directive_metadata_mut(directive);
+            metadata.insert(ENVELOPE_KEY_AUTHOR.to_owned(), author_id.clone());
+            finalized += 1;
+            if metadata.contains_key(ENVELOPE_KEY_SIGNATURE) {
+                continue;
+            }
+            let Some(signer) = signer.as_ref() else {
+                continue;
+            };
+            let (parents, lamport) = Self::envelope_parents_and_lamport(metadata);
+            let (parents, lamport) = (parents.to_owned(), lamport.to_owned());
+            if let Some(signature_hex) = signer(content_id, is_transaction, &parents, &lamport) {
+                metadata.insert(ENVELOPE_KEY_SIGNATURE.to_owned(), signature_hex);
+                signed += 1;
+            }
+        }
+        // The raw spellings on disk have to be replaced whether or not a
+        // signature was produced: the author and the stamp boot added are in
+        // memory only until a rewrite.
+        self.force_compaction = true;
+        info!(
+            finalized,
+            signed,
+            signer_installed = signer.is_some(),
+            author = %author_id,
+            "operator input adopted at boot now carries this node's identity (H-13)"
+        );
+        finalized
+    }
+
+    /// How many boot-adopted operator-input directives still await
+    /// [`Self::finalize_operator_input`] (H-13). Zero on every node-written
+    /// file, and zero again once finalised.
+    pub fn unsigned_operator_input_count(&self) -> usize {
+        self.unsigned_operator_input.len()
     }
 
     // ── Mutations ────────────────────────────────────────────────────────
@@ -2474,8 +3145,17 @@ impl LedgerService {
                 .insert(ENVELOPE_KEY_SIGNATURE.to_owned(), signature_hex);
         }
 
-        // Insert into DAG.
+        // T64 / H-16: the fan-in cap every peer applies, as an invariant on the
+        // local insert. `choose_parents` already names at most `MAX_PARENTS`,
+        // so this cannot fire today; it is here because the only fan-in check
+        // this path used to reach was the FILE one at the next boot, which is
+        // how an over-cap append was accepted locally, refused everywhere, and
+        // then quarantined out of this node's own DAG. A refusal here has moved
+        // the clock by one unused value, which is harmless: gaps never collide.
         let directive = Directive::Transaction(resolved);
+        validate_parent_fan_in(&directive)?;
+
+        // Insert into DAG.
         let content_id = match self.dag.insert(directive.clone(), false)? {
             InsertResult::Inserted { content_id } => content_id,
             InsertResult::Duplicate { content_id } => {
@@ -2716,37 +3396,91 @@ impl LedgerService {
     /// Writes only keys from [`ENVELOPE_KEYS`] — the closed set every ingest
     /// path enforces.
     ///
-    /// Refuses — rather than saturating — when the next value would reach
-    /// [`LAMPORT_CEILING`] (H-07). A directive stamped at or above the cap is
+    /// Refuses — rather than saturating — when the value to be stamped is not
+    /// legal under [`lamport_value_is_legal`] (H-07, H-12): the largest value
+    /// this node stamps is `LAMPORT_CEILING - 2`, the largest every peer's wire
+    /// check and every peer's adoption accept. A directive stamped past that is
     /// not a degraded write, it is an invisible one: this node would return
     /// success while every peer refused the result forever. The caller is told
     /// at the point of writing instead. The check runs before any mutation, so
     /// a refusal leaves the clock and the metadata exactly as they were — the
     /// same rejection-ordering rule H-04 and L-02 follow.
     ///
-    /// `content_id` is the id the transaction will be stored under: parents
-    /// are the current heads MINUS any head that already descends from that id
-    /// through a dangling `openledger-parents` (L-40) — see
-    /// [`LedgerDag::heads_admissible_as_parents_of`]. On every honest ledger
-    /// that is all the heads, exactly as before.
+    /// `content_id` is the id the transaction will be stored under; parents are
+    /// chosen by [`Self::choose_parents`] (L-40, and at most [`MAX_PARENTS`] of
+    /// them since T64).
     fn stamp_transaction_envelope(
         &mut self,
         metadata: &mut Metadata,
         content_id: &str,
     ) -> Result<(), ServiceError> {
-        self.lamport_clock = checked_lamport(self.lamport_clock.saturating_add(1))?;
+        let parents = self.choose_parents(content_id);
+        self.lamport_clock = self.next_stamp()?;
         metadata.insert(ENVELOPE_KEY_AUTHOR.to_owned(), self.author_id.clone());
         metadata.insert(
             ENVELOPE_KEY_LAMPORT.to_owned(),
             self.lamport_clock.to_string(),
         );
-
-        // Parents: current DAG heads, sorted ascending (§3.3.1) — the ones this
-        // transaction can name without closing a cycle (L-40).
-        let mut parents: Vec<&str> = self.dag.heads_admissible_as_parents_of(content_id);
-        parents.sort();
-        metadata.insert(ENVELOPE_KEY_PARENTS.to_owned(), parents.join(","));
+        metadata.insert(ENVELOPE_KEY_PARENTS.to_owned(), parents);
         Ok(())
+    }
+
+    /// The `openledger-parents` value for a transaction this node stamps, whose
+    /// content id will be `content_id` (§3.3.1, L-40, T64 / H-16).
+    ///
+    /// The current heads this transaction can name without closing a cycle
+    /// ([`LedgerDag::heads_admissible_as_parents_of`]), sorted ascending, and —
+    /// since T64 — **at most [`MAX_PARENTS`] of them, the lexicographically
+    /// smallest**. The rest stay heads and are merged by later appends.
+    ///
+    /// Before T64 this named every admissible head. One allowlisted peer
+    /// sending 257 valid parentless transactions therefore made the victim's
+    /// next append name 257 parents: it returned success, was refused by every
+    /// peer (`openledger-parents has 257 entries`), and was quarantined out of
+    /// the victim's own DAG at its next boot — its own posting gone from its
+    /// own balances — while the planted heads stayed heads, so it happened
+    /// again. Naming fewer parents loses nothing: parents record what the
+    /// author had seen, and any subset of the heads is a valid, acyclic choice
+    /// (a subset of an admissible set is admissible). Smallest-first makes the
+    /// choice deterministic, so two replicas holding the same heads name the
+    /// same parents.
+    ///
+    /// Shared by every site that stamps parents — the local append and the file
+    /// path's adoption of a parentless operator entry — so they cannot drift.
+    fn choose_parents(&self, content_id: &str) -> String {
+        let mut parents: Vec<&str> = self.dag.heads_admissible_as_parents_of(content_id);
+        parents.sort_unstable();
+        parents.truncate(MAX_PARENTS);
+        parents.join(",")
+    }
+
+    /// The value this node stamps next, checked against the one Lamport rule
+    /// (H-07, H-12) — see [`checked_lamport`].
+    ///
+    /// On a refusal the error names the author of the highest-lamport
+    /// directive this node holds (DAG or quarantine): that is the directive
+    /// that carried the clock to the ceiling, and its author is the first thing
+    /// the mesh-wide remedy needs. Found by a scan, on the refusal path only —
+    /// a node that reaches it can no longer author, so the scan costs nothing
+    /// that matters, and no extra state has to survive reloads.
+    fn next_stamp(&self) -> Result<u64, ServiceError> {
+        let next = self.lamport_clock.saturating_add(1);
+        checked_lamport(next, None).map_err(|_| ServiceError::LamportCeiling {
+            next,
+            author: self.highest_lamport_author(),
+        })
+    }
+
+    /// Author of the highest-lamport directive this node holds, in the DAG or
+    /// in the quarantine (H-12 diagnostics; refusal path only).
+    fn highest_lamport_author(&self) -> Option<String> {
+        self.dag
+            .directives()
+            .into_iter()
+            .chain(self.quarantined.values())
+            .filter_map(|directive| Some((directive.lamport_clock()?, directive)))
+            .max_by_key(|(lamport, _)| *lamport)
+            .and_then(|(_, directive)| directive_author(directive).map(str::to_owned))
     }
 
     /// Stamp non-transaction directive envelope (author + lamport, no parents).
@@ -2756,7 +3490,7 @@ impl LedgerService {
     /// (H-07) — opens, closes and every other kind are stamped from the same
     /// clock and are refused by peers on the same bound.
     fn stamp_directive_envelope(&mut self, metadata: &mut Metadata) -> Result<(), ServiceError> {
-        self.lamport_clock = checked_lamport(self.lamport_clock.saturating_add(1))?;
+        self.lamport_clock = self.next_stamp()?;
         metadata.insert(ENVELOPE_KEY_AUTHOR.to_owned(), self.author_id.clone());
         metadata.insert(
             ENVELOPE_KEY_LAMPORT.to_owned(),
@@ -2963,6 +3697,13 @@ impl LedgerService {
         }
 
         let (kind, canonical, record) = if compact {
+            // H-13: operator input boot adopted must carry its final envelope
+            // before the rewrite that puts it on disk canonically. `gl-node`
+            // has already done this by the time it compacts; this is the
+            // library caller's path, where a service with no signer installed
+            // writes the entries unsigned — as a reconcile without a signer
+            // always has. A no-op once the set is drained.
+            self.finalize_operator_input();
             // L-30 / L-12: this is the write that would erase a hand edit, so
             // this is where the exact check belongs — re-read, re-hash, and
             // reconcile the edit in before serializing over it.
@@ -3324,6 +4065,37 @@ impl LedgerService {
     /// and the reload is redone here, synchronously, against the files as they
     /// are *now*: exactly the pre-L-43 behaviour, reached only by a caller that
     /// broke the contract, and logged as such.
+    ///
+    /// # A reload never installs an emptier ledger (H-15)
+    ///
+    /// The rebuild is refused — memory kept, the refusal logged with both
+    /// counts — when it holds **fewer directives than
+    /// `dag.len() − pending_ids.len()`**. That floor, not `dag.len()`, is the
+    /// exact statement of what a failed commit may legitimately have left
+    /// behind: the staged batch (`pending_ids`) was never on disk, so a
+    /// faithful rebuild is short by exactly it and no more. A rebuild short by
+    /// *more* than the staged batch means the files lost something memory
+    /// still has — the `.bean` removed or renamed under the node (the case
+    /// that used to reload an empty file over the complete DAG), truncated,
+    /// or hand-edited down — and installing it would turn a disk incident
+    /// into an acknowledged-write loss. Refusing leaves memory ahead of disk
+    /// by design; `force_compaction` is set so the next commit is a full
+    /// rewrite that puts every in-memory directive back on disk (and removes
+    /// a journal whose tail the failed commit may have torn — the reload that
+    /// would have detected that tail is the one being refused).
+    ///
+    /// There is deliberately no "install it anyway" argument: the only
+    /// wholesale reload in this workspace is this L-13 recovery, and no
+    /// caller of it ever wants less than it has. A count is compared, not
+    /// content — the DAG is grow-only between reloads (L-43's argument), so a
+    /// rebuild with at least the floor's directives holds every id memory
+    /// holds minus, at most, the staged ones.
+    ///
+    /// Every installed reload logs the before/after directive counts. And
+    /// once installed, the rebuild's operator input (H-13; re-derived from the
+    /// file, which still spells it raw until a compaction succeeds) is
+    /// finalised with the carried signer, so the caller's next commit writes
+    /// it signed.
     pub fn finish_recovery(
         &mut self,
         reload: RecoveryReload,
@@ -3338,13 +4110,48 @@ impl LedgerService {
                  discarding the stale rebuild and reloading synchronously. The single-writer \
                  contract on LedgerService::commit_gate was violated (L-43)"
             );
-            LedgerService::boot(self.file_path.clone(), self.author_id.clone())
+            LedgerService::boot_with(
+                self.file_path.clone(),
+                self.author_id.clone(),
+                BootMode::Reload,
+            )
         };
         match reloaded {
-            Ok(reloaded) => self.adopt_reloaded(reloaded),
+            Ok(reloaded) => {
+                let in_memory = self.dag.len();
+                let staged = self.pending_ids.len();
+                let on_disk = reloaded.dag.len();
+                let floor = in_memory.saturating_sub(staged);
+                if on_disk < floor {
+                    error!(
+                        in_memory,
+                        staged,
+                        on_disk,
+                        floor,
+                        file = %self.file_path.display(),
+                        "REFUSING to install an L-13 rebuild that holds fewer directives than \
+                         memory minus the staged batch: the files lost records memory still \
+                         holds. Memory is kept, ahead of disk; the next commit is a full rewrite \
+                         that puts every in-memory directive back on disk (H-15)"
+                    );
+                    self.force_compaction = true;
+                    return;
+                }
+                warn!(
+                    before = in_memory,
+                    after = on_disk,
+                    discarded_staged = staged,
+                    file = %self.file_path.display(),
+                    "L-13 reload installed: memory rebuilt from disk after a failed commit"
+                );
+                self.adopt_reloaded(reloaded);
+                self.finalize_operator_input();
+            }
             Err(reload_error) => {
                 error!(
                     %reload_error,
+                    in_memory = self.dag.len(),
+                    staged = self.pending_ids.len(),
                     "ledger reload-from-disk failed after a failed commit; in-memory state may be \
                      ahead of disk (L-13)"
                 );
@@ -3363,6 +4170,7 @@ impl LedgerService {
             quarantined_text: self.quarantined_text.len(),
             external_reconcile_count: self.external_reconcile_count,
             force_compaction: self.force_compaction,
+            unsigned_operator_input: self.unsigned_operator_input.len(),
         }
     }
 
@@ -3431,6 +4239,20 @@ impl LedgerService {
     /// "deleted records come back" one. `file_path` is configuration too, and
     /// is carried by construction — [`Self::begin_recovery`] passes it into
     /// `boot`, and `journal_path` is re-derived from the same path.
+    ///
+    /// # One file-shape fact IS carried, conditionally (L-64)
+    ///
+    /// `canonical_is_current` is a statement about the bytes on disk — "the
+    /// `.bean` holds exactly what this service would write" — and `boot`
+    /// answers it `false` because boot did not write the file. After a
+    /// reload that made *every* later write a forced compaction, appends that
+    /// would have fit included, and on a ledger whose canonical spelling is
+    /// over the cap each of those compactions failed and reloaded again: a
+    /// wedge entered by one failed append. But the reload has just hashed the
+    /// bytes it read, and this service knows the hash of the bytes it last
+    /// wrote; when the two agree the file is exactly as canonical as it was
+    /// before the reload, so the flag is kept. Any other case (the file
+    /// changed, or was never canonical) keeps boot's `false`.
     fn adopt_reloaded(&mut self, reloaded: LedgerService) {
         // Moved out of the old `self` before the assignment drops it.
         let author_id = std::mem::take(&mut self.author_id);
@@ -3440,6 +4262,10 @@ impl LedgerService {
         let commit_in_flight = std::sync::Arc::clone(&self.commit_in_flight);
         let commit_observer = self.commit_observer.take();
         let commit_generation = self.commit_generation;
+        // L-64: the rebuild read the very bytes this service last wrote or
+        // read, so the file is as canonical as it was.
+        let canonical_is_current =
+            self.canonical_is_current && self.last_file_hash == reloaded.last_file_hash;
 
         *self = reloaded;
 
@@ -3450,6 +4276,7 @@ impl LedgerService {
         self.commit_in_flight = commit_in_flight;
         self.commit_observer = commit_observer;
         self.commit_generation = commit_generation;
+        self.canonical_is_current = canonical_is_current;
     }
 
     /// Adopt an out-of-band hand edit before a full-file persist overwrites it
@@ -3523,13 +4350,47 @@ impl LedgerService {
     /// file's size or mtime moves, so in practice an edit is still adopted at
     /// the very next write — what changed is only that the adoption is no
     /// longer *unconditionally* re-read on every single write.
+    ///
+    /// # An absent file is nothing to adopt (H-15)
+    ///
+    /// `rm`/`mv` of the `.bean` under a running node used to fail this read
+    /// with `NotFound`, which failed the prepare, which ran the L-13 reload,
+    /// which `boot`ed an **empty** file and installed it over the complete
+    /// in-memory ledger — the cheapest total loss in the series. There is
+    /// nothing on disk to adopt and nothing on disk to lose, so the answer is
+    /// `Ok` with a loud warning, and the compaction this call precedes
+    /// recreates the file from memory with every directive in it.
+    ///
+    /// # Baseline only what parsed (H-14)
+    ///
+    /// The `stat` marker and the byte count are re-baselined on the
+    /// identical-bytes path only. On a real edit [`Self::reconcile_content`]
+    /// records them — after the parse, together with the hash — so a file
+    /// that does not parse is re-detected as foreign by the very next
+    /// `prepare` instead of being mistaken for "what we last read".
     fn adopt_external_edits(&mut self) -> Result<(), ServiceError> {
-        let content = read_ledger_file(&self.file_path)?;
-        // Re-baseline the cheap probe from the same read, so an editor that
-        // merely touched the mtime does not escalate every later append.
-        self.canonical_marker = FileMarker::of(&self.file_path);
-        self.canonical_bytes = content.len() as u64;
+        let content = match read_ledger_file(&self.file_path) {
+            Ok(content) => content,
+            Err(ServiceError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                warn!(
+                    file = %self.file_path.display(),
+                    directives = self.dag.len(),
+                    "ledger file is MISSING on disk — removed or renamed while this node was \
+                     running. Nothing to adopt; the compaction that follows recreates it from \
+                     memory with every directive in it (H-15)"
+                );
+                self.canonical_marker = None;
+                self.canonical_bytes = 0;
+                self.canonical_is_current = false;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         if file_content_hash(&content) == self.last_file_hash {
+            // Re-baseline the cheap probe from the same read, so an editor that
+            // merely touched the mtime does not escalate every later append.
+            self.canonical_marker = FileMarker::of(&self.file_path);
+            self.canonical_bytes = content.len() as u64;
             return Ok(());
         }
 
@@ -3639,6 +4500,17 @@ impl LedgerService {
             // re-booting under it would discard state it is about to make
             // durable. Nothing was written, nothing is ahead of disk.
             Err(ServiceError::CommitInFlight) => return Err(ServiceError::CommitInFlight),
+            // M-37(a): a `.bean` that does not parse is refused by the
+            // adoption BEFORE anything about it is recorded (H-14), so the
+            // prepare left memory exactly as the caller staged it and the
+            // files untouched. Reloading here bought nothing and cost the
+            // finding: `boot` on that file loaded every parseable hand-typed
+            // block raw, bypassing every reconcile check and the signature.
+            // The write stays refused until the operator repairs the file;
+            // the staged batch stays in memory and is written by the first
+            // commit after the repair (see `prepare_or_recover` in `gl-node`
+            // for the same arm and the same argument).
+            Err(error @ ServiceError::Parse(_)) => return Err(error),
             Err(error) => error,
         };
 
@@ -3665,7 +4537,17 @@ impl LedgerService {
         // T44: a COMPACTION, not an append. Reconcile's output is a canonical
         // rewrite — it drops the entries it refused and re-spells everything
         // else — and neither of those is something a journal record can say.
-        if result.new_directives > 0 {
+        //
+        // M-37(b): on `rejected > 0` as well as `new_directives > 0`. The L-12
+        // warning says the canonical re-persist drops what was refused, and
+        // until this ran only on adoptions that was false for a rejected-ONLY
+        // edit: the entry stayed on disk and the next boot loaded it raw,
+        // without the I3 check that had just refused it. Quarantined entries
+        // are counted in `rejected` too and are NOT dropped by this rewrite
+        // (H-08's split) — the extra compaction on their account is harmless.
+        // And whenever the service already knows the file must be rewritten
+        // (`force_compaction` — e.g. the file vanished, H-15), do it now.
+        if result.new_directives > 0 || result.rejected > 0 || self.force_compaction {
             self.compact()?;
         }
 
@@ -3692,24 +4574,64 @@ impl LedgerService {
     /// The two entry points now carry the same guard in the same shape. The
     /// probe is re-baselined from this read either way, so an editor that
     /// merely touched the mtime does not escalate the next append.
+    ///
+    /// # H-14, H-15, M-37(b)
+    ///
+    /// The marker and byte count are re-baselined only on identical bytes;
+    /// on a real edit `reconcile_content` records them after the parse (H-14).
+    /// A file that is *gone* is nothing to reconcile: the next commit is
+    /// forced to be a compaction, which recreates it from memory (H-15). And
+    /// the forced compaction is armed on `rejected > 0` as well, so the
+    /// canonical re-persist the L-12 warning promises actually happens
+    /// (M-37(b); see [`Self::reconcile_file`]).
     pub fn reconcile_file_staged(
         &mut self,
     ) -> Result<crate::file_watcher::ReconcileResult, ServiceError> {
-        let content = read_ledger_file(&self.file_path)?;
-        self.canonical_marker = FileMarker::of(&self.file_path);
-        self.canonical_bytes = content.len() as u64;
+        let nothing = crate::file_watcher::ReconcileResult {
+            new_directives: 0,
+            duplicates: 0,
+            rejected: 0,
+        };
+        let content = match read_ledger_file(&self.file_path) {
+            Ok(content) => content,
+            Err(ServiceError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                warn!(
+                    file = %self.file_path.display(),
+                    directives = self.dag.len(),
+                    "ledger file is MISSING on disk — removed or renamed while this node was \
+                     running. Nothing to reconcile; the next commit is a full rewrite that \
+                     recreates it from memory with every directive in it (H-15)"
+                );
+                self.canonical_marker = None;
+                self.canonical_bytes = 0;
+                self.canonical_is_current = false;
+                self.force_compaction = true;
+                return Ok(nothing);
+            }
+            Err(error) => return Err(error),
+        };
         if file_content_hash(&content) == self.last_file_hash {
-            return Ok(crate::file_watcher::ReconcileResult {
-                new_directives: 0,
-                duplicates: 0,
-                rejected: 0,
-            });
+            self.canonical_marker = FileMarker::of(&self.file_path);
+            self.canonical_bytes = content.len() as u64;
+            return Ok(nothing);
         }
         let result = self.reconcile_content(&content)?;
-        if result.new_directives > 0 {
+        if result.new_directives > 0 || result.rejected > 0 {
             self.force_compaction = true;
         }
         Ok(result)
+    }
+
+    /// Does the service already know its next commit must be a full rewrite?
+    /// (T44's `force_compaction`, read-only.)
+    ///
+    /// For the node's file watcher, which drives the commit after
+    /// [`Self::reconcile_file_staged`] itself: a reconcile that adopted or
+    /// refused something arms this, and so does a reconcile that found the
+    /// file missing (H-15) — a case the watcher cannot see in the
+    /// `ReconcileResult`, which has nothing to count.
+    pub fn compaction_pending(&self) -> bool {
+        self.force_compaction
     }
 
     /// Is `hash` — lowercase-hex SHA-256 of the canonical file's bytes — the
@@ -3752,40 +4674,23 @@ impl LedgerService {
         &mut self,
         content: &str,
     ) -> Result<crate::file_watcher::ReconcileResult, ServiceError> {
-        // Record the hash of what we are about to merge from, before anything
-        // can fail: this text is now the baseline for the next persist's
-        // hand-edit check (L-30). T44: and the cheap `stat` probe's baseline
-        // too, so the facts this service holds about the canonical file are
-        // refreshed together and cannot drift.
         let content_hash = file_content_hash(content);
         // M-29: is this text the one this service itself last wrote (or read)?
         let is_own_bytes = content_hash == self.last_file_hash;
-        self.last_file_hash = content_hash;
-        self.canonical_bytes = content.len() as u64;
-        self.canonical_marker = FileMarker::of(&self.file_path);
-        // Whatever is on disk right now came from a text editor, not from this
-        // service's serializer: it needs canonicalising, not appending to.
-        //
-        // M-29: unless it did come from this service's serializer. The clear
-        // was unconditional, and `prepare` turns `canonical_is_current = false`
-        // into a forced rewrite — so ONE watcher tick over the node's own
-        // compaction output permanently demoted every subsequent commit from
-        // T44's `Append` to a full `Compact`, and each of those compactions
-        // rewrote the file, which the watcher saw, which cleared the flag
-        // again. A self-sustaining loop that turned the append-only path off
-        // for the life of the process, entered by the node writing its own
-        // file.
-        //
-        // Setting it, never clearing it, is the correct asymmetry: this
-        // function learns "the file is not canonical" but never learns "it is"
-        // — only a compaction this service performed knows that, and
-        // `finish_commit` is where it is recorded. So identical bytes leave the
-        // flag exactly as it was: still `false` after boot (which read a file
-        // it did not write), still `true` after a compaction.
-        if !is_own_bytes {
-            self.canonical_is_current = false;
-        }
 
+        // H-14: PARSE FIRST. Nothing about this text — not its hash, not its
+        // size, not its `stat` marker, not the canonical flag — is recorded
+        // until it is known to parse. These four used to be written above
+        // this point, so a file that then failed to parse became "what this
+        // service last read": the next commit of any kind saw an unchanged
+        // baseline, adopted nothing, and rewrote the file from memory over the
+        // operator's edit — valid lines included — after two log lines had
+        // said it was safe. Now a file that does not parse leaves every fact
+        // this service holds about the `.bean` untouched, so the very next
+        // `prepare` re-detects it as foreign, re-reads it, and refuses again:
+        // a broken hand edit blocks writes until it is repaired, which is what
+        // the documentation has always claimed.
+        //
         // L-45: the file this reconcile is reading contains, at its tail,
         // whatever boot could not parse — `compaction_text` puts it back on
         // every rewrite precisely so it is not lost. So `parse_file` over the
@@ -3810,17 +4715,11 @@ impl LedgerService {
         // directive and is no longer retained; one who deletes the block
         // outright is simply obeyed. Without this the next compaction would
         // splice the stale broken text back in underneath the repaired copy.
-        let file_directives = match parse_file(content) {
-            Ok(directives) => {
-                // Everything parses: nothing is being held back any more.
-                self.quarantined_text.clear();
-                directives
-            }
+        let (file_directives, retained_text) = match parse_file(content) {
+            // Everything parses: nothing is being held back any more.
+            Ok(directives) => (directives, BTreeSet::new()),
             Err(errors) => match self.parse_around_quarantined_text(content) {
-                Some((directives, retained)) => {
-                    self.quarantined_text = retained;
-                    directives
-                }
+                Some((directives, retained)) => (directives, retained),
                 None => {
                     warn!(
                         file = %self.file_path.display(),
@@ -3833,6 +4732,37 @@ impl LedgerService {
             },
         };
 
+        // The text parsed: it is now the baseline for the next persist's
+        // hand-edit check (L-30). T44: and the cheap `stat` probe's baseline
+        // too, so the facts this service holds about the canonical file are
+        // refreshed together and cannot drift.
+        self.last_file_hash = content_hash;
+        self.canonical_bytes = content.len() as u64;
+        self.canonical_marker = FileMarker::of(&self.file_path);
+        self.quarantined_text = retained_text;
+        // Whatever is on disk right now came from a text editor, not from this
+        // service's serializer: it needs canonicalising, not appending to.
+        //
+        // M-29: unless it did come from this service's serializer. The clear
+        // was unconditional, and `prepare` turns `canonical_is_current = false`
+        // into a forced rewrite — so ONE watcher tick over the node's own
+        // compaction output permanently demoted every subsequent commit from
+        // T44's `Append` to a full `Compact`, and each of those compactions
+        // rewrote the file, which the watcher saw, which cleared the flag
+        // again. A self-sustaining loop that turned the append-only path off
+        // for the life of the process, entered by the node writing its own
+        // file.
+        //
+        // Setting it, never clearing it, is the correct asymmetry: this
+        // function learns "the file is not canonical" but never learns "it is"
+        // — only a compaction this service performed knows that, and
+        // `finish_commit` is where it is recorded. So identical bytes leave the
+        // flag exactly as it was: still `false` after boot (which read a file
+        // it did not write), still `true` after a compaction.
+        if !is_own_bytes {
+            self.canonical_is_current = false;
+        }
+
         // L-12: canonical order, like boot. Stable, so equal keys keep file order.
         let mut file_directives = file_directives;
         file_directives.sort_by(|a, b| {
@@ -3841,287 +4771,54 @@ impl LedgerService {
                 .then_with(|| a.type_priority().cmp(&b.type_priority()))
         });
 
-        let mut new_count = 0;
-        let mut dup_count = 0;
-        let mut rejected = 0;
-        // (content id, reason) for every entry this reconcile refuses — logged
-        // below, because the canonical re-persist drops them from the file.
-        let mut rejections: Vec<(String, String)> = Vec::new();
+        // M-38: the same Kahn pre-scan boot runs, over the file ∪ the live
+        // quarantine. The DAG's own I8 check catches a planted cycle only on
+        // the SECOND insert — the first member's partner is absent, so it goes
+        // in — and `release_quarantined_now_in_dag` then freed that member
+        // from the quarantine, it became a head, this node's own next
+        // transaction descended from it, and the next boot's scan quarantined
+        // the cycle AND that transaction: signed, served, then gone from every
+        // balance on every restart until the file was hand-repaired. A member
+        // found here stays quarantined (a newly planted one joins the
+        // quarantine, so the rewrite that follows keeps it in the file rather
+        // than dropping it — the next boot would quarantine it anyway) and is
+        // never inserted. The union matters: the file may hold one member and
+        // the quarantine the other. O(transactions) hashes on a path that
+        // already hashes every directive once; empty on every honest file.
+        let cycle_blocked = {
+            let candidates: Vec<&Directive> = file_directives
+                .iter()
+                .chain(self.live_quarantine().map(|(_, directive)| directive))
+                .collect();
+            directives_blocked_by_parent_cycles(&candidates)
+        };
 
-        for mut directive in file_directives {
+        let mut tally = AdoptionTally::default();
+
+        for directive in file_directives {
             let content_id = compute_content_id(&directive);
 
             // Check if already in DAG (G-Set dedup).
             if self.dag.get(&content_id).is_some() {
-                dup_count += 1;
+                tally.duplicates += 1;
                 continue;
             }
 
-            // H-04: never adopt a directive whose date the file grammar cannot
-            // read back — the next persist would brick every later boot. Checked
-            // before the envelope stamp so a rejection cannot move the Lamport
-            // clock either. `read_date` cannot currently yield such a year, so
-            // this is a guard against future parser or format changes.
-            if let Err(error) = validate_directive_dates(&directive) {
-                rejected += 1;
-                rejections.push((content_id.clone(), error.to_string()));
-                continue;
-            }
-
-            // H-06: a file may legitimately carry the four envelope keys at
-            // directive level (that is how a peer's directive round-trips), but
-            // any other `openledger-*` key — and any at posting level — is
-            // unvalidated metadata that the content hash ignores and that
-            // `extract_envelope` would promote into the envelope on the next
-            // serve, bricking the receiving peer's closed-set check.
-            // L-26: control characters in body strings would be written
-            // verbatim into every replica's file from here on.
-            // T41: and the same `MAX_PARENTS` fan-in cap the wire path applies.
-            // The cap was wire-only, so a hand edit — or a pre-hardening file —
-            // could carry an `openledger-parents` list of any length, which the
-            // next persist would then serve to every peer, where it is refused.
-            // M-20: and the rest of the wire path's check set, which this path
-            // simply did not have. Since L-11 reconcile SIGNS what it adopts,
-            // so an entry the file accepts and the wire refuses is adopted,
-            // signed with this node's key, persisted and served — and then
-            // refused by every peer forever while this node keeps advertising
-            // it. Permanent divergence plus perpetual re-Want churn, reached
-            // through a text editor rather than a peer. The three missing
-            // checks were:
-            //
-            // * **L-02** — `enforce_economic_bean_limit`. Called on all three
-            //   local API paths and on `stage_remote_directive`, never here,
-            //   and nothing else bounds body length: the parser caps charsets,
-            //   not lengths.
-            // * **L-29** — parent txid FORM. `parent_txid_is_well_formed` had
-            //   exactly one production call site. Parents are envelope metadata
-            //   and are stripped before hashing, so an uppercase-hex spelling
-            //   of a real txid changes no content id, passes `validate_parent_
-            //   fan_in` (a count check), passes `LedgerDag::insert` (no form
-            //   check), and then never resolves.
-            // * The **format** of `openledger-lamport`. The adoption arm below
-            //   read it with `.parse().ok()` and treated failure as "leave the
-            //   clock alone", so `openledger-lamport: "seven"` was adopted
-            //   silently. Its RANGE is T46's `checked_lamport`, applied a few
-            //   lines down — one rule, one constant, not a second copy here.
-            //
-            // Placed in this chain, i.e. BEFORE the envelope stamp, so a
-            // refusal costs the entry its line in `rejections` and moves
-            // neither the Lamport clock nor a half-stamped envelope — the same
-            // ordering rule H-04 states above and T27 states for the local
-            // paths.
-            if let Err(error) = validate_body_envelope_keys(&directive, ENVELOPE_KEYS)
-                .and_then(|()| validate_body_strings(&directive))
-                .and_then(|()| validate_parent_fan_in(&directive))
-                .and_then(|()| validate_file_ingest_parity(&directive))
+            if !cycle_blocked.is_empty()
+                && matches!(directive, Directive::Transaction(_))
+                && cycle_blocked.contains(&content_id)
             {
-                rejected += 1;
-                rejections.push((content_id.clone(), error.to_string()));
+                tally.refuse(
+                    content_id.clone(),
+                    "transaction sits on (or descends from) an openledger-parents cycle; \
+                     quarantined, not adopted (M-38)"
+                        .to_owned(),
+                );
+                self.quarantined.entry(content_id).or_insert(directive);
                 continue;
             }
 
-            // Adopt: stamp envelope metadata only if missing.
-            // If the directive already has envelope keys (e.g. from another node),
-            // preserve them as-is to maintain content hash stability.
-            let metadata = directive_metadata_mut(&mut directive);
-
-            let needs_stamp = !metadata.contains_key("openledger-lamport");
-
-            // H-07: the clock value this adoption would move to, bounds-checked
-            // BEFORE anything is written. The ceiling is not a wire rule — a
-            // file is an ingest path too, and a hand-edited (or pre-T46) `.bean`
-            // carrying a value at the cap would otherwise walk this node's clock
-            // past it exactly as a hostile peer once could. Computing it first
-            // means a refusal costs the directive its line in `rejections` and
-            // leaves both the clock and a half-stamped envelope untouched.
-            let next_lamport = if needs_stamp {
-                checked_lamport(self.lamport_clock.saturating_add(1))
-            } else {
-                // Update local Lamport clock to at least match the incoming
-                // value.
-                //
-                // T41 — the `+1` asymmetry with peer ingest, documented rather
-                // than unified. `stage_remote_directive` does
-                // `max(local, remote).saturating_add(1)`; this does `max(local,
-                // incoming)` with no `+1`, and **both preserve the (author,
-                // lamport) uniqueness M-18 needs**, because the increment that
-                // matters happens at STAMPING time, not at adoption time:
-                // `stamp_transaction_envelope`/`stamp_directive_envelope`
-                // pre-increment, so the next value this node signs is
-                // `max(local, incoming) + 1` — strictly greater than anything
-                // adopted here — either way. The peer-ingest form simply
-                // reserves that slot one step earlier, leaving the clock one
-                // ahead; it is more conservative, not more correct.
-                //
-                // NOT unified, deliberately. The clock is serialized into the
-                // envelope of every directive this node subsequently stamps, so
-                // changing the arithmetic on either path changes the `.bean`
-                // bytes for an identical input sequence — which is exactly what
-                // T27's `batch_path_is_byte_identical_to_per_entry_path` and
-                // T29's byte-identical convergence assertions pin. A cosmetic
-                // unification is not worth perturbing determinism tests whose
-                // whole value is that they are sensitive.
-                match metadata
-                    .get("openledger-lamport")
-                    .and_then(|v| v.parse::<u64>().ok())
-                {
-                    Some(incoming_lamport) => {
-                        checked_lamport(self.lamport_clock.max(incoming_lamport))
-                    }
-                    // Unparsable: the clock stays exactly where it is, as it did
-                    // before this guard existed.
-                    None => Ok(self.lamport_clock),
-                }
-            };
-            let next_lamport = match next_lamport {
-                Ok(value) => value,
-                Err(error) => {
-                    rejected += 1;
-                    rejections.push((content_id.clone(), error.to_string()));
-                    continue;
-                }
-            };
-
-            if needs_stamp {
-                if !metadata.contains_key("openledger-author") {
-                    metadata.insert("openledger-author".to_owned(), self.author_id.clone());
-                }
-                metadata.insert("openledger-lamport".to_owned(), next_lamport.to_string());
-            }
-            self.lamport_clock = next_lamport;
-
-            // For transactions: set parents to current heads if not already set.
-            //
-            // Provisionally ALL heads: the fan-in cap below is measured on
-            // this superset, and the set is narrowed (L-40) once the id the
-            // DAG will store the entry under is known — see `stamped_parents`.
-            let mut stamped_parents = false;
-            if let Directive::Transaction(txn) = &mut directive {
-                if !txn.metadata.contains_key("openledger-parents") {
-                    stamped_parents = true;
-                    let heads: Vec<String> = self.dag.heads().iter().cloned().collect();
-                    let mut sorted = heads;
-                    sorted.sort();
-                    txn.metadata
-                        .insert("openledger-parents".to_owned(), sorted.join(","));
-                }
-            }
-
-            // Validate transactions (I1–I3, I9).
-            if let Err(error) = enforce_resource_limits(&directive) {
-                rejected += 1;
-                rejections.push((content_id.clone(), error.to_string()));
-                continue;
-            }
-            if let Directive::Transaction(txn) = &directive {
-                match validate_transaction(txn, &self.accounts) {
-                    Ok(validated) => {
-                        // Build the final transaction with the resolved postings.
-                        let final_txn = Transaction {
-                            postings: validated.postings,
-                            ..txn.clone()
-                        };
-                        let mut final_directive = Directive::Transaction(final_txn);
-                        // L-11: sign over the id the DAG will actually store it
-                        // under. That is NOT `content_id` when I2 resolved an
-                        // elided posting — the resolved body hashes differently,
-                        // and a signature over the pre-resolution id would fail
-                        // on every peer.
-                        let stored_id = compute_content_id(&final_directive);
-                        // L-40: parents this node chose must not include a head
-                        // that already names `stored_id` through a dangling
-                        // `openledger-parents` — that is a cycle this node would
-                        // build itself, refused below and, had it landed,
-                        // quarantined with the operator's entry at next boot.
-                        // Chosen against `stored_id`, not `content_id`: the DAG
-                        // keys (and a planted pointer targets) the resolved
-                        // body. Identical to the provisional set on every
-                        // honest ledger. Parents the FILE spelled are the
-                        // operator's own and are left alone.
-                        if stamped_parents {
-                            let mut parents = self.dag.heads_admissible_as_parents_of(&stored_id);
-                            parents.sort();
-                            let parents = parents.join(",");
-                            directive_metadata_mut(&mut final_directive)
-                                .insert("openledger-parents".to_owned(), parents);
-                        }
-                        // M-20 / L-02, the second application. The guard chain
-                        // above measured the body as the FILE spells it; I2
-                        // then resolved the elided posting, which is what the
-                        // signature, the DAG and every peer actually see. A
-                        // body within the cap before resolution can be over it
-                        // after, and the wire cap is enforced on the resolved
-                        // form — so the entry must be re-measured on this side
-                        // of `validate_transaction` and before
-                        // `sign_adopted_entry`. Costs one serialization on the
-                        // reconcile path only, which already rewrites the whole
-                        // file.
-                        if let Err(error) = enforce_economic_bean_limit(&final_directive) {
-                            rejected += 1;
-                            rejections.push((content_id.clone(), error.to_string()));
-                            continue;
-                        }
-                        self.sign_adopted_entry(&mut final_directive, &stored_id);
-                        match self.dag.insert(final_directive.clone(), false) {
-                            Ok(InsertResult::Inserted { .. }) => {
-                                self.read_model.index_directive(&final_directive);
-                                // T44: reconcile always compacts, so this entry
-                                // is written by the full rewrite rather than by
-                                // a journal record; tracking it keeps
-                                // `uncommitted_count` honest and makes the
-                                // "nothing to do" short-circuit correct.
-                                self.pending_ids.push(stored_id.clone());
-                                new_count += 1;
-                            }
-                            Ok(InsertResult::Duplicate { .. }) => {
-                                dup_count += 1;
-                            }
-                            Err(error) => {
-                                rejected += 1;
-                                rejections.push((content_id.clone(), error.to_string()));
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        rejected += 1;
-                        rejections.push((content_id.clone(), error.to_string()));
-                    }
-                }
-            } else {
-                // M-09: a hand-added `close` goes through the same
-                // no-later-transactions rule as the local API and the peer
-                // ingest path, rather than being applied unconditionally with
-                // the error swallowed. It lands in the `rejected` tally like
-                // every other refused adoption.
-                if let Directive::Close(close) = &directive {
-                    if let Err(error) = self.reject_backdated_close(close) {
-                        rejected += 1;
-                        rejections.push((content_id.clone(), error.to_string()));
-                        continue;
-                    }
-                }
-                // L-11: a non-transaction body is stored exactly as parsed, so
-                // its content id is the one computed at the top of the loop.
-                self.sign_adopted_entry(&mut directive, &content_id);
-                // Non-transaction directives: insert, then record any lifecycle
-                // event under the content id the DAG assigned (M-09).
-                match self.dag.insert(directive.clone(), false) {
-                    Ok(InsertResult::Inserted { .. }) => {
-                        self.accounts.record_lifecycle(&directive, &content_id);
-                        self.read_model.index_directive(&directive);
-                        // T44: see the transaction arm above.
-                        self.pending_ids.push(content_id.clone());
-                        new_count += 1;
-                    }
-                    Ok(InsertResult::Duplicate { .. }) => {
-                        dup_count += 1;
-                    }
-                    Err(error) => {
-                        rejected += 1;
-                        rejections.push((content_id.clone(), error.to_string()));
-                    }
-                }
-            }
+            self.adopt_file_directive(directive, content_id, &mut tally);
         }
 
         // H-08: a repaired directive keeps its content id (the envelope is
@@ -4143,7 +4840,8 @@ impl LedgerService {
         // operator their records are about to be dropped when they are not is
         // how an operator is talked into "fixing" it by hand under a running
         // node, which L-30 says is unsupported.
-        let (preserved, dropped): (Vec<_>, Vec<_>) = rejections
+        let (preserved, dropped): (Vec<_>, Vec<_>) = tally
+            .rejections
             .iter()
             .partition(|(id, _)| self.quarantined.contains_key(id));
         if !dropped.is_empty() {
@@ -4174,10 +4872,317 @@ impl LedgerService {
         }
 
         Ok(crate::file_watcher::ReconcileResult {
-            new_directives: new_count,
-            duplicates: dup_count,
-            rejected,
+            new_directives: tally.new_directives,
+            duplicates: tally.duplicates,
+            rejected: tally.rejected,
         })
+    }
+
+    /// Adopt ONE directive read from this node's own `.bean` file — the body
+    /// of the reconcile loop, shared with boot's operator-input adoption
+    /// (H-13) so the two file paths cannot drift apart.
+    ///
+    /// `content_id` is the id of the directive as the file spells it; the
+    /// caller has already checked it is not in the DAG. Every refusal is
+    /// recorded in `tally` with its reason, and the return value tells the
+    /// caller which of the three things happened, with the **stored** id on
+    /// an insert (it differs from `content_id` when I2 resolved an elided
+    /// posting). The lamport clock moves only in the `Inserted` arms (L-55):
+    /// every check below `continue`s past the insert on failure, and the
+    /// ordering T46 fixed on the peer path — adopt after validation, never
+    /// before — applies to the file path identically.
+    fn adopt_file_directive(
+        &mut self,
+        mut directive: Directive,
+        content_id: String,
+        tally: &mut AdoptionTally,
+    ) -> FileAdoption {
+        // H-04: never adopt a directive whose date the file grammar cannot
+        // read back — the next persist would brick every later boot. Checked
+        // before the envelope stamp so a rejection cannot move the Lamport
+        // clock either. `read_date` cannot currently yield such a year, so
+        // this is a guard against future parser or format changes.
+        if let Err(error) = validate_directive_dates(&directive) {
+            tally.refuse(content_id, error.to_string());
+            return FileAdoption::Refused;
+        }
+
+        // H-06: a file may legitimately carry the four envelope keys at
+        // directive level (that is how a peer's directive round-trips), but
+        // any other `openledger-*` key — and any at posting level — is
+        // unvalidated metadata that the content hash ignores and that
+        // `extract_envelope` would promote into the envelope on the next
+        // serve, bricking the receiving peer's closed-set check.
+        // L-26: control characters in body strings would be written
+        // verbatim into every replica's file from here on.
+        // T41: and the same `MAX_PARENTS` fan-in cap the wire path applies.
+        // The cap was wire-only, so a hand edit — or a pre-hardening file —
+        // could carry an `openledger-parents` list of any length, which the
+        // next persist would then serve to every peer, where it is refused.
+        // M-20: and the rest of the wire path's check set, which this path
+        // simply did not have. Since L-11 reconcile SIGNS what it adopts,
+        // so an entry the file accepts and the wire refuses is adopted,
+        // signed with this node's key, persisted and served — and then
+        // refused by every peer forever while this node keeps advertising
+        // it. Permanent divergence plus perpetual re-Want churn, reached
+        // through a text editor rather than a peer. The three missing
+        // checks were:
+        //
+        // * **L-02** — `enforce_economic_bean_limit`. Called on all three
+        //   local API paths and on `stage_remote_directive`, never here,
+        //   and nothing else bounds body length: the parser caps charsets,
+        //   not lengths.
+        // * **L-29** — parent txid FORM. `parent_txid_is_well_formed` had
+        //   exactly one production call site. Parents are envelope metadata
+        //   and are stripped before hashing, so an uppercase-hex spelling
+        //   of a real txid changes no content id, passes `validate_parent_
+        //   fan_in` (a count check), passes `LedgerDag::insert` (no form
+        //   check), and then never resolves.
+        // * The **format** of `openledger-lamport`. The adoption arm below
+        //   read it with `.parse().ok()` and treated failure as "leave the
+        //   clock alone", so `openledger-lamport: "seven"` was adopted
+        //   silently. Its RANGE is T46's `checked_lamport`, applied a few
+        //   lines down — one rule, one constant, not a second copy here.
+        //
+        // Placed in this chain, i.e. BEFORE the envelope stamp, so a
+        // refusal costs the entry its line in `rejections` and moves
+        // neither the Lamport clock nor a half-stamped envelope — the same
+        // ordering rule H-04 states above and T27 states for the local
+        // paths.
+        if let Err(error) = validate_body_envelope_keys(&directive, ENVELOPE_KEYS)
+            .and_then(|()| validate_body_strings(&directive))
+            .and_then(|()| validate_parent_fan_in(&directive))
+            .and_then(|()| validate_file_ingest_parity(&directive))
+        {
+            tally.refuse(content_id, error.to_string());
+            return FileAdoption::Refused;
+        }
+
+        // Adopt: stamp envelope metadata only if missing.
+        // If the directive already has envelope keys (e.g. from another node),
+        // preserve them as-is to maintain content hash stability.
+        let metadata = directive_metadata_mut(&mut directive);
+
+        let needs_stamp = !metadata.contains_key("openledger-lamport");
+
+        // H-07: the clock value this adoption would move to, bounds-checked
+        // BEFORE anything is written. The ceiling is not a wire rule — a
+        // file is an ingest path too, and a hand-edited (or pre-T46) `.bean`
+        // carrying a value at the cap would otherwise walk this node's clock
+        // past it exactly as a hostile peer once could. Computing it first
+        // means a refusal costs the directive its line in `rejections` and
+        // leaves both the clock and a half-stamped envelope untouched.
+        let next_lamport = if needs_stamp {
+            self.next_stamp()
+        } else {
+            // Update local Lamport clock to at least match the incoming
+            // value.
+            //
+            // T41 — the `+1` asymmetry with peer ingest, documented rather
+            // than unified. `stage_remote_directive` does
+            // `max(local, remote).saturating_add(1)`; this does `max(local,
+            // incoming)` with no `+1`, and **both preserve the (author,
+            // lamport) uniqueness M-18 needs**, because the increment that
+            // matters happens at STAMPING time, not at adoption time:
+            // `stamp_transaction_envelope`/`stamp_directive_envelope`
+            // pre-increment, so the next value this node signs is
+            // `max(local, incoming) + 1` — strictly greater than anything
+            // adopted here — either way. The peer-ingest form simply
+            // reserves that slot one step earlier, leaving the clock one
+            // ahead; it is more conservative, not more correct.
+            //
+            // NOT unified, deliberately. The clock is serialized into the
+            // envelope of every directive this node subsequently stamps, so
+            // changing the arithmetic on either path changes the `.bean`
+            // bytes for an identical input sequence — which is exactly what
+            // T27's `batch_path_is_byte_identical_to_per_entry_path` and
+            // T29's byte-identical convergence assertions pin. A cosmetic
+            // unification is not worth perturbing determinism tests whose
+            // whole value is that they are sensitive.
+            //
+            // T63 / H-12: the one Lamport rule on `max(local, incoming)` —
+            // the value this path moves the clock to — and the adoption
+            // ratchet, exactly as on the peer path. A file is operator input
+            // here, and pasting a peer's directive into it must not be a way
+            // around either bound. `author` names whom to remove from the
+            // allowlist when either refuses.
+            match metadata
+                .get("openledger-lamport")
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                Some(incoming_lamport) => {
+                    let author = metadata.get(ENVELOPE_KEY_AUTHOR).map(String::as_str);
+                    checked_lamport(self.lamport_clock.max(incoming_lamport), author).and_then(
+                        |next| {
+                            check_lamport_advance(self.lamport_clock, incoming_lamport, author)
+                                .map(|()| next)
+                        },
+                    )
+                }
+                // Unparsable: the clock stays exactly where it is, as it did
+                // before this guard existed.
+                None => Ok(self.lamport_clock),
+            }
+        };
+        let next_lamport = match next_lamport {
+            Ok(value) => value,
+            Err(error) => {
+                tally.refuse(content_id, error.to_string());
+                return FileAdoption::Refused;
+            }
+        };
+
+        if needs_stamp {
+            if !metadata.contains_key("openledger-author") {
+                metadata.insert("openledger-author".to_owned(), self.author_id.clone());
+            }
+            metadata.insert("openledger-lamport".to_owned(), next_lamport.to_string());
+        }
+        // L-55: `self.lamport_clock = next_lamport` used to sit here, ahead
+        // of `enforce_resource_limits`, `validate_transaction`, the
+        // resolved-body cap and `dag.insert` — each of which refuses with the
+        // clock already moved, so a rejected hand-appended entry carrying
+        // `openledger-lamport: "5000"` walked the clock from 3 to 5000 and
+        // the next authored envelope was 5001. The assignment now lives in
+        // the two `Inserted` arms below, mirroring the peer path.
+
+        // For transactions: set parents to current heads if not already set.
+        //
+        // Provisionally against the file's content id; re-chosen (L-40) once
+        // the id the DAG will store the entry under is known — see
+        // `stamped_parents`. Both through `choose_parents`, so both are capped
+        // at `MAX_PARENTS` (T64 / H-16): this path signs what it adopts, and an
+        // over-cap parent list signed here is refused by every peer exactly as
+        // an over-cap local append was.
+        let mut stamped_parents = false;
+        if let Directive::Transaction(txn) = &mut directive {
+            if !txn.metadata.contains_key("openledger-parents") {
+                stamped_parents = true;
+                txn.metadata.insert(
+                    "openledger-parents".to_owned(),
+                    self.choose_parents(&content_id),
+                );
+            }
+        }
+
+        // Validate transactions (I1–I3, I9).
+        if let Err(error) = enforce_resource_limits(&directive) {
+            tally.refuse(content_id, error.to_string());
+            return FileAdoption::Refused;
+        }
+        if let Directive::Transaction(txn) = &directive {
+            match validate_transaction(txn, &self.accounts) {
+                Ok(validated) => {
+                    // Build the final transaction with the resolved postings.
+                    let final_txn = Transaction {
+                        postings: validated.postings,
+                        ..txn.clone()
+                    };
+                    let mut final_directive = Directive::Transaction(final_txn);
+                    // L-11: sign over the id the DAG will actually store it
+                    // under. That is NOT `content_id` when I2 resolved an
+                    // elided posting — the resolved body hashes differently,
+                    // and a signature over the pre-resolution id would fail
+                    // on every peer.
+                    let stored_id = compute_content_id(&final_directive);
+                    // L-40: parents this node chose must not include a head
+                    // that already names `stored_id` through a dangling
+                    // `openledger-parents` — that is a cycle this node would
+                    // build itself, refused below and, had it landed,
+                    // quarantined with the operator's entry at next boot.
+                    // Chosen against `stored_id`, not `content_id`: the DAG
+                    // keys (and a planted pointer targets) the resolved
+                    // body. Identical to the provisional set on every
+                    // honest ledger. Parents the FILE spelled are the
+                    // operator's own and are left alone.
+                    if stamped_parents {
+                        let parents = self.choose_parents(&stored_id);
+                        directive_metadata_mut(&mut final_directive)
+                            .insert("openledger-parents".to_owned(), parents);
+                    }
+                    // M-20 / L-02, the second application. The guard chain
+                    // above measured the body as the FILE spells it; I2
+                    // then resolved the elided posting, which is what the
+                    // signature, the DAG and every peer actually see. A
+                    // body within the cap before resolution can be over it
+                    // after, and the wire cap is enforced on the resolved
+                    // form — so the entry must be re-measured on this side
+                    // of `validate_transaction` and before
+                    // `sign_adopted_entry`. Costs one serialization on the
+                    // reconcile path only, which already rewrites the whole
+                    // file.
+                    if let Err(error) = enforce_economic_bean_limit(&final_directive) {
+                        tally.refuse(content_id, error.to_string());
+                        return FileAdoption::Refused;
+                    }
+                    self.sign_adopted_entry(&mut final_directive, &stored_id);
+                    match self.dag.insert(final_directive.clone(), false) {
+                        Ok(InsertResult::Inserted { .. }) => {
+                            // L-55: adopted, so the clock moves — and only now.
+                            self.lamport_clock = next_lamport;
+                            self.read_model.index_directive(&final_directive);
+                            // T44: reconcile always compacts, so this entry
+                            // is written by the full rewrite rather than by
+                            // a journal record; tracking it keeps
+                            // `uncommitted_count` honest and makes the
+                            // "nothing to do" short-circuit correct.
+                            self.pending_ids.push(stored_id.clone());
+                            tally.new_directives += 1;
+                            FileAdoption::Inserted(stored_id)
+                        }
+                        Ok(InsertResult::Duplicate { .. }) => {
+                            tally.duplicates += 1;
+                            FileAdoption::Duplicate
+                        }
+                        Err(error) => {
+                            tally.refuse(content_id, error.to_string());
+                            FileAdoption::Refused
+                        }
+                    }
+                }
+                Err(error) => {
+                    tally.refuse(content_id, error.to_string());
+                    FileAdoption::Refused
+                }
+            }
+        } else {
+            // M-09: a hand-added `close` goes through the same
+            // no-later-transactions rule as the local API and the peer
+            // ingest path, rather than being applied unconditionally with
+            // the error swallowed. It lands in the `rejected` tally like
+            // every other refused adoption.
+            if let Directive::Close(close) = &directive {
+                if let Err(error) = self.reject_backdated_close(close) {
+                    tally.refuse(content_id, error.to_string());
+                    return FileAdoption::Refused;
+                }
+            }
+            // L-11: a non-transaction body is stored exactly as parsed, so
+            // its content id is the one computed at the top of the loop.
+            self.sign_adopted_entry(&mut directive, &content_id);
+            // Non-transaction directives: insert, then record any lifecycle
+            // event under the content id the DAG assigned (M-09).
+            match self.dag.insert(directive.clone(), false) {
+                Ok(InsertResult::Inserted { .. }) => {
+                    // L-55: see the transaction arm.
+                    self.lamport_clock = next_lamport;
+                    self.accounts.record_lifecycle(&directive, &content_id);
+                    self.read_model.index_directive(&directive);
+                    // T44: see the transaction arm above.
+                    self.pending_ids.push(content_id.clone());
+                    tally.new_directives += 1;
+                    FileAdoption::Inserted(content_id)
+                }
+                Ok(InsertResult::Duplicate { .. }) => {
+                    tally.duplicates += 1;
+                    FileAdoption::Duplicate
+                }
+                Err(error) => {
+                    tally.refuse(content_id, error.to_string());
+                    FileAdoption::Refused
+                }
+            }
+        }
     }
 
     /// Re-parse a file that `parse_file` refused, skipping only the blocks this
@@ -4209,7 +5214,10 @@ impl LedgerService {
                 retained.insert(block.text);
                 continue;
             }
-            match parse_file(&block.text) {
+            // L-62: the same per-block parser boot's salvage uses, so a block
+            // the whole-file parser refused (a mid-file BOM) is refused here
+            // too instead of being adopted.
+            match parse_block(&block.text) {
                 Ok(parsed) => directives.extend(parsed),
                 Err(_) => return None,
             }
@@ -4544,6 +5552,44 @@ impl LedgerService {
             .collect()
     }
 
+    /// Refuse a remote transaction that names no current head while its author
+    /// already owns [`MAX_UNMERGED_HEADS_PER_AUTHOR`] heads here (T64 / H-16).
+    ///
+    /// A transaction that names a current head replaces it: the head count
+    /// cannot grow, so it is always admitted, whoever wrote it. One that names
+    /// no current head — a parentless genesis, a sibling of something already
+    /// merged — adds a head, which is honest concurrency in small numbers and
+    /// the H-16 inflation in large ones. Counting per author keeps the bound
+    /// on the party that can cause it: an honest author owns about one head,
+    /// a peer's normal parentless genesis on an empty ledger owns zero, and no
+    /// author can push another author's count.
+    ///
+    /// Not a verdict on the directive (classified not-permanent by the node's
+    /// refusal cache): the next local append names up to [`MAX_PARENTS`] heads
+    /// and so frees the author's quota, after which the same transaction is
+    /// admissible.
+    ///
+    /// Costs one pass over the heads, which this bound itself keeps small.
+    fn check_unmerged_head_bound(&self, transaction: &Transaction) -> Result<(), ServiceError> {
+        let heads = self.dag.heads();
+        if transaction
+            .parent_ids()
+            .iter()
+            .any(|parent| heads.contains(*parent))
+        {
+            return Ok(());
+        }
+        let author = transaction.author();
+        let owned = self.dag.heads_authored_by(author);
+        if owned >= MAX_UNMERGED_HEADS_PER_AUTHOR {
+            return Err(ServiceError::UnmergedHeadLimit {
+                author: author.map(str::to_owned),
+                heads: owned,
+            });
+        }
+        Ok(())
+    }
+
     /// Insert a validated remote directive into the ledger, persisting after it
     /// (P2P receive path, single-insert semantics).
     ///
@@ -4642,6 +5688,8 @@ impl LedgerService {
                     });
                 }
             }
+            // T64 / H-16: the per-author unmerged-head bound.
+            self.check_unmerged_head_bound(transaction)?;
         }
 
         // Lamport adoption (§3.4.2): `lamport = max(local, remote) + 1`,
@@ -4675,9 +5723,33 @@ impl LedgerService {
         // T41: the `+1` here and its absence on the reconcile path are both
         // correct — see the long note at the reconcile site for why, and for
         // why they are deliberately left different.
+        //
+        // T63 / H-12 — the one rule and the ratchet:
+        //
+        // * **The rule** is applied to `max(local, remote)`: it must be a legal
+        //   value (`value + 1 < LAMPORT_CEILING`), so the clock this adopts,
+        //   `max + 1`, is at most `LAMPORT_CEILING - 1`. That is the same
+        //   predicate the wire applies to `remote` and the stamp applies to
+        //   the value it writes — before T63 this site bounded `max + 1`
+        //   against the same number the other two applied to the value, which
+        //   is how `CEILING - 1` was legal to stamp and to send yet refused
+        //   here.
+        // * **The ratchet** refuses a `remote` more than `MAX_LAMPORT_ADVANCE`
+        //   above the local clock. Without it the rule is reachable in one
+        //   step: a legal directive at `CEILING - 2` stopped authoring on every
+        //   adopter. See `check_lamport_advance` for why it is relative to the
+        //   local clock and has no first-contact exemption.
+        //
+        // Ceiling first: an illegal VALUE is refused as such whatever the
+        // local clock; the ratchet is the state-dependent second opinion.
+        let author = directive_author(&directive);
         let next_lamport = directive
             .lamport_clock()
-            .map(|remote| checked_lamport(self.lamport_clock.max(remote).saturating_add(1)))
+            .map(|remote| {
+                let next = checked_lamport(self.lamport_clock.max(remote), author)?;
+                check_lamport_advance(self.lamport_clock, remote, author)?;
+                Ok::<u64, ServiceError>(next.saturating_add(1))
+            })
             .transpose()?;
 
         // Validate and insert based on directive type.
@@ -4794,6 +5866,37 @@ impl LedgerService {
         }
         Ok(())
     }
+}
+
+/// The running counts of one pass over file directives — the reconcile loop's
+/// and boot's operator-input adoption's (H-13) — plus every refusal with its
+/// reason, for the L-12 per-entry log line.
+#[derive(Debug, Default)]
+struct AdoptionTally {
+    new_directives: usize,
+    duplicates: usize,
+    rejected: usize,
+    /// `(content id as the file spells it, reason)` for every refusal.
+    rejections: Vec<(String, String)>,
+}
+
+impl AdoptionTally {
+    fn refuse(&mut self, content_id: String, reason: String) {
+        self.rejected += 1;
+        self.rejections.push((content_id, reason));
+    }
+}
+
+/// What [`LedgerService::adopt_file_directive`] did with one directive.
+#[derive(Debug)]
+enum FileAdoption {
+    /// Inserted into the DAG under this **stored** id (the resolved body's id,
+    /// which differs from the file's content id when I2 filled an elision).
+    Inserted(String),
+    /// The resolved body was already in the DAG.
+    Duplicate,
+    /// Refused; the reason is in the tally.
+    Refused,
 }
 
 /// Mutable access to whichever directive kind's metadata map this is.
@@ -5709,9 +6812,11 @@ mod tests {
     fn test_close_rejects_a_body_over_the_wire_size_cap() {
         // `close_account` cannot reach its own size check through
         // `open_account` any more — the open is refused first — but it is
-        // reachable, and this is how: boot deliberately applies no limits, so a
-        // ledger written before this fix (or by hand) can hold an account name
-        // no `close` directive could ever be shipped for.
+        // reachable, and this is how: boot deliberately applies no limits to
+        // HISTORY, so a ledger written before this fix can hold an account
+        // name no `close` directive could ever be shipped for. History means
+        // node-written, i.e. enveloped (H-13): an envelope-less `open` is
+        // operator input and gets the write-path cap at boot instead.
         let path = test_file_path();
         let huge = long_account("Assets", MAX_ECONOMIC_BEAN_LENGTH + 1_024);
         let persisted = full_file_serialize(
@@ -5719,7 +6824,7 @@ mod tests {
                 date: make_date(2024, 1, 1),
                 account: huge.clone(),
                 currencies: vec![],
-                metadata: BTreeMap::new(),
+                metadata: filler_envelope(1),
             })],
             &[],
         );
@@ -7319,17 +8424,57 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
-    // ── H-07 / T46: the Lamport ceiling as a single rule ─────────────────
+    // ── H-07 / T46, H-12 / T63: the Lamport ceiling as ONE rule ──────────
+
+    /// A `.bean` whose history already reaches `lamport`: the three opens
+    /// `setup_with_accounts` makes, authored by `peer-history`, the highest at
+    /// `lamport`.
+    ///
+    /// The adoption ratchet (T63) bounds how far one directive may move a
+    /// clock, so a test that needs a clock near the ceiling gets there the way
+    /// a real node does — by holding the history, which boot loads without the
+    /// ratchet — instead of by one remote jump, which is now refused.
+    fn history_file_at(lamport: u64) -> String {
+        format!(
+            "2024-01-01 open Assets:Cash USD\n  openledger-author: \"peer-history\"\n  \
+             openledger-lamport: \"{a}\"\n\n\
+             2024-01-01 open Equity:Opening\n  openledger-author: \"peer-history\"\n  \
+             openledger-lamport: \"{b}\"\n\n\
+             2024-01-01 open Expenses:Food USD\n  openledger-author: \"peer-history\"\n  \
+             openledger-lamport: \"{lamport}\"\n",
+            a = lamport - 2,
+            b = lamport - 1,
+        )
+    }
+
+    fn boot_with_history_at(lamport: u64, author: &str) -> (LedgerService, PathBuf) {
+        let path = test_file_path();
+        std::fs::write(&path, history_file_at(lamport)).unwrap();
+        let svc = LedgerService::boot(path.clone(), author.to_owned()).unwrap();
+        assert_eq!(
+            svc.lamport_clock(),
+            lamport + 1,
+            "boot resumes above history"
+        );
+        (svc, path)
+    }
+
+    /// Within one ratchet step of the ceiling: close enough that the tests
+    /// below measure the CEILING, far enough that nothing here is already at it.
+    const NEAR_CEILING: u64 = LAMPORT_CEILING - (1 << 31);
 
     #[test]
     fn test_remote_lamport_at_the_ceiling_is_refused_not_adopted() {
-        // H-07(c). The cap and the arithmetic around it are one rule: the clock
-        // must stay below `LAMPORT_CEILING`, and adoption is
-        // `max(local, remote) + 1`, so `CEILING - 2` is the largest value that
-        // can be adopted. The bound used to be inclusive on the wire and
-        // unchecked here, which is precisely the one-step gap the attack used.
-        let (mut svc, path) = boot_empty();
+        // H-07(c), restated by T63 (H-12). A value is legal iff `value + 1 <
+        // LAMPORT_CEILING`, and adoption applies exactly that predicate to
+        // `max(local, remote)`, so `CEILING - 2` is the largest value that can be
+        // adopted. This half has not moved; what T63 changed is that the wire
+        // and the stamp now apply the SAME predicate — before, `CEILING - 1` was
+        // refused here while `union_merge` accepted it and the stamp wrote it,
+        // and the two tests pinned both halves of that contradiction.
+        let (mut svc, path) = boot_with_history_at(NEAR_CEILING, "test-peer");
         let date = make_date(2024, 1, 1);
+        let count = svc.directive_count();
 
         for (lamport, label) in [
             (LAMPORT_CEILING, "at the ceiling"),
@@ -7344,21 +8489,41 @@ mod tests {
                 .stage_remote_directive(remote_open("Assets:Remote", date, lamport))
                 .unwrap_err();
             assert_eq!(error.error_code(), "LAMPORT_CEILING", "{label}");
+            assert!(
+                error.to_string().contains("peer-remote"),
+                "T63: the refusal names the author to remove from the allowlist: {error}"
+            );
             assert_eq!(
                 svc.lamport_clock(),
                 before,
                 "refused, therefore not adopted: {label}"
             );
-            assert_eq!(svc.directive_count(), 0, "{label}");
+            assert_eq!(svc.directive_count(), count, "{label}");
         }
 
-        // The largest adoptable value is still accepted — the guard is a bound,
-        // not a blanket refusal — and it leaves the clock on the last value this
+        // The largest legal value is still accepted — the guard is a bound, not
+        // a blanket refusal — and it leaves the clock on the last value this
         // node may hold.
         svc.stage_remote_directive(remote_open("Assets:Remote", date, LAMPORT_CEILING - 2))
             .unwrap();
         assert_eq!(svc.lamport_clock(), LAMPORT_CEILING - 1);
+        std::fs::remove_file(path).ok();
 
+        // On a fresh node the VALUE verdict still comes first for an illegal
+        // value; a legal one far above the clock is the ratchet's to refuse.
+        let (mut fresh, path) = boot_empty();
+        for lamport in [LAMPORT_CEILING, LAMPORT_CEILING - 1, u64::MAX] {
+            let error = fresh
+                .stage_remote_directive(remote_open("Assets:Remote", date, lamport))
+                .unwrap_err();
+            assert_eq!(error.error_code(), "LAMPORT_CEILING");
+        }
+        let error = fresh
+            .stage_remote_directive(remote_open("Assets:Remote", date, LAMPORT_CEILING - 2))
+            .unwrap_err();
+        assert_eq!(error.error_code(), "LAMPORT_ADVANCE");
+        assert_eq!(fresh.lamport_clock(), 0);
+        assert_eq!(fresh.directive_count(), 0);
         std::fs::remove_file(path).ok();
     }
 
@@ -7369,8 +8534,13 @@ mod tests {
         // still returned success — the silent half of the finding. Both stamp
         // sites now refuse, and refuse *cleanly*: no clock movement, no DAG
         // insert, no file write.
-        let (mut svc, path) = setup_with_accounts();
-        svc.stage_remote_directive(remote_open(
+        //
+        // T63 (H-12): delivered as the attack is — staged AND persisted — so
+        // the restart half below can assert the boot warning fires for the
+        // state a peer can actually reach (clock `CEILING - 1`). It used to
+        // test `clock >= CEILING`, which this state never satisfies.
+        let (mut svc, path) = boot_with_history_at(NEAR_CEILING, "test-peer");
+        svc.insert_remote_directive(remote_open(
             "Assets:Remote",
             make_date(2024, 1, 1),
             LAMPORT_CEILING - 2,
@@ -7385,9 +8555,14 @@ mod tests {
             .open_account("Assets:Later".to_owned(), make_date(2024, 1, 1), vec![])
             .unwrap_err();
         assert_eq!(error.error_code(), "LAMPORT_CEILING");
+        let message = error.to_string();
         assert!(
-            error.to_string().contains("refused by every peer"),
-            "the error must say why the ceiling exists: {error}"
+            message.contains("refused by every peer"),
+            "the error must say why the ceiling exists: {message}"
+        );
+        assert!(
+            message.contains("peer-remote") && message.contains("allowlist"),
+            "T63: the error must name the author and the mesh-wide remedy: {message}"
         );
 
         // `stamp_transaction_envelope`.
@@ -7398,6 +8573,662 @@ mod tests {
         assert_eq!(svc.directive_count(), directives_before);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), file_before);
 
+        // The restart half (H-12 fact 1): the file re-derives `CEILING - 1`
+        // and boot SAYS so, naming the author.
+        drop(svc);
+        let (rebooted, logged) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap());
+        let mut rebooted = rebooted;
+        assert_eq!(rebooted.lamport_clock(), LAMPORT_CEILING - 1);
+        assert!(
+            logged.contains("at the Lamport ceiling")
+                && logged.contains("H-12")
+                && logged.contains("peer-remote"),
+            "boot must warn at CEILING - 1 and name the author, got: {logged}"
+        );
+        let error = rebooted
+            .open_account("Assets:Later".to_owned(), make_date(2024, 1, 1), vec![])
+            .unwrap_err();
+        assert_eq!(error.error_code(), "LAMPORT_CEILING");
+
+        std::fs::remove_file(path).ok();
+    }
+
+    /// T63 (H-12): the boot warning is the stamp's own predicate, so it fires
+    /// exactly when authoring is going to be refused — `CEILING - 2` included,
+    /// which a `clock + 1 >= CEILING` test would miss — and a separate warning
+    /// covers a clock within one ratchet step of the ceiling.
+    #[test]
+    fn test_boot_warns_exactly_when_authoring_is_refused() {
+        for (history, refused) in [
+            (LAMPORT_CEILING - 2, true),
+            (LAMPORT_CEILING - 3, true),
+            (LAMPORT_CEILING - 4, false),
+        ] {
+            let path = test_file_path();
+            std::fs::write(&path, history_file_at(history)).unwrap();
+            let (svc, logged) = capture_warnings(|| {
+                LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap()
+            });
+            let mut svc = svc;
+            assert_eq!(
+                logged.contains("at the Lamport ceiling"),
+                refused,
+                "history at {history}: {logged}"
+            );
+            assert_eq!(
+                logged.contains("within one adoption step"),
+                !refused,
+                "history at {history}: {logged}"
+            );
+            let outcome =
+                svc.open_account("Assets:Later".to_owned(), make_date(2024, 1, 1), vec![]);
+            assert_eq!(
+                outcome.is_err(),
+                refused,
+                "history at {history}: {outcome:?}"
+            );
+            if let Ok(id) = outcome {
+                let stamped = svc.get_directive(&id).unwrap().lamport_clock().unwrap();
+                assert_eq!(stamped, LAMPORT_CEILING - 2, "the largest legal stamp");
+            }
+            std::fs::remove_file(path).ok();
+        }
+
+        // An ordinary history warns about nothing.
+        let path = test_file_path();
+        std::fs::write(&path, history_file_at(1_000)).unwrap();
+        let (_svc, logged) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap());
+        assert!(!logged.contains("H-12"), "{logged}");
+        std::fs::remove_file(path).ok();
+    }
+
+    /// Manifest item 4 (T63 / H-12): whatever a node authors after ingesting a
+    /// directive near the ceiling is accepted by a peer holding the same
+    /// history — at `CEILING - 3` it authors nothing (refused loudly, locally),
+    /// never one silently unreplicable record, which is what `h07proof` showed.
+    #[test]
+    fn test_h12_every_directive_a_node_authors_is_accepted_by_a_peer() {
+        let date = make_date(2024, 1, 1);
+        for (poison, expected_authored) in [
+            (LAMPORT_CEILING - 3, 0),
+            (LAMPORT_CEILING - 4, 1),
+            (LAMPORT_CEILING - 5, 2),
+        ] {
+            let (mut a, path_a) = boot_with_history_at(NEAR_CEILING, "node-a");
+            let (mut b, path_b) = boot_with_history_at(NEAR_CEILING, "node-b");
+            let hostile = remote_open("Assets:Remote", date, poison);
+            a.stage_remote_directive(hostile.clone()).unwrap();
+            b.stage_remote_directive(hostile).unwrap();
+
+            let mut authored = 0;
+            let error = loop {
+                match a.open_account(format!("Assets:Later{authored}"), date, vec![]) {
+                    Ok(id) => {
+                        let directive = a.get_directive(&id).unwrap().clone();
+                        let lamport = directive.lamport_clock().unwrap();
+                        assert!(lamport_value_is_legal(lamport), "stamped {lamport}");
+                        b.stage_remote_directive(directive).unwrap_or_else(|error| {
+                            panic!("peer refused A's directive at lamport {lamport}: {error}")
+                        });
+                        authored += 1;
+                        assert!(authored <= 3, "the ceiling must stop authoring");
+                    }
+                    Err(error) => break error,
+                }
+            };
+            assert_eq!(error.error_code(), "LAMPORT_CEILING");
+            assert_eq!(authored, expected_authored, "poison at {poison}");
+            std::fs::remove_file(path_a).ok();
+            std::fs::remove_file(path_b).ok();
+        }
+    }
+
+    /// T63 (H-12): the adoption ratchet. A remote directive more than 2^32
+    /// above the local clock is refused and moves nothing; one within it is
+    /// adopted; and the refusal is state-dependent — once the clock has caught
+    /// up, the same directive is accepted.
+    #[test]
+    fn test_adoption_ratchet_bounds_one_step() {
+        let (mut svc, path) = boot_with_history_at(1_000, "test-peer");
+        let date = make_date(2024, 1, 1);
+        let local = svc.lamport_clock();
+        let count = svc.directive_count();
+
+        let over = remote_open("Assets:Over", date, local + MAX_LAMPORT_ADVANCE + 1);
+        let exact = remote_open("Assets:Exact", date, local + MAX_LAMPORT_ADVANCE);
+        for (directive, label) in [(&over, "2^32 + 1"), (&exact, "exactly 2^32")] {
+            let error = svc.stage_remote_directive(directive.clone()).unwrap_err();
+            assert_eq!(error.error_code(), "LAMPORT_ADVANCE", "{label}");
+            assert!(error.to_string().contains("peer-remote"), "{error}");
+            assert_eq!(
+                svc.lamport_clock(),
+                local,
+                "{label}: the clock must not move"
+            );
+            assert_eq!(svc.directive_count(), count, "{label}: nothing inserted");
+        }
+
+        svc.stage_remote_directive(remote_open(
+            "Assets:Within",
+            date,
+            local + MAX_LAMPORT_ADVANCE - 1,
+        ))
+        .unwrap()
+        .expect("inserted");
+        assert_eq!(
+            svc.lamport_clock(),
+            local + MAX_LAMPORT_ADVANCE,
+            "the largest single advance is exactly 2^32"
+        );
+
+        // State-dependent: both refusals are acceptable now.
+        svc.stage_remote_directive(over).unwrap().expect("inserted");
+        svc.stage_remote_directive(exact)
+            .unwrap()
+            .expect("inserted");
+        std::fs::remove_file(path).ok();
+    }
+
+    /// T63 (H-12): the file path (reconcile, and boot's operator input, which
+    /// shares `adopt_file_directive`) applies the same rule and the same
+    /// ratchet. Pasting a peer's directive into the `.bean` is not a way round
+    /// either.
+    #[test]
+    fn test_adoption_ratchet_and_rule_apply_to_the_file_path() {
+        let (mut svc, path) = boot_with_history_at(1_000, "test-peer");
+        let local = svc.lamport_clock();
+        let paste = |svc: &mut LedgerService, account: &str, lamport: u64| {
+            let mut text = std::fs::read_to_string(&path).unwrap();
+            text.push_str(&format!(
+                "\n2024-01-01 open {account}\n  openledger-author: \"peer-remote\"\n  \
+                 openledger-lamport: \"{lamport}\"\n"
+            ));
+            std::fs::write(&path, text).unwrap();
+            svc.reconcile_file().unwrap()
+        };
+
+        for (account, lamport) in [
+            ("Assets:Over", local + MAX_LAMPORT_ADVANCE),
+            // Legal on no path since T63; the file path used to accept it,
+            // because it bounded `max(local, incoming)` with `>= CEILING`.
+            ("Assets:Ceiling", LAMPORT_CEILING - 1),
+        ] {
+            let result = paste(&mut svc, account, lamport);
+            assert_eq!(result.rejected, 1, "{account}");
+            assert_eq!(result.new_directives, 0, "{account}");
+            assert_eq!(
+                svc.lamport_clock(),
+                local,
+                "{account}: the clock must not move"
+            );
+        }
+
+        let result = paste(&mut svc, "Assets:Within", local + MAX_LAMPORT_ADVANCE - 1);
+        assert_eq!(result.new_directives, 1);
+        assert_eq!(svc.lamport_clock(), local + MAX_LAMPORT_ADVANCE - 1);
+        std::fs::remove_file(path).ok();
+
+        // The RULE alone, with the ratchet out of the way (a clock within one
+        // step of the ceiling): `CEILING - 1` is refused, `CEILING - 2` is the
+        // largest value the file path adopts — the same bound as the wire.
+        let (mut svc, near_path) = boot_with_history_at(NEAR_CEILING, "test-peer");
+        let local = svc.lamport_clock();
+        let mut paste_near = |account: &str, lamport: u64| {
+            let mut text = std::fs::read_to_string(&near_path).unwrap();
+            text.push_str(&format!(
+                "\n2024-01-01 open {account}\n  openledger-author: \"peer-remote\"\n  \
+                 openledger-lamport: \"{lamport}\"\n"
+            ));
+            std::fs::write(&near_path, text).unwrap();
+            svc.reconcile_file().unwrap()
+        };
+        let result = paste_near("Assets:Ceiling", LAMPORT_CEILING - 1);
+        assert_eq!((result.rejected, result.new_directives), (1, 0));
+        let result = paste_near("Assets:Last", LAMPORT_CEILING - 2);
+        assert_eq!((result.rejected, result.new_directives), (0, 1));
+        assert!(svc.lamport_clock() > local);
+        assert_eq!(svc.lamport_clock(), LAMPORT_CEILING - 2);
+        std::fs::remove_file(near_path).ok();
+    }
+
+    /// T63 (H-12 fact 3): boot's clock counts every directive in the DAG, and
+    /// a directive kept OUT of the DAG only when it is this node's own. A
+    /// quarantined foreign directive at `CEILING - 2` used to set the clock —
+    /// and, the quarantine being written back by every compaction, set it on
+    /// every boot forever. This node's own quarantined record still counts,
+    /// or its `(author, lamport)` pair could be re-issued (M-18).
+    #[test]
+    fn test_boot_clock_counts_quarantined_directives_only_when_own() {
+        let date = make_date(2024, 1, 1);
+        let quarantined = |author: &str, lamport: u64| {
+            // An uppercase-hex parent: refused by L-29's form check, so boot
+            // quarantines it.
+            let mut directive = flood_transaction(author, 0, &"A".repeat(64));
+            directive_metadata_mut(&mut directive)
+                .insert("openledger-lamport".to_owned(), lamport.to_string());
+            directive
+        };
+        for (author, lamport, expected_clock) in [
+            ("peer-remote", LAMPORT_CEILING - 2, 6),
+            ("test-peer", 1_000, 1_001),
+        ] {
+            let path = test_file_path();
+            let file = full_file_serialize(
+                &[
+                    remote_open("Assets:Cash", date, 4),
+                    remote_open("Equity:Opening", date, 5),
+                    quarantined(author, lamport),
+                ],
+                &[],
+            );
+            std::fs::write(&path, file).unwrap();
+            let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+            assert_eq!(svc.quarantined_count(), 1, "{author}");
+            assert_eq!(svc.lamport_clock(), expected_clock, "{author}");
+            svc.open_account("Assets:Later".to_owned(), date, vec![])
+                .unwrap_or_else(|error| panic!("{author}: authoring must work: {error}"));
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    /// T63's fresh-join decision, pinned. The ratchet is relative to the LOCAL
+    /// clock with no first-contact exemption; a node with clock 0 must still
+    /// converge with a mesh whose history reaches lamport 10^9, receiving the
+    /// highest directive first.
+    #[test]
+    fn test_fresh_node_converges_with_a_history_reaching_1e9() {
+        let date = make_date(2024, 1, 1);
+        let (mut source, source_path) = setup_with_accounts();
+        for (index, lamport) in [1_000, 1_000_000, 500_000_000, 1_000_000_000]
+            .into_iter()
+            .enumerate()
+        {
+            source
+                .stage_remote_directive(remote_open(&format!("Assets:Mesh{index}"), date, lamport))
+                .unwrap()
+                .expect("inserted");
+        }
+        for day in 16..19 {
+            let mut input = balanced_input();
+            input.date = make_date(2024, 1, day);
+            source.append_transaction(input).unwrap();
+        }
+        assert!(source.lamport_clock() > 1_000_000_000);
+
+        // Non-transactions highest-lamport first, then transactions in the
+        // order their parents allow (anti-entropy buffers an orphan until its
+        // parents arrive, so it never stages one out of order).
+        let mut others: Vec<Directive> = Vec::new();
+        let mut transactions: Vec<Directive> = Vec::new();
+        for directive in source.dag().directives() {
+            match directive {
+                Directive::Transaction(_) => transactions.push(directive.clone()),
+                _ => others.push(directive.clone()),
+            }
+        }
+        others.sort_by_key(|directive| std::cmp::Reverse(directive.lamport_clock()));
+        transactions.sort_by_key(Directive::lamport_clock);
+        assert_eq!(others[0].lamport_clock(), Some(1_000_000_000));
+
+        let (mut fresh, fresh_path) = boot_empty();
+        assert_eq!(fresh.lamport_clock(), 0);
+        for directive in others.into_iter().chain(transactions) {
+            let lamport = directive.lamport_clock();
+            fresh
+                .stage_remote_directive(directive)
+                .unwrap_or_else(|error| panic!("fresh node refused lamport {lamport:?}: {error}"))
+                .expect("inserted");
+        }
+        assert_eq!(fresh.directive_count(), source.directive_count());
+        assert!(fresh.lamport_clock() > source.lamport_clock() - 1);
+
+        // And the joined node's own writes replicate back.
+        let id = fresh
+            .open_account("Assets:Joined".to_owned(), date, vec![])
+            .unwrap();
+        source
+            .stage_remote_directive(fresh.get_directive(&id).unwrap().clone())
+            .unwrap()
+            .expect("the mesh accepts the new node's directive");
+
+        std::fs::remove_file(source_path).ok();
+        std::fs::remove_file(fresh_path).ok();
+    }
+
+    /// T63: why the ratchet needs no first-contact exemption even for a history
+    /// whose TOTAL exceeds 2^32. The refusal is not permanent (the node's
+    /// refusal cache does not keep it), so each anti-entropy round re-offers
+    /// what was refused, and the clock climbs through the history.
+    #[test]
+    fn test_ratchet_refusal_is_retried_and_a_stepped_history_converges() {
+        let date = make_date(2024, 1, 1);
+        let steps: [u64; 4] = [3_000_000_000, 6_000_000_000, 9_000_000_000, 12_000_000_000];
+        let mut pending: Vec<Directive> = steps
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(index, lamport)| remote_open(&format!("Assets:Step{index}"), date, *lamport))
+            .collect();
+
+        let (mut fresh, path) = boot_empty();
+        let mut rounds = 0;
+        while !pending.is_empty() {
+            rounds += 1;
+            assert!(
+                rounds <= steps.len(),
+                "must converge, one step per round at worst"
+            );
+            let mut refused = Vec::new();
+            for directive in pending {
+                match fresh.stage_remote_directive(directive.clone()) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => panic!("nothing here is a duplicate"),
+                    Err(error) => {
+                        assert_eq!(error.error_code(), "LAMPORT_ADVANCE");
+                        refused.push(directive);
+                    }
+                }
+            }
+            pending = refused;
+        }
+        assert_eq!(rounds, 4);
+        assert_eq!(fresh.lamport_clock(), 12_000_000_001);
+        std::fs::remove_file(path).ok();
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+
+        /// T63 property: from any legal clock, no ingest path — peer staging,
+        /// file adoption, local authoring — moves the clock past
+        /// `LAMPORT_CEILING - 1`, or by more than `MAX_LAMPORT_ADVANCE` in one
+        /// step, and every value stamped is legal.
+        #[test]
+        fn prop_no_ingest_path_breaks_the_lamport_rule(
+            start in 0..LAMPORT_CEILING,
+            operations in proptest::collection::vec(
+                (0u8..3, proptest::prop_oneof![
+                    proptest::prelude::any::<u64>(),
+                    (LAMPORT_CEILING - 8)..=(LAMPORT_CEILING + 8),
+                    0u64..16,
+                    (MAX_LAMPORT_ADVANCE - 4)..=(MAX_LAMPORT_ADVANCE + 4),
+                    (2 * MAX_LAMPORT_ADVANCE - 4)..=(2 * MAX_LAMPORT_ADVANCE + 4),
+                ], proptest::prelude::any::<bool>()),
+                1..24,
+            ),
+        ) {
+            let (mut svc, path) = boot_empty();
+            svc.lamport_clock = start;
+            let date = make_date(2024, 1, 1);
+            for (index, (kind, raw, relative)) in operations.into_iter().enumerate() {
+                let before = svc.lamport_clock();
+                // Half the values are offsets from the clock, so the ratchet's
+                // boundary is actually exercised.
+                let value = if relative { before.saturating_add(raw) } else { raw };
+                let account = format!("Assets:P{index}");
+                match kind {
+                    0 => {
+                        let _ = svc.stage_remote_directive(remote_open(&account, date, value));
+                    }
+                    1 => {
+                        let directive = remote_open(&account, date, value);
+                        let content_id = compute_content_id(&directive);
+                        let mut tally = AdoptionTally::default();
+                        let _ = svc.adopt_file_directive(directive, content_id, &mut tally);
+                    }
+                    _ => {
+                        if let Ok(id) = svc.open_account(account, date, vec![]) {
+                            let stamped = svc.get_directive(&id).unwrap().lamport_clock().unwrap();
+                            proptest::prop_assert!(lamport_value_is_legal(stamped));
+                            proptest::prop_assert_eq!(stamped, before + 1);
+                        }
+                    }
+                }
+                let after = svc.lamport_clock();
+                proptest::prop_assert!(after >= before);
+                proptest::prop_assert!(
+                    after <= before.max(LAMPORT_CEILING - 1),
+                    "clock {} past CEILING - 1 from {}", after, before
+                );
+                proptest::prop_assert!(
+                    after - before <= MAX_LAMPORT_ADVANCE,
+                    "clock advanced {} in one step", after - before
+                );
+            }
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    /// H-17 (T65): `enforce_resource_limits` applies the amount cap to the
+    /// non-transaction kinds, so a library caller's in-memory `balance` with an
+    /// over-cap amount — which never passed the parser — is refused by
+    /// `stage_remote_directive` rather than stored.
+    #[test]
+    fn test_h17_remote_balance_with_over_cap_amount_is_refused() {
+        let (mut svc, path) = setup_with_accounts();
+        let directive = Directive::Balance(Balance {
+            date: make_date(2024, 2, 1),
+            account: "Assets:Cash".to_owned(),
+            amount: Amount {
+                number: rust_decimal::Decimal::MAX,
+                currency: "USD".to_owned(),
+            },
+            metadata: remote_envelope(9),
+        });
+        let count = svc.directive_count();
+        let error = svc.stage_remote_directive(directive).unwrap_err();
+        assert!(error.to_string().contains("H-17"), "{error}");
+        assert_eq!(error.error_code(), "RESOURCE_LIMIT_EXCEEDED");
+        assert_eq!(svc.directive_count(), count);
+        std::fs::remove_file(path).ok();
+    }
+
+    // ── H-16 / T64: bounded parent choice, per-author head bound ─────────
+
+    /// A valid remote transaction by `author` naming `parents` (comma-joined),
+    /// distinct per `index` so every one is a new content id.
+    fn flood_transaction(author: &str, index: usize, parents: &str) -> Directive {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("openledger-author".to_owned(), author.to_owned());
+        metadata.insert("openledger-lamport".to_owned(), (10 + index).to_string());
+        metadata.insert("openledger-parents".to_owned(), parents.to_owned());
+        let posting = |account: &str, number| Posting {
+            account: account.to_owned(),
+            amount: Some(Amount {
+                number,
+                currency: "USD".to_owned(),
+            }),
+            cost: None,
+            price: None,
+            metadata: BTreeMap::new(),
+        };
+        Directive::Transaction(Transaction {
+            date: make_date(2024, 1, 16),
+            flag: Flag::Complete,
+            payee: None,
+            narration: Some(format!("{author} {index}")),
+            tags: vec![],
+            links: vec![],
+            postings: vec![
+                posting("Assets:Cash", dec!(1)),
+                posting("Equity:Opening", dec!(-1)),
+            ],
+            metadata,
+        })
+    }
+
+    /// Stage the H-16 flood: `MAX_UNMERGED_HEADS_PER_AUTHOR` parentless
+    /// transactions from `peer-a` (all it may plant) and one from `peer-b`, so
+    /// the head set is `MAX_PARENTS + 1` — the audit's 257.
+    fn stage_parentless_flood(svc: &mut LedgerService) -> Vec<Directive> {
+        let mut flood = Vec::new();
+        for index in 0..MAX_UNMERGED_HEADS_PER_AUTHOR {
+            flood.push(flood_transaction("peer-a", index, ""));
+        }
+        flood.push(flood_transaction("peer-b", 0, ""));
+        for directive in &flood {
+            svc.stage_remote_directive(directive.clone())
+                .unwrap()
+                .expect("inserted");
+        }
+        assert_eq!(svc.head_count(), MAX_PARENTS + 1);
+        flood
+    }
+
+    /// Manifest item 5 (T64 / H-16). `MAX_PARENTS + 1` parentless remote
+    /// transactions, then a local append: the append names at most
+    /// `MAX_PARENTS` parents (the smallest), passes the fan-in check every peer
+    /// applies, is accepted by a second service, and survives a reboot —
+    /// nothing quarantined, the victim's own posting still in its balances.
+    #[test]
+    fn test_h16_parentless_flood_cannot_make_a_local_append_over_cap() {
+        let (mut svc, path) = setup_with_accounts();
+        let flood = stage_parentless_flood(&mut svc);
+        let mut heads: Vec<String> = svc.head_txids().into_iter().collect();
+        heads.sort();
+
+        let outcome = svc.append_transaction(balanced_input()).unwrap();
+        let appended = svc.get_directive(&outcome.txid).unwrap().clone();
+        let Directive::Transaction(transaction) = &appended else {
+            panic!("an append stores a transaction")
+        };
+        validate_parent_fan_in(&appended).expect("every peer's fan-in check passes");
+        let parents: Vec<String> = transaction
+            .parent_ids()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(parents.len(), MAX_PARENTS);
+        assert_eq!(
+            parents,
+            heads[..MAX_PARENTS].to_vec(),
+            "the MAX_PARENTS lexicographically smallest heads, sorted"
+        );
+        assert_eq!(
+            svc.head_count(),
+            2,
+            "the appended one plus the one left over"
+        );
+        svc.persist_or_reload().unwrap();
+
+        // A second service holding the same history accepts it.
+        let (mut peer, peer_path) = setup_with_accounts();
+        for directive in &flood {
+            peer.stage_remote_directive(directive.clone()).unwrap();
+        }
+        peer.stage_remote_directive(appended)
+            .unwrap()
+            .expect("the peer accepts the victim's append");
+
+        // Reboot quarantines nothing, and the victim's own posting stays.
+        drop(svc);
+        let rebooted = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert_eq!(rebooted.quarantined_count(), 0);
+        assert!(rebooted.get_directive(&outcome.txid).is_some());
+        assert_eq!(rebooted.head_count(), 2);
+
+        // The leftover head is merged by the next append.
+        let mut rebooted = rebooted;
+        let mut input = balanced_input();
+        input.date = make_date(2024, 1, 17);
+        rebooted.append_transaction(input).unwrap();
+        assert_eq!(rebooted.head_count(), 1);
+
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(peer_path).ok();
+    }
+
+    /// T64 / H-16: the per-author bound — the 257th unmerged head from one
+    /// author is refused, the 256th admitted; the honest shapes always pass.
+    #[test]
+    fn test_h16_unmerged_head_bound_is_per_author_and_admits_honest_shapes() {
+        let (mut svc, path) = boot_empty();
+        // A peer's normal parentless genesis on an empty ledger.
+        let date = make_date(2024, 1, 1);
+        svc.stage_remote_directive(remote_open("Assets:Cash", date, 1))
+            .unwrap();
+        svc.stage_remote_directive(remote_open("Equity:Opening", date, 2))
+            .unwrap();
+        svc.stage_remote_directive(flood_transaction("peer-a", 0, ""))
+            .unwrap()
+            .expect("a genesis on an empty ledger is admitted");
+
+        for index in 1..MAX_UNMERGED_HEADS_PER_AUTHOR {
+            svc.stage_remote_directive(flood_transaction("peer-a", index, ""))
+                .unwrap()
+                .unwrap_or_else(|| panic!("head #{} is within the bound", index + 1));
+        }
+        assert_eq!(svc.head_count(), MAX_UNMERGED_HEADS_PER_AUTHOR);
+
+        // The 257th: refused, nothing moves.
+        let clock = svc.lamport_clock();
+        let over = flood_transaction("peer-a", MAX_UNMERGED_HEADS_PER_AUTHOR, "");
+        let error = svc.stage_remote_directive(over.clone()).unwrap_err();
+        assert_eq!(error.error_code(), "UNMERGED_HEAD_LIMIT");
+        assert!(error.to_string().contains("peer-a"), "{error}");
+        assert_eq!(svc.lamport_clock(), clock);
+        assert_eq!(svc.head_count(), MAX_UNMERGED_HEADS_PER_AUTHOR);
+
+        // Naming a current head is always admitted — even at the bound.
+        let a_head = svc.head_txids().into_iter().min().unwrap();
+        svc.stage_remote_directive(flood_transaction("peer-a", 1_000, &a_head))
+            .unwrap()
+            .expect("naming a current head replaces it");
+        assert_eq!(svc.head_count(), MAX_UNMERGED_HEADS_PER_AUTHOR);
+
+        // Per author: another author's parentless transaction is admitted.
+        svc.stage_remote_directive(flood_transaction("peer-b", 0, ""))
+            .unwrap()
+            .expect("peer-b owns no heads");
+
+        // State-dependent: once a local append merges peer-a's heads, the
+        // refused transaction is admissible.
+        svc.append_transaction(balanced_input()).unwrap();
+        svc.stage_remote_directive(over)
+            .unwrap()
+            .expect("admissible once the author's heads are merged");
+
+        std::fs::remove_file(path).ok();
+    }
+
+    /// T64: the file path's parent stamp (reconcile, and boot's operator input)
+    /// shares `choose_parents`, so a hand-typed transaction on a flooded ledger
+    /// is capped too — it is signed and served like a local append.
+    #[test]
+    fn test_h16_file_adoption_caps_stamped_parents() {
+        let (mut svc, path) = setup_with_accounts();
+        stage_parentless_flood(&mut svc);
+        svc.persist_or_reload().unwrap();
+
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(
+            "\n2024-01-20 * \"hand typed\"\n  Assets:Cash  2 USD\n  Equity:Opening  -2 USD\n",
+        );
+        std::fs::write(&path, text).unwrap();
+        let result = svc.reconcile_file().unwrap();
+        assert_eq!(result.new_directives, 1);
+
+        let adopted = svc
+            .dag()
+            .directives()
+            .into_iter()
+            .find(|directive| {
+                matches!(directive, Directive::Transaction(transaction)
+                    if transaction.narration.as_deref() == Some("hand typed"))
+            })
+            .unwrap()
+            .clone();
+        validate_parent_fan_in(&adopted).expect("capped at MAX_PARENTS");
+        let Directive::Transaction(transaction) = &adopted else {
+            unreachable!()
+        };
+        assert_eq!(transaction.parent_ids().len(), MAX_PARENTS);
+
+        drop(svc);
+        let rebooted = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert_eq!(rebooted.quarantined_count(), 0);
         std::fs::remove_file(path).ok();
     }
 
@@ -11782,6 +13613,751 @@ mod tests {
         let after = svc.sorted_directive_ids();
         assert_eq!(after.len(), before.len() - 1);
         assert!(after.iter().all(|id| svc.contains_directive(id)));
+        remove_ledger_and_journal(&path);
+    }
+
+    // ── T61 / T62: one file path; recovery never installs an emptier ledger ──
+
+    /// `balanced_input` with its own date and narration, so several distinct
+    /// transactions can be authored from one fixture.
+    fn narrated_input(date: NaiveDate, narration: &str) -> TransactionInput {
+        TransactionInput {
+            date,
+            narration: Some(narration.to_owned()),
+            ..balanced_input()
+        }
+    }
+
+    fn transaction_named<'a>(svc: &'a LedgerService, narration: &str) -> Option<&'a Directive> {
+        svc.dag()
+            .directives()
+            .into_iter()
+            .find(|directive| match directive {
+                Directive::Transaction(txn) => txn.narration.as_deref() == Some(narration),
+                _ => false,
+            })
+    }
+
+    /// A hand-typed transaction with no envelope on accounts
+    /// `setup_with_accounts` opened — the stop-edit-start shape.
+    const OFFLINE_HAND_EDIT: &str = "\n2024-01-20 * \"Hand\" \"Offline edit\"\n  \
+         Assets:Cash                                        250.00 USD\n  \
+         Equity:Opening                                    -250.00 USD\n";
+
+    /// A hand-typed transaction on an account that was never opened.
+    const HAND_EDIT_ON_UNOPENED_ACCOUNT: &str = "\n2024-02-01 * \"Hand\" \"unopened\"\n  \
+         Assets:Vault                                       250.00 USD\n  \
+         Equity:Opening                                    -250.00 USD\n";
+
+    /// Manifest item 1 (H-13): the README's stop → edit → start workflow. The
+    /// hand-typed record carries this node's author, lamport, parents and
+    /// signature after boot + identity + startup compaction, a second service
+    /// accepts it through the peer path, and the node's next transaction
+    /// descends from a record every peer can verify.
+    ///
+    /// Bug-catch: revert the operator-input split in `boot` (load
+    /// envelope-less directives as history again) and the metadata is `{}`.
+    #[test]
+    fn h13_a_stop_edit_start_hand_edit_is_adopted_signed_and_accepted_by_a_peer() {
+        let (mut svc, path) = setup_with_accounts();
+        svc.set_signer(marker_signer());
+        svc.compact().unwrap();
+        drop(svc);
+
+        // The node is stopped; the operator appends by hand.
+        append_to_file(&path, OFFLINE_HAND_EDIT);
+
+        // The node starts: boot, then — as `gl-node` does — identity, then the
+        // startup compaction.
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert_eq!(svc.unsigned_operator_input_count(), 1);
+        assert_eq!(
+            svc.directive_count(),
+            4,
+            "adopted at boot: visible to every post-boot reader immediately"
+        );
+        svc.set_signer(marker_signer());
+        assert_eq!(svc.finalize_operator_input(), 1);
+        assert_eq!(svc.unsigned_operator_input_count(), 0);
+        svc.compact().unwrap();
+
+        let adopted = transaction_named(&svc, "Offline edit")
+            .expect("the hand-typed transaction is in the DAG")
+            .clone();
+        let stored_id = compute_content_id(&adopted);
+        let metadata = adopted.metadata();
+        assert_eq!(
+            metadata.get("openledger-author"),
+            Some(&"test-peer".to_owned()),
+            "H-13: this node's author id"
+        );
+        let lamport = metadata
+            .get("openledger-lamport")
+            .expect("H-13: a lamport value");
+        let parents = metadata
+            .get("openledger-parents")
+            .expect("H-13: a parents line");
+        let signature = metadata
+            .get("openledger-signature")
+            .expect("H-13: signed as this node's own before the first persist");
+        assert_eq!(
+            signature,
+            &format!("sig({stored_id}|true|{parents}|{lamport})"),
+            "the signature covers exactly the envelope boot stamped"
+        );
+
+        // On disk in canonical form, envelope included.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        let block = on_disk
+            .split("\n\n")
+            .find(|block| block.contains("Offline edit"))
+            .expect("the record is in the file");
+        assert!(block.contains(&format!("openledger-signature: \"{signature}\"")));
+        assert!(block.contains("openledger-author: \"test-peer\""));
+
+        // A restart reads it as history: nothing left to finalise.
+        let rebooted = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert_eq!(rebooted.unsigned_operator_input_count(), 0);
+        assert_eq!(rebooted.directive_count(), 4);
+
+        // A second service accepts it through the peer path.
+        let (mut peer, peer_path) = boot_empty();
+        peer.stage_remote_directive(remote_open("Assets:Cash", make_date(2024, 1, 1), 1))
+            .unwrap();
+        peer.stage_remote_directive(remote_open("Equity:Opening", make_date(2024, 1, 1), 2))
+            .unwrap();
+        let accepted = peer
+            .stage_remote_directive(adopted.clone())
+            .expect("H-13: a peer must accept the adopted record");
+        assert_eq!(accepted.as_deref(), Some(stored_id.as_str()));
+
+        // The node's next transaction names it as a parent — which is now fine.
+        let next = svc.append_transaction(balanced_input()).unwrap();
+        let next_parents = svc
+            .get_directive(&next.txid)
+            .unwrap()
+            .metadata()
+            .get("openledger-parents")
+            .cloned()
+            .unwrap();
+        assert!(next_parents.contains(&stored_id));
+
+        remove_ledger_and_journal(&path);
+        remove_ledger_and_journal(&peer_path);
+    }
+
+    /// H-13: operator input the adoption refuses at boot is quarantined —
+    /// kept in the file, kept out of the DAG, never loaded raw — and a repair
+    /// followed by a restart adopts it.
+    #[test]
+    fn h13_operator_input_boot_refuses_is_quarantined_not_dropped_and_not_loaded() {
+        let (svc, path) = setup_with_accounts();
+        drop(svc);
+        append_to_file(&path, HAND_EDIT_ON_UNOPENED_ACCOUNT);
+
+        let (booted, logged) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "test-peer".to_owned()));
+        let mut svc = booted.unwrap();
+        assert!(
+            transaction_named(&svc, "unopened").is_none(),
+            "a transaction on an unopened account must not be loaded raw"
+        );
+        assert!(!svc.accounts().is_open("Assets:Vault"));
+        assert_eq!(svc.quarantined_count(), 1);
+        assert_eq!(svc.unsigned_operator_input_count(), 0);
+        assert!(logged.contains("QUARANTINED"), "{logged}");
+
+        svc.set_signer(marker_signer());
+        svc.finalize_operator_input();
+        svc.compact().unwrap();
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("unopened"),
+            "boot never drops what it read"
+        );
+
+        // Repair by hand, restart: the open sorts first, the transaction adopts.
+        append_to_file(&path, "\n2024-01-01 open Assets:Vault USD\n");
+        let (rebooted, _) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "test-peer".to_owned()));
+        let rebooted = rebooted.unwrap();
+        assert!(transaction_named(&rebooted, "unopened").is_some());
+        assert_eq!(rebooted.quarantined_count(), 0);
+        assert_eq!(rebooted.unsigned_operator_input_count(), 2);
+
+        remove_ledger_and_journal(&path);
+    }
+
+    /// H-13: an L-13 reload before the startup compaction re-derives the
+    /// operator input and `finish_recovery` finalises it with the carried
+    /// signer, so the caller's next commit still writes it signed.
+    #[test]
+    fn h13_a_reload_before_the_first_compaction_re_signs_the_operator_input() {
+        let (svc, path) = setup_with_accounts();
+        drop(svc);
+        append_to_file(&path, OFFLINE_HAND_EDIT);
+
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.set_signer(marker_signer());
+        // Not finalised yet — and a commit fails before the startup compaction.
+        let (_, logged) = capture_warnings(|| svc.recover_failed_commit());
+        assert!(logged.contains("L-13 reload installed"), "{logged}");
+        assert_eq!(svc.unsigned_operator_input_count(), 0);
+        let adopted = transaction_named(&svc, "Offline edit").unwrap();
+        assert!(
+            adopted.metadata().contains_key("openledger-signature"),
+            "finish_recovery must finalise the re-derived operator input"
+        );
+        svc.compact().unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("openledger-signature"));
+        remove_ledger_and_journal(&path);
+    }
+
+    /// Manifest item 2 (H-14): a failed reconcile is followed by a write that
+    /// returns `PARSE_ERROR` and leaves both hand-written lines on disk — on
+    /// both sides of `COMPACTION_MIN_CANONICAL_BYTES`.
+    ///
+    /// Bug-catch: move the `last_file_hash`/marker assignments in
+    /// `reconcile_content` back above the parse and the write succeeds and
+    /// the file loses both lines.
+    #[test]
+    fn h14_a_failed_reconcile_leaves_the_edit_on_disk_and_blocks_the_next_write() {
+        // Below the threshold: every commit is a compaction.
+        let (mut svc, path) = setup_with_accounts();
+        svc.compact().unwrap();
+        let canonical = std::fs::read_to_string(&path).unwrap();
+        let edited = format!("{canonical}\n2024-02-01 open Assets:New USD\n\n2024-03-03 open\n");
+        std::fs::write(&path, &edited).unwrap();
+
+        let (result, _) = capture_warnings(|| svc.reconcile_file_staged());
+        assert_eq!(result.unwrap_err().error_code(), "PARSE_ERROR");
+        let (outcome, _) = capture_warnings(|| svc.append_transaction(balanced_input()));
+        assert_eq!(
+            outcome.unwrap_err().error_code(),
+            "PARSE_ERROR",
+            "H-14: the next write must be refused, not canonicalised over the edit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            edited,
+            "both hand-written lines survive, byte for byte"
+        );
+        assert!(!svc.accounts().is_open("Assets:New"));
+        remove_ledger_and_journal(&path);
+
+        // Above the threshold: the append path, with a journal outstanding.
+        let (mut svc, path) = boot_large_ledger();
+        svc.stage_remote_directive(remote_open("Assets:Journaled", make_date(2024, 3, 1), 10))
+            .unwrap();
+        svc.persist_or_reload().unwrap();
+        assert!(
+            svc.journal_bytes() > 0,
+            "the fixture must be on the append path"
+        );
+        let canonical = std::fs::read_to_string(&path).unwrap();
+        let edited = format!("{canonical}\n2024-02-01 open Assets:New USD\n\n2024-03-03 open\n");
+        std::fs::write(&path, &edited).unwrap();
+
+        let (result, _) = capture_warnings(|| svc.reconcile_file_staged());
+        assert_eq!(result.unwrap_err().error_code(), "PARSE_ERROR");
+        svc.stage_remote_directive(remote_open("Assets:After", make_date(2024, 3, 2), 11))
+            .unwrap();
+        let (outcome, _) = capture_warnings(|| svc.persist_or_reload());
+        assert_eq!(outcome.unwrap_err().error_code(), "PARSE_ERROR");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        assert!(!svc.accounts().is_open("Assets:New"));
+        remove_ledger_and_journal(&path);
+    }
+
+    /// M-37(a), the `e1b`/`e12` shape: a refused hand edit is NOT loaded raw
+    /// by a recovery boot after a failed write; the refusal is stable until
+    /// the file is repaired; and after the repair the entry is refused by the
+    /// reconcile's own I3 check rather than loaded.
+    ///
+    /// Bug-catch: put the `recover_failed_commit` back on the `Parse` arm of
+    /// `commit_inline` and the hand-typed transaction is in the DAG after the
+    /// first failed write.
+    #[test]
+    fn m37a_a_refused_hand_edit_is_not_loaded_raw_by_a_failed_write() {
+        let (mut svc, path) = setup_with_accounts();
+        svc.set_signer(marker_signer());
+        svc.compact().unwrap();
+        let canonical = std::fs::read_to_string(&path).unwrap();
+        let edited = format!("{canonical}{HAND_EDIT_ON_UNOPENED_ACCOUNT}\n2024-03-03 open\n");
+        std::fs::write(&path, &edited).unwrap();
+
+        let (outcome, _) = capture_warnings(|| svc.append_transaction(balanced_input()));
+        assert_eq!(outcome.unwrap_err().error_code(), "PARSE_ERROR");
+        assert!(
+            transaction_named(&svc, "unopened").is_none(),
+            "M-37(a): the hand-typed transaction must not be loaded raw by a recovery boot"
+        );
+        assert!(!svc.accounts().is_open("Assets:Vault"));
+
+        // Stable: refused again, file untouched.
+        let (outcome, _) = capture_warnings(|| svc.append_transaction(balanced_input()));
+        assert_eq!(outcome.unwrap_err().error_code(), "PARSE_ERROR");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+
+        // Repair the broken line. The write goes through; the transaction on
+        // the unopened account is refused by the reconcile and dropped.
+        std::fs::write(&path, format!("{canonical}{HAND_EDIT_ON_UNOPENED_ACCOUNT}")).unwrap();
+        let (outcome, logged) = capture_warnings(|| svc.append_transaction(balanced_input()));
+        outcome.expect("after the repair the write goes through");
+        assert!(logged.contains("will drop them from the file"), "{logged}");
+        assert!(transaction_named(&svc, "unopened").is_none());
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("Funding"));
+        assert!(!on_disk.contains("Assets:Vault"));
+        remove_ledger_and_journal(&path);
+    }
+
+    /// M-37(b), the `e13` shape: a rejected-ONLY hand edit arms the compaction
+    /// the L-12 warning promises, the rewrite drops it from the file, and the
+    /// next boot cannot load it.
+    ///
+    /// Bug-catch: revert `rejected > 0` in `reconcile_file_staged` /
+    /// `reconcile_file` and `compaction_pending()` is false / the entry stays
+    /// on disk.
+    #[test]
+    fn m37b_a_rejected_only_hand_edit_is_dropped_by_the_re_persist() {
+        let (mut svc, path) = setup_with_accounts();
+        svc.compact().unwrap();
+
+        // The watcher's half: stage, then the commit the node drives.
+        append_to_file(&path, HAND_EDIT_ON_UNOPENED_ACCOUNT);
+        let (result, logged) = capture_warnings(|| svc.reconcile_file_staged());
+        let result = result.unwrap();
+        assert_eq!((result.new_directives, result.rejected), (0, 1));
+        assert!(logged.contains("will drop them from the file"));
+        assert!(
+            svc.compaction_pending(),
+            "M-37(b): a rejected-only reconcile must arm the compaction its warning promises"
+        );
+        svc.compact().unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("unopened"));
+
+        // The inline form does it by itself.
+        append_to_file(&path, HAND_EDIT_ON_UNOPENED_ACCOUNT);
+        let (result, _) = capture_warnings(|| svc.reconcile_file());
+        assert_eq!(result.unwrap().rejected, 1);
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("unopened"));
+
+        let rebooted = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert!(transaction_named(&rebooted, "unopened").is_none());
+        assert!(!rebooted.accounts().is_open("Assets:Vault"));
+        remove_ledger_and_journal(&path);
+    }
+
+    /// M-38, the `e3` shape: a reconcile over a file holding a planted parent
+    /// cycle keeps BOTH members quarantined, `heads` excludes them, the
+    /// node's own next transaction does not descend from either, and the next
+    /// boot does not quarantine that transaction.
+    ///
+    /// Bug-catch: drop the Kahn pre-scan from `reconcile_content` and one
+    /// member leaks into the DAG (quarantine shrinks to one).
+    #[test]
+    fn m38_a_reconcile_keeps_both_members_of_a_planted_cycle_quarantined() {
+        let (mut svc, path) = setup_with_accounts();
+        let a = svc
+            .append_transaction(narrated_input(make_date(2024, 2, 1), "A"))
+            .unwrap()
+            .txid;
+        let b = svc
+            .append_transaction(narrated_input(make_date(2024, 2, 2), "B"))
+            .unwrap()
+            .txid;
+        drop(svc);
+
+        // Plant the cycle: A's parents := B (B already names A).
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut planted = String::new();
+        let mut in_a = false;
+        for line in text.lines() {
+            if !line.starts_with(' ') && !line.is_empty() {
+                in_a = line.contains("\"A\"");
+            }
+            if in_a && line.trim_start().starts_with("openledger-parents:") {
+                planted.push_str(&format!("  openledger-parents: \"{b}\"\n"));
+            } else {
+                planted.push_str(line);
+                planted.push('\n');
+            }
+        }
+        std::fs::write(&path, &planted).unwrap();
+
+        let (booted, _) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "test-peer".to_owned()));
+        let mut svc = booted.unwrap();
+        let mut quarantined: Vec<String> = svc
+            .quarantined_ids()
+            .iter()
+            .map(|id| (*id).to_owned())
+            .collect();
+        quarantined.sort();
+        let mut expected = vec![a.clone(), b.clone()];
+        expected.sort();
+        assert_eq!(quarantined, expected, "boot quarantines both members");
+        let (_, _) = capture_warnings(|| svc.compact().unwrap());
+
+        // An unrelated hand edit triggers a reconcile.
+        append_to_file(&path, "\n2024-01-01 open Assets:Other USD\n");
+        let (result, _) = capture_warnings(|| svc.reconcile_file());
+        let result = result.unwrap();
+        assert_eq!(result.new_directives, 1);
+        let mut still: Vec<String> = svc
+            .quarantined_ids()
+            .iter()
+            .map(|id| (*id).to_owned())
+            .collect();
+        still.sort();
+        assert_eq!(still, expected, "M-38: the quarantine must stay {{A, B}}");
+        assert!(!svc.dag().heads().contains(&a) && !svc.dag().heads().contains(&b));
+
+        let c = svc
+            .append_transaction(narrated_input(make_date(2024, 3, 1), "C"))
+            .unwrap()
+            .txid;
+        let c_parents = svc
+            .get_directive(&c)
+            .unwrap()
+            .metadata()
+            .get("openledger-parents")
+            .cloned()
+            .unwrap();
+        assert!(
+            !c_parents.contains(&a) && !c_parents.contains(&b),
+            "the node's own transaction must not descend from a cycle member: {c_parents}"
+        );
+
+        let (rebooted, _) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "test-peer".to_owned()));
+        let rebooted = rebooted.unwrap();
+        assert!(
+            rebooted.get_directive(&c).is_some(),
+            "C must not be quarantined at the next boot"
+        );
+        assert_eq!(rebooted.quarantined_ids().len(), 2);
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-55: a reconcile entry that is rejected after the stamp point leaves
+    /// the Lamport clock exactly where it was, and the next authored envelope
+    /// continues from there.
+    ///
+    /// Bug-catch: move `self.lamport_clock = next_lamport` back above the
+    /// validation in `adopt_file_directive` and the clock jumps to 5000.
+    #[test]
+    fn l55_a_rejected_reconcile_entry_does_not_move_the_clock() {
+        let (mut svc, path) = setup_with_accounts();
+        svc.compact().unwrap();
+        let before = svc.lamport_clock();
+
+        append_to_file(
+            &path,
+            "\n2024-02-01 * \"Hand\" \"unbalanced\"\n  \
+             openledger-author: \"test-peer\"\n  \
+             openledger-lamport: \"5000\"\n  \
+             openledger-parents: \"\"\n  \
+             Assets:Cash                                        250.00 USD\n  \
+             Equity:Opening                                     -10.00 USD\n",
+        );
+        let (result, _) = capture_warnings(|| svc.reconcile_file());
+        assert_eq!(result.unwrap().rejected, 1);
+        assert_eq!(
+            svc.lamport_clock(),
+            before,
+            "L-55: a rejected entry must not move the clock"
+        );
+
+        let id = svc
+            .open_account("Assets:Next".to_owned(), make_date(2024, 3, 1), vec![])
+            .unwrap();
+        assert_eq!(
+            svc.get_directive(&id).unwrap().lamport_clock(),
+            Some(before + 1),
+            "the next authored envelope continues from the untouched clock"
+        );
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-62, the `e7` shape: a mid-file byte-order mark neither bricks boot
+    /// (as the file's only defect) nor loads the marked block (with another
+    /// broken block present); the block is held verbatim across compactions.
+    ///
+    /// Bug-catch: call `parse_file` instead of `parse_block` in the salvage
+    /// and (a) fails to boot while (b) opens `Assets:Bom`.
+    #[test]
+    fn l62_a_mid_file_byte_order_mark_boots_and_the_marked_block_is_not_loaded() {
+        let base = "2024-01-01 open Assets:Cash USD\n\n2024-01-01 open Equity:Opening USD\n";
+
+        // (a) the BOM'd header is the file's only defect.
+        let path = test_file_path();
+        std::fs::write(
+            &path,
+            format!("{base}\n\u{FEFF}2024-02-01 open Assets:Bom USD\n"),
+        )
+        .unwrap();
+        let (booted, logged) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "test-peer".to_owned()));
+        let mut svc = booted.expect("L-62: a mid-file BOM must not brick boot");
+        assert_eq!(svc.unparsable_block_count(), 1);
+        assert!(
+            !svc.accounts().is_open("Assets:Bom"),
+            "the whole-file parser refused it; the salvage must not load it"
+        );
+        assert!(logged.contains("byte-order mark"), "{logged}");
+        svc.compact().unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("\u{FEFF}2024-02-01 open Assets:Bom"));
+        let (rebooted, _) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "test-peer".to_owned()));
+        let rebooted = rebooted.unwrap();
+        assert_eq!(rebooted.unparsable_block_count(), 1);
+        assert!(!rebooted.accounts().is_open("Assets:Bom"));
+        remove_ledger_and_journal(&path);
+
+        // (b) another broken block is present too.
+        let path = test_file_path();
+        std::fs::write(
+            &path,
+            format!("{base}\n\u{FEFF}2024-02-01 open Assets:Bom USD\n\n2024-03-03 open\n"),
+        )
+        .unwrap();
+        let (booted, _) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "test-peer".to_owned()));
+        let svc = booted.unwrap();
+        assert_eq!(svc.unparsable_block_count(), 2);
+        assert!(!svc.accounts().is_open("Assets:Bom"));
+        remove_ledger_and_journal(&path);
+    }
+
+    /// Manifest item 3 (H-15): `remove_file(.bean)` under a running service →
+    /// the next write succeeds and the file holds every directive.
+    ///
+    /// Bug-catch: make `adopt_external_edits` propagate `NotFound` again and
+    /// the write fails with `IO`, the reload installs an empty ledger, and the
+    /// file ends up holding one directive.
+    #[test]
+    fn h15_removing_the_bean_under_a_running_service_loses_nothing() {
+        let (mut svc, path) = boot_empty();
+        for name in ["Assets:A", "Assets:B", "Assets:C"] {
+            svc.open_account(
+                name.to_owned(),
+                make_date(2024, 1, 1),
+                vec!["USD".to_owned()],
+            )
+            .unwrap();
+        }
+        std::fs::remove_file(&path).unwrap();
+
+        let (outcome, logged) = capture_warnings(|| {
+            svc.open_account(
+                "Assets:D".to_owned(),
+                make_date(2024, 1, 1),
+                vec!["USD".to_owned()],
+            )
+        });
+        outcome.expect("H-15: the write after the file vanished must succeed");
+        assert!(logged.contains("MISSING"), "{logged}");
+        assert_eq!(svc.directive_count(), 4);
+
+        let on_disk = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert_eq!(
+            on_disk.directive_count(),
+            4,
+            "the recreated file holds every directive"
+        );
+        for name in ["Assets:A", "Assets:B", "Assets:C", "Assets:D"] {
+            assert!(on_disk.accounts().is_open(name), "{name}");
+        }
+        remove_ledger_and_journal(&path);
+    }
+
+    /// H-15: the L-13 reload itself. A rebuild is refused when it holds fewer
+    /// directives than `dag.len() − pending_ids.len()` — the file gone, or
+    /// truncated below memory — and installed when it is short by exactly the
+    /// staged batch, which is the legitimate shape of a failed commit.
+    ///
+    /// Bug-catch: drop the floor check in `finish_recovery` (or let a reload
+    /// create the file) and case 1 installs an empty ledger.
+    #[test]
+    fn h15_a_recovery_reload_never_installs_an_emptier_ledger() {
+        let (mut svc, path) = setup_with_accounts();
+        svc.compact().unwrap();
+        let count = svc.directive_count();
+
+        // Case 1: the file is gone. A reload never creates it.
+        std::fs::remove_file(&path).unwrap();
+        let (_, logged) = capture_warnings(|| svc.recover_failed_commit());
+        assert!(!path.exists(), "a reload must never create the ledger file");
+        assert_eq!(svc.directive_count(), count, "memory is kept");
+        assert!(logged.contains("H-15"), "{logged}");
+        // The next commit writes memory back.
+        let (outcome, _) = capture_warnings(|| {
+            svc.open_account("Assets:Recovered".to_owned(), make_date(2024, 2, 1), vec![])
+        });
+        outcome.unwrap();
+        assert_eq!(
+            LedgerService::boot(path.clone(), "test-peer".to_owned())
+                .unwrap()
+                .directive_count(),
+            count + 1
+        );
+
+        // Case 2: the file is there but holds less than memory minus the staged
+        // batch. Refused, and the refusal arms a full rewrite.
+        std::fs::write(&path, "2024-01-01 open Assets:Only USD\n").unwrap();
+        svc.stage_remote_directive(remote_open("Assets:Staged", make_date(2024, 3, 1), 10))
+            .unwrap();
+        let before = svc.directive_count();
+        let (_, logged) = capture_warnings(|| svc.recover_failed_commit());
+        assert_eq!(
+            svc.directive_count(),
+            before,
+            "H-15: the emptier rebuild must not install"
+        );
+        assert!(logged.contains("REFUSING"), "{logged}");
+        assert!(svc.compaction_pending());
+        let (outcome, _) = capture_warnings(|| svc.compact());
+        outcome.unwrap();
+        let durable = svc.directive_count();
+        assert_eq!(
+            LedgerService::boot(path.clone(), "test-peer".to_owned())
+                .unwrap()
+                .directive_count(),
+            durable,
+            "the rewrite put every in-memory directive back on disk"
+        );
+
+        // Case 3 (control): short by exactly the staged batch — installed.
+        svc.stage_remote_directive(remote_open("Assets:Undurable", make_date(2024, 3, 2), 11))
+            .unwrap();
+        let (_, logged) = capture_warnings(|| svc.recover_failed_commit());
+        assert!(logged.contains("L-13 reload installed"), "{logged}");
+        assert_eq!(svc.directive_count(), durable);
+        assert!(!svc.accounts().is_open("Assets:Undurable"));
+        remove_ledger_and_journal(&path);
+    }
+
+    /// H-15: a fresh boot refuses an absent `.bean` that has a journal beside
+    /// it, naming both files; with the journal gone the same path is a new
+    /// ledger.
+    #[test]
+    fn h15_boot_refuses_a_missing_bean_beside_a_journal() {
+        let (mut svc, path) = boot_large_ledger();
+        svc.stage_remote_directive(remote_open("Assets:Journaled", make_date(2024, 3, 1), 10))
+            .unwrap();
+        svc.persist_or_reload().unwrap();
+        let journal_path = svc.journal_path().to_path_buf();
+        assert!(journal_path.exists());
+        drop(svc);
+
+        std::fs::remove_file(&path).unwrap();
+        let error = match LedgerService::boot(path.clone(), "test-peer".to_owned()) {
+            Ok(_) => panic!("H-15: no .bean beside a journal must not boot an empty ledger"),
+            Err(error) => error,
+        };
+        assert_eq!(error.error_code(), "IO_ERROR");
+        let rendered = error.to_string();
+        assert!(rendered.contains(&path.display().to_string()), "{rendered}");
+        assert!(
+            rendered.contains(&journal_path.display().to_string()),
+            "{rendered}"
+        );
+        assert!(!path.exists(), "the refusal must not create the file");
+
+        std::fs::remove_file(&journal_path).unwrap();
+        let fresh = LedgerService::boot(path.clone(), "test-peer".to_owned())
+            .expect("with nothing beside it the path is a new ledger");
+        assert_eq!(fresh.directive_count(), 0);
+        remove_ledger_and_journal(&path);
+    }
+
+    /// Manifest item 3 (M-35): the `brick` fixture — `canonical + journal >
+    /// MAX_LEDGER_FILE_BYTES` with the journal a subset of the canonical, the
+    /// state a crash between the compaction's rename and its `remove_journal`
+    /// leaves — boots, with `directive_count == boot(canonical alone)`.
+    ///
+    /// Bug-catch: budget the journal at `MAX − canonical` again and boot fails
+    /// with `LEDGER_JOURNAL`.
+    #[test]
+    fn m35_a_journal_left_behind_by_a_crashed_compaction_still_boots() {
+        let path = test_file_path();
+        let journal_path = crate::journal::journal_path_for(&path);
+        // The budget is checked against the journal's LENGTH before a byte is
+        // parsed, so the shape is built from bytes, not directives: one
+        // enveloped note (history) padded with 1 MiB comment lines, which the
+        // parser skips in O(lines). C ≈ 63 MiB, J ≈ 2 MiB (over the old
+        // `MAX − C` budget of 1 MiB), J's directive ⊂ C. Sized so the SHA-256
+        // passes — the only per-byte cost left — total ~67 MiB; a fixture of
+        // real 1 MiB directives proves the same thing at twenty seconds in a
+        // debug build.
+        let note = Directive::Note(Note {
+            date: make_date(2024, 1, 1),
+            account: "Assets:Cash".to_owned(),
+            comment: "folded".to_owned(),
+            metadata: filler_envelope(1),
+        });
+        let note_text = full_file_serialize(std::slice::from_ref(&note), &[]);
+        let padding_line = format!(";{}\n", "x".repeat((1 << 20) - 2));
+        let canonical = format!("{note_text}{}", padding_line.repeat(63));
+        std::fs::write(&path, &canonical).unwrap();
+        let payload = format!("{note_text}{}", padding_line.repeat(2));
+        std::fs::write(&journal_path, crate::journal::record_bytes(&payload)).unwrap();
+        let c = std::fs::metadata(&path).unwrap().len();
+        let j = std::fs::metadata(&journal_path).unwrap().len();
+        assert!(
+            c + j > MAX_LEDGER_FILE_BYTES,
+            "fixture: {c} + {j} must exceed the cap"
+        );
+        assert!(c <= MAX_LEDGER_FILE_BYTES && j <= MAX_LEDGER_FILE_BYTES);
+
+        let booted = LedgerService::boot(path.clone(), "test-peer".to_owned())
+            .expect("M-35: a fully folded journal must not brick boot");
+        // `directive_count == boot(C alone)`: the canonical's own directive
+        // set, read without a second 63 MiB hash.
+        let canonical_alone = parse_file(&canonical).unwrap().len();
+        assert_eq!(canonical_alone, 1);
+        assert_eq!(
+            booted.directive_count(),
+            canonical_alone,
+            "the journal was fully folded into the canonical file"
+        );
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-64 (the `r2` shape): after one `recover_failed_commit()` on a healthy
+    /// ledger past the threshold, the next prepare is still an `Append`.
+    ///
+    /// Bug-catch: stop carrying `canonical_is_current` in `adopt_reloaded`
+    /// and the second prepare is a `Compact`.
+    #[test]
+    fn l64_a_recovery_reload_on_a_healthy_ledger_keeps_the_append_path() {
+        let (mut svc, path) = boot_large_ledger();
+        svc.stage_remote_directive(remote_open("Assets:One", make_date(2024, 3, 1), 10))
+            .unwrap();
+        let pending = svc.prepare_commit().unwrap().expect("something staged");
+        assert_eq!(
+            pending.kind(),
+            CommitKind::Append,
+            "premise: a healthy ledger appends"
+        );
+        drop(pending);
+
+        let (_, _) = capture_warnings(|| svc.recover_failed_commit());
+
+        svc.stage_remote_directive(remote_open("Assets:Two", make_date(2024, 3, 2), 11))
+            .unwrap();
+        let pending = svc.prepare_commit().unwrap().expect("something staged");
+        assert_eq!(
+            pending.kind(),
+            CommitKind::Append,
+            "L-64: a reload that read the bytes this service wrote must not force a compaction"
+        );
+        drop(pending);
         remove_ledger_and_journal(&path);
     }
 }

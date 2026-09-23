@@ -100,9 +100,11 @@ pub fn generate_pad_transaction(
         .and_then(|entry| entry.balances.get(currency).copied())
         .unwrap_or(Decimal::ZERO);
 
-    // Step 2: delta = target - current. Checked (H1): both operands can sit
-    // near ±Decimal::MAX (the balance amount is caller-supplied and the read
-    // model saturates), and a bare `-` panics on overflow. An overflowing
+    // Step 2: delta = target - current. Checked (H1): every ingress caps both
+    // operands' inputs since H-17 (`validate::MAX_AMOUNT_MANTISSA`), but this
+    // is a `pub` function over any directives and any read model, and a model
+    // built from unvalidated input can still sit at ±Decimal::MAX (its
+    // over-cap fallback saturates), where a bare `-` panics. An overflowing
     // delta means an absurd assertion; synthesize no pad rather than panic.
     let delta = target_amount.checked_sub(current)?;
 

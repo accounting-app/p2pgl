@@ -114,7 +114,17 @@ impl std::fmt::Display for JournalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             JournalError::TooLarge { length, budget } => {
-                write!(f, "ledger journal is {length} bytes (max {budget})")
+                // M-35: the one shape that produces this on a node nobody
+                // touched is a compaction that crashed between the `.bean`
+                // rename and the journal removal — the journal is then older
+                // than the `.bean` and every record in it is already folded in.
+                write!(
+                    f,
+                    "ledger journal is {length} bytes (max {budget}); a journal older than the \
+                     .bean it sits beside may be the leftover of a compaction that crashed before \
+                     removing it, in which case its records are already folded into the .bean \
+                     (M-35)"
+                )
             }
             JournalError::Corrupt { offset, reason } => {
                 write!(f, "ledger journal is corrupt at byte {offset}: {reason}")

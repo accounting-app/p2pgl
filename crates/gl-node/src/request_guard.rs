@@ -20,7 +20,8 @@ use axum::http::{header, Method, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tracing::warn;
 
 /// Shared guard state for the middleware layer.
@@ -39,6 +40,110 @@ pub struct RequestGuardState {
 const HOST_REJECTION: &str = "request Host is not an allowed host for this node";
 const CONTENT_TYPE_REJECTION: &str = "Content-Type must be application/json";
 const ORIGIN_REJECTION: &str = "cross-origin requests to this node are not allowed";
+
+/// Minimum gap between two guard-refusal `warn!` lines (M-41).
+///
+/// The same interval `PerIpConnections::should_log_refusal` uses. The guard is
+/// the outermost layer of both routes — deliberately outside the rate limiter,
+/// so a bad `Host` never reaches the schema — which also put its `warn!`s
+/// outside every budget: one client was measured producing 100–190 MB/s of
+/// log, ~13k lines/s, each echoing a header of its choosing. One line per
+/// interval, carrying how many were suppressed since the last, says the same
+/// thing to an operator at a rate the node chooses.
+const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Longest prefix of an attacker-chosen header value a refusal line quotes (M-41).
+///
+/// Enough to recognise a misconfigured proxy or a rebinding domain; far short
+/// of hyper's 64 KiB head buffer (`http_server::HTTP1_MAX_BUF_SIZE`), which is
+/// the most a value could be.
+const MAX_ECHOED_HEADER_CHARS: usize = 128;
+
+/// Process-wide throttle for the guard's refusal `warn!`s (M-41).
+///
+/// A `static` rather than a field of [`RequestGuardState`] because the state is
+/// built by struct literal at three sites and the log is per process anyway:
+/// the question it answers — "has this node warned about a refused request in
+/// the last ten seconds?" — has one answer per node.
+static REFUSAL_LOG: RefusalLogThrottle = RefusalLogThrottle::new();
+
+/// One `warn!` per [`REFUSAL_LOG_INTERVAL`], plus a count of what was not said.
+pub(crate) struct RefusalLogThrottle {
+    inner: Mutex<RefusalLogState>,
+}
+
+struct RefusalLogState {
+    last_logged: Option<Instant>,
+    suppressed: u64,
+}
+
+impl RefusalLogThrottle {
+    const fn new() -> Self {
+        Self {
+            inner: Mutex::new(RefusalLogState {
+                last_logged: None,
+                suppressed: 0,
+            }),
+        }
+    }
+
+    /// Note one refusal at `now`. `Some(suppressed)` means "log this one, and
+    /// this many were swallowed since the last line"; `None` means stay quiet.
+    fn note(&self, now: Instant) -> Option<u64> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match state.last_logged {
+            Some(previous) if now.duration_since(previous) < REFUSAL_LOG_INTERVAL => {
+                state.suppressed = state.suppressed.saturating_add(1);
+                None
+            }
+            _ => {
+                state.last_logged = Some(now);
+                Some(std::mem::take(&mut state.suppressed))
+            }
+        }
+    }
+}
+
+/// At most [`MAX_ECHOED_HEADER_CHARS`] of a header value, cut on a character
+/// boundary and marked when cut (M-41).
+fn excerpt(value: &str) -> String {
+    let mut chars = value.char_indices();
+    match chars.nth(MAX_ECHOED_HEADER_CHARS) {
+        Some((cut, _)) => format!("{}…({} bytes)", &value[..cut], value.len()),
+        None => value.to_owned(),
+    }
+}
+
+/// Which header a refusal line quotes, if any (M-41).
+enum Echo<'a> {
+    Nothing,
+    Host(&'a str),
+    ContentType(&'a str),
+    Origin(&'a str),
+}
+
+/// Emit one throttled refusal line, or nothing (M-41).
+///
+/// Throttled as one class: an attacker can pick whichever of the three checks
+/// fails, so a per-check interval would be three lines per interval, not one.
+/// The excerpt is taken only when a line is actually emitted, so a suppressed
+/// refusal allocates nothing for its log.
+fn warn_refusal(reason: &'static str, echo: Echo<'_>) {
+    let Some(suppressed) = REFUSAL_LOG.note(Instant::now()) else {
+        return;
+    };
+    match echo {
+        Echo::Nothing => warn!(suppressed, "{reason}"),
+        Echo::Host(value) => warn!(host = %excerpt(value), suppressed, "{reason}"),
+        Echo::ContentType(value) => {
+            warn!(content_type = %excerpt(value), suppressed, "{reason}")
+        }
+        Echo::Origin(value) => warn!(origin = %excerpt(value), suppressed, "{reason}"),
+    }
+}
 
 /// Axum middleware enforcing Host, Content-Type and Origin on GraphQL routes (H-01).
 ///
@@ -65,7 +170,10 @@ pub async fn request_guard(
         Some(value) => match value.to_str() {
             Ok(text) => Some(text.to_owned()),
             Err(_) => {
-                warn!("rejected request with a non-ASCII Host header");
+                warn_refusal(
+                    "rejected request with a non-ASCII Host header",
+                    Echo::Nothing,
+                );
                 return reject(StatusCode::FORBIDDEN, HOST_REJECTION);
             }
         },
@@ -76,12 +184,20 @@ pub async fn request_guard(
             .map(|authority| authority.as_str().to_owned()),
     };
     let Some(authority) = authority else {
-        warn!("rejected request with neither a Host header nor a URI authority");
+        warn_refusal(
+            "rejected request with neither a Host header nor a URI authority",
+            Echo::Nothing,
+        );
         return reject(StatusCode::FORBIDDEN, HOST_REJECTION);
     };
     let host = normalize_host(&authority);
     if !guard_state.allowed_hosts.contains(&host) {
-        warn!(%host, "rejected request whose Host is not allowed (DNS rebinding)");
+        // M-41: throttled, and the value is an excerpt — `%host` echoed up to
+        // hyper's whole head buffer, once per request, outside every limiter.
+        warn_refusal(
+            "rejected request whose Host is not allowed (DNS rebinding)",
+            Echo::Host(&host),
+        );
         return reject(StatusCode::FORBIDDEN, HOST_REJECTION);
     }
 
@@ -103,9 +219,9 @@ pub async fn request_guard(
         match media_type.as_deref() {
             Some("application/json") => {}
             other => {
-                warn!(
-                    content_type = other.unwrap_or("<missing>"),
-                    "rejected POST with a non-JSON Content-Type"
+                warn_refusal(
+                    "rejected POST with a non-JSON Content-Type",
+                    Echo::ContentType(other.unwrap_or("<missing>")),
                 );
                 return reject(StatusCode::UNSUPPORTED_MEDIA_TYPE, CONTENT_TYPE_REJECTION);
             }
@@ -116,7 +232,10 @@ pub async fn request_guard(
             let origin = match origin_value.to_str() {
                 Ok(text) => text,
                 Err(_) => {
-                    warn!("rejected POST with a non-ASCII Origin header");
+                    warn_refusal(
+                        "rejected POST with a non-ASCII Origin header",
+                        Echo::Nothing,
+                    );
                     return reject(StatusCode::FORBIDDEN, ORIGIN_REJECTION);
                 }
             };
@@ -127,7 +246,7 @@ pub async fn request_guard(
                 &guard_state.allowed_hosts,
                 guard_state.tls_terminated,
             ) {
-                warn!(%origin, "rejected cross-origin POST");
+                warn_refusal("rejected cross-origin POST", Echo::Origin(origin));
                 return reject(StatusCode::FORBIDDEN, ORIGIN_REJECTION);
             }
         }
@@ -790,5 +909,149 @@ mod tests {
                 "Origin: {spelling} must be refused (L-52)"
             );
         }
+    }
+
+    // ── T66 / M-41: throttled, excerpted refusal logging ────────────────
+
+    /// The throttle logs the first refusal, swallows everything inside the
+    /// interval while counting it, and hands the count to the next line out.
+    #[test]
+    fn refusal_log_throttle_emits_one_line_per_interval_with_a_count() {
+        let throttle = RefusalLogThrottle::new();
+        let start = Instant::now();
+        assert_eq!(throttle.note(start), Some(0), "the first refusal is logged");
+        for _ in 0..999 {
+            assert_eq!(throttle.note(start + Duration::from_millis(5)), None);
+        }
+        assert_eq!(
+            throttle.note(start + REFUSAL_LOG_INTERVAL - Duration::from_millis(1)),
+            None,
+            "still inside the interval"
+        );
+        assert_eq!(
+            throttle.note(start + REFUSAL_LOG_INTERVAL),
+            Some(1000),
+            "the next line carries how many were swallowed"
+        );
+        assert_eq!(
+            throttle.note(start + 2 * REFUSAL_LOG_INTERVAL),
+            Some(0),
+            "a quiet interval resets the count"
+        );
+    }
+
+    /// `excerpt` keeps a short value whole, cuts a long one at the budget on a
+    /// character boundary, and states the full length it stood in for.
+    #[test]
+    fn excerpt_is_bounded_and_char_safe() {
+        assert_eq!(excerpt("evil.example"), "evil.example");
+        let long = "é".repeat(100 * 1024);
+        let cut = excerpt(&long);
+        assert!(cut.starts_with(&"é".repeat(MAX_ECHOED_HEADER_CHARS)));
+        assert!(cut.ends_with(&format!("…({} bytes)", long.len())), "{cut}");
+        assert!(cut.len() < 512, "{}", cut.len());
+    }
+
+    /// Capture every `warn!` emitted while `body` runs on this thread.
+    fn capture_warnings<T>(body: impl FnOnce() -> T) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for SharedBuffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuffer {
+            type Writer = SharedBuffer;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = SharedBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, body);
+        let logged = String::from_utf8_lossy(&buffer.0.lock().unwrap()).into_owned();
+        (value, logged)
+    }
+
+    /// M-41: N = 200 foreign-Host requests, each carrying a 100 KiB `Host`,
+    /// are all refused (403) and produce at most K = 2 guard log lines (the
+    /// throttle is process-wide, so another test may have spent this
+    /// interval's line — the bound holds either way), none longer than
+    /// T = 1,024 bytes, and none containing the header's payload. The same
+    /// request shape against the Origin and Content-Type checks is bounded
+    /// the same way, since all three share one throttle and one excerpt.
+    #[test]
+    fn foreign_host_refusals_are_throttled_and_never_echo_the_header() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (_dir, application) = default_app();
+        let payload = format!("evil.example.{}", "a".repeat(100 * 1024));
+        let marker = &payload[..2048];
+
+        let (statuses, logged) = capture_warnings(|| {
+            runtime.block_on(async {
+                let mut statuses = Vec::new();
+                for i in 0..200 {
+                    // Built from scratch: adding a second `Host` on top of
+                    // `graphql_post()`'s would leave the allowed one first.
+                    let request = match i % 3 {
+                        0 => Request::post("/graphql")
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .header(header::HOST, payload.as_str())
+                            .body(Body::from(VALID_BODY)),
+                        1 => graphql_post()
+                            .header(header::ORIGIN, format!("http://{payload}"))
+                            .body(Body::from(VALID_BODY)),
+                        _ => Request::post("/graphql")
+                            .header(header::HOST, "127.0.0.1:4000")
+                            .header(header::CONTENT_TYPE, format!("text/{payload}"))
+                            .body(Body::from(VALID_BODY)),
+                    }
+                    .expect("request");
+                    let response = application
+                        .clone()
+                        .oneshot(request)
+                        .await
+                        .expect("router never fails");
+                    statuses.push(response.status());
+                }
+                statuses
+            })
+        });
+
+        assert_eq!(statuses.len(), 200);
+        assert!(
+            statuses
+                .iter()
+                .all(|s| *s == StatusCode::FORBIDDEN || *s == StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            "{statuses:?}"
+        );
+        let guard_lines: Vec<&str> = logged.lines().filter(|l| l.contains("rejected")).collect();
+        assert!(
+            guard_lines.len() <= 2,
+            "{} guard lines for 200 refusals:\n{}",
+            guard_lines.len(),
+            guard_lines.join("\n")
+        );
+        for line in &guard_lines {
+            assert!(line.len() < 1024, "a {}-byte log line: {line}", line.len());
+            assert!(!line.contains(marker), "the header payload reached the log");
+            assert!(line.contains("suppressed="), "{line}");
+        }
+        assert!(!logged.contains(marker));
     }
 }

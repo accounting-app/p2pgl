@@ -1,7 +1,6 @@
 use async_graphql::{InputValueError, InputValueResult, Scalar, ScalarType, Value};
 use chrono::{Datelike, NaiveDate};
 use rust_decimal::Decimal;
-use std::str::FromStr;
 
 /// Smallest year the ledger's `.bean` file grammar can express (H-04).
 const MIN_LEDGER_YEAR: i32 = 1;
@@ -51,11 +50,26 @@ pub struct DecimalScalar(pub Decimal);
 
 #[Scalar(name = "Decimal")]
 impl ScalarType for DecimalScalar {
+    /// Parse a wire decimal, refusing one outside the ledger's amount cap.
+    ///
+    /// (H-17) Every `Decimal` a client sends is an amount the ledger would
+    /// store — a posting's units, cost or price — so the cap
+    /// ([`ledger::validate::MAX_AMOUNT_MANTISSA`]) applies here, at the API
+    /// edge, with the same constant `validate_transaction` and the `.bean`
+    /// parser use. `validate_transaction` still re-checks it: this is the
+    /// early, typed refusal, not the only one. `from_str_exact` for the same
+    /// reason the parser uses it: `from_str` silently rounds a fraction past 28
+    /// digits, so the value checked and stored would not be the value sent.
+    ///
+    /// Output values (balances, report totals) are sums and may legitimately
+    /// exceed the cap; they only ever go through [`Self::to_value`].
     fn parse(value: Value) -> InputValueResult<Self> {
         match &value {
             Value::String(decimal_string) => {
-                let decimal = Decimal::from_str(decimal_string)
+                let decimal = Decimal::from_str_exact(decimal_string)
                     .map_err(|_| InputValueError::custom("Invalid decimal string"))?;
+                ledger::validate::check_amount_cap("Decimal", decimal)
+                    .map_err(|error| InputValueError::custom(error.to_string()))?;
                 Ok(DecimalScalar(decimal))
             }
             _ => Err(InputValueError::expected_type(value)),
@@ -100,6 +114,7 @@ impl ScalarType for TransactionId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn test_date_scalar_round_trip() {
@@ -155,6 +170,42 @@ mod tests {
     fn test_decimal_scalar_rejects_json_number() {
         let result = DecimalScalar::parse(Value::Number(serde_json::Number::from(100)));
         assert!(result.is_err(), "Decimal must be a string on the wire (I4)");
+    }
+
+    /// H-17: an amount past the cap is refused at the API edge — including the
+    /// `±Decimal::MAX` pair the B6 proof used — while the largest in-cap
+    /// values, at either end of the scale range, still parse.
+    #[test]
+    fn test_decimal_scalar_enforces_the_amount_cap() {
+        for over_cap in [
+            "79228162514264337593543950335",  // Decimal::MAX
+            "-79228162514264337593543950335", // Decimal::MIN
+            "1000000000000000000000",         // 10^21: 22 digits
+            "10000000000000.00000000",        // 22 digits: trailing zeros count
+            "1.000000000000000000000",        // 22 digits at scale 21
+        ] {
+            let error = DecimalScalar::parse(Value::String(over_cap.to_owned()))
+                .expect_err(&format!("{over_cap} must be refused"));
+            assert!(
+                format!("{error:?}").contains("H-17"),
+                "{over_cap}: refusal must name the cap, got {error:?}"
+            );
+        }
+        for in_cap in [
+            "999999999999999999999",
+            "-999999999999999999999",
+            "9999999999999.99999999",
+            "0.0000000000000000000000000001",
+        ] {
+            let parsed = DecimalScalar::parse(Value::String(in_cap.to_owned()))
+                .unwrap_or_else(|_| panic!("{in_cap} must be accepted"));
+            assert_eq!(parsed.to_value(), Value::String(in_cap.to_owned()));
+        }
+        // No silent rounding: a 29th fractional digit is refused, not dropped.
+        assert!(
+            DecimalScalar::parse(Value::String("0.00000000000000000000000000001".to_owned()))
+                .is_err()
+        );
     }
 
     #[test]

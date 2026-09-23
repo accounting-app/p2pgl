@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::hash::compute_content_id;
 use crate::model::*;
+use crate::validate::amount_within_cap;
 
 // ─── Core types ──────────────────────────────────────────────────────────────
 
@@ -87,13 +88,169 @@ pub struct IndexedTransaction {
     pub transaction: Transaction,
 }
 
+// ─── Exact accumulation (H-17) ───────────────────────────────────────────────
+
+/// An exact, order-independent running sum of one currency's amounts (H-17).
+///
+/// # The bug this replaces
+///
+/// Balances used to be one `Decimal` per `(account, currency)`, advanced with
+/// `saturating_add` in whatever order the caller walked. Neither half of that
+/// is associative: saturation (`MAX + 1 − MAX = 0`, `MAX − MAX + 1 = 1`), and
+/// `Decimal` addition itself, which at any scale above zero does not fail on a
+/// 96-bit overflow but drops a digit and rounds. The live running totals
+/// folded in arrival order and `verify`'s sweep and boot in date order, so a
+/// peer holding `+MAX` / `−MAX` could erase an honest posting from one
+/// replica's live reports while `verify` passed on it (H-17).
+///
+/// # Why this is exact
+///
+/// One partial sum is kept **per scale** present, so every addition is between
+/// two numbers of the same scale, and each partial is the exact integer sum of
+/// its amounts' mantissas. Every stored amount has `|mantissa| ≤ 10^21 − 1`
+/// ([`crate::validate::MAX_AMOUNT_MANTISSA`], enforced at every ingress), and
+/// no partial can hold more postings than a 64 MiB ledger has bytes, so every
+/// partial stays below `2^26 × 10^21 < 2^96`: no addition ever overflows, so
+/// none ever rounds, so the partials are the same whatever order the amounts
+/// arrived in. [`Self::total`] then combines the partials in ascending-scale
+/// order — a fixed order over order-independent inputs — so the reported
+/// balance, representation included, is a pure function of the set of amounts.
+///
+/// That is why no path has to fold in a canonical order to agree with another:
+/// the incremental running total, `account(at:)`, every report and `verify`'s
+/// batched sweep reach the same partials from any order, including after a
+/// backdated [`ReadModel::index_directive`] append. Re-folding in canonical
+/// `(date, type priority, content id)` order would have given the same answer
+/// at the cost of a per-account re-sort on every backdated arrival — which a
+/// gossip catch-up makes quadratic.
+///
+/// A single partial is also why keeping one per scale, rather than capping the
+/// scale, is enough: mixing scales was the other non-associativity (`10^20 +
+/// 10^-8` needs 29 digits), and here scales never meet until [`Self::total`].
+///
+/// # Outside the cap
+///
+/// An amount past the cap can only reach the read model from a caller that
+/// bypassed every ingress (a library caller building one from raw directives,
+/// as some overflow tests deliberately do). Such a partial falls back to the
+/// pre-H-17 saturating/rounding arithmetic rather than panic — T17/H1's
+/// no-panic contract — and [`ReadModel::over_cap_posting_count`] says so. The
+/// fallback is a `debug_assert` failure whenever that count is zero, because
+/// then it is unreachable by the arithmetic above.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ExactSum {
+    /// `(scale, partial)`, ascending by scale, one entry per scale seen. The
+    /// scale is the key the partial was opened under; inside the cap it is
+    /// also the partial's own scale.
+    partials: Vec<(u32, Decimal)>,
+}
+
+impl ExactSum {
+    /// Add one amount into the partial for its scale.
+    ///
+    /// `exact_guaranteed` is `true` when every amount the model holds is inside
+    /// the cap — then this addition cannot overflow, and a failure is a bug.
+    fn add(&mut self, number: Decimal, exact_guaranteed: bool) {
+        let scale = number.scale();
+        match self.partials.binary_search_by_key(&scale, |&(key, _)| key) {
+            Ok(index) => {
+                let partial = &mut self.partials[index].1;
+                *partial = add_same_scale(*partial, number, exact_guaranteed);
+            }
+            Err(index) => self
+                .partials
+                .insert(index, (scale, without_negative_zero(number))),
+        }
+    }
+
+    /// The balance: the partials combined in ascending-scale order.
+    ///
+    /// Exact whenever the result fits 96 bits at the finest scale present —
+    /// every realistic balance. Past that, `Decimal` rounds the finest digits,
+    /// but in this one fixed order over order-independent partials, so every
+    /// path and every replica rounds identically.
+    fn total(&self, exact_guaranteed: bool) -> Decimal {
+        self.partials
+            .iter()
+            .fold(Decimal::ZERO, |total, &(_, partial)| {
+                add_in_fixed_order(total, partial, exact_guaranteed)
+            })
+    }
+}
+
+/// Same-scale addition that is exact or reports that it was not (H-17).
+///
+/// `checked_add` is not enough on its own: it returns `None` only at scale 0,
+/// and at any other scale "overflow" means it quietly dropped a digit. Between
+/// two operands of one scale an exact sum keeps that scale (a zero operand
+/// returns the other, which has it too), so a changed scale is the rounding.
+fn add_same_scale(partial: Decimal, number: Decimal, exact_guaranteed: bool) -> Decimal {
+    match partial.checked_add(number) {
+        Some(sum) if sum.scale() == partial.scale() => without_negative_zero(sum),
+        _ => {
+            debug_assert!(
+                !exact_guaranteed,
+                "H-17: a same-scale partial of in-cap amounts overflowed 96 bits \
+                 ({partial} + {number}); MAX_AMOUNT_MANTISSA no longer bounds the sum"
+            );
+            partial.saturating_add(number)
+        }
+    }
+}
+
+/// Addition in a caller-fixed order over order-independent inputs (H-17).
+///
+/// Used where the operands are already reported balances — a total across
+/// scales, currencies or accounts — each combined in one deterministic order
+/// (ascending scale, `BTreeMap` currency order, sorted account order). Such a
+/// sum may round when its operands' scales are far apart, identically
+/// everywhere; it cannot overflow while every amount is inside the cap,
+/// because the magnitude of any such sum is at most the sum of every posting's
+/// magnitude, `< 2^26 × 10^21 × 1.12 < 2^96`.
+fn add_in_fixed_order(left: Decimal, right: Decimal, exact_guaranteed: bool) -> Decimal {
+    match left.checked_add(right) {
+        Some(sum) => without_negative_zero(sum),
+        None => {
+            debug_assert!(
+                !exact_guaranteed,
+                "H-17: a report-level sum of in-cap balances overflowed ({left} + {right})"
+            );
+            left.saturating_add(right)
+        }
+    }
+}
+
+/// `-0` and `0` are equal but print differently; a balance must not depend on
+/// which of them an addition order happened to produce.
+fn without_negative_zero(mut number: Decimal) -> Decimal {
+    if number.is_zero() {
+        number.set_sign_positive(true);
+    }
+    number
+}
+
+/// Per-currency exact sums for one account.
+type ExactBalances = BTreeMap<String, ExactSum>;
+
+/// The reported form of an account's exact sums.
+fn report_balances(balances: &ExactBalances, exact_guaranteed: bool) -> CurrencyBalances {
+    balances
+        .iter()
+        .map(|(currency, sum)| (currency.clone(), sum.total(exact_guaranteed)))
+        .collect()
+}
+
 // ─── Read model ──────────────────────────────────────────────────────────────
 
 /// The in-memory read model. Built from directives; queried by the GraphQL layer.
 #[derive(Debug, Clone, Default)]
 pub struct ReadModel {
-    /// Per-account running balances: `account → currency → amount`.
-    account_balances: HashMap<String, CurrencyBalances>,
+    /// Per-account running balances: `account → currency → exact sum`.
+    ///
+    /// Advanced in arrival order by [`Self::index_directive`]; order-free by
+    /// construction (see [`ExactSum`]), so it always equals a fresh fold of
+    /// the whole set in any order (H-17).
+    account_balances: HashMap<String, ExactBalances>,
     /// Transactions indexed by txid, sorted by (date, lamport, txid).
     transactions: Vec<IndexedTransaction>,
     /// Transaction lookup by txid.
@@ -110,6 +267,11 @@ pub struct ReadModel {
     /// [`Self::index_directive`], and the DAG is grow-only (nothing is ever
     /// removed), so the index cannot go stale in either direction.
     latest_posting_dates: HashMap<String, NaiveDate>,
+    /// Indexed postings whose amount is outside the H-17 cap.
+    ///
+    /// Zero for every model built from directives that passed an ingress; see
+    /// [`Self::over_cap_posting_count`].
+    over_cap_postings: usize,
 }
 
 impl ReadModel {
@@ -121,6 +283,7 @@ impl ReadModel {
             txid_index: HashMap::new(),
             account_postings: HashMap::new(),
             latest_posting_dates: HashMap::new(),
+            over_cap_postings: 0,
         };
 
         // Sort directives by canonical order for consistent processing.
@@ -167,19 +330,26 @@ impl ReadModel {
                 return;
             }
 
-            // Update running balances.
+            // Update running balances — exactly, so arrival order cannot
+            // matter (H-17; see `ExactSum`).
+            for posting in &txn.postings {
+                if let Some(ref amount) = posting.amount {
+                    if !amount_within_cap(amount.number) {
+                        self.over_cap_postings += 1;
+                    }
+                }
+            }
+            let exact_guaranteed = self.exact_guaranteed();
             for posting in &txn.postings {
                 if let Some(ref amount) = posting.amount {
                     // Use the raw posting amount (not weight) for account balances.
                     // Account balances track commodity units, not converted amounts.
-                    let balances = self
-                        .account_balances
+                    self.account_balances
                         .entry(posting.account.clone())
-                        .or_default();
-                    let running = balances
+                        .or_default()
                         .entry(amount.currency.clone())
-                        .or_insert(Decimal::ZERO);
-                    *running = running.saturating_add(amount.number);
+                        .or_default()
+                        .add(amount.number, exact_guaranteed);
                 }
             }
 
@@ -213,6 +383,7 @@ impl ReadModel {
     /// Returns every account's debit/credit balance. For multi-currency accounts,
     /// positive amounts are debits and negative are credits (as Decimal sums).
     pub fn trial_balance(&self, at: NaiveDate) -> TrialBalanceReport {
+        let exact_guaranteed = self.exact_guaranteed();
         let balances = self.balances_at(at);
         let mut rows = Vec::new();
         let mut total_debit = Decimal::ZERO;
@@ -229,7 +400,7 @@ impl ReadModel {
                 // but the GraphQL type uses a single Decimal.
                 let mut net = Decimal::ZERO;
                 for &amount in currency_balances.values() {
-                    net = net.saturating_add(amount);
+                    net = add_in_fixed_order(net, amount, exact_guaranteed);
                 }
 
                 let (debit, credit) = if net >= Decimal::ZERO {
@@ -238,8 +409,8 @@ impl ReadModel {
                     (Decimal::ZERO, -net)
                 };
 
-                total_debit = total_debit.saturating_add(debit);
-                total_credit = total_credit.saturating_add(credit);
+                total_debit = add_in_fixed_order(total_debit, debit, exact_guaranteed);
+                total_credit = add_in_fixed_order(total_credit, credit, exact_guaranteed);
 
                 rows.push(TrialBalanceRow {
                     account: account.to_owned(),
@@ -261,6 +432,7 @@ impl ReadModel {
     ///
     /// Includes the Net-Income closing entry into Equity.
     pub fn balance_sheet(&self, at: NaiveDate) -> BalanceSheetReport {
+        let exact_guaranteed = self.exact_guaranteed();
         let balances = self.balances_at(at);
 
         let mut assets = Vec::new();
@@ -290,14 +462,14 @@ impl ReadModel {
                     for (currency, &amount) in currency_balances {
                         // Income is stored as negative (credit); negate to get positive contribution.
                         let running = net_income.entry(currency.clone()).or_insert(Decimal::ZERO);
-                        *running = running.saturating_sub(amount);
+                        *running = add_in_fixed_order(*running, -amount, exact_guaranteed);
                     }
                 }
                 "Expenses" => {
                     for (currency, &amount) in currency_balances {
                         // Expenses are stored as positive (debit); subtract from net income.
                         let running = net_income.entry(currency.clone()).or_insert(Decimal::ZERO);
-                        *running = running.saturating_sub(amount);
+                        *running = add_in_fixed_order(*running, -amount, exact_guaranteed);
                     }
                 }
                 _ => {} // Other account types are not included in balance sheet.
@@ -326,6 +498,7 @@ impl ReadModel {
 
     /// Income statement for a date range (FR-2 AC3).
     pub fn income_statement(&self, from: NaiveDate, to: NaiveDate) -> IncomeStatementReport {
+        let exact_guaranteed = self.exact_guaranteed();
         let balances = self.balances_in_range(from, to);
 
         let mut income = Vec::new();
@@ -349,7 +522,7 @@ impl ReadModel {
                     for (currency, &amount) in currency_balances {
                         // Income is negative (credit); negate for net.
                         let running = net.entry(currency.clone()).or_insert(Decimal::ZERO);
-                        *running = running.saturating_sub(amount);
+                        *running = add_in_fixed_order(*running, -amount, exact_guaranteed);
                     }
                     income.push(entry);
                 }
@@ -357,7 +530,7 @@ impl ReadModel {
                     for (currency, &amount) in currency_balances {
                         // Expenses are positive (debit); subtract from net.
                         let running = net.entry(currency.clone()).or_insert(Decimal::ZERO);
-                        *running = running.saturating_sub(amount);
+                        *running = add_in_fixed_order(*running, -amount, exact_guaranteed);
                     }
                     expenses.push(entry);
                 }
@@ -430,7 +603,7 @@ impl ReadModel {
                 let all = self.balances_at(date);
                 all.get(account).cloned()?
             }
-            None => self.account_balances.get(account).cloned()?,
+            None => report_balances(self.account_balances.get(account)?, self.exact_guaranteed()),
         };
 
         Some(AccountBalanceEntry {
@@ -508,7 +681,8 @@ impl ReadModel {
         visit.sort_by_key(|&i| queries[i].1);
 
         let order = self.date_ordered_transactions();
-        let mut running: HashMap<&str, CurrencyBalances> = HashMap::new();
+        let exact_guaranteed = self.exact_guaranteed();
+        let mut running: HashMap<&str, ExactBalances> = HashMap::new();
         let mut cursor = 0usize;
         let mut postings_visited = 0usize;
 
@@ -534,12 +708,16 @@ impl ReadModel {
                     let Some(&key) = wanted.get(posting.account.as_str()) else {
                         continue;
                     };
+                    // H-17: the same exact accumulator the live running
+                    // totals use, so the two agree by construction.
                     let balances = running.entry(key).or_default();
                     match balances.get_mut(&amount.currency) {
-                        Some(total) => *total = total.saturating_add(amount.number),
+                        Some(sum) => sum.add(amount.number, exact_guaranteed),
                         // Only the first sighting of a currency allocates.
                         None => {
-                            balances.insert(amount.currency.clone(), amount.number);
+                            let mut sum = ExactSum::default();
+                            sum.add(amount.number, exact_guaranteed);
+                            balances.insert(amount.currency.clone(), sum);
                         }
                     }
                 }
@@ -548,7 +726,7 @@ impl ReadModel {
 
             entries[query] = running.get(account).map(|balances| AccountBalanceEntry {
                 account: account.to_owned(),
-                balances: balances.clone(),
+                balances: report_balances(balances, exact_guaranteed),
             });
         }
 
@@ -572,6 +750,25 @@ impl ReadModel {
         self.latest_posting_dates.get(account).copied()
     }
 
+    /// Indexed postings whose amount is outside the H-17 amount cap
+    /// ([`crate::validate::MAX_AMOUNT_MANTISSA`]).
+    ///
+    /// Zero whenever every directive reached the model through an ingress —
+    /// the local API, peer ingest, reconcile, or the `.bean` parser at boot
+    /// all refuse such an amount — and then every balance and report this
+    /// model returns is exact and independent of the order the directives
+    /// arrived in. Non-zero only for a model a library caller built from
+    /// unvalidated directives; see [`ExactSum`] for what the reports then do.
+    pub fn over_cap_posting_count(&self) -> usize {
+        self.over_cap_postings
+    }
+
+    /// Whether every indexed amount is inside the cap, so every accumulation
+    /// is provably exact (the condition the H-17 debug assertions check).
+    fn exact_guaranteed(&self) -> bool {
+        self.over_cap_postings == 0
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────────
 
     /// Indices into [`Self::transactions`], ascending by transaction date (M-23).
@@ -586,8 +783,8 @@ impl ReadModel {
     /// The check is O(T) and the common case really is already sorted, so the
     /// sort is paid only when a backdated append has actually happened. The
     /// sort is stable, so ties keep the vector's own `(date, lamport, txid)`
-    /// order — balances are a sum over the cut, so intra-date order does not
-    /// affect the answer either way.
+    /// order — balances are an exact sum over the cut ([`ExactSum`], H-17), so
+    /// intra-date order does not affect the answer, representation included.
     fn date_ordered_transactions(&self) -> Vec<usize> {
         let mut order: Vec<usize> = (0..self.transactions.len()).collect();
         let already_sorted = self
@@ -601,25 +798,12 @@ impl ReadModel {
     }
 
     /// Compute account balances at a given date (transactions with date ≤ at).
+    ///
+    /// Walks the vector in arrival order, which is safe because the fold is
+    /// exact ([`ExactSum`], H-17): it equals the running totals and the batched
+    /// sweep whatever order either of them walked.
     fn balances_at(&self, at: NaiveDate) -> HashMap<String, CurrencyBalances> {
-        let mut balances: HashMap<String, CurrencyBalances> = HashMap::new();
-
-        for indexed in &self.transactions {
-            if indexed.transaction.date > at {
-                continue;
-            }
-            for posting in &indexed.transaction.postings {
-                if let Some(ref amount) = posting.amount {
-                    let account_balances = balances.entry(posting.account.clone()).or_default();
-                    let running = account_balances
-                        .entry(amount.currency.clone())
-                        .or_insert(Decimal::ZERO);
-                    *running = running.saturating_add(amount.number);
-                }
-            }
-        }
-
-        balances
+        self.balances_where(|date| date <= at)
     }
 
     /// Compute account balances in a date range [from, to] inclusive.
@@ -628,24 +812,45 @@ impl ReadModel {
         from: NaiveDate,
         to: NaiveDate,
     ) -> HashMap<String, CurrencyBalances> {
-        let mut balances: HashMap<String, CurrencyBalances> = HashMap::new();
+        self.balances_where(|date| from <= date && date <= to)
+    }
+
+    /// Exact per-account balances over the transactions whose date passes
+    /// `included` — the one fold every date-cut report shares (H-17).
+    fn balances_where(
+        &self,
+        included: impl Fn(NaiveDate) -> bool,
+    ) -> HashMap<String, CurrencyBalances> {
+        let exact_guaranteed = self.exact_guaranteed();
+        let mut sums: HashMap<&str, ExactBalances> = HashMap::new();
 
         for indexed in &self.transactions {
-            if indexed.transaction.date < from || indexed.transaction.date > to {
+            if !included(indexed.transaction.date) {
                 continue;
             }
             for posting in &indexed.transaction.postings {
                 if let Some(ref amount) = posting.amount {
-                    let account_balances = balances.entry(posting.account.clone()).or_default();
-                    let running = account_balances
-                        .entry(amount.currency.clone())
-                        .or_insert(Decimal::ZERO);
-                    *running = running.saturating_add(amount.number);
+                    let account_sums = sums.entry(posting.account.as_str()).or_default();
+                    match account_sums.get_mut(&amount.currency) {
+                        Some(sum) => sum.add(amount.number, exact_guaranteed),
+                        None => {
+                            let mut sum = ExactSum::default();
+                            sum.add(amount.number, exact_guaranteed);
+                            account_sums.insert(amount.currency.clone(), sum);
+                        }
+                    }
                 }
             }
         }
 
-        balances
+        sums.into_iter()
+            .map(|(account, balances)| {
+                (
+                    account.to_owned(),
+                    report_balances(&balances, exact_guaranteed),
+                )
+            })
+            .collect()
     }
 }
 
@@ -1334,6 +1539,299 @@ mod tests {
             batched.entries[1].as_ref().unwrap().balances.get("USD"),
             Some(&dec!(1500))
         );
+    }
+
+    // ── H-17: exact, order-independent balances ─────────────────────────
+
+    use crate::validate::MAX_AMOUNT_MANTISSA;
+    use proptest::prelude::*;
+
+    /// The largest in-cap mantissa, as the signed type `Decimal` builds from.
+    const CAP: i128 = MAX_AMOUNT_MANTISSA as i128;
+
+    fn at_scale(mantissa: i128, scale: u32) -> Decimal {
+        Decimal::from_i128_with_scale(mantissa, scale)
+    }
+
+    /// Balances as exact text: equal values that print differently (`1.0` vs
+    /// `1.00`, `-0` vs `0`) must not count as agreement.
+    fn render(entry: &Option<AccountBalanceEntry>) -> Option<Vec<(String, String)>> {
+        entry.as_ref().map(|entry| {
+            entry
+                .balances
+                .iter()
+                .map(|(currency, number)| (currency.clone(), number.to_string()))
+                .collect()
+        })
+    }
+
+    fn render_trial_balance(report: &TrialBalanceReport) -> Vec<String> {
+        let mut rendered: Vec<String> = report
+            .rows
+            .iter()
+            .map(|row| format!("{} {} {}", row.account, row.debit, row.credit))
+            .collect();
+        rendered.push(format!("{} {}", report.total_debit, report.total_credit));
+        rendered
+    }
+
+    /// The B6 shape, inside the cap: `+X` dated later, honest dust, `−X` dated
+    /// earliest. `X` is the largest in-cap integer and the dust sits at the
+    /// finest scale — both legal amounts — so `X + dust` needs 49 digits.
+    ///
+    /// Before T65 the balance was one `Decimal` folded in arrival order, and
+    /// `X + dust` silently rounded the dust away: the replica that saw `X`
+    /// before `−X` reported 0, the one that saw them the other way reported
+    /// the dust, and `verify`'s date-ordered sweep disagreed with the live
+    /// total on the same node (H-17).
+    #[test]
+    fn test_h17_in_cap_extremes_are_order_independent() {
+        let big = at_scale(CAP, 0);
+        let dust = at_scale(1, 28);
+        let pair = |day: u32, narration: &str, number: Decimal| {
+            make_txn(
+                make_date(2024, 1, day),
+                narration,
+                vec![("Assets:A", number, "USD"), ("Assets:B", -number, "USD")],
+            )
+        };
+        let plus_big = pair(20, "+X", big);
+        let honest = pair(10, "dust", dust);
+        let minus_big = pair(5, "-X", -big);
+
+        let arrivals = [
+            [plus_big.clone(), honest.clone(), minus_big.clone()],
+            [minus_big.clone(), plus_big.clone(), honest.clone()],
+            [honest.clone(), minus_big.clone(), plus_big.clone()],
+            [plus_big.clone(), minus_big.clone(), honest.clone()],
+        ];
+        let far = make_date(2024, 12, 31);
+        for arrival in &arrivals {
+            let mut live = ReadModel::default();
+            for directive in arrival {
+                live.index_directive(directive);
+            }
+            let built = ReadModel::build(arrival);
+            let batched = live.balances_at_dates(&[("Assets:A", far)]);
+            for (label, entry) in [
+                ("live account()", live.account_balance("Assets:A", None)),
+                (
+                    "live account(at:)",
+                    live.account_balance("Assets:A", Some(far)),
+                ),
+                ("batched sweep", batched.entries[0].clone()),
+                (
+                    "rebooted account()",
+                    built.account_balance("Assets:A", None),
+                ),
+            ] {
+                assert_eq!(
+                    entry.as_ref().map(|entry| entry.balances["USD"]),
+                    Some(dust),
+                    "{label}: the honest dust must survive every arrival order"
+                );
+            }
+            let row = live
+                .trial_balance(far)
+                .rows
+                .into_iter()
+                .find(|row| row.account == "Assets:A")
+                .unwrap();
+            assert_eq!(row.debit, dust, "trial balance agrees");
+            assert_eq!(live.over_cap_posting_count(), 0);
+        }
+    }
+
+    /// An amount past the cap can only come from a caller that skipped every
+    /// ingress. The model counts it, and falls back to non-panicking
+    /// arithmetic rather than asserting (T17/H1's no-panic contract).
+    #[test]
+    fn test_h17_over_cap_amounts_are_counted_not_panicked_on() {
+        let over = make_txn(
+            make_date(2024, 1, 1),
+            "over",
+            vec![
+                ("Assets:A", Decimal::MAX, "USD"),
+                ("Assets:B", Decimal::MIN, "USD"),
+            ],
+        );
+        let again = make_txn(
+            make_date(2024, 1, 2),
+            "again",
+            vec![
+                ("Assets:A", Decimal::MAX, "USD"),
+                ("Assets:B", Decimal::MIN, "USD"),
+            ],
+        );
+        let model = ReadModel::build(&[over, again]);
+        assert_eq!(model.over_cap_posting_count(), 4);
+        assert_eq!(
+            model.account_balance("Assets:A", None).unwrap().balances["USD"],
+            Decimal::MAX,
+            "saturates, as before H-17, instead of panicking"
+        );
+        let in_cap = ReadModel::build(&sample_directives());
+        assert_eq!(in_cap.over_cap_posting_count(), 0);
+    }
+
+    /// Scale is part of what a balance prints, so it must be order-free too.
+    /// Before T65, `5.00 − 5.00 + 3` printed `3` (a zero left operand hands
+    /// back the right one) while `3 + 5.00 − 5.00` printed `3.00`. A zero
+    /// balance is `0.00`, never `-0.00`.
+    #[test]
+    fn test_h17_representation_is_order_independent() {
+        let t = |day: u32, number: Decimal| {
+            make_txn(
+                make_date(2024, 1, day),
+                &format!("t{day}"),
+                vec![("Assets:A", number, "USD")],
+            )
+        };
+        let a = t(1, dec!(5.00));
+        let b = t(2, dec!(-5.00));
+        let c = t(3, dec!(3));
+        let one = ReadModel::build(&[a.clone(), b.clone(), c.clone()]);
+        let mut two = ReadModel::default();
+        for directive in [&c, &b, &a] {
+            two.index_directive(directive);
+        }
+        let printed = |model: &ReadModel| {
+            model.account_balance("Assets:A", None).unwrap().balances["USD"].to_string()
+        };
+        assert_eq!(printed(&one), printed(&two));
+
+        let zero = ReadModel::build(&[a, b]);
+        assert_eq!(
+            zero.account_balance("Assets:A", None).unwrap().balances["USD"].to_string(),
+            "0.00"
+        );
+    }
+
+    /// Any in-cap amount at any scale, weighted towards the extremes that
+    /// broke the old fold: `±CAP` at scale 0 and single units at scale 28.
+    fn capped_amount() -> impl Strategy<Value = Decimal> {
+        let mantissa = prop_oneof![
+            Just(CAP),
+            Just(-CAP),
+            Just(1i128),
+            Just(-1i128),
+            -1_000i128..1_000,
+            -CAP..=CAP,
+        ];
+        let scale = prop_oneof![Just(0u32), Just(2u32), Just(8u32), Just(28u32), 0u32..=28];
+        (mantissa, scale).prop_map(|(mantissa, scale)| at_scale(mantissa, scale))
+    }
+
+    const PROP_ACCOUNTS: [&str; 4] = ["Assets:A", "Assets:B", "Income:C", "Expenses:D"];
+    const PROP_CURRENCIES: [&str; 2] = ["USD", "BTC"];
+
+    fn arbitrary_transaction() -> impl Strategy<Value = Directive> {
+        (
+            0u64..20,
+            prop::collection::vec((0usize..4, capped_amount(), 0usize..2), 1..4),
+            any::<u32>(),
+        )
+            .prop_map(|(day, postings, nonce)| {
+                let date = make_date(2024, 1, 1) + chrono::Days::new(day);
+                let postings = postings
+                    .into_iter()
+                    .map(|(account, number, currency)| {
+                        (PROP_ACCOUNTS[account], number, PROP_CURRENCIES[currency])
+                    })
+                    .collect();
+                make_txn(date, &format!("n{nonce}"), postings)
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+        /// H-17's regression, as the audit specified it: random arrival order
+        /// vs `build` (boot) vs the batched sweep (`verify`), with values up
+        /// to the cap and mixed scales, checked at EVERY prefix — including
+        /// the prefixes where a backdated directive has just been appended.
+        ///
+        /// Agreement is checked as printed text, not only as `Decimal`
+        /// equality, so a path that reaches the same value with a different
+        /// scale or a `-0` fails too.
+        #[test]
+        fn prop_h17_balances_are_exact_and_order_independent(
+            (arrival, other_arrival) in prop::collection::vec(arbitrary_transaction(), 1..20)
+                .prop_flat_map(|txns| (Just(txns.clone()), Just(txns).prop_shuffle())),
+            query_days in prop::collection::vec(0u64..25, 1..8),
+        ) {
+            let far = make_date(2030, 1, 1);
+            let mut live = ReadModel::default();
+            for (prefix, directive) in arrival.iter().enumerate() {
+                live.index_directive(directive);
+                let seen = &arrival[..=prefix];
+                // Boot over the same set, and the same set in reverse arrival.
+                let built = ReadModel::build(seen);
+                let mut reversed = ReadModel::default();
+                for directive in seen.iter().rev() {
+                    reversed.index_directive(directive);
+                }
+                prop_assert_eq!(live.over_cap_posting_count(), 0);
+
+                let queries: Vec<(&str, NaiveDate)> = query_days
+                    .iter()
+                    .flat_map(|&day| {
+                        let date = make_date(2023, 12, 28) + chrono::Days::new(day);
+                        PROP_ACCOUNTS.iter().map(move |&account| (account, date))
+                    })
+                    .chain(PROP_ACCOUNTS.iter().map(|&account| (account, far)))
+                    .collect();
+                let batched = live.balances_at_dates(&queries);
+                let batched_built = built.balances_at_dates(&queries);
+                for (index, &(account, at)) in queries.iter().enumerate() {
+                    let per_query = render(&live.account_balance(account, Some(at)));
+                    prop_assert_eq!(
+                        &render(&batched.entries[index]), &per_query,
+                        "prefix {} batched vs account(at:) for {} at {}", prefix, account, at
+                    );
+                    prop_assert_eq!(&render(&batched_built.entries[index]), &per_query);
+                }
+                for account in PROP_ACCOUNTS {
+                    let running = render(&live.account_balance(account, None));
+                    prop_assert_eq!(
+                        &running, &render(&live.account_balance(account, Some(far))),
+                        "prefix {}: live account() vs account(at:) for {}", prefix, account
+                    );
+                    prop_assert_eq!(&running, &render(&built.account_balance(account, None)));
+                    prop_assert_eq!(&running, &render(&reversed.account_balance(account, None)));
+                }
+                prop_assert_eq!(
+                    render_trial_balance(&live.trial_balance(far)),
+                    render_trial_balance(&built.trial_balance(far))
+                );
+            }
+
+            // A second replica holding the same set, received in another order.
+            let mut replica = ReadModel::default();
+            for directive in &other_arrival {
+                replica.index_directive(directive);
+            }
+            for account in PROP_ACCOUNTS {
+                prop_assert_eq!(
+                    render(&live.account_balance(account, None)),
+                    render(&replica.account_balance(account, None))
+                );
+            }
+            prop_assert_eq!(
+                render_trial_balance(&live.trial_balance(far)),
+                render_trial_balance(&replica.trial_balance(far))
+            );
+            let sheet = |model: &ReadModel| {
+                let report = model.balance_sheet(far);
+                format!("{:?}{:?}{:?}", report.assets, report.liabilities, report.equity)
+            };
+            prop_assert_eq!(sheet(&live), sheet(&replica));
+            let income = |model: &ReadModel| {
+                let report = model.income_statement(make_date(2024, 1, 5), far);
+                format!("{:?}{:?}{:?}", report.income, report.expenses, report.net)
+            };
+            prop_assert_eq!(income(&live), income(&replica));
+        }
     }
 
     /// No queries: no answers, and no walk.

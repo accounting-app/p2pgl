@@ -5,7 +5,6 @@
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use std::collections::BTreeMap;
-use std::str::FromStr;
 
 use crate::error::{ParseError, ParseErrorKind};
 use crate::model::*;
@@ -192,7 +191,20 @@ impl Scanner {
             .iter()
             .filter(|c| **c != ',')
             .collect();
-        Decimal::from_str(&number_string).map_err(|e| format!("Invalid number: {e}"))
+        // H-17: `from_str_exact`, not `from_str`. The latter silently rounds a
+        // fraction longer than 28 digits, so the number held — and hashed, and
+        // judged against the cap below — was not the number the file says.
+        let number =
+            Decimal::from_str_exact(&number_string).map_err(|e| format!("Invalid number: {e}"))?;
+        // H-17: the amount cap, at the one reader every amount in a `.bean`
+        // body goes through — posting units, `{cost}`, `@`/`@@` price,
+        // `balance` and `price` directives. That makes it the gate on the wire
+        // (`validate_supply_entry` re-parses the body) and on the file path,
+        // where boot quarantines the refused block rather than loading it:
+        // boot applies no transaction-level validation, so this is the only
+        // check history passes through.
+        crate::validate::check_amount_cap("amount", number).map_err(|error| error.to_string())?;
+        Ok(number)
     }
 
     fn read_currency(&mut self) -> Result<String, String> {
@@ -542,22 +554,104 @@ pub fn strip_byte_order_mark(input: &str) -> &str {
 /// content ids — are identical to the same file without one.
 ///
 /// Returns `Err` with all accumulated errors if any line fails to parse.
+///
+/// This is the FILE loader's entry point and it deliberately keeps every
+/// error: an operator fixing a hand-edited `.bean` wants the whole list. The
+/// remote path must not use it — see [`parse_file_bounded`] (H-18).
 pub fn parse_file(input: &str) -> Result<Vec<Directive>, Vec<ParseError>> {
+    parse_file_with_cap(input, None).map_err(|bounded| bounded.errors)
+}
+
+/// The errors of a [`parse_file_bounded`] run: the first `max_errors` in
+/// source order, plus how many there were in all (H-18).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedParseErrors {
+    /// At most the `max_errors` the caller asked for, in source order.
+    pub errors: Vec<ParseError>,
+    /// Every block that failed, counted whether or not it was kept.
+    pub total: usize,
+}
+
+/// [`parse_file`] for input a PEER wrote: keep at most `max_errors` errors,
+/// count the rest (T66 / H-18).
+///
+/// `parse_file` pushes one `ParseError` per failed block with no cap, and a
+/// 1 MiB body of `"x\n"` × 524,288 is 524,288 failed blocks — measured at
+/// ~195 MB of transient allocation and a 55 MB error string per entry, after
+/// every frame cap had already been paid. The block loop is the same one the
+/// file loader runs; the only difference is that an error past the cap is
+/// dropped as soon as it is made, so the live set is `max_errors` deep no
+/// matter how long the body is. The count still covers every block, so the
+/// caller can say "524,288 parse errors; first: …" rather than pretend there
+/// were three.
+///
+/// `max_errors == 0` keeps nothing and only counts.
+pub fn parse_file_bounded(
+    input: &str,
+    max_errors: usize,
+) -> Result<Vec<Directive>, BoundedParseErrors> {
+    parse_file_with_cap(input, Some(max_errors))
+}
+
+/// How many directive blocks [`parse_file`] would see in `input` (T66 / H-18).
+///
+/// A block is one non-indented, non-blank, non-comment line plus the indented
+/// lines under it. Every block yields exactly one directive or one error, so
+/// for a body with no stray indented lines this is `directives.len() +
+/// errors.len()` of a `parse_file` run — without parsing, allocating, or
+/// keeping anything. (A stray indented line before any header is an error but
+/// not a block; it is under-counted, never over-counted, which is the safe
+/// direction for a refusal gate.) The wire path expects exactly one directive
+/// per entry and uses this to refuse a many-block body BEFORE paying to parse
+/// it; `count_directive_headers_agrees_with_parse_file` pins the two to the
+/// same rule.
+pub fn count_directive_headers(input: &str) -> usize {
+    strip_byte_order_mark(input)
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty()
+                && !trimmed.starts_with(';')
+                && !line.starts_with(' ')
+                && !line.starts_with('\t')
+        })
+        .count()
+}
+
+/// The one block loop behind [`parse_file`] and [`parse_file_bounded`].
+///
+/// `max_errors` of `None` keeps every error (the file loader); `Some(n)` keeps
+/// the first `n` and counts the rest (the wire path, H-18).
+fn parse_file_with_cap(
+    input: &str,
+    max_errors: Option<usize>,
+) -> Result<Vec<Directive>, BoundedParseErrors> {
     let input = strip_byte_order_mark(input);
 
     let mut directives = Vec::new();
     let mut errors = Vec::new();
+    let mut total_errors = 0usize;
+    let mut note_error = |errors: &mut Vec<ParseError>, error: ParseError| {
+        total_errors += 1;
+        if max_errors.is_none_or(|cap| errors.len() < cap) {
+            errors.push(error);
+        }
+    };
 
-    let lines: Vec<&str> = input.lines().collect();
-    let mut index = 0;
+    // H-18 (T66): the lines are walked, not collected. `input.lines().collect()`
+    // was a 16-byte `&str` per line — 5× the body for three-byte lines, 12×
+    // at the `Vec`'s last doubling with the old buffer still live — paid before
+    // a single block was parsed, on the wire path as on the file path. A
+    // peekable iterator sees exactly what the indexed loop saw: a block's body
+    // is consumed line by line, and the blank or non-indented line that ends it
+    // is left for the outer loop.
+    let mut lines = input.lines().enumerate().peekable();
 
-    while index < lines.len() {
-        let line = lines[index];
+    while let Some((index, line)) = lines.next() {
         let trimmed = line.trim();
 
         // Skip blank lines and comment-only lines.
         if trimmed.is_empty() || trimmed.starts_with(';') {
-            index += 1;
             continue;
         }
 
@@ -565,12 +659,10 @@ pub fn parse_file(input: &str) -> Result<Vec<Directive>, Vec<ParseError>> {
         if !line.starts_with(' ') && !line.starts_with('\t') {
             let header_line_number = index + 1; // 1-based
             let header = line;
-            index += 1;
 
             // Collect indented body lines (postings + metadata).
             let mut body_lines: Vec<(usize, &str)> = Vec::new();
-            while index < lines.len() {
-                let body_line = lines[index];
+            while let Some(&(body_index, body_line)) = lines.peek() {
                 if body_line.is_empty() {
                     // Blank line ends the block.
                     break;
@@ -578,9 +670,9 @@ pub fn parse_file(input: &str) -> Result<Vec<Directive>, Vec<ParseError>> {
                 if body_line.starts_with(' ') || body_line.starts_with('\t') {
                     let body_trimmed = body_line.trim();
                     if !body_trimmed.is_empty() && !body_trimmed.starts_with(';') {
-                        body_lines.push((index + 1, body_line));
+                        body_lines.push((body_index + 1, body_line));
                     }
-                    index += 1;
+                    lines.next();
                 } else {
                     // Next non-indented line = next directive.
                     break;
@@ -589,23 +681,46 @@ pub fn parse_file(input: &str) -> Result<Vec<Directive>, Vec<ParseError>> {
 
             match parse_directive_block(header, &body_lines, header_line_number) {
                 Ok(directive) => directives.push(directive),
-                Err(error) => errors.push(error),
+                Err(error) => note_error(&mut errors, error),
             }
         } else {
-            errors.push(ParseError::new(
-                index + 1,
-                1,
-                "Unexpected indented line without a preceding directive",
-                ParseErrorKind::BadStructure,
-            ));
-            index += 1;
+            note_error(
+                &mut errors,
+                ParseError::new(
+                    index + 1,
+                    1,
+                    "Unexpected indented line without a preceding directive",
+                    ParseErrorKind::BadStructure,
+                ),
+            );
         }
     }
 
-    if errors.is_empty() {
+    if total_errors == 0 {
         Ok(directives)
     } else {
-        Err(errors)
+        Err(BoundedParseErrors {
+            errors,
+            total: total_errors,
+        })
+    }
+}
+
+/// Quote at most [`TRAILING_CONTENT_EXCERPT_CHARS`] of a peer-chosen token
+/// back in an error message (M-41).
+///
+/// The same excerpting `reject_trailing_content` does, and for the same
+/// reason: a token is attacker text on the wire path, and `Unsupported
+/// directive: '<1 MiB>'` was a 1 MiB error string — then a 1 MiB log line.
+fn excerpt_token(token: &str) -> String {
+    if token.chars().count() > TRAILING_CONTENT_EXCERPT_CHARS {
+        token
+            .chars()
+            .take(TRAILING_CONTENT_EXCERPT_CHARS)
+            .chain(std::iter::once('\u{2026}'))
+            .collect()
+    } else {
+        token.to_owned()
     }
 }
 
@@ -645,15 +760,7 @@ fn reject_trailing_content(
     if scanner.at_eol() {
         return Ok(());
     }
-    let rest = scanner.rest_of_line();
-    let excerpt: String = if rest.chars().count() > TRAILING_CONTENT_EXCERPT_CHARS {
-        rest.chars()
-            .take(TRAILING_CONTENT_EXCERPT_CHARS)
-            .chain(std::iter::once('\u{2026}'))
-            .collect()
-    } else {
-        rest
-    };
+    let excerpt = excerpt_token(&scanner.rest_of_line());
     Err(ParseError::new(
         line_number,
         scanner.column_of_rest(),
@@ -720,7 +827,7 @@ fn parse_directive_block(
                 return Err(ParseError::new(
                     line_number,
                     scanner.column(),
-                    format!("Unsupported directive: '{keyword}'"),
+                    format!("Unsupported directive: '{}'", excerpt_token(&keyword)),
                     ParseErrorKind::UnsupportedDirective,
                 ));
             }
@@ -755,7 +862,7 @@ fn parse_directive_block(
                 _ => Err(ParseError::new(
                     line_number,
                     scanner.column(),
-                    format!("Unsupported directive: '{keyword}'"),
+                    format!("Unsupported directive: '{}'", excerpt_token(&keyword)),
                     ParseErrorKind::UnsupportedDirective,
                 )),
             }
@@ -2371,6 +2478,100 @@ mod tests {
         }
     }
 
+    /// H-17: the number parser refuses an amount past the cap, with an error
+    /// that names it, wherever in a body the amount sits — this reader is the
+    /// gate on the wire and at boot, where nothing else checks history.
+    #[test]
+    fn test_parse_refuses_an_amount_over_the_cap() {
+        let over = "1000000000000000000000"; // 10^21: 22 significant digits
+        for (what, input) in [
+            (
+                "posting",
+                format!("2024-01-15 *\n  Assets:Cash {over} USD\n  Equity:Opening -1 USD\n"),
+            ),
+            (
+                "negative posting",
+                format!("2024-01-15 *\n  Assets:Cash 1 USD\n  Equity:Opening -{over} USD\n"),
+            ),
+            (
+                "cost",
+                format!(
+                    "2024-01-15 *\n  Assets:Stock 1 AAPL {{{over} USD}}\n  Assets:Cash -1 USD\n"
+                ),
+            ),
+            (
+                "unit price",
+                format!("2024-01-15 *\n  Assets:Stock 1 AAPL @ {over} USD\n  Assets:Cash -1 USD\n"),
+            ),
+            (
+                "total price",
+                format!(
+                    "2024-01-15 *\n  Assets:Stock 1 AAPL @@ {over} USD\n  Assets:Cash -1 USD\n"
+                ),
+            ),
+            (
+                "balance",
+                format!("2024-01-15 balance Assets:Cash {over} USD\n"),
+            ),
+            (
+                "price directive",
+                format!("2024-01-15 price EUR {over} USD\n"),
+            ),
+            (
+                "Decimal::MAX",
+                "2024-01-15 balance Assets:Cash 79228162514264337593543950335 USD\n".to_owned(),
+            ),
+            (
+                "trailing zeros count",
+                "2024-01-15 balance Assets:Cash 10,000,000,000,000.00000000 USD\n".to_owned(),
+            ),
+        ] {
+            let errors = parse_file(&input).expect_err(&format!("{what} must be refused"));
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.kind == ParseErrorKind::InvalidNumber
+                        && error.message.contains("H-17")),
+                "{what}: expected an H-17 InvalidNumber error, got {errors:?}"
+            );
+        }
+    }
+
+    /// H-17: the largest in-cap amounts still parse, exactly as written, at
+    /// both ends of the scale range.
+    #[test]
+    fn test_parse_accepts_the_largest_in_cap_amounts() {
+        for number in [
+            "999999999999999999999",
+            "-999,999,999,999,999,999,999",
+            "9999999999999.99999999",
+            "0.0000000000000000000000000001",
+        ] {
+            let input = format!("2024-01-15 balance Assets:Cash {number} USD\n");
+            let directives =
+                parse_file(&input).unwrap_or_else(|e| panic!("{number} must parse: {e:?}"));
+            let Directive::Balance(balance) = &directives[0] else {
+                panic!("expected a balance");
+            };
+            assert_eq!(balance.amount.number.to_string(), number.replace(',', ""));
+        }
+    }
+
+    /// H-17: a fraction longer than `Decimal` can hold is refused, not rounded
+    /// — `from_str` used to turn this into `0.0000000000000000000000000000`,
+    /// so the number held (and hashed) was not the number in the file.
+    #[test]
+    fn test_parse_refuses_rather_than_rounds_an_overlong_fraction() {
+        let input = "2024-01-15 balance Assets:Cash 0.00000000000000000000000000001 USD\n";
+        let errors = parse_file(input).expect_err("29 fractional digits cannot be held exactly");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.kind == ParseErrorKind::InvalidNumber),
+            "{errors:?}"
+        );
+    }
+
     #[test]
     fn test_inline_comment_ignored() {
         let input = "2024-01-01 open Assets:Cash ; this is a comment\n";
@@ -2744,5 +2945,124 @@ mod tests {
                 "{name} must round-trip"
             );
         }
+    }
+
+    // ── T66 / H-18: the bounded parse entry point for the wire path ──────
+
+    /// `parse_file_bounded` keeps the first `max_errors` in source order and
+    /// counts every failed block, while `parse_file` still keeps them all.
+    #[test]
+    fn parse_file_bounded_keeps_the_first_errors_and_counts_the_rest() {
+        let body = "x\n".repeat(1000);
+        let bounded = parse_file_bounded(&body, 3).unwrap_err();
+        assert_eq!(bounded.errors.len(), 3);
+        assert_eq!(bounded.total, 1000);
+        assert_eq!(
+            bounded.errors.iter().map(|e| e.line).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "the kept errors are the FIRST ones, in source order"
+        );
+        // The file loader keeps every error, byte for byte the same ones.
+        let all = parse_file(&body).unwrap_err();
+        assert_eq!(all.len(), 1000);
+        assert_eq!(&all[..3], &bounded.errors[..]);
+        // A cap of zero only counts.
+        let counted = parse_file_bounded(&body, 0).unwrap_err();
+        assert!(counted.errors.is_empty());
+        assert_eq!(counted.total, 1000);
+        // Fewer errors than the cap: the cap is invisible.
+        let two = parse_file_bounded("x\n2024-01-01 open Assets:Cash USD\ny\n", 3).unwrap_err();
+        assert_eq!(two.errors.len(), 2);
+        assert_eq!(two.total, 2);
+        // A clean body is `Ok` on both.
+        assert_eq!(
+            parse_file_bounded("2024-01-01 open Assets:Cash USD\n", 3).unwrap(),
+            parse_file("2024-01-01 open Assets:Cash USD\n").unwrap()
+        );
+    }
+
+    /// `count_directive_headers` is `directives + errors` of a `parse_file` run
+    /// for every block shape the loop distinguishes: blank, comment, tab- and
+    /// space-indented, a leading BOM, CRLF, and bodies that fail.
+    #[test]
+    fn count_directive_headers_agrees_with_parse_file() {
+        // Every block parses: the count is the directive count.
+        let all_parse = [
+            "",
+            "\n\n",
+            "; only a comment\n   ; indented comment\n",
+            "\u{feff}2024-01-01 open Assets:Cash USD\n",
+            "2024-01-01 open Assets:Cash USD\n2024-01-02 open Assets:Bank USD\n",
+            "2024-01-01 * \"payee\" \"narr\"\n  Assets:Cash  1 USD\n  Equity:Open\n",
+            "2024-01-01 * \"payee\" \"narr\"\n\tAssets:Cash  1 USD\n\tEquity:Open\n",
+            "2024-01-01 open Assets:Cash USD\r\n2024-01-02 open Assets:Bank USD\r\n",
+            "2024-01-01 open Assets:Cash USD\n  meta: \"v\"\n; c\n2024-01-02 note Assets:Cash \"n\"\n",
+        ];
+        for input in all_parse {
+            let directives = parse_file(input).unwrap_or_else(|e| panic!("{input:?}: {e:?}"));
+            assert_eq!(
+                count_directive_headers(input),
+                directives.len(),
+                "header count disagrees with parse_file for {input:?}"
+            );
+        }
+        // Every block fails: the count is the error count.
+        let x50 = "x\n".repeat(50);
+        let x_blank50 = "x\n\n".repeat(50);
+        let all_fail = [x50.as_str(), x_blank50.as_str()];
+        for input in all_fail {
+            let errors = parse_file(input).unwrap_err();
+            let bounded = parse_file_bounded(input, usize::MAX).unwrap_err();
+            assert_eq!(bounded.total, errors.len());
+            assert_eq!(
+                count_directive_headers(input),
+                errors.len(),
+                "header count disagrees with parse_file for {input:?}"
+            );
+        }
+        // A good block, an orphaned indented line after a blank, a bad block:
+        // two headers; two errors (the orphan and the bad date).
+        let orphaned = "2024-01-01 open Assets:Cash USD\n  meta: \"v\"\n\n  orphaned: \"v\"\n2024-13-01 open A:B USD\n";
+        assert_eq!(parse_file(orphaned).unwrap_err().len(), 2);
+        assert_eq!(count_directive_headers(orphaned), 2);
+        // A stray indented line before any header is an ERROR but not a
+        // block: under-counted, which only ever makes the wire gate lenient
+        // and leaves the bounded parser to refuse it.
+        let stray = "  stray indented line\nx\n\n y\n";
+        assert_eq!(parse_file(stray).unwrap_err().len(), 3);
+        assert_eq!(count_directive_headers(stray), 1);
+        let indented50 = " x\n".repeat(50);
+        assert_eq!(parse_file(&indented50).unwrap_err().len(), 50);
+        assert_eq!(count_directive_headers(&indented50), 0);
+        // Mixed: a bad-date block, a note block with a bad body line, and a
+        // stray indented line after a blank — two headers, three errors.
+        let mixed = "2024-13-01 open Assets:Cash USD\n; comment\n2024-01-01 note Assets:Cash \"n\"\n  x\n\n  y\n";
+        let errors = parse_file(mixed).unwrap_err();
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert_eq!(count_directive_headers(mixed), 2);
+    }
+
+    /// T66 / M-41: an unsupported keyword is quoted back at most 60 characters
+    /// long, exactly as a trailing-content excerpt is — a 1 MiB keyword was a
+    /// 1 MiB error message and then a 1 MiB log line.
+    #[test]
+    fn unsupported_directive_message_excerpts_the_keyword() {
+        let keyword = "k".repeat(1024 * 1024);
+        let input = format!("2024-01-01 {keyword}\n");
+        let errors = parse_file(&input).unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].kind, ParseErrorKind::UnsupportedDirective);
+        assert!(errors[0].message.len() < 128, "{}", errors[0].message.len());
+        assert!(errors[0].message.ends_with("\u{2026}'"));
+        // A short keyword is still quoted whole.
+        let errors = parse_file("2024-01-01 option \"t\" \"v\"\n").unwrap_err();
+        assert_eq!(errors[0].message, "Unsupported directive: 'option'");
+        // The unlisted-keyword arm bounds the same way.
+        let errors = parse_file(&format!("2024-01-01 {}\n", "z".repeat(500))).unwrap_err();
+        assert_eq!(errors[0].kind, ParseErrorKind::UnsupportedDirective);
+        assert_eq!(
+            errors[0].message.chars().count(),
+            "Unsupported directive: ''".len() + 61
+        );
     }
 }

@@ -197,6 +197,23 @@ pub enum WireMessage {
     Supply { v: u64, entries: Vec<SupplyEntry> },
 }
 
+impl WireMessage {
+    /// The frame's wire discriminator, and nothing else (M-41).
+    ///
+    /// For a log line that says "expected X, got Y": `?message` renders the
+    /// whole frame — a 4,096-id `HaveHeads` page or a 16 MiB `Supply` — into
+    /// a log line the peer wrote. The discriminator is the only thing the log
+    /// needs to say which arm was taken, and it is a constant.
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            WireMessage::Announce { .. } => "announce",
+            WireMessage::HaveHeads { .. } => "have_heads",
+            WireMessage::Want { .. } => "want",
+            WireMessage::Supply { .. } => "supply",
+        }
+    }
+}
+
 /// The kind of directive being announced or supplied.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -565,17 +582,69 @@ fn saturating_count(claimed: u64) -> usize {
 /// Longest decode-error detail this crate will carry out of ciborium (T49).
 ///
 /// Enough to name the type mismatch and where it happened; far too short to be
-/// worth using as a channel.
-const MAX_DECODE_ERROR_CHARS: usize = 256;
+/// worth using as a channel. Since T66 it is also the budget every
+/// attacker-reachable error is rendered under on the intake path (H-18, M-41):
+/// one number for "how much of a peer's text may reach a log line".
+pub const MAX_DECODE_ERROR_CHARS: usize = 256;
+
+/// What [`BoundedSink::finish`] appends when the budget cut something off.
+pub const TRUNCATION_MARKER: &str = "… (error truncated)";
 
 /// A [`std::fmt::Write`] sink that keeps at most `budget` characters (T49).
 ///
 /// Character-counted, not byte-counted, and it only ever cuts on a character
 /// boundary — so the result is always valid UTF-8 and always printable.
-struct BoundedSink {
+///
+/// `pub` since T66 (H-18, M-41): the wire crate's parse-error rendering and
+/// `gl-node`'s intake `warn!` sites format through it, so a `MergeError`
+/// wrapping a peer's body can never become a log line the size of that body.
+/// Prefer [`bounded_display`] unless the write sequence itself matters.
+pub struct BoundedSink {
     kept: String,
     budget: usize,
     elided: bool,
+}
+
+impl BoundedSink {
+    /// An empty sink that keeps at most `budget` characters.
+    pub fn new(budget: usize) -> Self {
+        Self {
+            kept: String::new(),
+            budget,
+            elided: false,
+        }
+    }
+
+    /// Whether anything written so far was cut off.
+    pub fn elided(&self) -> bool {
+        self.elided
+    }
+
+    /// The kept text, with [`TRUNCATION_MARKER`] appended if anything was cut.
+    ///
+    /// The marker is appended AFTER the budget is spent, so a caller sizing a
+    /// buffer sees at most `budget + TRUNCATION_MARKER.chars().count()`.
+    pub fn finish(mut self) -> String {
+        if self.elided {
+            self.kept.push_str(TRUNCATION_MARKER);
+        }
+        self.kept
+    }
+}
+
+/// Render `value` through a [`BoundedSink`] of `budget` characters (T66).
+///
+/// The truncation happens as the value is FORMATTED: nothing downstream ever
+/// holds a full-size rendering, which is the difference between "a bounded log
+/// line" and "an unbounded `String` we then shorten". A `Display` impl can only
+/// fail through its sink and the sink never fails, so the `write!` result is
+/// ignored rather than unwrapped — a panic while formatting an attacker's error
+/// would be the worse of the two outcomes.
+pub fn bounded_display(value: &impl std::fmt::Display, budget: usize) -> String {
+    use std::fmt::Write as _;
+    let mut sink = BoundedSink::new(budget);
+    let _ = write!(sink, "{value}");
+    sink.finish()
 }
 
 impl std::fmt::Write for BoundedSink {
@@ -620,22 +689,8 @@ impl std::fmt::Write for BoundedSink {
 /// Note what this does not claim to fix: the peak allocation during the decode
 /// itself. That is `Content` buffering plus serde's own message, both inside
 /// ciborium, and bounding it belongs with the frame caps (M-16/H-09), not here.
-fn elide_decode_error(error: &impl std::fmt::Display) -> String {
-    use std::fmt::Write as _;
-    let mut sink = BoundedSink {
-        kept: String::new(),
-        budget: MAX_DECODE_ERROR_CHARS,
-        elided: false,
-    };
-    // `BoundedSink` never returns `Err`, and a `Display` impl can only fail by
-    // way of its sink, so this cannot fail — ignored rather than unwrapped
-    // because a panic while formatting an attacker's error would be the worse
-    // of the two outcomes.
-    let _ = write!(sink, "{error}");
-    if sink.elided {
-        sink.kept.push_str("… (error truncated)");
-    }
-    sink.kept
+pub fn elide_decode_error(error: &impl std::fmt::Display) -> String {
+    bounded_display(error, MAX_DECODE_ERROR_CHARS)
 }
 
 /// Wire protocol errors.
@@ -946,6 +1001,55 @@ mod tests {
         // Sanity: the payload really is in the frame, so the test is not passing
         // because the frame was rejected before serde ever saw it.
         assert!(frame.len() > payload_bytes);
+    }
+
+    /// T66 (M-41): `bounded_display` keeps a short value verbatim, cuts a long
+    /// one at the budget and says so, and its output is sized by the budget
+    /// alone — never by the value.
+    #[test]
+    fn bounded_display_is_sized_by_the_budget_not_the_value() {
+        assert_eq!(bounded_display(&"short", 16), "short");
+        let long = "é".repeat(4 * 1024 * 1024);
+        let rendered = bounded_display(&long, 256);
+        assert!(rendered.ends_with(TRUNCATION_MARKER));
+        assert_eq!(
+            rendered.chars().count(),
+            256 + TRUNCATION_MARKER.chars().count()
+        );
+        assert!(rendered.len() < 1024);
+    }
+
+    /// T66 (M-41): a full `HaveHeads` page where a `Supply` was expected used
+    /// to be `?other`-rendered into the log. What the log carries now is the
+    /// discriminator, a constant far under the 512-char bar for every variant.
+    #[test]
+    fn a_full_have_heads_page_logs_as_its_variant_name() {
+        let ids: Vec<String> = (0..MAX_HAVE_HEADS).map(|i| format!("{i:064x}")).collect();
+        let page = WireMessage::have_heads_page(ids.clone(), ids, true);
+        assert!(
+            format!("{page:?}").len() > 512 * 1024,
+            "the frame itself is huge"
+        );
+        assert_eq!(page.variant_name(), "have_heads");
+        assert!(page.variant_name().len() < 512);
+        assert_eq!(WireMessage::want(Vec::new()).variant_name(), "want");
+        assert_eq!(
+            WireMessage::Supply {
+                v: WIRE_VERSION,
+                entries: Vec::new()
+            }
+            .variant_name(),
+            "supply"
+        );
+        assert_eq!(
+            WireMessage::Announce {
+                v: WIRE_VERSION,
+                id: String::new(),
+                kind: DirectiveKind::Open
+            }
+            .variant_name(),
+            "announce"
+        );
     }
 
     /// The sink cuts on character boundaries and reports whether it cut.

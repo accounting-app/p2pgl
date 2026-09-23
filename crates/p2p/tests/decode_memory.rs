@@ -37,6 +37,7 @@ use p2p::protocol::{
     DirectiveKind, SupplyEntry, WireError, WireMessage, MAX_MESSAGE_SIZE, MAX_SUPPLY_ENTRIES,
     MAX_WANT_IDS, SUPPLY_TYPE_DISCRIMINATOR,
 };
+use p2p::union_merge::{validate_supply_entry, MergeError, MAX_REPORTED_PARSE_ERRORS};
 
 /// Serializes the measuring tests in this binary — see the module docs.
 static MEASUREMENT: Mutex<()> = Mutex::new(());
@@ -541,4 +542,130 @@ fn supply_payload_hidden_from_the_entry_count_is_rejected_within_a_bounded_peak(
          attack is held to must be one honest traffic meets",
         honest.len(),
     );
+}
+
+// ─── T66 / H-18: the parse-error amplifier behind every frame cap ───────────
+
+/// A `Supply` entry whose body is exactly `body`, under a well-formed id that
+/// is not its hash — the id-form check passes and the body is what decides.
+fn entry_with_body(body: String) -> SupplyEntry {
+    SupplyEntry {
+        id: "0".repeat(64),
+        kind: DirectiveKind::Open,
+        economic_bean: body,
+        envelope: std::collections::BTreeMap::new(),
+    }
+}
+
+/// Peak allocation permitted while validating one entry, as a multiple of the
+/// entry's body — the same 4× bar the frame decodes are held to.
+const ENTRY_PEAK_BUDGET_MULTIPLE: usize = 4;
+
+/// H-18: the three bodies the audit measured — `"x\n"` × 512k at 194,924,029 B
+/// (185.9×) with a 55,463,434 B error; `"x\n\n"` × 349k at 131.9×; `" x\n"` ×
+/// 349k at 145.6× — validated under the counting allocator. Each must peak
+/// within 4× its body and render its error under 1,024 bytes.
+///
+/// Three shapes because the fix has two layers and the shapes split across
+/// them: the first two are many directive BLOCKS and are refused by the
+/// header count without parsing; the third is many stray indented lines and
+/// no block at all — also refused by the count. `parse_file_bounded` itself is
+/// measured separately below, on a body that gets past the count.
+#[test]
+fn a_thousand_block_body_is_refused_within_a_bounded_peak_and_a_small_error() {
+    let _measuring = measurement_lock();
+    let mib = 1024 * 1024;
+    let shapes = [
+        ("\"x\\n\" x 512k", "x\n".repeat(mib / 2)),
+        ("\"x\\n\\n\" x 349k", "x\n\n".repeat(mib / 3)),
+        ("\" x\\n\" x 349k", " x\n".repeat(mib / 3)),
+    ];
+    for (name, body) in shapes {
+        let body_len = body.len();
+        let entry = entry_with_body(body);
+        let budget = body_len * ENTRY_PEAK_BUDGET_MULTIPLE;
+        let (result, peak) = peak_allocated_during(|| validate_supply_entry(&entry));
+        let error = result.expect_err("a body of bad blocks must be refused");
+        let rendered = error.to_string();
+        println!(
+            "{name}: body {body_len} bytes, peak {peak} bytes ({:.2}× body, budget {budget}), \
+             error {} bytes",
+            peak as f64 / body_len as f64,
+            rendered.len()
+        );
+        assert!(
+            matches!(error, MergeError::ParseError(_)),
+            "{name}: {error}"
+        );
+        assert!(
+            peak <= budget,
+            "{name}: validating a {body_len}-byte body peaked at {peak} bytes, over the \
+             {ENTRY_PEAK_BUDGET_MULTIPLE}× budget of {budget}"
+        );
+        assert!(
+            rendered.len() < 1024,
+            "{name}: the error is {} bytes — it is carrying the body",
+            rendered.len()
+        );
+    }
+}
+
+/// H-18, the bounded parser on its own: a body that PASSES the block count
+/// (one header) and then fails 349k times inside `parse_file_bounded` — stray
+/// indented lines before a bad header. This is the layer that used to keep
+/// one `ParseError` per failure; it now keeps `MAX_REPORTED_PARSE_ERRORS`
+/// and counts the rest, so the peak is bounded by the body, not by the
+/// failure count, and the rendered error is a constant size.
+#[test]
+fn the_bounded_parser_peaks_within_budget_on_a_body_the_block_count_admits() {
+    let _measuring = measurement_lock();
+    let mib = 1024 * 1024;
+    // `mib / 3 - 1` stray lines plus the header: just under the 1 MiB bean cap.
+    let body = format!("{}x\n", " x\n".repeat(mib / 3 - 1));
+    assert!(body.len() <= mib && body.len() > mib - 8, "{}", body.len());
+    let body_len = body.len();
+    assert_eq!(ledger::parse::count_directive_headers(&body), 1);
+    let entry = entry_with_body(body);
+    let budget = body_len * ENTRY_PEAK_BUDGET_MULTIPLE;
+
+    let (result, peak) = peak_allocated_during(|| validate_supply_entry(&entry));
+    let error = result.expect_err("a body of stray lines must be refused");
+    let rendered = error.to_string();
+    println!(
+        "stray-lines-then-header: body {body_len} bytes, peak {peak} bytes ({:.2}× body, \
+         budget {budget}), error {} bytes",
+        peak as f64 / body_len as f64,
+        rendered.len()
+    );
+    let MergeError::ParseError(detail) = &error else {
+        panic!("expected a parse error, got {error}");
+    };
+    assert!(
+        detail.starts_with(&format!("{} parse error(s); first: ", mib / 3)),
+        "{detail}"
+    );
+    assert_eq!(
+        detail.matches("Unexpected indented line").count(),
+        MAX_REPORTED_PARSE_ERRORS
+    );
+    assert!(
+        peak <= budget,
+        "peaked at {peak} bytes, over the budget of {budget}"
+    );
+    assert!(rendered.len() < 1024, "{}", rendered.len());
+
+    // And `parse_file_bounded` directly, without the wire path's other checks.
+    let (bounded, parser_peak) = peak_allocated_during(|| {
+        ledger::parse::parse_file_bounded(&entry.economic_bean, MAX_REPORTED_PARSE_ERRORS)
+    });
+    let bounded = bounded.expect_err("must fail");
+    println!(
+        "parse_file_bounded alone: peak {parser_peak} bytes ({:.2}× body), kept {} of {}",
+        parser_peak as f64 / body_len as f64,
+        bounded.errors.len(),
+        bounded.total
+    );
+    assert_eq!(bounded.errors.len(), MAX_REPORTED_PARSE_ERRORS);
+    assert_eq!(bounded.total, mib / 3);
+    assert!(parser_peak <= budget);
 }

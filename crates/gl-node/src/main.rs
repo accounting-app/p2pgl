@@ -198,10 +198,15 @@ async fn main() {
     let directive_count = service.directive_count();
     let head_count = service.head_count();
     let quarantined_count = service.quarantined_count();
+    // H-13: directives boot adopted as operator input (no envelope in the
+    // file) that still await this node's identity and signature — finalised
+    // below, after the key is loaded and before anything is written or served.
+    let operator_input_count = service.unsigned_operator_input_count();
     info!(
         directives = directive_count,
         heads = head_count,
         quarantined = quarantined_count,
+        operator_input = operator_input_count,
         path = %ledger_path.display(),
         "ledger service booted"
     );
@@ -239,19 +244,13 @@ async fn main() {
     // Wrap in Arc<RwLock> for concurrent access (§3.5).
     let shared_ledger: SharedLedger = Arc::new(RwLock::new(service));
 
-    // T44: fold any commit journal back into the canonical `.bean` before
-    // serving. A journal is only ever present here after an unclean stop (a
-    // clean one compacts on the way out), so this is the crash-recovery point:
-    // boot has already unioned canonical ∪ journal into memory, and this writes
-    // that union out as one canonical file and deletes the sidecar.
-    //
-    // A failure is logged, not fatal. The journal is still on disk and still
-    // correct — boot read it once and would read it again — so refusing to
-    // start would turn a recoverable disk hiccup into an outage.
-    if let Err(error) = ledger_commit::compact(&shared_ledger).await {
-        warn!(%error, "could not compact the ledger commit journal at startup; \
-                       the journal is intact and will be folded in by a later write");
-    }
+    // The startup compaction used to run HERE, before the node key was loaded,
+    // before `set_author_id` and before `set_signer` (H-13): it rewrote the
+    // `.bean` with whatever envelope boot had — for a hand-typed record, none
+    // — and the P2P tasks below started serving that file's contents before
+    // the signer existed either. It now runs after the signer is installed
+    // and the operator input is finalised, and the P2P tasks are spawned after
+    // it. See "H-13: identity before the first write" below.
 
     // Transaction broadcast for subscriptions.
     let broadcast = TransactionBroadcast::new();
@@ -319,7 +318,13 @@ async fn main() {
     );
 
     // Boot P2P if enabled (§3.4). Keep identity even when the allowlist is empty.
-    let gossip_sender = if config.p2p.enabled {
+    //
+    // H-13: only the IDENTITY is established here — the endpoint, the author
+    // id, the handler. The router, the gossip loop and the anti-entropy loop
+    // are spawned further down, after the signer is installed and the first
+    // compaction has run, so nothing this node serves or gossips can predate
+    // its own identity.
+    let p2p_identity = if config.p2p.enabled {
         let Some(secret_key) = node_secret_key.as_ref() else {
             error!("p2p.enabled is true but no secret key was loaded — aborting");
             std::process::exit(1);
@@ -355,13 +360,7 @@ async fn main() {
                     // the gossip loop's and the anti-entropy tick's all share it.
                     connections: peer_connections::PeerConnectionCache::new(),
                 };
-                p2p_router = Some(p2p_service::spawn_router(&peer_node, handler.clone()));
-                let sender = p2p_service::spawn_gossip_loop(&peer_node, handler.clone());
-                p2p_service::spawn_anti_entropy_loop(&peer_node, handler);
-                // L-20: expire orphans on a timer, not only when an insert
-                // happens to run the sweep.
-                p2p_service::spawn_orphan_eviction_loop(orphan_buffer.clone());
-                Some(sender)
+                Some((peer_node, handler))
             }
             Err(error) => {
                 error!(%error, "failed to boot P2P — aborting (p2p.enabled is true)");
@@ -401,6 +400,62 @@ async fn main() {
         ));
     }
 
+    // ── H-13: identity before the first write ──────────────────────────────
+    //
+    // The README's supported edit workflow is stop → edit → start, and boot
+    // has just adopted whatever the operator typed as OPERATOR INPUT: this
+    // node's lamport and parents stamped, author still the boot placeholder,
+    // no signature — because the key was not loaded yet. Now it is: write the
+    // real author id over the placeholder and sign, so the compaction that
+    // follows persists those records exactly as an `appendTransaction` would
+    // have, and every peer accepts them. Before this ordering the compaction
+    // ran first, the file was rewritten without an envelope, and everything
+    // the node authored afterwards named an unverifiable parent.
+    {
+        let mut service = shared_ledger.write().await;
+        if service.unsigned_operator_input_count() > 0 {
+            let finalized = service.finalize_operator_input();
+            info!(
+                finalized,
+                signing_enabled = config.signing.enabled,
+                "operator input adopted at boot now carries this node's author id and \
+                 signature; the startup compaction writes it to the .bean (H-13)"
+            );
+        }
+    }
+
+    // T44: fold any commit journal back into the canonical `.bean` before
+    // serving. A journal is only ever present here after an unclean stop (a
+    // clean one compacts on the way out), so this is the crash-recovery point:
+    // boot has already unioned canonical ∪ journal into memory, and this writes
+    // that union out as one canonical file and deletes the sidecar. H-13: and
+    // it is the write that gives boot-adopted operator input its envelope on
+    // disk, which is why it runs here — after the signer — and not before.
+    //
+    // A failure is logged, not fatal. The journal is still on disk and still
+    // correct — boot read it once and would read it again — so refusing to
+    // start would turn a recoverable disk hiccup into an outage.
+    if let Err(error) = ledger_commit::compact(&shared_ledger).await {
+        warn!(%error, "could not compact the ledger commit journal at startup; \
+                       the journal is intact and will be folded in by a later write");
+    }
+
+    // H-13 (d): the P2P tasks start only now — with the author id set, the
+    // signer installed and the operator input finalised — so the first
+    // directive this node ever serves or gossips already carries its identity.
+    let gossip_sender = match p2p_identity {
+        Some((peer_node, handler)) => {
+            p2p_router = Some(p2p_service::spawn_router(&peer_node, handler.clone()));
+            let sender = p2p_service::spawn_gossip_loop(&peer_node, handler.clone());
+            p2p_service::spawn_anti_entropy_loop(&peer_node, handler);
+            // L-20: expire orphans on a timer, not only when an insert
+            // happens to run the sweep.
+            p2p_service::spawn_orphan_eviction_loop(orphan_buffer.clone());
+            Some(sender)
+        }
+        None => None,
+    };
+
     // Start the file watcher if the operator asked for it (§3.3, CT-12).
     //
     // M-19: this switch is `watchLedgerFile`, and it gates the watcher and
@@ -421,7 +476,10 @@ async fn main() {
                 interval.tick().await;
                 let current = FileState::from_path(&watcher_path);
                 let change = current.detect_change(&last_state);
-                if change == FileChangeKind::Modified {
+                // H-15: a `Deleted` is handled like a `Modified`. The
+                // reconcile finds nothing to read, arms a forced compaction,
+                // and the commit below recreates the file from memory.
+                if matches!(change, FileChangeKind::Modified | FileChangeKind::Deleted) {
                     // M-29: self-write suppression. Every commit this node makes
                     // to the canonical file is a `Modified` here, and without
                     // this check the watcher answered it by taking the write
@@ -458,7 +516,16 @@ async fn main() {
                         let mut svc = watcher_ledger.write().await;
                         match svc.reconcile_file_staged() {
                             Ok(result) => {
-                                if result.new_directives > 0 {
+                                // M-37(b): a rejected-ONLY edit compacts too.
+                                // The L-12 warning promises the canonical
+                                // re-persist drops what was refused; without
+                                // this arm the refused entry stayed on disk
+                                // and the next boot loaded it. H-15: and so
+                                // does a reconcile that found the file gone.
+                                if result.new_directives > 0
+                                    || result.rejected > 0
+                                    || svc.compaction_pending()
+                                {
                                     info!(
                                         new = result.new_directives,
                                         duplicates = result.duplicates,
@@ -470,6 +537,10 @@ async fn main() {
                                     Ok(None)
                                 }
                             }
+                            // H-14 / M-37(a): a file that does not parse left
+                            // every fact the service holds about the `.bean`
+                            // untouched, so the next commit re-detects it and
+                            // refuses too; nothing to restore here.
                             Err(error) => {
                                 warn!(%error, "failed to reconcile external edit");
                                 Ok(None)

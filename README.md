@@ -645,6 +645,21 @@ The `/health` endpoint never *requires* authentication. On a non-loopback bind i
 **Editing a `.bean` file while the node that owns it is running is not
 supported. Stop the node, edit the file, start it again.**
 
+That stop → edit → start path is the supported one, and this is what it does.
+At boot, a directive that carries neither `openledger-author` nor
+`openledger-lamport` was not written by a node, so it is treated as **operator
+input** rather than history: it goes through the same checks a live hand edit
+goes through (lifecycle, balance, body size, envelope keys), is stamped with
+this node's author id, Lamport value and parents, is **signed with this node's
+key once the key is loaded** — which happens before the startup compaction and
+before any peer is served — and the startup compaction writes it to the file in
+canonical form. From then on it replicates like any other local write. A
+hand-typed entry the checks refuse is **quarantined**: kept in the file exactly
+as you wrote it, kept out of the ledger, named in the boot banner with its
+reason, until you repair it and restart (boot never drops what it read). The
+same rule adopts, once, the envelope-less `open`/`close` lines a very old build
+wrote before it stamped non-transaction directives.
+
 The node treats its ledger file as something it writes, and a persist is a
 full-file atomic rewrite. Two mechanisms make a concurrent hand edit *less*
 likely to be lost, and neither of them makes it safe:
@@ -698,14 +713,23 @@ same trust boundary:
   and one whose author names a different node is adopted unsigned with a warning
   (signing it here would produce a signature that verifies nowhere).
 - Entries that fail validation are dropped, each logged with its content id and
-  the reason, before the canonical rewrite removes them from the file.
+  the reason, before the canonical rewrite removes them from the file — and that
+  rewrite runs even when *every* entry in the edit was refused, so a refused
+  line does not linger on disk to be loaded raw at the next boot. (At boot the
+  same refusal quarantines instead of dropping; see above.)
 - A file that no longer **parses** blocks writes until a human fixes it, rather
-  than being canonicalized on top of a half-saved edit. A line the parser
-  cannot read *in full* counts as not parsing: trailing tokens it does not
-  understand are refused, naming the text it could not read, rather than being
-  dropped so that the shorter line left over is adopted and written back in
-  place of what you typed. Comments and trailing whitespace are still fine
+  than being canonicalized on top of a half-saved edit. The refusal records
+  nothing about the broken file — not its hash, not its size — so every later
+  write re-reads it and refuses again until it is repaired; a broken file is
+  never mistaken for "what the node last read" and then overwritten. A line the
+  parser cannot read *in full* counts as not parsing: trailing tokens it does
+  not understand are refused, naming the text it could not read, rather than
+  being dropped so that the shorter line left over is adopted and written back
+  in place of what you typed. Comments and trailing whitespace are still fine
   everywhere they were before.
+- Removing or renaming the `.bean` under a running node does not lose anything:
+  the next write recreates it from memory with every directive in it, and a
+  failed write never installs an emptier ledger over the one in memory.
 
 ---
 

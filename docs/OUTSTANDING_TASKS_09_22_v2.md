@@ -32,12 +32,12 @@ covers only what is open: seven new Highs, eleven new Mediums, twelve new Lows, 
 
 | # | Findings addressed | Sev | Effort | Status |
 |---|---|---|---|---|
-| T61 | H-13 + H-14 + M-37 + M-38 + L-55 + L-62 — one file path | **High** | M | ☐ |
-| T62 | H-15 + M-35 + L-64 — recovery never installs an emptier ledger | **High** | S | ☐ |
-| T63 | H-12 — the ceiling as one rule, plus the adoption ratchet | **High** | S | ☐ |
-| T64 | H-16 — bounded parent choice, per-author head bound | **High** | S | ☐ |
-| T65 | H-17 — exact, order-independent balances (magnitude cap) | **High** | M | ☐ |
-| T66 | H-18 + M-41 + L-60 — bounded errors and unsolicited input on the wire | **High** | S–M | ☐ |
+| T61 | H-13 + H-14 + M-37 + M-38 + L-55 + L-62 — one file path | **High** | M | ☑ |
+| T62 | H-15 + M-35 + L-64 — recovery never installs an emptier ledger | **High** | S | ☑ |
+| T63 | H-12 — the ceiling as one rule, plus the adoption ratchet | **High** | S | ☑ |
+| T64 | H-16 — bounded parent choice, per-author head bound | **High** | S | ☑ |
+| T65 | H-17 — exact, order-independent balances (magnitude cap) | **High** | M | ☑ |
+| T66 | H-18 + M-41 + L-60 — bounded errors and unsolicited input on the wire | **High** | S–M | ☑ |
 | T67 | M-36 + L-57 + L-58 + L-59 + R-17 — file-type discipline for every ledger-side open | Med | S–M | ☐ |
 | T68 | M-43 + M-44 (R-18) — journal policy | Med | S | ☐ |
 | T69 | M-39 + M-42 + M-45 + L-63 + L-65 + L-35/R-19 + L-43/R-20 — cost bounds on read, watch, near-cap | Med | M | ☐ |
@@ -67,7 +67,8 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
 
 ## Tier 1 — ship-blockers (the seven new Highs)
 
-### ☐ T61 — One file path (H-13, H-14, M-37, M-38, L-55, L-62) — M
+### ☑ T61 — One file path (H-13, H-14, M-37, M-38, L-55, L-62) — M
+> **Done 2026-09-23 (working tree, not committed).** (a) `reconcile_content` parses first; the file-state fields are written only on success. (b) `prepare_or_recover` and `commit_inline` return `Parse` without reloading. (c) **Design deviation from the brief, accepted:** boot adopts envelope-less directives (no author and no lamport, `is_operator_input`) through the same `adopt_file_directive` the reconcile uses — one code path, extracted from the reconcile loop — and records them in `unsigned_operator_input`; `finalize_operator_input()` later stamps the current author and signs, idempotently, from `main.rs` right after `set_signer`, from `prepare`'s compaction branch (library callers without a signer get unsigned entries) and from `finish_recovery`. Chosen over a parked list so balances include the edit from boot and a reload re-derives the set for free. A refused operator entry is quarantined, never dropped. (d) `main.rs` order is now boot → banner → P2P identity → `set_signer` → `finalize_operator_input` → startup compaction → P2P tasks → watcher → HTTP. (e) `rejected > 0` forces the compaction (reconcile_file, reconcile_file_staged, watcher). (f) Kahn pre-scan over file ∪ live quarantine. (g) clock assigned only in the two `Inserted` arms. (h) `parse_block` refuses a block starting with U+FEFF. (i) README §Editing rewritten. Thirteen revert-proven tests (`h13_*`, `h14_*`, `m37a_*`, `m37b_*`, `m38_*`, `l55_*`, `l62_*`). Orchestrator re-ran the offline-edit probe: the hand-typed transaction now carries author, lamport, parents and signature. **Behaviour change:** a `.bean` that does not parse keeps blocking writes with `PARSE_ERROR` until repaired; envelope-less opens in legacy files are stamped and signed as this node's own on first start. **Residual:** at the lamport ceiling, operator input cannot be adopted and is quarantined; adoption is one-way (an edit adopted at boot and removed from the file before the first compaction is not un-adopted).
 - **Why first:** two of the three routes by which an operator following the README loses or corrupts
   records live here. H-13: the supported stop-edit-start workflow produces records with no envelope and no
   signature, refused by every peer, and the node's next transaction names one as a parent — everything the
@@ -129,7 +130,8 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
   raw at the next boot); `e3` asserts the quarantine stays `{A, B}` and `heads` excludes A; the L-55 shape
   asserts the clock is unchanged after a rejected entry; the `e7` BOM fixture boots. Bug-catch proof for each.
 
-### ☐ T62 — Recovery must never install an emptier ledger (H-15, M-35, L-64) — S
+### ☑ T62 — Recovery must never install an emptier ledger (H-15, M-35, L-64) — S
+> **Done 2026-09-23 (working tree, not committed).** Private `BootMode { Fresh, Reload }`: a reload never creates the `.bean`; a fresh boot refuses an absent `.bean` beside a journal (the `.lock` is not used as a signal — `main.rs` creates it before boot). `NotFound` in `adopt_external_edits`/`reconcile_file_staged` = nothing to adopt, forces a compaction that recreates the file from memory; the watcher reacts to `Deleted`. `finish_recovery` refuses a rebuild holding fewer than `dag.len() − pending_ids.len()` directives, keeps memory, sets `force_compaction`, and logs before/after counts on every install. Boot's journal budget is `MAX_LEDGER_FILE_BYTES`; the `TooLarge` message names a possibly folded leftover. `adopt_reloaded` keeps `canonical_is_current` when the rebuild read the bytes this service last wrote. Orchestrator re-ran `rm-bean` (3 → 4 → 5 directives, nothing lost) and `brick` (boots, 60,001 directives). **Behaviour change:** a missing `.bean` with a journal beside it refuses to boot. **Residual (L-64 half):** boot does not yet warn when `compaction_text().len() > MAX` for a dense hand-written file; the reload-induced wedge is gone.
 - **Why:** H-15 is the cheapest total loss in the series. `mv ledger.bean ledger.bak` under a running node:
   the next `prepare` sees `FileMarker::of == None` ([service.rs:3190-3205](../crates/ledger/src/service.rs#L3190-L3205)),
   escalates to a compaction, `adopt_external_edits` fails `NotFound`, the L-13 reload runs `boot`, and `boot`
@@ -160,7 +162,8 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
   a dense 63 MiB hand-written file boots and compacts; after one `recover_failed_commit()` on a healthy
   ledger the next prepare is still `Append`.
 
-### ☐ T63 — The ceiling as one rule, plus the adoption ratchet (H-12) — S
+### ☑ T63 — The ceiling as one rule, plus the adoption ratchet (H-12) — S
+> **Done 2026-09-23 (working tree, not committed).** `lamport_value_is_legal(v) := v + 1 < CEILING` is the one rule, called by both stamp sites (`next_stamp`, largest stamp `CEILING-2`), the wire (`union_merge.rs`) and both adoption paths. `MAX_LAMPORT_ADVANCE = 2^32`; `check_lamport_advance` refuses `remote − local >= 2^32` on the remote and file paths with a new `LamportAdvance` error, classified **not permanent** (retried, not cached). Boot clock counts inserted directives plus quarantined ones authored by this node. Boot warns exactly when authoring will be refused (the stamp predicate on `clock + 1`, so it fires at `CEILING-2` too — a deliberate deviation from the tracker's `clock + 1 >= CEILING`) and again within 2^32 of the ceiling. `LamportCeiling` names the author and the mesh-wide remedy. **Fresh-join decision:** no first-contact exemption — an exemption would hand an allowlisted peer the one-step jump on every new node. Honest histories fit (`test_fresh_node_converges_with_a_history_reaching_1e9`), and larger totals converge over retried rounds because parents carry smaller lamports (`test_ratchet_refusal_is_retried_and_a_stepped_history_converges`, 3e9 → 12e9 in 4 rounds). Orchestrator re-ran the variant proof: the directive A authors at `CEILING-2` is adopted by B. **Behaviour change:** `2^53−1` is now refused everywhere; `LAMPORT_ADVANCE` is a new error. **Residuals:** a mesh already holding a single >2^32 jump cannot be joined until that directive is removed; the ratchet slows exhaustion to ~2^21 attributable directives rather than preventing it — the allowlist remains the control.
 - **Why:** H-07 is only partially closed. `checked_lamport` ([service.rs:929-934](../crates/ledger/src/service.rs#L929-L934))
   is applied to `clock + 1` at the stamp sites ([:2737, :2759](../crates/ledger/src/service.rs#L2737)), to
   `value` on the wire ([union_merge.rs:289-292](../crates/p2p/src/union_merge.rs#L289-L292)) and to
@@ -191,7 +194,8 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
   adopted; property test: no reachable ingest path can push the clock past `CEILING − 1` or by more than 2^32
   in one step. Bug-catch proof against each of the three predicates separately.
 
-### ☐ T64 — Bounded parent choice (H-16) — S
+### ☑ T64 — Bounded parent choice (H-16) — S
+> **Done 2026-09-23 (working tree, not committed).** `choose_parents` keeps the 256 smallest admissible heads, used by the local stamp and file adoption; `validate_parent_fan_in` runs before the local insert; `MAX_UNMERGED_HEADS_PER_AUTHOR = 256` enforced on the remote path via `dag.heads_authored_by` with a new `UnmergedHeadLimit` error, not permanent. Honest shapes pinned: a first parentless transaction on an empty ledger and any transaction naming a current head are admitted. Orchestrator re-ran the variant proof: 257th single-author head refused; victim names 256 parents, peer accepts, reboot quarantines 0, balance 252. **Residual:** smallest-id parent choice lets an attacker who grinds small ids hold honest heads unmerged by this node; costs frontier size only, capped per author.
 - **Why:** `stamp_transaction_envelope` names **every** admissible head with no cap
   ([service.rs:2746-2748](../crates/ledger/src/service.rs#L2746-L2748)) and the local insert
   ([:2479](../crates/ledger/src/service.rs#L2479)) runs no `validate_parent_fan_in`; the remote path accepts
@@ -214,7 +218,8 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
   the 257th parentless transaction from one author is refused while a 256th is admitted; a transaction from
   the same author that names a current head is always admitted.
 
-### ☐ T65 — Exact, order-independent balances (H-17) — M
+### ☑ T65 — Exact, order-independent balances (H-17) — M
+> **Done 2026-09-23 (working tree, not committed).** Cap `MAX_AMOUNT_SIGNIFICANT_DIGITS = 21` (`validate.rs`): 2^26 postings × (10^21 − 1) < 2^96, so no same-scale sum can round, with 8× headroom over the M-35 worst case. Enforced in the parser (`from_str_exact` plus the cap — fractions over 28 digits are refused, no longer silently rounded), the GraphQL scalar, `validate_transaction` (inputs and the resolved elided leg), `enforce_resource_limits` for non-transaction directives, and the boot quarantine chain. **Design deviation from the tracker, accepted:** no scale cap. A scale ≤ 8 cap would make ordinary unit × rate legs (scale ≥ 10) unrecordable and quarantine existing history. Instead `ExactSum` keeps one exact partial per `(account, currency, scale)`, combined in ascending-scale order at read time, so the result is independent of arrival order by construction and no canonical re-fold is needed (which would have made gossip catch-up quadratic). No `saturating_*` remains on the validated path; an impossible overflow falls back without panicking and is counted by `over_cap_posting_count()`. Permanent 256-case proptest compares arrival order vs `build` vs reverse vs batched vs a shuffled replica, as printed text. Orchestrator re-ran the ±MAX peer proof: both refused, balance 7 on every view and after reboot. **Behaviour change:** amounts over 21 significant digits are refused; a mixed-scale balance may print with different trailing zeros than before. **Residuals:** exact i128 accumulation stays a design item; I1 products can round inside `rust_decimal` past scale 28 (deterministic); `verify` does not yet report `over_cap_posting_count() > 0`.
 - **Why:** `saturating_add` is not associative and neither is `Decimal` addition across a >28-digit scale
   gap; live reports fold in arrival order ([read_model.rs:182, 617](../crates/ledger/src/read_model.rs#L182)),
   `verify` and boot fold in date order ([:539](../crates/ledger/src/read_model.rs#L539)); no magnitude cap
@@ -239,7 +244,8 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
   quarantined at boot; `account()` equals the batched sweep at all times; CT-9 still byte-identical.
 - **Residual to record:** the i128 route (exact for any magnitude) stays open as a design item.
 
-### ☐ T66 — Bounded errors and unsolicited input on the wire (H-18, M-41, L-60) — S/M
+### ☑ T66 — Bounded errors and unsolicited input on the wire (H-18, M-41, L-60) — S/M
+> **Done 2026-09-23 (working tree, not committed).** `parse_file_bounded` + `count_directive_headers`; `validate_supply_entry` now refuses cheaply first (content-id form, body length, envelope, one directive block) and parses with three errors kept, each ≤ 256 chars. Re-measured: the `"x\n"` × 512k shape went from 194.9 MB / 55 MB of log to **136 B / 87 B**. Bounded echoes everywhere on the intake/drain path (`log_error`), `frame=variant_name()`, keyword excerpt 60 chars, long envelope keys by length. HTTP: one process-wide throttle for guard refusals (one line per 10 s with `suppressed=N`, values cut at 128 chars) and `max_buf_size` 64 KiB. L-60: `fetch_want_chunk` keeps only Wanted ids; pushed Supply frames record no refusals (`SupplyOrigin`). **Behaviour changes:** a Supply entry with a malformed id is refused before parsing; HTTP heads over ~64–112 KiB get 431; new error texts and log fields. **Residuals:** a single 1 MiB bad line still peaks at 6× in the per-character scanner; pushed Supply frames are still fully validated (bounded); the unsolicited-entry warning is per round, not rate-limited.
 - **Why:** `validate_supply_entry` ([union_merge.rs:152-154](../crates/p2p/src/union_merge.rs#L152-L154))
   runs `parse_file`, which pushes one `ParseError` per block with no cap ([parse.rs:592-599](../crates/ledger/src/parse.rs#L592-L599)),
   then Debug-renders and joins them all; a 1 MiB body of `"x\n"` × 524,288 costs **194,924,029 B (185.9×)**

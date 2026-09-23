@@ -338,7 +338,7 @@ impl ProtocolHandler for AntiEntropyHandler {
             )));
         };
         if let Err(error) = serve_anti_entropy(self, connection, remote).await {
-            warn!(peer = %remote, %error, "anti-entropy inbound session failed");
+            warn!(peer = %remote, error = %log_error(&error), "anti-entropy inbound session failed");
             return Err(AcceptError::from_err(std::io::Error::other(error)));
         }
         Ok(())
@@ -509,7 +509,10 @@ async fn serve_anti_entropy(
                     write_message(&mut send, &reply, io_timeout).await?;
                 }
                 WireMessage::Supply { entries, .. } => {
-                    apply_supply_entries(handler, entries, remote).await;
+                    // A PUSHED Supply: this node Wanted none of it. Applied,
+                    // but its refusals are never remembered (L-60) — see
+                    // `SupplyOrigin::Pushed`.
+                    apply_supply_entries_from(handler, entries, remote, SupplyOrigin::Pushed).await;
                 }
                 WireMessage::Announce { .. } => {
                     debug!(peer = %remote, "ignoring announce on anti-entropy ALPN");
@@ -697,7 +700,7 @@ pub async fn fetch_want(
     let session = match open_peer_session(endpoint, handler, peer_addr).await {
         Ok(session) => session,
         Err(SessionOpenError::Dial(error)) => {
-            warn!(peer = %peer, %error, "anti-entropy connect failed");
+            warn!(peer = %peer, error = %log_error(&error), "anti-entropy connect failed");
             return;
         }
         Err(SessionOpenError::DialTimeout) => {
@@ -705,7 +708,7 @@ pub async fn fetch_want(
             return;
         }
         Err(SessionOpenError::OpenStream(error)) => {
-            warn!(peer = %peer, %error, "anti-entropy want session failed");
+            warn!(peer = %peer, error = %log_error(&error), "anti-entropy want session failed");
             return;
         }
     };
@@ -721,7 +724,7 @@ pub async fn fetch_want(
         // operation must not inherit it (T42). This drops only the cache's
         // handle — a concurrent operation on the same connection keeps running.
         handler.connections.invalidate(peer, &connection);
-        warn!(peer = %peer, %error, "anti-entropy want session failed");
+        warn!(peer = %peer, error = %log_error(&error), "anti-entropy want session failed");
     }
 }
 
@@ -749,7 +752,7 @@ pub async fn exchange_with_peer(
             return;
         }
         Err(SessionOpenError::OpenStream(error)) => {
-            warn!(peer = %peer, %error, "anti-entropy head exchange failed");
+            warn!(peer = %peer, error = %log_error(&error), "anti-entropy head exchange failed");
             return;
         }
     };
@@ -760,7 +763,7 @@ pub async fn exchange_with_peer(
     } = session;
     if let Err(error) = run_head_exchange(&mut send, &mut recv, handler, peer, &mut budget).await {
         handler.connections.invalidate(peer, &connection);
-        warn!(peer = %peer, %error, "anti-entropy head exchange failed");
+        warn!(peer = %peer, error = %log_error(&error), "anti-entropy head exchange failed");
     }
 }
 
@@ -993,10 +996,24 @@ async fn fetch_want_chunk(
         {
             WireMessage::Supply { entries, .. } => entries,
             other => {
-                warn!(peer = %remote, ?other, "expected Supply after Want");
+                // M-41: the variant, never the frame — `?other` rendered a
+                // 4,096-id advert page into one log line the peer wrote.
+                warn!(peer = %remote, frame = other.variant_name(), "expected Supply after Want");
                 return Ok(());
             }
         };
+        // L-60: only what this round asked for is served, validated, or
+        // remembered. Progress is measured against the WANTED ids the peer
+        // served — an unsolicited entry is not progress on anything.
+        let outstanding: HashSet<&str> = remaining.iter().map(String::as_str).collect();
+        let (entries, unsolicited) = retain_wanted_entries(entries, &outstanding);
+        if unsolicited > 0 {
+            warn!(
+                peer = %remote,
+                unsolicited,
+                "dropped Supply entries this node did not Want"
+            );
+        }
         let served: HashSet<&str> = entries.iter().map(|entry| entry.id.as_str()).collect();
         let next: Vec<String> = remaining
             .iter()
@@ -1004,7 +1021,7 @@ async fn fetch_want_chunk(
             .cloned()
             .collect();
         let stalled = next.len() == remaining.len();
-        apply_supply_entries(handler, entries, remote).await;
+        apply_supply_entries_from(handler, entries, remote, SupplyOrigin::Wanted).await;
         if stalled {
             // The peer served none of what we asked for: it does not have them,
             // or the reply was empty. Another round would ask the same thing.
@@ -1057,6 +1074,63 @@ where
 /// Tally of what `apply_supply_entries` did with one `Supply` batch (M-14).
 ///
 /// Every entry lands in exactly one bucket, so the fields partition the batch.
+/// Longest rendering of a peer-derived error on the intake/drain path (M-41).
+///
+/// One number with `p2p::protocol::MAX_DECODE_ERROR_CHARS`: the `MergeError`s
+/// that reach `warn!` here wrap text the peer wrote — an id, a key, a parse
+/// message — and since T66 every one is formatted through [`log_error`], so a
+/// 16 MiB frame cannot become a 16 MiB log line whichever arm refuses it.
+const MAX_LOG_ERROR_CHARS: usize = p2p::protocol::MAX_DECODE_ERROR_CHARS;
+
+/// Render `error` for a `warn!` field, bounded (M-41).
+///
+/// `%error` on a `MergeError` used to render the whole thing; a 1 MiB body's
+/// parse error was measured at 55 MB on one line (H-18). The bound is applied
+/// as the value is FORMATTED, so nothing downstream holds the full rendering.
+fn log_error(error: &impl std::fmt::Display) -> String {
+    p2p::protocol::bounded_display(error, MAX_LOG_ERROR_CHARS)
+}
+
+/// Where a `Supply` batch came from, which decides whether its refusals may be
+/// remembered (L-60).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SupplyOrigin {
+    /// The reply to a `Want` this node sent, already filtered to the ids it
+    /// asked for by [`retain_wanted_entries`]. Every refusal is a verdict on
+    /// something this node chose to ask this peer for, so it is recorded (L-34).
+    Wanted,
+    /// A frame the peer sent on its own, on the serve side. Nothing in it was
+    /// Wanted, so nothing in it may be recorded: before T66 a peer could fill
+    /// its own 4,096-entry refusal quota with junk ids it invented, and four
+    /// such peers reached the 16,384 global cap and FIFO-evicted everyone
+    /// else's honest entries (L-60). The entries are still applied — a pushed
+    /// frame is how a peer hands over what it knows we lack without waiting
+    /// for our next advert — but a refusal here is a fact about what the peer
+    /// chose to push, not about what this node will ever ask for.
+    Pushed,
+}
+
+/// Keep only the entries whose id is in `wanted`; return them and how many
+/// were dropped (L-60).
+///
+/// A `Supply` answering a `Want` may carry anything the peer likes. Before T66
+/// every entry was validated and, when refused, recorded against the peer's
+/// refusal quota — whether or not it had been asked for. Filtering to the
+/// outstanding set first means an unsolicited entry costs the receiver a hash
+/// lookup and nothing else: no parse, no signature check, no cache slot.
+fn retain_wanted_entries(
+    entries: Vec<p2p::protocol::SupplyEntry>,
+    wanted: &HashSet<&str>,
+) -> (Vec<p2p::protocol::SupplyEntry>, usize) {
+    let before = entries.len();
+    let kept: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| wanted.contains(entry.id.as_str()))
+        .collect();
+    let dropped = before - kept.len();
+    (kept, dropped)
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SupplyOutcome {
     /// M-14 fast path: `entry.id` was already in the DAG, so validation was skipped.
@@ -1083,17 +1157,44 @@ pub(crate) struct SupplyOutcome {
 /// work with NO write lock; phase 2 takes the write lock exactly once, stages
 /// the whole batch in memory, drains any orphans it unblocks, and persists a
 /// single time for the batch + drained orphans.
+///
+/// Tests' shorthand for the Wanted path — a batch the caller has already
+/// filtered to the ids it `Want`ed ([`SupplyOrigin::Wanted`]). Production has
+/// two callers and both state their origin through
+/// [`apply_supply_entries_from`]: `fetch_want_chunk` (Wanted, after
+/// [`retain_wanted_entries`]) and the serve loop's pushed-`Supply` arm
+/// (Pushed), so no caller can apply a frame without saying whether its
+/// refusals may be remembered (L-60).
+#[cfg(test)]
 async fn apply_supply_entries(
     handler: &AntiEntropyHandler,
     entries: Vec<p2p::protocol::SupplyEntry>,
     remote: EndpointId,
+) -> SupplyOutcome {
+    apply_supply_entries_from(handler, entries, remote, SupplyOrigin::Wanted).await
+}
+
+/// [`apply_supply_entries`] with the batch's origin stated (L-60).
+///
+/// The origin changes exactly one thing: whether permanent refusals are
+/// recorded in the peer's [`p2p::anti_entropy::RefusalCache`] quota. A
+/// `Wanted` batch was asked for id by id, so every refusal is a fact about
+/// something this node will otherwise ask for again; a `Pushed` batch was not,
+/// so recording its refusals would let the peer spend — and, across peers,
+/// exhaust — a cache that exists to protect this node's own Wants.
+async fn apply_supply_entries_from(
+    handler: &AntiEntropyHandler,
+    entries: Vec<p2p::protocol::SupplyEntry>,
+    remote: EndpointId,
+    origin: SupplyOrigin,
 ) -> SupplyOutcome {
     let from_peer = remote.to_string();
     let mut outcome = SupplyOutcome::default();
     // L-34: ids refused for good, by phase. Intake verdicts are pure functions
     // of the served bytes and are recorded unconditionally; stage and drain
     // verdicts read ledger state, so they are recorded only once the batch they
-    // were reached against is durable (see the end of this function).
+    // were reached against is durable (see the end of this function). L-60:
+    // neither is recorded at all for a pushed batch — see `SupplyOrigin`.
     let mut intake_refused: Vec<String> = Vec::new();
     let mut stage_refused: Vec<(String, String)> = Vec::new();
     let mut batch_durable = true;
@@ -1135,7 +1236,7 @@ async fn apply_supply_entries(
         match validate_supply_entry(&entry) {
             Ok(directive) => {
                 if let Err(error) = verify_author_allowlisted(&directive, &handler.allowlist) {
-                    warn!(%error, peer = %remote, "rejected ALPN supply: author not allowlisted");
+                    warn!(error = %log_error(&error), peer = %remote, "rejected ALPN supply: author not allowlisted");
                     outcome.rejected += 1;
                     note_intake_refusal(&mut intake_refused, &entry.id, &error);
                     continue;
@@ -1143,7 +1244,7 @@ async fn apply_supply_entries(
                 if let Err(error) =
                     verify_remote_signature(&directive, handler.signing_enabled, &handler.mesh_id)
                 {
-                    warn!(%error, peer = %remote, "rejected ALPN supply: signature");
+                    warn!(error = %log_error(&error), peer = %remote, "rejected ALPN supply: signature");
                     outcome.rejected += 1;
                     note_intake_refusal(&mut intake_refused, &entry.id, &error);
                     continue;
@@ -1153,7 +1254,8 @@ async fn apply_supply_entries(
                 staged.push(directive);
             }
             Err(error) => {
-                warn!(%error, "invalid ALPN supply entry");
+                // H-18/M-41: bounded — this is the line that was 55 MB.
+                warn!(error = %log_error(&error), peer = %remote, "invalid ALPN supply entry");
                 outcome.rejected += 1;
                 note_intake_refusal(&mut intake_refused, &entry.id, &error);
             }
@@ -1247,7 +1349,7 @@ async fn apply_supply_entries(
                             outcome.buffered += 1;
                         }
                         None => {
-                            warn!(%error, "rejected remote directive from ALPN");
+                            warn!(error = %log_error(&error), peer = %remote, "rejected remote directive from ALPN");
                             outcome.rejected += 1;
                             if stage_refusal_is_permanent(&error) {
                                 stage_refused.push((from_peer.clone(), content_id));
@@ -1295,7 +1397,7 @@ async fn apply_supply_entries(
                 // anti-entropy will re-pull it. The tallies above describe what
                 // was attempted, not what is stored; we return them without
                 // panicking.
-                warn!(%error, peer = %remote, "failed to persist ALPN supply batch; rolled back in memory, will re-pull");
+                warn!(error = %log_error(&error), peer = %remote, "failed to persist ALPN supply batch; rolled back in memory, will re-pull");
                 batch_durable = false;
             }
         } else {
@@ -1309,6 +1411,14 @@ async fn apply_supply_entries(
     // the commit failed, the reload rolled that state back, so those verdicts
     // are discarded — anti-entropy re-pulls the batch and they are re-derived.
     if !batch_durable {
+        stage_refused.clear();
+    }
+    // L-60: a pushed batch was never Wanted, so none of its verdicts may
+    // occupy the cache — see `SupplyOrigin::Pushed`. (`RefusalCache::record`
+    // also refuses any id that is not a content id, so even a Wanted batch —
+    // filtered to form-checked advert ids — can only ever record 64-hex ids.)
+    if origin == SupplyOrigin::Pushed {
+        intake_refused.clear();
         stage_refused.clear();
     }
     if !intake_refused.is_empty() || !stage_refused.is_empty() {
@@ -1399,6 +1509,12 @@ fn intake_refusal_is_permanent(error: &MergeError) -> bool {
 ///   shows one that clears once another transaction lands; a missing parent is
 ///   an orphan and is buffered before staging is ever tried;
 /// * `LamportCeiling` — reached against THIS node's clock, not the directive;
+/// * `LamportAdvance` (T63 / H-12, the adoption ratchet) — judged against this
+///   node's clock, which rises as the intervening history arrives; caching it
+///   would stop a node that is catching up from ever adopting the top of the
+///   history it is climbing toward;
+/// * `UnmergedHeadLimit` (T64 / H-16) — judged against the author's current
+///   heads here, which the next local append merges;
 /// * `Io`, `Journal`, `CommitInFlight`, `Parse` — transient or not a verdict on
 ///   the directive at all.
 ///
@@ -1429,6 +1545,8 @@ fn stage_refusal_is_permanent(error: &ServiceError) -> bool {
         | ServiceError::AccountAlreadyOpen { .. }
         | ServiceError::Dag(_)
         | ServiceError::LamportCeiling { .. }
+        | ServiceError::LamportAdvance { .. }
+        | ServiceError::UnmergedHeadLimit { .. }
         | ServiceError::Io(_)
         | ServiceError::Journal { .. }
         | ServiceError::CommitInFlight
@@ -1491,13 +1609,13 @@ fn restage_freed_entry(
     dag_ids: &mut HashSet<String>,
 ) -> Restaged {
     if let Err(error) = verify_author_allowlisted(&entry.directive, context.allowlist) {
-        warn!(%error, "rejected resolved orphan: author");
+        warn!(error = %log_error(&error), "rejected resolved orphan: author");
         return refused_if_permanent(intake_refusal_is_permanent(&error));
     }
     if let Err(error) =
         verify_remote_signature(&entry.directive, context.signing_enabled, context.mesh_id)
     {
-        warn!(%error, "rejected resolved orphan: signature");
+        warn!(error = %log_error(&error), "rejected resolved orphan: signature");
         return refused_if_permanent(intake_refusal_is_permanent(&error));
     }
     match service.stage_remote_directive(entry.directive.clone()) {
@@ -1513,7 +1631,7 @@ fn restage_freed_entry(
         Ok(None) => Restaged::Dropped,
         Err(error) => {
             let Some(account) = account_wait_target(&error) else {
-                warn!(%error, "rejected resolved orphan directive");
+                warn!(error = %log_error(&error), "rejected resolved orphan directive");
                 return refused_if_permanent(stage_refusal_is_permanent(&error));
             };
             match buffer.insert_awaiting_accounts(
@@ -1921,6 +2039,33 @@ pub(crate) mod tests {
     /// `p2p_service` tests that already import this module's helpers keep one
     /// import, and so no test module owns the lock the others depend on.
     pub(crate) use crate::test_support::NET_TEST_LOCK;
+
+    /// T63 / T64 (H-12, H-16): the two new refusals are judged against THIS
+    /// node's state — its clock, the author's current heads — so the L-34
+    /// refusal cache must not keep them. Caching the ratchet's refusal would
+    /// stop a node that is climbing through a history from ever adopting its
+    /// top; caching the head bound would suppress a transaction that the next
+    /// local append makes admissible.
+    #[test]
+    fn test_state_dependent_stage_refusals_are_not_cached() {
+        for error in [
+            ServiceError::LamportAdvance {
+                remote: 1 << 40,
+                local: 0,
+                author: Some("peer".to_owned()),
+            },
+            ServiceError::UnmergedHeadLimit {
+                author: Some("peer".to_owned()),
+                heads: 256,
+            },
+            ServiceError::LamportCeiling {
+                next: ledger::service::LAMPORT_CEILING,
+                author: None,
+            },
+        ] {
+            assert!(!stage_refusal_is_permanent(&error), "{error}");
+        }
+    }
 
     pub(crate) async fn bind_direct_endpoint() -> Endpoint {
         Endpoint::builder(presets::Minimal)
@@ -5363,6 +5508,85 @@ pub(crate) mod tests {
         assert_eq!(buffer.refusals().len(), 2);
     }
 
+    /// T66 / L-60 (unit): the wanted-set filter keeps exactly the entries whose
+    /// id was outstanding, in arrival order, and counts the rest.
+    #[test]
+    fn retain_wanted_entries_keeps_only_the_outstanding_ids() {
+        let entry = |id: &str| p2p::protocol::SupplyEntry {
+            id: id.to_owned(),
+            kind: p2p::protocol::DirectiveKind::Open,
+            economic_bean: String::new(),
+            envelope: std::collections::BTreeMap::new(),
+        };
+        let a = format!("{:064x}", 0xau64);
+        let b = format!("{:064x}", 0xbu64);
+        let junk = format!("{:064x}", 0xdead_beefu64);
+        let wanted: HashSet<&str> = [a.as_str(), b.as_str()].into_iter().collect();
+        let (kept, dropped) = retain_wanted_entries(
+            vec![entry(&junk), entry(&b), entry("not-even-an-id"), entry(&a)],
+            &wanted,
+        );
+        assert_eq!(dropped, 2);
+        assert_eq!(
+            kept.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec![b.as_str(), a.as_str()]
+        );
+        let (kept, dropped) = retain_wanted_entries(Vec::new(), &wanted);
+        assert!(kept.is_empty());
+        assert_eq!(dropped, 0);
+    }
+
+    /// T66 / L-60 (pushed arm): the same batch as
+    /// `only_permanent_refusals_are_cached_and_waits_still_converge`, applied
+    /// as a PUSHED frame, records nothing — neither the backdated close nor
+    /// the garbage body — while it is still applied (the waits are buffered).
+    #[tokio::test]
+    async fn a_pushed_supply_records_no_refusals() {
+        let author = iroh::SecretKey::generate().public();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let fixture = refusal_fixture(temp_dir.path(), &author.to_string(), &[]);
+        let handler = refusal_sink(temp_dir.path(), &fixture).await;
+        let seeded = &fixture.seeded;
+        let remote = iroh::SecretKey::generate().public();
+        let peer = remote.to_string();
+
+        let garbage_id = format!("{:064x}", 0xdead_beefu64);
+        let garbage = p2p::protocol::SupplyEntry {
+            id: garbage_id.clone(),
+            kind: p2p::protocol::DirectiveKind::Open,
+            economic_bean: "this is not valid beancount".to_owned(),
+            envelope: std::collections::BTreeMap::new(),
+        };
+        let batch = vec![
+            fixture.poison.clone(),
+            entry_for(&seeded.source, &seeded.txn2),
+            entry_for(&seeded.source, &fixture.txn3),
+            garbage,
+        ];
+        let outcome =
+            apply_supply_entries_from(&handler, batch, remote, SupplyOrigin::Pushed).await;
+        assert_eq!(outcome.rejected, 2, "still refused");
+        assert_eq!(outcome.buffered, 2, "still applied: the waits are buffered");
+
+        let now = std::time::Instant::now();
+        let buffer = handler.orphan_buffer.read().await;
+        let refusals = buffer.refusals();
+        assert!(
+            refusals.is_empty(),
+            "a pushed frame must not occupy the refusal cache: {}",
+            refusals.len()
+        );
+        assert!(!refusals.is_refused(&peer, &fixture.poison.id, now));
+        assert!(!refusals.is_refused(&peer, &garbage_id, now));
+        drop(buffer);
+
+        // The Wanted path, for contrast, records both (the L-34 test proper).
+        let wanted = vec![fixture.poison.clone()];
+        apply_supply_entries_from(&handler, wanted, remote, SupplyOrigin::Wanted).await;
+        let buffer = handler.orphan_buffer.read().await;
+        assert!(buffer.refusals().is_refused(&peer, &fixture.poison.id, now));
+    }
+
     /// A stand-in peer that serves a fixed set of entries over the real wire
     /// protocol and RECORDS every id it is asked for — the observable L-34's
     /// end-to-end test counts. Serves streams until the connection ends, so
@@ -5371,6 +5595,9 @@ pub(crate) mod tests {
     struct RecordingSource {
         entries: Arc<std::sync::Mutex<Vec<p2p::protocol::SupplyEntry>>>,
         wanted: Arc<std::sync::Mutex<Vec<String>>>,
+        /// Appended to EVERY `Supply` reply whether or not they were Wanted
+        /// (L-60). Empty for an honest peer.
+        unsolicited: Vec<p2p::protocol::SupplyEntry>,
     }
 
     impl std::fmt::Debug for RecordingSource {
@@ -5400,9 +5627,13 @@ pub(crate) mod tests {
                                 .expect("wanted")
                                 .extend(ids.iter().cloned());
                             let held = self.entries.lock().expect("entries").clone();
-                            p2p::anti_entropy::build_supply(&ids, |id| {
+                            let mut reply = p2p::anti_entropy::build_supply(&ids, |id| {
                                 held.iter().find(|entry| entry.id == id).cloned()
-                            })
+                            });
+                            if let WireMessage::Supply { entries, .. } = &mut reply {
+                                entries.extend(self.unsolicited.iter().cloned());
+                            }
+                            reply
                         }
                         _ => continue,
                     };
@@ -5448,6 +5679,7 @@ pub(crate) mod tests {
         let source = RecordingSource {
             entries: Arc::new(std::sync::Mutex::new(held)),
             wanted: Arc::new(std::sync::Mutex::new(Vec::new())),
+            unsolicited: Vec::new(),
         };
         let router_source = Router::builder(endpoint_source.clone())
             .accept(p2p::protocol::ANTI_ENTROPY_ALPN, source.clone())
@@ -5500,6 +5732,90 @@ pub(crate) mod tests {
             "the orphan converged"
         );
         assert!(svc.get_directive(&fixture.poison.id).is_none());
+    }
+
+    /// T66 / L-60 KEY TEST (end to end). A peer that pads every `Supply` reply
+    /// with entries this node never Wanted — 200 garbage bodies under fresh,
+    /// well-formed ids (with the four honest ones, under the 256-entry frame
+    /// cap) — gets none of them validated or remembered: after the exchange
+    /// the refusal cache holds exactly the ONE refusal the node earned by
+    /// asking (the backdated close), not 201, and no garbage id is in it.
+    /// Before T66 each such frame cost 200 parses and 200 cache slots, and
+    /// about twenty of them filled the peer's whole 4,096 quota (L-60).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unsolicited_supply_entries_are_dropped_before_validation_and_never_cached() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_source = bind_direct_endpoint().await;
+        let endpoint_sink = bind_direct_endpoint().await;
+        let author = iroh::SecretKey::generate().public();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let fixture = refusal_fixture(
+            temp_dir.path(),
+            &author.to_string(),
+            &[endpoint_source.id().to_string()],
+        );
+        let handler_sink = refusal_sink(temp_dir.path(), &fixture).await;
+        let seeded = &fixture.seeded;
+
+        let held: Vec<p2p::protocol::SupplyEntry> = vec![
+            entry_for(&seeded.source, &seeded.open_food),
+            fixture.poison.clone(),
+            entry_for(&seeded.source, &seeded.txn2),
+            entry_for(&seeded.source, &fixture.txn3),
+        ];
+        let unsolicited: Vec<p2p::protocol::SupplyEntry> = (0..200u64)
+            .map(|index| p2p::protocol::SupplyEntry {
+                id: format!("{:064x}", 0xdead_0000u64 + index),
+                kind: p2p::protocol::DirectiveKind::Open,
+                economic_bean: "this is not valid beancount".to_owned(),
+                envelope: std::collections::BTreeMap::new(),
+            })
+            .collect();
+        let unsolicited_ids: Vec<String> = unsolicited.iter().map(|e| e.id.clone()).collect();
+        let source = RecordingSource {
+            entries: Arc::new(std::sync::Mutex::new(held)),
+            wanted: Arc::new(std::sync::Mutex::new(Vec::new())),
+            unsolicited,
+        };
+        let router_source = Router::builder(endpoint_source.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, source.clone())
+            .spawn();
+        wait_until_dialable(&endpoint_source).await;
+        wait_until_dialable(&endpoint_sink).await;
+
+        for _ in 0..2 {
+            exchange_with_peer(&endpoint_sink, endpoint_source.addr(), &handler_sink).await;
+        }
+        let _ = router_source.shutdown().await;
+
+        // The Wanted entries converged as usual.
+        let svc = handler_sink.ledger.read().await;
+        assert!(svc.get_directive(&seeded.open_food).is_some());
+        assert!(svc.get_directive(&seeded.txn2).is_some());
+        assert!(svc.get_directive(&fixture.txn3).is_some());
+        assert!(svc.get_directive(&fixture.poison.id).is_none());
+        drop(svc);
+
+        // The refusal cache holds the one earned refusal and nothing unwanted.
+        let now = std::time::Instant::now();
+        let peer = endpoint_source.id().to_string();
+        let buffer = handler_sink.orphan_buffer.read().await;
+        let refusals = buffer.refusals();
+        assert!(refusals.is_refused(&peer, &fixture.poison.id, now));
+        assert_eq!(
+            refusals.len(),
+            1,
+            "L-60: unsolicited entries must not occupy the refusal cache"
+        );
+        for id in &unsolicited_ids {
+            assert!(!refusals.is_refused(&peer, id, now), "{id} was recorded");
+        }
+        // And they were never asked for — the sink's Wants name only advert ids.
+        let wanted = source.wanted.lock().expect("wanted");
+        for id in &unsolicited_ids {
+            assert!(!wanted.contains(id));
+        }
     }
 
     // ─── T58 / L-39: the inbound frame byte budget ──────────────────────────

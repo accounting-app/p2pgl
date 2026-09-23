@@ -444,6 +444,22 @@ impl LedgerDag {
         &self.heads
     }
 
+    /// How many current heads carry `openledger-author == author` (T64 / H-16).
+    ///
+    /// `None` counts the heads with no author at all. One pass over the heads,
+    /// which the per-author bound this feeds keeps small; heads are always
+    /// transactions, so only a transaction's author is read.
+    pub fn heads_authored_by(&self, author: Option<&str>) -> usize {
+        self.heads
+            .iter()
+            .filter_map(|id| self.nodes.get(id))
+            .filter(|node| match &node.directive {
+                Directive::Transaction(transaction) => transaction.author() == author,
+                _ => false,
+            })
+            .count()
+    }
+
     /// Total number of directives in the G-Set.
     pub fn len(&self) -> usize {
         self.nodes.len()
