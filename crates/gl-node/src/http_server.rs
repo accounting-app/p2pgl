@@ -75,6 +75,22 @@ const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 /// the 60-per-minute rate limit long before it needed the sockets. A reverse
 /// proxy fans *everyone* in through one address, which is why the configured
 /// trusted proxies are exempt (see [`serve_hardened`]).
+///
+/// **What "one address" means bounds what this cap bounds (L-61).** The key is
+/// [`crate::rate_limit::bucket_key`]: an IPv4 address, or an IPv6 **/64** —
+/// the rate limiter's M-04b rule, so rotating inside one allocation buys
+/// nothing. But IPv6 is routed in larger blocks than that: one routed /48 is
+/// 65,536 distinct /64 keys, each with its own 64 slots, far past the global
+/// [`DEFAULT_MAX_CONNECTIONS`] of 1,024. So this cap stops a single IPv4
+/// address or a single /64 from taking every slot, and nothing wider; an
+/// attacker holding a /48 meets only the global cap, exactly as before M-33.
+/// Bounding per-prefix fan-in beyond a /64 is the upstream proxy's or the
+/// host firewall's job (e.g. an nftables meter keyed on the /48).
+///
+/// Refused connections get no admission cooldown: the refusal already reads
+/// nothing and spawns nothing, and what a reconnect loop costs is the kernel's
+/// accept-and-close, which a user-space cooldown cannot avoid (L-61 residual,
+/// see `docs/OUTSTANDING_TASKS_09_22_v2.md` T71).
 const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 64;
 
 /// Minimum gap between "per-IP cap reached" warnings, so a client hammering
@@ -148,7 +164,9 @@ impl Default for HttpServerSettings {
 /// Keyed on [`crate::rate_limit::bucket_key`], so "one client" means the same
 /// thing here as it does to the rate limiter: an IPv4 address (v4-mapped
 /// spellings folded in, M-30) or an IPv6 /64. Rotating addresses inside one
-/// allocation does not buy extra slots.
+/// allocation does not buy extra slots — but a routed /48 is 65,536 such keys,
+/// so this bounds one address or one /64, not one network (L-61; see
+/// [`DEFAULT_MAX_CONNECTIONS_PER_IP`]).
 struct PerIpConnections {
     counts: Mutex<HashMap<IpAddr, usize>>,
     max_per_ip: usize,

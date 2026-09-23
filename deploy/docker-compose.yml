@@ -3,7 +3,8 @@
 # Spins up 3 gl-node instances. Inbound ledger replication only happens
 # after you put each node's EndpointId into p2p.bootstrapEndpointIds
 # (empty allowlist = no remote Supply). Use a unique swarmTopic per mesh;
-# this sample uses openledger/docker-dev (not the public default).
+# this sample uses openledger/docker-dev (not the public default), and pins
+# meshId to that same string — see "Mesh identity" below.
 #
 # Usage — every node needs its OWN key, so generate three:
 #   GL_NODE_0_API_KEY="$(openssl rand -hex 32)" \
@@ -65,15 +66,21 @@
 # `Forwarded:` is not supported). Listing anything an untrusted client can
 # reach lets that client forge its own rate-limit identity.
 #
-# ── Mesh identity (L-23) ─────────────────────────────────────────────────────
+# ── Mesh identity (L-23, R-9) ────────────────────────────────────────────────
 # All three nodes share gl-node.docker.json, so they share a signature domain —
-# which is what a single mesh needs. No `meshId` is set there on purpose: a
-# literal UUID shipped in the repository would be copy-pasted into every
-# deployment, giving them all one mesh identity (the L-08 sample-key failure
-# mode with a different field). The domain therefore falls back to swarmTopic
-# ("openledger/docker-dev"). For a real deployment, set a `meshId` you generated
-# yourself (`uuidgen`) in your own copy of the config — see the README's
-# `p2p.meshId` section for the rollout procedure on an existing mesh.
+# which is what a single mesh needs. `meshId` is set there to
+# "openledger/docker-dev", which is the stack's swarmTopic BYTE FOR BYTE. That
+# is deliberate: before this change the domain fell back to the topic, and a
+# signature is verified by rebuilding the signed message with the verifier's own
+# domain, so the topic's exact value is the only meshId that keeps every
+# directive this stack has already signed verifying. Any other value — a fresh
+# UUID included — would orphan that history. (A node with meshId unset now logs
+# a boot WARN saying exactly this; meshId becomes required in a later release.)
+#
+# For a NEW mesh of your own, do not copy this value: generate a meshId
+# (`uuidgen`) and a unique swarmTopic before the first directive is written. For
+# an EXISTING mesh, set meshId to your current swarmTopic verbatim — see the
+# README's `p2p.meshId` section.
 #
 # GraphiQL is off. p2p.relayMode is disabled (same Docker bridge); set "n0"
 # only when peers must traverse NAT via public Iroh relays.

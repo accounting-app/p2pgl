@@ -337,15 +337,12 @@ async fn main() {
     // receive this string, so neither reads `swarm_topic` for signature
     // purposes and the two cannot drift apart.
     let signature_domain = config.p2p.signature_domain().to_owned();
-    info!(
-        source = config.p2p.signature_domain_source(),
-        length = signature_domain.len(),
-        // The domain doubles as a quasi-credential when it falls back to the
-        // swarm topic (which is also the gossip join string), so the log names
-        // its shape, never its value.
-        prefix = %signature_domain.chars().take(4).collect::<String>(),
-        "mesh signature domain resolved"
-    );
+    // The domain doubles as a quasi-credential when it falls back to the swarm
+    // topic (which is also the gossip join string), so the log names its
+    // shape, never its value. R-9: with `meshId` unset on a signing node this
+    // is a WARN whose remedy leads with "set p2p.meshId to your current
+    // swarmTopic verbatim" — see `NodeConfig::log_signature_domain`.
+    config.log_signature_domain();
 
     // Boot P2P if enabled (§3.4). Keep identity even when the allowlist is empty.
     //

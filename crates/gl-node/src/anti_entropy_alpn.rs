@@ -135,7 +135,11 @@ const READ_CHUNK: usize = 64 * 1024;
 /// journal). One tick of the default interval costs a head exchange, which the
 /// backoff does not suppress: the advert is still sent and read, only the
 /// Want/Supply half is skipped.
-const SUPPLY_HEADROOM_BACKOFF: Duration = Duration::from_secs(60);
+///
+/// The DEFAULT of [`AntiEntropyTimeouts::supply_backoff`]; since T71
+/// `p2p.antiEntropySupplyBackoffSeconds` sets the value a node runs under
+/// (floor 5 s, ceiling 1 h — see `config.rs`).
+pub const SUPPLY_HEADROOM_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Upper bound on [`SupplyBackoff`]'s entries. Keys are allowlisted peers (the
 /// only ones whose `Supply` is ever applied), so this is never reached by an
@@ -170,8 +174,10 @@ impl SupplyBackoff {
         self.lock().get(&peer).is_some_and(|until| *until > now)
     }
 
-    /// Defer `peer`'s `Supply` for [`SUPPLY_HEADROOM_BACKOFF`] from `now`.
-    fn arm(&self, peer: EndpointId, now: std::time::Instant) {
+    /// Defer `peer`'s `Supply` for `backoff` from `now` — the handler's
+    /// [`AntiEntropyTimeouts::supply_backoff`], [`SUPPLY_HEADROOM_BACKOFF`] by
+    /// default (T71: configurable, so the map records a deadline, not a rule).
+    fn arm(&self, peer: EndpointId, now: std::time::Instant, backoff: Duration) {
         let mut until = self.lock();
         until.retain(|_, expires| *expires > now);
         if until.len() >= SUPPLY_BACKOFF_MAX_PEERS && !until.contains_key(&peer) {
@@ -179,7 +185,7 @@ impl SupplyBackoff {
             // evict, since a missed backoff costs one deferred batch.
             return;
         }
-        until.insert(peer, now + SUPPLY_HEADROOM_BACKOFF);
+        until.insert(peer, now + backoff);
     }
 
     fn lock(
@@ -283,6 +289,12 @@ pub struct AntiEntropyTimeouts {
     /// An honest full catch-up at the accumulation cap spends ~8,700 frames: 256
     /// advert pages each way, then one `Want` and one `Supply` per 256-id chunk.
     pub max_session_frames: usize,
+    /// How long a peer's `Supply` stays deferred after one of its batches did
+    /// not fit under the ledger's size cap (M-39) — see
+    /// [`SUPPLY_HEADROOM_BACKOFF`] for the default's reasoning. A field rather
+    /// than the constant so `p2p.antiEntropySupplyBackoffSeconds` can set it
+    /// (T71); it applies to every Supply this node applies, fetched or pushed.
+    pub supply_backoff: Duration,
 }
 
 impl Default for AntiEntropyTimeouts {
@@ -297,6 +309,7 @@ impl Default for AntiEntropyTimeouts {
             // Read off the server-side limit rather than restated, so "mirrors
             // the server's budget" stays true by construction (M-28).
             max_session_frames: AntiEntropyLimits::default().max_requests_per_connection,
+            supply_backoff: SUPPLY_HEADROOM_BACKOFF,
         }
     }
 }
@@ -1658,9 +1671,10 @@ async fn stage_and_commit_batch(
     if staged_bytes > headroom {
         drop(svc);
         drop(permit);
+        let backoff = handler.timeouts.supply_backoff;
         handler
             .supply_backoff
-            .arm(remote, std::time::Instant::now());
+            .arm(remote, std::time::Instant::now(), backoff);
         outcome.deferred += staged.len();
         // Bounded: fixed-width numbers and the peer id, and at most once per
         // peer per backoff window.
@@ -1669,7 +1683,7 @@ async fn stage_and_commit_batch(
             entries = staged.len(),
             estimated_bytes = staged_bytes,
             headroom_bytes = headroom,
-            backoff_secs = SUPPLY_HEADROOM_BACKOFF.as_secs(),
+            backoff_secs = backoff.as_secs(),
             "ALPN supply batch deferred: it would not fit under the ledger size cap \
              (MAX_LEDGER_FILE_BYTES); not applying this peer's Supply until the backoff \
              expires. Reads and compaction are unaffected; archive or split the ledger to \
@@ -3417,6 +3431,52 @@ pub(crate) mod tests {
             .supply_backoff
             .is_active(remote, std::time::Instant::now()));
         assert_eq!(sink.read().await.directive_count(), 8);
+    }
+
+    /// T71: the deferral lasts `timeouts.supply_backoff` — what
+    /// `p2p.antiEntropySupplyBackoffSeconds` sets — not the built-in 60 s.
+    ///
+    /// Bug-catch: arm with `SUPPLY_HEADROOM_BACKOFF` instead of the handler's
+    /// value and the peer is still backed off 6 s in, past its configured 5 s.
+    #[tokio::test]
+    async fn t71_a_deferred_batch_backs_off_for_the_configured_duration() {
+        let author = iroh::SecretKey::generate().public();
+        let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let entries = remote_open_entries(temp_dir.path(), &author.to_string(), 8);
+        let ledger =
+            crate::ledger_commit::near_cap::near_cap_ledger(&temp_dir.path().join("t71.bean"), 64);
+        let configured = Duration::from_secs(5);
+        let handler = make_handler_with_timeouts(
+            Arc::clone(&ledger),
+            allow,
+            AntiEntropyTimeouts {
+                supply_backoff: configured,
+                ..AntiEntropyTimeouts::default()
+            },
+        );
+        let remote = iroh::SecretKey::generate().public();
+        let armed_before = std::time::Instant::now();
+        let outcome = apply_supply_entries(&handler, entries, remote).await;
+        let armed_after = std::time::Instant::now();
+        assert_eq!(outcome.deferred, 8, "the batch cannot fit: {outcome:?}");
+        assert!(
+            handler
+                .supply_backoff
+                .is_active(remote, armed_after + configured - Duration::from_secs(1)),
+            "still deferred just inside the configured backoff"
+        );
+        assert!(
+            !handler
+                .supply_backoff
+                .is_active(remote, armed_before + configured + Duration::from_secs(1)),
+            "the configured backoff, not the 60 s default, decides when it lifts"
+        );
+        assert_eq!(
+            AntiEntropyTimeouts::default().supply_backoff,
+            SUPPLY_HEADROOM_BACKOFF,
+            "an absent key keeps today's 60 s"
+        );
     }
 
     // ─── M-16 / T24 connection + request limits (network) ───────────────────

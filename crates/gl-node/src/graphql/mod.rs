@@ -102,14 +102,70 @@ pub async fn graphql_handler(
     schema.execute(request.into_inner()).await.into()
 }
 
+/// The exact GraphiQL release the explorer page loads (L-66).
+///
+/// async-graphql 7.2.1's default is `"4"`, a floating major: `unpkg.com`
+/// resolved `graphiql@4/graphiql.min.js` to whatever 4.x was newest at the
+/// moment an operator opened the tab (4.1.2 on 2026-09-23, the value pinned
+/// here, so pinning changed nothing an operator sees). The GraphiQL tab is a
+/// same-origin, unauthenticated session on the node — on a loopback bind with
+/// auth off it can run every mutation — so the code it runs should be one
+/// reviewed release, not "the latest one".
+///
+/// **Residual (L-66):** this pins the version only. `GraphiQLSource` offers no
+/// way to add `integrity` attributes, and its template hard-codes
+/// `react@18`/`react-dom@18` **development** builds (a floating minor) from
+/// the same CDN (`async-graphql-7.2.1/src/http/graphiql_v2_source.hbs:28-51`),
+/// so whoever controls those CDN responses still controls the page. What
+/// bounds that is configuration: `graphiql` defaults to `false` and is refused
+/// on any non-loopback bind.
+pub const GRAPHIQL_VERSION: &str = "4.1.2";
+
 /// Handler for `GET /graphql` — serve the GraphiQL interactive explorer.
 pub async fn graphiql_handler() -> impl IntoResponse {
-    Html(GraphiQLSource::build().endpoint("/graphql").finish())
+    Html(graphiql_page())
+}
+
+/// The explorer page, with the GraphiQL assets pinned to [`GRAPHIQL_VERSION`].
+fn graphiql_page() -> String {
+    GraphiQLSource::build()
+        .endpoint("/graphql")
+        .version(GRAPHIQL_VERSION)
+        .finish()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L-66: both GraphiQL assets load the pinned release; no floating
+    /// `graphiql@4/` reference survives.
+    ///
+    /// Bug-catch: drop `.version(GRAPHIQL_VERSION)` and the page loads
+    /// `graphiql@4/graphiql.min.js`.
+    #[test]
+    fn test_graphiql_assets_are_pinned_to_an_exact_version() {
+        let page = graphiql_page();
+        let pinned = format!("https://unpkg.com/graphiql@{GRAPHIQL_VERSION}/");
+        assert!(
+            page.contains(&format!("{pinned}graphiql.min.js")),
+            "script not pinned: {page}"
+        );
+        assert!(
+            page.contains(&format!("{pinned}graphiql.min.css")),
+            "stylesheet not pinned: {page}"
+        );
+        assert_eq!(
+            page.matches("unpkg.com/graphiql@").count(),
+            page.matches(pinned.as_str()).count(),
+            "every graphiql asset carries the exact version"
+        );
+        assert_eq!(
+            GRAPHIQL_VERSION.split('.').count(),
+            3,
+            "an exact major.minor.patch, not a range"
+        );
+    }
 
     #[tokio::test]
     async fn test_schema_introspection() {

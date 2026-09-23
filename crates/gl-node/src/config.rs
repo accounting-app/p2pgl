@@ -9,7 +9,7 @@ use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Environment variable that supplies `auth.apiKey`.
 ///
@@ -367,6 +367,17 @@ pub struct P2pConfig {
     /// One accept token back per this many milliseconds (M-40).
     #[serde(default = "default_anti_entropy_accept_refill_milliseconds")]
     pub anti_entropy_accept_refill_milliseconds: u64,
+
+    /// Outbound anti-entropy exchanges this node runs at once, across all
+    /// peers (R-5, T69; config surface T71). Past it, peers queue FIFO for the
+    /// next free slot.
+    #[serde(default = "default_anti_entropy_max_concurrent_exchanges")]
+    pub anti_entropy_max_concurrent_exchanges: usize,
+
+    /// Seconds a peer's `Supply` stays deferred after one of its batches did
+    /// not fit under the ledger's size cap (M-39, T69; config surface T71).
+    #[serde(default = "default_anti_entropy_supply_backoff_seconds")]
+    pub anti_entropy_supply_backoff_seconds: u64,
 }
 
 /// Hand-written so the two quasi-credentials this struct carries are not
@@ -419,6 +430,14 @@ impl std::fmt::Debug for P2pConfig {
                 "anti_entropy_accept_refill_milliseconds",
                 &self.anti_entropy_accept_refill_milliseconds,
             )
+            .field(
+                "anti_entropy_max_concurrent_exchanges",
+                &self.anti_entropy_max_concurrent_exchanges,
+            )
+            .field(
+                "anti_entropy_supply_backoff_seconds",
+                &self.anti_entropy_supply_backoff_seconds,
+            )
             .finish()
     }
 }
@@ -454,6 +473,7 @@ impl P2pConfig {
             max_advert_pages: self.anti_entropy_max_advert_pages,
             max_advert_id_bytes: self.anti_entropy_max_advert_id_bytes,
             max_session_frames: self.anti_entropy_max_session_frames,
+            supply_backoff: Duration::from_secs(self.anti_entropy_supply_backoff_seconds),
             ..AntiEntropyTimeouts::default()
         }
     }
@@ -471,6 +491,7 @@ impl P2pConfig {
             accept_refill_interval: Duration::from_millis(
                 self.anti_entropy_accept_refill_milliseconds,
             ),
+            max_concurrent_outbound_exchanges: self.anti_entropy_max_concurrent_exchanges,
             ..AntiEntropyLimits::default()
         }
     }
@@ -531,6 +552,8 @@ impl Default for P2pConfig {
             anti_entropy_accept_burst: default_anti_entropy_accept_burst(),
             anti_entropy_accept_refill_milliseconds:
                 default_anti_entropy_accept_refill_milliseconds(),
+            anti_entropy_max_concurrent_exchanges: default_anti_entropy_max_concurrent_exchanges(),
+            anti_entropy_supply_backoff_seconds: default_anti_entropy_supply_backoff_seconds(),
         }
     }
 }
@@ -606,6 +629,14 @@ fn default_anti_entropy_accept_refill_milliseconds() -> u64 {
     .unwrap_or(u64::MAX)
 }
 
+fn default_anti_entropy_max_concurrent_exchanges() -> usize {
+    AntiEntropyLimits::default().max_concurrent_outbound_exchanges
+}
+
+fn default_anti_entropy_supply_backoff_seconds() -> u64 {
+    AntiEntropyTimeouts::default().supply_backoff.as_secs()
+}
+
 /// Bounds on `p2p.antiEntropySessionSeconds` (M-40, R-7).
 ///
 /// Floor: the per-frame `io` (30 s). A session shorter than one frame's own
@@ -667,6 +698,28 @@ const MAX_ANTI_ENTROPY_ACCEPT_BURST: u32 = 256;
 /// happens once per `io`, so a slower refill would ration honest traffic.
 const MIN_ANTI_ENTROPY_ACCEPT_REFILL_MILLISECONDS: u64 = 100;
 const MAX_ANTI_ENTROPY_ACCEPT_REFILL_MILLISECONDS: u64 = 30_000;
+
+/// Bounds on `p2p.antiEntropyMaxConcurrentExchanges` (R-5, T69 → T71).
+///
+/// Floor: 1 — one exchange at a time still converges (anti-entropy needs only
+/// one honest exchange to run; the rest queue FIFO), and `0` would stop
+/// outbound replication altogether. Ceiling: 64. Each exchange against a
+/// hostile peer can hold ≈ 130–150 MiB resident at worst, so 64 is ≈ 8–10 GiB —
+/// already past what the bound exists to prevent; beyond it the allowlist size
+/// is the only limit again, which is the pre-R-5 state.
+const MIN_ANTI_ENTROPY_MAX_CONCURRENT_EXCHANGES: usize = 1;
+const MAX_ANTI_ENTROPY_MAX_CONCURRENT_EXCHANGES: usize = 64;
+
+/// Bounds on `p2p.antiEntropySupplyBackoffSeconds` (M-39, T69 → T71).
+///
+/// Floor: 5 s. The backoff exists so a node at its size cap stops re-pulling,
+/// re-validating and re-deferring the same batch on every tick; at the
+/// anti-entropy interval's default of 5 s, anything shorter lifts before the
+/// next tick and is no backoff at all. Ceiling: one hour, the session ceiling's
+/// reasoning in the other direction — a node an operator has already made room
+/// on should not sit out replication from a peer for longer than that.
+const MIN_ANTI_ENTROPY_SUPPLY_BACKOFF_SECONDS: u64 = 5;
+const MAX_ANTI_ENTROPY_SUPPLY_BACKOFF_SECONDS: u64 = 3_600;
 
 fn default_swarm_topic() -> String {
     "openledger/transactions".to_owned()
@@ -920,6 +973,20 @@ impl NodeConfig {
                      environment key left the node still accepting the stale one"
                 );
             }
+            if !config.auth.enabled {
+                // 0922-v2 §5: the environment key used to be discarded in
+                // silence when auth is off, so an operator who exported it
+                // believed the node was guarded. A public bind is refused
+                // anyway (auth is forced on there); this is the loopback case,
+                // where the mutations are then open to anything local. The
+                // value is never echoed.
+                warn!(
+                    env_var = API_KEY_ENV_VAR,
+                    "GL_NODE_API_KEY is set but auth.enabled is false, so the key is IGNORED and \
+                     every GraphQL request, mutations included, is served without one; set \
+                     \"auth\": {{ \"enabled\": true }} to require it, or unset the variable"
+                );
+            }
             config.auth.api_key = env_api_key;
         }
 
@@ -1062,6 +1129,7 @@ impl NodeConfig {
                     "allowedHosts contains invalid host: {host}"
                 )));
             }
+            Self::validate_allowed_host_form(host)?;
         }
 
         // L-23 / M-31: the rules below are applied to whatever actually
@@ -1260,10 +1328,22 @@ impl NodeConfig {
             )));
         }
         if value.trim() != value {
+            // L-56: never echo the value. The padded string differs from the
+            // live join credential / signature domain by one byte, `main`
+            // surfaces this error through `error!`, and every other site that
+            // names this value redacts it (M-32). The redacted shape (length and
+            // a four-character prefix) plus the byte offset of the offending
+            // whitespace is enough to find the typo in the file.
+            let offset = if value.starts_with(char::is_whitespace) {
+                0
+            } else {
+                value.trim_end().len()
+            };
             return Err(ConfigError::Validation(format!(
-                "{field} must not have leading or trailing whitespace, got \"{value}\"; {why} — \
-                 refused rather than trimmed, because trimming it here would turn a loud boot \
-                 failure into a silent partition"
+                "{field} must not have leading or trailing whitespace, got {} with whitespace at \
+                 byte {offset}; {why} — refused rather than trimmed, because trimming it here \
+                 would turn a loud boot failure into a silent partition",
+                crate::auth::redact(value)
             )));
         }
         if value.len() > MAX_SIGNATURE_DOMAIN_BYTES {
@@ -1285,12 +1365,59 @@ impl NodeConfig {
         Ok(())
     }
 
+    /// Refuse an `allowedHosts` entry the Host guard could never match (0922-v2
+    /// §5).
+    ///
+    /// The guard reduces every `Host` header with
+    /// [`crate::request_guard::split_authority`] — port and IPv6 brackets
+    /// stripped — and looks the bare host up in this list. An entry spelled
+    /// with a port (`ledger.example.com:443`) or brackets (`[::1]`) therefore
+    /// matched nothing: it passed validation, and then every request through
+    /// that name got `403`, with nothing at boot to say why. Running the entry
+    /// through the same split and refusing it when the split changes it keeps
+    /// the two in agreement by construction.
+    ///
+    /// A trailing dot (`ledger.example.com.`) is the fully-qualified spelling
+    /// of the same name, but clients send the name without it and the guard
+    /// compares bytes, so it too matches nothing in practice.
+    ///
+    /// Echoing the entry is fine here: a host name is not a credential, and
+    /// the neighbouring `allowedHosts` errors already name it.
+    fn validate_allowed_host_form(host: &str) -> Result<(), ConfigError> {
+        let (bare, port) = crate::request_guard::split_authority(host);
+        if let Some(port) = port {
+            return Err(ConfigError::Validation(format!(
+                "allowedHosts entries are hostnames or IP literals without a port, got \"{host}\"; \
+                 the Host guard strips the port (:{port}) from every request before the lookup, \
+                 so this entry could never match and every request through it would get 403 — \
+                 list \"{bare}\" instead"
+            )));
+        }
+        if bare != host {
+            return Err(ConfigError::Validation(format!(
+                "allowedHosts entries must not be bracketed, got \"{host}\"; the Host guard \
+                 strips IPv6 brackets before the lookup, so this entry could never match — \
+                 list \"{bare}\" instead"
+            )));
+        }
+        if host.len() > 1 && host.ends_with('.') {
+            return Err(ConfigError::Validation(format!(
+                "allowedHosts entries must not end with a dot, got \"{host}\"; clients send the \
+                 name without the trailing dot and the Host guard compares it byte for byte, so \
+                 this entry would match nothing and every request would get 403 — list \"{}\" \
+                 instead",
+                host.trim_end_matches('.')
+            )));
+        }
+        Ok(())
+    }
+
     /// One bounds check for both `http` timeouts, so they cannot drift apart.
     /// Refuse any anti-entropy session bound outside its floor and ceiling
     /// (R-7); see the `MIN_`/`MAX_ANTI_ENTROPY_*` constants for each pair.
     fn validate_anti_entropy_bounds(&self) -> Result<(), ConfigError> {
         let p2p = &self.p2p;
-        let bounds: [(&str, u64, u64, u64, &str); 6] = [
+        let bounds: [(&str, u64, u64, u64, &str); 8] = [
             (
                 "p2p.antiEntropySessionSeconds",
                 p2p.anti_entropy_session_seconds,
@@ -1339,6 +1466,22 @@ impl NodeConfig {
                 "below the floor a reconnect loop is admitted at a rate no honest peer \
                  needs; above the ceiling an honest peer's re-dials are rationed",
             ),
+            (
+                "p2p.antiEntropyMaxConcurrentExchanges",
+                p2p.anti_entropy_max_concurrent_exchanges as u64,
+                MIN_ANTI_ENTROPY_MAX_CONCURRENT_EXCHANGES as u64,
+                MAX_ANTI_ENTROPY_MAX_CONCURRENT_EXCHANGES as u64,
+                "0 stops outbound replication; above the ceiling hostile peers may each \
+                 hold an exchange's worst-case memory at once",
+            ),
+            (
+                "p2p.antiEntropySupplyBackoffSeconds",
+                p2p.anti_entropy_supply_backoff_seconds,
+                MIN_ANTI_ENTROPY_SUPPLY_BACKOFF_SECONDS,
+                MAX_ANTI_ENTROPY_SUPPLY_BACKOFF_SECONDS,
+                "below the floor a node at its size cap re-pulls the same batch every \
+                 tick; above the ceiling it sits out a peer long after room was made",
+            ),
         ];
         for (field, value, min, max, why) in bounds {
             if !(min..=max).contains(&value) {
@@ -1381,6 +1524,48 @@ impl NodeConfig {
             self.bind_address.as_str(),
             "127.0.0.1" | "::1" | "localhost"
         )
+    }
+
+    /// Log which field the signature domain resolved from (L-23) — and, when
+    /// `p2p.meshId` is unset on a node that signs, WARN with the one
+    /// history-preserving remedy (R-9).
+    ///
+    /// The R-9 decision: `meshId` becomes required a release from now, so an
+    /// operator must be told today, at `warn`, what to set it to — and the only
+    /// value that keeps an existing mesh's signatures verifying is the current
+    /// `swarmTopic`, byte for byte, because a signature is checked by
+    /// rebuilding the signed message with the verifier's own domain. The remedy
+    /// therefore LEADS with that sentence; the README's old `uuidgen` advice is
+    /// right for a new mesh and destroys an existing one's history.
+    ///
+    /// Never prints the domain: on the fallback path it *is* the gossip join
+    /// credential (M-32, L-56), so only its source, length and a four-character
+    /// prefix appear — the shape `main` always logged. A node with signing off
+    /// has no signatures to invalidate, so it gets the `info` line only.
+    pub fn log_signature_domain(&self) {
+        let domain = self.p2p.signature_domain();
+        let source = self.p2p.signature_domain_source();
+        let length = domain.len();
+        let prefix: String = domain.chars().take(4).collect();
+        if self.p2p.mesh_id.is_none() && self.signing.enabled {
+            warn!(
+                source,
+                length,
+                prefix = %prefix,
+                "p2p.meshId is unset, so this node's signature domain is p2p.swarmTopic; meshId \
+                 will be REQUIRED in a later release. Remedy: set p2p.meshId to your current \
+                 swarmTopic verbatim — any other value invalidates every signature already in \
+                 the mesh. Copy the value byte for byte on every node; after that the topic can \
+                 change without touching signatures (R-9, L-23)"
+            );
+        } else {
+            info!(
+                source,
+                length,
+                prefix = %prefix,
+                "mesh signature domain resolved"
+            );
+        }
     }
 
     /// Whether to serve GraphiQL on `GET /graphql`.
@@ -2121,6 +2306,61 @@ mod tests {
         assert!(error_message.contains("allowedHosts"));
     }
 
+    /// A config listing `hosts` in `allowedHosts`.
+    fn load_with_allowed_hosts(hosts: &[&str]) -> Result<NodeConfig, ConfigError> {
+        let file = write_temp_config(&format!(
+            r#"{{ "ledgerPath": "./data/ledger.bean", "allowedHosts": {} }}"#,
+            serde_json::json!(hosts)
+        ));
+        NodeConfig::load_from_path(&file.path().to_path_buf())
+    }
+
+    /// 0922-v2 §5: an entry with a port, IPv6 brackets or a trailing dot used
+    /// to boot and then 403 every request through that name. Each is now a
+    /// `ConfigError::Validation` that says why and names the spelling to use.
+    #[test]
+    fn test_allowed_hosts_entries_the_guard_cannot_match_are_refused() {
+        for (entry, says, instead) in [
+            (
+                "ledger.example.com:443",
+                "without a port",
+                "ledger.example.com",
+            ),
+            ("10.0.0.7:4000", "without a port", "10.0.0.7"),
+            ("[::1]:4000", "without a port", "::1"),
+            ("[2001:db8::7]", "must not be bracketed", "2001:db8::7"),
+            (
+                "ledger.example.com.",
+                "must not end with a dot",
+                "ledger.example.com",
+            ),
+        ] {
+            let error = load_with_allowed_hosts(&[entry])
+                .map(|_| ())
+                .expect_err(&format!("{entry} must be refused at boot"));
+            assert!(
+                matches!(error, ConfigError::Validation(_)),
+                "{entry}: {error}"
+            );
+            let message = error.to_string();
+            assert!(message.contains("allowedHosts"), "{entry}: {message}");
+            assert!(message.contains(says), "{entry}: {message}");
+            assert!(
+                message.contains(&format!("list \"{instead}\" instead")),
+                "{entry}: the error names the spelling that works: {message}"
+            );
+        }
+    }
+
+    /// The bare spellings the guard compares against still load, IPv6
+    /// literals included (every colon of a bare literal belongs to it).
+    #[test]
+    fn test_allowed_hosts_bare_names_and_literals_still_load() {
+        let config = load_with_allowed_hosts(&["ledger.example.com", "10.0.0.7", "2001:db8::7"])
+            .expect("bare hosts are the documented form");
+        assert_eq!(config.allowed_hosts.len(), 3);
+    }
+
     #[test]
     fn test_allowed_hosts_empty_entry_rejected() {
         let file =
@@ -2384,6 +2624,87 @@ mod tests {
         assert!(checked >= 4, "expected to find the shipped sample configs");
     }
 
+    /// R-9: the shipped docker config sets `meshId` to its own `swarmTopic`
+    /// byte for byte — the only value that keeps the stack's already-signed
+    /// history verifying — and both pass the signature-domain rules.
+    #[test]
+    fn test_docker_config_pins_mesh_id_to_its_swarm_topic() {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../deploy/gl-node.docker.json");
+        let config: NodeConfig =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("docker config"))
+                .expect("docker config parses");
+        assert_eq!(
+            config.p2p.mesh_id.as_deref(),
+            Some(config.p2p.swarm_topic.as_str()),
+            "meshId must equal swarmTopic verbatim, or the stack's signatures stop verifying"
+        );
+        assert_eq!(config.p2p.signature_domain(), "openledger/docker-dev");
+        NodeConfig::validate_signature_domain("p2p.meshId", config.p2p.signature_domain(), "")
+            .expect("the shipped meshId is a well-formed domain");
+    }
+
+    // ── R-9: the meshId-unset boot warning ─────────────────────────────
+
+    /// A signing node on a fixed topic, with or without a `meshId`.
+    fn signing_config(topic: &str, mesh_id: Option<&str>, signing: bool) -> NodeConfig {
+        let mesh_field = match mesh_id {
+            Some(value) => format!(r#", "meshId": {}"#, serde_json::json!(value)),
+            None => String::new(),
+        };
+        let file = write_temp_config(&format!(
+            r#"{{ "ledgerPath": "./data/ledger.bean", "signing": {{ "enabled": {signing} }},
+                  "p2p": {{ "swarmTopic": {}{mesh_field} }} }}"#,
+            serde_json::json!(topic)
+        ));
+        NodeConfig::load_from_path(&file.path().to_path_buf()).expect("valid config")
+    }
+
+    /// R-9: `meshId` unset on a signing node → a WARN whose remedy leads with
+    /// the verbatim-`swarmTopic` sentence, naming the field — and never the
+    /// topic, which on this path is the join credential and the domain.
+    ///
+    /// Bug-catch: demote the `warn!` to `info!` (the pre-T71 line) and nothing
+    /// is captured at WARN.
+    #[test]
+    fn test_mesh_id_unset_warns_with_the_verbatim_remedy_and_never_the_topic() {
+        let topic = "acme/secret-join-topic-77";
+        let config = signing_config(topic, None, true);
+        let ((), logged) = capture_warnings(|| config.log_signature_domain());
+        assert!(logged.contains("WARN"), "must be a warning: {logged}");
+        assert!(
+            logged.contains(
+                "Remedy: set p2p.meshId to your current swarmTopic verbatim — any other value \
+                 invalidates every signature already in the mesh"
+            ),
+            "the remedy leads with the history-preserving value: {logged}"
+        );
+        assert!(
+            logged.contains("p2p.swarmTopic"),
+            "names swarmTopic: {logged}"
+        );
+        assert!(!logged.contains(topic), "the topic was printed: {logged}");
+        assert!(
+            logged.contains(&format!("length={}", topic.len())) && logged.contains("prefix=acme"),
+            "the redacted shape the boot log always used: {logged}"
+        );
+    }
+
+    /// No warning once `meshId` is set (any value — the verbatim one included),
+    /// and none on a node that does not sign (it has no signatures to lose).
+    #[test]
+    fn test_mesh_id_set_or_signing_off_does_not_warn() {
+        let topic = "acme/secret-join-topic-77";
+        for config in [
+            signing_config(topic, Some(topic), true),
+            signing_config(topic, Some("3f2504e0-4f89-41d3-9a0c-0305e82c3301"), true),
+            signing_config(topic, None, false),
+        ] {
+            let ((), logged) = capture_warnings(|| config.log_signature_domain());
+            assert!(logged.is_empty(), "unexpected warning: {logged}");
+        }
+    }
+
     // ── R-7: anti-entropy session bounds ───────────────────────────────
 
     /// A config setting one `p2p` anti-entropy key to `value`.
@@ -2395,7 +2716,7 @@ mod tests {
     }
 
     /// Every R-7 key with its floor and ceiling.
-    fn anti_entropy_keys() -> [(&'static str, u64, u64); 6] {
+    fn anti_entropy_keys() -> [(&'static str, u64, u64); 8] {
         [
             (
                 "antiEntropySessionSeconds",
@@ -2426,6 +2747,16 @@ mod tests {
                 "antiEntropyAcceptRefillMilliseconds",
                 MIN_ANTI_ENTROPY_ACCEPT_REFILL_MILLISECONDS,
                 MAX_ANTI_ENTROPY_ACCEPT_REFILL_MILLISECONDS,
+            ),
+            (
+                "antiEntropyMaxConcurrentExchanges",
+                MIN_ANTI_ENTROPY_MAX_CONCURRENT_EXCHANGES as u64,
+                MAX_ANTI_ENTROPY_MAX_CONCURRENT_EXCHANGES as u64,
+            ),
+            (
+                "antiEntropySupplyBackoffSeconds",
+                MIN_ANTI_ENTROPY_SUPPLY_BACKOFF_SECONDS,
+                MAX_ANTI_ENTROPY_SUPPLY_BACKOFF_SECONDS,
             ),
         ]
     }
@@ -2473,6 +2804,13 @@ mod tests {
         assert_eq!(timeouts.max_advert_pages, expected.max_advert_pages);
         assert_eq!(timeouts.max_advert_id_bytes, expected.max_advert_id_bytes);
         assert_eq!(timeouts.max_session_frames, expected.max_session_frames);
+        // T71: the two keys routed here by T69 default to its constants.
+        assert_eq!(timeouts.supply_backoff, expected.supply_backoff);
+        assert_eq!(
+            timeouts.supply_backoff,
+            crate::anti_entropy_alpn::SUPPLY_HEADROOM_BACKOFF
+        );
+        assert_eq!(timeouts.supply_backoff, Duration::from_secs(60));
 
         let limits = config.p2p.anti_entropy_limits();
         let expected = AntiEntropyLimits::default();
@@ -2490,6 +2828,11 @@ mod tests {
             limits.accept_refill_interval,
             expected.accept_refill_interval
         );
+        assert_eq!(
+            limits.max_concurrent_outbound_exchanges,
+            crate::connection_limiter::DEFAULT_MAX_CONCURRENT_OUTBOUND_EXCHANGES
+        );
+        assert_eq!(limits.max_concurrent_outbound_exchanges, 8);
     }
 
     /// R-7: a set key reaches the settings the handler is built from, and the
@@ -2503,7 +2846,9 @@ mod tests {
                 "antiEntropyMaxAdvertIdBytes": 33554432,
                 "antiEntropyMaxSessionFrames": 20000,
                 "antiEntropyAcceptBurst": 4,
-                "antiEntropyAcceptRefillMilliseconds": 5000 } }"#,
+                "antiEntropyAcceptRefillMilliseconds": 5000,
+                "antiEntropyMaxConcurrentExchanges": 3,
+                "antiEntropySupplyBackoffSeconds": 90 } }"#,
         );
         let config =
             NodeConfig::load_from_path(&file.path().to_path_buf()).expect("in-bounds values");
@@ -2516,6 +2861,8 @@ mod tests {
         assert_eq!(limits.max_requests_per_connection, 20_000);
         assert_eq!(limits.accept_burst, 4);
         assert_eq!(limits.accept_refill_interval, Duration::from_secs(5));
+        assert_eq!(limits.max_concurrent_outbound_exchanges, 3);
+        assert_eq!(timeouts.supply_backoff, Duration::from_secs(90));
     }
 
     // ── L-23: p2p.meshId ─────────────────────────────────────────────────
@@ -2736,6 +3083,44 @@ mod tests {
                 message.contains("p2p.swarmTopic"),
                 "the error must name the field the operator has to fix ({reason}): {message}"
             );
+            // L-56: the topic is the gossip join credential and, here, the
+            // signature domain; the boot error is logged, so it must never
+            // carry the value. (An empty or all-whitespace value has nothing
+            // to leak, and `contains("")` is vacuously true.)
+            if !value.trim().is_empty() {
+                assert!(
+                    !message.contains(value.trim()),
+                    "the error must not echo the topic ({reason}): {message}"
+                );
+            }
+        }
+    }
+
+    /// L-56: the whitespace refusal locates the typo without printing the
+    /// value — the redacted shape and the byte offset of the whitespace.
+    #[test]
+    fn test_padded_signature_domain_error_names_the_offset_not_the_value() {
+        let topic = "acme/secret-join-topic-77";
+        for (padded, offset) in [(format!("{topic} "), topic.len()), (format!(" {topic}"), 0)] {
+            let message = load_with_swarm_topic(&padded, None)
+                .expect_err("a padded topic must be refused")
+                .to_string();
+            assert!(!message.contains(topic), "value echoed: {message}");
+            assert!(
+                message.contains(&format!("whitespace at byte {offset}")),
+                "the offset locates the typo: {message}"
+            );
+            assert!(
+                message.contains(&format!("{} bytes", padded.len())),
+                "the redacted shape names the length: {message}"
+            );
+            let mesh_message = load_with_mesh_id(Some(&padded))
+                .expect_err("a padded meshId must be refused")
+                .to_string();
+            assert!(
+                !mesh_message.contains(topic),
+                "meshId echoed: {mesh_message}"
+            );
         }
     }
 
@@ -2936,6 +3321,46 @@ mod tests {
         let value = tracing::subscriber::with_default(subscriber, body);
         let logged = String::from_utf8_lossy(&buffer.0.lock().unwrap()).into_owned();
         (value, logged)
+    }
+
+    /// 0922-v2 §5: an environment key with auth disabled is not silently
+    /// discarded — boot warns, names the variable, and never prints the key.
+    #[test]
+    fn test_environment_api_key_with_auth_disabled_warns_without_echoing_it() {
+        let file = write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean" }"#);
+        let (config, logged) = capture_warnings(|| {
+            NodeConfig::load_from_path_with_env_api_key(
+                file.path(),
+                Some(TEST_ENV_API_KEY.to_owned()),
+            )
+            .expect("auth disabled on loopback still boots")
+        });
+        assert!(!config.auth.enabled);
+        assert!(
+            logged.contains("GL_NODE_API_KEY is set but auth.enabled is false"),
+            "the ignored key must be reported: {logged}"
+        );
+        assert!(
+            !logged.contains(TEST_ENV_API_KEY),
+            "the warning must not print the key: {logged}"
+        );
+
+        // Auth on, or no environment key: no such warning.
+        let (_, quiet) = capture_warnings(|| {
+            NodeConfig::load_from_path_with_env_api_key(file.path(), None).expect("loads")
+        });
+        assert!(!quiet.contains("GL_NODE_API_KEY is set"), "{quiet}");
+        let enabled = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "auth": { "enabled": true } }"#,
+        );
+        let (_, quiet) = capture_warnings(|| {
+            NodeConfig::load_from_path_with_env_api_key(
+                enabled.path(),
+                Some(TEST_ENV_API_KEY.to_owned()),
+            )
+            .expect("the environment supplies the required key")
+        });
+        assert!(!quiet.contains("GL_NODE_API_KEY is set"), "{quiet}");
     }
 
     /// The name is published in the README, in the compose file and in a boot

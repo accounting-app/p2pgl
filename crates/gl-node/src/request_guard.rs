@@ -345,7 +345,11 @@ fn normalize_host(authority: &str) -> String {
 }
 
 /// Split an authority into its host and its explicit port, if any.
-fn split_authority(authority: &str) -> (&str, Option<&str>) {
+///
+/// `pub(crate)` so config validation can run every `allowedHosts` entry through
+/// the same split the guard applies to the `Host` header (§5 of the 0922-v2
+/// audit): an entry this function would change can never be matched.
+pub(crate) fn split_authority(authority: &str) -> (&str, Option<&str>) {
     if let Some(rest) = authority.strip_prefix('[') {
         // Bracketed IPv6 literal: `[::1]:4000` → (`::1`, `4000`).
         match rest.split_once(']') {

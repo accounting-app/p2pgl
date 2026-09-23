@@ -362,9 +362,13 @@ Checks that all content hashes and parent links are valid.
 curl -s -X POST http://127.0.0.1:4000/graphql \
   -H "Content-Type: application/json" \
   -d '{
-    "query": "{ verify { ok nodesChecked errors } }"
+    "query": "{ verify { ok nodesChecked errors truncated } }"
   }'
 ```
+
+`errors` lists at most the first 1,000 problems, one per offending node;
+`truncated` is how many more were found and not listed (`0` means `errors` is
+complete).
 
 ---
 
@@ -435,10 +439,12 @@ boot if it is missing — the node will not start half-hardened.
 }
 ```
 
-`p2p.meshId` is the one option deliberately left out of the block: on an
-existing mesh, setting it changes the signature domain and invalidates every
-signature already held. Read [Mesh identity](#mesh-identity-p2pmeshid) before
-you set one.
+`p2p.meshId` is the one option deliberately left out of the block, because the
+right value depends on whether the mesh already exists: on an **existing** mesh,
+set it to your current `swarmTopic` verbatim — any other value invalidates every
+signature already in the mesh. Read [Mesh identity](#mesh-identity-p2pmeshid)
+before you set one. A signing node with no `meshId` logs a warning at every
+boot saying so; `meshId` becomes required in a later release.
 
 > `"apiKey": "change-me"` above is a **placeholder that this node refuses to
 > boot with**, on purpose — see [API keys](#api-keys) before you copy the block.
@@ -449,7 +455,7 @@ you set one.
 | `bindAddress` | `"127.0.0.1"` | HTTP listen address |
 | `port` | `4000` | HTTP listen port |
 | `watchLedgerFile` | `false` | Poll the `.bean` every 250 ms and fold a hand edit in promptly. It does **not** control whether a hand edit is accepted — nothing does — see [Editing the `.bean` file](#editing-the-bean-file-by-hand) |
-| `graphiql` | `false` | GraphiQL playground; refused outright on a non-loopback bind |
+| `graphiql` | `false` | GraphiQL playground; refused outright on a non-loopback bind. The page loads GraphiQL 4.1.2 (pinned) and React 18 from `unpkg.com` — see below |
 | `cors.allowedOrigins` | `[]` | Browser origin allowlist; `"*"` is rejected |
 | `allowedHosts` | `[]` | Extra `Host` header values accepted, beyond loopback and the bind address. **Required (non-empty) on a non-loopback bind** — see below |
 | `trustedProxies` | `[]` | Reverse-proxy IPs whose `X-Forwarded-For` the rate limiter believes — see below |
@@ -459,7 +465,7 @@ you set one.
 | `http.headerReadTimeoutSeconds` | `30` | Time a client gets to send a complete request head; also bounds idle keep-alive. `1`–`300` |
 | `http.requestTimeoutSeconds` | `30` | Whole-request ceiling, body read and GraphQL execution included (`408` on expiry). `1`–`300` |
 | `http.maxConnections` | `1024` | Concurrently served connections; excess stays in the kernel backlog. `8`–`65536` |
-| `http.maxConnectionsPerIp` | `64` | Concurrent connections one client may hold (keyed per IPv4 address or IPv6 /64, like the rate limiter), so one address cannot take every slot. Addresses listed in `trustedProxies` are exempt — list your reverse proxy there, or every client behind it shares this cap. Clamped to `maxConnections`. `8`–`65536` |
+| `http.maxConnectionsPerIp` | `64` | Concurrent connections one client may hold (keyed per IPv4 address or IPv6 /64, like the rate limiter), so one address cannot take every slot. **It bounds one address or one /64, not one network:** a routed IPv6 /48 is 65,536 /64 keys, far past the global cap, so per-prefix limits wider than a /64 belong in your proxy or firewall. Addresses listed in `trustedProxies` are exempt — list your reverse proxy there, or every client behind it shares this cap. Clamped to `maxConnections`. `8`–`65536` |
 | `signing.enabled` | `false` | Sign transactions with Ed25519. Forced on when `p2p.enabled` |
 | `p2p.enabled` | `false` | Enable Iroh mesh replication |
 | `p2p.secretKeyPath` | `./data/iroh.secret` | The node's Ed25519 key — its QUIC identity **and** its signing key. Created `0600` if absent. An existing file is refused unless it is a regular file (not a symlink), owned by the uid the node runs as, and not readable by group or other |
@@ -472,9 +478,11 @@ you set one.
 | `p2p.antiEntropyMaxSessionFrames` | `100000` | Frames one anti-entropy connection may cost, on either side. `10000`–`1000000` |
 | `p2p.antiEntropyAcceptBurst` | `8` | New inbound anti-entropy connections one peer may open back to back; beyond it, one per refill interval (refusals close with code 6 `accept-rate-limit`). `2`–`256` |
 | `p2p.antiEntropyAcceptRefillMilliseconds` | `2000` | One accept token back per this interval. `100`–`30000` |
+| `p2p.antiEntropyMaxConcurrentExchanges` | `8` | Outbound anti-entropy exchanges this node runs at once, across all peers; past it, peers wait their turn in order. Each exchange against a hostile peer can hold ~130–150 MiB at worst. `1`–`64` |
+| `p2p.antiEntropySupplyBackoffSeconds` | `60` | When a peer's batch would not fit under the 64 MiB ledger cap, that peer's `Supply` is not applied again for this long (one warning per deferral). `5`–`3600` |
 | `p2p.relayMode` | `"n0"` | `"n0"` (public Iroh relays and discovery) or `"disabled"` (direct addresses only). Anything else is refused at boot — see [Relay mode](#relay-mode-p2prelaymode) |
 | `p2p.swarmTopic` | `openledger/transactions` | Gossip topic, and the signature domain while `meshId` is unset; required unique on a public bind. Same form as `meshId`: non-empty, no surrounding whitespace, ASCII letters, digits and `- _ . : /`, up to 128 bytes |
-| `p2p.meshId` | *(unset)* | Mesh identity bound into every signature. Use a random UUID. Unset falls back to `swarmTopic` — see below |
+| `p2p.meshId` | *(unset)* | Mesh identity bound into every signature. **Existing mesh: your current `swarmTopic`, verbatim** — any other value invalidates every signature already in the mesh. New mesh: a random UUID. Unset falls back to `swarmTopic` and draws a boot warning on a signing node — see below |
 
 **`allowedHosts`.** The request guard checks the `Host` header on every
 GraphQL request, which is what stops a DNS-rebinding page in a browser from
@@ -483,7 +491,25 @@ non-wildcard `bindAddress` are always accepted; everything else has to be
 listed. A wildcard bind such as `0.0.0.0` names no host a client could send,
 so on a non-loopback bind an **empty `allowedHosts` is refused at boot** rather
 than left to reject every request with a `403` at runtime. Entries are bare
-hostnames or IP literals — no scheme, no port, no path.
+hostnames or IP literals — no scheme, no port, no path, no IPv6 brackets and no
+trailing dot. The guard strips the port and brackets from every `Host` header
+before the lookup, so an entry spelled `ledger.example.com:443` or `[::1]` could
+never match; each of those is refused at boot with the spelling to use instead.
+
+Two things the guard deliberately does not hide:
+
+- **`OPTIONS` is answered for any `Host`.** The CORS layer short-circuits every
+  `OPTIONS` request before the Host guard, and the response carries the route's
+  `Allow` header (`GET,HEAD,POST` on `/graphql` with GraphiQL on, `GET,HEAD`
+  with it off or on `/health`). A rebinding page can read that much — "a
+  gl-node is here, GraphiQL on or off" — and nothing else: no data, no
+  mutation, no version.
+- **Loopback names are interchangeable in `Origin`.** Same-origin is judged as
+  "the `Origin` host is an allowed host and its port equals the request's", so
+  a page at `http://localhost:4000` is accepted by a request sent to
+  `127.0.0.1:4000`, and vice versa. That matters only if a *different* service
+  on another loopback address shares the node's port; CORS preflight still
+  blocks cross-origin JSON `POST`s.
 
 **`trustedProxies`.** Behind a TLS terminator every request arrives from the
 same socket address, so without this list the whole internet shares a single
@@ -521,6 +547,14 @@ node, the proxy has already accepted the connection and is holding it. Treat
 these values as the floor under a misconfigured or bypassed proxy, not as the
 deployment's limits.
 
+**GraphiQL's assets come from a CDN.** With `graphiql: true` the page at
+`GET /graphql` loads GraphiQL **4.1.2** (an exact version, not the floating
+`4`) and React 18 development builds from `unpkg.com`, without subresource
+integrity — the async-graphql page builder offers no way to add it. The tab is
+a same-origin session on the node, so whoever controls those CDN responses
+controls what it sends. That is why GraphiQL is off by default and refused on
+any non-loopback bind; leave it off unless you are exploring a local node.
+
 ### API keys
 
 `auth.apiKey` is the only credential in front of the writable GraphQL
@@ -549,7 +583,10 @@ which is the better place for it: the config file tends to be committed, baked
 into an image, or mounted read-only, and a secret in any of those is a secret
 that leaks. When both are set, **the environment wins** and the node logs a
 warning naming the winner — so rotate by changing the environment variable and
-restarting. (Do not rely on the file value being the one in use.) On Unix, a
+restarting. (Do not rely on the file value being the one in use.) Setting
+`GL_NODE_API_KEY` does **not** turn authentication on: with `auth.enabled:
+false` the key is ignored, and the node logs a warning at boot saying so
+(without printing the key). On Unix, a
 config file that carries a non-empty `apiKey` and is readable by group or other
 also draws a warning at boot; `chmod 600` it, or move the key to the
 environment.
@@ -573,60 +610,76 @@ so check that your peers can actually connect before relying on it.
 
 ### Mesh identity (`p2p.meshId`)
 
+> **On an existing mesh: set `p2p.meshId` to your current `swarmTopic`
+> verbatim — any other value invalidates every signature already in the mesh.**
+> Copy it byte for byte, on every node. A signing node with `meshId` unset logs
+> a boot warning that says exactly this, and `meshId` becomes **required** in a
+> later release.
+
 The swarm topic is a *reachability* string: anyone holding it
 plus one member EndpointId can join the gossip overlay. Using it as the
 signature domain too meant two meshes that happened to pick the same custom
 topic accepted each other's signed directives. Setting `meshId` separates the
-two — a random UUID (`uuidgen`) is the recommendation, though any identifier of
-ASCII letters, digits and `- _ . : /` up to 128 bytes is accepted.
+two; any identifier of ASCII letters, digits and `- _ . : /` up to 128 bytes is
+accepted.
 
 Because leaving `meshId` unset is the default and the topic then *is* the
 domain, **`swarmTopic` is held to exactly the same form rules** — non-empty, no
 leading or trailing whitespace, ASCII letters, digits and `- _ . : /`, at most
 128 bytes — and a value that breaks them is refused at boot rather than
-trimmed. A topic differing by one space between two nodes is not a cosmetic
-difference: it is a different gossip overlay *and* a different signature
-domain, and it would otherwise surface much later as `InvalidSignature`.
+trimmed. The refusal names the field, the value's length and the byte offset of
+the stray whitespace, never the value itself (it is the join credential). A
+topic differing by one space between two nodes is not a cosmetic difference: it
+is a different gossip overlay *and* a different signature domain, and it would
+otherwise surface much later as `InvalidSignature`.
 
 Leaving it unset keeps the pre-existing behaviour exactly: the domain is
-`swarmTopic`. That matters on an existing deployment, because a signature is
-checked by reconstructing the signed message with the verifier's own domain —
-so **changing the resolved domain invalidates every signature already persisted
-and every signature peers hold**.
+`swarmTopic`. A signature is checked by reconstructing the signed message with
+the verifier's own domain, so **changing the resolved domain invalidates every
+signature already persisted and every signature peers hold** — which is why the
+only safe `meshId` for an existing mesh is the string it already signs with.
 
-On a **new** mesh, set `meshId` on every node before the first directive is
-written and there is nothing else to think about.
+**New mesh.** Generate a random UUID (`uuidgen`) and a unique `swarmTopic`, set
+both on every node before the first directive is written, and there is nothing
+else to think about.
 
-**Rolling one out on an existing mesh** is a coordinated, all-at-once change,
-because the fallback rule means an existing mesh keeps verifying under
-`swarmTopic` until you deliberately migrate it:
+**Existing mesh — the recommended step.** Set `meshId` to the current
+`swarmTopic`, byte for byte, on each node. The resolved domain does not change,
+so no signature is invalidated and no maintenance window is needed: nodes can
+be switched one at a time. What it buys is that the two are now separate
+settings — from then on you can rotate `swarmTopic` (the join credential)
+without touching the signature domain. The shipped
+`deploy/gl-node.docker.json` does exactly this (`"meshId":
+"openledger/docker-dev"`, its own topic).
 
-1. **Decide you want it.** An existing mesh is not broken by leaving `meshId`
-   unset — it keeps using `swarmTopic` as its domain, exactly as it always has.
-   Migrate only if you need identity separated from reachability (for example,
-   two meshes that share a topic string, or a topic you intend to rotate).
-2. **Generate one value** (`uuidgen`) and use that same string on every node.
-   It is compared byte for byte, so leading or trailing whitespace is refused
-   at boot rather than silently trimmed — a value that differs by one character
-   between two nodes is a mesh-wide verification failure that presents as "the
-   other node's key is wrong".
-3. **Take a maintenance window and switch every node together.** During the
+**Existing mesh — moving to a *different* domain** (for example, two meshes
+that share a topic string and must stop accepting each other's directives) is
+a coordinated, all-at-once change, and every directive signed before it stops
+verifying. Do it only if you need it:
+
+1. **Pick one new value** and use that same string on every node. It is
+   compared byte for byte, so leading or trailing whitespace is refused at boot
+   rather than silently trimmed — a value that differs by one character between
+   two nodes is a mesh-wide verification failure that presents as "the other
+   node's key is wrong".
+2. **Take a maintenance window and switch every node together.** During the
    window the mesh is partitioned by domain: a node on the new `meshId` cannot
    verify anything signed by a node still on the old domain, and vice versa.
    Anti-entropy will keep retrying, so a short split heals once every node is
    over, but a node left behind stays permanently unable to accept its peers'
    directives.
-4. **Expect already-persisted signatures not to re-verify.** Directives written
+3. **Expect already-persisted signatures not to re-verify.** Directives written
    before the switch were signed under the old domain. They stay in the ledger
    and their content ids are unchanged — the content hash does not include the
    signature envelope — but a signature check against the new domain will not
    pass for them. Verify the mesh has converged *before* the switch, so nothing
    is still in flight that needs its signature checked afterwards.
-5. **Confirm the boot log.** Each node logs the domain's `source`
-   (`p2p.meshId` or `p2p.swarmTopic (meshId unset)`) with its length and a
-   four-character prefix — never the value itself, because on the fallback path
-   the domain *is* the gossip join credential. All nodes must report
-   `source="p2p.meshId"` and the same length and prefix.
+
+**Confirm the boot log** either way. Each node logs the domain's `source`
+(`p2p.meshId` or `p2p.swarmTopic (meshId unset)`) with its length and a
+four-character prefix — never the value itself, because on the fallback path
+the domain *is* the gossip join credential. All nodes must report
+`source="p2p.meshId"` and the same length and prefix.
 
 Rolling back is the same procedure in reverse, with the same window.
 
@@ -736,6 +789,36 @@ same trust boundary:
 - Removing or renaming the `.bean` under a running node does not lose anything:
   the next write recreates it from memory with every directive in it, and a
   failed write never installs an emptier ledger over the one in memory.
+
+### The commit journal (`<ledgerPath>.journal`)
+
+Between full rewrites the node appends each write to a sidecar,
+`<ledgerPath>.journal`, and folds it back into the `.bean` at startup, at
+shutdown and on the next full rewrite. You normally never see it; these are the
+cases where you might:
+
+- **It must be the node's own file.** The journal, the `.lock` and the key file
+  must be regular files (not a FIFO, directory or symlink), owned by the uid the
+  node runs as, with a single hard link; the lock and key must be `0600`, and a
+  journal writable by group or other is refused (one merely readable by others
+  loads with a warning and is compacted away). A FIFO, directory or dangling
+  symlink at the `.bean` or the journal refuses boot.
+- **A `.bean` missing beside a journal refuses boot** rather than starting an
+  empty ledger with the journal's writes on top.
+- **A torn final record** — a crash mid-append — is dropped with a warning, and
+  the journal is kept as `<ledgerPath>.journal.torn-<unix-seconds>` instead of
+  being deleted. No boot reads it; inspect it, then remove it.
+- **Damage anywhere else refuses boot**, naming the byte offset. It cannot be a
+  crash, so the node will not guess which records to keep.
+- **The per-record checksum is unkeyed.** It catches bit rot and accidents, not
+  tampering: anyone who can write the journal can rewrite a record and its
+  checksum together. The ownership and mode rules above are what protect it.
+- **"Error but durable."** If a full rewrite installs the new `.bean` and then
+  cannot delete the old journal (a sticky directory, a journal owned by someone
+  else, an immutable attribute), the write is **reported as failed but is on
+  disk**, and the node's reload shows it. Before retrying a failed mutation,
+  look for it (`journal`, or `transaction(txid:)` if you have the id) — a blind
+  retry can book it twice.
 
 ---
 

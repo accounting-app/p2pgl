@@ -26,6 +26,7 @@
         "gossipIntervalMilliseconds": 1000,
         "antiEntropyIntervalMilliseconds": 5000,
         "swarmTopic": "openledger/docker-dev",
+        "meshId": "openledger/docker-dev",
         "relayMode": "disabled"
     }
 }
