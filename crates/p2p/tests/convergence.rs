@@ -347,6 +347,9 @@ struct Replica {
     permanent: BTreeMap<String, String>,
     /// The last retryable refusal per id — diagnostics for the divergence report.
     retryable: BTreeMap<String, String>,
+    /// A1 (0924): a replica "stopped" by [`Replica::stop`] leaves its `.bean`
+    /// on disk for a later boot (the README's stop → edit → start).
+    keep_files: bool,
 }
 
 impl Replica {
@@ -374,6 +377,7 @@ impl Replica {
             orphans: OrphanBuffer::new(),
             permanent: BTreeMap::new(),
             retryable: BTreeMap::new(),
+            keep_files: false,
         }
     }
 
@@ -640,6 +644,9 @@ impl Replica {
 
 impl Drop for Replica {
     fn drop(&mut self) {
+        if self.keep_files {
+            return;
+        }
         let _ = std::fs::remove_file(self.svc.journal_path());
         let _ = std::fs::remove_file(&self.path);
     }
@@ -1800,4 +1807,873 @@ fn t76_cap_sized_amounts_and_mixed_scale_dust_converge_to_equal_exact_balances()
             "case T76 / {order:?}: the trial balance says so too"
         );
     }
+}
+
+// ═══ A1 (0924 re-audit of T72): rules on content, not on the replica ════════
+//
+// The cases below probe the T72 mechanisms as a *mesh* property: parent choice
+// under a multi-author flood with local authoring everywhere, its determinism
+// across replicas, the trusted-bootstrap join through `gl-node`'s real boot
+// order with the H-20 verifier installed, a fresh join under the orphan-buffer
+// caps, a pre-T75 over-cap record in one replica's file, and the H-19
+// clock-versus-history warning on an honest mesh with repeated fresh joins.
+
+use ledger::service::{clock_is_far_above_history, DirectiveVerifier};
+use p2p::anti_entropy::compute_want_by_membership;
+use p2p::orphan_buffer::MAX_ORPHANS_PER_PEER;
+use p2p::protocol::MAX_SUPPLY_ENTRIES;
+
+/// A real Ed25519 key signing for `mesh_id` (see [`key`], which signs for
+/// [`MESH_ID`]).
+fn key_for_mesh(seed: u8, mesh_id: &str) -> Arc<PeerKeySignatureProvider> {
+    let mut bytes = [0u8; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let i = u8::try_from(index).expect("32 < 256");
+        *byte = seed.wrapping_mul(31).wrapping_add(i).wrapping_mul(7) ^ 0x5C;
+    }
+    Arc::new(PeerKeySignatureProvider::from_bytes(
+        &bytes,
+        mesh_id.to_owned(),
+    ))
+}
+
+/// The verifier `gl-node`'s `main.rs` installs (H-20 / T73):
+/// `security::signing::verify_signature` over the wire's `SignableMessage`
+/// and the node's mesh id — the same check `verify_remote_signature` applies
+/// to a peer's directive.
+fn verifier(mesh_id: &str) -> DirectiveVerifier {
+    let mesh_id = mesh_id.to_owned();
+    Arc::new(
+        move |content_id: &str,
+              is_transaction: bool,
+              parents: &str,
+              lamport: &str,
+              author: &str,
+              signature: &str| {
+            security::signing::verify_signature(
+                &SignableMessage {
+                    content_id,
+                    is_transaction,
+                    parents,
+                    lamport,
+                },
+                signature,
+                author,
+                &mesh_id,
+            )
+            .is_ok()
+        },
+    )
+}
+
+/// What `gl-node`'s boot sequence reported (`main.rs`: H-13 finalisation and
+/// the H-20 pass).
+#[derive(Debug)]
+struct GlNodeBoot {
+    finalized: usize,
+    quarantined_by_signature: usize,
+}
+
+fn author_of(directive: &Directive) -> Option<String> {
+    let metadata = match directive {
+        Directive::Transaction(txn) => &txn.metadata,
+        Directive::Open(open) => &open.metadata,
+        _ => return None,
+    };
+    metadata.get("openledger-author").cloned()
+}
+
+impl Replica {
+    /// Boot exactly as `gl-node` does (`main.rs`, T73 order): `boot` under the
+    /// `"local"` placeholder → `set_author_id` (the P2P identity) →
+    /// `set_signer` → `set_verifier` → `finalize_operator_input` →
+    /// `verify_own_history` → the startup compaction. `mesh_id` is what the
+    /// key signs for and what the verifier checks against.
+    fn boot_like_gl_node(
+        name: &str,
+        key: Arc<PeerKeySignatureProvider>,
+        path: PathBuf,
+        mesh_id: &str,
+    ) -> (Self, GlNodeBoot) {
+        let mut svc = LedgerService::boot(path.clone(), "local".to_owned())
+            .unwrap_or_else(|error| panic!("{name}: boot: {error}"));
+        svc.set_author_id(key.public_key_hex());
+        svc.set_signer(signer(&key));
+        svc.set_verifier(verifier(mesh_id));
+        let finalized = if svc.unsigned_operator_input_count() > 0 {
+            svc.finalize_operator_input()
+        } else {
+            0
+        };
+        let quarantined_by_signature = svc.verify_own_history();
+        svc.compact()
+            .unwrap_or_else(|error| panic!("{name}: startup compaction: {error}"));
+        let replica = Replica {
+            name: name.to_owned(),
+            key,
+            path,
+            svc,
+            orphans: OrphanBuffer::new(),
+            permanent: BTreeMap::new(),
+            retryable: BTreeMap::new(),
+            keep_files: false,
+        };
+        (
+            replica,
+            GlNodeBoot {
+                finalized,
+                quarantined_by_signature,
+            },
+        )
+    }
+
+    /// Stop this replica cleanly (compact, so the `.bean` is canonical and
+    /// the journal is gone) and hand back the file for an edit and a re-boot.
+    fn stop(mut self) -> PathBuf {
+        self.svc.compact().expect("compaction at shutdown");
+        self.keep_files = true;
+        self.path.clone()
+    }
+
+    /// The `openledger-parents` a transaction this replica holds names.
+    fn parents_of(&self, id: &str) -> Vec<String> {
+        let Some(Directive::Transaction(txn)) = self.svc.get_directive(id) else {
+            panic!(
+                "{}: {id} is not a transaction this replica holds",
+                self.name
+            );
+        };
+        txn.metadata
+            .get("openledger-parents")
+            .map(|parents| {
+                parents
+                    .split(',')
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Current heads with their authors.
+    fn heads_with_authors(&self) -> Vec<(String, Option<String>)> {
+        let mut heads: Vec<(String, Option<String>)> = self
+            .svc
+            .head_txids()
+            .into_iter()
+            .map(|head| {
+                let author = self.svc.get_directive(&head).and_then(author_of);
+                (head, author)
+            })
+            .collect();
+        heads.sort();
+        heads
+    }
+}
+
+impl Mesh {
+    /// Boot a replica on `path` through the `gl-node` order and allowlist it.
+    fn add_like_gl_node(
+        &mut self,
+        name: &str,
+        key: Arc<PeerKeySignatureProvider>,
+        path: PathBuf,
+        mesh_id: &str,
+    ) -> (usize, GlNodeBoot) {
+        let (replica, report) = Replica::boot_like_gl_node(name, key, path, mesh_id);
+        (self.push(replica), report)
+    }
+
+    /// Stop replica `index` (its slot keeps a placeholder so indices stay
+    /// stable) and return its canonical `.bean`.
+    fn stop(&mut self, index: usize) -> PathBuf {
+        let name = self.replicas[index].name.clone();
+        let key = Arc::clone(&self.replicas[index].key);
+        let placeholder = Replica::boot(&name, key);
+        let replica = std::mem::replace(&mut self.replicas[index], placeholder);
+        replica.stop()
+    }
+
+    /// Re-boot slot `index` on `path` through the `gl-node` order.
+    fn restart_like_gl_node(&mut self, index: usize, path: PathBuf, mesh_id: &str) -> GlNodeBoot {
+        let name = self.replicas[index].name.clone();
+        let key = Arc::clone(&self.replicas[index].key);
+        let (replica, report) = Replica::boot_like_gl_node(&name, key, path, mesh_id);
+        self.replicas[index] = replica;
+        report
+    }
+
+    /// Anti-entropy from `from` to `to` exactly as `gl-node` runs one Want
+    /// session: the Want is `compute_want_by_membership` over the holder's
+    /// advert (heads first, then every id in hex order), fetched in chunks of
+    /// `MAX_SUPPLY_ENTRIES`, each chunk staged, drained and committed before
+    /// the next (`fetch_want_chunk` → `apply_supply_entries_from`). `order`
+    /// `None` is the advert order; `Some` re-sorts the Want (an adversarial
+    /// server that ignores the Want's order).
+    fn serve_like_gl_node(&mut self, from: usize, to: usize, order: Option<Order>) -> usize {
+        let wanted: Vec<String> = {
+            let holder = &self.replicas[from];
+            let receiver = &self.replicas[to];
+            let mut heads: Vec<String> = holder.svc.head_txids().into_iter().collect();
+            heads.sort();
+            let mut ids: Vec<String> = holder.svc.all_directive_ids().into_iter().collect();
+            ids.sort();
+            compute_want_by_membership(
+                |id| receiver.svc.contains_directive(id) || receiver.permanent.contains_key(id),
+                &heads,
+                &ids,
+            )
+        };
+        let wanted = match order {
+            Some(order) => self.order_ids(wanted, order),
+            None => wanted,
+        };
+        let mut staged = 0;
+        for chunk in wanted.chunks(MAX_SUPPLY_ENTRIES) {
+            let holder = &self.replicas[from].svc;
+            let entries =
+                match build_supply(chunk, |id| holder.get_directive(id).map(make_supply_entry)) {
+                    WireMessage::Supply { entries, .. } => entries,
+                    other => panic!("build_supply returned {other:?}"),
+                };
+            let allowlist = &self.allowlist;
+            staged += self.replicas[to].intake(entries, allowlist);
+        }
+        staged
+    }
+
+    /// Ticks of `serve_like_gl_node` from `from` to `to` until one changes
+    /// nothing, bounded by `max_ticks`. Returns the ticks taken (the last one
+    /// is the quiet one) or `None` if the bound was hit first.
+    fn join_like_gl_node(
+        &mut self,
+        from: usize,
+        to: usize,
+        order: Option<Order>,
+        max_ticks: usize,
+    ) -> Option<usize> {
+        for tick in 1..=max_ticks {
+            let before = self.replicas[to].svc.directive_count();
+            self.serve_like_gl_node(from, to, order);
+            if self.replicas[to].svc.directive_count() == before {
+                return Some(tick);
+            }
+        }
+        None
+    }
+}
+
+/// `count` parentless transactions signed by `attacker` whose content ids
+/// all start with `prefix` — the L-68 id-grinder: a narration is free text,
+/// so the attacker tries bodies until the SHA-256 lands where it wants (here
+/// below every honest id). Only the winners are signed. Returns the ids.
+fn ground_parentless_flood(
+    mesh: &mut Mesh,
+    attacker: &PeerKeySignatureProvider,
+    count: usize,
+    tag: &str,
+    prefix: &str,
+) -> Vec<String> {
+    let mut ids = Vec::with_capacity(count);
+    let mut attempt = 0u64;
+    while ids.len() < count {
+        let narration = format!("{tag}-ground{attempt}");
+        attempt += 1;
+        let body = Directive::Transaction(transaction_body(&narration, 1, "Assets:Cash"));
+        if !compute_content_id(&body).starts_with(prefix) {
+            continue;
+        }
+        let lamport = 100 + u64::try_from(ids.len()).expect("small");
+        let directive = hand_transaction(attacker, &narration, 1, &[], lamport);
+        ids.push(mesh.record(&directive));
+    }
+    ids
+}
+
+/// An `open` with `currencies`, stamped and signed by hand with `key`.
+fn hand_open_with_currencies(
+    key: &PeerKeySignatureProvider,
+    account: &str,
+    currencies: Vec<String>,
+    lamport: u64,
+) -> Directive {
+    let mut open = Open {
+        date: day(1),
+        account: account.to_owned(),
+        currencies,
+        metadata: BTreeMap::new(),
+    };
+    let content_id = compute_content_id(&Directive::Open(open.clone()));
+    let lamport = lamport.to_string();
+    let signature = sign(
+        key,
+        &SignableMessage {
+            content_id: &content_id,
+            is_transaction: false,
+            parents: "",
+            lamport: &lamport,
+        },
+    );
+    open.metadata
+        .insert("openledger-author".to_owned(), key.public_key_hex());
+    open.metadata
+        .insert("openledger-lamport".to_owned(), lamport);
+    open.metadata
+        .insert("openledger-signature".to_owned(), signature);
+    Directive::Open(open)
+}
+
+// ─── A1 / L-68: multi-author flood, local authoring on every replica ────────
+
+/// Two allowlisted flooders serve 400 parentless transactions each, ids
+/// ground to start with `00` so every flooded head sorts below every honest
+/// one (the L-68 attack); every replica is served a random subset (≈ 400
+/// heads), then authors twice under `select_parents`. Pins (T72 / L-68) that
+/// every honest author's head is named by every local append while the flood
+/// is over `MAX_PARENTS` (author diversity: `max(1, 256 / A)` per author, so
+/// no flooder's share can crowd an honest head out), that no append names
+/// more than `MAX_PARENTS`, and that the mesh — the flooders still serving —
+/// converges to the oracle. Smallest-id-only choice (T64) fails this.
+#[test]
+fn l68_multi_author_flood_with_local_authoring_on_every_replica_converges() {
+    let mut mesh = seeded_mesh(9241, 3);
+    let flooders = [key(210), key(211)];
+    let flooder_ids: BTreeSet<String> = flooders.iter().map(|k| k.public_key_hex()).collect();
+    for flooder in &flooders {
+        mesh.allow_also(&flooder.public_key_hex());
+    }
+    let mut flood: Vec<String> = Vec::new();
+    for (i, flooder) in flooders.iter().enumerate() {
+        flood.extend(ground_parentless_flood(
+            &mut mesh,
+            flooder,
+            400,
+            &format!("x{i}"),
+            "00",
+        ));
+    }
+    // One honest head per replica before the flood, concurrent, then synced.
+    for replica in 0..3 {
+        mesh.append(replica, &format!("pre-{replica}"), 2, "Assets:Cash");
+    }
+    mesh.run_to_fixed_point(Order::Ascending);
+    for replica in 0..3 {
+        let subset = mesh.rng.subset(&flood);
+        mesh.deliver(replica, subset, Order::Random);
+    }
+    let mut appends = 0usize;
+    for round in 0..2 {
+        for replica in 0..3 {
+            let heads = mesh.replicas[replica].heads_with_authors();
+            if round == 0 {
+                assert!(
+                    heads.len() > MAX_PARENTS,
+                    "R{replica}: the flood must be over the cap ({} heads)",
+                    heads.len()
+                );
+            }
+            let id = mesh.append(
+                replica,
+                &format!("local-{replica}-{round}"),
+                3,
+                "Expenses:Food",
+            );
+            let parents = mesh.replicas[replica].parents_of(&id);
+            let after = mesh.replicas[replica].svc.head_count();
+            // The cost of one honest append under a flood: it merges
+            // `MAX_PARENTS − honest heads` flooded heads, so the frontier
+            // shrinks by ~255 per honest append and grows only as fast as the
+            // flooders author (the T72 residual: bounded by the file cap).
+            eprintln!(
+                "A1 / L-68 flood: R{replica} round {round}: heads {} → {after}, named {}",
+                heads.len(),
+                parents.len()
+            );
+            assert_eq!(
+                parents.len(),
+                heads.len().min(MAX_PARENTS),
+                "R{replica} round {round}: names every head up to the cap"
+            );
+            for (head, author) in &heads {
+                let honest = author
+                    .as_ref()
+                    .is_some_and(|author| !flooder_ids.contains(author));
+                if honest {
+                    assert!(
+                        parents.contains(head),
+                        "R{replica} round {round}: honest head {head} (author {author:?}) \
+                         was not named — L-68 diversity broken"
+                    );
+                }
+            }
+            appends += 1;
+        }
+    }
+    assert_eq!(appends, 6);
+    let pool_rounds = mesh.deliver_pool_to_fixed_point(Order::Random);
+    let gossip_rounds = mesh.run_to_fixed_point(Order::Random);
+    eprintln!("A1 / L-68 flood: pool rounds {pool_rounds}, anti-entropy rounds {gossip_rounds}");
+    mesh.assert_converged("A1 / L-68 multi-author flood");
+}
+
+/// Two replicas holding the same head set — 300 flooded heads ground below
+/// every honest id, plus one honest head from each replica — name
+/// byte-identical parents when each authors (T72 / L-68: `select_parents` is
+/// a pure function of the head set; nothing replica-local, no `HashMap`
+/// order, no own-author preference — "own heads first, then smallest" would
+/// name `pre-a` on one replica and `pre-b` on the other). The mesh then
+/// converges with the flooder still serving.
+#[test]
+fn l68_replicas_holding_identical_heads_name_identical_parents() {
+    let mut mesh = seeded_mesh(9242, 2);
+    let attacker = key(200);
+    mesh.allow_also(&attacker.public_key_hex());
+    let pre_a = mesh.append(0, "pre-a", 2, "Assets:Cash");
+    let pre_b = mesh.append(1, "pre-b", 4, "Assets:Cash");
+    mesh.run_to_fixed_point(Order::Ascending);
+    let flood = ground_parentless_flood(&mut mesh, &attacker, 300, "g", "00");
+    assert!(
+        flood.iter().all(|id| id < &pre_a && id < &pre_b),
+        "every ground id sorts below both honest heads"
+    );
+    for replica in [0, 1] {
+        mesh.deliver(replica, flood.clone(), Order::Random);
+    }
+    let heads_a = mesh.replicas[0].heads_with_authors();
+    let heads_b = mesh.replicas[1].heads_with_authors();
+    assert_eq!(heads_a, heads_b, "both replicas hold the same heads");
+    assert_eq!(heads_a.len(), 302);
+    let a_id = mesh.append(0, "a-local", 5, "Expenses:Food");
+    let b_id = mesh.append(1, "b-local", 6, "Expenses:Food");
+    let parents_a = mesh.replicas[0].parents_of(&a_id);
+    let parents_b = mesh.replicas[1].parents_of(&b_id);
+    assert_eq!(parents_a.len(), MAX_PARENTS);
+    assert_eq!(
+        parents_a, parents_b,
+        "the same head set must name the same parents on every replica"
+    );
+    assert!(parents_a.contains(&pre_a) && parents_a.contains(&pre_b));
+    assert!(parents_a.windows(2).all(|w| w[0] < w[1]), "ascending");
+    mesh.deliver_pool_to_fixed_point(Order::Random);
+    mesh.run_to_fixed_point(Order::Random);
+    mesh.assert_converged("A1 / L-68 determinism");
+}
+
+// ─── A1 / H-19 + H-20: the bootstrap join through gl-node's real boot order ─
+
+/// The README's join, run through `gl-node`'s actual sequence (`boot("local")`
+/// → `set_author_id` → `set_signer` → `set_verifier` → `finalize_operator_input`
+/// → `verify_own_history` → compaction) on a copy of A's `.bean`, after A
+/// itself was stopped, its file edited as `edit` says, and restarted the same
+/// way (the README's stop → edit → start); B never stops. `hand_line` appends
+/// one transaction with no envelope (operator input, H-13); `edit_record`
+/// changes the narration of a record A signed (H-20). Everyone then authors
+/// and anti-entropy runs in the real advert order. Returns the harness's
+/// divergence report at the fixed point, or `None` when converged, plus the
+/// ids of what B is still waiting on.
+fn bootstrap_join_scenario(
+    seed: u64,
+    hand_line: bool,
+    edit_record: bool,
+) -> (Option<String>, Vec<String>) {
+    let (mut mesh, jump_id, _after, _open) = h19_mesh(seed, Jump::Transaction);
+    let (a, b) = (0, 1);
+    let signed = mesh.append(a, "to-be-edited", 11, "Assets:Cash");
+    mesh.run_to_fixed_point(Order::Ascending);
+    assert!(mesh.replicas[b].svc.contains_directive(&signed));
+
+    let path = mesh.stop(a);
+    let mut text = std::fs::read_to_string(&path).expect("read A's .bean");
+    assert!(text.contains("\"to-be-edited\""));
+    if edit_record {
+        text = text.replace("\"to-be-edited\"", "\"to-be-edited (typo fixed)\"");
+    }
+    if hand_line {
+        text.push_str(
+            "\n2024-01-15 * \"hand-typed by the operator\"\n  Assets:Cash  9 USD\n  Equity:Opening  -9 USD\n",
+        );
+    }
+    std::fs::write(&path, &text).expect("write the edited .bean");
+
+    // A restarts on its file, gl-node order. The H-20 pass runs inside
+    // `set_signer` / `set_verifier`, so `verify_own_history` itself reports 0
+    // here (A1 report §4); the quarantine is observed via `quarantined_count`.
+    let a_report = mesh.restart_like_gl_node(a, path.clone(), MESH_ID);
+    let a_quarantined = mesh.replicas[a].svc.quarantined_count();
+    eprintln!("A1 / bootstrap: A restarted: {a_report:?}, quarantined {a_quarantined}");
+    // What `main.rs` logs its H-20 banner from: the LAST pass's count, which
+    // is 0 whenever the setters' passes already did the quarantining.
+    assert_eq!(a_report.quarantined_by_signature, 0);
+    assert_eq!(
+        a_report.finalized,
+        usize::from(hand_line),
+        "the hand line is operator input"
+    );
+    assert_eq!(
+        a_quarantined,
+        usize::from(edit_record),
+        "the edited record is quarantined (H-20)"
+    );
+    assert_eq!(
+        mesh.replicas[a].svc.contains_directive(&signed),
+        !edit_record
+    );
+
+    // F joins by bootstrap from A's file (post-restart compaction).
+    let copy = temp_bean("F-copy");
+    std::fs::copy(&path, &copy).expect("copy A's compacted .bean");
+    let (f, f_report) = mesh.add_like_gl_node("F", key(10), copy, MESH_ID);
+    eprintln!(
+        "A1 / bootstrap: F booted: {f_report:?}, holds {} quarantined {}",
+        mesh.replicas[f].svc.directive_count(),
+        mesh.replicas[f].svc.quarantined_count()
+    );
+    assert!(
+        mesh.replicas[f].svc.contains_directive(&jump_id),
+        "the removed author's transaction loads as history"
+    );
+    assert_eq!(
+        f_report.finalized, 0,
+        "A's compaction already finalised the hand line under A"
+    );
+    assert_eq!(
+        mesh.replicas[f].svc.quarantined_count(),
+        usize::from(edit_record)
+    );
+    assert_eq!(
+        mesh.replicas[f].svc.directive_count(),
+        mesh.replicas[a].svc.directive_count(),
+        "the copy boots with A's whole history"
+    );
+
+    mesh.append(a, "after-a", 3, "Assets:Cash");
+    mesh.append(b, "after-b", 4, "Assets:Bank");
+    let own = mesh.append(f, "after-f", 8, "Assets:Cash");
+    let mut ticks = 0;
+    loop {
+        ticks += 1;
+        let before = mesh.counts();
+        for to in 0..mesh.replicas.len() {
+            for from in 0..mesh.replicas.len() {
+                if from != to {
+                    mesh.serve_like_gl_node(from, to, None);
+                }
+            }
+        }
+        if mesh.counts() == before {
+            break;
+        }
+        assert!(ticks < MAX_ROUNDS);
+    }
+    eprintln!(
+        "A1 / bootstrap: anti-entropy ticks {ticks}, counts {:?}, F's own write on A {} on B {}",
+        mesh.counts(),
+        mesh.replicas[a].svc.contains_directive(&own),
+        mesh.replicas[b].svc.contains_directive(&own)
+    );
+    let report = mesh.divergence_among(&mesh.all(), &[]);
+    let mut waiting: Vec<String> = mesh.replicas[b]
+        .orphans
+        .wanted_parent_ids()
+        .into_iter()
+        .collect();
+    waiting.sort();
+    let _ = std::fs::remove_file(&path);
+    (report, waiting)
+}
+
+/// A hand-typed line only (no edit): the operator input is adopted under A's
+/// identity at A's restart, the copy carries it finalised, and the join
+/// converges with F's own write accepted everywhere. Passes at HEAD.
+#[test]
+fn h19_bootstrap_join_through_gl_node_order_with_operator_input_converges() {
+    let (report, _) = bootstrap_join_scenario(9243, true, false);
+    assert!(
+        report.is_none(),
+        "A1 / bootstrap (hand line): {}",
+        report.unwrap_or_default()
+    );
+}
+
+/// An edited signed record only (no hand line): A's restart and F's boot both
+/// quarantine it (H-20), B still serves the original and both re-adopt it,
+/// and the join converges. Passes at HEAD.
+#[test]
+fn h19_bootstrap_join_through_gl_node_order_with_a_quarantined_block_converges() {
+    let (report, _) = bootstrap_join_scenario(9248, false, true);
+    assert!(
+        report.is_none(),
+        "A1 / bootstrap (edit): {}",
+        report.unwrap_or_default()
+    );
+}
+
+/// Both at once — the README's stop → edit → start with a typo fixed in a
+/// signed record AND a line appended. Boot stamps the operator input's
+/// parents (`adopt_operator_input_at_boot` → `adopt_file_directive` →
+/// `choose_parents`) against the heads it holds at that moment, which
+/// include the edited record; the H-20 pass runs later, inside `set_signer`,
+/// and `quarantine_out_of_dag` rebuilds the survivors without re-parenting
+/// them. The hand line — now signed by A and served — names a parent that
+/// exists only in A's (and the copy's) quarantine, so B buffers it forever,
+/// and so every write A and F make afterwards, F's own included. Fails at
+/// HEAD: B ends three short, waiting on the quarantined id.
+#[test]
+#[ignore = "A1-3: operator input adopted at boot names a parent the H-20 pass then quarantines; the signed hand line and everything authored after it are orphaned on every peer"]
+fn h20_operator_input_stamped_at_boot_must_not_name_a_record_the_h20_pass_quarantines() {
+    let (report, waiting) = bootstrap_join_scenario(9249, true, true);
+    eprintln!("A1 / bootstrap (edit + hand line): B waits on {waiting:?}");
+    assert!(
+        report.is_none(),
+        "A1 / bootstrap (edit + hand line): {}",
+        report.unwrap_or_default()
+    );
+}
+
+/// A joiner whose key and verifier are for a different `meshId` boots on the
+/// copy: every signature in the file is over another mesh's domain, so the
+/// H-20 pass quarantines the ENTIRE history at boot. Pins that the
+/// misconfiguration is total and visible in the counts (nothing loads into
+/// the DAG, nothing half-joins). The harness's intake signs and verifies for
+/// [`MESH_ID`] on every replica, so the wire side of the mismatch is not
+/// modelled here; the boot side is what the bootstrap join adds.
+#[test]
+fn h19_bootstrap_join_with_the_wrong_mesh_id_quarantines_everything_at_boot() {
+    let (mut mesh, _jump_id, _after, _open) = h19_mesh(9244, Jump::Open);
+    let a = 0;
+    let held_by_a = mesh.replicas[a].svc.directive_count();
+    let path = mesh.stop(a);
+    let copy = temp_bean("F-wrong-mesh");
+    std::fs::copy(&path, &copy).expect("copy A's compacted .bean");
+    let (f, report) =
+        mesh.add_like_gl_node("F", key_for_mesh(10, "another-mesh"), copy, "another-mesh");
+    eprintln!(
+        "A1 / wrong meshId: {report:?}, A held {held_by_a}, F holds {} quarantined {}",
+        mesh.replicas[f].svc.directive_count(),
+        mesh.replicas[f].svc.quarantined_count()
+    );
+    assert_eq!(
+        mesh.replicas[f].svc.quarantined_count(),
+        held_by_a,
+        "every record is quarantined"
+    );
+    assert_eq!(mesh.replicas[f].svc.directive_count(), 0);
+    let _ = std::fs::remove_file(&path);
+}
+
+// ─── A1 / T75 residual: pre-cap history in one replica's file ───────────────
+
+/// A's file (pre-T75 history) holds an `open` with `MAX_CURRENCIES_PER_OPEN + 1`
+/// currencies; A boots on it (the file path applies no cardinality cap) and
+/// posts to that account. A fresh F joining by anti-entropy refuses the `open`
+/// at intake (`ResourceLimitExceeded`, cached for good) and buffers every
+/// transaction on that account awaiting it, forever. Same available set, two
+/// permanently different committed DAGs and balances — the M-50 shape restated
+/// for the T75 caps ("existing history over these caps still loads at boot
+/// and is served, but upgraded peers refuse it"). Fails at HEAD: F holds 2 of
+/// 4 with the posting orphaned on the account.
+#[test]
+#[ignore = "A1-2: a pre-T75 over-cap record loaded from the file is served but refused by every upgraded peer, so an anti-entropy join never converges on that account"]
+fn t75_over_cap_open_loaded_from_a_file_partitions_anti_entropy_joiners() {
+    let mut mesh = Mesh::new(9245);
+    let peer = key(1);
+    let mut currencies: Vec<String> = (0..ledger::limits::MAX_CURRENCIES_PER_OPEN)
+        .map(|i| format!("C{i:03}"))
+        .collect();
+    currencies.push("USD".to_owned());
+    let history = [
+        hand_open(&peer, "Assets:Cash", 1),
+        hand_open(&peer, "Equity:Opening", 2),
+        hand_open_with_currencies(&peer, "Assets:Multi", currencies, 3),
+    ];
+    let path = temp_bean("pre-t75");
+    std::fs::write(&path, ledger::serialize::full_file_serialize(&history, &[]))
+        .expect("write the history file");
+    let a = mesh.add_on_file("A", 1, path);
+    assert_eq!(
+        mesh.replicas[a].svc.directive_count(),
+        3,
+        "boot loads the over-cap open"
+    );
+    let posted = mesh.append(a, "into-multi", 5, "Assets:Multi");
+    let f = mesh.add("F", 10);
+    let rounds = mesh.run_to_fixed_point(Order::Ascending);
+    let fresh = &mesh.replicas[f];
+    eprintln!(
+        "A1 / T75: anti-entropy rounds {rounds}; F holds {} of {}, permanent {:?}, orphans {}",
+        fresh.svc.directive_count(),
+        mesh.replicas[a].svc.directive_count(),
+        fresh.permanent,
+        fresh.orphans.len()
+    );
+    assert!(
+        fresh.svc.contains_directive(&posted),
+        "F must hold the posting on Assets:Multi"
+    );
+    let among = mesh.all();
+    mesh.assert_converged_among("A1 / T75 over-cap open", &among, &[]);
+}
+
+// ─── A1 / H-19: the clock-versus-history warning on an honest mesh ──────────
+
+/// No jump anywhere: a two-replica mesh with `opens` accounts (parentless, so
+/// a joiner adopts them in advert order, i.e. hex order) and two
+/// transactions; then `joiners` fresh nodes join by anti-entropy, each
+/// authoring one directive — an `open` when `joiner_opens`, else a
+/// transaction. Every adoption of a value below the clock still adds one
+/// (`max(local, remote) + 1`), so a join inflates the joiner's clock by its
+/// inversions, its own directive stamps that clock into the history, and the
+/// next joiner starts from there: clocks compound across joins whenever the
+/// highest-lamport directive is parentless (a transaction at the tip is
+/// drained last, after its parents, so it does not compound). Returns R0's
+/// clock and count and whether `clock_is_far_above_history` — the exact
+/// predicate behind the boot and adoption WARN — fired on any node.
+fn honest_mesh_clock_after_fresh_joins(
+    opens: usize,
+    joiners: usize,
+    order: Option<Order>,
+    joiner_opens: bool,
+) -> (u64, usize, bool) {
+    let mut mesh = seeded_mesh(9246, 2);
+    for i in 0..opens {
+        mesh.open(0, &format!("Assets:Acct{i:04}"));
+    }
+    mesh.append(0, "t-0", 1, "Assets:Cash");
+    mesh.append(1, "t-1", 2, "Assets:Cash");
+    mesh.run_to_fixed_point(Order::Ascending);
+    let mut fired = false;
+    for j in 0..joiners {
+        let f = mesh.add(&format!("J{j}"), u8::try_from(20 + j).expect("small"));
+        let ticks = mesh
+            .join_like_gl_node(0, f, order, MAX_ROUNDS)
+            .expect("joins");
+        if joiner_opens {
+            mesh.open(f, &format!("Assets:Joiner{j}"));
+        } else {
+            mesh.append(f, &format!("j{j}"), 3, "Assets:Cash");
+        }
+        mesh.run_to_fixed_point(Order::Ascending);
+        let clock = mesh.replicas[f].svc.lamport_clock();
+        let count = mesh.replicas[f].svc.directive_count();
+        let far = clock_is_far_above_history(clock, count);
+        eprintln!(
+            "A1 / H-19 warn: joiner {j}: ticks {ticks}, clock {clock}, count {count}, \
+             threshold {}, fires {far}",
+            4 * count + 1024
+        );
+        fired |= far;
+    }
+    let clock = mesh.replicas[0].svc.lamport_clock();
+    let count = mesh.replicas[0].svc.directive_count();
+    (
+        clock,
+        count,
+        fired || clock_is_far_above_history(clock, count),
+    )
+}
+
+/// `CLOCK_HISTORY_WARN_FACTOR`'s doc derives "a clock is at most twice the
+/// directive count … four times the count, plus 1024, therefore never fires
+/// on an honest node". The bound holds for one join and compounds across
+/// joins: a 300-account ledger, twelve fresh nodes joining by anti-entropy
+/// in the real advert order and each opening an account, ends with R0's clock
+/// above `4 × count + 1024` with no jump in the history, and the boot /
+/// adoption WARN prescribes the bootstrap join. Fails at HEAD (clock 2,314
+/// over 317 directives, threshold 2,292; 4,042 when served newest-first).
+#[test]
+#[ignore = "A1-1: the clock-versus-history WARN fires on an honest mesh after repeated fresh joins — clocks compound across joins, so the 4 × count + 1024 bound is not a bound on honest clocks"]
+fn h19_clock_warning_is_silent_on_an_honest_mesh_with_repeated_fresh_joins() {
+    let (clock, count, fired) = honest_mesh_clock_after_fresh_joins(300, 12, None, true);
+    eprintln!(
+        "A1 / H-19 warn: R0 clock {clock}, count {count}, threshold {}, fires {fired}",
+        4 * count + 1024
+    );
+    assert!(
+        !fired,
+        "the H-19 warning fired on an honest mesh: clock {clock} over {count} directives"
+    );
+}
+
+/// The one-join case the doc's derivation does cover: a single fresh join of
+/// the same ledger, in advert order and newest-first, stays under the bound,
+/// and so do eight joins that each author a transaction (the tip is drained
+/// last, so nothing compounds). Passes at HEAD.
+#[test]
+fn h19_clock_warning_is_silent_after_one_fresh_join_or_transaction_authoring_joins() {
+    for (joiners, order, joiner_opens) in [
+        (1usize, None, true),
+        (1, Some(Order::AntiCausal), true),
+        (8, None, false),
+    ] {
+        let (clock, count, fired) =
+            honest_mesh_clock_after_fresh_joins(300, joiners, order, joiner_opens);
+        eprintln!(
+            "A1 / H-19 warn: joiners {joiners}, order {order:?}, joiner opens {joiner_opens}: \
+             R0 clock {clock}, count {count}, threshold {}, fires {fired}",
+            4 * count + 1024
+        );
+        assert!(
+            !fired,
+            "joiners {joiners} order {order:?} opens {joiner_opens}"
+        );
+    }
+}
+
+// ─── A1: a long chain under the orphan-buffer caps ──────────────────────────
+
+/// One author's chain of `n` transactions (every append names the previous
+/// head — the ordinary honest shape), held by A; a fresh F joins from A alone
+/// through the real Want session (advert order — heads first, then every id
+/// in hex order — 256-entry chunks, drain per chunk) or from a server that
+/// ignores the Want's order and serves newest-first. Returns the ticks to
+/// the fixed point within `max_ticks`, or `None`, and asserts convergence
+/// when it was reached.
+fn chain_join_ticks(n: usize, order: Option<Order>, max_ticks: usize) -> Option<usize> {
+    let mut mesh = seeded_mesh(9247, 1);
+    for k in 0..n {
+        mesh.append(0, &format!("c{k}"), amount_for(k), account_for(k));
+    }
+    let f = mesh.add("F", 10);
+    let ticks = mesh.join_like_gl_node(0, f, order, max_ticks);
+    eprintln!(
+        "A1 / chain n={n} order {order:?}: ticks {ticks:?}, F holds {} of {}, orphans {}",
+        mesh.replicas[f].svc.directive_count(),
+        mesh.replicas[0].svc.directive_count(),
+        mesh.replicas[f].orphans.len()
+    );
+    if ticks.is_some() {
+        let among = mesh.all();
+        mesh.assert_converged_among(&format!("A1 / chain n={n} {order:?}"), &among, &[]);
+    }
+    ticks
+}
+
+/// A chain that fits the per-peer orphan budget (`MAX_ORPHANS_PER_PEER`)
+/// joins in a tick or two in either order: everything that arrives before
+/// its parent is buffered and drained as the chain resolves. Passes at HEAD.
+#[test]
+fn chain_under_the_orphan_cap_joins_in_two_ticks_in_advert_and_reverse_order() {
+    let n = MAX_ORPHANS_PER_PEER - 200;
+    let advert = chain_join_ticks(n, None, 4).expect("joins within the bound");
+    let reverse = chain_join_ticks(n, Some(Order::AntiCausal), 4).expect("joins within the bound");
+    eprintln!("A1 / chain under cap: advert order {advert} ticks, newest-first {reverse} ticks");
+    assert!(advert <= 3 && reverse <= 3);
+}
+
+/// A chain longer than the per-peer orphan budget: the buffer refuses (never
+/// evicts) what arrives past 1,000 entries and the Want is in hex order, so
+/// each tick stages only the prefix that happens to percolate through what
+/// is buffered. Measured at HEAD: 1,300 transactions take exactly 30 ticks
+/// (150 s at the default 5 s interval); 1,500 hold 350 of 1,503 after 60
+/// ticks; 3,000 do not finish in 30 ticks. Served newest-first by a peer that
+/// ignores the Want's order it is one directive per tick. Fails at HEAD.
+#[test]
+#[ignore = "A1-4: a fresh anti-entropy join of a chain longer than MAX_ORPHANS_PER_PEER progresses a few directives per tick — the per-peer orphan cap refuses instead of evicting and the Want is in hex order"]
+fn chain_over_the_orphan_cap_joins_within_thirty_ticks_in_advert_order() {
+    let n = 3 * MAX_ORPHANS_PER_PEER;
+    let ticks = chain_join_ticks(n, None, 30);
+    assert!(
+        ticks.is_some(),
+        "a {n}-transaction chain did not join in 30 ticks"
+    );
 }

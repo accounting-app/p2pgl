@@ -290,6 +290,38 @@ mod oracle {
             })
         }
 
+        /// A value from a sign and little-endian base-2^64 limbs, by doubling
+        /// (A5, 0924): the readout of `wide::I256`'s binary representation,
+        /// sharing nothing with the operations under test.
+        pub fn from_base_2_64_limbs(negative: bool, limbs: &[u64]) -> Big {
+            let mut value = Big::zero();
+            for &limb in limbs.iter().rev() {
+                for _ in 0..64 {
+                    value = value.add(&value);
+                }
+                value = value.add(&Big::from_u128(u128::from(limb)));
+            }
+            if negative {
+                value.negated()
+            } else {
+                value
+            }
+        }
+
+        pub fn is_negative(&self) -> bool {
+            self.negative
+        }
+
+        /// Sign-aware comparison (A5, 0924).
+        pub fn compare(&self, other: &Big) -> Ordering {
+            match (self.negative, other.negative) {
+                (false, true) => Ordering::Greater,
+                (true, false) => Ordering::Less,
+                (false, false) => Big::compare_magnitude(&self.limbs, &other.limbs),
+                (true, true) => Big::compare_magnitude(&other.limbs, &self.limbs),
+            }
+        }
+
         /// The value as an `i128`, when its magnitude fits 96 bits — the
         /// mantissa range of a `Decimal`.
         pub fn to_decimal_mantissa(&self) -> Option<i128> {
@@ -1764,4 +1796,617 @@ fn generators_exercise_both_branches_of_the_rule() {
         exact * 5 >= samples && (samples - exact) * 5 >= samples,
         "exact in {exact} of {samples} samples"
     );
+}
+
+// ─── A5 (0924 re-audit of T76): wide.rs against the base-10^9 oracle ─────────
+
+use ledger::service::MAX_LEDGER_FILE_BYTES;
+use ledger::validate::{check_amount_cap, validate_transaction, AccountState};
+use ledger::wide::I256;
+use oracle::Big;
+
+/// `value` read out of `I256`'s `Debug` form — the sign and the four
+/// base-2^64 limbs — into the oracle's base-10^9 integer, through nothing
+/// but doubling and addition. This is the readout every `I256` check below
+/// compares through, so a wrong limb, carry or sign shows up as a value.
+fn i256_as_big(value: I256) -> Big {
+    let text = format!("{value:?}");
+    let negative = text.contains("negative: true");
+    let start = text.find('[').expect("limbs") + 1;
+    let end = text.find(']').expect("limbs");
+    let limbs: Vec<u64> = text[start..end]
+        .split(',')
+        .map(|limb| limb.trim().parse().expect("a u64 limb"))
+        .collect();
+    assert_eq!(limbs.len(), 4, "four limbs");
+    Big::from_base_2_64_limbs(negative, &limbs)
+}
+
+/// `2^bits` in the oracle.
+fn two_pow(bits: usize) -> Big {
+    let mut limbs = vec![0u64; bits / 64];
+    limbs.push(1u64 << (bits % 64));
+    Big::from_base_2_64_limbs(false, &limbs)
+}
+
+/// Whether `|value| ≤ 2^256 − 1`, the magnitude `I256` holds.
+fn fits_256_bits(value: &Big) -> bool {
+    value.magnitude().compare(&two_pow(256)) == std::cmp::Ordering::Less
+}
+
+/// A signed `i128` (weighted to its edges and to the `Decimal` mantissa
+/// bound) and a power of ten to shift it by: `2^127 × 10^38 < 2^256`, so
+/// every operand fits and their sums reach past 2^255.
+fn i256_operand() -> impl Strategy<Value = (i128, u32)> {
+    let mantissa_max = decimal_max_mantissa();
+    let mantissa = prop_oneof![
+        Just(0i128),
+        Just(1),
+        Just(-1),
+        Just(i128::MAX),
+        Just(i128::MIN + 1),
+        Just(mantissa_max),
+        Just(-mantissa_max),
+        Just(mantissa_max + 1),
+        any::<i128>(),
+        -1000i128..1000,
+        any::<i128>().prop_map(|value| value / 1_000_000_000),
+    ];
+    (mantissa, 0u32..=38)
+}
+
+proptest! {
+    #![proptest_config(config(512))]
+
+    /// A5 (0924): `wide::I256` as a new bignum, every operation against the
+    /// base-10^9 oracle — `from_i128`, `× 10^k`, `checked_add` (both signs,
+    /// both magnitude orders, overflow exactly when the oracle passes
+    /// `2^256 − 1`), negation (zero stays non-negative), `Ord`, exact and
+    /// half-to-even division by `10^k` including an exact tie built on
+    /// purpose in both signs, and `to_i128_within` at the `Decimal` mantissa
+    /// bound. The read model's fold and Rule R stand on these.
+    #[test]
+    fn wide_i256_matches_the_base_ten_oracle(
+        (a, shift_a) in i256_operand(),
+        (b, shift_b) in i256_operand(),
+        dropped in 0u32..=40,
+    ) {
+        let x = I256::from_i128(a).checked_mul_pow10(shift_a).expect("2^127 × 10^38 < 2^256");
+        let y = I256::from_i128(b).checked_mul_pow10(shift_b).expect("fits");
+        let big_x = Big::from_i128(a).times_power_of_ten(shift_a);
+        let big_y = Big::from_i128(b).times_power_of_ten(shift_b);
+        prop_assert_eq!(i256_as_big(x), big_x.clone(), "from_i128 × 10^k");
+        prop_assert_eq!(i256_as_big(y), big_y.clone());
+
+        // Addition: overflow exactly when the oracle's magnitude passes 2^256 − 1.
+        let sum = big_x.add(&big_y);
+        match x.checked_add(y) {
+            Some(total) => {
+                prop_assert_eq!(i256_as_big(total), sum.clone());
+                prop_assert!(fits_256_bits(&sum));
+            }
+            None => prop_assert!(!fits_256_bits(&sum), "spurious overflow"),
+        }
+        prop_assert_eq!(x.checked_add(y), y.checked_add(x), "commutative");
+        prop_assert_eq!(x.checked_add(x.negated()), Some(I256::ZERO), "x + (−x)");
+
+        // Sign, zero and order.
+        prop_assert_eq!(i256_as_big(x.negated()), big_x.negated());
+        prop_assert!(!(x.is_zero() && x.is_negative()), "a negative zero");
+        prop_assert_eq!(x.is_negative(), big_x.is_negative());
+        prop_assert_eq!(x.is_zero(), big_x.is_zero());
+        prop_assert_eq!(x.cmp(&y), big_x.compare(&big_y));
+
+        // × 10^dropped, overflow exactly when the oracle says so.
+        let product = big_x.times_power_of_ten(dropped);
+        match x.checked_mul_pow10(dropped) {
+            Some(shifted) => {
+                prop_assert_eq!(i256_as_big(shifted), product.clone());
+                prop_assert!(fits_256_bits(&product));
+            }
+            None => prop_assert!(!fits_256_bits(&product), "spurious overflow"),
+        }
+
+        // ÷ 10^dropped: exactly, and rounded half to even on the magnitude.
+        prop_assert_eq!(
+            x.div_pow10_exact(dropped).map(i256_as_big),
+            big_x.divide_by_power_of_ten_exactly(dropped)
+        );
+        prop_assert_eq!(
+            i256_as_big(x.div_pow10_round_half_even(dropped)),
+            big_x.divide_by_power_of_ten_half_even(dropped)
+        );
+
+        // An exact tie at `dropped` digits, in x's sign: x·10^d ± 5·10^(d−1)
+        // rounds to x when x is even and one away from zero past it when odd.
+        if dropped >= 1 {
+            let sign = if x.is_negative() { -5 } else { 5 };
+            let half = I256::from_i128(sign).checked_mul_pow10(dropped - 1).expect("fits");
+            if let Some(tie) = x.checked_mul_pow10(dropped).and_then(|shifted| shifted.checked_add(half)) {
+                let big_tie = i256_as_big(tie);
+                let rounded = tie.div_pow10_round_half_even(dropped);
+                prop_assert_eq!(i256_as_big(rounded), big_tie.divide_by_power_of_ten_half_even(dropped));
+                let odd = shift_a == 0 && a % 2 != 0;
+                let even_neighbour = if odd {
+                    let away = if x.is_negative() { -1 } else { 1 };
+                    x.checked_add(I256::from_i128(away)).expect("fits")
+                } else {
+                    x
+                };
+                prop_assert_eq!(rounded, even_neighbour, "tie → even, symmetric in the sign");
+            }
+        }
+
+        // The Decimal mantissa bound.
+        let bound = u128::try_from(decimal_max_mantissa()).expect("positive");
+        prop_assert_eq!(x.to_i128_within(bound), big_x.to_decimal_mantissa());
+    }
+}
+
+// ─── A5: Rule R beyond the cap, and the ingress round trip ───────────────────
+
+/// Any `Decimal` at all — mantissa up to `±(2^96 − 1)` at scales 0–28 — the
+/// range a library caller (not an ingress) can feed the read model.
+fn any_decimal() -> impl Strategy<Value = Decimal> {
+    let max = decimal_max_mantissa();
+    let mantissa = prop_oneof![
+        Just(0i128),
+        Just(1),
+        Just(-1),
+        Just(max),
+        Just(-max),
+        Just(cap()),
+        Just(-cap()),
+        -max..=max,
+        (-max..=max).prop_map(|value| value / 1_000_000_000_000),
+        -1000i128..1000,
+    ];
+    (mantissa, scale()).prop_map(|(mantissa, scale)| Decimal::from_i128_with_scale(mantissa, scale))
+}
+
+/// The two `open`s `validate_transaction` needs for a transfer.
+fn transfer_accounts() -> AccountState {
+    let mut state = AccountState::new();
+    for account in [CASH, OPENING] {
+        let Directive::Open(ref directive) = open(account, BTreeMap::new()) else {
+            unreachable!("open() builds an Open");
+        };
+        state.record_open(directive, &format!("open-{account}"));
+    }
+    state
+}
+
+proptest! {
+    #![proptest_config(config(256))]
+
+    /// A5 (0924): Rule R against the oracle on amounts NO ingress admits —
+    /// up to `±Decimal::MAX` at any scale, in any order. Exact when it fits,
+    /// rounded once (flag = only zeros dropped) when it does not, and past
+    /// every scale: the infallible read saturates to `±Decimal::MAX` flagged
+    /// inexact, every `try_*` report refuses, and no claim holds. The
+    /// property at HEAD stops at the cap; this is the library-level half the
+    /// Done note's "OutOfRange … covered by unit tests" leaves to `read_model.rs`.
+    #[test]
+    fn rule_r_matches_the_oracle_beyond_the_cap(
+        amounts in prop::collection::vec(any_decimal(), 1..24),
+        seed in any::<u64>(),
+    ) {
+        let sum = ExactSum::of(&amounts);
+        let expected = sum.expected();
+        let directives = local_transfers(&amounts);
+        for (order, model) in models_in_three_orders(&directives, seed) {
+            assert_paths_agree(&model, order)?;
+            match &expected {
+                Expected::Exact(value) => {
+                    assert_paths_equal(&model, *value, order)?;
+                    prop_assert_eq!(read_exact_flag(&model, CASH), Some(true));
+                    prop_assert!(model.try_account_balance(CASH, None).is_ok());
+                    prop_assert!(model.try_trial_balance(far()).is_ok());
+                    assert_assertions_are_exact(&model, &sum, *value, order)?;
+                }
+                Expected::Rounded(value) => {
+                    assert_paths_equal(&model, *value, order)?;
+                    prop_assert_eq!(read_exact_flag(&model, CASH), Some(sum.equals(*value)));
+                    prop_assert!(model.try_account_balance(CASH, None).is_ok());
+                    assert_assertions_are_exact(&model, &sum, *value, order)?;
+                }
+                Expected::OutOfRange => {
+                    let saturated = if sum.value_at_finest().is_negative() {
+                        Decimal::MIN
+                    } else {
+                        Decimal::MAX
+                    };
+                    prop_assert_eq!(read_now(&model, CASH), Some(saturated.to_string()), "{}", order);
+                    prop_assert_eq!(read_exact_flag(&model, CASH), Some(false));
+                    prop_assert!(model.try_account_balance(CASH, None).is_err());
+                    prop_assert!(model.try_trial_balance(far()).is_err());
+                    prop_assert!(model.try_balance_sheet(far()).is_err());
+                    for claim in [Decimal::MAX, Decimal::MIN, Decimal::ZERO] {
+                        prop_assert_eq!(assertion_verdicts(&model, &assertion(CASH, claim)), (false, false));
+                    }
+                }
+            }
+        }
+    }
+
+    /// A5 (0924): the ingress round trip. For any non-zero amount — in cap,
+    /// past it, or anywhere a `Decimal` reaches — the GraphQL scalar's rule
+    /// (`check_amount_cap`, the call `DecimalScalar::parse` makes),
+    /// `validate_transaction` and the `.bean` re-parse of what the serializer
+    /// writes (the wire's gate, boot, journal replay and reconcile) give ONE
+    /// verdict; and when it is "accepted", the re-read amount is the original
+    /// mantissa and scale under the original content id, so no node writes a
+    /// record it cannot re-load and no peer sees a hash mismatch on it.
+    #[test]
+    fn every_ingress_gives_one_verdict_and_re_reads_the_amount_it_accepted(
+        amount in prop_oneof![cap_amount(), over_cap_amount(), any_decimal()],
+    ) {
+        prop_assume!(!amount.is_zero());
+        let stored = transfer(0, amount, envelope("peer", 10));
+        let Directive::Transaction(ref transaction) = stored else {
+            unreachable!("transfer() builds a transaction");
+        };
+        let scalar_rule = check_amount_cap("Decimal", amount).is_ok();
+        let validated = validate_transaction(transaction, &transfer_accounts()).is_ok();
+        let reparsed = parse_file(&economic_canonical_serialize(&stored));
+        prop_assert_eq!(scalar_rule, validated, "scalar vs validate_transaction on {}", amount);
+        prop_assert_eq!(scalar_rule, reparsed.is_ok(), "scalar vs the .bean re-parse on {}", amount);
+        prop_assert_eq!(scalar_rule, amount.abs() <= Decimal::from_i128_with_scale(cap(), 0));
+        if let Ok(directives) = reparsed {
+            prop_assert_eq!(directives.len(), 1);
+            let Directive::Transaction(ref back) = directives[0] else {
+                unreachable!("a transaction re-parses as one");
+            };
+            for (index, sign) in [(0, Decimal::ONE), (1, Decimal::NEGATIVE_ONE)] {
+                let number = back.postings[index].amount.as_ref().expect("explicit").number;
+                let original = amount * sign;
+                prop_assert_eq!(
+                    (number.mantissa(), number.scale()),
+                    (original.mantissa(), original.scale()),
+                    "posting {} re-reads differently", index
+                );
+            }
+            prop_assert_eq!(compute_content_id(&directives[0]), compute_content_id(&stored));
+        }
+    }
+}
+
+// ─── A5: deterministic edges ─────────────────────────────────────────────────
+
+/// A5 (0924): `balance` claims spelled at a scale other than the sum's, a
+/// sum whose partials cancel at one scale and not another, the largest
+/// possible claim (`balance` amounts are uncapped) on a sum it is and is not,
+/// and an account never posted to — the per-assertion and batched (`verify`)
+/// paths agree on every one, and `actualExact` says which figure `actual` is.
+#[test]
+fn assertion_claims_at_other_scales_and_over_cancelling_partials_agree_on_both_paths() {
+    let d = |text: &str| Decimal::from_str_exact(text).expect("literal");
+    let dust = Decimal::from_i128_with_scale(1, 28);
+    let cases: [(&[Decimal], Decimal, bool, &str); 9] = [
+        (&[d("1000.00")], d("1000"), true, "1000.00"),
+        (&[d("1000")], d("1000.00"), true, "1000"),
+        (&[d("1.00"), d("-1.00"), d("7")], d("7.0000"), true, "7"),
+        (&[d("1000"), d("-1000.00")], d("0"), true, "0.00"),
+        (&[d("1000"), d("-1000.00")], d("-0.00"), true, "0.00"),
+        (
+            &[Decimal::MAX],
+            Decimal::MAX,
+            true,
+            "79228162514264337593543950335",
+        ),
+        (
+            &[Decimal::MAX, dust],
+            Decimal::MAX,
+            false,
+            "79228162514264337593543950335",
+        ),
+        (&[dust], dust, true, "0.0000000000000000000000000001"),
+        (&[], d("0.00"), true, "0"),
+    ];
+    for (amounts, claim, holds, printed) in cases {
+        let model = ReadModel::build(&local_transfers(amounts));
+        let single = evaluate_balance_assertion(&assertion(CASH, claim), &model);
+        assert_eq!(
+            assertion_verdicts(&model, &assertion(CASH, claim)),
+            (holds, holds),
+            "{amounts:?} vs claim {claim}"
+        );
+        assert_eq!(single.actual.to_string(), printed, "{amounts:?}: actual");
+        assert_eq!(
+            single.actual_exact,
+            ExactSum::of(amounts).equals(single.actual),
+            "{amounts:?}: actual_exact"
+        );
+        assert_eq!(single.expected, claim);
+    }
+}
+
+/// A5 (0924): the documented residual, quantified. I1 runs on weights
+/// `rust_decimal` rounds to 28 places, so a transaction whose EXACT weights
+/// do not cancel is accepted when the rounded ones do — by at most half a
+/// unit in the 28th place per priced leg (`0.1 X @ 1e-28 USD` has exact
+/// weight `1e-29` and rounded weight `0`). Pinned as acceptance because the
+/// Done note requires that any future exactness change "must not refuse
+/// history"; a refusal here would be that regression.
+#[test]
+fn i1_accepts_an_exact_imbalance_below_the_28th_place_because_weights_are_rounded() {
+    let d = |text: &str| Decimal::from_str_exact(text).expect("literal");
+    let priced = |number: &str, price: &str| Posting {
+        account: "Assets:Crypto".to_owned(),
+        amount: Some(Amount {
+            number: d(number),
+            currency: "BTC".to_owned(),
+        }),
+        cost: None,
+        price: Some(PriceSpec::Unit(Amount {
+            number: d(price),
+            currency: USD.to_owned(),
+        })),
+        metadata: BTreeMap::new(),
+    };
+    let mut accounts = transfer_accounts();
+    let Directive::Open(ref crypto) = open("Assets:Crypto", BTreeMap::new()) else {
+        unreachable!("open() builds an Open");
+    };
+    accounts.record_open(crypto, "open-crypto");
+    let transaction = |postings: Vec<Posting>| Transaction {
+        date: date(2024, 2, 1),
+        flag: Flag::Complete,
+        payee: None,
+        narration: Some("rounded weights".to_owned()),
+        tags: Vec::new(),
+        links: Vec::new(),
+        postings,
+        metadata: BTreeMap::new(),
+    };
+    // Exact imbalance 1e-29 USD; rounded weight sum 0.
+    let dust = transaction(vec![
+        priced("0.1", "0.0000000000000000000000000001"),
+        posting(CASH, Decimal::ZERO, USD),
+    ]);
+    validate_transaction(&dust, &accounts).expect("accepted on rounded weights");
+    // Three legs: 3 × 0.333…3 (exact) + 0.1 × 1e-28 (rounds to 0) − 0.999…9.
+    let three = transaction(vec![
+        priced("3", "0.3333333333333333333333333333"),
+        priced("0.1", "0.0000000000000000000000000001"),
+        posting(CASH, d("-0.9999999999999999999999999999"), USD),
+    ]);
+    validate_transaction(&three, &accounts).expect("accepted on rounded weights");
+    // The bound: a 1e-28 imbalance that IS representable is refused.
+    let visible = transaction(vec![
+        priced("1", "0.0000000000000000000000000001"),
+        posting(CASH, Decimal::ZERO, USD),
+    ]);
+    assert!(validate_transaction(&visible, &accounts).is_err());
+}
+
+/// A5 (0924): the documented trial-balance residual, quantified. With every
+/// `Assets` row `1000 + 4e-26` (inexact: rounded down to scale 25), the
+/// total is the exact sum of the exact rows rounded once, so it differs from
+/// the sum of the displayed rows — by one unit in the last place here, and
+/// in general by at most half an ulp of the total plus half an ulp per
+/// inexact row. `exact: false` on the report is the only signal.
+#[test]
+fn an_inexact_trial_balance_total_differs_from_its_displayed_rows_by_the_rounding() {
+    let d = |text: &str| Decimal::from_str_exact(text).expect("literal");
+    let mut directives = Vec::new();
+    for (index, account) in ["Assets:A", "Assets:B"].into_iter().enumerate() {
+        for (offset, amount) in [d("1000"), d("0.00000000000000000000000004")]
+            .into_iter()
+            .enumerate()
+        {
+            directives.push(Directive::Transaction(Transaction {
+                date: date(2024, 1, 2),
+                flag: Flag::Complete,
+                payee: None,
+                narration: Some(format!("row {index} part {offset}")),
+                tags: Vec::new(),
+                links: Vec::new(),
+                postings: vec![
+                    posting(account, amount, USD),
+                    posting(OPENING, -amount, USD),
+                ],
+                metadata: BTreeMap::new(),
+            }));
+        }
+    }
+    let report = ReadModel::build(&directives).trial_balance(far());
+    let rows: Vec<&ledger::read_model::TrialBalanceRow> = report
+        .rows
+        .iter()
+        .filter(|row| row.account.starts_with("Assets"))
+        .collect();
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        assert_eq!(row.debit.to_string(), "1000.0000000000000000000000000");
+        assert!(!row.exact);
+    }
+    let displayed: Decimal = rows.iter().map(|row| row.debit).sum();
+    assert_eq!(displayed.to_string(), "2000.0000000000000000000000000");
+    assert_eq!(
+        report.total_debit.to_string(),
+        "2000.0000000000000000000000001",
+        "the total is the exact sum rounded once"
+    );
+    assert_eq!(report.total_debit, report.total_credit);
+    assert!(!report.exact);
+    assert_eq!(
+        (report.total_debit - displayed).to_string(),
+        "0.0000000000000000000000001",
+        "one ulp of the displayed scale"
+    );
+}
+
+/// A5 (0924): the arithmetic the exact fold stands on, checked in the
+/// oracle rather than asserted in a comment — a partial of `2^31` postings
+/// of `2^96 − 1` is below `2^127`; folding 29 such partials to scale 28 is
+/// below `2^256`; and no ingress can reach `2^31` postings in one partial:
+/// the densest posting line the parser accepts is 16 bytes, so the 64 MiB
+/// file plus the 64 MiB journal hold under `2^24` of them.
+#[test]
+fn the_partial_posting_limit_is_unreachable_and_the_fold_fits_256_bits() {
+    let partial_limit: u64 = 1 << 31; // read_model::PARTIAL_POSTING_LIMIT
+    let mantissa_max = Big::from_i128(decimal_max_mantissa());
+    let mut partial = Big::zero();
+    // 2^31 × (2^96 − 1) by 31 doublings.
+    partial = partial.add(&mantissa_max);
+    for _ in 0..31 {
+        partial = partial.add(&partial);
+    }
+    assert_eq!(
+        partial.compare(&two_pow(127)),
+        std::cmp::Ordering::Less,
+        "a full partial fits an i128"
+    );
+    let mut fold = Big::zero();
+    for _ in 0..29 {
+        fold = fold.add(&two_pow(127).times_power_of_ten(28));
+    }
+    assert_eq!(
+        fold.compare(&two_pow(256)),
+        std::cmp::Ordering::Less,
+        "29 partials at scale 28 fit an I256"
+    );
+
+    // The densest posting line the grammar admits, and what it costs.
+    let dense = "2024-01-02 *\n  Equity:A 1 XX\n  Equity:B -1 XX\n";
+    let directives = parse_file(dense).expect("the densest legal transaction parses");
+    let Directive::Transaction(ref transaction) = directives[0] else {
+        panic!("a transaction");
+    };
+    assert_eq!(transaction.postings.len(), 2);
+    let bytes_per_posting = ("  Equity:A 1 XX\n".len()) as u64;
+    assert_eq!(bytes_per_posting, 16);
+    let most_postings = 2 * MAX_LEDGER_FILE_BYTES / bytes_per_posting;
+    assert!(
+        most_postings < partial_limit / 128,
+        "{most_postings} postings from file + journal, limit {partial_limit}"
+    );
+}
+
+/// A5 (0924): a library-built negative zero (`-Decimal` of a zero amount)
+/// serializes as `-0.00`, which no reader can hand back: the parser and the
+/// scalar both read it as `0.00`, so its content id changes across the
+/// round trip. No ingress produces one (`from_str_exact` never does, the
+/// resolved leg is never zero, costs and prices are positive), so this pins
+/// the fact rather than a defect: a `Directive` built in memory with a
+/// negative zero is not one the file or a peer would ever return.
+#[test]
+fn a_negative_zero_is_a_library_artifact_no_ingress_returns() {
+    let negative_zero = -Decimal::from_i128_with_scale(0, 2);
+    assert_eq!(negative_zero.to_string(), "-0.00");
+    assert_eq!(negative_zero.mantissa(), 0);
+    let parsed = Decimal::from_str_exact("-0.00").expect("parses");
+    assert!(!parsed.is_sign_negative(), "the reader hands back +0.00");
+    let built = transfer(0, Decimal::from_i128_with_scale(0, 2), BTreeMap::new());
+    let body = economic_canonical_serialize(&built);
+    assert!(body.contains("-0.00 USD"), "{body}");
+    let reread = parse_file(&body).expect("re-parses");
+    assert_ne!(
+        compute_content_id(&reread[0]),
+        compute_content_id(&built),
+        "the id covers the spelling, and the spelling does not survive"
+    );
+}
+
+// ─── A5-1: the over-cap remainder of M-50 ────────────────────────────────────
+
+/// A5-1 (0924, EXECUTED at HEAD): M-50's shape is closed only up to `10^21`.
+/// A pre-T65 history holding an amount PAST the new cap — a base-unit token
+/// ledger's `50000000000000000000000 WEI` (50,000 ETH), or the `±Decimal::MAX`
+/// H-17's peer could plant before T65 — is quarantined as text at boot with
+/// exactly M-50's consequences: its children load with a dangling parent,
+/// balances silently exclude it, `verify` reports `MissingParent` forever,
+/// and a fresh replica refuses the parent for good (`INVALID_POSTING`,
+/// permanent-class) and gets `MISSING_PARENT` on every descendant. The 0923
+/// regression requirement — "keep the descendants' parents resolvable, or
+/// refuse loudly" — is what this asserts; boot only warns with L-45's
+/// Unicode-account wording. Fails at HEAD; enable when the remainder has a
+/// remedy (quarantine the descendant closure, or refuse boot naming the id).
+#[test]
+#[ignore = "A5-1: a pre-T65 amount past 10^21 still gets M-50's dangling children and unsyncable fresh replica"]
+fn over_cap_history_keeps_its_descendants_parents_resolvable_or_refuses_loudly() {
+    let wei = "WEI";
+    let x_amount = Decimal::from_str_exact("50000000000000000000000").expect("5 × 10^22");
+    let with_currency = |account: &str, number: Decimal| Posting {
+        account: account.to_owned(),
+        amount: Some(Amount {
+            number,
+            currency: wei.to_owned(),
+        }),
+        cost: None,
+        price: None,
+        metadata: BTreeMap::new(),
+    };
+    let record =
+        |day: u32, narration: &str, number: Decimal, author: &str, lamport: u64, parents: &str| {
+            Directive::Transaction(Transaction {
+                date: date(2024, 1, day),
+                flag: Flag::Complete,
+                payee: None,
+                narration: Some(narration.to_owned()),
+                tags: Vec::new(),
+                links: Vec::new(),
+                postings: vec![with_currency(CASH, number), with_currency(OPENING, -number)],
+                metadata: BTreeMap::from([
+                    ("openledger-author".to_owned(), author.to_owned()),
+                    ("openledger-lamport".to_owned(), lamport.to_string()),
+                    ("openledger-parents".to_owned(), parents.to_owned()),
+                ]),
+            })
+        };
+    let x = record(2, "X pre-upgrade", x_amount, "nodeA", 3, "");
+    let x_id = compute_content_id(&x);
+    let c = record(3, "C child", Decimal::from(5), "nodeA", 4, &x_id);
+    let c_id = compute_content_id(&c);
+    let g = record(4, "G grandchild", Decimal::from(9), "nodeB", 5, &c_id);
+    let opens = [open(CASH, BTreeMap::new()), open(OPENING, BTreeMap::new())];
+    let file = ledger::serialize::full_file_serialize(
+        &[
+            opens[0].clone(),
+            opens[1].clone(),
+            x.clone(),
+            c.clone(),
+            g.clone(),
+        ],
+        &[],
+    );
+    let path = scratch_ledger("a5-1-over-cap-history");
+    std::fs::write(&path, &file).expect("write the pre-T65 file");
+
+    let upgraded = LedgerService::boot(&path, "nodeA".to_owned()).expect("boot");
+    let report = verify_dag(upgraded.dag(), upgraded.read_model());
+    let mut served: Vec<Directive> = upgraded
+        .sorted_directive_ids()
+        .iter()
+        .rev()
+        .map(|id| upgraded.get_directive(id).expect("served").clone())
+        .collect();
+    // The two `open`s first (the served order is by id), then newest first.
+    served.sort_by_key(|directive| !matches!(directive, Directive::Open(_)));
+    let fresh_path = scratch_ledger("a5-1-fresh");
+    let mut fresh = LedgerService::boot(&fresh_path, "fresh".to_owned()).expect("boot fresh");
+    let refused = sync_from_served(&mut fresh, served);
+    let outcome = format!(
+        "upgraded: unparsable={} quarantined={} X in DAG={} C in DAG={} cash={:?} verify.ok={} errors={:?}; \
+         fresh refused={refused:?}",
+        upgraded.unparsable_block_count(),
+        upgraded.quarantined_count(),
+        upgraded.contains_directive(&x_id),
+        upgraded.contains_directive(&c_id),
+        upgraded
+            .read_model()
+            .account_balance(CASH, None)
+            .and_then(|entry| entry.balances.get(wei).map(Decimal::to_string)),
+        report.ok,
+        report.errors
+    );
+    remove_scratch(&path);
+    remove_scratch(&fresh_path);
+    // Either the whole chain is history (X in the DAG, verify clean, a fresh
+    // replica takes all of it) or none of it is served to a peer that cannot
+    // take it. Serving C and G without X is neither.
+    let whole = upgraded.contains_directive(&x_id) && report.ok && refused.is_empty();
+    let withheld = !upgraded.contains_directive(&c_id) && refused.is_empty();
+    assert!(whole || withheld, "{outcome}");
 }

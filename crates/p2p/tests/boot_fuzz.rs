@@ -33,6 +33,19 @@
 //! served-but-refused id and the wire error, and T73 made them pass:
 //! [`OPERATORS_ENABLED`] holds every operator and `boot_fuzz_all_operators`
 //! runs each one under every check.
+//!
+//! ## A2 (0924 re-audit of T73)
+//!
+//! The pipeline now also installs the verifier `main.rs` installs right
+//! after the signer, and runs `verify_own_history` before the compaction.
+//! The `op_q`–`op_ab` operators probe what the signature covers (parents,
+//! lamport, a duplicated envelope line), journal replay, the salvage of an
+//! unparsable head, a pasted block signed by another peer, and the
+//! compositions the 0924 hunt found: an edited own record plus a hand
+//! append in the same session (A2-1), a foreign-author half envelope (A2-2),
+//! a hand parent naming the quarantined id (A2-3) and a lamport edit that
+//! moves the clock (A2-4). `boot_fuzz_all_operators_including_a2` sweeps
+//! every green operator.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -40,9 +53,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use chrono::NaiveDate;
+use ledger::hash::compute_content_id;
+use ledger::journal::{append_record, journal_path_for};
 use ledger::model::{Amount, Directive, Flag, Transaction};
+use ledger::parse::parse_file;
 use ledger::read_model::CurrencyBalances;
-use ledger::service::{DirectiveSigner, LedgerService, PostingInput, TransactionInput};
+use ledger::service::{
+    DirectiveSigner, DirectiveVerifier, LedgerService, PostingInput, TransactionInput,
+};
 use p2p::allowlist::PeerAllowlist;
 use p2p::gossip::make_supply_entry;
 use p2p::protocol::SupplyEntry;
@@ -50,6 +68,7 @@ use p2p::union_merge::{validate_supply_entry, verify_author_allowlisted, verify_
 use proptest::prelude::*;
 use rust_decimal::Decimal;
 use security::signing::{PeerKeySignatureProvider, SignableMessage, SignatureProvider};
+use sha2::{Digest, Sha256};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -155,6 +174,45 @@ fn signer_for(provider: &Arc<PeerKeySignatureProvider>) -> DirectiveSigner {
             })
         },
     )
+}
+
+/// The verifier `main.rs` installs right after the signer: the wire's
+/// `verify_signature` over the same message and the same mesh id (A2).
+fn verifier() -> DirectiveVerifier {
+    Arc::new(
+        move |content_id: &str,
+              is_transaction: bool,
+              parents: &str,
+              lamport: &str,
+              author: &str,
+              signature: &str| {
+            security::signing::verify_signature(
+                &SignableMessage {
+                    content_id,
+                    is_transaction,
+                    parents,
+                    lamport,
+                },
+                signature,
+                author,
+                MESH_ID,
+            )
+            .is_ok()
+        },
+    )
+}
+
+/// A second, allowlisted peer of the same mesh, derived from the fixture's
+/// author so a case is reproducible from its seed (A2).
+fn foreign_provider(truth: &Truth) -> Arc<PeerKeySignatureProvider> {
+    let mut key = [0u8; 32];
+    for (slot, byte) in key.iter_mut().zip(truth.author.as_bytes()) {
+        *slot = byte ^ 0x5a;
+    }
+    Arc::new(PeerKeySignatureProvider::from_bytes(
+        &key,
+        MESH_ID.to_owned(),
+    ))
 }
 
 fn sign_kind(
@@ -354,15 +412,31 @@ fn run_pipeline(
     path: &Path,
     provider: &Arc<PeerKeySignatureProvider>,
 ) -> Result<LedgerService, String> {
+    run_pipeline_until(path, provider, true)
+}
+
+/// [`run_pipeline`], optionally stopping before the startup compaction — the
+/// crash window between `finalize_operator_input` and the rewrite (A2).
+fn run_pipeline_until(
+    path: &Path,
+    provider: &Arc<PeerKeySignatureProvider>,
+    compact: bool,
+) -> Result<LedgerService, String> {
     let mut svc = LedgerService::boot(path.to_path_buf(), "local".to_owned())
         .map_err(|error| format!("boot refused the file: {error}"))?;
     svc.set_author_id(provider.public_key_hex());
     svc.set_signer(signer_for(provider));
+    // A2: `main.rs` installs the verifier right after the signer (signing is
+    // on), so a foreign-authored record is judged by its author's key.
+    svc.set_verifier(verifier());
     if svc.unsigned_operator_input_count() > 0 {
         svc.finalize_operator_input();
     }
-    svc.compact()
-        .map_err(|error| format!("startup compaction failed: {error}"))?;
+    svc.verify_own_history();
+    if compact {
+        svc.compact()
+            .map_err(|error| format!("startup compaction failed: {error}"))?;
+    }
     Ok(svc)
 }
 
@@ -583,9 +657,22 @@ fn replay_through_local_api(snapshot: &Snapshot, truth: &Truth) -> Vec<String> {
 
 /// The invariant, as a list of violations (empty = holds).
 fn audit(snapshot: &Snapshot, truth: &Truth, effect: &Effect, checks: Checks) -> Vec<String> {
+    audit_with(snapshot, truth, effect, checks, &[])
+}
+
+/// [`audit`] under a peer whose allowlist also holds `extra_authors`: a block
+/// signed by another allowlisted peer of the mesh must be accepted (A2).
+fn audit_with(
+    snapshot: &Snapshot,
+    truth: &Truth,
+    effect: &Effect,
+    checks: Checks,
+    extra_authors: &[String],
+) -> Vec<String> {
     let mut failures = Vec::new();
-    let allowlist =
-        PeerAllowlist::parse(std::slice::from_ref(&truth.author)).expect("author is an EndpointId");
+    let mut authors = vec![truth.author.clone()];
+    authors.extend(extra_authors.iter().cloned());
+    let allowlist = PeerAllowlist::parse(&authors).expect("authors are EndpointIds");
 
     // A parent is resolvable on a peer if the node serves it or the mesh
     // already holds it (the truth): a deleted line is re-supplied by peers.
@@ -867,6 +954,145 @@ enum Operator {
     LeadingBom,
     /// (p) identity (control).
     Identity,
+    // ── A2 (0924 re-audit) ──
+    /// (q) edit the `openledger-parents` line of a signed transaction — a
+    /// signed field, so the record must be quarantined.
+    EditParentsLine,
+    /// (r) edit the `openledger-lamport` line of a signed transaction (+1).
+    EditLamportLine,
+    /// (s) duplicate the lamport line: the original spelling, then an edited
+    /// one — the parser keeps the LAST spelling, which is the edited value.
+    DuplicateLamportLineEdited,
+    /// (t) the commit journal holds an edited copy of a signed record under
+    /// a recomputed checksum; the `.bean` is untouched.
+    JournalEditedCopy,
+    /// (u) a stray word right after the header line: the head is the bare
+    /// header (0 postings, no envelope), the tail unparsable.
+    StrayWordAfterHeader,
+    /// (v) a block signed by another allowlisted peer of the mesh, pasted in.
+    PasteSignedForeignBlock,
+    /// (w) the same block with a forged signature.
+    PasteForgedForeignBlock,
+    /// (x) A2-1: an edited signed record plus a hand-appended transaction in
+    /// the same stop → edit → start session.
+    EditNarrationPlusAppendHand,
+    /// (y) A2-1 by paste: a hand header pasted between the envelope and the
+    /// postings of a signed block (no blank line).
+    PasteHeaderInsideSignedBlock,
+    /// (z) A2-3: a hand transaction whose hand-typed parent is the id the
+    /// edited record is quarantined under.
+    AppendHandTransactionQuarantinedParent,
+    /// (aa) A2-2: a hand transaction carrying `openledger-author: <another
+    /// allowlisted peer>` and no lamport.
+    ForeignAuthorHalfEnvelope,
+    /// (ab) A2-4: the lamport line of a signed record edited to a value near
+    /// 2^32.
+    EditLamportLineHuge,
+}
+
+/// Every operator that is green at HEAD `3d64a16`: [`OPERATORS_ENABLED`] plus
+/// the A2 operators that pin an existing mechanism. The four finding-pinning
+/// operators (x, y, z, aa) and (ab) are excluded — their tests are
+/// `#[ignore]`d with the finding id.
+const OPERATORS_ALL: [Operator; 25] = [
+    Operator::EditNarration,
+    Operator::EditAmountBalanced,
+    Operator::EditAmountUnbalanced,
+    Operator::DedentPosting,
+    Operator::BomBeforePosting,
+    Operator::StrayWordLine,
+    Operator::DeleteLamportLine,
+    Operator::DeleteAuthorLine,
+    Operator::DeleteSignatureLine,
+    Operator::AppendHandTransaction,
+    Operator::AppendReopen,
+    Operator::AppendHandTransactionDanglingParent,
+    Operator::DuplicateSignedBlockRaw,
+    Operator::DuplicateRawOfCycleMember,
+    Operator::DeleteSignedBlock,
+    Operator::Crlf,
+    Operator::LeadingBom,
+    Operator::Identity,
+    Operator::EditParentsLine,
+    Operator::EditLamportLine,
+    Operator::DuplicateLamportLineEdited,
+    Operator::JournalEditedCopy,
+    Operator::StrayWordAfterHeader,
+    Operator::PasteSignedForeignBlock,
+    Operator::PasteForgedForeignBlock,
+];
+
+/// A signed foreign block: the body signed by `provider` over parents `""`
+/// and lamport `"1"`, as a peer's genesis-era transaction would be (A2).
+fn signed_foreign_block(provider: &PeerKeySignatureProvider, forged: bool) -> String {
+    let body = "2024-01-30 * \"Peer\" \"pasted from another node's ledger\"\n  Expenses:Rent                                     20.00 USD\n  Assets:Cash                                      -20.00 USD";
+    let directive = parse_file(&format!("{body}\n"))
+        .expect("foreign body parses")
+        .remove(0);
+    let id = compute_content_id(&directive);
+    let mut signature = provider
+        .sign(&SignableMessage {
+            content_id: &id,
+            is_transaction: true,
+            parents: "",
+            lamport: "1",
+        })
+        .expect("signing enabled");
+    if forged {
+        let flipped = if signature.starts_with('0') { '1' } else { '0' };
+        signature.replace_range(0..1, &flipped.to_string());
+    }
+    set_lines(body, |lines| {
+        lines.insert(
+            1,
+            format!("  {KEY_AUTHOR}: \"{}\"", provider.public_key_hex()),
+        );
+        lines.insert(2, format!("  {KEY_LAMPORT}: \"1\""));
+        lines.insert(3, format!("  {KEY_PARENTS}: \"\""));
+        lines.insert(4, format!("  {KEY_SIGNATURE}: \"{signature}\""));
+    })
+}
+
+/// `;;olj <len> <sha256>\n<payload>` — the journal's record format, with the
+/// checksum recomputed over the (edited) payload (A2).
+fn journal_record(payload: &str) -> String {
+    format!(
+        ";;olj {} {:x}\n{payload}",
+        payload.len(),
+        Sha256::digest(payload.as_bytes())
+    )
+}
+
+/// The narration edit of operator (a), as a helper for the compositions.
+fn edit_narration(block: &str) -> String {
+    set_lines(block, |lines| {
+        let header = &lines[0];
+        lines[0] = match header.rfind('"') {
+            Some(quote) => format!("{} (edited){}", &header[..quote], &header[quote..]),
+            None => format!("{} \"edited\"{}", &header[..12], &header[12..]),
+        };
+    })
+}
+
+/// What [`mutate`] produced: the file text, what it did to the node-written
+/// records, an optional commit-journal record to write beside the file, and
+/// the authors a peer's allowlist must also hold (A2).
+struct Mutation {
+    text: String,
+    effect: Effect,
+    journal: Option<String>,
+    extra_authors: Vec<String>,
+}
+
+impl Mutation {
+    fn text(text: String, effect: Effect) -> Self {
+        Mutation {
+            text,
+            effect,
+            journal: None,
+            extra_authors: Vec::new(),
+        }
+    }
 }
 
 /// Every operator, under every check (T73: H-20 (a)–(e), (h); M-47 (f), (g);
@@ -896,9 +1122,11 @@ const HAND_TRANSACTION: &str = "2024-01-29 * \"Hand\" \"appended while the node 
 
 /// Apply `operator` to the node-written `text`; `position` picks the target
 /// block/line. `None` means the operator does not apply to this fixture.
-fn mutate(truth: &Truth, operator: Operator, position: usize) -> Option<(String, Effect)> {
+fn mutate(truth: &Truth, operator: Operator, position: usize) -> Option<Mutation> {
     let text = &truth.text;
     let mut blocks = split_blocks(text);
+    let mut journal: Option<String> = None;
+    let mut extra_authors: Vec<String> = Vec::new();
     let signed_txns: Vec<usize> = blocks
         .iter()
         .enumerate()
@@ -1012,11 +1240,122 @@ fn mutate(truth: &Truth, operator: Operator, position: usize) -> Option<(String,
                 .push(truth_id_of(truth, &blocks[index]).unwrap());
             blocks.remove(index);
         }
-        Operator::Crlf => return Some((text.replace('\n', "\r\n"), effect)),
-        Operator::LeadingBom => return Some((format!("\u{feff}{text}"), effect)),
-        Operator::Identity => return Some((text.clone(), effect)),
+        Operator::Crlf => return Some(Mutation::text(text.replace('\n', "\r\n"), effect)),
+        Operator::LeadingBom => return Some(Mutation::text(format!("\u{feff}{text}"), effect)),
+        Operator::Identity => return Some(Mutation::text(text.clone(), effect)),
+        // ── A2 ──
+        Operator::EditParentsLine => {
+            let index = pick(&signed_txns);
+            touch(&mut effect, &blocks[index]);
+            blocks[index] = set_lines(&blocks[index], |lines| {
+                for line in lines.iter_mut() {
+                    if line.trim_start().starts_with(KEY_PARENTS) {
+                        *line = format!("  {KEY_PARENTS}: \"{NOWHERE_PARENT}\"");
+                    }
+                }
+            });
+        }
+        Operator::EditLamportLine | Operator::EditLamportLineHuge => {
+            let index = pick(&signed_txns);
+            touch(&mut effect, &blocks[index]);
+            let lamport: u64 = envelope_value(&blocks[index], KEY_LAMPORT)
+                .expect("signed block has a lamport")
+                .parse()
+                .expect("decimal lamport");
+            let value = if operator == Operator::EditLamportLine {
+                lamport + 1
+            } else {
+                4_000_000_000
+            };
+            blocks[index] = set_lines(&blocks[index], |lines| {
+                for line in lines.iter_mut() {
+                    if line.trim_start().starts_with(KEY_LAMPORT) {
+                        *line = format!("  {KEY_LAMPORT}: \"{value}\"");
+                    }
+                }
+            });
+        }
+        Operator::DuplicateLamportLineEdited => {
+            let index = pick(&signed_txns);
+            touch(&mut effect, &blocks[index]);
+            let lamport: u64 = envelope_value(&blocks[index], KEY_LAMPORT)
+                .expect("signed block has a lamport")
+                .parse()
+                .expect("decimal lamport");
+            blocks[index] = set_lines(&blocks[index], |lines| {
+                for line in lines.iter_mut() {
+                    if line.trim_start().starts_with(KEY_LAMPORT) {
+                        *line = format!("{line}\n  {KEY_LAMPORT}: \"{}\"", lamport + 1000);
+                    }
+                }
+            });
+        }
+        Operator::JournalEditedCopy => {
+            let index = pick(&signed_txns);
+            let edited = edit_narration(&blocks[index]);
+            journal = Some(journal_record(&format!("{edited}\n")));
+            // The `.bean` is untouched; the record is edited in the journal.
+        }
+        Operator::StrayWordAfterHeader => {
+            let index = pick(&signed_txns);
+            touch(&mut effect, &blocks[index]);
+            blocks[index] = set_lines(&blocks[index], |lines| lines.insert(1, "oops".to_owned()));
+        }
+        Operator::PasteSignedForeignBlock | Operator::PasteForgedForeignBlock => {
+            let provider = foreign_provider(truth);
+            extra_authors.push(provider.public_key_hex());
+            blocks.push(signed_foreign_block(
+                &provider,
+                operator == Operator::PasteForgedForeignBlock,
+            ));
+        }
+        Operator::EditNarrationPlusAppendHand => {
+            let index = pick(&signed_txns);
+            touch(&mut effect, &blocks[index]);
+            blocks[index] = edit_narration(&blocks[index]);
+            blocks.push(HAND_TRANSACTION.to_owned());
+        }
+        Operator::PasteHeaderInsideSignedBlock => {
+            let index = pick(&signed_txns);
+            touch(&mut effect, &blocks[index]);
+            let first_posting = posting_lines(&blocks[index])[0];
+            blocks[index] = set_lines(&blocks[index], |lines| {
+                lines.insert(
+                    first_posting,
+                    "2024-01-29 * \"Hand\" \"pasted without a blank line\"".to_owned(),
+                )
+            });
+        }
+        Operator::AppendHandTransactionQuarantinedParent => {
+            let index = pick(&signed_txns);
+            touch(&mut effect, &blocks[index]);
+            blocks[index] = edit_narration(&blocks[index]);
+            let quarantined_id = compute_content_id(
+                &parse_file(&format!("{}\n", blocks[index]))
+                    .expect("edited block parses")
+                    .remove(0),
+            );
+            blocks.push(set_lines(HAND_TRANSACTION, |lines| {
+                lines.insert(1, format!("  {KEY_PARENTS}: \"{quarantined_id}\""))
+            }));
+        }
+        Operator::ForeignAuthorHalfEnvelope => {
+            let provider = foreign_provider(truth);
+            extra_authors.push(provider.public_key_hex());
+            blocks.push(set_lines(HAND_TRANSACTION, |lines| {
+                lines.insert(
+                    1,
+                    format!("  {KEY_AUTHOR}: \"{}\"", provider.public_key_hex()),
+                )
+            }));
+        }
     }
-    Some((join_blocks(&blocks), effect))
+    Some(Mutation {
+        text: join_blocks(&blocks),
+        effect,
+        journal,
+        extra_authors,
+    })
 }
 
 // ─── One fuzz case ───────────────────────────────────────────────────────────
@@ -1030,7 +1369,13 @@ struct CaseReport {
 }
 
 fn run_case(truth: &Truth, operator: Operator, position: usize, checks: Checks) -> CaseReport {
-    let Some((mutated, effect)) = mutate(truth, operator, position) else {
+    let Some(Mutation {
+        text: mutated,
+        effect,
+        journal,
+        extra_authors,
+    }) = mutate(truth, operator, position)
+    else {
         return CaseReport {
             applied: false,
             failures: Vec::new(),
@@ -1041,6 +1386,9 @@ fn run_case(truth: &Truth, operator: Operator, position: usize, checks: Checks) 
     let dir = fresh_dir("case");
     let path = dir.join("ledger.bean");
     std::fs::write(&path, &mutated).unwrap();
+    if let Some(record) = &journal {
+        append_record(&journal_path_for(&path), record).expect("journal record written");
+    }
 
     let mut failures = Vec::new();
     let mut adopted = BTreeMap::new();
@@ -1051,7 +1399,7 @@ fn run_case(truth: &Truth, operator: Operator, position: usize, checks: Checks) 
             let first = snapshot_of(&svc);
             drop(svc);
             failures.extend(
-                audit(&first, truth, &effect, checks)
+                audit_with(&first, truth, &effect, checks, &extra_authors)
                     .into_iter()
                     .map(|failure| format!("first boot: {failure}")),
             );
@@ -1067,7 +1415,7 @@ fn run_case(truth: &Truth, operator: Operator, position: usize, checks: Checks) 
                     let second = snapshot_of(&svc);
                     drop(svc);
                     failures.extend(
-                        audit(&second, truth, &effect, checks)
+                        audit_with(&second, truth, &effect, checks, &extra_authors)
                             .into_iter()
                             .map(|failure| format!("reboot: {failure}")),
                     );
@@ -1237,6 +1585,209 @@ fn op_p_identity() {
     assert_eq!(first.balances, truth.balances);
 }
 
+// ─── A2 (0924 re-audit): what the signature covers, journal replay, salvage ──
+
+/// The signature covers `openledger-parents`: an edited parents line on a
+/// node-written record is quarantined, the record is not served.
+///
+/// Revert-proof: make the verifier arm of `verify_history_directive` (or the
+/// `set_verifier`/`set_signer` passes) a no-op and the record is served with
+/// a parent no peer resolves.
+#[test]
+fn op_q_edit_parents_line_of_signed_record_is_quarantined() {
+    let report = assert_holds(Operator::EditParentsLine, 31, 1, Checks::ALL);
+    assert_eq!(report.first.unwrap().quarantined_ids.len(), 1);
+}
+
+/// The signature covers `openledger-lamport`: an edited lamport line is
+/// quarantined.
+#[test]
+fn op_r_edit_lamport_line_of_signed_record_is_quarantined() {
+    let report = assert_holds(Operator::EditLamportLine, 32, 2, Checks::ALL);
+    assert_eq!(report.first.unwrap().quarantined_ids.len(), 1);
+}
+
+/// A duplicated envelope line resolves last-wins in the parser
+/// (`parse.rs` inserts into a `BTreeMap`), so "original, then edited" is the
+/// edited value: the signature does not verify and the record is quarantined
+/// rather than served under a lamport nobody signed.
+#[test]
+fn op_s_duplicated_lamport_line_resolves_to_the_last_spelling() {
+    let report = assert_holds(Operator::DuplicateLamportLineEdited, 33, 0, Checks::ALL);
+    assert_eq!(report.first.unwrap().quarantined_ids.len(), 1);
+}
+
+/// A record replayed from the commit journal takes the same loop as the
+/// `.bean` (canonical ∪ journal is one text), so an edited copy with a
+/// recomputed checksum is verified and quarantined; the canonical record is
+/// served; the compaction folds the journal and the reboot is a fixed point.
+///
+/// Revert-proof: a no-op verify pass serves the journal copy under a new id
+/// with the old signature.
+#[test]
+fn op_t_journal_edited_copy_is_verified_and_quarantined() {
+    let report = assert_holds(Operator::JournalEditedCopy, 34, 1, Checks::ALL);
+    assert!(report.adopted.is_empty(), "nothing new is served");
+    assert_eq!(report.first.unwrap().quarantined_ids.len(), 1);
+}
+
+/// A stray word right after the header line leaves a head that is the bare
+/// header (a 0-posting, envelope-less transaction) and an unparsable tail:
+/// the salvage demotes the head into the same raw block, nothing is adopted.
+///
+/// Revert-proof: drop the demotion in `salvage_unparsable_blocks` and the
+/// bare header is adopted as operator input — a 0-posting transaction
+/// signed by this node.
+#[test]
+fn op_u_stray_word_after_header_holds_the_block_whole() {
+    let report = assert_holds(Operator::StrayWordAfterHeader, 35, 0, Checks::ALL);
+    assert!(report.adopted.is_empty(), "the bare header is not adopted");
+    let first = report.first.unwrap();
+    assert_eq!(
+        first.quarantined_ids.len(),
+        0,
+        "held as raw text, not by id"
+    );
+    assert_eq!(first.quarantined_count, 1);
+}
+
+/// A block signed by another allowlisted peer, pasted in, is verified with
+/// its author's key and served untouched: the pipeline installs the
+/// verifier as `main.rs` does.
+#[test]
+fn op_v_pasted_block_signed_by_another_allowlisted_peer_is_served() {
+    let truth = generate_fixture(36);
+    let foreign = foreign_provider(&truth).public_key_hex();
+    let report = run_case(&truth, Operator::PasteSignedForeignBlock, 0, Checks::ALL);
+    assert!(report.failures.is_empty(), "{:#?}", report.failures);
+    assert_eq!(report.adopted.len(), 1);
+    let (_, directive) = report.adopted.iter().next().unwrap();
+    assert_eq!(
+        directive.metadata().get(KEY_AUTHOR),
+        Some(&foreign),
+        "served under the peer's authorship"
+    );
+}
+
+/// The same block with a forged signature is quarantined by the verifier —
+/// the author id is the key.
+///
+/// Revert-proof: remove `set_verifier` from the pipeline (or make the
+/// verifier arm a no-op) and the forged block is served as loaded.
+#[test]
+fn op_w_pasted_block_with_a_forged_signature_is_quarantined() {
+    let report = assert_holds(Operator::PasteForgedForeignBlock, 37, 0, Checks::ALL);
+    assert!(report.adopted.is_empty());
+    assert_eq!(report.first.unwrap().quarantined_ids.len(), 1);
+}
+
+/// A2-1: the operator fixes a typo in a line the node wrote AND appends a
+/// transaction in the same stop → edit → start session. Boot adopts the
+/// hand record with parents = the heads it sees, which include the edited
+/// record's new id; `set_signer` then quarantines that id; finalize signs
+/// the hand record over a parent no peer will ever hold. Every peer refuses
+/// it and everything this node authors afterwards.
+#[test]
+#[ignore = "A2-1: boot stamps a hand record's parents before the verify pass, so it names the edited record's id that set_signer then quarantines; signed over a parent no peer holds"]
+fn op_x_edited_record_plus_hand_append_in_one_session() {
+    assert_holds(Operator::EditNarrationPlusAppendHand, 38, 0, Checks::ALL);
+}
+
+/// A2-1 by paste: a hand header pasted between the envelope and the postings
+/// of a signed block. The head (header + envelope, 0 postings) is
+/// quarantined by the verify pass; the tail (the hand header + the original's
+/// postings) is adopted with the quarantined head as its parent.
+#[test]
+#[ignore = "A2-1: the tail of a pasted-into signed block is adopted with the quarantined head as its parent"]
+fn op_y_hand_header_pasted_inside_a_signed_block() {
+    assert_holds(Operator::PasteHeaderInsideSignedBlock, 39, 1, Checks::ALL);
+}
+
+/// A2-3: L-75 resolves a hand-typed parent in DAG ∪ quarantine. An edited
+/// own record is quarantined under a new id that no peer holds; a hand line
+/// naming it is adopted, signed and served, and orphaned on every peer.
+#[test]
+#[ignore = "A2-3: L-75 resolves hand parents in DAG ∪ quarantine; a quarantined edited record is in no peer's DAG"]
+fn op_z_hand_parent_naming_the_quarantined_id() {
+    assert_holds(
+        Operator::AppendHandTransactionQuarantinedParent,
+        40,
+        0,
+        Checks::ALL,
+    );
+}
+
+/// A2-2: a hand transaction with `openledger-author: <another allowlisted
+/// peer>` and no lamport is operator input (M-47), stamped, kept under the
+/// foreign author, unsigned (T41 warn-and-adopt) and served as a head; every
+/// peer refuses it (`EnvelopeMissing(openledger-signature)`) and the node's
+/// next write names it.
+#[test]
+#[ignore = "A2-2: a foreign-author half envelope is adopted unsigned and served as a head; peers refuse it and everything this node writes after it"]
+fn op_aa_foreign_author_half_envelope_is_served_unsigned() {
+    assert_holds(Operator::ForeignAuthorHalfEnvelope, 41, 0, Checks::ALL);
+}
+
+/// A2-4: a lamport line of an own record edited to 4,000,000,000 is
+/// quarantined by the verify pass, yet the clock boot folded from it stays:
+/// the node's next write carries ~2^32 and the mesh follows (T72's
+/// "far above" WARN fires on every later boot).
+#[test]
+#[ignore = "A2-4: an own record's edited lamport moves the clock although the record is quarantined"]
+fn op_ab_huge_lamport_edit_of_a_quarantined_record_does_not_move_the_clock() {
+    let truth = generate_fixture(42);
+    let mutation = mutate(&truth, Operator::EditLamportLineHuge, 0).unwrap();
+    let dir = fresh_dir("huge");
+    let path = dir.join("ledger.bean");
+    std::fs::write(&path, &mutation.text).unwrap();
+    let svc = run_pipeline(&path, &truth.provider).unwrap();
+    assert_eq!(
+        svc.quarantined_ids().len(),
+        1,
+        "the edited record is quarantined"
+    );
+    let clock = svc.lamport_clock();
+    drop(svc);
+    std::fs::remove_dir_all(dir).ok();
+    assert!(
+        clock < 4_000_000_000,
+        "the clock ({clock}) follows a lamport the node never served"
+    );
+}
+
+/// A crash between `finalize_operator_input` and the startup compaction,
+/// with a quarantined own record beside the hand record: the next boot
+/// derives a byte-identical envelope (same lamport, same parents, same
+/// signature), and a second `finalize_operator_input` is a no-op. The
+/// 0923 §9 claim, re-checked now that `set_author_id` (T78) may shift
+/// lamports and the verify pass may shrink the DAG.
+#[test]
+fn composite_crash_between_finalize_and_compaction_is_byte_identical() {
+    let truth = generate_fixture(43);
+    let mutation = mutate(&truth, Operator::EditNarrationPlusAppendHand, 0).unwrap();
+    let dir = fresh_dir("crash");
+    let path = dir.join("ledger.bean");
+    std::fs::write(&path, &mutation.text).unwrap();
+    let hand_entry = |svc: &LedgerService| {
+        let id = svc
+            .all_directive_ids()
+            .into_iter()
+            .find(|id| !truth.entries.contains_key(id))
+            .expect("the hand record is served");
+        make_supply_entry(svc.get_directive(&id).unwrap())
+    };
+    let first = run_pipeline_until(&path, &truth.provider, false).unwrap();
+    let entry_first = hand_entry(&first);
+    assert_eq!(first.quarantined_ids().len(), 1);
+    drop(first);
+    let mut second = run_pipeline_until(&path, &truth.provider, false).unwrap();
+    let entry_second = hand_entry(&second);
+    assert_eq!(entry_first, entry_second, "byte-identical across the crash");
+    assert_eq!(second.finalize_operator_input(), 0, "idempotent");
+    drop(second);
+    std::fs::remove_dir_all(dir).ok();
+}
+
 // ─── Bug-catch proofs of the oracle itself ───────────────────────────────────
 
 /// A served record whose signature does not verify is named by the oracle
@@ -1393,6 +1944,25 @@ proptest! {
     fn boot_fuzz_all_operators(
         seed in any::<u64>(),
         operator in any_operator(&OPERATORS_ENABLED),
+        position in 0..64usize,
+    ) {
+        let truth = generate_fixture(seed);
+        let report = run_case(&truth, operator, position, Checks::ALL);
+        if !report.applied {
+            return Ok(());
+        }
+        prop_assert!(
+            report.failures.is_empty(),
+            "{operator:?} (seed {seed}, position {position}):\n  {}",
+            report.failures.join("\n  ")
+        );
+    }
+
+    /// Every green operator, including the A2 ones (A2).
+    #[test]
+    fn boot_fuzz_all_operators_including_a2(
+        seed in any::<u64>(),
+        operator in any_operator(&OPERATORS_ALL),
         position in 0..64usize,
     ) {
         let truth = generate_fixture(seed);

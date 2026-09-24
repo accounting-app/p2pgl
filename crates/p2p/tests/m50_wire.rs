@@ -257,3 +257,399 @@ fn a_transaction_amount_past_the_cap_is_refused_on_the_wire_for_good() {
             .unwrap_or_else(|error| panic!("{inside} refused: {error}"));
     }
 }
+
+// ─── A5 (0924 re-audit of T76): the wire on both caps, at every spelling ─────
+
+use ledger::limits::MAX_CURRENCIES_PER_OPEN;
+use ledger::model::{Open, Price};
+use ledger::service::MAX_POSTINGS_PER_TRANSACTION;
+
+/// A non-transaction directive (`open`, `price`) signed by `key` at `lamport`.
+fn sign_directive(key: &PeerKeySignatureProvider, directive: Directive, lamport: u64) -> Directive {
+    let content_id = compute_content_id(&directive);
+    let lamport = lamport.to_string();
+    let signature = key
+        .sign(&SignableMessage {
+            content_id: &content_id,
+            is_transaction: false,
+            parents: "",
+            lamport: &lamport,
+        })
+        .expect("a peer key signs");
+    let stamp = |metadata: &mut BTreeMap<String, String>| {
+        for (name, value) in [
+            ("openledger-author", key.public_key_hex()),
+            ("openledger-lamport", lamport.clone()),
+            ("openledger-signature", signature.clone()),
+        ] {
+            metadata.insert(name.to_owned(), value);
+        }
+    };
+    match directive {
+        Directive::Open(mut open) => {
+            stamp(&mut open.metadata);
+            Directive::Open(open)
+        }
+        Directive::Price(mut price) => {
+            stamp(&mut price.metadata);
+            Directive::Price(price)
+        }
+        other => other,
+    }
+}
+
+fn signed_open(
+    key: &PeerKeySignatureProvider,
+    account: &str,
+    currencies: usize,
+    lamport: u64,
+) -> Directive {
+    sign_directive(
+        key,
+        Directive::Open(Open {
+            date: date(1),
+            account: account.to_owned(),
+            currencies: (0..currencies)
+                .map(|index| format!("C{index:03}"))
+                .collect(),
+            metadata: BTreeMap::new(),
+        }),
+        lamport,
+    )
+}
+
+fn signed_price(key: &PeerKeySignatureProvider, number: Decimal, lamport: u64) -> Directive {
+    sign_directive(
+        key,
+        Directive::Price(Price {
+            date: date(5),
+            currency: "BTC".to_owned(),
+            amount: usd(number),
+            metadata: BTreeMap::new(),
+        }),
+        lamport,
+    )
+}
+
+/// A signed transfer with `count` postings (the first `count − 1` share one
+/// unit each, the last balances them).
+fn signed_wide_transfer(key: &PeerKeySignatureProvider, count: usize, lamport: u64) -> Directive {
+    let mut postings: Vec<Posting> = (0..count - 1)
+        .map(|_| posting("Assets:Cash", Decimal::ONE))
+        .collect();
+    postings.push(posting("Equity:Opening", -Decimal::from(count as u64 - 1)));
+    let mut transaction = Transaction {
+        date: date(2),
+        flag: Flag::Complete,
+        payee: None,
+        narration: Some(format!("{count} postings")),
+        tags: vec![],
+        links: vec![],
+        postings,
+        metadata: BTreeMap::new(),
+    };
+    let content_id = compute_content_id(&Directive::Transaction(transaction.clone()));
+    let lamport = lamport.to_string();
+    let signature = key
+        .sign(&SignableMessage {
+            content_id: &content_id,
+            is_transaction: true,
+            parents: "",
+            lamport: &lamport,
+        })
+        .expect("a peer key signs");
+    for (name, value) in [
+        ("openledger-author", key.public_key_hex()),
+        ("openledger-lamport", lamport),
+        ("openledger-parents", String::new()),
+        ("openledger-signature", signature),
+    ] {
+        transaction.metadata.insert(name.to_owned(), value);
+    }
+    Directive::Transaction(transaction)
+}
+
+/// A5 (0924): `10^21` — the inclusive bound — spelled at every scale a
+/// `Decimal` can hold it (0–7 fractional zeros, both signs) crosses the
+/// wire signed; one unit in the last place past it at each of those scales
+/// is refused as a permanent parse verdict; and the scale-8 spelling is not
+/// a `Decimal` at all (29 mantissa digits past 2^96), so it is refused
+/// before any cap by `from_str_exact` — on the wire and at the API alike.
+#[test]
+fn ten_pow_21_at_every_representable_scale_crosses_the_wire_signed() {
+    let key = key();
+    for scale in 0..=7u32 {
+        let spelled = if scale == 0 {
+            "1000000000000000000000".to_owned()
+        } else {
+            format!("1000000000000000000000.{}", "0".repeat(scale as usize))
+        };
+        for sign in ["", "-"] {
+            let number = Decimal::from_str_exact(&format!("{sign}{spelled}")).expect("literal");
+            assert_eq!(number.scale(), scale);
+            let admitted = through_the_wire(&signed_transfer(&key, 2, "at the cap", number, "", 3))
+                .unwrap_or_else(|error| panic!("{sign}{spelled} refused: {error}"));
+            let Directive::Transaction(ref transaction) = admitted else {
+                panic!("a transaction")
+            };
+            let back = transaction.postings[0]
+                .amount
+                .as_ref()
+                .expect("explicit")
+                .number;
+            assert_eq!(
+                back.to_string(),
+                format!("{sign}{spelled}"),
+                "spelling kept"
+            );
+        }
+        // One ulp past, at this scale.
+        let past = Decimal::from_i128_with_scale(
+            i128::try_from(MAX_AMOUNT_MAGNITUDE).expect("fits") * 10i128.pow(scale) + 1,
+            scale,
+        );
+        let error = through_the_wire(&signed_transfer(&key, 2, "past", past, "", 3))
+            .expect_err("one ulp past the cap");
+        assert!(
+            matches!(error, MergeError::ParseError(ref message) if message.contains("H-17")),
+            "{past}: {error:?}"
+        );
+        assert!(intake_refusal_is_permanent(&error));
+    }
+    let unrepresentable = "1000000000000000000000.00000000";
+    assert!(
+        Decimal::from_str_exact(unrepresentable).is_err(),
+        "10^21 with eight zeros is 10^29 in the mantissa: no Decimal"
+    );
+    // The same string in a body: the number reader refuses it before the cap.
+    let mut entry = make_supply_entry(&signed_transfer(
+        &key,
+        2,
+        "unrepresentable",
+        Decimal::ONE,
+        "",
+        3,
+    ));
+    entry.economic_bean = entry
+        .economic_bean
+        .replace("1 USD", &format!("{unrepresentable} USD"))
+        .replace("-1 USD", &format!("-{unrepresentable} USD"));
+    let error = validate_supply_entry(&entry).expect_err("no Decimal holds it");
+    assert!(
+        matches!(error, MergeError::ParseError(ref message) if message.contains("Invalid number")),
+        "{error:?}"
+    );
+}
+
+/// A5 (0924): `balance` and `price` amounts are never summed, so the cap does
+/// not apply to them on the wire either — `Decimal::MAX` in each crosses
+/// `validate_supply_entry` + `verify_remote_signature` signed and stages;
+/// the assertion then evaluates (and fails, honestly) against the exact sum.
+#[test]
+fn balance_and_price_amounts_above_the_cap_cross_the_wire_signed() {
+    let key = key();
+    let path = scratch_ledger("uncapped");
+    let mut service = LedgerService::boot(&path, "fresh".to_owned()).expect("boot");
+    service
+        .open_account(
+            "Assets:Cash".to_owned(),
+            NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+            vec![],
+        )
+        .expect("open");
+    for (label, directive) in [
+        ("balance MAX", signed_balance(&key, Decimal::MAX, 6)),
+        ("balance MIN", signed_balance(&key, Decimal::MIN, 7)),
+        ("price MAX", signed_price(&key, Decimal::MAX, 8)),
+        (
+            "price 10^21 + 1",
+            signed_price(
+                &key,
+                Decimal::from_i128_with_scale(
+                    i128::try_from(MAX_AMOUNT_MAGNITUDE).expect("fits") + 1,
+                    0,
+                ),
+                9,
+            ),
+        ),
+    ] {
+        let admitted = through_the_wire(&directive)
+            .unwrap_or_else(|error| panic!("{label} refused on the wire: {error}"));
+        service
+            .stage_remote_directive(admitted)
+            .unwrap_or_else(|error| panic!("{label} refused at staging: {error}"))
+            .expect("new");
+    }
+    let report = verify_dag(service.dag(), service.read_model());
+    assert!(report.ok, "{:?}", report.errors);
+    assert_eq!(report.assertions.evaluated, 2);
+    assert_eq!(
+        report.assertions.failures.len(),
+        2,
+        "0 is neither MAX nor MIN"
+    );
+    for failure in &report.assertions.failures {
+        assert!(failure.actual_exact);
+        assert_eq!(failure.actual, Decimal::ZERO);
+    }
+    drop(service);
+    let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+}
+
+/// A5 (0924): the M-50 fixture and the T75 caps together. A pre-T65 amount
+/// (`10^21`, 22 digits) crosses the wire; a pre-T75 `open` with one currency
+/// past `MAX_CURRENCIES_PER_OPEN`, and a transaction with one posting past
+/// `MAX_POSTINGS_PER_TRANSACTION`, do not — refused as
+/// `ResourceLimitExceeded`, permanent — although an upgraded node boots
+/// both as history and serves them. On a fresh replica the `open` is refused
+/// and every later posting to that account is `ACCOUNT_NOT_OPEN`: the R-10 /
+/// T51 residual class, which is M-50's consequence under another cap.
+#[test]
+fn a_pre_t65_amount_crosses_the_wire_but_an_over_t75_cap_directive_never_does() {
+    let key = key();
+    let ten_pow_21 =
+        Decimal::from_i128_with_scale(i128::try_from(MAX_AMOUNT_MAGNITUDE).expect("fits"), 0);
+    through_the_wire(&signed_transfer(
+        &key,
+        2,
+        "X pre-upgrade",
+        ten_pow_21,
+        "",
+        3,
+    ))
+    .expect("the pre-T65 amount is inside the magnitude cap");
+
+    let wide_open = signed_open(&key, "Assets:Many", MAX_CURRENCIES_PER_OPEN + 1, 2);
+    let error = through_the_wire(&wide_open).expect_err("65 currencies");
+    assert!(
+        matches!(error, MergeError::ResourceLimitExceeded(_)),
+        "{error:?}"
+    );
+    assert!(intake_refusal_is_permanent(&error));
+    through_the_wire(&signed_open(&key, "Assets:Few", MAX_CURRENCIES_PER_OPEN, 2))
+        .expect("64 currencies is the cap, inclusive");
+
+    let wide_transfer = signed_wide_transfer(&key, MAX_POSTINGS_PER_TRANSACTION + 1, 3);
+    let error = through_the_wire(&wide_transfer).expect_err("1001 postings");
+    assert!(
+        matches!(error, MergeError::ResourceLimitExceeded(_)),
+        "{error:?}"
+    );
+    assert!(intake_refusal_is_permanent(&error));
+
+    // The upgraded node boots the pre-T75 `open` as history and serves it …
+    let opening = signed_open(&key, "Equity:Opening", 0, 1);
+    let child = signed_transfer(&key, 3, "on the wide account", Decimal::from(5), "", 4);
+    let Directive::Transaction(mut on_many) = child else {
+        panic!("a transaction")
+    };
+    on_many.postings[0].account = "Assets:Many".to_owned();
+    on_many.postings[0].amount = Some(Amount {
+        number: Decimal::from(5),
+        currency: "C001".to_owned(),
+    });
+    on_many.postings[1].amount = Some(Amount {
+        number: Decimal::from(-5),
+        currency: "C001".to_owned(),
+    });
+    let on_many = {
+        // Re-sign the edited body.
+        let content_id = compute_content_id(&Directive::Transaction(on_many.clone()));
+        let signature = key
+            .sign(&SignableMessage {
+                content_id: &content_id,
+                is_transaction: true,
+                parents: "",
+                lamport: "4",
+            })
+            .expect("signs");
+        on_many
+            .metadata
+            .insert("openledger-signature".to_owned(), signature);
+        Directive::Transaction(on_many)
+    };
+    let path = scratch_ledger("t75-history");
+    std::fs::write(
+        &path,
+        ledger::serialize::full_file_serialize(
+            &[opening.clone(), wide_open.clone(), on_many.clone()],
+            &[],
+        ),
+    )
+    .expect("write");
+    let upgraded = LedgerService::boot(&path, "nodeA".to_owned()).expect("boot");
+    assert_eq!(
+        upgraded.quarantined_count(),
+        0,
+        "history over a T75 cap loads"
+    );
+    assert!(upgraded.contains_directive(&compute_content_id(&wide_open)));
+    assert!(upgraded.contains_directive(&compute_content_id(&on_many)));
+
+    // … and a fresh replica can never take the account or anything on it.
+    let fresh_path = scratch_ledger("t75-fresh");
+    let mut fresh = LedgerService::boot(&fresh_path, "fresh".to_owned()).expect("boot fresh");
+    let mut codes = Vec::new();
+    for directive in [&opening, &wide_open, &on_many] {
+        codes.push(match through_the_wire(directive) {
+            Ok(admitted) => fresh
+                .stage_remote_directive(admitted)
+                .map(|_| "OK")
+                .unwrap_or_else(|error| error.error_code()),
+            Err(error) => {
+                assert!(intake_refusal_is_permanent(&error));
+                "WIRE_REFUSED"
+            }
+        });
+    }
+    assert_eq!(codes, vec!["OK", "WIRE_REFUSED", "ACCOUNT_NOT_OPEN"]);
+    drop(upgraded);
+    drop(fresh);
+    let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    let _ = std::fs::remove_dir_all(fresh_path.parent().expect("dir"));
+}
+
+/// A5-1 (0924), the wire half: an amount past `10^21` that a pre-T65 node
+/// still serves (`5 × 10^22 WEI`) is refused for good on the wire, and its
+/// child — inside every cap, signed, well-formed — passes the wire and then
+/// waits on `MISSING_PARENT` forever. The upgraded serving node quarantines
+/// the parent as text and still serves the child (`ledger/tests/exact_balances.rs`
+/// pins that half, ignored); this pins what the receiving side does with it.
+#[test]
+fn an_over_cap_parent_a_pre_t65_node_serves_strands_its_child_on_every_fresh_replica() {
+    let key = key();
+    let over = Decimal::from_str_exact("50000000000000000000000").expect("5 × 10^22");
+    let x = signed_transfer(&key, 2, "X pre-upgrade", over, "", 3);
+    let x_id = compute_content_id(&x);
+    let c = signed_transfer(&key, 3, "C child", Decimal::from(5), &x_id, 4);
+
+    let error = through_the_wire(&x).expect_err("past the cap");
+    assert!(
+        matches!(error, MergeError::ParseError(ref message) if message.contains("H-17")),
+        "{error:?}"
+    );
+    assert!(
+        intake_refusal_is_permanent(&error),
+        "cached for good (L-34)"
+    );
+
+    let path = scratch_ledger("stranded");
+    let mut fresh = LedgerService::boot(&path, "fresh".to_owned()).expect("boot");
+    for account in ["Assets:Cash", "Equity:Opening"] {
+        fresh
+            .open_account(
+                account.to_owned(),
+                NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+                vec![],
+            )
+            .expect("open");
+    }
+    let admitted = through_the_wire(&c).expect("the child is inside every cap");
+    let error = fresh
+        .stage_remote_directive(admitted)
+        .expect_err("its parent can never arrive");
+    assert_eq!(error.error_code(), "MISSING_PARENT");
+    assert!(!fresh.contains_directive(&compute_content_id(&c)));
+    drop(fresh);
+    let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+}
