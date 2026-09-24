@@ -1681,33 +1681,35 @@ fn op_w_pasted_block_with_a_forged_signature_is_quarantined() {
     assert_eq!(report.first.unwrap().quarantined_ids.len(), 1);
 }
 
-/// A2-1: the operator fixes a typo in a line the node wrote AND appends a
-/// transaction in the same stop → edit → start session. Boot adopts the
-/// hand record with parents = the heads it sees, which include the edited
-/// record's new id; `set_signer` then quarantines that id; finalize signs
-/// the hand record over a parent no peer will ever hold. Every peer refuses
-/// it and everything this node authors afterwards.
+/// H-22 (0924 A2-1), closed by T79: the operator fixes a typo in a line the
+/// node wrote AND appends a transaction in the same stop → edit → start
+/// session. Boot adopts the hand record with parents = the heads it sees,
+/// which include the edited record's new id; `set_signer` then quarantines
+/// that id. Before T79 finalize signed the hand record over that parent,
+/// which no peer will ever hold, and every peer refused it and everything
+/// this node authored afterwards; the quarantine rebuild now re-chooses its
+/// parents from what survives, before it is signed.
 #[test]
-#[ignore = "A2-1: boot stamps a hand record's parents before the verify pass, so it names the edited record's id that set_signer then quarantines; signed over a parent no peer holds"]
 fn op_x_edited_record_plus_hand_append_in_one_session() {
     assert_holds(Operator::EditNarrationPlusAppendHand, 38, 0, Checks::ALL);
 }
 
-/// A2-1 by paste: a hand header pasted between the envelope and the postings
-/// of a signed block. The head (header + envelope, 0 postings) is
-/// quarantined by the verify pass; the tail (the hand header + the original's
-/// postings) is adopted with the quarantined head as its parent.
+/// H-22 by paste (0924 A2-1), closed by T79: a hand header pasted between
+/// the envelope and the postings of a signed block. The head (header +
+/// envelope, 0 postings) is quarantined by the verify pass; the tail (the
+/// hand header + the original's postings) was adopted with the quarantined
+/// head as its parent, and is now re-parented onto what survives.
 #[test]
-#[ignore = "A2-1: the tail of a pasted-into signed block is adopted with the quarantined head as its parent"]
 fn op_y_hand_header_pasted_inside_a_signed_block() {
     assert_holds(Operator::PasteHeaderInsideSignedBlock, 39, 1, Checks::ALL);
 }
 
-/// A2-3: L-75 resolves a hand-typed parent in DAG ∪ quarantine. An edited
-/// own record is quarantined under a new id that no peer holds; a hand line
-/// naming it is adopted, signed and served, and orphaned on every peer.
+/// H-22's second door (0924 A2-3), closed by T79: L-75 resolved a hand-typed
+/// parent in DAG ∪ quarantine. An edited own record is quarantined under a
+/// new id that no peer holds; a hand line naming it was adopted, signed and
+/// served, and orphaned on every peer. A hand parent must now be a record
+/// this node serves, so the line is quarantined with its parent.
 #[test]
-#[ignore = "A2-3: L-75 resolves hand parents in DAG ∪ quarantine; a quarantined edited record is in no peer's DAG"]
 fn op_z_hand_parent_naming_the_quarantined_id() {
     assert_holds(
         Operator::AppendHandTransactionQuarantinedParent,
@@ -1717,13 +1719,13 @@ fn op_z_hand_parent_naming_the_quarantined_id() {
     );
 }
 
-/// A2-2: a hand transaction with `openledger-author: <another allowlisted
-/// peer>` and no lamport is operator input (M-47), stamped, kept under the
-/// foreign author, unsigned (T41 warn-and-adopt) and served as a head; every
-/// peer refuses it (`EnvelopeMissing(openledger-signature)`) and the node's
-/// next write names it.
+/// M-54 (0924 A2-2), closed by T79: a hand transaction with
+/// `openledger-author: <another allowlisted peer>` and no lamport is operator
+/// input (M-47). Before T79 it was stamped, kept under the foreign author,
+/// unsigned (T41 warn-and-adopt) and served as a head; every peer refused it
+/// (`EnvelopeMissing(openledger-signature)`) and the node's next write named
+/// it. It is now quarantined as written at finalisation.
 #[test]
-#[ignore = "A2-2: a foreign-author half envelope is adopted unsigned and served as a head; peers refuse it and everything this node writes after it"]
 fn op_aa_foreign_author_half_envelope_is_served_unsigned() {
     assert_holds(Operator::ForeignAuthorHalfEnvelope, 41, 0, Checks::ALL);
 }

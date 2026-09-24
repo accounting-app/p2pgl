@@ -2412,14 +2412,15 @@ fn h19_bootstrap_join_through_gl_node_order_with_a_quarantined_block_converges()
 /// signed record AND a line appended. Boot stamps the operator input's
 /// parents (`adopt_operator_input_at_boot` → `adopt_file_directive` →
 /// `choose_parents`) against the heads it holds at that moment, which
-/// include the edited record; the H-20 pass runs later, inside `set_signer`,
-/// and `quarantine_out_of_dag` rebuilds the survivors without re-parenting
-/// them. The hand line — now signed by A and served — names a parent that
-/// exists only in A's (and the copy's) quarantine, so B buffers it forever,
-/// and so every write A and F make afterwards, F's own included. Fails at
-/// HEAD: B ends three short, waiting on the quarantined id.
+/// include the edited record; the H-20 pass runs later, inside `set_signer`.
+/// Before T79 `quarantine_out_of_dag` rebuilt the survivors without
+/// re-parenting them, so the hand line — signed by A and served — named a
+/// parent that existed only in A's (and the copy's) quarantine, B buffered it
+/// forever, and so every write A and F made afterwards (H-22; failed at
+/// `3d64a16` with B three short, waiting on the quarantined id). The rebuild
+/// now re-chooses the parents of still-unsigned operator input, so the mesh
+/// converges through the bootstrap join.
 #[test]
-#[ignore = "A1-3: operator input adopted at boot names a parent the H-20 pass then quarantines; the signed hand line and everything authored after it are orphaned on every peer"]
 fn h20_operator_input_stamped_at_boot_must_not_name_a_record_the_h20_pass_quarantines() {
     let (report, waiting) = bootstrap_join_scenario(9249, true, true);
     eprintln!("A1 / bootstrap (edit + hand line): B waits on {waiting:?}");

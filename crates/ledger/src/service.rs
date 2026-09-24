@@ -2849,10 +2849,21 @@ pub struct LedgerService {
     /// Since M-47 a half envelope is operator input, so an adopted entry may
     /// carry an author the operator typed rather than the one boot stamped.
     /// `finalize_operator_input` writes this node's id only over the stamp;
-    /// a file-spelled author that names another node is kept, unsigned, with
-    /// the T41 warning — this node cannot sign for it, and rewriting it would
-    /// sign a record the operator attributed to someone else.
+    /// since T79 (M-54) a file-spelled author that names another node is
+    /// refused there — quarantined as the file spelled it — because this node
+    /// cannot sign for it and every peer refuses it unsigned.
     operator_input_with_file_author: BTreeSet<String>,
+    /// Each entry of [`Self::unsigned_operator_input`] as the FILE spelled it,
+    /// keyed by its stored id, with the file's content id (they differ when
+    /// I2 resolved an elided posting) (T79 / H-22).
+    ///
+    /// Boot adopts operator input before the node's identity is complete, so
+    /// a later step can still refuse an entry it already stamped: the
+    /// signature pass can quarantine the parent it was stamped against, and
+    /// `finalize_operator_input` refuses a foreign author. A refused entry is
+    /// quarantined as written — never a half-stamped copy, which the next
+    /// boot would mistake for history. Cleared by `finalize_operator_input`.
+    operator_input_as_written: BTreeMap<String, (String, Directive)>,
     /// The highest lamport per author among the records boot saw that did
     /// NOT reach the DAG (L-67, T78) — see [`BootLamportHigh`]. Boot folds
     /// only its own author's entry into the clock; `gl-node` boots under a
@@ -3648,6 +3659,7 @@ impl LedgerService {
             unverified_history,
             unsigned_operator_input: Vec::new(),
             operator_input_with_file_author: BTreeSet::new(),
+            operator_input_as_written: BTreeMap::new(),
             boot_outside_dag_lamports: std::mem::take(&mut lamport_high.outside_dag),
             boot_clock_base: lamport_clock,
             journal_path,
@@ -3749,6 +3761,19 @@ impl LedgerService {
         !metadata.contains_key(ENVELOPE_KEY_AUTHOR) || !metadata.contains_key(ENVELOPE_KEY_LAMPORT)
     }
 
+    /// Why operator input naming another node as its author is refused
+    /// (M-54, T79) — one spelling for both file paths.
+    fn foreign_operator_input_reason(other_author: &str) -> String {
+        format!(
+            "openledger-author names another node ({other_author}) on an entry that is missing \
+             its openledger-lamport or openledger-signature: this node cannot sign for that \
+             author, every signing peer refuses it unsigned, and this node's next write would \
+             name it as a parent — so everything written after it would be refused too. \
+             Remove the openledger-author line to adopt it as this node's own, or restore the \
+             author's complete signed record from a peer's copy of the ledger (M-54)"
+        )
+    }
+
     /// Hold `directive` in `quarantine` under `content_id`, keeping an
     /// enveloped spelling over an envelope-less one (L-76).
     ///
@@ -3839,12 +3864,20 @@ impl LedgerService {
             // `finalize_operator_input` must not write this node's id over
             // it — see `operator_input_with_file_author`.
             let file_author = directive_author(&directive).map(str::to_owned);
-            match self.adopt_file_directive(directive, content_id.clone(), &mut tally) {
+            match self.adopt_file_directive(
+                directive,
+                content_id.clone(),
+                &mut tally,
+                AdoptionPath::Boot,
+            ) {
                 FileAdoption::Inserted(stored_id) => {
                     if file_author.is_some() {
                         self.operator_input_with_file_author
                             .insert(stored_id.clone());
                     }
+                    // T79 / H-22: a later step may still refuse this entry.
+                    self.operator_input_as_written
+                        .insert(stored_id.clone(), (content_id, as_written));
                     self.unsigned_operator_input.push(stored_id);
                 }
                 FileAdoption::Duplicate => {}
@@ -3920,13 +3953,54 @@ impl LedgerService {
         if self.unsigned_operator_input.is_empty() {
             return 0;
         }
+        // M-54 (T79): an author the FILE spelled that is not this node. Boot
+        // could not judge it — the author may have been a placeholder then —
+        // so it is judged here, where the identity is complete, and refused:
+        // this node cannot sign for it, every signing peer refuses it
+        // unsigned, and adopted it is a head this node's next write names.
+        // `quarantine_out_of_dag` holds each as the file spelled it and
+        // re-chooses the parents of the operator input that named it.
+        let foreign: BTreeSet<String> = self
+            .operator_input_with_file_author
+            .iter()
+            .filter(|content_id| {
+                self.dag
+                    .get(content_id.as_str())
+                    .and_then(directive_author)
+                    .is_some_and(|author| author != self.author_id)
+            })
+            .cloned()
+            .collect();
+        if !foreign.is_empty() {
+            for content_id in &foreign {
+                let author = self
+                    .dag
+                    .get(content_id)
+                    .and_then(directive_author)
+                    .unwrap_or_default()
+                    .to_owned();
+                warn!(
+                    id = %content_id,
+                    this_node = %self.author_id,
+                    file = %self.file_path.display(),
+                    "quarantining a ledger-file entry, kept in the file as written: {}",
+                    Self::foreign_operator_input_reason(&author)
+                );
+            }
+            self.quarantine_out_of_dag(&foreign);
+        }
         let ids = std::mem::take(&mut self.unsigned_operator_input);
-        let file_authored = std::mem::take(&mut self.operator_input_with_file_author);
+        // Every file-spelled author left names this node (the rest were
+        // refused above), so the stamp below writes the id it already has.
+        self.operator_input_with_file_author.clear();
+        // Nothing can refuse these entries any more: from here on they are
+        // this node's signed records, and a later quarantine treats them as
+        // history.
+        self.operator_input_as_written.clear();
         let author_id = self.author_id.clone();
         let signer = self.signer.clone();
         let mut finalized = 0usize;
         let mut signed = 0usize;
-        let mut foreign: Vec<(String, String)> = Vec::new();
         // L-74: the read model holds boot's clone of each of these, author
         // placeholder and all; re-indexed below so `journal` serves what
         // `transaction` serves.
@@ -3937,19 +4011,6 @@ impl LedgerService {
             };
             let is_transaction = matches!(directive, Directive::Transaction(_));
             let metadata = directive_metadata_mut(directive);
-            // M-47 / T41: an author the file spelled that is not this node is
-            // the operator's word — this node cannot sign for it, and writing
-            // its own id over it would sign a record the operator attributed
-            // to someone else. Kept as adopted (unsigned) with the T41
-            // warning; the remedy is to drop the author line.
-            if file_authored.contains(content_id) {
-                if let Some(other) = metadata.get(ENVELOPE_KEY_AUTHOR) {
-                    if other != &author_id {
-                        foreign.push((content_id.clone(), other.clone()));
-                        continue;
-                    }
-                }
-            }
             metadata.insert(ENVELOPE_KEY_AUTHOR.to_owned(), author_id.clone());
             finalized += 1;
             if !metadata.contains_key(ENVELOPE_KEY_SIGNATURE) {
@@ -3984,16 +4045,6 @@ impl LedgerService {
             author = %author_id,
             "operator input adopted at boot now carries this node's identity (H-13)"
         );
-        for (content_id, other_author) in &foreign {
-            warn!(
-                content_id,
-                author = %other_author,
-                this_node = %author_id,
-                "adopted an unsigned ledger-file entry authored by another node; this node \
-                 cannot sign for that author, so the entry will NOT replicate to peers with \
-                 signing enabled — remove the openledger-author line to adopt it as our own"
-            );
-        }
         self.verify_history_pass();
         // L-64 (T78): boot deferred its size check to here, where the
         // envelope the compaction will write is complete.
@@ -4042,6 +4093,7 @@ impl LedgerService {
     /// boot is never refused. Returns how many directives were quarantined.
     pub fn verify_own_history(&mut self) -> usize {
         let quarantined = self.verify_history_pass();
+        self.warn_about_served_children_of_quarantined_records();
         if !self.unverified_history.is_empty() {
             warn!(
                 unverified = self.unverified_history.len(),
@@ -4057,6 +4109,58 @@ impl LedgerService {
             );
         }
         quarantined
+    }
+
+    /// Say so when a record this node serves names a parent that is only in
+    /// its quarantine (T79 / H-22, item (d)).
+    ///
+    /// No peer can adopt such a record — a quarantined record is never
+    /// served — nor anything that descends from it. Since T79 boot never
+    /// signs operator input over such a parent, so this finds what an older
+    /// build left in the file (a hand line signed over an edited record's
+    /// id), or a signed record whose parent this boot quarantined for another
+    /// reason (history written before signing was enabled). A WARN, not a
+    /// quarantine: the records are this node's acknowledged history, often
+    /// with long chains of descendants, and quarantining them would take all
+    /// of that out of local balances on the strength of what the mesh lacks —
+    /// the operator decides (restore the parent, or rebuild this node by the
+    /// bootstrap join). One pass over the DAG, only when something is
+    /// quarantined.
+    fn warn_about_served_children_of_quarantined_records(&self) {
+        if self.quarantined.is_empty() {
+            return;
+        }
+        let mut stranded: Vec<(&str, &str)> = Vec::new();
+        for content_id in self.dag.ids() {
+            let Some(Directive::Transaction(txn)) = self.dag.get(content_id) else {
+                continue;
+            };
+            if let Some(parent) = txn
+                .parent_ids()
+                .into_iter()
+                .find(|parent| self.quarantined.contains_key(*parent))
+            {
+                stranded.push((content_id, parent));
+            }
+        }
+        if stranded.is_empty() {
+            return;
+        }
+        stranded.sort_unstable();
+        warn!(
+            count = stranded.len(),
+            sample = %stranded
+                .iter()
+                .take(RECOVERY_MISSING_SAMPLE)
+                .map(|(child, parent)| format!("{child}->{parent}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            file = %self.file_path.display(),
+            "ledger records this node serves name a parent that is only in its quarantine; no \
+             peer can adopt them or anything written after them. Restore the quarantined \
+             parent from a peer's copy of the ledger, or rebuild this node by the bootstrap \
+             join (H-22)"
+        );
     }
 
     /// The pass behind [`Self::verify_own_history`], without the
@@ -4205,51 +4309,99 @@ impl LedgerService {
     /// boot put it: an own record's value still counts whether it is served
     /// or quarantined (`BootLamportHigh`), and a clock never walks backwards
     /// (M-18).
+    ///
+    /// # Operator input still awaiting finalisation (T79 / H-22)
+    ///
+    /// Boot stamps the parents of operator input from the heads it holds
+    /// *before* the signature pass has judged the history under them, so an
+    /// edited own record (a new content id under its old envelope) can be
+    /// the head a hand-appended line names. Signed over that parent, the
+    /// line is refused by every peer — a quarantined record is never served
+    /// — and so is everything this node writes after it. The rebuild is
+    /// where that is put right, because it is the one point that knows what
+    /// survives: each entry of [`Self::unsigned_operator_input`] is rebased
+    /// onto the DAG being rebuilt, exactly as boot would have adopted it
+    /// over a file without the refused records —
+    ///
+    /// * parents this node chose are chosen again, by the same rule, from
+    ///   the rebuilt heads (nothing is signed or served yet, so nothing has
+    ///   seen the old choice; the content id is unchanged, since parents are
+    ///   envelope);
+    /// * parents the operator spelled must all have survived, else the entry
+    ///   is refused;
+    /// * a transaction must still validate against the rebuilt account
+    ///   state (an `open` it relied on may be what was refused).
+    ///
+    /// A refused entry joins the quarantine as the FILE spelled it
+    /// ([`Self::operator_input_as_written`]), and a later entry that relied
+    /// on it is judged against a DAG without it, so the refusal cascades
+    /// exactly as far as it must. Signed history is never re-parented.
     fn quarantine_out_of_dag(&mut self, refused: &BTreeSet<String>) {
         if refused.is_empty() {
             return;
         }
-        let ids: Vec<String> = self
+        let entries: Vec<(String, Directive)> = self
             .dag
             .content_ids()
             .into_iter()
-            .map(str::to_owned)
+            .filter_map(|id| Some((id.to_owned(), self.dag.get(id)?.clone())))
             .collect();
-        let mut survivors: Vec<Directive> = Vec::with_capacity(ids.len());
-        for content_id in ids {
-            let Some(directive) = self.dag.get(&content_id) else {
-                continue;
-            };
-            if refused.contains(&content_id) {
-                self.quarantined
-                    .entry(content_id)
-                    .or_insert_with(|| directive.clone());
-            } else {
-                survivors.push(directive.clone());
-            }
-        }
+        let pending: HashSet<String> = self.unsigned_operator_input.iter().cloned().collect();
+        let hand_parented: HashSet<String> = self
+            .operator_input_as_written
+            .iter()
+            .filter(|(_, (_, written))| {
+                matches!(written, Directive::Transaction(_))
+                    && written.metadata().contains_key(ENVELOPE_KEY_PARENTS)
+            })
+            .map(|(stored_id, _)| stored_id.clone())
+            .collect();
+        let mut refused_now: BTreeSet<String> = refused.clone();
+        let mut rebased = 0usize;
+        let mut cascaded: Vec<(String, String)> = Vec::new();
         let mut dag = LedgerDag::new();
         let mut accounts = AccountState::new();
-        for directive in &survivors {
+        for (content_id, mut directive) in entries {
+            if refused_now.contains(&content_id) {
+                self.hold_refused_in_quarantine(&content_id, directive);
+                continue;
+            }
+            if pending.contains(&content_id) {
+                match Self::rebase_operator_input(
+                    &content_id,
+                    &mut directive,
+                    hand_parented.contains(&content_id),
+                    &dag,
+                    &accounts,
+                ) {
+                    Ok(true) => rebased += 1,
+                    Ok(false) => {}
+                    Err(reason) => {
+                        refused_now.insert(content_id.clone());
+                        cascaded.push((content_id.clone(), reason));
+                        self.hold_refused_in_quarantine(&content_id, directive);
+                        continue;
+                    }
+                }
+            }
             match dag.insert(directive.clone(), false) {
                 Ok(InsertResult::Inserted { content_id }) => {
-                    accounts.record_lifecycle(directive, &content_id);
+                    accounts.record_lifecycle(&directive, &content_id);
                 }
                 Ok(InsertResult::Duplicate { .. }) => {}
                 Err(error) => {
                     // Unreachable — a subset of an acyclic graph inserted in
-                    // the same order is acyclic — but a refusal here must cost
+                    // the same order is acyclic, and a rebased entry names
+                    // only admissible heads — but a refusal here must cost
                     // the directive its place in the DAG, never in the file.
-                    let content_id = compute_content_id(directive);
                     error!(
                         %error,
                         id = %content_id,
                         "the DAG refused a directive while being rebuilt after a signature \
                          quarantine; the directive is quarantined too (H-08)"
                     );
-                    self.quarantined
-                        .entry(content_id)
-                        .or_insert_with(|| directive.clone());
+                    refused_now.insert(content_id.clone());
+                    self.hold_refused_in_quarantine(&content_id, directive);
                 }
             }
         }
@@ -4257,16 +4409,98 @@ impl LedgerService {
         self.read_model = ReadModel::build(&kept);
         self.dag = dag;
         self.accounts = accounts;
-        self.pending_ids.retain(|id| !refused.contains(id));
-        self.adopted_from_file.retain(|id| !refused.contains(id));
+        self.pending_ids.retain(|id| !refused_now.contains(id));
+        self.adopted_from_file
+            .retain(|id| !refused_now.contains(id));
         self.unsigned_operator_input
-            .retain(|id| !refused.contains(id));
+            .retain(|id| !refused_now.contains(id));
+        self.operator_input_with_file_author
+            .retain(|id| !refused_now.contains(id));
+        self.operator_input_as_written
+            .retain(|id, _| !refused_now.contains(id));
         // L-35: the snapshot cache is keyed by DAG size, which just shrank
         // and can grow back to the same number over a different set.
         *self
             .directive_id_snapshot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        if rebased > 0 {
+            info!(
+                rebased,
+                file = %self.file_path.display(),
+                "operator input adopted at boot named a record this boot has since \
+                 quarantined; its parents were chosen again from what survives, before it is \
+                 signed (H-22)"
+            );
+        }
+        for (content_id, reason) in &cascaded {
+            warn!(
+                id = %content_id,
+                reason = %reason,
+                file = %self.file_path.display(),
+                "quarantining operator input adopted at boot, kept in the file as written: it \
+                 depended on a record this boot has since quarantined (H-22, H-08)"
+            );
+        }
+    }
+
+    /// Hold a directive the rebuild refused in [`Self::quarantined`] (T79):
+    /// as the file spelled it when it is operator input still awaiting
+    /// finalisation, never a half-stamped copy the next boot would take for
+    /// history; as loaded otherwise.
+    fn hold_refused_in_quarantine(&mut self, content_id: &str, directive: Directive) {
+        match self.operator_input_as_written.get(content_id).cloned() {
+            Some((file_id, written)) => {
+                Self::quarantine_keeping_envelope(&mut self.quarantined, file_id, written);
+            }
+            None => {
+                self.quarantined
+                    .entry(content_id.to_owned())
+                    .or_insert(directive);
+            }
+        }
+    }
+
+    /// Rebase one entry of operator input onto the DAG being rebuilt (T79 /
+    /// H-22) — see [`Self::quarantine_out_of_dag`]. `Ok(true)` when its
+    /// parents changed; `Err` names why it can no longer be adopted.
+    fn rebase_operator_input(
+        content_id: &str,
+        directive: &mut Directive,
+        hand_parented: bool,
+        dag: &LedgerDag,
+        accounts: &AccountState,
+    ) -> Result<bool, String> {
+        let Directive::Transaction(txn) = directive else {
+            return Ok(false);
+        };
+        let before = txn.metadata.get(ENVELOPE_KEY_PARENTS).cloned();
+        if hand_parented {
+            if let Some(parent) = txn
+                .parent_ids()
+                .into_iter()
+                .find(|parent| dag.get(parent).is_none())
+            {
+                return Err(format!(
+                    "openledger-parents names {parent}, a record this boot quarantined, which is \
+                     never served (H-22); a hand-spelled parent must be a record this node \
+                     serves — remove the openledger-parents line to let this node choose the \
+                     parents (L-75)"
+                ));
+            }
+        } else {
+            txn.metadata.insert(
+                ENVELOPE_KEY_PARENTS.to_owned(),
+                choose_parents_in(dag, content_id),
+            );
+        }
+        if let Err(error) = validate_transaction(txn, accounts) {
+            return Err(format!(
+                "{error} — without the records this boot quarantined, the entry no longer \
+                 validates (H-22)"
+            ));
+        }
+        Ok(txn.metadata.get(ENVELOPE_KEY_PARENTS) != before.as_ref())
     }
 
     /// How many boot-adopted operator-input directives still await
@@ -4738,13 +4972,7 @@ impl LedgerService {
     /// Shared by every site that stamps parents — the local append and the file
     /// path's adoption of a parentless operator entry — so they cannot drift.
     fn choose_parents(&self, content_id: &str) -> String {
-        let mut candidates: Vec<(&str, Option<&str>)> = self
-            .dag
-            .heads_admissible_as_parents_of(content_id)
-            .into_iter()
-            .map(|head| (head, self.dag.get(head).and_then(directive_author)))
-            .collect();
-        select_parents(&mut candidates).join(",")
+        choose_parents_in(&self.dag, content_id)
     }
 
     /// The value this node stamps next, checked against the one Lamport rule
@@ -5642,11 +5870,15 @@ impl LedgerService {
                     "L-13 reload installed: memory rebuilt from disk after a failed commit"
                 );
                 self.adopt_reloaded(reloaded);
-                self.finalize_operator_input();
                 // H-20: the reload re-derived the history from the file; the
                 // carried signer and verifier were installed by assignment,
-                // not by the setters, so the pass runs here.
+                // not by the setters, so the pass runs here — and BEFORE the
+                // operator input is finalised (T79 / H-22): the pass's
+                // quarantine rebases what is still unsigned, and anything it
+                // quarantined after the signing would stay a parent of a
+                // signed record no peer can resolve.
                 self.verify_own_history();
+                self.finalize_operator_input();
             }
             Err(reload_error) => {
                 // M-49: see the doc comment — the refusing arm's two facts,
@@ -6345,7 +6577,7 @@ impl LedgerService {
                 continue;
             }
 
-            self.adopt_file_directive(directive, content_id, &mut tally);
+            self.adopt_file_directive(directive, content_id, &mut tally, AdoptionPath::Live);
         }
 
         // H-08: a repaired directive keeps its content id (the envelope is
@@ -6423,6 +6655,7 @@ impl LedgerService {
         mut directive: Directive,
         content_id: String,
         tally: &mut AdoptionTally,
+        path: AdoptionPath,
     ) -> FileAdoption {
         // H-04: never adopt a directive whose date the file grammar cannot
         // read back — the next persist would brick every later boot. Checked
@@ -6497,23 +6730,51 @@ impl LedgerService {
         // stale by construction.
         let needs_stamp = Self::is_operator_input(&directive);
 
+        // M-54 (T79): operator input is this node's own authorship. An entry
+        // whose file-spelled `openledger-author` names another node cannot be
+        // signed here, so every signing peer refuses it — and adopted, it is
+        // a head this node's next write names as a parent, so everything
+        // written after it is orphaned mesh-wide (M-47's consequence). On the
+        // live path the identity is final, so the rule runs here, before
+        // anything is stamped; at boot the author may still be a placeholder
+        // and the rule runs in `finalize_operator_input`.
+        if needs_stamp && path == AdoptionPath::Live {
+            if let Some(other) = directive_author(&directive) {
+                if other != self.author_id {
+                    tally.refuse(content_id, Self::foreign_operator_input_reason(other));
+                    return FileAdoption::Refused;
+                }
+            }
+        }
+
         // L-75: parents the operator spelled must resolve. They are honoured
         // verbatim below, and a parent that exists nowhere became a signed
         // head every later write descended from — orphaned on every peer, no
-        // warning. DAG ∪ quarantine: a quarantined parent is a record this
-        // file holds. Checked before the stamp, so a refusal moves nothing.
+        // warning. In the DAG alone (T79 / H-22): a quarantined record is
+        // never served, so no peer can resolve a parent that is only in this
+        // node's quarantine. At boot the DAG still holds history the
+        // signature pass has not judged yet; `quarantine_out_of_dag` checks
+        // again once it has. Checked before the stamp, so a refusal moves
+        // nothing.
         if needs_stamp {
             if let Directive::Transaction(txn) = &directive {
-                if let Some(parent) = txn.parent_ids().into_iter().find(|parent| {
-                    self.dag.get(parent).is_none() && !self.quarantined.contains_key(*parent)
-                }) {
+                if let Some(parent) = txn
+                    .parent_ids()
+                    .into_iter()
+                    .find(|parent| self.dag.get(parent).is_none())
+                {
+                    let held = if self.quarantined.contains_key(parent) {
+                        "is held in this node's quarantine, which is never served"
+                    } else {
+                        "exists nowhere in this ledger"
+                    };
                     tally.refuse(
                         content_id,
                         format!(
-                            "openledger-parents names {parent}, which exists neither in this \
-                             ledger nor in its quarantine; a hand-spelled parent must resolve \
-                             — remove the openledger-parents line to let this node choose \
-                             the parents (L-75)"
+                            "openledger-parents names {parent}, which {held}; a hand-spelled \
+                             parent must be a record this node serves, and since H-22 one in \
+                             the quarantine does not count — remove the openledger-parents \
+                             line to let this node choose the parents (L-75)"
                         ),
                     );
                     return FileAdoption::Refused;
@@ -6879,6 +7140,16 @@ impl LedgerService {
             Some(other_author) => {
                 // Only reachable when the file itself named an author; the
                 // stamp above never overwrites one.
+                //
+                // T79 / M-54: no longer reachable for OPERATOR INPUT — an
+                // entry missing its lamport or signature that names another
+                // node is refused before this (live path) or at finalisation
+                // (boot), because adopted it was a parent of every later own
+                // write and the reasons below did not hold for it (it is not
+                // inert: it is a head). What still arrives here is a complete
+                // author + lamport envelope without a signature on a node
+                // with no verifier (signing off), where the history rule is
+                // "loaded as it is".
                 //
                 // T41 — WARN AND ADOPT is the deliberate choice here; refusing
                 // the entry was considered and rejected. Three reasons.
@@ -7569,6 +7840,38 @@ enum FileAdoption {
     Duplicate,
     /// Refused; the reason is in the tally.
     Refused,
+}
+
+/// Which file path is adopting (T79 / M-54).
+///
+/// The two paths share every rule except those that need the node's final
+/// identity. At boot the author may still be a placeholder (gl-node sets the
+/// real one after boot) and no signer or verifier is installed, so a rule
+/// that compares against this node's author runs later, in
+/// `finalize_operator_input`; on the live reconcile the identity is final
+/// and the rule runs before anything is stamped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdoptionPath {
+    /// `boot`'s adoption of operator input.
+    Boot,
+    /// The live reconcile of a running node.
+    Live,
+}
+
+/// The `openledger-parents` value a transaction stored under `content_id`
+/// names in `dag`: its admissible heads, at most [`MAX_PARENTS`], chosen by
+/// [`select_parents`] (§3.3.1, L-40, T64, L-68).
+///
+/// A free function over any DAG so the H-22 rebuild in
+/// `quarantine_out_of_dag` chooses parents by exactly the rule every stamping
+/// site uses, against the DAG it is rebuilding.
+fn choose_parents_in(dag: &LedgerDag, content_id: &str) -> String {
+    let mut candidates: Vec<(&str, Option<&str>)> = dag
+        .heads_admissible_as_parents_of(content_id)
+        .into_iter()
+        .map(|head| (head, dag.get(head).and_then(directive_author)))
+        .collect();
+    select_parents(&mut candidates).join(",")
 }
 
 /// Mutable access to whichever directive kind's metadata map this is.
@@ -8370,11 +8673,13 @@ mod tests {
 
     #[test]
     fn test_reconcile_does_not_sign_for_another_author() {
-        // Residual, made explicit: a hand edit that names someone ELSE as
-        // author cannot be signed by this node — the verifier checks the
-        // signature against the author's key, so our signature would fail
-        // everywhere, which is worse than none. Adopted unsigned, with a
-        // warning that names the entry.
+        // A hand edit that names someone ELSE as author cannot be signed by
+        // this node — the verifier checks the signature against the author's
+        // key, so our signature would fail everywhere. Until T79 it was
+        // adopted unsigned with a warning; adopted, it was a head this node's
+        // next write named, so everything written after it was refused by
+        // every peer (M-54). Since T79 (decision (7) of 2026-09-24) it is
+        // refused, and the canonical rewrite removes it from the file.
         let (mut svc, path) = setup_with_accounts();
         svc.set_signer(marker_signer());
         append_to_file(
@@ -8386,22 +8691,18 @@ mod tests {
         );
 
         let (result, logs) = capture_warnings(|| svc.reconcile_file().unwrap());
-        assert_eq!(result.new_directives, 1, "still adopted, just not signed");
-
-        let adopted = svc
-            .dag()
-            .directives()
-            .into_iter()
-            .find(|d| matches!(d, Directive::Transaction(_)))
-            .unwrap();
-        assert!(!adopted.metadata().contains_key("openledger-signature"));
-        assert_eq!(
-            adopted.metadata().get("openledger-author"),
-            Some(&"a-different-node".to_owned())
+        assert_eq!(result.new_directives, 0, "M-54: refused, not adopted");
+        assert_eq!(result.rejected, 1);
+        assert!(
+            !svc.dag()
+                .directives()
+                .into_iter()
+                .any(|d| matches!(d, Directive::Transaction(_))),
+            "nothing this node could not sign is served"
         );
         assert!(
-            logs.contains("cannot sign for that author"),
-            "the operator must be told this entry will not replicate: {logs}"
+            logs.contains("cannot sign for that author") && logs.contains("(M-54)"),
+            "the operator must be told why and what to do: {logs}"
         );
 
         std::fs::remove_file(path).ok();
@@ -10809,7 +11110,7 @@ mod tests {
                         let directive = remote_open(&account, date, value);
                         let content_id = compute_content_id(&directive);
                         let mut tally = AdoptionTally::default();
-                        let _ = svc.adopt_file_directive(directive, content_id, &mut tally);
+                        let _ = svc.adopt_file_directive(directive, content_id, &mut tally, AdoptionPath::Live);
                     }
                     _ => {
                         if let Ok(id) = svc.open_account(account, date, vec![]) {
@@ -18426,8 +18727,11 @@ mod tests {
 
     /// M-47: a half envelope is operator input on both file paths. The
     /// lamport is re-stamped, this node's author stamped where absent, the
-    /// stale signature discarded and a fresh one made; a foreign author is
-    /// kept, unsigned, with the T41 warning.
+    /// stale signature discarded and a fresh one made. A foreign author was
+    /// kept, unsigned, with the T41 warning until T79 (M-54, decision (7) of
+    /// 2026-09-24): it is now quarantined as the file spelled it, at
+    /// finalisation, and again at every boot until the operator removes the
+    /// author line.
     ///
     /// Bug-catch: revert `is_operator_input` to "neither key" and the two
     /// own half-envelope records are served raw; revert the signature strip
@@ -18472,16 +18776,29 @@ mod tests {
         let (finalized, logged) = capture_warnings(|| svc.finalize_operator_input());
         assert_eq!(finalized, 2);
         assert!(logged.contains("cannot sign for that author"), "{logged}");
+        assert!(logged.contains("(M-54)"), "{logged}");
         check_own(&svc, "author only");
         check_own(&svc, "lamport only");
-        let foreign = transaction_named(&svc, "foreign author only").unwrap();
-        assert_eq!(
-            foreign.metadata().get(ENVELOPE_KEY_AUTHOR),
-            Some(&"a-different-node".to_owned()),
-            "T41: the operator's attribution is kept"
+        assert!(
+            transaction_named(&svc, "foreign author only").is_none(),
+            "M-54: a foreign author on operator input is never served"
         );
-        assert!(foreign.metadata().contains_key(ENVELOPE_KEY_LAMPORT));
-        assert!(!foreign.metadata().contains_key(ENVELOPE_KEY_SIGNATURE));
+        let held = svc
+            .quarantined
+            .values()
+            .find(|directive| {
+                matches!(directive, Directive::Transaction(txn)
+                    if txn.narration.as_deref() == Some("foreign author only"))
+            })
+            .expect("quarantined");
+        assert_eq!(
+            held.metadata().get(ENVELOPE_KEY_AUTHOR),
+            Some(&"a-different-node".to_owned())
+        );
+        assert!(
+            !held.metadata().contains_key(ENVELOPE_KEY_LAMPORT),
+            "held as the file spelled it, never half-stamped"
+        );
         assert_lamport_pairs_unique(
             &svc.dag()
                 .directives()
@@ -18500,10 +18817,15 @@ mod tests {
         rebooted.set_signer(marker_signer());
         assert_eq!(
             rebooted.unsigned_operator_input_count(),
-            0,
-            "canonical on disk"
+            1,
+            "canonical on disk; the refused line is back in the file as written"
         );
-        assert_eq!(rebooted.quarantined_count(), 0);
+        assert_eq!(rebooted.finalize_operator_input(), 0);
+        assert_eq!(
+            rebooted.quarantined_count(),
+            1,
+            "refused again, never served"
+        );
         check_own(&rebooted, "author only");
         check_own(&rebooted, "lamport only");
 
@@ -18756,6 +19078,340 @@ mod tests {
         assert_eq!(
             svc.accounts().currencies("Assets:Cash"),
             Some(usd.as_slice())
+        );
+        remove_ledger_and_journal(&path);
+    }
+
+    // ── T79: operator input after verification (H-22, M-54, L-75) ──
+
+    /// A node-written file with two signed transactions, "T1" then "T2"
+    /// (T2 names T1), written by a marker-signing node and compacted.
+    fn two_signed_transactions_file() -> (PathBuf, String, String) {
+        let (mut svc, path) = setup_with_signed_accounts();
+        let first = svc
+            .append_transaction_signing(
+                narrated_input(make_date(2024, 1, 15), "T1"),
+                marker_sign(true),
+            )
+            .unwrap()
+            .txid;
+        let second = svc
+            .append_transaction_signing(
+                narrated_input(make_date(2024, 1, 16), "T2"),
+                marker_sign(true),
+            )
+            .unwrap()
+            .txid;
+        svc.compact().unwrap();
+        drop(svc);
+        (path, first, second)
+    }
+
+    /// A hand-typed transaction with no envelope, dated after the fixture.
+    fn h22_hand_line(narration: &str, parents: Option<&str>) -> String {
+        let parents = parents
+            .map(|parents| format!("\x20 openledger-parents: \"{parents}\"\n"))
+            .unwrap_or_default();
+        format!(
+            "\n2024-01-26 * \"Hand\" \"{narration}\"\n\
+             {parents}\
+             \x20 Assets:Cash                                         5.00 USD\n\
+             \x20 Equity:Opening                                     -5.00 USD\n"
+        )
+    }
+
+    /// The content id "T2" is stored under once its narration is edited to
+    /// "T2 edited" — the id the H-20 pass quarantines.
+    fn edited_t2_id(path: &Path) -> String {
+        let probe = LedgerService::boot(path.to_path_buf(), "test-peer".to_owned()).unwrap();
+        let id = compute_content_id(transaction_named(&probe, "T2 edited").expect("loaded"));
+        drop(probe);
+        id
+    }
+
+    fn parents_of_named(svc: &LedgerService, narration: &str) -> Vec<String> {
+        let directive = transaction_named(svc, narration).expect(narration);
+        match directive {
+            Directive::Transaction(txn) => {
+                txn.parent_ids().into_iter().map(str::to_owned).collect()
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// H-22: the README's stop → edit → start with a typo fixed in a signed
+    /// record AND a line appended. Boot stamps the hand line's parents from
+    /// the heads it holds — the edited record among them — before the H-20
+    /// pass quarantines that record. The quarantine rebuild re-chooses the
+    /// parents of the still-unsigned line from what survives, so the line is
+    /// signed over records every peer holds; a reboot is a fixed point.
+    ///
+    /// Bug-catch: drop the rebase in `quarantine_out_of_dag` and the hand
+    /// line is signed naming the quarantined id.
+    #[test]
+    fn h22_a_hand_line_appended_with_an_edit_is_rebased_before_it_is_signed() {
+        let (path, first, _second) = two_signed_transactions_file();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, content.replace("\"T2\"", "\"T2 edited\"")).unwrap();
+        let edited = edited_t2_id(&path);
+        append_to_file(&path, &h22_hand_line("appended with the fix", None));
+
+        // gl-node's order.
+        let mut svc = LedgerService::boot(path.clone(), "local".to_owned()).unwrap();
+        svc.set_author_id("test-peer".to_owned());
+        assert_eq!(
+            parents_of_named(&svc, "appended with the fix"),
+            vec![edited.clone()],
+            "premise: boot stamped the edited record as the parent"
+        );
+        let (_, logged) = capture_warnings(|| svc.set_signer(marker_signer()));
+        assert_eq!(svc.quarantined_ids(), vec![edited.as_str()]);
+        assert!(logged.contains("(H-22)") || svc.unsigned_operator_input_count() == 1);
+        assert_eq!(svc.finalize_operator_input(), 1);
+
+        assert_eq!(
+            parents_of_named(&svc, "appended with the fix"),
+            vec![first.clone()],
+            "re-chosen from what survives: T1 is the head once T2 edited is quarantined"
+        );
+        let hand = transaction_named(&svc, "appended with the fix").unwrap();
+        assert_eq!(
+            hand.metadata().get(ENVELOPE_KEY_SIGNATURE),
+            Some(&marker_signature(hand)),
+            "signed over the rebased parents"
+        );
+        assert_eq!(
+            svc.read_model()
+                .transaction(&compute_content_id(hand))
+                .and_then(|indexed| {
+                    indexed
+                        .transaction
+                        .metadata
+                        .get(ENVELOPE_KEY_PARENTS)
+                        .cloned()
+                }),
+            Some(first.clone()),
+            "L-74: the read model serves the rebased envelope"
+        );
+
+        svc.compact().unwrap();
+        let mut rebooted = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        rebooted.set_signer(marker_signer());
+        assert_eq!(rebooted.quarantined_ids(), vec![edited.as_str()]);
+        assert_eq!(
+            parents_of_named(&rebooted, "appended with the fix"),
+            vec![first],
+            "a fixed point"
+        );
+        remove_ledger_and_journal(&path);
+    }
+
+    /// H-22's second door and the cascade: a hand line whose
+    /// `openledger-parents` the operator spelled names the edited record's
+    /// id. At adoption that id is still in the DAG; once the H-20 pass
+    /// quarantines it, the line is refused with it and held as the FILE
+    /// spelled it, and a later hand line boot had stamped on top of it is
+    /// rebased onto what survives. Live, a hand parent that is only in the
+    /// quarantine is refused outright (L-75 in the DAG alone).
+    ///
+    /// Bug-catch: drop the hand-parent check in `rebase_operator_input` and
+    /// the first line is served naming the quarantined id; restore "DAG ∪
+    /// quarantine" in `adopt_file_directive` and the live line is adopted.
+    #[test]
+    fn h22_a_hand_parent_on_a_record_quarantined_at_boot_is_refused_and_the_refusal_cascades() {
+        let (path, first, _second) = two_signed_transactions_file();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, content.replace("\"T2\"", "\"T2 edited\"")).unwrap();
+        let edited = edited_t2_id(&path);
+        append_to_file(&path, &h22_hand_line("names the edit", Some(&edited)));
+        append_to_file(&path, &h22_hand_line("stamped on top", None));
+
+        let mut svc = LedgerService::boot(path.clone(), "local".to_owned()).unwrap();
+        svc.set_author_id("test-peer".to_owned());
+        assert_eq!(svc.unsigned_operator_input_count(), 2, "premise");
+        let (_, logged) = capture_warnings(|| svc.set_signer(marker_signer()));
+        assert!(transaction_named(&svc, "names the edit").is_none());
+        assert!(
+            logged.contains("(L-75)") && logged.contains(&edited),
+            "the refusal names the parent: {logged}"
+        );
+        let held = svc
+            .quarantined
+            .values()
+            .find(|directive| {
+                matches!(directive, Directive::Transaction(txn)
+                    if txn.narration.as_deref() == Some("names the edit"))
+            })
+            .expect("held in the quarantine");
+        assert!(
+            !held.metadata().contains_key(ENVELOPE_KEY_LAMPORT)
+                && !held.metadata().contains_key(ENVELOPE_KEY_AUTHOR),
+            "as the file spelled it, never half-stamped"
+        );
+        assert_eq!(
+            parents_of_named(&svc, "stamped on top"),
+            vec![first.clone()],
+            "rebased off the refused line"
+        );
+        assert_eq!(svc.finalize_operator_input(), 1);
+
+        // Live: a hand parent that is only in the quarantine is refused.
+        svc.compact().unwrap();
+        append_to_file(&path, &h22_hand_line("live on the edit", Some(&edited)));
+        let (result, logged) = capture_warnings(|| svc.reconcile_file().unwrap());
+        assert_eq!(result.new_directives, 0);
+        assert_eq!(
+            result.rejected, 3,
+            "the live line, plus the two quarantined blocks the reconcile re-reads"
+        );
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            on_disk.contains("T2 edited") && on_disk.contains("names the edit"),
+            "H-08: quarantined blocks are written back unchanged"
+        );
+        assert!(
+            logged.contains("held in this node's quarantine"),
+            "{logged}"
+        );
+        assert!(transaction_named(&svc, "live on the edit").is_none());
+        remove_ledger_and_journal(&path);
+    }
+
+    /// M-54 at boot, and the rebase's validation: a hand `open` naming
+    /// another node as its author is refused at finalisation (the author is
+    /// only final then), and a hand transaction on that account — valid
+    /// when boot adopted it — no longer validates without the `open`, so it
+    /// is refused with it, as written.
+    ///
+    /// Bug-catch: drop the foreign-author refusal in
+    /// `finalize_operator_input` and the `open` is served unsigned; drop the
+    /// `validate_transaction` call in `rebase_operator_input` and the
+    /// transaction is served on an account no peer has opened.
+    #[test]
+    fn m54_a_foreign_author_open_is_refused_at_finalisation_and_what_relied_on_it_goes_with_it() {
+        let (path, _) = signed_node_written_file();
+        append_to_file(
+            &path,
+            "\n2024-01-20 open Assets:Pasted USD\n\
+             \x20 openledger-author: \"a-different-node\"\n",
+        );
+        append_to_file(
+            &path,
+            "\n2024-01-26 * \"Hand\" \"on the pasted account\"\n\
+             \x20 Assets:Pasted                                        5.00 USD\n\
+             \x20 Equity:Opening                                      -5.00 USD\n",
+        );
+        let mut svc = LedgerService::boot(path.clone(), "local".to_owned()).unwrap();
+        svc.set_author_id("test-peer".to_owned());
+        svc.set_signer(marker_signer());
+        assert_eq!(
+            svc.unsigned_operator_input_count(),
+            2,
+            "premise: both adopted"
+        );
+
+        let (finalized, logged) = capture_warnings(|| svc.finalize_operator_input());
+        assert_eq!(finalized, 0);
+        assert!(logged.contains("(M-54)"), "{logged}");
+        assert!(logged.contains("no longer validates"), "{logged}");
+        assert!(!svc.accounts().is_open("Assets:Pasted"));
+        assert!(transaction_named(&svc, "on the pasted account").is_none());
+        assert_eq!(svc.quarantined_count(), 2);
+        assert!(
+            svc.quarantined
+                .values()
+                .all(|directive| { !directive.metadata().contains_key(ENVELOPE_KEY_LAMPORT) }),
+            "both held as the file spelled them"
+        );
+        remove_ledger_and_journal(&path);
+    }
+
+    /// H-22 on the recovery path: a reload re-derives operator input from
+    /// the file with parents stamped over the edited record, and the carried
+    /// signer is installed by assignment. The pass must run before the
+    /// finalisation, or the hand line is signed over a parent the pass then
+    /// quarantines.
+    ///
+    /// Bug-catch: swap `verify_own_history` and `finalize_operator_input`
+    /// back in `finish_recovery` and the hand line is signed naming the
+    /// quarantined id.
+    #[test]
+    fn h22_a_recovery_reload_verifies_before_it_finalises() {
+        let (path, first, _second) = two_signed_transactions_file();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, content.replace("\"T2\"", "\"T2 edited\"")).unwrap();
+        let edited = edited_t2_id(&path);
+        append_to_file(&path, &h22_hand_line("appended with the fix", None));
+
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.set_signer(marker_signer());
+        let (_, logged) = capture_warnings(|| svc.recover_failed_commit());
+        assert!(logged.contains("L-13 reload installed"), "{logged}");
+        assert_eq!(svc.quarantined_ids(), vec![edited.as_str()]);
+        assert_eq!(
+            svc.unsigned_operator_input_count(),
+            0,
+            "finalised by the reload"
+        );
+        assert_eq!(parents_of_named(&svc, "appended with the fix"), vec![first]);
+        let hand = transaction_named(&svc, "appended with the fix").unwrap();
+        assert_eq!(
+            hand.metadata().get(ENVELOPE_KEY_SIGNATURE),
+            Some(&marker_signature(hand))
+        );
+        remove_ledger_and_journal(&path);
+    }
+
+    /// H-22 item (d): a record this node serves that names a parent only in
+    /// its quarantine — what an older build left behind, a hand line signed
+    /// over an edited record's id — is named in a WARN with the remedy. Not
+    /// quarantined: it is acknowledged history (see
+    /// `warn_about_served_children_of_quarantined_records`).
+    ///
+    /// Bug-catch: drop the call in `verify_own_history` and nothing is said.
+    #[test]
+    fn h22_a_served_record_naming_a_quarantined_parent_is_named_in_a_warning() {
+        let (path, _first, _second) = two_signed_transactions_file();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, content.replace("\"T2\"", "\"T2 edited\"")).unwrap();
+        let edited = edited_t2_id(&path);
+        let unsigned = format!(
+            "2024-01-26 * \"Hand\" \"signed by an older build\"\n\
+             \x20 openledger-author: \"test-peer\"\n\
+             \x20 openledger-lamport: \"50\"\n\
+             \x20 openledger-parents: \"{edited}\"\n\
+             \x20 Assets:Cash                                         5.00 USD\n\
+             \x20 Equity:Opening                                     -5.00 USD\n"
+        );
+        let signed = marker_signed(parse_file(&unsigned).unwrap().remove(0));
+        let signature = signed
+            .metadata()
+            .get(ENVELOPE_KEY_SIGNATURE)
+            .unwrap()
+            .clone();
+        append_to_file(
+            &path,
+            &format!(
+                "\n{}",
+                unsigned.replacen(
+                    "  openledger-parents",
+                    &format!("  openledger-signature: \"{signature}\"\n  openledger-parents"),
+                    1
+                )
+            ),
+        );
+
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.set_signer(marker_signer());
+        assert_eq!(svc.quarantined_ids(), vec![edited.as_str()]);
+        assert!(
+            transaction_named(&svc, "signed by an older build").is_some(),
+            "premise: it verifies, so it is served"
+        );
+        let (_, logged) = capture_warnings(|| svc.verify_own_history());
+        assert!(
+            logged.contains("only in its quarantine") && logged.contains(&edited),
+            "{logged}"
         );
         remove_ledger_and_journal(&path);
     }

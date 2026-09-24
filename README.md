@@ -857,12 +857,25 @@ this node issued, so it is re-stamped, this node's author is stamped, and any
 `openledger-signature` on it is discarded (a signature under a fresh lamport
 verifies nowhere). An entry with only an `openledger-author` line is re-stamped
 the same way; if that author is **this node**, it is signed and replicates, and
-if it names **another node** it is adopted unsigned with a warning (this node
-cannot sign for it — drop the author line to adopt it as your own). A hand-typed
-`openledger-parents` line must name records this ledger holds; one that names a
-parent that exists nowhere is refused, because a signed record with a parent
-nobody can resolve orphans everything written after it. A hand-typed `open` of
-an account that is already open is refused exactly as the API refuses it. And a
+if it names **another node** it is refused — quarantined at boot, dropped by a
+live reconcile — because this node cannot sign for it, every signing peer
+refuses it unsigned, and adopted it would become the parent of this node's next
+write, so everything written after it would be refused too. Drop the author line
+to adopt it as your own, or restore that node's complete signed record from a
+peer's copy. A hand-typed `openledger-parents` line must name records this node
+**serves**; one that names a parent that exists nowhere, or one held in the
+quarantine (a quarantined record is never served), is refused, because a signed
+record with a parent nobody can resolve orphans everything written after it. A
+hand-typed `open` of an account that is already open is refused exactly as the
+API refuses it.
+
+Fixing a node-written record **and** appending new lines in the same edit is
+safe. Boot stamps your new lines' parents before it has checked the signatures
+of the history under them, so the edited record (quarantined a moment later) can
+be what they were first stamped against; the quarantine re-chooses the parents
+of every line not yet signed from what survives, and refuses — as written — a
+new line that can no longer stand without the quarantined record (one whose
+hand-typed parent it was, or a transaction on an account only it opened). And a
 node that **enables signing over a history it wrote unsigned** finds that
 history quarantined at the first signing boot — it never replicated to a signing
 mesh anyway; delete the `openledger-*` lines from those blocks to re-adopt them
@@ -919,10 +932,11 @@ same trust boundary:
   persist, so it replicates like any other local write. Two exceptions: an entry
   that carries a **full** envelope (author, lamport and signature) is adopted
   untouched if its signature verifies and refused if it does not (it came from
-  a peer, or it was edited), and one whose author names a different node is
-  adopted unsigned with a warning (signing it here would produce a signature
-  that verifies nowhere). A signature on a half envelope is discarded and a new
-  one made, as described under the stop → edit → start path above.
+  a peer, or it was edited), and an entry *without* a full envelope whose
+  author names a different node is refused (signing it here would produce a
+  signature that verifies nowhere, and unsigned it would orphan every later
+  write). A signature on a half envelope is discarded and a new one made, as
+  described under the stop → edit → start path above.
 - Entries that fail validation are dropped, each logged with its content id and
   the reason, before the canonical rewrite removes them from the file — and that
   rewrite runs even when *every* entry in the edit was refused, so a refused
