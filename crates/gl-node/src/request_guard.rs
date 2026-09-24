@@ -15,14 +15,17 @@
 //! the node as `127.0.0.1` or `::1`, which are always in the allowed set.
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{header, Method, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tracing::warn;
+
+use crate::connection_limiter::{KeyedRefusalLog, MAX_REFUSAL_LOG_SOURCES};
 
 /// Shared guard state for the middleware layer.
 #[derive(Clone)]
@@ -59,51 +62,51 @@ const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
 /// the most a value could be.
 const MAX_ECHOED_HEADER_CHARS: usize = 128;
 
-/// Process-wide throttle for the guard's refusal `warn!`s (M-41).
+/// The guard's refusal-log throttle: one line per client per
+/// [`REFUSAL_LOG_INTERVAL`] (M-41, T77).
+///
+/// Keyed by the client's rate-limit bucket (`rate_limit::bucket_key`: the
+/// address, or its `/64` for IPv6, so one host cannot mint sources by walking
+/// its prefix), with `None` for a request that carries no peer address (only
+/// in-process tests build those). Before T77 this was one window for the whole
+/// process: one client's flood hid every other client's refusals, and what the
+/// window swallowed was reported only by the next refusal — a burst of 999
+/// that then stopped was never reported at all. See
+/// [`crate::connection_limiter::KeyedRefusalLog`] for the table's bound and
+/// the report at expiry.
 ///
 /// A `static` rather than a field of [`RequestGuardState`] because the state is
-/// built by struct literal at three sites and the log is per process anyway:
-/// the question it answers — "has this node warned about a refused request in
-/// the last ten seconds?" — has one answer per node.
-static REFUSAL_LOG: RefusalLogThrottle = RefusalLogThrottle::new();
+/// built by struct literal at three sites and the log is per process anyway.
+static REFUSAL_LOG: LazyLock<KeyedRefusalLog<Option<IpAddr>>> = LazyLock::new(guard_refusal_log);
 
-/// One `warn!` per [`REFUSAL_LOG_INTERVAL`], plus a count of what was not said.
-pub(crate) struct RefusalLogThrottle {
-    inner: Mutex<RefusalLogState>,
+/// A fresh guard throttle (the static's constructor; tests build their own).
+fn guard_refusal_log() -> KeyedRefusalLog<Option<IpAddr>> {
+    KeyedRefusalLog::new(
+        REFUSAL_LOG_INTERVAL,
+        MAX_REFUSAL_LOG_SOURCES,
+        report_guard_refusals,
+    )
 }
 
-struct RefusalLogState {
-    last_logged: Option<Instant>,
-    suppressed: u64,
-}
-
-impl RefusalLogThrottle {
-    const fn new() -> Self {
-        Self {
-            inner: Mutex::new(RefusalLogState {
-                last_logged: None,
-                suppressed: 0,
-            }),
-        }
-    }
-
-    /// Note one refusal at `now`. `Some(suppressed)` means "log this one, and
-    /// this many were swallowed since the last line"; `None` means stay quiet.
-    fn note(&self, now: Instant) -> Option<u64> {
-        let mut state = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match state.last_logged {
-            Some(previous) if now.duration_since(previous) < REFUSAL_LOG_INTERVAL => {
-                state.suppressed = state.suppressed.saturating_add(1);
-                None
-            }
-            _ => {
-                state.last_logged = Some(now);
-                Some(std::mem::take(&mut state.suppressed))
-            }
-        }
+/// The guard's expiry summary (T77): what one client's window swallowed.
+fn report_guard_refusals(source: Option<&Option<IpAddr>>, suppressed: u64) {
+    match source {
+        Some(Some(client)) => warn!(
+            client = %client,
+            suppressed,
+            "requests refused by the Host/Content-Type/Origin guard and not logged in the last \
+             window"
+        ),
+        Some(None) => warn!(
+            suppressed,
+            "requests without a peer address refused by the Host/Content-Type/Origin guard and \
+             not logged in the last window"
+        ),
+        None => warn!(
+            suppressed,
+            "requests refused by the Host/Content-Type/Origin guard and not logged in the last \
+             window (clients past the per-client log table)"
+        ),
     }
 }
 
@@ -125,24 +128,44 @@ enum Echo<'a> {
     Origin(&'a str),
 }
 
-/// Emit one throttled refusal line, or nothing (M-41).
+/// Emit one throttled refusal line, or nothing (M-41, T77).
 ///
-/// Throttled as one class: an attacker can pick whichever of the three checks
-/// fails, so a per-check interval would be three lines per interval, not one.
-/// The excerpt is taken only when a line is actually emitted, so a suppressed
-/// refusal allocates nothing for its log.
-fn warn_refusal(reason: &'static str, echo: Echo<'_>) {
-    let Some(suppressed) = REFUSAL_LOG.note(Instant::now()) else {
+/// Throttled per client, and as one class per client: an attacker can pick
+/// whichever of the three checks fails, so a per-check interval would be three
+/// lines per interval, not one. The excerpt is taken only when a line is
+/// actually emitted, so a suppressed refusal allocates nothing for its log.
+fn warn_refusal(client: Option<IpAddr>, reason: &'static str, echo: Echo<'_>) {
+    warn_refusal_on(&REFUSAL_LOG, client, reason, echo);
+}
+
+/// [`warn_refusal`] against an explicit throttle (tests build their own).
+fn warn_refusal_on(
+    log: &KeyedRefusalLog<Option<IpAddr>>,
+    client: Option<IpAddr>,
+    reason: &'static str,
+    echo: Echo<'_>,
+) {
+    let Some(suppressed) = log.note(client, Instant::now()) else {
         return;
     };
+    let client = client.map_or_else(|| "-".to_owned(), |client| client.to_string());
     match echo {
-        Echo::Nothing => warn!(suppressed, "{reason}"),
-        Echo::Host(value) => warn!(host = %excerpt(value), suppressed, "{reason}"),
+        Echo::Nothing => warn!(%client, suppressed, "{reason}"),
+        Echo::Host(value) => warn!(%client, host = %excerpt(value), suppressed, "{reason}"),
         Echo::ContentType(value) => {
-            warn!(content_type = %excerpt(value), suppressed, "{reason}")
+            warn!(%client, content_type = %excerpt(value), suppressed, "{reason}")
         }
-        Echo::Origin(value) => warn!(origin = %excerpt(value), suppressed, "{reason}"),
+        Echo::Origin(value) => warn!(%client, origin = %excerpt(value), suppressed, "{reason}"),
     }
+}
+
+/// The key a request's refusals are throttled under (T77): the peer's
+/// rate-limit bucket, from the `ConnectInfo` the hardened accept loop inserts.
+fn refusal_source(request: &Request<Body>) -> Option<IpAddr> {
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(peer)| crate::rate_limit::bucket_key(peer.ip()))
 }
 
 /// Axum middleware enforcing Host, Content-Type and Origin on GraphQL routes (H-01).
@@ -165,12 +188,14 @@ pub async fn request_guard(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    let client = refusal_source(&request);
     // (a) Host — applies to every method, GraphiQL GETs included.
     let authority = match request.headers().get(header::HOST) {
         Some(value) => match value.to_str() {
             Ok(text) => Some(text.to_owned()),
             Err(_) => {
                 warn_refusal(
+                    client,
                     "rejected request with a non-ASCII Host header",
                     Echo::Nothing,
                 );
@@ -185,6 +210,7 @@ pub async fn request_guard(
     };
     let Some(authority) = authority else {
         warn_refusal(
+            client,
             "rejected request with neither a Host header nor a URI authority",
             Echo::Nothing,
         );
@@ -195,6 +221,7 @@ pub async fn request_guard(
         // M-41: throttled, and the value is an excerpt — `%host` echoed up to
         // hyper's whole head buffer, once per request, outside every limiter.
         warn_refusal(
+            client,
             "rejected request whose Host is not allowed (DNS rebinding)",
             Echo::Host(&host),
         );
@@ -220,6 +247,7 @@ pub async fn request_guard(
             Some("application/json") => {}
             other => {
                 warn_refusal(
+                    client,
                     "rejected POST with a non-JSON Content-Type",
                     Echo::ContentType(other.unwrap_or("<missing>")),
                 );
@@ -233,6 +261,7 @@ pub async fn request_guard(
                 Ok(text) => text,
                 Err(_) => {
                     warn_refusal(
+                        client,
                         "rejected POST with a non-ASCII Origin header",
                         Echo::Nothing,
                     );
@@ -246,7 +275,7 @@ pub async fn request_guard(
                 &guard_state.allowed_hosts,
                 guard_state.tls_terminated,
             ) {
-                warn_refusal("rejected cross-origin POST", Echo::Origin(origin));
+                warn_refusal(client, "rejected cross-origin POST", Echo::Origin(origin));
                 return reject(StatusCode::FORBIDDEN, ORIGIN_REJECTION);
             }
         }
@@ -386,6 +415,7 @@ mod tests {
     use axum::Router;
     use http_body_util::BodyExt;
     use std::io::Write;
+    use std::sync::Mutex;
     use tempfile::NamedTempFile;
     use tokio::sync::RwLock;
     use tower::ServiceExt;
@@ -917,31 +947,147 @@ mod tests {
 
     // ── T66 / M-41: throttled, excerpted refusal logging ────────────────
 
-    /// The throttle logs the first refusal, swallows everything inside the
-    /// interval while counting it, and hands the count to the next line out.
+    /// The throttle logs a client's first refusal, swallows everything inside
+    /// the interval while counting it, and — outside a runtime, where no
+    /// expiry report can be scheduled — hands the count to the next line out.
     #[test]
     fn refusal_log_throttle_emits_one_line_per_interval_with_a_count() {
-        let throttle = RefusalLogThrottle::new();
+        let throttle = guard_refusal_log();
+        let client = Some(IpAddr::from([192, 0, 2, 1]));
         let start = Instant::now();
-        assert_eq!(throttle.note(start), Some(0), "the first refusal is logged");
+        assert_eq!(
+            throttle.note(client, start),
+            Some(0),
+            "the first refusal is logged"
+        );
         for _ in 0..999 {
-            assert_eq!(throttle.note(start + Duration::from_millis(5)), None);
+            assert_eq!(
+                throttle.note(client, start + Duration::from_millis(5)),
+                None
+            );
         }
         assert_eq!(
-            throttle.note(start + REFUSAL_LOG_INTERVAL - Duration::from_millis(1)),
+            throttle.note(
+                client,
+                start + REFUSAL_LOG_INTERVAL - Duration::from_millis(1)
+            ),
             None,
             "still inside the interval"
         );
         assert_eq!(
-            throttle.note(start + REFUSAL_LOG_INTERVAL),
+            throttle.note(client, start + REFUSAL_LOG_INTERVAL),
             Some(1000),
             "the next line carries how many were swallowed"
         );
         assert_eq!(
-            throttle.note(start + 2 * REFUSAL_LOG_INTERVAL),
+            throttle.note(client, start + 2 * REFUSAL_LOG_INTERVAL),
             Some(0),
             "a quiet interval resets the count"
         );
+    }
+
+    /// T77 (Info): the guard's throttle is per client, and what a client's
+    /// window swallowed is reported when the window closes. Two clients
+    /// refused 100 times each inside one window get one first line EACH, and
+    /// one expiry line each carrying `suppressed=99`; before T77 the second
+    /// client got no line at all and the 198 swallowed refusals were reported
+    /// by nobody (nothing came after them).
+    ///
+    /// Bug-catch: key the throttle by nothing and the second client's first
+    /// line is missing; drop the scheduled report and there are no expiry
+    /// lines.
+    #[test]
+    fn guard_refusals_are_throttled_per_client_and_reported_at_expiry() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let interval = Duration::from_millis(200);
+        let log = KeyedRefusalLog::new(interval, MAX_REFUSAL_LOG_SOURCES, report_guard_refusals);
+        let (one, two) = (
+            IpAddr::from([192, 0, 2, 10]),
+            IpAddr::from([198, 51, 100, 20]),
+        );
+        let ((), logged) = capture_warnings(|| {
+            runtime.block_on(async {
+                for _ in 0..100 {
+                    for client in [one, two] {
+                        warn_refusal_on(
+                            &log,
+                            Some(client),
+                            "rejected request whose Host is not allowed (DNS rebinding)",
+                            Echo::Host("evil.example"),
+                        );
+                    }
+                }
+                tokio::time::sleep(interval * 3).await;
+            })
+        });
+        for client in [one, two] {
+            let first: Vec<&str> = logged
+                .lines()
+                .filter(|line| line.contains("rejected") && line.contains(&client.to_string()))
+                .collect();
+            assert_eq!(first.len(), 1, "one first line for {client}:\n{logged}");
+            assert!(first[0].contains("suppressed=0"), "{}", first[0]);
+            let expiry: Vec<&str> = logged
+                .lines()
+                .filter(|line| {
+                    line.contains("not logged in the last window")
+                        && line.contains(&client.to_string())
+                })
+                .collect();
+            assert_eq!(expiry.len(), 1, "one expiry line for {client}:\n{logged}");
+            assert!(expiry[0].contains("suppressed=99"), "{}", expiry[0]);
+        }
+    }
+
+    /// T77 (Info), through the real middleware: two clients' foreign-Host
+    /// refusals, interleaved, each produce their own first line — the key is
+    /// the `ConnectInfo` peer the accept loop inserts.
+    ///
+    /// Bug-catch: derive no source from the request (one shared key) and only
+    /// one of the two clients is ever named.
+    #[test]
+    fn foreign_host_refusals_from_two_clients_each_get_a_line() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (_dir, application) = default_app();
+        // TEST-NET addresses no other test in this binary uses, so the
+        // process-wide throttle's windows for them are this test's alone.
+        let clients: [SocketAddr; 2] = [
+            "192.0.2.77:50000".parse().unwrap(),
+            "203.0.113.77:50001".parse().unwrap(),
+        ];
+        let ((), logged) = capture_warnings(|| {
+            runtime.block_on(async {
+                for _ in 0..50 {
+                    for client in clients {
+                        let mut request = Request::post("/graphql")
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .header(header::HOST, "evil.example")
+                            .body(Body::from(VALID_BODY))
+                            .expect("request");
+                        request.extensions_mut().insert(ConnectInfo(client));
+                        let response = application
+                            .clone()
+                            .oneshot(request)
+                            .await
+                            .expect("router never fails");
+                        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                    }
+                }
+            })
+        });
+        for client in clients {
+            let lines = logged
+                .lines()
+                .filter(|line| line.contains("rejected") && line.contains(&client.ip().to_string()))
+                .count();
+            assert_eq!(lines, 1, "{client}:\n{logged}");
+        }
     }
 
     /// `excerpt` keeps a short value whole, cuts a long one at the budget on a

@@ -80,20 +80,28 @@ pub struct AntiEntropyLimits {
     ///     (before T75: 20–42× per body, 34.7× a frame)
     ///   one entry with a 1 MiB token (narration, metadata
     ///     value: the parser's 4 B/char scan)                  ≤ 6.5× that body
-    ///   256 honest 1000-posting transactions, staged           ~6×
-    ///   densest frame inside every cap (256 × 1000 postings,
-    ///     every count at its cap, ~19 KB bodies), staged       ~13× (≈ 63 MB)
+    /// Supply phase 1, held for staging (T77): at most one
+    ///   `PHASE_ONE_WEIGHT_BUDGET` (16 MiB) of parsed weight
+    ///   per frame, then staged; densest in-cap frame
+    ///   (256 × ~19 KB bodies, ~70 MB parsed)                  ≤ 16 MiB + one entry
+    ///     (before T77: the whole frame, ~13×, ≈ 63 MB)
     /// ```
     ///
-    /// The staged directives are bounded per frame by `MAX_SUPPLY_ENTRIES` ×
-    /// the §3.12 caps (≈ 63 MB), not by the frame's bytes, so small dense
-    /// frames multiply most. The REAL resident ceiling under the 256 MiB
-    /// default is therefore ≈ 2 GiB when the budget is full of honest maximal
-    /// `Supply` frames and ≈ 3.5 GiB (~14×) when an allowlisted peer fills it
-    /// with the densest in-cap frames — `Supply` being the only frame the
-    /// decode multiplies badly, and one honest peers rarely send inbound. The
-    /// budget is a fixed ceiling, not an exact one; size any host against the
-    /// multiple, not the nominal figure.
+    /// Since T77 the held weight is also CHARGED: a pushed `Supply`'s phase 1
+    /// grows the frame's reservation by the resident weight
+    /// (`p2p::anti_entropy::resident_weight`, conservative against a counting
+    /// allocator) of every directive it holds, stages what it holds whenever
+    /// the budget cannot cover the next one, and gives the weight back after
+    /// each chunk. So this budget now bounds bodies AND the parsed directives
+    /// waiting on them; what stays uncharged is the decode transient above
+    /// (≤ ~4× a body, before phase 1) and one directive per connection when
+    /// the budget is exhausted. Outbound (`Want`ed) frames are bounded by the
+    /// same 16 MiB per exchange and by the node's own loops. Before T77 the
+    /// staged directives were bounded per frame only by `MAX_SUPPLY_ENTRIES` ×
+    /// the §3.12 caps, so the ceiling under the 256 MiB default was ≈ 3.5 GiB
+    /// (~14×) of densest in-cap frames from one allowlisted peer. The budget
+    /// is still a ceiling on what is charged, not an exact resident figure;
+    /// size a host against the decode multiple, not the nominal figure.
     pub max_frame_bytes_in_flight: usize,
     /// Max inbound frame-body bytes in flight from ONE peer (L-39).
     ///
@@ -175,16 +183,245 @@ pub const DEFAULT_ACCEPT_BURST: u32 = 8;
 /// Default [`AntiEntropyLimits::accept_refill_interval`] (M-40).
 pub const DEFAULT_ACCEPT_REFILL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// How often a refused inbound connection may produce a `warn!` (M-40).
+/// How often ONE refusal source may produce a `warn!` (M-40, T77).
 ///
 /// The same ten seconds as the HTTP side's `PER_IP_REFUSAL_LOG_INTERVAL`, for
 /// the same reason: a refusal is cheap to provoke, so logging each one would
 /// hand a reconnect loop an unbounded log stream the limiter exists to deny it.
-/// Refusals in between are counted and reported on the next logged line.
-const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
+/// Refusals in between are counted and reported when the window closes — see
+/// [`KeyedRefusalLog`].
+pub(crate) const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Most refusal sources a [`KeyedRefusalLog`] tracks at once (T77).
+///
+/// Past it, every further source shares one overflow window, so the log is
+/// bounded at `MAX_REFUSAL_LOG_SOURCES + 1` first lines (plus as many expiry
+/// summaries) per [`REFUSAL_LOG_INTERVAL`] however many sources an attacker
+/// controls — ~13 lines a second at the ceiling, against the 100–190 MB/s one
+/// client produced before M-41. Sixty-four is past any honest allowlist's
+/// peers × refusal kinds and any honest set of misconfigured HTTP clients.
+pub(crate) const MAX_REFUSAL_LOG_SOURCES: usize = 64;
+
+/// Who a limiter refusal is logged against (T77) — the key of
+/// [`ConnectionLimiter::should_log_refusal`].
+///
+/// An allowlisted peer is keyed by `(peer, reason)`: the allowlist bounds the
+/// peers, and one peer's reconnect loop must not hide another peer's refusal,
+/// nor a rate refusal hide a full-slot one. A NOT-allowlisted dialer is
+/// keyed as one class, deliberately not by its `EndpointId`: identities are
+/// free to mint, so a per-identity key would give every fresh key its own
+/// first line — exactly the per-handshake log stream L-72 is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RefusalSource {
+    /// An allowlisted peer refused by one of the limiter's budgets.
+    Peer(EndpointId, Refusal),
+    /// Any peer not on the bootstrap allowlist (L-72).
+    NotAllowlisted,
+}
+
+/// A refusal-log throttle keyed by source, with the count of what it swallowed
+/// reported when each source's window closes (M-40, M-41, T77).
+///
+/// # What changed, and why
+///
+/// Both throttles this replaces — the limiter's and the HTTP request guard's —
+/// were ONE window per process: the first refusal of any kind in ten seconds
+/// was logged and every other one, from anyone, was counted. So one noisy
+/// source hid every other source for as long as it kept going (the audit's
+/// "process-wide throttles hide other sources"), and the count was printed only
+/// by the *next* refusal — a flood of 999 that then stopped was never reported
+/// at all. Here:
+///
+/// * **Keyed.** Each source (a client IP bucket, an allowlisted
+///   `(peer, reason)`, the not-allowlisted class) has its own window, so each
+///   gets its own first line.
+/// * **Bounded the way `accept_rate` is.** A new source first prunes every
+///   window that has closed and owes no report — state an absent entry already
+///   describes. Past [`MAX_REFUSAL_LOG_SOURCES`] live windows, new sources
+///   share one overflow window instead of growing the map.
+/// * **Reported at expiry.** The first refusal a window swallows schedules a
+///   report for the moment the window closes (a task on the current Tokio
+///   runtime, when there is one): it calls the throttle's `report` function
+///   with the count and forgets the window, so the next refusal from that
+///   source opens a fresh one and is logged with `suppressed = 0`. Outside a
+///   runtime nothing is scheduled and the count rides on the source's next
+///   logged line, as before.
+///
+/// A report and a late refusal cannot double-count: the report only takes the
+/// count of the window it was scheduled for, and a refusal that arrives after
+/// the window closed but before the report ran carries the count on its own
+/// line and opens a new window, which the report then leaves alone.
+pub(crate) struct KeyedRefusalLog<K> {
+    state: Arc<Mutex<RefusalWindows<K>>>,
+    interval: Duration,
+    max_sources: usize,
+    /// Emits the expiry summary for a source (`None` = the overflow window).
+    report: fn(Option<&K>, u64),
+}
+
+struct RefusalWindows<K> {
+    /// `None` is the overflow window shared by sources past the cap.
+    windows: HashMap<Option<K>, RefusalWindow>,
+}
+
+#[derive(Clone, Copy)]
+struct RefusalWindow {
+    opened: Instant,
+    suppressed: u64,
+    /// An expiry report is scheduled for this window.
+    report_armed: bool,
+}
+
+impl<K> KeyedRefusalLog<K>
+where
+    K: Clone + Eq + std::hash::Hash + Send + 'static,
+{
+    /// A throttle allowing one line per source per `interval`, tracking at
+    /// most `max_sources` sources, and reporting swallowed counts through
+    /// `report` when a window closes.
+    pub(crate) fn new(interval: Duration, max_sources: usize, report: fn(Option<&K>, u64)) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(RefusalWindows {
+                windows: HashMap::new(),
+            })),
+            interval,
+            max_sources,
+            report,
+        }
+    }
+
+    /// Note one refusal from `source` at `now`. `Some(suppressed)` means "log
+    /// this one; this many from the same source were swallowed and not yet
+    /// reported"; `None` means stay quiet (the count is kept for the report).
+    pub(crate) fn note(&self, source: K, now: Instant) -> Option<u64> {
+        let mut state = self.lock();
+        let key = self.resolve(&mut state, source, now);
+        let interval = self.interval;
+        match state.windows.get_mut(&key) {
+            Some(window) if now.saturating_duration_since(window.opened) < interval => {
+                window.suppressed = window.suppressed.saturating_add(1);
+                if !window.report_armed {
+                    window.report_armed = self.schedule_report(key.clone(), window.opened);
+                }
+                None
+            }
+            Some(window) => {
+                // The window closed and its report has not run (or there is no
+                // runtime to run it): this line carries the count instead.
+                let carried = std::mem::take(&mut window.suppressed);
+                *window = RefusalWindow {
+                    opened: now,
+                    suppressed: 0,
+                    report_armed: false,
+                };
+                Some(carried)
+            }
+            None => {
+                state.windows.insert(
+                    key,
+                    RefusalWindow {
+                        opened: now,
+                        suppressed: 0,
+                        report_armed: false,
+                    },
+                );
+                Some(0)
+            }
+        }
+    }
+
+    /// The map key `source` is counted under: its own, or the overflow
+    /// window's once [`Self::max_sources`] live windows exist.
+    fn resolve(&self, state: &mut RefusalWindows<K>, source: K, now: Instant) -> Option<K> {
+        let key = Some(source);
+        if state.windows.contains_key(&key) {
+            return key;
+        }
+        let interval = self.interval;
+        // `accept_rate`'s discipline: a closed window that owes no report is
+        // indistinguishable from an absent one, so drop them all first.
+        state.windows.retain(|_, window| {
+            window.report_armed || now.saturating_duration_since(window.opened) < interval
+        });
+        let tracked = state.windows.keys().filter(|key| key.is_some()).count();
+        if tracked >= self.max_sources {
+            None
+        } else {
+            key
+        }
+    }
+
+    /// Schedule the expiry report for the window of `key` opened at `opened`.
+    /// Returns whether one was scheduled (there is a runtime to run it on).
+    fn schedule_report(&self, key: Option<K>, opened: Instant) -> bool {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return false;
+        };
+        let state = Arc::clone(&self.state);
+        let deadline = opened + self.interval;
+        let report = self.report;
+        runtime.spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            let owed = {
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match state.windows.get(&key) {
+                    Some(window) if window.opened == opened => {
+                        let owed = window.suppressed;
+                        state.windows.remove(&key);
+                        owed
+                    }
+                    // A later refusal already carried the count and opened a
+                    // new window; that window is not this report's.
+                    _ => 0,
+                }
+            };
+            if owed > 0 {
+                report(key.as_ref(), owed);
+            }
+        });
+        true
+    }
+
+    /// Sources with a live or report-pending window, overflow included (tests).
+    #[cfg(test)]
+    pub(crate) fn tracked(&self) -> usize {
+        self.lock().windows.len()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RefusalWindows<K>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// The limiter's expiry summary (T77): one line per source whose window
+/// swallowed refusals.
+fn report_limiter_refusals(source: Option<&RefusalSource>, suppressed: u64) {
+    match source {
+        Some(RefusalSource::Peer(peer, reason)) => tracing::warn!(
+            peer = %peer,
+            reason = ?reason,
+            suppressed,
+            "anti-entropy connections refused and not logged in the last window"
+        ),
+        Some(RefusalSource::NotAllowlisted) => tracing::warn!(
+            suppressed,
+            "anti-entropy connections from peers not on the bootstrap allowlist refused and \
+             not logged in the last window"
+        ),
+        None => tracing::warn!(
+            suppressed,
+            "anti-entropy connections refused and not logged in the last window (sources past \
+             the per-source log table)"
+        ),
+    }
+}
 
 /// Why [`ConnectionLimiter::try_acquire`] refused a connection (M-16, M-40).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Refusal {
     /// The global concurrent-connection budget is spent.
     Global,
@@ -262,15 +499,8 @@ struct LimiterInner {
     accept_rate: Mutex<HashMap<EndpointId, Instant>>,
     accept_burst: u32,
     accept_refill_interval: Duration,
-    /// Throttle for the refusal `warn!` (M-40); see [`REFUSAL_LOG_INTERVAL`].
-    refusal_log: Mutex<RefusalLog>,
-}
-
-/// State behind [`ConnectionLimiter::should_log_refusal`].
-#[derive(Default)]
-struct RefusalLog {
-    last_logged: Option<Instant>,
-    suppressed: u64,
+    /// Throttle for the refusal `warn!`s, per [`RefusalSource`] (M-40, T77).
+    refusal_log: KeyedRefusalLog<RefusalSource>,
 }
 
 /// The byte counts behind [`FrameReservation`] (L-39).
@@ -300,32 +530,26 @@ impl ConnectionLimiter {
                 accept_rate: Mutex::new(HashMap::new()),
                 accept_burst: limits.accept_burst,
                 accept_refill_interval: limits.accept_refill_interval,
-                refusal_log: Mutex::new(RefusalLog::default()),
+                refusal_log: KeyedRefusalLog::new(
+                    REFUSAL_LOG_INTERVAL,
+                    MAX_REFUSAL_LOG_SOURCES,
+                    report_limiter_refusals,
+                ),
             }),
         }
     }
 
-    /// Whether a refusal happening now should be logged (M-40), and if so how
-    /// many were swallowed since the last logged one.
+    /// Whether a refusal of `source` happening now should be logged (M-40,
+    /// T77), and if so how many from the same source were swallowed and not
+    /// yet reported.
     ///
-    /// At most one `Some` per [`REFUSAL_LOG_INTERVAL`] across ALL peers and
-    /// reasons, so a reconnect loop's log cost is fixed however fast it loops.
-    pub fn should_log_refusal(&self, now: Instant) -> Option<u64> {
-        let mut log = self
-            .inner
-            .refusal_log
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match log.last_logged {
-            Some(previous) if now.saturating_duration_since(previous) < REFUSAL_LOG_INTERVAL => {
-                log.suppressed = log.suppressed.saturating_add(1);
-                None
-            }
-            _ => {
-                log.last_logged = Some(now);
-                Some(std::mem::take(&mut log.suppressed))
-            }
-        }
+    /// At most one `Some` per [`REFUSAL_LOG_INTERVAL`] per [`RefusalSource`]
+    /// (and at most [`MAX_REFUSAL_LOG_SOURCES`] + 1 sources), so a reconnect
+    /// loop's log cost is fixed however fast it loops, and one peer's loop no
+    /// longer hides another's refusals. What a window swallowed is reported by
+    /// its own line when the window closes — see [`KeyedRefusalLog`].
+    pub fn should_log_refusal(&self, source: RefusalSource, now: Instant) -> Option<u64> {
+        self.inner.refusal_log.note(source, now)
     }
 
     /// An empty frame-body reservation charged to `peer` (L-39).
@@ -472,9 +696,10 @@ impl LimiterInner {
 /// using the body's size as the stand-in for what the decoded message holds.
 ///
 /// That stand-in is a 1× charge for a 2–6× footprint (L-65): the decoded
-/// message, ciborium's `Content` buffering (up to 4×) and a `Supply` batch's
-/// staged directives all live under the reservation uncharged. See
-/// [`AntiEntropyLimits::max_frame_bytes_in_flight`] for the measured multiple.
+/// message and ciborium's `Content` buffering (up to 4×) live under the
+/// reservation uncharged. A `Supply` batch's parsed directives are charged on
+/// top since T77 ([`Self::shrink_to`]). See
+/// [`AntiEntropyLimits::max_frame_bytes_in_flight`] for the measured multiples.
 pub struct FrameReservation {
     /// `None` for an unmetered reservation (outbound reads; see [`Self::unmetered`]).
     metered: Option<(Arc<LimiterInner>, EndpointId)>,
@@ -497,7 +722,6 @@ impl FrameReservation {
     }
 
     /// Bytes this reservation currently holds.
-    #[cfg(test)]
     pub(crate) fn held(&self) -> usize {
         self.held
     }
@@ -532,24 +756,38 @@ impl FrameReservation {
         self.held = target;
         true
     }
-}
 
-impl Drop for FrameReservation {
-    fn drop(&mut self) {
+    /// Shrink the reservation to `target` bytes, returning the difference to
+    /// the global and per-peer budgets (T77). A `target` at or above what is
+    /// held is a no-op.
+    ///
+    /// For the one reservation that is charged for something other than a
+    /// frame body: `apply_supply_entries_from`'s phase 1 charges the resident
+    /// weight of the directives it holds for staging, and gives it back each
+    /// time a chunk has been staged and dropped.
+    pub fn shrink_to(&mut self, target: usize) {
+        if target >= self.held {
+            return;
+        }
+        let released = self.held - target;
+        self.held = target;
         let Some((inner, peer)) = &self.metered else {
             return;
         };
-        if self.held == 0 {
-            return;
-        }
         let mut bytes = inner.lock_frame_bytes();
-        bytes.total = bytes.total.saturating_sub(self.held);
+        bytes.total = bytes.total.saturating_sub(released);
         if let Some(count) = bytes.per_peer.get_mut(peer) {
-            *count = count.saturating_sub(self.held);
+            *count = count.saturating_sub(released);
             if *count == 0 {
                 bytes.per_peer.remove(peer);
             }
         }
+    }
+}
+
+impl Drop for FrameReservation {
+    fn drop(&mut self) {
+        self.shrink_to(0);
     }
 }
 
@@ -863,19 +1101,141 @@ mod tests {
     #[test]
     fn refusal_logging_is_rate_limited_and_counts_what_it_suppressed() {
         let limiter = ConnectionLimiter::new(AntiEntropyLimits::default());
+        let peer = SecretKey::generate().public();
+        let source = RefusalSource::Peer(peer, Refusal::AcceptRate);
         let now = Instant::now();
-        assert_eq!(limiter.should_log_refusal(now), Some(0));
+        assert_eq!(limiter.should_log_refusal(source, now), Some(0));
         for step in 1..=5 {
             assert_eq!(
-                limiter.should_log_refusal(now + Duration::from_secs(step)),
+                limiter.should_log_refusal(source, now + Duration::from_secs(step)),
                 None
             );
         }
         assert_eq!(
-            limiter.should_log_refusal(now + REFUSAL_LOG_INTERVAL),
+            limiter.should_log_refusal(source, now + REFUSAL_LOG_INTERVAL),
             Some(5),
-            "the next logged line reports the five suppressed refusals"
+            "outside a runtime, the next logged line reports the five suppressed refusals"
         );
-        assert_eq!(limiter.should_log_refusal(now + REFUSAL_LOG_INTERVAL), None);
+        assert_eq!(
+            limiter.should_log_refusal(source, now + REFUSAL_LOG_INTERVAL),
+            None
+        );
+    }
+
+    // ── T77: per-source refusal throttles ───────────────────────────────
+
+    /// T77 (Info): each source has its own window. Two allowlisted peers — and
+    /// two reasons for one peer — each get their own first line inside the
+    /// same ten seconds, and the not-allowlisted class is ONE source however
+    /// many identities dial.
+    ///
+    /// Bug-catch: key the throttle by nothing (one process-wide window) and
+    /// the second source's first refusal is swallowed.
+    #[test]
+    fn refusal_logging_is_per_source() {
+        let limiter = ConnectionLimiter::new(AntiEntropyLimits::default());
+        let (one, two) = (
+            SecretKey::generate().public(),
+            SecretKey::generate().public(),
+        );
+        let now = Instant::now();
+        let later = now + Duration::from_secs(1);
+        let rate = |peer| RefusalSource::Peer(peer, Refusal::AcceptRate);
+        assert_eq!(limiter.should_log_refusal(rate(one), now), Some(0));
+        assert_eq!(limiter.should_log_refusal(rate(one), later), None);
+        assert_eq!(
+            limiter.should_log_refusal(rate(two), later),
+            Some(0),
+            "another peer's first refusal is not hidden by the first peer's window"
+        );
+        assert_eq!(
+            limiter.should_log_refusal(RefusalSource::Peer(one, Refusal::PerPeer), later),
+            Some(0),
+            "another reason from the same peer is its own source"
+        );
+        assert_eq!(
+            limiter.should_log_refusal(RefusalSource::NotAllowlisted, later),
+            Some(0)
+        );
+        for _ in 0..50 {
+            assert_eq!(
+                limiter.should_log_refusal(RefusalSource::NotAllowlisted, later),
+                None,
+                "every not-allowlisted dialer shares one window"
+            );
+        }
+    }
+
+    /// T77: the table is bounded. Past `MAX_REFUSAL_LOG_SOURCES` live
+    /// windows, new sources share ONE overflow window (one line, then
+    /// quiet), and a closed window that owes no report is pruned when the
+    /// next new source arrives.
+    #[test]
+    fn refusal_log_sources_are_bounded_and_pruned() {
+        fn ignore(_: Option<&u32>, _: u64) {}
+        let log = KeyedRefusalLog::<u32>::new(REFUSAL_LOG_INTERVAL, 4, ignore);
+        let now = Instant::now();
+        for source in 0..4 {
+            assert_eq!(log.note(source, now), Some(0));
+        }
+        assert_eq!(
+            log.note(100, now),
+            Some(0),
+            "the overflow window's first line"
+        );
+        for source in 101..200 {
+            assert_eq!(
+                log.note(source, now),
+                None,
+                "overflow sources share one window"
+            );
+        }
+        assert_eq!(log.tracked(), 5, "four sources plus the overflow window");
+        let after = now + REFUSAL_LOG_INTERVAL;
+        assert_eq!(
+            log.note(7, after),
+            Some(0),
+            "closed windows are pruned, so a new source is tracked again"
+        );
+        assert_eq!(log.tracked(), 1);
+    }
+
+    /// T77 (Info): what a window swallowed is reported when the window
+    /// closes, by the window's own line — not only by the source's next
+    /// refusal, which may never come. After the report the source starts a
+    /// fresh window whose first line carries 0 (nothing counted twice).
+    ///
+    /// Bug-catch: drop the scheduled report and nothing is reported until the
+    /// source's next refusal.
+    #[tokio::test]
+    async fn suppressed_refusals_are_reported_when_the_window_closes() {
+        static REPORTS: Mutex<Vec<(Option<u32>, u64)>> = Mutex::new(Vec::new());
+        fn record(source: Option<&u32>, suppressed: u64) {
+            REPORTS.lock().unwrap().push((source.copied(), suppressed));
+        }
+        let interval = Duration::from_millis(200);
+        let log = KeyedRefusalLog::<u32>::new(interval, 8, record);
+        let start = Instant::now();
+        assert_eq!(log.note(1, start), Some(0));
+        assert_eq!(log.note(2, start), Some(0));
+        for _ in 0..999 {
+            assert_eq!(log.note(1, start), None);
+        }
+        for _ in 0..3 {
+            assert_eq!(log.note(2, start), None);
+        }
+        tokio::time::sleep(interval * 3).await;
+        let mut reports = REPORTS.lock().unwrap().clone();
+        reports.sort_unstable();
+        assert_eq!(
+            reports,
+            vec![(Some(1), 999), (Some(2), 3)],
+            "each source's swallowed count is reported once, at expiry"
+        );
+        assert_eq!(
+            log.note(1, Instant::now()),
+            Some(0),
+            "the reported count is not carried again"
+        );
     }
 }

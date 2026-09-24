@@ -156,12 +156,48 @@ fn temporary_path_for(path: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
     ))
 }
 
+/// Is `name` a temporary [`persist_atomically`] could have left beside a
+/// ledger whose file name is `ledger_name` (L-57, T78)?
+///
+/// Exactly two shapes — the **reserved** names beside a ledger:
+///
+/// * `<name>.tmp` — the fixed name every rewrite used before T67;
+/// * `<name>.tmp.<pid>.<nonce>` — [`temporary_path_for`]'s: `<pid>` is
+///   `std::process::id()` in decimal (1–10 ASCII digits, a `u32`), `<nonce>`
+///   a `u64` formatted `{:016x}` (exactly 16 lowercase hex digits).
+///
+/// Before T78 the sweep matched `<name>.tmp.*`, so any same-uid file an
+/// operator happened to name that way — `ledger.bean.tmp.backup`, say — was
+/// deleted at the next boot (0923 audit §5).
+fn is_reserved_temporary_name(name: &str, ledger_name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix(ledger_name)
+        .and_then(|rest| rest.strip_prefix(TEMPORARY_INFIX))
+    else {
+        return false;
+    };
+    if rest.is_empty() {
+        return true;
+    }
+    let Some((pid, nonce)) = rest.strip_prefix('.').and_then(|rest| rest.split_once('.')) else {
+        return false;
+    };
+    (1..=10).contains(&pid.len())
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && nonce.len() == 16
+        && nonce
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Remove the temporaries crashed rewrites left beside `path` (L-57).
 ///
 /// Runs once, from a process-start boot — under `gl-node` that is after
 /// `ledger_lock::acquire`, so no sibling process can be mid-persist on this
-/// ledger and every match is a crashed leftover. Matches `<name>.tmp` (the
-/// pre-T67 fixed name) and `<name>.tmp.*`. Removes only what a crashed persist
+/// ledger and every match is a crashed leftover. Matches only the reserved
+/// names [`is_reserved_temporary_name`] defines — `<name>.tmp` (the pre-T67
+/// fixed name) and `<name>.tmp.<pid>.<16 hex>` — never any other
+/// `<name>.tmp.*` (T78). Removes only what a crashed persist
 /// could have left: a regular file or a symlink, owned by this uid. Anything
 /// else — a directory, a FIFO, a file another account owns — is logged and
 /// left alone: it is not ours to delete, and it no longer blocks a write,
@@ -172,8 +208,7 @@ fn sweep_stale_temporaries(path: &Path) {
     let Some(file_name) = path.file_name() else {
         return;
     };
-    let exact = format!("{}{TEMPORARY_INFIX}", file_name.to_string_lossy());
-    let prefix = format!("{exact}.");
+    let ledger_name = file_name.to_string_lossy();
     let directory = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
@@ -184,7 +219,7 @@ fn sweep_stale_temporaries(path: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name != exact && !name.starts_with(&prefix) {
+        if !is_reserved_temporary_name(&name, &ledger_name) {
             continue;
         }
         let candidate = entry.path();
@@ -1433,8 +1468,21 @@ fn check_lamport_advance(
 /// clock — and, since the quarantine is written back by every compaction,
 /// kept setting it forever (H-12 fact 3).
 ///
-/// Unparsable blocks (L-45) are not directives and never counted, before or
-/// after T63.
+/// Unparsable blocks (L-45) are not directives, but a block that carries an
+/// `openledger-author` / `openledger-lamport` pair naming this node counts
+/// (T78): it is text this node signed — typically a node-written record the
+/// H-20 salvage held whole beside a damaged neighbour — it stays in the file
+/// and may be on peers, so its pair must not be re-issued either. Before T78
+/// they were never counted.
+///
+/// # When "this node" is only learnt after boot (L-67, T78)
+///
+/// `gl-node` boots with a placeholder author and learns its `EndpointId`
+/// afterwards, so at boot no out-of-DAG record is "own". Every out-of-DAG
+/// value is therefore also kept per author ([`Self::outside_dag`], moved into
+/// [`LedgerService::boot_outside_dag_lamports`]), and
+/// [`LedgerService::set_author_id`] folds the new author's entry exactly as
+/// this fold would have had boot known it.
 #[derive(Default)]
 struct BootLamportHigh {
     value: u64,
@@ -1444,6 +1492,10 @@ struct BootLamportHigh {
     /// author (T72 / H-19 diagnostics — see [`Self::suspect_author`]).
     foreign_value: u64,
     foreign_author: Option<String>,
+    /// The highest lamport per author among everything boot saw that did NOT
+    /// reach the DAG — quarantined, duplicate-body envelopes, envelopes in
+    /// unparsable text (L-67, T78).
+    outside_dag: BTreeMap<String, u64>,
 }
 
 impl BootLamportHigh {
@@ -1464,11 +1516,36 @@ impl BootLamportHigh {
         }
     }
 
-    /// Fold a directive that is NOT in the DAG: only this node's own count.
+    /// Fold a directive that is NOT in the DAG: only this node's own count;
+    /// every author's value is remembered for a later `set_author_id`.
     fn note_if_own(&mut self, directive: &Directive, own_author: &str) {
+        if let (Some(author), Some(lamport)) =
+            (directive_author(directive), directive.lamport_clock())
+        {
+            self.remember_outside_dag(author, lamport);
+        }
         if directive_author(directive) == Some(own_author) {
             self.note(directive, own_author);
         }
+    }
+
+    /// Fold the envelopes spelled in one unparsable block (T78): only this
+    /// node's own count; every author's value is remembered.
+    fn note_text_if_own(&mut self, text: &str, own_author: &str) {
+        for (author, lamport) in envelope_pairs_in_text(text) {
+            self.remember_outside_dag(&author, lamport);
+            if author == own_author
+                && (lamport > self.value || self.author.is_none() && lamport == self.value)
+            {
+                self.value = lamport;
+                self.author = Some(author);
+            }
+        }
+    }
+
+    fn remember_outside_dag(&mut self, author: &str, lamport: u64) {
+        let slot = self.outside_dag.entry(author.to_owned()).or_insert(0);
+        *slot = (*slot).max(lamport);
     }
 
     /// The author to name in a clock diagnostic: whoever carried the clock
@@ -1482,6 +1559,53 @@ impl BootLamportHigh {
     fn suspect_author(&self) -> Option<&str> {
         self.foreign_author.as_deref().or(self.author.as_deref())
     }
+}
+
+/// The `(openledger-author, openledger-lamport)` pairs spelled in raw ledger
+/// text that did not parse (T78).
+///
+/// Line-based and deliberately forgiving — the block is unparsable, so its
+/// structure cannot be trusted: a directive starts at every non-indented,
+/// non-comment line, and an indented `openledger-author:` /
+/// `openledger-lamport:` metadata line belongs to the directive above it.
+/// Values are unquoted; a lamport that is not a decimal `u64` is skipped. A
+/// directive with only one of the two lines yields nothing.
+fn envelope_pairs_in_text(text: &str) -> Vec<(String, u64)> {
+    fn value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+        let rest = line.trim_start().strip_prefix(key)?.strip_prefix(':')?;
+        let rest = rest.trim();
+        Some(
+            rest.strip_prefix('"')
+                .and_then(|inner| inner.strip_suffix('"'))
+                .unwrap_or(rest),
+        )
+    }
+    let mut pairs = Vec::new();
+    let mut current: (Option<String>, Option<u64>) = (None, None);
+    let mut flush = |current: &mut (Option<String>, Option<u64>)| {
+        if let (Some(author), Some(lamport)) = (current.0.take(), current.1.take()) {
+            pairs.push((author, lamport));
+        }
+        *current = (None, None);
+    };
+    for line in text.lines() {
+        let indented = line.starts_with([' ', '\t']);
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with(';') {
+            continue;
+        }
+        if !indented {
+            flush(&mut current);
+            continue;
+        }
+        if let Some(author) = value(line, ENVELOPE_KEY_AUTHOR) {
+            current.0 = Some(author.to_owned());
+        } else if let Some(lamport) = value(line, ENVELOPE_KEY_LAMPORT) {
+            current.1 = lamport.parse::<u64>().ok();
+        }
+    }
+    flush(&mut current);
+    pairs
 }
 
 /// A directive's `openledger-author`, for any kind.
@@ -2705,8 +2829,10 @@ pub struct LedgerService {
     /// records the stored ids; [`Self::finalize_operator_input`] then, once
     /// the identity is known, writes the real author id over the placeholder
     /// and signs. Nothing in the signed message (`content_id`,
-    /// `is_transaction`, `parents`, `lamport`) changes between the two steps,
-    /// so the signature covers exactly what boot stamped.
+    /// `is_transaction`, `parents`, `lamport`) changes between the two steps
+    /// except the one re-stamp [`Self::set_author_id`] may make (L-67: the
+    /// lamport a boot under the real author would have given), so the
+    /// signature covers exactly what that boot would have stamped.
     ///
     /// `gl-node` calls `finalize_operator_input` right after `set_signer` and
     /// before the startup compaction and the P2P tasks; [`Self::prepare`]
@@ -2727,6 +2853,18 @@ pub struct LedgerService {
     /// the T41 warning — this node cannot sign for it, and rewriting it would
     /// sign a record the operator attributed to someone else.
     operator_input_with_file_author: BTreeSet<String>,
+    /// The highest lamport per author among the records boot saw that did
+    /// NOT reach the DAG (L-67, T78) — see [`BootLamportHigh`]. Boot folds
+    /// only its own author's entry into the clock; `gl-node` boots under a
+    /// placeholder author, so [`Self::set_author_id`] folds the real one's.
+    /// One entry per distinct author outside the DAG; re-derived by every
+    /// boot, so an L-13 reload replaces it.
+    boot_outside_dag_lamports: BTreeMap<String, u64>,
+    /// The clock value boot resumed from, before it stamped any operator
+    /// input (L-67, T78): what [`Self::set_author_id`] compares the new
+    /// author's out-of-DAG high against to re-stamp that input exactly as a
+    /// boot under the new author would have.
+    boot_clock_base: u64,
 
     // ── T44: append-only persistence ──────────────────────────────────────
     /// `<ledger>.bean.journal` — the append-only sidecar, derived once at boot.
@@ -2914,7 +3052,17 @@ impl LedgerService {
         let content = match read_ledger_file(&file_path) {
             Ok(content) => content,
             Err(ServiceError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                let journal_exists = journal_path.exists();
+                // T78: `lstat`, not `Path::exists()` — `exists()` follows a
+                // symlink, so a DANGLING journal link read as "absent", the
+                // Fresh arm created an empty `.bean`, and only then did the
+                // journal open refuse the link. Any entry at the journal path
+                // (a dangling link included), and any probe error other than
+                // NotFound, counts as present: the refusal below creates
+                // nothing.
+                let journal_exists = !matches!(
+                    std::fs::symlink_metadata(&journal_path),
+                    Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+                );
                 match mode {
                     BootMode::Reload => {
                         return Err(ServiceError::Io(std::io::Error::new(
@@ -3352,6 +3500,11 @@ impl LedgerService {
             }
         }
 
+        // T78: an envelope naming this node inside a block boot could not
+        // parse is a pair this node signed; see `BootLamportHigh`.
+        for block in &unparsable {
+            lamport_high.note_text_if_own(&block.text, &author_id);
+        }
         let max_lamport = lamport_high.value;
         let lamport_clock = if max_lamport > 0 {
             max_lamport.saturating_add(1)
@@ -3495,6 +3648,8 @@ impl LedgerService {
             unverified_history,
             unsigned_operator_input: Vec::new(),
             operator_input_with_file_author: BTreeSet::new(),
+            boot_outside_dag_lamports: std::mem::take(&mut lamport_high.outside_dag),
+            boot_clock_base: lamport_clock,
             journal_path,
             canonical_bytes,
             canonical_marker,
@@ -3529,7 +3684,53 @@ impl LedgerService {
         // place. Same path as a live hand edit, same order boot itself used.
         service.adopt_operator_input_at_boot(operator_input);
 
+        // L-64 (T78): a process start says so when the canonical form will not
+        // fit. With operator input pending the check waits for
+        // `finalize_operator_input`, whose author and signature are part of
+        // what the compaction writes; a reload is a recovery rebuild and
+        // stays quiet.
+        if matches!(mode, BootMode::Fresh) && service.unsigned_operator_input.is_empty() {
+            service.warn_if_canonical_exceeds_cap();
+        }
+
         Ok(service)
+    }
+
+    /// Warn when the canonical form of this ledger — what every compaction
+    /// writes — is larger than [`MAX_LEDGER_FILE_BYTES`] (L-64, T78).
+    ///
+    /// The file on disk can be under the cap while its canonical spelling is
+    /// not: operator input gains an envelope (author, lamport, parents,
+    /// signature — several hundred bytes on a one-line `open`), a leading
+    /// `;comment` gains a space, one-space indentation becomes two. Such a
+    /// ledger boots and serves, but `persist_atomically` refuses every
+    /// compaction, so a write that needs one fails (and the startup compaction
+    /// in `gl-node` logs it). Measured with [`Self::compaction_text_len`], one
+    /// per-directive serialization pass per process start (or per
+    /// finalisation of boot's operator input): no sort, no clone of the
+    /// ledger, no 64 MiB string. Returns the canonical length when it is over
+    /// the cap.
+    fn warn_if_canonical_exceeds_cap(&self) -> Option<u64> {
+        let canonical = self.compaction_text_len();
+        if canonical <= MAX_LEDGER_FILE_BYTES {
+            return None;
+        }
+        warn!(
+            canonical_bytes = canonical,
+            file_bytes = self.canonical_bytes,
+            journal_bytes = self.canonical_journal_bytes,
+            max = MAX_LEDGER_FILE_BYTES,
+            over_by = canonical - MAX_LEDGER_FILE_BYTES,
+            file = %self.file_path.display(),
+            "the canonical form of this ledger is larger than the ledger file cap, although the \
+             file on disk is not: every compaction will refuse to write it, so writes that need \
+             one fail. The difference is spelling — operator input gains its openledger \
+             envelope, a leading ';comment' gains a space, indentation is normalised. Stop the \
+             node and shrink the file until its canonical form fits: remove leading comments \
+             and hand-typed directives you do not need, or start a new ledger for new history \
+             (L-64)"
+        );
+        Some(canonical)
     }
 
     /// Is this file directive operator input rather than node-written history?
@@ -3794,6 +3995,9 @@ impl LedgerService {
             );
         }
         self.verify_history_pass();
+        // L-64 (T78): boot deferred its size check to here, where the
+        // envelope the compaction will write is complete.
+        self.warn_if_canonical_exceeds_cap();
         finalized
     }
 
@@ -4988,6 +5192,58 @@ impl LedgerService {
             }
         }
         text
+    }
+
+    /// `self.compaction_text().len()`, without building the text (L-64, T78).
+    ///
+    /// The canonical file is the leading comments (`; <comment>\n` each), the
+    /// directives each serialised exactly as `full_file_serialize` spells one
+    /// — a directive's text does not depend on its neighbours or its position
+    /// — joined by one blank-line `\n` (also before the first one when there
+    /// are comments), then the quarantined text blocks as
+    /// [`Self::compaction_text`] appends them. The sum is order-free, so the
+    /// canonical sort and the clone of every directive are skipped.
+    /// `t78_compaction_text_len_is_the_length_of_compaction_text` pins it to
+    /// the real text.
+    fn compaction_text_len(&self) -> u64 {
+        let mut total: u64 = self
+            .leading_comments
+            .iter()
+            .map(|comment| comment.len() as u64 + 3)
+            .sum();
+        let mut directives: u64 = 0;
+        for directive in self
+            .dag
+            .directives()
+            .into_iter()
+            .chain(self.live_quarantine().map(|(_, directive)| directive))
+        {
+            total += full_file_serialize(std::slice::from_ref(directive), &[]).len() as u64;
+            directives += 1;
+        }
+        if directives > 0 {
+            total += if self.leading_comments.is_empty() {
+                directives - 1
+            } else {
+                directives
+            };
+        }
+        for block in &self.quarantined_text {
+            let was_empty = total == 0;
+            if !was_empty {
+                total += 1;
+            }
+            total += block.len() as u64;
+            let ends_with_newline = if block.is_empty() {
+                !was_empty
+            } else {
+                block.ends_with('\n')
+            };
+            if !ends_with_newline {
+                total += 1;
+            }
+        }
+        total
     }
 
     fn compaction_directives(&self) -> Vec<Directive> {
@@ -6793,8 +7049,99 @@ impl LedgerService {
     }
 
     /// Update the author identity (called when P2P boots and we learn our EndpointId).
+    ///
+    /// # L-67 (T78): the clock learns what "own" meant at boot
+    ///
+    /// Boot counts a record that did not reach the DAG (quarantined, a
+    /// duplicate body's envelope, an envelope in unparsable text) only when it
+    /// is this node's own ([`BootLamportHigh`]) — and `gl-node` boots under a
+    /// placeholder author, so at a process boot nothing was "own", the clock
+    /// resumed below the node's own quarantined records, and the node
+    /// re-issued `(author, lamport)` pairs it had already signed (M-18). So
+    /// here, when the author changes, the new author's out-of-DAG high is
+    /// folded exactly as boot would have folded it:
+    ///
+    /// * the clock is raised to resume above it;
+    /// * operator input boot adopted and has not yet been finalised
+    ///   ([`Self::finalize_operator_input`] — unsigned, in memory only) is
+    ///   re-stamped by the same shift, so each record carries the lamport a
+    ///   boot under the real author — an L-13 reload — gives it, and the
+    ///   envelope the mesh sees does not depend on whether a startup
+    ///   compaction ever failed. Parents are untouched; the shift is uniform,
+    ///   so every child stays above its parents.
+    ///
+    /// Nothing moves when boot already counted the value (booted with this
+    /// author) or the DAG already carries the clock above it. A shift that
+    /// would stamp past [`LAMPORT_CEILING`] is not applied (the node cannot
+    /// author there anyway); the clock is still raised, so every later stamp
+    /// refuses loudly instead of re-issuing a pair.
     pub fn set_author_id(&mut self, author_id: String) {
         self.author_id = author_id;
+        let own_high = self
+            .boot_outside_dag_lamports
+            .get(&self.author_id)
+            .copied()
+            .unwrap_or(0);
+        // Boot's own rule: resume at `max + 1` when anything is non-zero.
+        let resume = if own_high > 0 {
+            own_high.saturating_add(1)
+        } else {
+            0
+        };
+        if resume <= self.boot_clock_base {
+            return;
+        }
+        let shift = resume - self.boot_clock_base;
+        self.boot_clock_base = resume;
+
+        let mut restamp: Vec<(String, u64)> = Vec::new();
+        for content_id in &self.unsigned_operator_input {
+            if let Some(lamport) = self.dag.get(content_id).and_then(Directive::lamport_clock) {
+                restamp.push((content_id.clone(), lamport.saturating_add(shift)));
+            }
+        }
+        let highest = restamp
+            .iter()
+            .map(|(_, lamport)| *lamport)
+            .max()
+            .unwrap_or(0);
+        if !restamp.is_empty() && !lamport_value_is_legal(highest) {
+            warn!(
+                author = %self.author_id,
+                own_high,
+                shift,
+                "this node's own records outside the DAG put its clock so high that the \
+                 operator input adopted at boot cannot be re-stamped above them without passing \
+                 the Lamport ceiling; it keeps its boot stamp, and this node will refuse to \
+                 author (L-67, H-12)"
+            );
+            restamp.clear();
+        }
+        let mut reindex: Vec<Directive> = Vec::new();
+        for (content_id, lamport) in &restamp {
+            if let Some(directive) = self.dag.get_mut(content_id) {
+                directive_metadata_mut(directive)
+                    .insert(ENVELOPE_KEY_LAMPORT.to_owned(), lamport.to_string());
+                reindex.push(directive.clone());
+            }
+        }
+        for directive in &reindex {
+            self.read_model.reindex_directive(directive);
+        }
+        let before = self.lamport_clock;
+        self.lamport_clock = self.lamport_clock.max(resume).max(highest);
+        if self.lamport_clock != before {
+            info!(
+                author = %self.author_id,
+                own_high,
+                lamport_clock = self.lamport_clock,
+                restamped = restamp.len(),
+                "this node's own records outside the DAG (quarantined, or held as unparsable \
+                 text) carry lamports above the clock boot resumed at under its placeholder \
+                 author; the clock now resumes above them so no (author, lamport) pair is \
+                 issued twice (L-67, M-18)"
+            );
+        }
     }
 
     /// Install the signer reconcile uses to stamp adopted entries (L-11).
@@ -16518,6 +16865,449 @@ mod tests {
         std::fs::remove_dir_all(directory).ok();
     }
 
+    // ── T78: L-67, the placeholder boot author ───────────────────────────
+
+    /// The author `gl-node` learns from its key after boot.
+    const L67_REAL: &str = "REALENDPOINTID";
+
+    fn l67_envelope(author: &str, lamport: u64) -> Metadata {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("openledger-author".to_owned(), author.to_owned());
+        metadata.insert("openledger-lamport".to_owned(), lamport.to_string());
+        metadata
+    }
+
+    /// The 0923 audit's D3 `h5` file: two peer opens (lamports 5, 6) in the
+    /// DAG and this node's OWN transaction at 12, quarantined at boot for its
+    /// upper-case parent — still in the file, possibly on every peer. `extra`
+    /// is appended verbatim (operator input, unparsable text).
+    fn l67_file(extra: &str) -> PathBuf {
+        let mut own = BTreeMap::new();
+        own.insert("openledger-author".to_owned(), L67_REAL.to_owned());
+        own.insert("openledger-lamport".to_owned(), "12".to_owned());
+        own.insert("openledger-parents".to_owned(), "A".repeat(64));
+        let directives = vec![
+            Directive::Open(Open {
+                date: make_date(2024, 1, 1),
+                account: "Assets:Cash".to_owned(),
+                currencies: Vec::new(),
+                metadata: l67_envelope("peer-history", 5),
+            }),
+            Directive::Open(Open {
+                date: make_date(2024, 1, 1),
+                account: "Equity:Opening".to_owned(),
+                currencies: Vec::new(),
+                metadata: l67_envelope("peer-history", 6),
+            }),
+            Directive::Transaction(Transaction {
+                date: make_date(2024, 1, 16),
+                flag: Flag::Complete,
+                payee: None,
+                narration: Some("mine".to_owned()),
+                tags: Vec::new(),
+                links: Vec::new(),
+                postings: vec![
+                    Posting {
+                        account: "Assets:Cash".to_owned(),
+                        amount: Some(Amount {
+                            number: dec!(1),
+                            currency: "USD".to_owned(),
+                        }),
+                        cost: None,
+                        price: None,
+                        metadata: BTreeMap::new(),
+                    },
+                    Posting {
+                        account: "Equity:Opening".to_owned(),
+                        amount: Some(Amount {
+                            number: dec!(-1),
+                            currency: "USD".to_owned(),
+                        }),
+                        cost: None,
+                        price: None,
+                        metadata: BTreeMap::new(),
+                    },
+                ],
+                metadata: own,
+            }),
+        ];
+        let path = test_file_path();
+        std::fs::write(
+            &path,
+            format!("{}{extra}", full_file_serialize(&directives, &[])),
+        )
+        .unwrap();
+        path
+    }
+
+    /// L-67 (the audit's D3 `h5`): `gl-node` boots under the placeholder
+    /// `"local"` and calls `set_author_id` once the key is loaded. Boot folds
+    /// an out-of-DAG record into the clock only when it is the boot author's,
+    /// so the node's own quarantined record at 12 was ignored, the clock
+    /// resumed at 7, and six local writes stamped 8..=13 — re-issuing the pair
+    /// `(REALENDPOINTID, 12)` it had already signed (M-18). `set_author_id`
+    /// now folds it: the clock resumes where a boot under the real id resumes,
+    /// and no stamp repeats a quarantined own pair.
+    ///
+    /// Bug-catch: make `set_author_id` only assign the author again and the
+    /// clock stays at 7 and the stamps include 12.
+    #[test]
+    fn l67_set_author_id_resumes_the_clock_above_own_quarantined_records() {
+        let path = l67_file("");
+        let mut svc = LedgerService::boot(path.clone(), "local".to_owned()).unwrap();
+        assert_eq!(svc.quarantined_count(), 1, "the own record is quarantined");
+        assert_eq!(
+            svc.lamport_clock(),
+            7,
+            "boot under the placeholder: DAG max + 1"
+        );
+        svc.set_author_id(L67_REAL.to_owned());
+        let control = LedgerService::boot(path.clone(), L67_REAL.to_owned()).unwrap();
+        assert_eq!(
+            svc.lamport_clock(),
+            control.lamport_clock(),
+            "the clock a boot under the real author resumes at"
+        );
+        assert!(svc.lamport_clock() > 12);
+        drop(control);
+
+        let mut stamped = Vec::new();
+        for index in 0..6 {
+            let id = svc
+                .open_account(
+                    format!("Assets:N{index}"),
+                    make_date(2024, 1, 1),
+                    Vec::new(),
+                )
+                .unwrap();
+            stamped.push(svc.get_directive(&id).unwrap().lamport_clock().unwrap());
+        }
+        assert!(
+            stamped.iter().all(|lamport| *lamport > 12),
+            "M-18: a quarantined own pair is never re-issued: {stamped:?}"
+        );
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-67, the audit's X1-3 half: a hand-typed line adopted at boot as
+    /// operator input got its lamport from the placeholder boot's clock (7 +
+    /// 1), while an L-13 reload — a boot under the REAL author — stamps it
+    /// above the own quarantined record (13 + 1). Which envelope the mesh saw
+    /// depended on whether a startup compaction ever failed. `set_author_id`
+    /// re-stamps unfinalised operator input by the same shift, so the two
+    /// agree, and the signed pair is never an own quarantined one.
+    ///
+    /// Bug-catch: skip the re-stamp loop in `set_author_id` and the
+    /// placeholder path finalises the hand line at 8, the reload at 14.
+    #[test]
+    fn l67_operator_input_gets_the_same_lamport_on_a_placeholder_boot_and_a_reload() {
+        let path = l67_file(
+            "\n2024-01-20 * \"hand typed\"\n  Assets:Cash  2 USD\n  Equity:Opening  -2 USD\n",
+        );
+        let hand = |svc: &LedgerService| {
+            svc.dag()
+                .directives()
+                .into_iter()
+                .find(|directive| {
+                    matches!(directive, Directive::Transaction(txn)
+                        if txn.narration.as_deref() == Some("hand typed"))
+                })
+                .cloned()
+                .expect("the hand line is adopted")
+        };
+        let hand_lamport = |svc: &LedgerService| hand(svc).lamport_clock().unwrap();
+
+        let mut placeholder = LedgerService::boot(path.clone(), "local".to_owned()).unwrap();
+        assert_eq!(placeholder.unsigned_operator_input_count(), 1);
+        placeholder.set_author_id(L67_REAL.to_owned());
+        assert_eq!(placeholder.finalize_operator_input(), 1);
+        let via_placeholder = hand_lamport(&placeholder);
+
+        let mut reload = LedgerService::boot(path.clone(), L67_REAL.to_owned()).unwrap();
+        assert_eq!(reload.finalize_operator_input(), 1);
+        let via_reload = hand_lamport(&reload);
+
+        assert_eq!(via_placeholder, via_reload, "Fresh and reload agree");
+        assert!(via_placeholder > 12, "above the own quarantined record");
+        assert_eq!(placeholder.lamport_clock(), reload.lamport_clock());
+        // The read model serves what the DAG holds.
+        let served = placeholder
+            .read_model()
+            .transaction(&compute_content_id(&hand(&placeholder)))
+            .and_then(|indexed| {
+                indexed
+                    .transaction
+                    .metadata
+                    .get("openledger-lamport")
+                    .cloned()
+            });
+        assert_eq!(served, Some(via_placeholder.to_string()));
+        remove_ledger_and_journal(&path);
+    }
+
+    /// T78: an envelope naming this node inside a block boot could not parse
+    /// — a node-written record held as raw text — is a pair this node signed.
+    /// It now feeds the clock at boot, under the real author and through
+    /// `set_author_id` alike; a foreign envelope in the same text does not.
+    ///
+    /// Bug-catch: drop the `note_text_if_own` loop in `boot_with` and both
+    /// clocks resume at 13, below the own raw record at 40.
+    #[test]
+    fn t78_an_own_envelope_in_unparsable_text_feeds_the_clock() {
+        let raw = format!(
+            "\n2024-01-05 open Assets:Mine\n  openledger-author: \"{L67_REAL}\"\n  \
+             openledger-lamport: \"40\"\n  this line does not parse\n\n\
+             2024-01-06 open Assets:Theirs\n  openledger-author: \"someone-else\"\n  \
+             openledger-lamport: \"90\"\n  neither does this one\n"
+        );
+        let path = l67_file(&raw);
+        let real = LedgerService::boot(path.clone(), L67_REAL.to_owned()).unwrap();
+        assert_eq!(
+            real.quarantined_text.len(),
+            2,
+            "both blocks are held as text"
+        );
+        assert_eq!(
+            real.lamport_clock(),
+            41,
+            "own raw 40 counts, foreign raw 90 does not"
+        );
+        drop(real);
+        let mut placeholder = LedgerService::boot(path.clone(), "local".to_owned()).unwrap();
+        assert_eq!(placeholder.lamport_clock(), 7);
+        placeholder.set_author_id(L67_REAL.to_owned());
+        assert_eq!(placeholder.lamport_clock(), 41);
+        remove_ledger_and_journal(&path);
+    }
+
+    /// The text scan's shape rules: pairs per directive, quoted or not, a
+    /// directive with only half an envelope or an unreadable lamport yields
+    /// nothing, comments are skipped.
+    #[test]
+    fn t78_envelope_pairs_in_text_reads_one_pair_per_directive() {
+        let text = "2024-01-01 open A:B\n  openledger-author: \"x\"\n  openledger-lamport: 7\n\
+                    ; a comment\n\
+                    2024-01-02 open A:C\n  openledger-author: \"y\"\n\
+                    2024-01-03 open A:D\n  openledger-lamport: \"9\"\n\
+                    2024-01-04 open A:E\n  openledger-author: \"z\"\n  openledger-lamport: \"nine\"\n\
+                    2024-01-05 open A:F\n\topenledger-lamport: \"11\"\n  openledger-author: \"w\"\n";
+        assert_eq!(
+            envelope_pairs_in_text(text),
+            vec![("x".to_owned(), 7), ("w".to_owned(), 11)]
+        );
+    }
+
+    // ── T78: L-64, the canonical form over the cap ───────────────────────
+
+    /// The length [`LedgerService::compaction_text_len`] computes is the
+    /// length of the text a compaction writes, on every shape that frames it
+    /// differently: empty, directives only, leading comments, quarantined
+    /// directives, unparsable text blocks, operator input before and after
+    /// finalisation.
+    #[test]
+    fn t78_compaction_text_len_is_the_length_of_compaction_text() {
+        let check = |svc: &LedgerService, shape: &str| {
+            assert_eq!(
+                svc.compaction_text_len(),
+                svc.compaction_text().len() as u64,
+                "{shape}"
+            );
+        };
+        let empty = test_file_path();
+        let svc = LedgerService::boot(empty.clone(), "test-peer".to_owned()).unwrap();
+        check(&svc, "empty");
+        remove_ledger_and_journal(&empty);
+
+        let (svc, path) = boot_large_ledger();
+        check(&svc, "large, canonical");
+        remove_ledger_and_journal(&path);
+
+        let comments = test_file_path();
+        std::fs::write(&comments, ";no space\n;  two\n\n").unwrap();
+        let svc = LedgerService::boot(comments.clone(), "test-peer".to_owned()).unwrap();
+        check(&svc, "comments only");
+        remove_ledger_and_journal(&comments);
+
+        let path = l67_file(
+            "\n2024-01-05 open Assets:Mine\n  this line does not parse\n\
+             \n2024-01-20 * \"hand typed\"\n  Assets:Cash  2 USD\n  Equity:Opening  -2 USD\n",
+        );
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.insert_str(0, ";header\n; spaced\n\n");
+        content.push_str("\n2024-02-01 open Assets:Tail\n  garbage without a newline");
+        std::fs::write(&path, &content).unwrap();
+        let mut svc = LedgerService::boot(path.clone(), "local".to_owned()).unwrap();
+        assert!(
+            svc.quarantined_count() >= 2,
+            "quarantine and text both present"
+        );
+        check(&svc, "comments, quarantine, text, operator input");
+        svc.set_author_id(L67_REAL.to_owned());
+        svc.finalize_operator_input();
+        check(&svc, "after finalisation");
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-64 (carried): a dense hand-written file under the cap whose
+    /// CANONICAL form is over it boots — and now says so, naming both sizes
+    /// and the remedy, because every compaction will refuse to write it. The
+    /// fixture is the cheap way to be dense: 63 leading comment lines of
+    /// ~1 MiB written `;x…` (canonical `; x…`, one byte more each) filling the
+    /// file to 16 bytes under the cap, plus one enveloped directive. A small
+    /// ledger boots without the line.
+    ///
+    /// Bug-catch: drop the `warn_if_canonical_exceeds_cap` call from
+    /// `boot_with` and the warning is absent.
+    #[test]
+    fn l64_a_dense_file_whose_canonical_form_is_over_the_cap_boots_with_a_warning() {
+        let path = test_file_path();
+        let note = Directive::Note(Note {
+            date: make_date(2024, 1, 1),
+            account: "Assets:Cash".to_owned(),
+            comment: "dense".to_owned(),
+            metadata: filler_envelope(1),
+        });
+        let note_text = full_file_serialize(std::slice::from_ref(&note), &[]);
+        let target = MAX_LEDGER_FILE_BYTES as usize - 16 - note_text.len();
+        let line = format!(";{}\n", "x".repeat((1 << 20) - 2));
+        let mut content = line.repeat(target / line.len());
+        let rest = target - content.len();
+        content.push(';');
+        content.push_str(&"x".repeat(rest - 2));
+        content.push('\n');
+        content.push_str(&note_text);
+        assert_eq!(content.len() as u64, MAX_LEDGER_FILE_BYTES - 16);
+        std::fs::write(&path, &content).unwrap();
+
+        let (booted, logged) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "test-peer".to_owned()));
+        let booted = booted.expect("an over-cap canonical form still boots");
+        assert!(logged.contains("L-64"), "the boot names it: {logged}");
+        let canonical = booted.compaction_text().len() as u64;
+        assert!(canonical > MAX_LEDGER_FILE_BYTES, "fixture: {canonical}");
+        assert!(
+            logged.contains(&format!("canonical_bytes={canonical}"))
+                && logged.contains(&format!("file_bytes={}", MAX_LEDGER_FILE_BYTES - 16))
+                && logged.contains(&format!("max={MAX_LEDGER_FILE_BYTES}")),
+            "the sizes are named: {logged}"
+        );
+        assert!(logged.contains("Stop the node and shrink"), "{logged}");
+        drop(booted);
+        remove_ledger_and_journal(&path);
+
+        let small = test_file_path();
+        std::fs::write(&small, &note_text).unwrap();
+        let (booted, logged) =
+            capture_warnings(|| LedgerService::boot(small.clone(), "test-peer".to_owned()));
+        booted.unwrap();
+        assert!(!logged.contains("L-64"), "{logged}");
+        remove_ledger_and_journal(&small);
+    }
+
+    /// T78 (0923 audit §5): the boot sweep deletes only the names
+    /// `persist_atomically` reserves — `<name>.tmp` and
+    /// `<name>.tmp.<pid>.<16 hex>` — and leaves every other `<name>.tmp.*`
+    /// alone: an operator's `ledger.bean.tmp.backup` survives a boot, as do
+    /// near-misses of the reserved shape (a short or upper-case nonce, a
+    /// non-numeric pid, an extra field).
+    ///
+    /// Bug-catch: match `name.starts_with("<name>.tmp.")` again in
+    /// `sweep_stale_temporaries` and the backup is deleted.
+    #[cfg(unix)]
+    #[test]
+    fn t78_the_sweep_leaves_an_operator_tmp_backup_alone() {
+        let directory = t67_directory("t78-sweep");
+        let path = directory.join("ledger.bean");
+        std::fs::write(&path, "2024-01-01 open Assets:Cash USD\n").unwrap();
+        let kept: Vec<PathBuf> = [
+            "ledger.bean.tmp.backup",
+            "ledger.bean.tmp.1234",
+            "ledger.bean.tmp.1234.00000000deadbee",
+            "ledger.bean.tmp.1234.0000000000DEADBE",
+            "ledger.bean.tmp.12a4.00000000deadbeef",
+            "ledger.bean.tmp.1234.00000000deadbeef.old",
+            "ledger.bean.tmp..00000000deadbeef",
+            "ledger.bean.tmp.12345678901.00000000deadbeef",
+        ]
+        .iter()
+        .map(|name| directory.join(name))
+        .collect();
+        for file in &kept {
+            std::fs::write(file, "operator data").unwrap();
+        }
+        let swept = [
+            directory.join("ledger.bean.tmp"),
+            directory.join("ledger.bean.tmp.1234.00000000deadbeef"),
+            directory.join(format!(
+                "ledger.bean.tmp.{}.0123456789abcdef",
+                std::process::id()
+            )),
+        ];
+        for file in &swept {
+            std::fs::write(file, "half-written").unwrap();
+        }
+
+        LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        for file in &kept {
+            assert_eq!(
+                std::fs::read_to_string(file).ok().as_deref(),
+                Some("operator data"),
+                "{} is not a reserved temporary name and must survive a boot",
+                file.display()
+            );
+        }
+        for file in &swept {
+            assert!(!file.exists(), "{} is a crashed temporary", file.display());
+        }
+        // And the name `persist_atomically` really draws is one the sweep owns.
+        let drawn = temporary_path_for(&path, path.file_name().unwrap());
+        assert!(is_reserved_temporary_name(
+            &drawn.file_name().unwrap().to_string_lossy(),
+            "ledger.bean"
+        ));
+        std::fs::remove_dir_all(directory).ok();
+    }
+
+    /// T78 (0923 audit §5): a DANGLING symlink at the journal path beside an
+    /// absent `.bean` refuses a fresh boot and creates nothing. The presence
+    /// probe was `Path::exists()`, which follows the link: it read "absent",
+    /// the fresh arm created an empty `.bean`, and only then did the journal
+    /// open refuse the link — leaving a new empty ledger behind.
+    ///
+    /// Bug-catch: probe with `journal_path.exists()` again and the `.bean`
+    /// exists after the refused boot.
+    #[cfg(unix)]
+    #[test]
+    fn t78_a_dangling_journal_link_without_a_bean_refuses_boot_and_creates_nothing() {
+        let directory = t67_directory("t78-dangling-journal");
+        let path = directory.join("ledger.bean");
+        let journal_path = crate::journal::journal_path_for(&path);
+        std::os::unix::fs::symlink(directory.join("nowhere"), &journal_path).unwrap();
+
+        let outcome = boot_error_within(path.clone());
+        assert!(outcome.starts_with("Err"), "{outcome}");
+        assert!(
+            outcome.contains("H-15"),
+            "the journal-present refusal: {outcome}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&path).is_err(),
+            "the refused boot must not create the .bean"
+        );
+        let mut entries: Vec<String> = std::fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec!["ledger.bean.journal".to_owned()],
+            "nothing else created"
+        );
+        std::fs::remove_dir_all(directory).ok();
+    }
+
     /// L-57: a directory at the old fixed `<name>.tmp` wedged every full
     /// rewrite (`remove_file` → EISDIR/EPERM). Writes now use a fresh
     /// `<name>.tmp.<pid>.<nonce>` and succeed; the boot sweep removes stale
@@ -16691,6 +17481,59 @@ mod tests {
         assert!(logged.contains("torn record"), "{logged}");
         assert!(booted.accounts().is_open("Assets:Kept"));
         assert!(!booted.accounts().is_open("Assets:Lost"));
+        remove_ledger_and_journal(&path);
+    }
+
+    /// T78 (0923 audit §5, D2 `(e2)`): the ext4 `data=writeback` shape — the
+    /// final record's payload reads back as an older journal's text, no NUL —
+    /// boots with the torn warning instead of refusing (`LEDGER_JOURNAL`), and
+    /// the record it drops is not destroyed: the compaction that folds the
+    /// journal renames it to a `.torn-*` sidecar holding the exact bytes.
+    ///
+    /// Bug-catch: restore the `payload.contains(&0)` condition in
+    /// `journal::read_journal` and boot fails with `LEDGER_JOURNAL`.
+    #[test]
+    fn t78_a_stale_final_journal_record_boots_torn_and_its_bytes_are_kept() {
+        let path = test_file_path();
+        std::fs::write(&path, "2024-01-01 open Assets:Cash USD\n").unwrap();
+        let journal_path = crate::journal::journal_path_for(&path);
+        crate::journal::append_record(
+            &journal_path,
+            &crate::journal::record_bytes("2024-01-02 open Assets:Kept USD\n"),
+        )
+        .unwrap();
+        let record = crate::journal::record_bytes("2024-01-03 open Assets:Lost USD\n");
+        crate::journal::append_record(&journal_path, &record).unwrap();
+        let mut bytes = std::fs::read(&journal_path).unwrap();
+        let payload_start = bytes.len() - (record.len() - (record.find('\n').unwrap() + 1));
+        let stale: Vec<u8> = b"2023-12-01 open Assets:OldFolded USD\n"
+            .iter()
+            .copied()
+            .cycle()
+            .take(bytes.len() - payload_start)
+            .collect();
+        bytes[payload_start..].copy_from_slice(&stale);
+        assert!(!bytes.contains(&0), "the ext4 shape holds no NUL");
+        std::fs::write(&journal_path, &bytes).unwrap();
+
+        let (booted, logged) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "test-peer".to_owned()));
+        let mut booted = booted.expect("T78: a stale final record must not brick boot");
+        assert!(logged.contains("torn record"), "{logged}");
+        assert!(booted.accounts().is_open("Assets:Kept"));
+        assert!(!booted.accounts().is_open("Assets:Lost"));
+
+        booted.compact().unwrap();
+        let sidecars = torn_sidecars(&journal_path);
+        assert_eq!(sidecars.len(), 1, "{sidecars:?}");
+        assert_eq!(
+            std::fs::read(&sidecars[0]).unwrap(),
+            bytes,
+            "the dropped record's bytes are kept byte-for-byte"
+        );
+        for sidecar in sidecars {
+            std::fs::remove_file(sidecar).ok();
+        }
         remove_ledger_and_journal(&path);
     }
 

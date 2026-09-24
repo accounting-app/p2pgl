@@ -102,6 +102,14 @@ pub async fn graphql_handler(
     schema.execute(request.into_inner()).await.into()
 }
 
+/// The GraphiQL release as a string literal, so the asset URLs below can be
+/// built from it at compile time (`concat!` takes literals, not consts).
+macro_rules! graphiql_version {
+    () => {
+        "4.1.2"
+    };
+}
+
 /// The exact GraphiQL release the explorer page loads (L-66).
 ///
 /// async-graphql 7.2.1's default is `"4"`, a floating major: `unpkg.com`
@@ -112,26 +120,137 @@ pub async fn graphql_handler(
 /// auth off it can run every mutation — so the code it runs should be one
 /// reviewed release, not "the latest one".
 ///
-/// **Residual (L-66):** this pins the version only. `GraphiQLSource` offers no
-/// way to add `integrity` attributes, and its template hard-codes
-/// `react@18`/`react-dom@18` **development** builds (a floating minor) from
-/// the same CDN (`async-graphql-7.2.1/src/http/graphiql_v2_source.hbs:28-51`),
-/// so whoever controls those CDN responses still controls the page. What
-/// bounds that is configuration: `graphiql` defaults to `false` and is refused
-/// on any non-loopback bind.
-pub const GRAPHIQL_VERSION: &str = "4.1.2";
+/// Since T78 every asset the page loads is also held to a Subresource
+/// Integrity hash ([`PINNED_ASSETS`]), so a CDN that serves other bytes at
+/// these URLs is refused by the browser rather than run.
+pub const GRAPHIQL_VERSION: &str = graphiql_version!();
+
+/// One external asset of the explorer page, pinned (L-66, T78).
+struct PinnedAsset {
+    /// The URL `GraphiQLSource`'s template references (async-graphql 7.2.1,
+    /// `src/http/graphiql_v2_source.hbs:28-35, 47`).
+    template_url: &'static str,
+    /// The exact URL the page loads instead: an exact version and, for
+    /// React, the **production** build (the template loads the development
+    /// builds of a floating `@18`).
+    url: &'static str,
+    /// `sha384-<base64>` of the bytes at `url`. Obtained once, on 2026-09-23,
+    /// with `curl -sS <url> | openssl dgst -sha384 -binary | openssl base64
+    /// -A`; `unpkg.com` and `cdn.jsdelivr.net/npm/` served identical bytes.
+    /// npm versions are immutable, so a different hash means different bytes
+    /// — which is the point.
+    integrity: &'static str,
+}
+
+/// Every external script and stylesheet of the explorer page (L-66, T78).
+///
+/// To move a version: change the URL, fetch it, recompute the hash as
+/// [`PinnedAsset::integrity`] says, and run
+/// `graphql::tests::test_graphiql_page_loads_only_pinned_assets_with_integrity`.
+const PINNED_ASSETS: [PinnedAsset; 4] = [
+    PinnedAsset {
+        template_url: "https://unpkg.com/react@18/umd/react.development.js",
+        url: "https://unpkg.com/react@18.3.1/umd/react.production.min.js",
+        integrity: "sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z",
+    },
+    PinnedAsset {
+        template_url: "https://unpkg.com/react-dom@18/umd/react-dom.development.js",
+        url: "https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js",
+        integrity: "sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1",
+    },
+    PinnedAsset {
+        template_url: concat!(
+            "https://unpkg.com/graphiql@",
+            graphiql_version!(),
+            "/graphiql.min.css"
+        ),
+        url: concat!(
+            "https://unpkg.com/graphiql@",
+            graphiql_version!(),
+            "/graphiql.min.css"
+        ),
+        integrity: "sha384-1el1QShFBnnXTx9x/Cprg82hZWKt0ry29OAYIXt05swbi0KcZDFoj0CWguMpopJr",
+    },
+    PinnedAsset {
+        template_url: concat!(
+            "https://unpkg.com/graphiql@",
+            graphiql_version!(),
+            "/graphiql.min.js"
+        ),
+        url: concat!(
+            "https://unpkg.com/graphiql@",
+            graphiql_version!(),
+            "/graphiql.min.js"
+        ),
+        integrity: "sha384-9XdHu7ajgGJziD4J1zNBKQ842Q/+zZfDv+ib1eMhZWBH6hPAs806x+Jbcf0yNO6B",
+    },
+];
+
+/// The template's favicon, a third origin (`graphql.org`) the page contacted
+/// on every load (L-66). Stripped: the browser falls back to the node's own
+/// `/favicon.ico`, which is simply absent.
+const TEMPLATE_FAVICON_URL: &str = "https://graphql.org/favicon.ico";
 
 /// Handler for `GET /graphql` — serve the GraphiQL interactive explorer.
 pub async fn graphiql_handler() -> impl IntoResponse {
     Html(graphiql_page())
 }
 
-/// The explorer page, with the GraphiQL assets pinned to [`GRAPHIQL_VERSION`].
+/// The explorer page: GraphiQL pinned to [`GRAPHIQL_VERSION`], every external
+/// asset rewritten to [`PINNED_ASSETS`] with its integrity hash, and no
+/// third-origin favicon.
 fn graphiql_page() -> String {
-    GraphiQLSource::build()
+    let page = GraphiQLSource::build()
         .endpoint("/graphql")
         .version(GRAPHIQL_VERSION)
-        .finish()
+        .finish();
+    pin_page_assets(&page)
+}
+
+/// Post-process `GraphiQLSource::finish()`'s HTML (L-66, T78).
+///
+/// `GraphiQLSource` has no hook for `integrity` attributes, so each external
+/// tag the template emits is found by its URL and its opening tag rewritten
+/// whole: `<script src=… integrity=… crossorigin="anonymous">` or
+/// `<link rel="stylesheet" href=… integrity=… crossorigin="anonymous" />`
+/// (SRI on a cross-origin asset needs a CORS fetch; `unpkg.com` answers
+/// `Access-Control-Allow-Origin: *`). The favicon tag is removed. A template
+/// that changes shape — a URL moved, a tag added — is caught by
+/// `test_graphiql_page_loads_only_pinned_assets_with_integrity`, which fails
+/// if any external `src`/`href` in the result lacks an integrity hash; the
+/// template is fixed by `Cargo.lock` (async-graphql 7.2.1) until then.
+fn pin_page_assets(page: &str) -> String {
+    let mut page = page.to_owned();
+    for asset in &PINNED_ASSETS {
+        let Some((start, end)) = enclosing_tag(&page, asset.template_url) else {
+            continue;
+        };
+        let replacement = if page[start..].starts_with("<link") {
+            format!(
+                "<link rel=\"stylesheet\" href=\"{}\" integrity=\"{}\" crossorigin=\"anonymous\" />",
+                asset.url, asset.integrity
+            )
+        } else {
+            format!(
+                "<script src=\"{}\" integrity=\"{}\" crossorigin=\"anonymous\">",
+                asset.url, asset.integrity
+            )
+        };
+        page.replace_range(start..end, &replacement);
+    }
+    if let Some((start, end)) = enclosing_tag(&page, TEMPLATE_FAVICON_URL) {
+        page.replace_range(start..end, "");
+    }
+    page
+}
+
+/// The byte range of the opening tag whose attribute value is exactly `url`
+/// (`"url"` quoted), from its `<` through its `>`.
+fn enclosing_tag(page: &str, url: &str) -> Option<(usize, usize)> {
+    let at = page.find(&format!("\"{url}\""))?;
+    let start = page[..at].rfind('<')?;
+    let end = at + page[at..].find('>')? + 1;
+    Some((start, end))
 }
 
 #[cfg(test)]
@@ -165,6 +284,107 @@ mod tests {
             3,
             "an exact major.minor.patch, not a range"
         );
+    }
+
+    /// Every `<script src>` and `<link href>` the page carries, as
+    /// `(tag, url)`.
+    fn external_references(page: &str) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        let mut rest = page;
+        while let Some(open) = rest.find('<') {
+            let tail = &rest[open..];
+            let Some(close) = tail.find('>') else { break };
+            let tag = &tail[..=close];
+            for attribute in ["src=\"", "href=\""] {
+                if let Some(at) = tag.find(attribute) {
+                    let value = &tag[at + attribute.len()..];
+                    let value = &value[..value.find('"').unwrap()];
+                    found.push((tag.to_owned(), value.to_owned()));
+                }
+            }
+            rest = &tail[close + 1..];
+        }
+        found
+    }
+
+    /// L-66 (T78): the explorer page loads nothing that is not pinned. Every
+    /// external `<script src>` / `<link href>` carries the `integrity` hash of
+    /// its [`PINNED_ASSETS`] entry and `crossorigin="anonymous"`; React is the
+    /// exact 18.3.1 production build; no development build, floating `@18`
+    /// or `graphql.org` favicon remains. This is also the template-shape
+    /// guard: if async-graphql's template moves or adds an asset, a reference
+    /// without an integrity hash appears here and the test fails.
+    ///
+    /// Bug-catch: return `GraphiQLSource`'s page without `pin_page_assets`
+    /// and the React development builds load with no integrity.
+    #[test]
+    fn test_graphiql_page_loads_only_pinned_assets_with_integrity() {
+        let page = graphiql_page();
+        let references = external_references(&page);
+        assert_eq!(
+            references.len(),
+            PINNED_ASSETS.len(),
+            "one reference per pinned asset: {references:?}"
+        );
+        for asset in &PINNED_ASSETS {
+            let matching: Vec<_> = references
+                .iter()
+                .filter(|(_, url)| url == asset.url)
+                .collect();
+            assert_eq!(matching.len(), 1, "{} is loaded once: {page}", asset.url);
+            let tag = &matching[0].0;
+            assert!(
+                tag.contains(&format!("integrity=\"{}\"", asset.integrity)),
+                "{tag}"
+            );
+            assert!(tag.contains("crossorigin=\"anonymous\""), "{tag}");
+        }
+        for (tag, url) in &references {
+            assert!(
+                url.starts_with("https://"),
+                "only pinned https assets: {tag}"
+            );
+            assert!(tag.contains("integrity=\"sha384-"), "no integrity: {tag}");
+        }
+        for unpinned in [
+            "development",
+            "react@18/",
+            "react-dom@18/",
+            "graphql.org",
+            "graphiql@4/",
+        ] {
+            assert!(!page.contains(unpinned), "{unpinned} remains: {page}");
+        }
+        assert!(page.contains("react@18.3.1/umd/react.production.min.js"));
+        assert!(page.contains("react-dom@18.3.1/umd/react-dom.production.min.js"));
+    }
+
+    /// The hashes are well-formed SHA-384 SRI values — `sha384-` and the
+    /// base64 of 48 bytes — and every URL names an exact version.
+    #[test]
+    fn test_pinned_asset_hashes_are_sha384_and_urls_exact() {
+        for asset in &PINNED_ASSETS {
+            let encoded = asset
+                .integrity
+                .strip_prefix("sha384-")
+                .unwrap_or_else(|| panic!("{}", asset.integrity));
+            assert_eq!(encoded.len(), 64, "48 bytes of base64: {}", asset.integrity);
+            assert!(encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'));
+            let version = asset
+                .url
+                .split('@')
+                .nth(1)
+                .and_then(|rest| rest.split('/').next())
+                .unwrap();
+            assert_eq!(
+                version.split('.').count(),
+                3,
+                "exact version: {}",
+                asset.url
+            );
+        }
     }
 
     #[tokio::test]

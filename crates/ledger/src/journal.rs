@@ -86,21 +86,40 @@
 //!     fails closed, naming the offset (M-43 / R-18). Before T68 it was
 //!     classified torn, every later record was silently dropped, and the
 //!     startup compaction erased them;
-//!   - the **final** record's payload is complete but fails its checksum and
-//!     contains a NUL byte. A node-written payload never contains NUL; a
-//!     metadata-first filesystem (XFS, ext4 `data=writeback`) that loses power
-//!     between `write_all` and `sync_all` can expose the appended region as
-//!     zeros at its new length (M-44). A header line holding NUL with no later
-//!     record header is the same artefact one block earlier.
+//!   - the **final** record's payload is complete by length but fails its
+//!     checksum, and no *intact* record (a `;;olj ` line whose claimed bytes
+//!     follow it and match its hash) starts inside it (T78). A metadata-first
+//!     filesystem that loses power between `write_all` and `sync_all` can
+//!     persist the new length without the data: XFS exposes the region as
+//!     zeros (M-44's original, NUL-only rule), ext4 `data=writeback` as
+//!     whatever the reused blocks held before — typically an older, folded
+//!     journal's text, with no NUL and possibly with stale `;;olj ` lines cut
+//!     at block boundaries (0923 audit §5; the byte shape is executed, a real
+//!     ext4 crash was not). An intact record inside the region means this
+//!     record's length was damaged to swallow records appended after it — a
+//!     crash cannot do that (M-43) — so that case still fails closed. A
+//!     header line holding NUL with no later record header is the zero-fill
+//!     artefact one block earlier.
 //! * **Anything else fails closed**: a complete-but-malformed header, a
-//!   non-final payload whose checksum does not match, a payload that is not
-//!   UTF-8, a journal larger than the budget. A crash does not produce these
-//!   on the filesystems the NUL rule covers — a hand edit or real corruption
-//!   does — and the ledger refuses to boot on top of them rather than silently
-//!   discarding directives it was told were durable.
+//!   **non-final** payload whose checksum does not match, a payload that is
+//!   not UTF-8, a journal larger than the budget. A crash does not produce
+//!   these — a hand edit or real corruption does — and the ledger refuses to
+//!   boot on top of them rather than silently discarding directives it was
+//!   told were durable. (Residual: a crash whose stale bytes land in a
+//!   *header* line rather than a payload reads as a malformed header and
+//!   fails closed; so does a stale block that happens to hold one whole old
+//!   record.)
 //!
 //! The torn rule is a heuristic about bytes, so the bytes it drops are never
-//! destroyed on its strength: see the `.torn-*` rename above.
+//! destroyed on its strength: see the `.torn-*` rename above. That is also
+//! why widening it (T78) gives a journal writer nothing: whoever can make the
+//! final record fail its checksum can truncate the file, which was always a
+//! torn tail; either way the record is dropped from memory with a warning and
+//! its bytes are kept in the sidecar. What the widening costs is a final
+//! record damaged *after* its commit returned (bit rot on the last record):
+//! it now boots without that record, loudly, instead of refusing to boot —
+//! the "rename, never unlink" policy keeps it recoverable, and a replicated
+//! record is re-supplied by peers.
 //!
 //! **Hand-editing the journal is unsupported.** It is node-private state, not
 //! an interchange format; the supported way to hand-edit a ledger is the
@@ -353,12 +372,18 @@ pub fn read_journal(path: &Path, budget: u64) -> Result<JournalScan, JournalErro
         let digest = Sha256::digest(payload);
         let actual_hash: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
         if actual_hash != expected_hash {
-            // M-44: the final record, complete by length, whose payload holds
-            // a NUL byte — the zero-filled tail a metadata-first filesystem
-            // exposes after a power loss between `write_all` and `sync_all`.
-            // No node-written payload contains NUL, so this is the crash
-            // artefact, not an edit; anywhere but the end it is still corrupt.
-            if cursor == bytes.len() && payload.contains(&0) {
+            // M-44 → T78: the FINAL record, complete by length, whose
+            // payload fails its checksum. A power loss between `write_all`
+            // and `sync_all` on a metadata-first filesystem leaves exactly
+            // this: the new length reached the disk, the data did not, and
+            // the region reads back as zeros (XFS — M-44's NUL rule) or as
+            // whatever the reused blocks held before (ext4 `data=writeback`:
+            // typically an older, folded journal's text — no NUL at all).
+            // Torn, unless an INTACT record starts inside it: then this
+            // record's length was damaged to swallow records appended after
+            // it, which a crash cannot do (M-43), and it fails closed.
+            // Anywhere but the end a checksum failure is still corrupt.
+            if cursor == bytes.len() && !has_later_intact_record(payload) {
                 scan.torn_tail_bytes = (bytes.len() - record_start) as u64;
                 break;
             }
@@ -389,6 +414,56 @@ fn has_later_record_header(rest: &[u8]) -> bool {
         || rest
             .windows(TAG.len() + 1)
             .any(|window| window[0] == b'\n' && &window[1..] == TAG)
+}
+
+/// Does `region` hold a complete, checksum-valid record starting at a line
+/// start (T78)?
+///
+/// `region` is the payload of a final record that failed its checksum; its
+/// offset 0 is a line start. A node-written payload never holds a line
+/// starting `;;olj ` ([`has_later_record_header`]), so the FIRST such line in
+/// the region is where the next appended record would begin if this record's
+/// length had been damaged to run to the end of the file — and an appended
+/// record reads back intact. Only that first candidate is checked, so the cost
+/// is one parse and at most one hash over bytes already in memory, whatever
+/// the region holds.
+///
+/// Not [`has_later_record_header`], which the over-long-claim arm uses: the
+/// ext4 `data=writeback` shape exposes a reused block of an OLDER journal,
+/// whose text is full of `;;olj ` lines cut at arbitrary block boundaries.
+/// Those do not verify against the bytes that follow them; a real later
+/// record does. (A stale block that happens to hold one whole old record
+/// verifies too, and fails closed — the pre-T78 answer.)
+fn has_later_intact_record(region: &[u8]) -> bool {
+    const TAG: &[u8] = b";;olj ";
+    let start = if region.starts_with(TAG) {
+        0
+    } else {
+        match region
+            .windows(TAG.len() + 1)
+            .position(|window| window[0] == b'\n' && &window[1..] == TAG)
+        {
+            Some(newline) => newline + 1,
+            None => return false,
+        }
+    };
+    let candidate = &region[start..];
+    let Some(header_end) = candidate.iter().position(|byte| *byte == b'\n') else {
+        return false;
+    };
+    let Some((length, expected_hash)) = std::str::from_utf8(&candidate[..header_end])
+        .ok()
+        .and_then(parse_header)
+    else {
+        return false;
+    };
+    let body = &candidate[header_end + 1..];
+    if length > body.len() {
+        return false;
+    }
+    let digest = Sha256::digest(&body[..length]);
+    let actual_hash: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    actual_hash == expected_hash
 }
 
 /// Parse `;;olj <len> <sha256hex>` into its two fields.
@@ -565,6 +640,15 @@ pub enum FileTrust {
     /// regular `.bean` and leaves the target untouched (it always has). To keep
     /// the ledger elsewhere, symlink the data directory instead.
     OperatorLedger,
+    /// `gl-node`'s config file (`GL_NODE_CONFIG`) — **read only**, operator
+    /// owned (T77 / L-73). The [`FileTrust::OperatorLedger`] policy: a symlink
+    /// is followed (configs are routinely mounted as links — a Kubernetes
+    /// ConfigMap is one), the target must be a regular file, the open never
+    /// blocks, and owner and mode are not checked (the operator may keep it
+    /// under another account; `gl-node` warns separately when a file holding
+    /// the API key is readable by others). Its own variant so the refusal and
+    /// any later tightening name the config, not the ledger.
+    OperatorConfig,
     /// A node-private file the node **reads** — the journal at boot and in the
     /// L-13 reload. Never followed through a symlink; must be owned by this
     /// uid, have exactly one link, and be writable by nobody else. Group/world
@@ -604,9 +688,10 @@ pub struct CheckedFile {
 /// One helper for every ledger-side open (M-36, L-58, L-59, the key file's
 /// L-49 race), in this order:
 ///
-/// 1. **`lstat`** (or `stat` for [`FileTrust::OperatorLedger`], which follows a
-///    symlink by policy) and require a regular file. Refusing here means a
-///    FIFO, device or directory is never opened at all.
+/// 1. **`lstat`** (or `stat` for [`FileTrust::OperatorLedger`] and
+///    [`FileTrust::OperatorConfig`], which follow a symlink by policy) and
+///    require a regular file. Refusing here means a FIFO, device or directory
+///    is never opened at all.
 /// 2. **`open`** with `O_NONBLOCK` — a FIFO swapped in after step 1 opens
 ///    immediately (or fails `ENXIO` for writing) instead of parking the thread
 ///    until a peer process appears — and, unless following by policy,
@@ -639,7 +724,7 @@ fn open_checked_impl(
 ) -> std::io::Result<CheckedFile> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-    let follow = trust == FileTrust::OperatorLedger;
+    let follow = matches!(trust, FileTrust::OperatorLedger | FileTrust::OperatorConfig);
     let inspect = |path: &Path| {
         if follow {
             std::fs::metadata(path)
@@ -717,7 +802,8 @@ fn open_checked_impl(
     // 4. Node-owned files: ours, one name, and nobody else's to write (or read).
     let mode = opened.mode() & 0o777;
     let mut readable_by_others = false;
-    if trust != FileTrust::OperatorLedger {
+    // Operator files (the followed classes) stop at type and identity.
+    if !follow {
         let uid = effective_uid();
         if opened.uid() != uid {
             return Err(std::io::Error::new(
@@ -1318,6 +1404,114 @@ mod tests {
             matches!(error, JournalError::Corrupt { offset, .. } if offset == second as u64),
             "got {error}"
         );
+        std::fs::remove_file(path).ok();
+    }
+
+    // ── T78: a checksum-failing final record (ext4 `data=writeback`) ───
+
+    /// Two appended records whose LAST payload is then overwritten, at its
+    /// exact length, by `stale` cycled — the byte shape ext4 `data=writeback`
+    /// leaves after a power cut between `write_all` and `sync_all` (the
+    /// 0923 audit's D2 `torn (e1)/(e2)` fixture). Returns the bytes and the
+    /// offset of the last record's header.
+    fn with_stale_final_payload(path: &Path, stale: &[u8]) -> (Vec<u8>, usize) {
+        append_record(path, &record_bytes("2024-01-02 open Assets:Kept USD\n")).unwrap();
+        let last = std::fs::metadata(path).unwrap().len() as usize;
+        let record = record_bytes("2024-01-03 open Assets:Lost USD\n");
+        append_record(path, &record).unwrap();
+        let mut bytes = std::fs::read(path).unwrap();
+        let payload_start = last + record.find('\n').unwrap() + 1;
+        let length = bytes.len() - payload_start;
+        bytes[payload_start..].copy_from_slice(
+            &stale
+                .iter()
+                .copied()
+                .cycle()
+                .take(length)
+                .collect::<Vec<u8>>(),
+        );
+        write_private(path, &bytes);
+        (bytes, last)
+    }
+
+    /// T78 (0923 audit §5, D2 `(e1)`/`(e2)`): the final record's payload reads
+    /// back as STALE text, not zeros — an older journal's record, header line
+    /// included (e1), or plain old payload text (e2). No NUL, so M-44's rule
+    /// said `Corrupt` and boot refused on a file the node wrote. Both are the
+    /// torn final record now: the record before it loads, the whole last
+    /// record is reported as torn.
+    ///
+    /// Bug-catch: restore the `payload.contains(&0)` condition in
+    /// `read_journal` and both shapes are `Corrupt` ("does not match its
+    /// recorded SHA-256").
+    #[test]
+    fn t78_a_stale_final_payload_is_a_torn_tail() {
+        let old_record = record_bytes("2023-12-01 open Assets:OldFolded USD\n");
+        for (shape, stale) in [
+            ("e1 (old record, header included)", old_record.as_bytes()),
+            (
+                "e2 (old payload text)",
+                b"2023-12-01 open Assets:OldFolded USD\n".as_slice(),
+            ),
+        ] {
+            let path = temp_journal("t78-stale");
+            let (bytes, last) = with_stale_final_payload(&path, stale);
+            assert!(!bytes.contains(&0), "{shape}: the fixture holds no NUL");
+            let scan = read_journal(&path, 1 << 20)
+                .unwrap_or_else(|error| panic!("{shape}: must be torn, got {error}"));
+            assert_eq!(
+                scan.payloads,
+                vec!["2024-01-02 open Assets:Kept USD\n"],
+                "{shape}"
+            );
+            assert_eq!(scan.torn_tail_bytes, (bytes.len() - last) as u64, "{shape}");
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    /// T78's limit, where the widened rule must NOT reach: the checksum
+    /// failure is only a crash artefact on the FINAL record. The same stale
+    /// text in a payload with a record after it is corruption; and a final
+    /// record whose length was damaged to run exactly to the end of the file
+    /// — swallowing the intact records appended after it — is corruption too
+    /// (the M-43 shape a crash cannot produce), both at the damaged record's
+    /// offset.
+    ///
+    /// Bug-catch: drop `!has_later_intact_record(payload)` from the final-record
+    /// arm and the second shape is `Ok` with one payload and two records
+    /// silently dropped.
+    #[test]
+    fn t78_a_checksum_failure_before_the_end_or_over_an_intact_record_is_corrupt() {
+        // Stale text in the MIDDLE record.
+        let path = temp_journal("t78-mid");
+        let (mut bytes, second) = three_records(&path);
+        let payload = second + bytes[second..].iter().position(|b| *b == b'\n').unwrap() + 1;
+        bytes[payload..payload + 10].copy_from_slice(b"2023-12-01");
+        write_private(&path, &bytes);
+        let error = read_journal(&path, 1 << 20).expect_err("mid-journal stale text");
+        assert!(
+            matches!(error, JournalError::Corrupt { offset, .. } if offset == second as u64),
+            "got {error}"
+        );
+        std::fs::remove_file(path).ok();
+
+        // The second of three claims exactly the bytes left in the file.
+        let path = temp_journal("t78-swallow");
+        let (bytes, second) = three_records(&path);
+        let header_end = second + bytes[second..].iter().position(|b| *b == b'\n').unwrap() + 1;
+        let to_end = (bytes.len() - header_end).to_string();
+        let damaged = with_length(&bytes, second, &to_end);
+        write_private(&path, &damaged);
+        match read_journal(&path, 64 * 1024 * 1024) {
+            Err(JournalError::Corrupt { offset, .. }) => assert_eq!(offset, second as u64),
+            Ok(scan) => panic!(
+                "a length damaged to swallow two intact records was read as a torn tail \
+                 ({} payloads, {} torn bytes)",
+                scan.payloads.len(),
+                scan.torn_tail_bytes
+            ),
+            Err(other) => panic!("expected Corrupt, got {other}"),
+        }
         std::fs::remove_file(path).ok();
     }
 

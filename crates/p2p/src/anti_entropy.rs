@@ -233,10 +233,11 @@ fn page_slice(ids: &[String], start: usize) -> Vec<String> {
 
 /// Estimated encoded size of one supply entry (H-02). An over-approximation.
 ///
-/// Public since T69: the receiver uses the same number to bound the journal
-/// record a batch would become before it stages it (M-39) — the record holds
-/// the same economic body and the same envelope pairs, one metadata line each,
-/// well inside the 128-byte per-entry allowance plus the id's 64.
+/// The SENDER's frame budget. T69 also used it on the receiver to bound the
+/// journal record a batch would become; that over-counted ~150–190 B an entry
+/// (the 128-byte framing allowance and the 64-byte id are not in the record),
+/// which near the cap deferred a batch that fit, forever. The receiver now
+/// uses [`RecordEstimate`], which is the record's exact length (T77).
 pub fn estimated_entry_bytes(entry: &SupplyEntry) -> usize {
     let envelope: usize = entry
         .envelope
@@ -249,6 +250,247 @@ pub fn estimated_entry_bytes(entry: &SupplyEntry) -> usize {
         .saturating_add(envelope)
         .saturating_add(entry.id.len())
         .saturating_add(SUPPLY_ENTRY_OVERHEAD_BYTES)
+}
+
+/// The exact length of the journal record a set of staged directives becomes
+/// (T77) — what `LedgerService::prepare_commit`'s append arm writes and its
+/// cap projection counts: `journal::record_bytes(full_file_serialize(set))`.
+///
+/// `full_file_serialize` of a set is the per-directive canonical forms (with
+/// their envelope metadata) joined by one blank-line `\n`, in an order that
+/// does not change the length, so the payload is the sum of
+/// [`Self::directive_bytes`] plus one byte per separator; the record adds a
+/// header whose only variable part is the payload length's digits. Each
+/// directive is therefore serialized once, when it is added, and the running
+/// total answers "does the set plus this one still fit?" in O(1).
+///
+/// # Why exact is still conservative
+///
+/// The estimate is taken on the directive as it arrived (validated, not yet
+/// staged). Staging stores that same value — a remote transaction must arrive
+/// with every posting resolved, so `validate_transaction` changes nothing it
+/// serializes, and the other kinds are inserted as given — so the staged
+/// record is exactly this long when every counted directive is staged, and
+/// shorter when some are duplicates, buffered or refused. It never counts a
+/// directive it was not given, so it can under-estimate only a record that
+/// also carries something ELSE staged earlier; the ALPN path takes it under
+/// the single-writer permit, where nothing else is pending.
+///
+/// It replaces [`estimated_entry_bytes`] on the receive side: that adds a
+/// 128-byte framing allowance and the 64-byte id, neither of which is in the
+/// record, so near the cap a batch that fit was deferred forever.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecordEstimate {
+    /// Sum of the counted directives' serialized lengths.
+    serialized: u64,
+    /// How many directives are counted.
+    count: u64,
+}
+
+impl RecordEstimate {
+    /// An empty set: no record at all.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The canonical, envelope-bearing serialization length of one directive
+    /// — its share of a journal record's payload, separators aside.
+    pub fn directive_bytes(directive: &ledger::model::Directive) -> u64 {
+        ledger::serialize::full_file_serialize(std::slice::from_ref(directive), &[]).len() as u64
+    }
+
+    /// This set plus one directive of `directive_bytes` serialized bytes.
+    #[must_use]
+    pub fn with(self, directive_bytes: u64) -> Self {
+        Self {
+            serialized: self.serialized.saturating_add(directive_bytes),
+            count: self.count.saturating_add(1),
+        }
+    }
+
+    /// Add one directive of `directive_bytes` serialized bytes.
+    pub fn add(&mut self, directive_bytes: u64) {
+        *self = self.with(directive_bytes);
+    }
+
+    /// How many directives are counted.
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// The journal payload: the forms plus one separator between each pair.
+    pub fn payload_bytes(&self) -> u64 {
+        self.serialized.saturating_add(self.count.saturating_sub(1))
+    }
+
+    /// The whole record, header included; 0 for an empty set (nothing staged
+    /// writes no record).
+    pub fn record_bytes(&self) -> u64 {
+        if self.count == 0 {
+            return 0;
+        }
+        let payload = self.payload_bytes();
+        record_header_bytes(payload).saturating_add(payload)
+    }
+}
+
+/// Length of a journal record header for a `payload`-byte payload. Taken from
+/// `ledger::journal::record_bytes` itself — the header of an empty payload,
+/// with the one-digit `0` swapped for the payload length's digits — so the
+/// frame format is referenced, not restated.
+fn record_header_bytes(payload: u64) -> u64 {
+    static EMPTY_RECORD: std::sync::LazyLock<u64> =
+        std::sync::LazyLock::new(|| ledger::journal::record_bytes("").len() as u64);
+    let digits = payload.checked_ilog10().map_or(1, |log| u64::from(log) + 1);
+    EMPTY_RECORD.saturating_sub(1).saturating_add(digits)
+}
+
+/// A conservative estimate of the heap one parsed directive holds (T77).
+///
+/// Phase 1 of the receiver's `Supply` handling keeps every directive it has
+/// validated until it stages them, and a parsed directive is much larger than
+/// its text: each posting is a `Posting` inline in a `Vec` plus its own
+/// strings, and every non-empty metadata map allocates a whole B-tree leaf.
+/// The densest body inside every §3.12 cap (1,000 postings, 100 posting and
+/// 100 directive metadata keys, 100 tags and links, ~19 KB) holds ~12.7× its
+/// text once parsed (T75's measurement), so bounding phase 1 by frame BYTES
+/// bounds nothing; the receiver bounds it by this instead.
+///
+/// Counted from the value, never from the text: every `String` and `Vec` at
+/// its capacity plus a per-allocation overhead, every metadata map as whole
+/// leaves of [`BTREE_NODE_CAPACITY`] entries. Calibrated against a counting
+/// allocator (gl-node's phase-1 residency test): at or above the real
+/// resident size for each shape measured, and within about 2× of it.
+pub fn resident_weight(directive: &ledger::model::Directive) -> usize {
+    use ledger::model::Directive;
+    let size = std::mem::size_of::<Directive>();
+    let body = match directive {
+        Directive::Transaction(txn) => {
+            let postings: usize = txn
+                .postings
+                .iter()
+                .map(|posting| {
+                    string_weight(&posting.account)
+                        + posting
+                            .amount
+                            .as_ref()
+                            .map_or(0, |amount| string_weight(&amount.currency))
+                        + posting
+                            .cost
+                            .as_ref()
+                            .and_then(|cost| cost.amount.as_ref())
+                            .map_or(0, |amount| string_weight(&amount.currency))
+                        + posting.price.as_ref().map_or(0, |price| match price {
+                            ledger::model::PriceSpec::Unit(amount)
+                            | ledger::model::PriceSpec::Total(amount) => {
+                                string_weight(&amount.currency)
+                            }
+                        })
+                        + metadata_weight(&posting.metadata)
+                })
+                .sum();
+            vec_weight::<ledger::model::Posting>(txn.postings.capacity())
+                + postings
+                + txn.payee.as_ref().map_or(0, string_weight)
+                + txn.narration.as_ref().map_or(0, string_weight)
+                + strings_weight(&txn.tags)
+                + strings_weight(&txn.links)
+                + metadata_weight(&txn.metadata)
+        }
+        Directive::Open(open) => {
+            string_weight(&open.account)
+                + strings_weight(&open.currencies)
+                + metadata_weight(&open.metadata)
+        }
+        Directive::Close(close) => string_weight(&close.account) + metadata_weight(&close.metadata),
+        Directive::Commodity(commodity) => {
+            string_weight(&commodity.currency) + metadata_weight(&commodity.metadata)
+        }
+        Directive::Pad(pad) => {
+            string_weight(&pad.account)
+                + string_weight(&pad.source_account)
+                + metadata_weight(&pad.metadata)
+        }
+        Directive::Balance(balance) => {
+            string_weight(&balance.account)
+                + string_weight(&balance.amount.currency)
+                + metadata_weight(&balance.metadata)
+        }
+        Directive::Note(note) => {
+            string_weight(&note.account)
+                + string_weight(&note.comment)
+                + metadata_weight(&note.metadata)
+        }
+        Directive::Document(document) => {
+            string_weight(&document.account)
+                + string_weight(&document.path)
+                + metadata_weight(&document.metadata)
+        }
+        Directive::Event(event) => {
+            string_weight(&event.event_type)
+                + string_weight(&event.description)
+                + metadata_weight(&event.metadata)
+        }
+        Directive::Price(price) => {
+            string_weight(&price.currency)
+                + string_weight(&price.amount.currency)
+                + metadata_weight(&price.metadata)
+        }
+    };
+    size + body
+}
+
+/// Allocator bookkeeping and size-class rounding charged per heap block by
+/// [`resident_weight`] — generous for the system allocators this runs on.
+const ALLOCATION_OVERHEAD_BYTES: usize = 16;
+
+/// Entries in one `BTreeMap` node (`2B − 1`, `B = 6` in std). Every non-empty
+/// map owns at least one whole node, which is what makes a map of one
+/// posting-metadata key cost ~0.5 KB.
+const BTREE_NODE_CAPACITY: usize = 11;
+
+fn string_weight(value: &String) -> usize {
+    if value.capacity() == 0 {
+        0
+    } else {
+        value.capacity() + ALLOCATION_OVERHEAD_BYTES
+    }
+}
+
+fn vec_weight<T>(capacity: usize) -> usize {
+    if capacity == 0 {
+        0
+    } else {
+        capacity * std::mem::size_of::<T>() + ALLOCATION_OVERHEAD_BYTES
+    }
+}
+
+fn strings_weight(values: &Vec<String>) -> usize {
+    vec_weight::<String>(values.capacity()) + values.iter().map(string_weight).sum::<usize>()
+}
+
+fn metadata_weight(metadata: &ledger::model::Metadata) -> usize {
+    if metadata.is_empty() {
+        return 0;
+    }
+    // Leaves hold up to BTREE_NODE_CAPACITY entries; internal nodes add one
+    // node per BTREE_NODE_CAPACITY + 1 children, so leaves + leaves / 11
+    // rounded up bounds the node count. An internal node is a leaf plus its
+    // edge array, charged here as a second leaf's worth.
+    let leaves = metadata.len().div_ceil(BTREE_NODE_CAPACITY);
+    let internal = if leaves > 1 {
+        leaves.div_ceil(BTREE_NODE_CAPACITY + 1) * 2
+    } else {
+        0
+    };
+    let node = BTREE_NODE_CAPACITY * 2 * std::mem::size_of::<String>()
+        + 4 * std::mem::size_of::<usize>()
+        + ALLOCATION_OVERHEAD_BYTES;
+    (leaves + internal) * node
+        + metadata
+            .iter()
+            .map(|(key, value)| string_weight(key) + string_weight(value))
+            .sum::<usize>()
 }
 
 /// One `Supply` reply being filled under both receive-side caps (H-02, L-33).
@@ -1192,6 +1434,67 @@ mod tests {
         assert_eq!(
             compute_want_by_membership(|id| local_all.contains(id), &honest_heads, &remote_ids),
             compute_want(&local_heads, &local_all, &honest_heads, &remote_ids)
+        );
+    }
+
+    // ── T77: the receiver's record estimate ─────────────────────────────
+
+    fn parsed(text: &str) -> Vec<ledger::model::Directive> {
+        ledger::parse::parse_file(text).expect("fixture parses")
+    }
+
+    /// `RecordEstimate` is the append arm's record length to the byte, for
+    /// sets whose payload length crosses a digit boundary of the header.
+    ///
+    /// Bug-catch: add the old per-entry `estimated_entry_bytes` allowance (or
+    /// drop the separators) and the equality fails.
+    #[test]
+    fn record_estimate_is_the_journal_record_length() {
+        let mut text = String::new();
+        let mut directives = Vec::new();
+        for index in 0..300 {
+            text = format!(
+                "2024-01-01 open Assets:A{index:03} USD\n  openledger-author: \"a\"\n  \
+                 openledger-lamport: \"{}\"\n",
+                index + 1
+            );
+            directives.extend(parsed(&text));
+            let mut estimate = RecordEstimate::new();
+            for directive in &directives {
+                estimate.add(RecordEstimate::directive_bytes(directive));
+            }
+            let record = ledger::journal::record_bytes(&ledger::serialize::full_file_serialize(
+                &directives,
+                &[],
+            ));
+            assert_eq!(
+                estimate.record_bytes(),
+                record.len() as u64,
+                "{} directives",
+                directives.len()
+            );
+        }
+        assert!(!text.is_empty());
+        assert_eq!(RecordEstimate::new().record_bytes(), 0);
+        // A one-byte payload, the smallest header.
+        let one = RecordEstimate::new().with(1);
+        assert_eq!(
+            one.record_bytes(),
+            ledger::journal::record_bytes("x").len() as u64
+        );
+    }
+
+    /// `resident_weight` grows with what a directive holds, and charges every
+    /// non-empty metadata map at least a whole B-tree node.
+    #[test]
+    fn resident_weight_counts_postings_and_metadata() {
+        let small = parsed("2024-01-01 *\n  Assets:A 1 USD\n  Assets:B -1 USD\n");
+        let with_meta = parsed("2024-01-01 *\n  Assets:A 1 USD\n    k: \"v\"\n  Assets:B -1 USD\n");
+        let small = resident_weight(&small[0]);
+        let with_meta = resident_weight(&with_meta[0]);
+        assert!(
+            with_meta >= small + BTREE_NODE_CAPACITY * 2 * std::mem::size_of::<String>(),
+            "{small} → {with_meta}"
         );
     }
 }

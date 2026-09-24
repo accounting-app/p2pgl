@@ -16,15 +16,19 @@ use iroh::EndpointId;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::connection_limiter::{AntiEntropyLimits, ConnectionLimiter, FrameReservation};
+use crate::connection_limiter::{
+    AntiEntropyLimits, ConnectionLimiter, FrameReservation, RefusalSource,
+};
 use crate::graphql::broadcast::TransactionBroadcast;
 use crate::graphql::query::txn_to_graphql;
+use crate::graphql::types::Transaction as GraphqlTransaction;
 use crate::graphql::SharedLedger;
 use crate::peer_connections::{AcquireError, PeerConnectionCache, Reuse};
 
 use ledger::service::ServiceError;
 use ledger::validate::ValidationError;
 use p2p::allowlist::PeerAllowlist;
+use p2p::anti_entropy::RecordEstimate;
 use p2p::gossip::make_supply_entry;
 use p2p::orphan_buffer::{OrphanBuffer, OrphanInsert};
 use p2p::protocol::{
@@ -170,6 +174,11 @@ const STAGE_REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
 /// for its [`ledger::service::LedgerService::append_headroom`] before staging
 /// and, when the batch cannot fit, defers it and arms this backoff for the
 /// peer that served it.
+///
+/// T77 / L-70 widened what arms it: a pre-stage deferral (the chunk's exact
+/// journal record does not fit), a drain that had to leave freed orphans
+/// unstaged for want of room, and ANY prepare or commit refused by the cap —
+/// so no near-cap path can cost a reload per tick.
 ///
 /// Deliberately **not** the L-34 refusal cache: nothing about these entries is
 /// wrong, and the condition clears the moment the operator makes room. An
@@ -587,11 +596,24 @@ impl ProtocolHandler for AntiEntropyHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let remote = connection.remote_id();
         if !self.allowlist.admits(remote) {
-            warn!(peer = %remote, "rejecting anti-entropy connection not on bootstrap allowlist");
+            // L-72: the refusal every dialer on a public bind can provoke, as
+            // fast as it can handshake — so it is throttled like the limiter's
+            // (one line per window for the whole not-allowlisted class, since
+            // identities are free to mint; the count is reported when the
+            // window closes) and it returns `Ok`, for the reason given below:
+            // `Err` made iroh's router log a second, unthrottled line.
             connection.close(1u32.into(), b"not-allowlisted");
-            return Err(AcceptError::from_err(std::io::Error::other(
-                "anti-entropy peer not allowlisted",
-            )));
+            if let Some(suppressed) = self
+                .limiter
+                .should_log_refusal(RefusalSource::NotAllowlisted, std::time::Instant::now())
+            {
+                warn!(
+                    peer = %remote,
+                    suppressed,
+                    "rejecting anti-entropy connection not on bootstrap allowlist"
+                );
+            }
+            return Ok(());
         }
         // M-16: bound concurrent inbound connections, globally and per peer;
         // M-40: and how often one peer may open them (the accept bucket). The
@@ -609,8 +631,12 @@ impl ProtocolHandler for AntiEntropyHandler {
             Ok(guard) => guard,
             Err(refusal) => {
                 connection.close(refusal.close_code().into(), refusal.close_reason());
-                if let Some(suppressed) = self.limiter.should_log_refusal(std::time::Instant::now())
-                {
+                // T77: throttled per `(peer, reason)`, so one peer's reconnect
+                // loop does not hide another peer's refusal.
+                if let Some(suppressed) = self.limiter.should_log_refusal(
+                    RefusalSource::Peer(remote, refusal),
+                    std::time::Instant::now(),
+                ) {
                     warn!(
                         peer = %remote,
                         reason = ?refusal,
@@ -859,7 +885,14 @@ async fn serve_anti_entropy(
                     // A PUSHED Supply: this node Wanted none of it. Applied,
                     // but its refusals are never remembered (L-60) — see
                     // `SupplyOrigin::Pushed`.
-                    apply_supply_entries_from(handler, entries, remote, SupplyOrigin::Pushed).await;
+                    apply_supply_entries_from(
+                        handler,
+                        entries,
+                        remote,
+                        SupplyOrigin::Pushed,
+                        &mut reservation,
+                    )
+                    .await;
                 }
                 WireMessage::Announce { .. } => {
                     debug!(peer = %remote, "ignoring announce on anti-entropy ALPN");
@@ -1471,7 +1504,14 @@ async fn fetch_want_chunk(
             .cloned()
             .collect();
         let stalled = next.len() == remaining.len();
-        apply_supply_entries_from(handler, entries, remote, SupplyOrigin::Wanted).await;
+        apply_supply_entries_from(
+            handler,
+            entries,
+            remote,
+            SupplyOrigin::Wanted,
+            &mut FrameReservation::unmetered(),
+        )
+        .await;
         if stalled {
             // The peer served none of what we asked for: it does not have them,
             // or the reply was empty. Another round would ask the same thing.
@@ -1610,13 +1650,67 @@ pub(crate) struct SupplyOutcome {
     pub rejected: usize,
     /// Not applied because the ledger is at its size cap: either this batch
     /// would not fit under [`ledger::service::LedgerService::append_headroom`],
-    /// or the serving peer's [`SupplyBackoff`] was already armed (M-39).
-    /// Nothing was staged or recorded for these; they are re-Wanted once the
-    /// backoff expires.
+    /// or the serving peer's [`SupplyBackoff`] was already armed (M-39), or —
+    /// since T77 — an orphan this batch freed would not have fit beside it
+    /// (L-70). Nothing was staged or recorded for these; they are re-Wanted
+    /// once the backoff expires.
     pub deferred: usize,
 }
 
-/// Apply one `Supply` batch: validate off the lock, then stage + persist once.
+/// Resident weight ([`p2p::anti_entropy::resident_weight`]) phase 1 of
+/// [`apply_supply_entries_from`] may hold for staging before it stages what
+/// it holds (T77, the T75 residual).
+///
+/// Phase 1 used to keep every validated directive of a frame until phase 2,
+/// and a parsed directive is far larger than its text: the densest body inside
+/// every §3.12 cap holds ~14× its bytes, so a 5 MB frame of them held ~63 MB
+/// (12.7× the frame) per slot, and an allowlisted peer filling the 256 MiB
+/// inbound budget with such frames held ~3.5 GiB. Now phase 1 stages and
+/// commits a chunk whenever the next directive would carry what it holds past
+/// this weight, so a slot holds at most one frame's worth of parsed
+/// directives, whatever the frame's density. One frame's size is the natural
+/// unit: an honest maximal frame (256 × 1000-posting transactions) is ~5
+/// chunks, i.e. ~5 journal records instead of one; the pushed path also
+/// charges the same weight to the connection limiter's byte budget (see
+/// [`apply_supply_entries_from`]).
+const PHASE_ONE_WEIGHT_BUDGET: usize = p2p::protocol::MAX_MESSAGE_SIZE as usize;
+
+/// What phase 1 holds for phase 2: validated directives in arrival order, each
+/// with its serialized length, plus the exact record they would become and
+/// their resident weight (T77).
+#[derive(Default)]
+struct PhaseOneChunk {
+    directives: Vec<(ledger::model::Directive, u64)>,
+    record: RecordEstimate,
+    weight: usize,
+}
+
+impl PhaseOneChunk {
+    fn push(&mut self, directive: ledger::model::Directive, bytes: u64, weight: usize) {
+        self.record.add(bytes);
+        self.weight = self.weight.saturating_add(weight);
+        self.directives.push((directive, bytes));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.directives.is_empty()
+    }
+}
+
+/// How one phase-2 chunk ended (T77).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChunkVerdict {
+    /// Staged and committed (or nothing needed committing): its stage
+    /// verdicts were reached against state that is still there (L-34).
+    Durable,
+    /// Not staged: it would not fit under the size cap (M-39).
+    Deferred,
+    /// Staged, but the commit did not land; see the log line for whether the
+    /// chunk was rolled back or stays staged.
+    NotDurable,
+}
+
+/// Apply one `Supply` batch: validate off the lock, then stage + persist.
 ///
 /// M-15: the previous shape took the ledger write lock and ran a full-file
 /// `full_file_serialize` + `sync_all` fsync once PER entry (and again per
@@ -1624,13 +1718,14 @@ pub(crate) struct SupplyOutcome {
 /// O(M×N) serializations + fsyncs, all under the write lock — the gossip loop
 /// blocked on `ledger.read()`, its channel filled, and GraphQL mutations
 /// blocked. This is now two phases: phase 1 does all the expensive parse/verify
-/// work with NO write lock; phase 2 takes the write lock exactly once, stages
-/// the whole batch in memory, drains any orphans it unblocks, and persists a
-/// single time for the batch + drained orphans.
+/// work with NO write lock; phase 2 takes the write lock once per chunk,
+/// stages the chunk in memory, drains any orphans it unblocks, and persists a
+/// single time for the chunk + drained orphans. A frame is one chunk unless
+/// its parsed directives outweigh [`PHASE_ONE_WEIGHT_BUDGET`] (T77).
 ///
 /// Tests' shorthand for the Wanted path — a batch the caller has already
-/// filtered to the ids it `Want`ed ([`SupplyOrigin::Wanted`]). Production has
-/// two callers and both state their origin through
+/// filtered to the ids it `Want`ed ([`SupplyOrigin::Wanted`]), metered by
+/// nothing. Production has two callers and both state their origin through
 /// [`apply_supply_entries_from`]: `fetch_want_chunk` (Wanted, after
 /// [`retain_wanted_entries`]) and the serve loop's pushed-`Supply` arm
 /// (Pushed), so no caller can apply a frame without saying whether its
@@ -1641,10 +1736,18 @@ async fn apply_supply_entries(
     entries: Vec<p2p::protocol::SupplyEntry>,
     remote: EndpointId,
 ) -> SupplyOutcome {
-    apply_supply_entries_from(handler, entries, remote, SupplyOrigin::Wanted).await
+    apply_supply_entries_from(
+        handler,
+        entries,
+        remote,
+        SupplyOrigin::Wanted,
+        &mut FrameReservation::unmetered(),
+    )
+    .await
 }
 
-/// [`apply_supply_entries`] with the batch's origin stated (L-60).
+/// [`apply_supply_entries`] with the batch's origin stated (L-60) and the
+/// reservation phase 1's staged weight is charged to (T77).
 ///
 /// The origin changes exactly one thing: whether permanent refusals are
 /// recorded in the peer's [`p2p::anti_entropy::RefusalCache`] quota. A
@@ -1652,11 +1755,22 @@ async fn apply_supply_entries(
 /// something this node will otherwise ask for again; a `Pushed` batch was not,
 /// so recording its refusals would let the peer spend — and, across peers,
 /// exhaust — a cache that exists to protect this node's own Wants.
+///
+/// `weight` is the frame's own [`FrameReservation`] on the inbound (pushed)
+/// path and an unmetered one on the outbound path. Phase 1 grows it by the
+/// resident weight of every directive it holds and shrinks it back each time
+/// a chunk has been staged, so the connection limiter's byte budget — which
+/// until T77 charged the frame body 1× for a footprint of up to ~14× — also
+/// covers what phase 1 holds; when the budget cannot cover the next directive,
+/// the chunk held so far is staged first. The outbound side is bounded by
+/// [`PHASE_ONE_WEIGHT_BUDGET`] alone, like the inbound one, and by its own
+/// loops' concurrency as before.
 async fn apply_supply_entries_from(
     handler: &AntiEntropyHandler,
     entries: Vec<p2p::protocol::SupplyEntry>,
     remote: EndpointId,
     origin: SupplyOrigin,
+    weight: &mut FrameReservation,
 ) -> SupplyOutcome {
     let from_peer = remote.to_string();
     let mut outcome = SupplyOutcome::default();
@@ -1672,27 +1786,38 @@ async fn apply_supply_entries_from(
     }
     // L-34: ids refused for good, by phase. Intake verdicts are pure functions
     // of the served bytes and are recorded unconditionally; stage and drain
-    // verdicts read ledger state, so they are recorded only once the batch they
-    // were reached against is durable (see the end of this function). L-60:
-    // neither is recorded at all for a pushed batch — see `SupplyOrigin`.
+    // verdicts read ledger state, so they are recorded only once the chunk they
+    // were reached against is durable (see `flush` below). L-60: neither is
+    // recorded at all for a pushed batch — see `SupplyOrigin`.
     let mut intake_refused: Vec<String> = Vec::new();
     let mut stage_refused: Vec<(String, String)> = Vec::new();
     // T72 / L-69: `(id, remote lamport)` of every entry the adoption ratchet
     // refused, for the per-peer short-circuit — see `SupplyBackoff`.
     let mut ratcheted: Vec<(String, u64)> = Vec::new();
-    let mut batch_durable = true;
 
     // ── Phase 1: validate off the ledger write lock (M-15) ──────────────
     //
     // Parsing, re-serializing, hashing, and Ed25519-verifying every entry is
     // the expensive work, and none of it needs the write lock. Staging it here
-    // means the whole batch takes the write lock exactly once, in phase 2.
-    let mut staged: Vec<ledger::model::Directive> = Vec::new();
-    // M-39: the over-approximated wire size of what is staged, which bounds
-    // the journal record the batch would become (the record is the same
-    // economic bodies plus the same envelope lines, under one header).
-    let mut staged_bytes: u64 = 0;
+    // means each chunk takes the write lock exactly once, in phase 2.
+    //
+    // T77: what is held for phase 2 is bounded by weight, not by count — see
+    // `PHASE_ONE_WEIGHT_BUDGET` — and each held directive carries its exact
+    // share of the journal record it will become (`RecordEstimate`), which is
+    // what phase 2 checks against the headroom. The pre-T77 per-entry wire
+    // estimate over-counted ~150–190 B an entry, so in the last ~40 KB before
+    // the cap a batch that fit was deferred forever.
+    let base = weight.held();
+    let mut chunk = PhaseOneChunk::default();
+    let mut deferring = false;
     for entry in entries {
+        // M-39 / L-70: once a chunk of this frame has been deferred at the
+        // cap (or its commit was refused by the cap), the peer is backed off
+        // and the rest of the frame is deferred with it, unvalidated.
+        if deferring {
+            outcome.deferred += 1;
+            continue;
+        }
         // M-14: dedup BEFORE validate. `validate_supply_entry` parses up to 1 MiB
         // of beancount, re-serializes, hashes, and Ed25519-verifies every entry
         // before anything checks whether `entry.id` is already in the DAG — the
@@ -1720,43 +1845,73 @@ async fn apply_supply_entries_from(
             outcome.skipped_present += 1;
             continue;
         }
-        match validate_supply_entry(&entry) {
-            Ok(directive) => {
-                if let Err(error) = verify_author_allowlisted(&directive, &handler.allowlist) {
-                    warn!(error = %log_error(&error), peer = %remote, "rejected ALPN supply: author not allowlisted");
-                    outcome.rejected += 1;
-                    note_intake_refusal(&mut intake_refused, &entry.id, &error);
-                    continue;
-                }
-                if let Err(error) =
-                    verify_remote_signature(&directive, handler.signing_enabled, &handler.mesh_id)
-                {
-                    warn!(error = %log_error(&error), peer = %remote, "rejected ALPN supply: signature");
-                    outcome.rejected += 1;
-                    note_intake_refusal(&mut intake_refused, &entry.id, &error);
-                    continue;
-                }
-                // Preserve arrival order so an open/parent earlier in the batch is
-                // visible to a later child's checks in phase 2.
-                staged_bytes = staged_bytes
-                    .saturating_add(p2p::anti_entropy::estimated_entry_bytes(&entry) as u64);
-                staged.push(directive);
-            }
+        let directive = match validate_supply_entry(&entry) {
+            Ok(directive) => directive,
             Err(error) => {
                 // H-18/M-41: bounded — this is the line that was 55 MB.
                 warn!(error = %log_error(&error), peer = %remote, "invalid ALPN supply entry");
                 outcome.rejected += 1;
                 note_intake_refusal(&mut intake_refused, &entry.id, &error);
+                continue;
             }
+        };
+        if let Err(error) = verify_author_allowlisted(&directive, &handler.allowlist) {
+            warn!(error = %log_error(&error), peer = %remote, "rejected ALPN supply: author not allowlisted");
+            outcome.rejected += 1;
+            note_intake_refusal(&mut intake_refused, &entry.id, &error);
+            continue;
         }
+        if let Err(error) =
+            verify_remote_signature(&directive, handler.signing_enabled, &handler.mesh_id)
+        {
+            warn!(error = %log_error(&error), peer = %remote, "rejected ALPN supply: signature");
+            outcome.rejected += 1;
+            note_intake_refusal(&mut intake_refused, &entry.id, &error);
+            continue;
+        }
+        drop(entry);
+        let resident = p2p::anti_entropy::resident_weight(&directive);
+        let bytes = RecordEstimate::directive_bytes(&directive);
+        // T77: stage what is held before holding more than the budget — or
+        // more than the limiter's byte budget will cover — at once.
+        let fits = chunk.weight.saturating_add(resident) <= PHASE_ONE_WEIGHT_BUDGET
+            && weight.grow_to(base + chunk.weight.saturating_add(resident));
+        if !fits && !chunk.is_empty() {
+            let verdict = stage_and_commit_batch(
+                handler,
+                std::mem::take(&mut chunk),
+                remote,
+                &mut outcome,
+                &mut stage_refused,
+                &mut ratcheted,
+            )
+            .await;
+            weight.shrink_to(base);
+            if verdict != ChunkVerdict::Durable
+                && handler
+                    .supply_backoff
+                    .is_active(remote, std::time::Instant::now())
+            {
+                deferring = true;
+                outcome.deferred += 1;
+                continue;
+            }
+            // Charge the directive that did not fit to the emptied chunk. If
+            // even that cannot be covered (other connections hold the whole
+            // budget) it is held uncharged: one directive, staged as the next
+            // chunk at the latest, never an accumulation.
+            let _ = weight.grow_to(base + resident);
+        }
+        // Preserve arrival order so an open/parent earlier in the batch is
+        // visible to a later child's checks in phase 2.
+        chunk.push(directive, bytes, resident);
     }
 
-    // ── Phase 2: one ledger write lock for the whole batch (M-15) ───────
-    if !staged.is_empty() {
-        batch_durable = stage_and_commit_batch(
+    // ── Phase 2: one ledger write lock per chunk (M-15) ─────────────────
+    if !chunk.is_empty() {
+        stage_and_commit_batch(
             handler,
-            staged,
-            staged_bytes,
+            chunk,
             remote,
             &mut outcome,
             &mut stage_refused,
@@ -1764,15 +1919,8 @@ async fn apply_supply_entries_from(
         )
         .await;
     }
+    weight.shrink_to(base);
 
-    // L-34: remember what was refused for good, so the next exchange with the
-    // peer that served it does not ask for it again within the TTL. A stage or
-    // drain verdict is only as good as the state it was reached against: when
-    // the commit failed, the reload rolled that state back, so those verdicts
-    // are discarded — anti-entropy re-pulls the batch and they are re-derived.
-    if !batch_durable {
-        stage_refused.clear();
-    }
     // L-60: a pushed batch was never Wanted, so none of its verdicts may
     // occupy the cache — see `SupplyOrigin::Pushed`. (`RefusalCache::record`
     // also refuses any id that is not a content id, so even a Wanted batch —
@@ -1809,18 +1957,39 @@ async fn apply_supply_entries_from(
         buffered = outcome.buffered,
         duplicate = outcome.duplicate,
         rejected = outcome.rejected,
+        deferred = outcome.deferred,
         "applied ALPN supply batch"
     );
     outcome
 }
 
-/// Phase 2 of [`apply_supply_entries_from`]: take the permit and the write
-/// lock once, check the batch fits, stage it, drain the orphans it frees, and
-/// commit once (M-15, T44).
+/// Phase 2 of [`apply_supply_entries_from`], for one chunk: take the permit
+/// and the write lock once, check the chunk fits, stage it, drain the orphans
+/// it frees as far as they fit, commit once (M-15, T44), and only then
+/// announce what it staged to GraphQL subscribers (T77 / L-70).
 ///
-/// Returns whether the batch is durable — i.e. whether the stage verdicts in
-/// `stage_refused` were reached against state that is still there (L-34). A
-/// batch deferred for headroom (M-39) staged nothing and returns `false`.
+/// The chunk's stage verdicts are appended to `stage_refused` only when the
+/// chunk ends [`ChunkVerdict::Durable`] — i.e. when they were reached against
+/// state that is still there (L-34). A chunk deferred for headroom (M-39)
+/// staged nothing.
+///
+/// # The size cap, end to end (M-39, L-70)
+///
+/// * **Before staging**: the chunk's exact record ([`RecordEstimate`]) against
+///   [`ledger::service::LedgerService::append_headroom`], under the permit so
+///   nothing moves the answer. A chunk that cannot fit is deferred and the
+///   peer backed off, without staging or a reload.
+/// * **While draining**: every orphan the chunk frees is checked against the
+///   record the ACTUAL staged set (what staged, plus the orphans drained so
+///   far) has become, before it is staged. Before T77 the drain staged up to
+///   16 MiB per peer after the pre-stage check, the prepare then refused the
+///   whole set, and the rollback cost a full reload — once per two ticks,
+///   forever, for a peer alternating adverts. An orphan that would not fit is
+///   dropped from the buffer (re-Wanted by membership once the backoff lifts)
+///   and the peer is backed off; the chunk and the orphans that fit commit.
+/// * **Any cap-refused prepare or commit** arms the backoff too, whatever the
+///   estimate said (a hand edit that grew the file since the last commit is
+///   invisible to `append_headroom`), so no path can pay one reload per tick.
 ///
 /// Lock-ordering discipline is unchanged inside the write lock: the
 /// orphan_buffer lock is only ever acquired under it (here and inside
@@ -1829,35 +1998,36 @@ async fn apply_supply_entries_from(
 /// only once the batch is durable.
 async fn stage_and_commit_batch(
     handler: &AntiEntropyHandler,
-    staged: Vec<ledger::model::Directive>,
-    staged_bytes: u64,
+    chunk: PhaseOneChunk,
     remote: EndpointId,
     outcome: &mut SupplyOutcome,
     stage_refused: &mut Vec<(String, String)>,
     ratcheted: &mut Vec<(String, u64)>,
-) -> bool {
+) -> ChunkVerdict {
     let from_peer = remote.to_string();
     let permit = crate::ledger_commit::acquire_write_permit(&handler.ledger).await;
     let mut svc = handler.ledger.write().await;
-    // M-39: will the batch fit? Asked under the permit, so no other writer can
-    // move the answer between here and the prepare. A batch that cannot fit is
+    // M-39: will the chunk fit? Asked under the permit, so no other writer can
+    // move the answer between here and the prepare. A chunk that cannot fit is
     // KNOWN to fail the prepare's cap projection; staging it anyway is what
-    // used to cost a full ledger reload per tick per peer.
+    // used to cost a full ledger reload per tick per peer. T77: the chunk's
+    // exact record, not a per-entry wire estimate.
     let headroom = svc.append_headroom();
-    if staged_bytes > headroom {
+    let estimated_bytes = chunk.record.record_bytes();
+    if estimated_bytes > headroom {
         drop(svc);
         drop(permit);
         let backoff = handler.timeouts.supply_backoff;
         handler
             .supply_backoff
             .arm(remote, std::time::Instant::now(), backoff);
-        outcome.deferred += staged.len();
+        outcome.deferred += chunk.directives.len();
         // Bounded: fixed-width numbers and the peer id, and at most once per
         // peer per backoff window.
         warn!(
             peer = %remote,
-            entries = staged.len(),
-            estimated_bytes = staged_bytes,
+            entries = chunk.directives.len(),
+            estimated_bytes,
             headroom_bytes = headroom,
             backoff_secs = backoff.as_secs(),
             "ALPN supply batch deferred: it would not fit under the ledger size cap \
@@ -1865,10 +2035,16 @@ async fn stage_and_commit_batch(
              expires. Reads and compaction are unaffected; archive or split the ledger to \
              make room (M-39)"
         );
-        return false;
+        return ChunkVerdict::Deferred;
     }
+    // L-34: this chunk's stage verdicts, kept only if the chunk is durable.
+    let mut refused_here: Vec<(String, String)> = Vec::new();
+    // T77 / L-70: the record the staged set has become, for the drain's
+    // re-checks, and what to announce once — and only once — it is durable.
+    let mut staged = RecordEstimate::new();
+    let mut announce: Vec<GraphqlTransaction> = Vec::new();
     let mut inserted_any = false;
-    for directive in staged {
+    for (directive, bytes) in chunk.directives {
         // Re-check dedup authoritatively under the write lock: an id may have
         // arrived earlier in this same batch, or via a drained orphan.
         let content_id = ledger::service::LedgerService::content_id(&directive);
@@ -1906,11 +2082,11 @@ async fn stage_and_commit_batch(
                 info!(content_id = %content_id, peer = %remote, "merged remote directive from ALPN");
                 outcome.merged += 1;
                 inserted_any = true;
+                staged.add(bytes);
                 if let ledger::model::Directive::Transaction(ref txn) = directive {
                     // M-45: the id is in hand; converting must not re-hash.
-                    handler
-                        .broadcast
-                        .publish(txn_to_graphql(txn, content_id, true));
+                    // T77 / L-70: announced after the commit, not here.
+                    announce.push(txn_to_graphql(txn, content_id, true));
                 }
             }
             Ok(None) => {
@@ -1945,100 +2121,199 @@ async fn stage_and_commit_batch(
                         }
                         outcome.buffered += 1;
                     }
-                    None => {
-                        // T72 / L-69: one line per peer per interval; the
-                        // rest are counted and reported on the next line.
-                        match handler
-                            .supply_backoff
-                            .should_log_stage_refusal(remote, std::time::Instant::now())
-                        {
-                            Some(suppressed) => {
-                                warn!(error = %log_error(&error), peer = %remote, suppressed, "rejected remote directive from ALPN");
-                            }
-                            None => {
-                                debug!(error = %log_error(&error), peer = %remote, "rejected remote directive from ALPN (warn throttled)");
-                            }
-                        }
-                        outcome.rejected += 1;
-                        if let ServiceError::LamportAdvance { remote, .. } = &error {
-                            ratcheted.push((content_id.clone(), *remote));
-                        }
-                        if stage_refusal_is_permanent(&error) {
-                            stage_refused.push((from_peer.clone(), content_id));
-                        }
-                    }
+                    None => note_stage_refusal(
+                        handler,
+                        remote,
+                        &from_peer,
+                        &content_id,
+                        &error,
+                        outcome,
+                        &mut refused_here,
+                        ratcheted,
+                    ),
                 }
             }
         }
     }
 
-    if inserted_any {
-        // Drain orphans this batch unblocked, then persist ONCE for the whole
-        // batch plus the drained orphans (M-15). `drain_orphans` stages
-        // (no persist), so this single commit covers everything.
-        let drained = drain_orphans(
-            &handler.orphan_buffer,
-            &mut svc,
-            &handler.broadcast,
-            handler.signing_enabled,
-            &handler.allowlist,
-            &handler.mesh_id,
-        )
-        .await;
-        stage_refused.extend(drained.permanent);
-        // T72 / L-69: a freed orphan the ratchet refused is dropped from the
-        // buffer and would be re-Wanted by membership next tick; only the
-        // ones this peer delivered are this peer's to short-circuit.
-        ratcheted.extend(
-            drained
-                .ratcheted
-                .into_iter()
-                .filter(|(peer, _, _)| *peer == from_peer)
-                .map(|(_, id, remote_lamport)| (id, remote_lamport)),
-        );
-        // T44: prepare under the lock, commit off it. For a catch-up batch
-        // on a ledger past the compaction threshold this is a single
-        // journal record for the whole batch — O(batch), not O(ledger) —
-        // and the fsync runs on a blocking thread with the write lock
-        // already released, so a peer streaming history no longer parks
-        // GraphQL readers on the disk.
-        // M-39: a failed prepare drops the write lock before its reload, so
-        // the rollback no longer queues every reader behind a ledger boot.
-        let prepared =
-            crate::ledger_commit::prepare_or_recover(&handler.ledger, svc, false, permit).await;
-        let commit = match prepared {
-            // H-11: the permit is handed to the commit, so a dropped
-            // exchange future cannot release the single-writer slot while
-            // the batch is still being written.
-            Ok((svc, pending, permit)) => {
-                drop(svc);
-                crate::ledger_commit::commit_pending(&handler.ledger, pending, permit).await
-            }
-            Err(error) => Err(error),
-        };
-        if let Err(error) = commit {
-            // L-13: the failure path already reloaded from disk, so the
-            // batch is rolled back in memory (memory==disk again) and
-            // anti-entropy will re-pull it. The tallies above describe what
-            // was attempted, not what is stored; we return them without
-            // panicking.
-            warn!(error = %log_error(&error), peer = %remote, "failed to persist ALPN supply batch; rolled back in memory, will re-pull");
-            return false;
-        }
-    } else {
+    if !inserted_any {
         drop(svc);
+        stage_refused.append(&mut refused_here);
+        return ChunkVerdict::Durable;
     }
-    true
+
+    // Drain orphans this chunk unblocked, then persist ONCE for the whole
+    // chunk plus the drained orphans (M-15). `drain_orphans` stages (no
+    // persist), so this single commit covers everything. T77 / L-70: each
+    // freed orphan is checked against the record the staged set has become
+    // before it is staged — see `DrainBudget`.
+    let mut budget = DrainBudget { headroom, staged };
+    let drained = drain_orphans(
+        &handler.orphan_buffer,
+        &mut svc,
+        handler.signing_enabled,
+        &handler.allowlist,
+        &handler.mesh_id,
+        &mut budget,
+    )
+    .await;
+    refused_here.extend(drained.permanent);
+    // T72 / L-69: a freed orphan the ratchet refused is dropped from the
+    // buffer and would be re-Wanted by membership next tick; only the
+    // ones this peer delivered are this peer's to short-circuit.
+    ratcheted.extend(
+        drained
+            .ratcheted
+            .into_iter()
+            .filter(|(peer, _, _)| *peer == from_peer)
+            .map(|(_, id, remote_lamport)| (id, remote_lamport)),
+    );
+    announce.extend(drained.announce);
+    if drained.deferred > 0 {
+        // L-70: the orphans that fit are staged; the rest wait for room.
+        let backoff = handler.timeouts.supply_backoff;
+        handler
+            .supply_backoff
+            .arm(remote, std::time::Instant::now(), backoff);
+        outcome.deferred += drained.deferred;
+        warn!(
+            peer = %remote,
+            orphans = drained.deferred,
+            staged_record_bytes = budget.staged.record_bytes(),
+            headroom_bytes = headroom,
+            backoff_secs = backoff.as_secs(),
+            "ALPN supply: orphans this batch freed would not fit under the ledger size cap \
+             beside it; the batch is committed, those orphans wait, and this peer's Supply is \
+             deferred until the backoff expires (L-70)"
+        );
+    }
+    // T44: prepare under the lock, commit off it. For a catch-up batch
+    // on a ledger past the compaction threshold this is a single
+    // journal record for the whole batch — O(batch), not O(ledger) —
+    // and the fsync runs on a blocking thread with the write lock
+    // already released, so a peer streaming history no longer parks
+    // GraphQL readers on the disk.
+    // M-39: a failed prepare drops the write lock before its reload, so
+    // the rollback no longer queues every reader behind a ledger boot.
+    let prepared =
+        crate::ledger_commit::prepare_or_recover(&handler.ledger, svc, false, permit).await;
+    let failure = match prepared {
+        // H-11: the permit is handed to the commit, so a dropped
+        // exchange future cannot release the single-writer slot while
+        // the batch is still being written.
+        Ok((svc, pending, permit)) => {
+            drop(svc);
+            crate::ledger_commit::commit_pending(&handler.ledger, pending, permit)
+                .await
+                .err()
+                .map(|error| (error, CommitStage::Commit))
+        }
+        Err(error) => Some((error, CommitStage::Prepare)),
+    };
+    let Some((error, stage)) = failure else {
+        // T77 / L-70: durable — only now is it true to tell a subscriber.
+        for transaction in announce {
+            handler.broadcast.publish(transaction);
+        }
+        stage_refused.append(&mut refused_here);
+        return ChunkVerdict::Durable;
+    };
+    if matches!(error, ServiceError::ResourceLimitExceeded { .. }) {
+        // L-70: any cap-refused prepare or commit backs the peer off, not
+        // only the pre-stage deferral — otherwise a refusal the estimate
+        // did not predict is paid for with a reload per tick.
+        handler.supply_backoff.arm(
+            remote,
+            std::time::Instant::now(),
+            handler.timeouts.supply_backoff,
+        );
+    }
+    // The tallies above describe what was attempted, not what is stored;
+    // nothing was announced and the stage verdicts are discarded (L-34).
+    match (stage, &error) {
+        // T77: the two prepare refusals that do NOT reload — see
+        // `ledger_commit::prepare_or_recover` — leave the batch staged in
+        // memory, served, and written by the next commit that succeeds.
+        (CommitStage::Prepare, ServiceError::CommitInFlight | ServiceError::Parse(_)) => {
+            warn!(error = %log_error(&error), peer = %remote, "failed to persist ALPN supply batch; it stays staged in memory and is written by the next successful commit (not rolled back)");
+        }
+        // L-13: every other failure already reloaded from disk, so the batch
+        // is rolled back in memory (memory == disk again) and anti-entropy
+        // will re-pull it.
+        _ => {
+            warn!(error = %log_error(&error), peer = %remote, "failed to persist ALPN supply batch; rolled back in memory, will re-pull");
+        }
+    }
+    ChunkVerdict::NotDurable
+}
+
+/// Which half of the T44 sequence refused a batch — it decides whether the
+/// batch was rolled back (see `stage_and_commit_batch`'s log lines).
+#[derive(Clone, Copy)]
+enum CommitStage {
+    Prepare,
+    Commit,
+}
+
+/// Log, tally and record one stage refusal of a supplied directive (L-34,
+/// T72 / L-69).
+#[allow(clippy::too_many_arguments)]
+fn note_stage_refusal(
+    handler: &AntiEntropyHandler,
+    remote: EndpointId,
+    from_peer: &str,
+    content_id: &str,
+    error: &ServiceError,
+    outcome: &mut SupplyOutcome,
+    refused_here: &mut Vec<(String, String)>,
+    ratcheted: &mut Vec<(String, u64)>,
+) {
+    // T72 / L-69: one line per peer per interval; the rest are counted and
+    // reported on the next line.
+    match handler
+        .supply_backoff
+        .should_log_stage_refusal(remote, std::time::Instant::now())
+    {
+        Some(suppressed) => {
+            warn!(error = %log_error(error), peer = %remote, suppressed, "rejected remote directive from ALPN");
+        }
+        None => {
+            debug!(error = %log_error(error), peer = %remote, "rejected remote directive from ALPN (warn throttled)");
+        }
+    }
+    outcome.rejected += 1;
+    if let ServiceError::LamportAdvance { remote, .. } = error {
+        ratcheted.push((content_id.to_owned(), *remote));
+    }
+    if stage_refusal_is_permanent(error) {
+        refused_here.push((from_peer.to_owned(), content_id.to_owned()));
+    }
 }
 
 /// The re-validation context a freed orphan is put back through.
 ///
 /// Bundled so [`restage_freed_entry`] stays inside clippy's argument budget.
 struct DrainContext<'a> {
-    broadcast: &'a TransactionBroadcast,
     signing_enabled: bool,
     allowlist: &'a PeerAllowlist,
     mesh_id: &'a str,
+}
+
+/// How much record a drain may add (T77 / L-70): the headroom the chunk was
+/// checked against, and the record the staged set has become so far.
+#[derive(Clone, Copy, Debug)]
+pub struct DrainBudget {
+    /// [`ledger::service::LedgerService::append_headroom`] under the permit.
+    pub headroom: u64,
+    /// The exact record of everything staged under this permit so far.
+    pub staged: RecordEstimate,
+}
+
+impl DrainBudget {
+    /// Room for one more directive of `bytes` serialized bytes?
+    fn admits(&self, bytes: u64) -> bool {
+        self.staged.with(bytes).record_bytes() <= self.headroom
+    }
 }
 
 /// Record an intake refusal of `id` if it was a permanent one (L-34).
@@ -2173,8 +2448,11 @@ fn account_wait_target(error: &ServiceError) -> Option<String> {
 
 /// What became of one freed orphan put back through validation.
 enum Restaged {
-    /// Merged into the DAG.
-    Staged,
+    /// Merged into the DAG; the transaction to announce once the commit
+    /// covering it is durable (T77 / L-70), if it is one.
+    Staged {
+        announce: Option<Box<GraphqlTransaction>>,
+    },
     /// Still blocked; back in the buffer waiting on this account (M-09).
     Rebuffered { account: String },
     /// Not in the buffer and not in the DAG, for a reason that can change — a
@@ -2186,19 +2464,30 @@ enum Restaged {
     /// against this remote lamport — re-fetching it is pointless until the
     /// clock reaches it (T72 / L-69). Otherwise as `Dropped`.
     Ratcheted { remote_lamport: u64 },
+    /// Not staged: the record the staged set has become has no room for it
+    /// under the size cap (T77 / L-70). Otherwise as `Dropped` — it is
+    /// re-Wanted by membership once the caller's backoff lifts.
+    Deferred,
 }
 
-/// Re-validate one freed orphan and stage it.
+/// Re-validate one freed orphan and stage it — if it fits (T77 / L-70).
 ///
 /// A freed entry that is still blocked on an account lifecycle query goes back
 /// into the buffer under its NEW blocking account (M-09) rather than being
 /// dropped — a transaction can post to several accounts, and validation reports
 /// only the first one that fails, so one release can uncover the next.
+///
+/// Before it is staged, its exact share of the journal record is checked
+/// against `budget`: the record the staged set has ALREADY become (the chunk's
+/// staged directives plus every orphan drained before this one) plus this one
+/// must still fit under the headroom the chunk was checked against. Before
+/// T77 nothing here looked at the size cap at all.
 fn restage_freed_entry(
     buffer: &mut OrphanBuffer,
     service: &mut ledger::service::LedgerService,
     context: &DrainContext<'_>,
     entry: p2p::orphan_buffer::OrphanEntry,
+    budget: &mut DrainBudget,
 ) -> Restaged {
     if let Err(error) = verify_author_allowlisted(&entry.directive, context.allowlist) {
         warn!(error = %log_error(&error), "rejected resolved orphan: author");
@@ -2210,16 +2499,23 @@ fn restage_freed_entry(
         warn!(error = %log_error(&error), "rejected resolved orphan: signature");
         return refused_if_permanent(intake_refusal_is_permanent(&error));
     }
+    let bytes = RecordEstimate::directive_bytes(&entry.directive);
+    if !budget.admits(bytes) {
+        debug!(content_id = %entry.id, bytes, "resolved orphan deferred: no room under the size cap");
+        return Restaged::Deferred;
+    }
     match service.stage_remote_directive(entry.directive.clone()) {
         Ok(Some(content_id)) => {
             info!(content_id = %content_id, "resolved orphan directive");
-            if let ledger::model::Directive::Transaction(ref txn) = entry.directive {
+            budget.staged.add(bytes);
+            let announce = match entry.directive {
                 // M-45: the id is in hand; converting must not re-hash.
-                context
-                    .broadcast
-                    .publish(txn_to_graphql(txn, content_id, true));
-            }
-            Restaged::Staged
+                ledger::model::Directive::Transaction(ref txn) => {
+                    Some(Box::new(txn_to_graphql(txn, content_id, true)))
+                }
+                _ => None,
+            };
+            Restaged::Staged { announce }
         }
         Ok(None) => Restaged::Dropped,
         Err(error) => {
@@ -2263,12 +2559,24 @@ fn refused_if_permanent(permanent: bool) -> Restaged {
 }
 
 /// Drain orphans whose parents have arrived, or whose account is now open
-/// (M-09). Re-checks signature and author.
+/// (M-09), as far as they fit under the size cap (T77 / L-70). Re-checks
+/// signature and author.
 ///
 /// M-15: this STAGES each resolved orphan into memory only (no persist per
 /// orphan). The caller persists once, after the drain, covering the whole batch
 /// plus every orphan resolved here. Parent presence is a DAG lookup (L-35), so
 /// the drain clones no id set at all.
+///
+/// T77 / L-70: `budget` carries the record the caller's staged set has become;
+/// each freed orphan is staged only if the set plus it still fits the
+/// headroom, and the budget grows by what was staged, so the commit that
+/// follows cannot be refused by the cap projection for anything this drain
+/// did. An orphan with no room is dropped from the buffer and counted in
+/// [`DrainOutcome::deferred`]; the caller backs the peer off.
+///
+/// T77 / L-70: nothing is announced to GraphQL subscribers from here — the
+/// staged transactions ride back in [`DrainOutcome::announce`] and the caller
+/// publishes them once its commit is durable.
 ///
 /// The loop terminates. Another pass runs only on real progress, which is
 /// either (a) a directive staged — monotone in a DAG this call grows only by
@@ -2284,13 +2592,12 @@ fn refused_if_permanent(permanent: bool) -> Restaged {
 pub async fn drain_orphans(
     orphan_buffer: &Arc<RwLock<OrphanBuffer>>,
     service: &mut ledger::service::LedgerService,
-    broadcast: &TransactionBroadcast,
     signing_enabled: bool,
     allowlist: &PeerAllowlist,
     mesh_id: &str,
-) -> DrainRefusals {
+    budget: &mut DrainBudget,
+) -> DrainOutcome {
     let context = DrainContext {
-        broadcast,
         signing_enabled,
         allowlist,
         mesh_id,
@@ -2302,7 +2609,7 @@ pub async fn drain_orphans(
     // it is staged.
     let mut buffer = orphan_buffer.write().await;
     let mut attempted: HashSet<(String, String)> = HashSet::new();
-    let mut refused = DrainRefusals::default();
+    let mut drained = DrainOutcome::default();
     let mut resolved_any = true;
     while resolved_any {
         resolved_any = false;
@@ -2314,9 +2621,9 @@ pub async fn drain_orphans(
             for entry in buffer.parent_arrived(&parent_id) {
                 let entry_id = entry.id.clone();
                 let from_peer = entry.from_peer.clone();
-                let outcome = restage_freed_entry(&mut buffer, service, &context, entry);
-                note_drain_refusal(&outcome, from_peer, &entry_id, &mut refused);
-                resolved_any |= made_progress(outcome, entry_id, &mut attempted);
+                let outcome = restage_freed_entry(&mut buffer, service, &context, entry, budget);
+                note_drain_refusal(&outcome, from_peer, &entry_id, &mut drained);
+                resolved_any |= made_progress(outcome, entry_id, &mut attempted, &mut drained);
             }
         }
 
@@ -2329,22 +2636,27 @@ pub async fn drain_orphans(
             for entry in buffer.account_opened(&account) {
                 let entry_id = entry.id.clone();
                 let from_peer = entry.from_peer.clone();
-                let outcome = restage_freed_entry(&mut buffer, service, &context, entry);
-                note_drain_refusal(&outcome, from_peer, &entry_id, &mut refused);
-                resolved_any |= made_progress(outcome, entry_id, &mut attempted);
+                let outcome = restage_freed_entry(&mut buffer, service, &context, entry, budget);
+                note_drain_refusal(&outcome, from_peer, &entry_id, &mut drained);
+                resolved_any |= made_progress(outcome, entry_id, &mut attempted, &mut drained);
             }
         }
     }
-    refused
+    drained
 }
 
 /// What [`drain_orphans`] reports back for the caller's per-peer records.
-#[derive(Debug, Default)]
-pub struct DrainRefusals {
+#[derive(Default)]
+pub struct DrainOutcome {
     /// `(delivering peer, id)` refused for good (L-34).
     pub permanent: Vec<(String, String)>,
     /// `(delivering peer, id, remote lamport)` refused by the ratchet (L-69).
     pub ratcheted: Vec<(String, String, u64)>,
+    /// Freed orphans not staged for want of room under the cap (T77 / L-70).
+    pub deferred: usize,
+    /// Staged transactions, to announce once the caller's commit is durable
+    /// (T77 / L-70).
+    pub announce: Vec<GraphqlTransaction>,
 }
 
 /// Collect a drained entry that was refused for good (L-34) or by the
@@ -2353,7 +2665,7 @@ fn note_drain_refusal(
     outcome: &Restaged,
     from_peer: Option<String>,
     entry_id: &str,
-    refused: &mut DrainRefusals,
+    refused: &mut DrainOutcome,
 ) {
     match (outcome, from_peer) {
         (Restaged::Refused, Some(peer)) => refused.permanent.push((peer, entry_id.to_owned())),
@@ -2366,18 +2678,30 @@ fn note_drain_refusal(
     }
 }
 
-/// Whether a restage attempt justifies another drain pass. See [`drain_orphans`].
+/// Whether a restage attempt justifies another drain pass (see
+/// [`drain_orphans`]); also files a staged transaction for announcement and
+/// counts a deferral.
 fn made_progress(
     outcome: Restaged,
     entry_id: String,
     attempted: &mut HashSet<(String, String)>,
+    drained: &mut DrainOutcome,
 ) -> bool {
     match outcome {
-        Restaged::Staged => true,
+        Restaged::Staged { announce } => {
+            drained
+                .announce
+                .extend(announce.map(|transaction| *transaction));
+            true
+        }
         // A new (entry, blocking account) pair means the release uncovered a
         // different unmet dependency — worth one more pass. A pair already seen
         // means the entry is going in circles, and does not.
         Restaged::Rebuffered { account } => attempted.insert((entry_id, account)),
+        Restaged::Deferred => {
+            drained.deferred += 1;
+            false
+        }
         Restaged::Dropped | Restaged::Refused | Restaged::Ratcheted { .. } => false,
     }
 }
@@ -6927,8 +7251,14 @@ pub(crate) mod tests {
             entry_for(&seeded.source, &fixture.txn3),
             garbage,
         ];
-        let outcome =
-            apply_supply_entries_from(&handler, batch, remote, SupplyOrigin::Pushed).await;
+        let outcome = apply_supply_entries_from(
+            &handler,
+            batch,
+            remote,
+            SupplyOrigin::Pushed,
+            &mut FrameReservation::unmetered(),
+        )
+        .await;
         assert_eq!(outcome.rejected, 2, "still refused");
         assert_eq!(outcome.buffered, 2, "still applied: the waits are buffered");
 
@@ -6946,7 +7276,14 @@ pub(crate) mod tests {
 
         // The Wanted path, for contrast, records both (the L-34 test proper).
         let wanted = vec![fixture.poison.clone()];
-        apply_supply_entries_from(&handler, wanted, remote, SupplyOrigin::Wanted).await;
+        apply_supply_entries_from(
+            &handler,
+            wanted,
+            remote,
+            SupplyOrigin::Wanted,
+            &mut FrameReservation::unmetered(),
+        )
+        .await;
         let buffer = handler.orphan_buffer.read().await;
         assert!(buffer.refusals().is_refused(&peer, &fixture.poison.id, now));
     }
@@ -7381,5 +7718,674 @@ pub(crate) mod tests {
             0,
             "nothing stays charged"
         );
+    }
+
+    // ─── T77: near-cap and edge cost bounds ───────────────────────────────
+
+    /// A log sink the capture subscribers write into (T77).
+    #[derive(Clone, Default)]
+    pub(crate) struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = LogBuffer;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl LogBuffer {
+        pub(crate) fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap_or_else(|p| p.into_inner())).into_owned()
+        }
+    }
+
+    /// Capture every event on this thread (and so every task of a
+    /// current-thread runtime) twice: `raw`, unfiltered at `WARN` and above,
+    /// and `filtered`, through the node's default `EnvFilter`
+    /// ([`crate::DEFAULT_LOG_FILTER`]) — what an operator without `RUST_LOG`
+    /// actually gets. Held until the guard drops.
+    pub(crate) fn capture_logs() -> (tracing::subscriber::DefaultGuard, LogBuffer, LogBuffer) {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::Layer;
+        let raw = LogBuffer::default();
+        let filtered = LogBuffer::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(raw.clone())
+                    .with_ansi(false)
+                    .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+            )
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(filtered.clone())
+                    .with_ansi(false)
+                    .with_filter(tracing_subscriber::EnvFilter::new(
+                        crate::DEFAULT_LOG_FILTER,
+                    )),
+            );
+        (tracing::subscriber::set_default(subscriber), raw, filtered)
+    }
+
+    /// `WARN` lines of `text` whose target is `target`.
+    fn warn_lines<'a>(text: &'a str, target: &str) -> Vec<&'a str> {
+        let marker = format!(" {target}:");
+        text.lines()
+            .filter(|line| line.contains(" WARN ") && line.contains(&marker))
+            .collect()
+    }
+
+    /// L-72 KEY TEST, over real iroh on loopback: 50 dials from a peer NOT on
+    /// the allowlist and 50 dials naming an unknown ALPN, under a `tracing`
+    /// capture. This node logs at most one own line for the whole
+    /// not-allowlisted class per window; iroh's router logs no
+    /// "ended with error" line for them at all (the arm returns `Ok`); and
+    /// under the default filter NOTHING from `iroh::protocol` reaches the log
+    /// — the bad-ALPN handshakes included, which die before any handler runs.
+    ///
+    /// Before T77 the 100 dials wrote ~150 WARN lines (~75 KB): our own
+    /// unthrottled line plus iroh's per `Err` for every not-allowlisted dial,
+    /// and iroh's per failed handshake for every bad ALPN.
+    ///
+    /// Bug-catch: (a) restore the unthrottled `warn!` + `Err` — 50 own lines
+    /// and 50 iroh "ended with error" lines in `raw`; (b) default the filter
+    /// back to `info` — the bad-ALPN lines reach `filtered`.
+    #[tokio::test]
+    async fn l72_refused_dials_on_a_public_bind_cost_at_most_one_line() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+        let (guard, raw, filtered) = capture_logs();
+        let pair = serve_pair(short_timeouts(), AntiEntropyLimits::default()).await;
+        let stranger = bind_direct_endpoint().await;
+        wait_until_dialable(&stranger).await;
+
+        let started = std::time::Instant::now();
+        let mut connected = 0usize;
+        for _ in 0..50 {
+            let dial = tokio::time::timeout(
+                Duration::from_secs(5),
+                stranger.connect(pair.addr.clone(), p2p::protocol::ANTI_ENTROPY_ALPN),
+            )
+            .await;
+            if let Ok(Ok(connection)) = dial {
+                connected += 1;
+                let reason =
+                    tokio::time::timeout(Duration::from_secs(3), connection.closed()).await;
+                if let Ok(reason) = reason {
+                    assert!(
+                        format!("{reason}").contains("not-allowlisted"),
+                        "refused as not allowlisted: {reason}"
+                    );
+                }
+            }
+        }
+        let mut refused_alpn = 0usize;
+        for _ in 0..50 {
+            let dial = tokio::time::timeout(
+                Duration::from_secs(5),
+                stranger.connect(pair.addr.clone(), b"t77/not-a-protocol/0"),
+            )
+            .await;
+            if !matches!(dial, Ok(Ok(_))) {
+                refused_alpn += 1;
+            }
+        }
+        let elapsed = started.elapsed();
+        // Let the server's accept tasks finish logging.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let _ = pair.router.shutdown().await;
+        drop(guard);
+
+        let raw = raw.text();
+        let filtered = filtered.text();
+        eprintln!(
+            "l72: {connected}/50 not-allowlisted handshakes, {refused_alpn}/50 bad-ALPN \
+             refusals in {elapsed:?}; raw WARN bytes {}, filtered bytes {}",
+            raw.len(),
+            filtered.len()
+        );
+        // Loopback QUIC can lose a handshake to a slow machine (or LuLu);
+        // the bound below is about the ones that complete.
+        assert!(
+            connected >= 25,
+            "loopback QUIC must complete most handshakes: {connected}/50"
+        );
+        assert_eq!(refused_alpn, 50, "an unknown ALPN never connects");
+        let windows =
+            1 + (elapsed.as_secs() / crate::connection_limiter::REFUSAL_LOG_INTERVAL.as_secs());
+        let own = raw
+            .lines()
+            .filter(|line| {
+                line.contains("rejecting anti-entropy connection not on bootstrap allowlist")
+            })
+            .count();
+        assert!(
+            own as u64 <= windows,
+            "{own} own refusal lines for 50 dials in {elapsed:?}:\n{raw}"
+        );
+        let iroh_err = raw
+            .lines()
+            .filter(|line| {
+                line.contains("iroh::protocol")
+                    && line.contains("Handling incoming connection ended with error")
+            })
+            .count();
+        assert_eq!(iroh_err, 0, "the refusal arm must return Ok:\n{raw}");
+        let iroh_filtered = warn_lines(&filtered, "iroh::protocol");
+        assert!(
+            iroh_filtered.is_empty(),
+            "the default filter must silence iroh's per-handshake warns:\n{}",
+            iroh_filtered.join("\n")
+        );
+    }
+
+    /// The source-side history for the L-70 shape: the two opens a
+    /// transaction needs, a short transaction B, and a long transaction O
+    /// whose parents name B — authored by `author`, served as entries.
+    struct OrphanFixture {
+        opens: Vec<p2p::protocol::SupplyEntry>,
+        parent: p2p::protocol::SupplyEntry,
+        child: p2p::protocol::SupplyEntry,
+        opens_bytes: Vec<u64>,
+        parent_bytes: u64,
+        child_bytes: u64,
+    }
+
+    fn narrated(narration_len: usize, day: u32) -> TransactionInput {
+        TransactionInput {
+            date: NaiveDate::from_ymd_opt(2024, 1, day).expect("valid date"),
+            flag: Flag::Complete,
+            payee: None,
+            narration: Some("n".repeat(narration_len)),
+            tags: Vec::new(),
+            links: Vec::new(),
+            postings: vec![
+                PostingInput {
+                    account: "Assets:Cash".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(-5),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                },
+                PostingInput {
+                    account: "Expenses:Food".to_owned(),
+                    amount: Some(Amount {
+                        number: dec!(5),
+                        currency: "USD".to_owned(),
+                    }),
+                    cost: None,
+                    price: None,
+                },
+            ],
+        }
+    }
+
+    fn orphan_fixture(dir: &std::path::Path, author: &str) -> OrphanFixture {
+        let mut source =
+            LedgerService::boot(dir.join("t77-source.bean"), author.to_owned()).expect("boot");
+        let day = NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid date");
+        let opens: Vec<String> = ["Assets:Cash", "Expenses:Food"]
+            .iter()
+            .map(|account| {
+                source
+                    .open_account_staged(
+                        (*account).to_owned(),
+                        day,
+                        vec!["USD".to_owned()],
+                        |_, _, _| None,
+                    )
+                    .expect("open")
+            })
+            .collect();
+        let parent = source
+            .append_transaction_staged(narrated(200, 2), |_, _, _| None)
+            .expect("parent")
+            .txid;
+        let child = source
+            .append_transaction_staged(narrated(700, 3), |_, _, _| None)
+            .expect("child")
+            .txid;
+        source.compact().expect("source commit");
+        let names = |id: &str| {
+            source
+                .get_directive(id)
+                .expect("present")
+                .metadata()
+                .get("openledger-parents")
+                .cloned()
+        };
+        assert!(
+            names(&child).is_some_and(|parents| parents.contains(&parent)),
+            "the child names the parent"
+        );
+        let bytes = |id: &str| RecordEstimate::directive_bytes(source.get_directive(id).unwrap());
+        OrphanFixture {
+            opens: opens.iter().map(|id| entry_for(&source, id)).collect(),
+            opens_bytes: opens.iter().map(|id| bytes(id)).collect(),
+            parent_bytes: bytes(&parent),
+            child_bytes: bytes(&child),
+            parent: entry_for(&source, &parent),
+            child: entry_for(&source, &child),
+        }
+    }
+
+    /// L-70 KEY TEST — `x3probe orphan`, through the real ALPN apply path.
+    /// Near the cap, a peer's child transaction O arrives first and is
+    /// buffered; then its parent B, which fits by itself. B frees O, and B + O
+    /// together do NOT fit. Now: B is staged and committed, O is deferred (not
+    /// staged), the peer is backed off, and there is no reload — B is still
+    /// there, durable, and the headroom dropped by exactly B's record.
+    ///
+    /// Before T77 the drain staged O after the pre-stage check, the prepare's
+    /// projection refused B + O, the L-13 reload rolled BOTH back, and no
+    /// backoff was armed — so the peer re-served them next tick, forever.
+    ///
+    /// Bug-catch: drop the drain's budget check — the prepare is refused, the
+    /// reload removes B, and `deferred` is 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn l70_drained_orphans_that_do_not_fit_are_deferred_without_a_reload() {
+        let author = iroh::SecretKey::generate().public();
+        let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let fixture = orphan_fixture(temp_dir.path(), &author.to_string());
+
+        let mut opens_record = RecordEstimate::new();
+        for bytes in &fixture.opens_bytes {
+            opens_record.add(*bytes);
+        }
+        let parent_alone = RecordEstimate::new()
+            .with(fixture.parent_bytes)
+            .record_bytes();
+        let both = RecordEstimate::new()
+            .with(fixture.parent_bytes)
+            .with(fixture.child_bytes)
+            .record_bytes();
+        // B fits, and so does O (it must be buffered first, and a batch is
+        // checked before anything in it is known to be an orphan); B + O
+        // does not.
+        let child_alone = RecordEstimate::new()
+            .with(fixture.child_bytes)
+            .record_bytes();
+        let headroom = opens_record.record_bytes()
+            + parent_alone.max(child_alone)
+            + fixture.parent_bytes.min(fixture.child_bytes) / 2;
+        assert!(
+            headroom - opens_record.record_bytes() < both,
+            "fixture: B + O must not fit"
+        );
+        let ledger = crate::ledger_commit::near_cap::near_cap_ledger(
+            &temp_dir.path().join("t77-orphan.bean"),
+            headroom,
+        );
+        let handler = make_handler(Arc::clone(&ledger), allow);
+        let remote = iroh::SecretKey::generate().public();
+
+        let opened = apply_supply_entries(&handler, fixture.opens.clone(), remote).await;
+        assert_eq!(opened.merged, 2, "{opened:?}");
+        let buffered = apply_supply_entries(&handler, vec![fixture.child.clone()], remote).await;
+        assert_eq!(buffered.buffered, 1, "O waits on B: {buffered:?}");
+        let before = ledger.read().await.append_headroom();
+        assert_eq!(before, headroom - opens_record.record_bytes());
+
+        let outcome = apply_supply_entries(&handler, vec![fixture.parent.clone()], remote).await;
+        assert_eq!(outcome.merged, 1, "B is staged: {outcome:?}");
+        assert_eq!(outcome.deferred, 1, "O is deferred: {outcome:?}");
+        assert!(
+            handler
+                .supply_backoff
+                .is_active(remote, std::time::Instant::now()),
+            "a drain that ran out of room backs the peer off"
+        );
+        let service = ledger.read().await;
+        assert!(
+            service.contains_directive(&fixture.parent.id),
+            "no reload: B is still there"
+        );
+        assert!(
+            !service.contains_directive(&fixture.child.id),
+            "O was not staged"
+        );
+        assert_eq!(service.uncommitted_count(), 0, "B is durable");
+        assert_eq!(
+            service.append_headroom(),
+            before - parent_alone,
+            "the journal grew by exactly B's record — the estimate is the record"
+        );
+    }
+
+    /// T77 (Info) KEY TEST: 40 KB below the cap, a 256-entry batch whose
+    /// journal record is ~38 KB is admitted. The pre-T77 estimate added a
+    /// 128-byte framing allowance and the 64-byte id per entry — ~85 KB for
+    /// this batch — so the batch was deferred, the peer backed off, and the
+    /// same thing happened every backoff window, forever.
+    ///
+    /// Bug-catch: check the headroom against the sum of
+    /// `estimated_entry_bytes` again and the batch is deferred.
+    #[tokio::test]
+    async fn t77_a_fitting_batch_in_the_last_40kb_is_admitted() {
+        let author = iroh::SecretKey::generate().public();
+        let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let entries = remote_open_entries(temp_dir.path(), &author.to_string(), 256);
+        let headroom = 40 * 1024;
+        let mut record = RecordEstimate::new();
+        for entry in &entries {
+            record.add(RecordEstimate::directive_bytes(
+                &validate_supply_entry(entry).expect("valid"),
+            ));
+        }
+        let wire_estimate: u64 = entries
+            .iter()
+            .map(|entry| p2p::anti_entropy::estimated_entry_bytes(entry) as u64)
+            .sum();
+        assert!(
+            record.record_bytes() <= headroom && wire_estimate > headroom,
+            "fixture: record {} and wire estimate {wire_estimate} around {headroom}",
+            record.record_bytes()
+        );
+
+        let ledger = crate::ledger_commit::near_cap::near_cap_ledger(
+            &temp_dir.path().join("t77-40k.bean"),
+            headroom,
+        );
+        let handler = make_handler(Arc::clone(&ledger), allow);
+        let remote = iroh::SecretKey::generate().public();
+        let outcome = apply_supply_entries(&handler, entries, remote).await;
+        assert_eq!((outcome.merged, outcome.deferred), (256, 0), "{outcome:?}");
+        assert!(!handler
+            .supply_backoff
+            .is_active(remote, std::time::Instant::now()));
+        let service = ledger.read().await;
+        assert_eq!(service.uncommitted_count(), 0);
+        assert_eq!(
+            service.append_headroom(),
+            headroom - record.record_bytes(),
+            "the record written is exactly the estimate"
+        );
+    }
+
+    /// L-70: GraphQL subscribers hear about a supplied transaction only once
+    /// it is durable. A batch whose commit fails (the ledger's directory is
+    /// read-only, so the compaction cannot create its temp file) announces
+    /// nothing; the same batch once the directory is writable again is
+    /// announced.
+    ///
+    /// Bug-catch: publish at stage time again and the subscriber receives the
+    /// transaction the failed commit rolled back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn l70_subscribers_hear_nothing_from_a_batch_whose_commit_failed() {
+        use std::os::unix::fs::PermissionsExt;
+        let author = iroh::SecretKey::generate().public();
+        let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
+        let source_dir = tempfile::tempdir().expect("temp dir");
+        let fixture = orphan_fixture(source_dir.path(), &author.to_string());
+        let mut batch = fixture.opens.clone();
+        batch.push(fixture.parent.clone());
+
+        let sink_dir = tempfile::tempdir().expect("temp dir");
+        let path = sink_dir.path().join("sink.bean");
+        std::fs::write(&path, "").expect("seed file");
+        let ledger: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(&path, "sink".to_owned()).expect("boot sink"),
+        ));
+        let handler = make_handler(Arc::clone(&ledger), allow);
+        let mut subscriber = handler.broadcast.subscribe();
+        let remote = iroh::SecretKey::generate().public();
+
+        let writable = std::fs::metadata(sink_dir.path()).unwrap().permissions();
+        std::fs::set_permissions(sink_dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(sink_dir.path().join("probe"), "").is_ok() {
+            std::fs::set_permissions(sink_dir.path(), writable).unwrap();
+            eprintln!("skipped: a read-only directory is writable here (root?)");
+            return;
+        }
+        let failed = apply_supply_entries(&handler, batch.clone(), remote).await;
+        std::fs::set_permissions(sink_dir.path(), writable).unwrap();
+        assert_eq!(failed.merged, 3, "the batch was staged: {failed:?}");
+        assert!(
+            !ledger.read().await.contains_directive(&fixture.parent.id),
+            "the failed commit was rolled back"
+        );
+        assert!(
+            matches!(
+                subscriber.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "a subscriber must not hear about a transaction that never became durable"
+        );
+
+        let landed = apply_supply_entries(&handler, batch, remote).await;
+        assert_eq!(landed.merged, 3, "{landed:?}");
+        let announced = subscriber
+            .try_recv()
+            .expect("the durable transaction is announced");
+        assert_eq!(announced.txid.0, fixture.parent.id);
+        assert!(subscriber.try_recv().is_err(), "announced once");
+    }
+
+    /// A per-thread counting allocator for the phase-1 residency test (T77).
+    ///
+    /// Counts only on a thread that has armed it, so the rest of this test
+    /// binary — hundreds of tests on other threads — is neither measured nor
+    /// measurably slowed (one thread-local read per allocation). A `const`
+    /// thread-local of `Cell`s has no destructor and allocates nothing, so it
+    /// is safe to touch from inside the allocator.
+    mod thread_counting {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static ARMED: Cell<bool> = const { Cell::new(false) };
+            static LIVE: Cell<isize> = const { Cell::new(0) };
+            static PEAK: Cell<isize> = const { Cell::new(0) };
+        }
+
+        pub(crate) struct ThreadCounting;
+
+        fn note(delta: isize) {
+            let _ = ARMED.try_with(|armed| {
+                if armed.get() {
+                    let live = LIVE.get() + delta;
+                    LIVE.set(live);
+                    if live > PEAK.get() {
+                        PEAK.set(live);
+                    }
+                }
+            });
+        }
+
+        // SAFETY: forwards every call unchanged to `System`; the bookkeeping
+        // touches only allocation-free thread-locals.
+        unsafe impl GlobalAlloc for ThreadCounting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                // SAFETY: the caller's layout, forwarded unchanged.
+                let pointer = unsafe { System.alloc(layout) };
+                if !pointer.is_null() {
+                    note(layout.size() as isize);
+                }
+                pointer
+            }
+
+            unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+                note(-(layout.size() as isize));
+                // SAFETY: pointer and layout come from a matching `alloc`.
+                unsafe { System.dealloc(pointer, layout) }
+            }
+        }
+
+        /// Run `call` on this thread with the counter armed, and return the
+        /// peak live bytes above the level at entry (frees of memory that
+        /// existed before count against it, as in `decode_memory.rs`).
+        pub(crate) fn peak_during<T>(call: impl FnOnce() -> T) -> (T, usize) {
+            LIVE.set(0);
+            PEAK.set(0);
+            ARMED.set(true);
+            let value = call();
+            ARMED.set(false);
+            (value, usize::try_from(PEAK.get()).unwrap_or(0))
+        }
+    }
+
+    #[global_allocator]
+    static THREAD_COUNTING: thread_counting::ThreadCounting = thread_counting::ThreadCounting;
+
+    /// The densest body inside every §3.12 cap (T75's `in-cap max` shape):
+    /// 100 tags, 100 links, 100 directive metadata keys, 1,000 postings of
+    /// which 100 carry a metadata key — ~19 KB of text, ~278 KB parsed. The
+    /// postings do not balance, so staging refuses it (I1) and nothing it
+    /// holds outlives phase 2.
+    fn densest_in_cap_entry(index: usize, author: &str) -> p2p::protocol::SupplyEntry {
+        let mut body = format!("2024-01-02 * \"{index:03}\"");
+        for tag in 0..100 {
+            body.push_str(&format!(" #t{tag}"));
+        }
+        for link in 0..100 {
+            body.push_str(&format!(" ^l{link}"));
+        }
+        body.push('\n');
+        for key in 0..100 {
+            body.push_str(&format!("  m{key}: \"\"\n"));
+        }
+        for posting in 0..ledger::service::MAX_POSTINGS_PER_TRANSACTION {
+            body.push_str("  Assets:A 1 AB\n");
+            if posting < 100 {
+                body.push_str(&format!("    p{posting}: \"\"\n"));
+            }
+        }
+        let parsed = ledger::parse::parse_file(&body).expect("the shape parses");
+        let mut envelope = std::collections::BTreeMap::new();
+        envelope.insert("openledger-author".to_owned(), author.to_owned());
+        envelope.insert("openledger-lamport".to_owned(), "2".to_owned());
+        envelope.insert("openledger-parents".to_owned(), String::new());
+        p2p::protocol::SupplyEntry {
+            id: ledger::hash::compute_content_id(&parsed[0]),
+            kind: p2p::protocol::DirectiveKind::from_directive(&parsed[0]),
+            economic_bean: body,
+            envelope,
+        }
+    }
+
+    /// T77 (the T75 residual) KEY TEST: phase 1 of a `Supply` of the densest
+    /// in-cap bodies — 256 of them, a ~5 MB frame that held ~71 MB (12.7× the
+    /// frame, T75) before anything was staged — now holds at most
+    /// `PHASE_ONE_WEIGHT_BUDGET` of parsed directives (plus one entry's
+    /// transient), measured with a counting allocator on the applying thread.
+    /// Every entry is still validated and refused at stage, exactly as before.
+    ///
+    /// Bug-catch: drop the weight check in phase 1 (one chunk per frame) and
+    /// the peak is the whole frame's parsed weight, ~70 MB.
+    #[test]
+    fn t77_phase_one_holds_at_most_its_weight_budget_of_the_densest_frame() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let author = iroh::SecretKey::generate().public();
+        let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ledger: SharedLedger = Arc::new(RwLock::new({
+            let mut service =
+                LedgerService::boot(temp_dir.path().join("t77-dense.bean"), "sink".to_owned())
+                    .expect("boot");
+            service
+                .open_account(
+                    "Assets:A".to_owned(),
+                    NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid date"),
+                    vec!["AB".to_owned()],
+                )
+                .expect("open");
+            service
+        }));
+        let handler = make_handler(Arc::clone(&ledger), allow);
+        let remote = iroh::SecretKey::generate().public();
+        let entries: Vec<_> = (0..MAX_SUPPLY_ENTRIES)
+            .map(|index| densest_in_cap_entry(index, &author.to_string()))
+            .collect();
+        let frame = WireMessage::supply(entries.clone())
+            .to_cbor()
+            .expect("encode")
+            .len();
+        assert!(frame <= MAX_MESSAGE_SIZE as usize);
+        let weight: usize = entries
+            .iter()
+            .map(|entry| p2p::anti_entropy::resident_weight(&validate_supply_entry(entry).unwrap()))
+            .sum();
+
+        let (outcome, peak) = thread_counting::peak_during(|| {
+            runtime.block_on(apply_supply_entries(&handler, entries, remote))
+        });
+        let bound = PHASE_ONE_WEIGHT_BUDGET + 4 * 1024 * 1024;
+        eprintln!(
+            "t77 phase 1: frame {frame} B, parsed weight {weight} B ({:.1}× frame); peak {peak} B \
+             ({:.2}× frame), bound {bound} B; {outcome:?}",
+            weight as f64 / frame as f64,
+            peak as f64 / frame as f64,
+        );
+        assert_eq!(
+            outcome.rejected, MAX_SUPPLY_ENTRIES,
+            "every dense entry is validated and refused at stage: {outcome:?}"
+        );
+        assert!(
+            weight > 2 * bound,
+            "fixture: the frame must outweigh the bound by far ({weight} vs {bound})"
+        );
+        assert!(
+            peak <= bound,
+            "phase 1 held {peak} B for a {frame} B frame, past {bound} B"
+        );
+    }
+
+    /// T77: the pushed path charges phase 1's held weight to the connection
+    /// limiter's byte budget and gives it back — nothing stays charged, and
+    /// the budget's high-water mark saw the weight on top of the frame.
+    #[test]
+    fn t77_phase_one_weight_is_charged_to_the_inbound_budget() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let author = iroh::SecretKey::generate().public();
+        let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let entries = remote_open_entries(temp_dir.path(), &author.to_string(), 64);
+        let weight: usize = entries
+            .iter()
+            .map(|entry| p2p::anti_entropy::resident_weight(&validate_supply_entry(entry).unwrap()))
+            .sum();
+        let ledger: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("t77-charge.bean"), "sink".to_owned())
+                .expect("boot"),
+        ));
+        let handler = make_handler(ledger, allow);
+        let remote = iroh::SecretKey::generate().public();
+        let mut reservation = handler.limiter.frame_reservation(remote);
+        assert!(reservation.grow_to(1000), "the frame body's charge");
+        let outcome = runtime.block_on(apply_supply_entries_from(
+            &handler,
+            entries,
+            remote,
+            SupplyOrigin::Pushed,
+            &mut reservation,
+        ));
+        assert_eq!(outcome.merged, 64, "{outcome:?}");
+        assert_eq!(reservation.held(), 1000, "the weight is given back");
+        assert_eq!(handler.limiter.frame_bytes_peak(), 1000 + weight);
+        drop(reservation);
+        assert_eq!(handler.limiter.frame_bytes_in_flight(), 0);
     }
 }

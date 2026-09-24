@@ -53,6 +53,10 @@ INFO  gl-node starting address=127.0.0.1:4000 version=0.1.0 ledger=my-ledger.bea
 
 The playground is **off** by default. Turn it on with `"graphiql": true` and visit **http://127.0.0.1:4000/graphql**. It is only available on a loopback bind — a non-loopback `bindAddress` with `graphiql` enabled is refused at boot, not silently downgraded.
 
+### Upgrading
+
+Read [`CHANGELOG.md`](CHANGELOG.md) before upgrading, starting with *Breaking*. Config files are parsed strictly, so an **older binary refuses a config that uses a key added in a newer one**: upgrade the binary before editing the config, and remove new keys before rolling back. A newer node may also refuse history an older one accepted (the cardinality and amount caps); the CHANGELOG lists each case and its remedy.
+
 ---
 
 ## API Reference — curl Examples
@@ -247,7 +251,8 @@ happens when amounts of very different scales are mixed (such as `1000` and
 `0.0000000000000000000000000001`), the figure is rounded once, half to even, to the finest scale that
 fits, and the report says so with `exact: false`. `balance` assertions and `verify` always compare
 against the exact sum. With the 10^21 limit, no total in a ledger of any size the node accepts can be
-too large to report.
+too large to report. An inexact figure is within half a unit in its last
+printed place of the exact sum.
 
 ### Queries (Reading Data)
 
@@ -403,6 +408,8 @@ curl -s -X POST http://127.0.0.1:4000/graphql \
 
 The config file is loaded from `gl-node.config.json` (or set `GL_NODE_CONFIG` env var).
 
+The config file must be a regular file of at most 1 MiB. A symlink to one is followed (a mounted ConfigMap works), but a FIFO, directory, device or dangling link is refused at startup, and by `--health-check`, rather than waited on. Its owner and mode are not checked; if it carries `auth.apiKey`, keep it `0600` or use `GL_NODE_API_KEY`.
+
 ### Minimal Config
 
 ```json
@@ -470,7 +477,7 @@ boot saying so; `meshId` becomes required in a later release.
 | `bindAddress` | `"127.0.0.1"` | HTTP listen address |
 | `port` | `4000` | HTTP listen port |
 | `watchLedgerFile` | `false` | Poll the `.bean` every 250 ms and fold a hand edit in promptly. It does **not** control whether a hand edit is accepted — nothing does — see [Editing the `.bean` file](#editing-the-bean-file-by-hand) |
-| `graphiql` | `false` | GraphiQL playground; refused outright on a non-loopback bind. The page loads GraphiQL 4.1.2 (pinned) and React 18 from `unpkg.com` — see below |
+| `graphiql` | `false` | GraphiQL playground; refused outright on a non-loopback bind. The page loads GraphiQL 4.1.2 and React 18.3.1 production builds from `unpkg.com`, each pinned by a Subresource Integrity hash — see below |
 | `cors.allowedOrigins` | `[]` | Browser origin allowlist; `"*"` is rejected |
 | `allowedHosts` | `[]` | Extra `Host` header values accepted, beyond loopback and the bind address. **Required (non-empty) on a non-loopback bind** — see below |
 | `trustedProxies` | `[]` | Reverse-proxy IPs whose `X-Forwarded-For` the rate limiter believes — see below |
@@ -563,12 +570,22 @@ these values as the floor under a misconfigured or bypassed proxy, not as the
 deployment's limits.
 
 **GraphiQL's assets come from a CDN.** With `graphiql: true` the page at
-`GET /graphql` loads GraphiQL **4.1.2** (an exact version, not the floating
-`4`) and React 18 development builds from `unpkg.com`, without subresource
-integrity — the async-graphql page builder offers no way to add it. The tab is
-a same-origin session on the node, so whoever controls those CDN responses
-controls what it sends. That is why GraphiQL is off by default and refused on
-any non-loopback bind; leave it off unless you are exploring a local node.
+`GET /graphql` loads GraphiQL **4.1.2** and React/React-DOM **18.3.1**
+production builds from `unpkg.com`. Each tag carries a SHA-384 `integrity`
+hash, so a CDN that serves anything else is refused by the browser and the page
+stays blank rather than running it. No other origin is contacted. The tab is
+still a same-origin session on the node, which is why GraphiQL is off by
+default and refused on any non-loopback bind.
+
+### Log volume on a public bind
+
+A node bound to a public address accepts QUIC handshakes from anyone. Refusals are logged at bounded rates:
+
+- one line per 10 s for every peer not on the allowlist, taken together;
+- one per 10 s per allowlisted peer and reason;
+- one per 10 s per HTTP client for requests the Host/Origin/Content-Type guard refuses.
+
+Each window's suppressed count is logged when the window closes. iroh's own per-handshake warnings (unknown ALPN, a handshake aborted by the peer) are silenced by the default filter, `info,iroh::protocol=error`. **If you set `RUST_LOG`, it replaces that default: keep `iroh::protocol=error` in it**, or any dialer can write ~300–700 bytes of log per handshake. Put the same log-volume controls (rotation, rate limits in your log shipper) on the QUIC port as on the HTTP edge.
 
 ### API keys
 
@@ -927,6 +944,14 @@ same trust boundary:
   the node already wrote. That includes a backup copied over the live file. Only
   lines you added since the node last rewrote the file may be dropped by that
   recovery.
+- The 64 MiB limit applies to the file as the node writes it. Hand-typed
+  directives gain an envelope of several hundred bytes each, so a file just
+  under the limit can grow past it; boot then warns, and every compaction fails
+  until the file is made smaller. Near the limit, a mutation whose record would
+  not fit is refused before anything changes (`RESOURCE_LIMIT_EXCEEDED`,
+  "refused before staging"), and a peer's batch that would not fit is deferred
+  and that peer paused for `p2p.antiEntropySupplyBackoffSeconds`. Archive or
+  split the ledger to make room.
 
 ### The commit journal (`<ledgerPath>.journal`)
 
@@ -939,14 +964,23 @@ cases where you might:
   must be regular files (not a FIFO, directory or symlink), owned by the uid the
   node runs as, with a single hard link; the lock and key must be `0600`, and a
   journal writable by group or other is refused (one merely readable by others
-  loads with a warning and is compacted away). A FIFO, directory or dangling
-  symlink at the `.bean` or the journal refuses boot.
+  loads with a warning and is compacted away). The node appends only to a
+  journal with no group or other permission bits (0600 or stricter). A FIFO,
+  directory or dangling symlink at the `.bean` or the journal refuses boot.
 - **A `.bean` missing beside a journal refuses boot** rather than starting an
   empty ledger with the journal's writes on top.
-- **A torn final record** — a crash mid-append — is dropped with a warning, and
-  so is a journal whose recovery reload after a failed write could not read the
-  files; the journal is kept as `<ledgerPath>.journal.torn-<unix-seconds>` instead of
-  being deleted. No boot reads it; inspect it, then remove it.
+- **A torn final record** — a crash mid-append — is dropped with a warning. On
+  some filesystems the crashed record reads back at full length but with zeros
+  (XFS) or old disk contents (ext4 `data=writeback`); a final record that fails
+  its checksum is treated the same way, unless an intact record follows inside
+  it. The same applies to a journal whose recovery reload after a failed write
+  could not read the files. The journal is kept as
+  `<ledgerPath>.journal.torn-<unix-seconds>` instead of being deleted. No boot
+  reads it; inspect it, then remove it.
+- **Reserved names.** `<ledgerPath>.tmp` and `<ledgerPath>.tmp.<pid>.<16 hex
+  digits>` are the node's temporary files; a stale one is deleted at startup. Do
+  not name your own files that way. Anything else, `ledger.bean.tmp.backup`
+  included, is left alone.
 - **Damage anywhere else refuses boot**, naming the byte offset. It cannot be a
   crash, so the node will not guess which records to keep.
 - **The per-record checksum is unkeyed.** It catches bit rot and accidents, not
@@ -1074,7 +1108,7 @@ cargo test -p ledger -- ct9_
 
 # Check formatting + linting
 cargo fmt --all -- --check
-cargo clippy --all-targets
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
 ---

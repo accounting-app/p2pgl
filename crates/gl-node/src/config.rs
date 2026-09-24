@@ -4,7 +4,6 @@ use crate::http_server::HttpServerSettings;
 use axum::http::{header, HeaderName, HeaderValue, Method};
 use serde::Deserialize;
 use std::fs::File;
-use std::io::Read;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -906,6 +905,65 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// Largest config file [`NodeConfig::load_from_path`] reads (T77 / L-73).
+///
+/// Every shipped config is a few KiB; the largest honest one — every key set,
+/// a long allowlist and origin list — is well under 100 KiB. One MiB is an
+/// order of magnitude past that and small enough that a wrong path (a log, a
+/// ledger, a disk image) is refused in one bounded read instead of being
+/// loaded, parsed and reported as JSON noise.
+pub(crate) const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Open and read the config file the way every other operator file is opened
+/// (T77 / L-73): through [`ledger::journal::open_checked`] with
+/// [`ledger::journal::FileTrust::OperatorConfig`] — a symlink followed to a
+/// regular file, anything else (a FIFO, a device, a directory, a dangling
+/// link) refused before a byte is read and without blocking — and read with
+/// [`ledger::journal::read_to_end_capped`] at [`MAX_CONFIG_FILE_BYTES`].
+///
+/// Before this the config was the one operator file opened with a plain,
+/// blocking `File::open` and read without a cap: a FIFO at `GL_NODE_CONFIG`
+/// parked boot (and `--health-check`, which shares this loader) before the
+/// ledger lock with one log line, and a 200 MB file was still loading at 30 s.
+///
+/// Returns the handle as well as the text, so the permission check describes
+/// the inode whose bytes were read (the L-04 rule).
+fn read_config_file(config_path: &Path) -> Result<(File, String), ConfigError> {
+    let checked = ledger::journal::open_checked(
+        config_path,
+        std::fs::OpenOptions::new().read(true),
+        ledger::journal::FileTrust::OperatorConfig,
+        "config file",
+    )
+    .map_err(ConfigError::FileRead)?;
+    let bytes = ledger::journal::read_to_end_capped(
+        &checked.file,
+        checked.metadata.len(),
+        MAX_CONFIG_FILE_BYTES,
+    )
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::FileTooLarge {
+            ConfigError::FileRead(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                format!(
+                    "{} is larger than {MAX_CONFIG_FILE_BYTES} bytes; refusing to load it as \
+                     a config file (L-73)",
+                    config_path.display()
+                ),
+            ))
+        } else {
+            ConfigError::FileRead(error)
+        }
+    })?;
+    let content = String::from_utf8(bytes).map_err(|error| {
+        ConfigError::FileRead(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not UTF-8: {error}", config_path.display()),
+        ))
+    })?;
+    Ok((checked.file, content))
+}
+
 impl NodeConfig {
     /// Load configuration from the given path, applying defaults and validating.
     ///
@@ -946,10 +1004,7 @@ impl NodeConfig {
         // Opened once and read from the handle, so the permission warning below
         // describes the inode whose bytes became the key rather than whatever
         // happens to sit at the path a moment later (the L-04 rule).
-        let mut file = File::open(config_path).map_err(ConfigError::FileRead)?;
-        let mut content = String::new();
-        file.read_to_string(&mut content)
-            .map_err(ConfigError::FileRead)?;
+        let (file, content) = read_config_file(config_path)?;
         reject_removed_config_keys(&content)?;
         let mut config: NodeConfig = serde_json::from_str(&content).map_err(ConfigError::Parse)?;
 
@@ -3789,5 +3844,101 @@ mod tests {
             load_with_http_section(&format!(r#"{{ "maxConnections": {MAX_MAX_CONNECTIONS} }}"#))
                 .expect("exactly the ceiling must be accepted");
         assert_eq!(at_ceiling.http.max_connections, MAX_MAX_CONNECTIONS);
+    }
+
+    // ── T77 / L-73: the config file is opened like every other operator file ─
+
+    /// A config body padded with trailing JSON whitespace to exactly `total`
+    /// bytes — still valid JSON, so only the size decides.
+    fn padded_config(total: usize) -> String {
+        let mut body = r#"{ "ledgerPath": "./data/ledger.bean" }"#.to_owned();
+        assert!(body.len() <= total);
+        body.push_str(&" ".repeat(total - body.len()));
+        body
+    }
+
+    /// L-73: a FIFO at `GL_NODE_CONFIG` used to park boot (and
+    /// `--health-check`, which calls the same loader) inside a blocking
+    /// `File::open` forever. It must now be refused, promptly, as not a
+    /// regular file.
+    ///
+    /// Bug-catch: restore `File::open` + `read_to_string` and the load never
+    /// returns — the 10 s receive times out.
+    #[cfg(unix)]
+    #[test]
+    fn l73_a_fifo_config_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("gl-node.config.json");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "mkfifo failed");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(NodeConfig::load_from_path(&path).map(|_| ()));
+        });
+        let outcome = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("L-73: loading a FIFO config must not block");
+        let message = format!("{}", outcome.expect_err("a FIFO is not a config file"));
+        assert!(message.contains("FIFO"), "{message}");
+        assert!(message.contains("config file"), "{message}");
+    }
+
+    /// L-73: the read is capped at `MAX_CONFIG_FILE_BYTES`; a 2 MiB config —
+    /// valid JSON, padded — is refused rather than loaded, and one exactly at
+    /// the cap still loads.
+    ///
+    /// Bug-catch: restore the uncapped `read_to_string` and the 2 MiB file
+    /// loads.
+    #[test]
+    fn l73_a_config_over_the_cap_is_refused() {
+        let oversized = write_temp_config(&padded_config(2 * 1024 * 1024));
+        let message = format!(
+            "{}",
+            NodeConfig::load_from_path(&oversized.path().to_path_buf())
+                .expect_err("a 2 MiB config must be refused")
+        );
+        assert!(
+            message.contains(&format!("larger than {MAX_CONFIG_FILE_BYTES} bytes")),
+            "{message}"
+        );
+
+        let at_cap = write_temp_config(&padded_config(
+            usize::try_from(MAX_CONFIG_FILE_BYTES).unwrap(),
+        ));
+        NodeConfig::load_from_path(&at_cap.path().to_path_buf())
+            .expect("a config exactly at the cap loads");
+    }
+
+    /// L-73: a symlinked config (a ConfigMap mount) is still followed, but a
+    /// dangling link or a directory is refused as not a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn l73_a_symlinked_config_is_followed_and_non_files_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.json");
+        std::fs::write(&target, r#"{ "ledgerPath": "./data/ledger.bean" }"#).unwrap();
+        let link = dir.path().join("gl-node.config.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        NodeConfig::load_from_path(&link).expect("a symlinked config is followed");
+
+        let dangling = dir.path().join("dangling.json");
+        std::os::unix::fs::symlink(dir.path().join("absent.json"), &dangling).unwrap();
+        let message = format!(
+            "{}",
+            NodeConfig::load_from_path(&dangling).expect_err("a dangling link is refused")
+        );
+        assert!(message.contains("symbolic link"), "{message}");
+
+        let message = format!(
+            "{}",
+            NodeConfig::load_from_path(&dir.path().to_path_buf())
+                .expect_err("a directory is refused")
+        );
+        assert!(message.contains("directory"), "{message}");
     }
 }

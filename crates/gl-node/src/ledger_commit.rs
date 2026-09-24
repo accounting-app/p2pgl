@@ -33,7 +33,10 @@
 //!
 //! Neither half rebuilds the ledger under its lock: a failed commit and a
 //! failed prepare both reload off the lock while the permit is held (L-43,
-//! M-39).
+//! M-39). At the size cap a mutation does not get that far:
+//! [`refuse_if_local_write_cannot_fit`] refuses a write whose journal record
+//! cannot fit before anything is staged, so it pays no reload (T77 / L-71) —
+//! the check anti-entropy has made since T69.
 //!
 //! # Why the permit exists, and why it is not the write lock
 //!
@@ -101,7 +104,13 @@
 //! commit is in flight, so a caller that forgets the permit gets a loud
 //! `COMMIT_IN_FLIGHT` error rather than a silently interleaved write.
 
-use ledger::service::{LedgerService, PendingCommit, RecoveryReload, ServiceError};
+use ledger::model::{Close, Directive, Metadata, Open, Posting, Transaction};
+use ledger::service::{
+    LedgerService, PendingCommit, RecoveryReload, ServiceError, TransactionInput, ENVELOPE_KEYS,
+    MAX_ECONOMIC_BEAN_LENGTH, MAX_LEDGER_FILE_BYTES,
+};
+use p2p::anti_entropy::RecordEstimate;
+use security::signing::{SignableMessage, SignatureProvider};
 use tokio::sync::{OwnedMutexGuard, RwLockWriteGuard};
 
 use crate::graphql::SharedLedger;
@@ -467,6 +476,204 @@ where
             Err(error)
         }
     }
+}
+
+/// A local write one of the three GraphQL mutations is about to stage (T77 /
+/// L-71) — the input, before any envelope exists.
+pub(crate) enum LocalWrite<'a> {
+    /// `appendTransaction`.
+    Transaction(&'a TransactionInput),
+    /// `openAccount`.
+    Open {
+        account: &'a str,
+        date: chrono::NaiveDate,
+        currencies: &'a [String],
+    },
+    /// `closeAccount`.
+    Close {
+        account: &'a str,
+        date: chrono::NaiveDate,
+    },
+}
+
+/// Headroom at or above which no single local write can fail the append arm's
+/// cap projection, so [`refuse_if_local_write_cannot_fit`] answers without
+/// building anything (T77).
+///
+/// A local directive's economic form is capped at `MAX_ECONOMIC_BEAN_LENGTH`
+/// before it is staged (L-02), and its envelope adds an author, a lamport, at
+/// most `MAX_PARENTS` 64-hex parents and one signature — under 20 KiB — plus
+/// a record header of under 100 bytes; twice the economic cap is past all of
+/// it. Every write on a ledger not within 2 MiB of the cap pays two field
+/// reads for this check.
+const LOCAL_WRITE_FAST_PATH_HEADROOM: u64 = 2 * MAX_ECONOMIC_BEAN_LENGTH as u64;
+
+/// Refuse a local write whose journal record cannot fit under the size cap,
+/// BEFORE it is staged (T77 / L-71).
+///
+/// # The bug this closes
+///
+/// A mutation at the cap used to stage, fail its prepare's cap projection and
+/// pay an L-13 reload — a full `LedgerService::boot` of up to 64 MiB, off the
+/// lock since T69 but with the single-writer permit held throughout. An
+/// API-key holder retrying a refused write therefore queued every other
+/// writer, the file watcher, peer batches and the shutdown compaction behind
+/// one full reload per attempt (3.65 s each on 305k directives); nine
+/// concurrent retries gave honest mutations 408s. The peer path has refused
+/// such batches before staging since T69; this is the same check for the
+/// mutations.
+///
+/// # How
+///
+/// Called with the permit and the write lock held, immediately before the
+/// `*_staged` call, so nothing moves between the answer and the stage. It
+/// builds the directive the stage would store — the resolved transaction
+/// (`validate_transaction`), or the `open` / `close` — with the envelope the
+/// stamp would give it: this node's author, the next lamport, for a
+/// transaction EVERY head it may name as a parent (a superset of the at most
+/// `MAX_PARENTS` the stamp picks, so never shorter), and the signature the
+/// installed provider produces. Its exact share of a journal record
+/// ([`RecordEstimate`]) against [`LedgerService::append_headroom`] then
+/// decides. The refusal changes nothing — no clock movement, no stage, no
+/// reload — and the caller drops the lock and the permit straight after it,
+/// so a refused write holds the permit for this check and nothing more.
+///
+/// # When it does not decide
+///
+/// It answers `Ok` — leaving the prepare's projection as the authority, as
+/// before — whenever it cannot predict the record exactly: something else is
+/// already staged (never, under the permit), the body is a duplicate (the
+/// stage records nothing), the input is invalid (the stage's own error is the
+/// better answer), or the account is already open / not open. On a ledger
+/// more than [`LOCAL_WRITE_FAST_PATH_HEADROOM`] from the cap it builds
+/// nothing at all.
+pub(crate) fn refuse_if_local_write_cannot_fit(
+    service: &LedgerService,
+    write: LocalWrite<'_>,
+    signer: Option<&dyn SignatureProvider>,
+) -> Result<(), ServiceError> {
+    let headroom = service.append_headroom();
+    if headroom >= LOCAL_WRITE_FAST_PATH_HEADROOM || service.uncommitted_count() > 0 {
+        return Ok(());
+    }
+    let Some(record) = local_write_record_bytes(service, write, signer) else {
+        return Ok(());
+    };
+    if record <= headroom {
+        return Ok(());
+    }
+    Err(ServiceError::ResourceLimitExceeded {
+        message: format!(
+            "this write's journal record ({record} bytes) does not fit in the {headroom} bytes \
+             left under the ledger size cap (max {MAX_LEDGER_FILE_BYTES}); refused before \
+             staging, nothing changed. Archive or split the ledger to make room"
+        ),
+    })
+}
+
+/// The exact journal record `write` would become if staged now, or `None`
+/// when that cannot be predicted (see [`refuse_if_local_write_cannot_fit`]).
+fn local_write_record_bytes(
+    service: &LedgerService,
+    write: LocalWrite<'_>,
+    signer: Option<&dyn SignatureProvider>,
+) -> Option<u64> {
+    let &[author_key, lamport_key, parents_key, signature_key] = ENVELOPE_KEYS else {
+        return None;
+    };
+    let lamport = service.lamport_clock().saturating_add(1).to_string();
+    let mut envelope = Metadata::new();
+    envelope.insert(author_key.to_owned(), service.author_id().to_owned());
+    envelope.insert(lamport_key.to_owned(), lamport.clone());
+    let (mut directive, is_transaction) = match write {
+        LocalWrite::Transaction(input) => {
+            let body = Transaction {
+                date: input.date,
+                flag: input.flag,
+                payee: input.payee.clone(),
+                narration: input.narration.clone(),
+                tags: input.tags.clone(),
+                links: input.links.clone(),
+                postings: input
+                    .postings
+                    .iter()
+                    .map(|posting| Posting {
+                        account: posting.account.clone(),
+                        amount: posting.amount.clone(),
+                        cost: posting.cost.clone(),
+                        price: posting.price.clone(),
+                        metadata: Metadata::new(),
+                    })
+                    .collect(),
+                metadata: Metadata::new(),
+            };
+            let resolved =
+                ledger::validate::validate_transaction(&body, service.accounts()).ok()?;
+            (Directive::Transaction(resolved), true)
+        }
+        LocalWrite::Open {
+            account,
+            date,
+            currencies,
+        } => {
+            if service.accounts().is_open(account) {
+                return None;
+            }
+            let open = Open {
+                date,
+                account: account.to_owned(),
+                currencies: currencies.to_vec(),
+                metadata: Metadata::new(),
+            };
+            (Directive::Open(open), false)
+        }
+        LocalWrite::Close { account, date } => {
+            if !service.accounts().is_open(account) {
+                return None;
+            }
+            let close = Close {
+                date,
+                account: account.to_owned(),
+                metadata: Metadata::new(),
+            };
+            (Directive::Close(close), false)
+        }
+    };
+    let content_id = LedgerService::content_id(&directive);
+    if service.contains_directive(&content_id) {
+        return None;
+    }
+    let parents = if is_transaction {
+        let parents = service
+            .dag()
+            .heads_admissible_as_parents_of(&content_id)
+            .join(",");
+        envelope.insert(parents_key.to_owned(), parents.clone());
+        parents
+    } else {
+        String::new()
+    };
+    if let Some(signature) = signer.and_then(|provider| {
+        provider.sign(&SignableMessage {
+            content_id: &content_id,
+            is_transaction,
+            parents: &parents,
+            lamport: &lamport,
+        })
+    }) {
+        envelope.insert(signature_key.to_owned(), signature);
+    }
+    match &mut directive {
+        Directive::Transaction(transaction) => transaction.metadata = envelope,
+        Directive::Open(open) => open.metadata = envelope,
+        Directive::Close(close) => close.metadata = envelope,
+        _ => return None,
+    }
+    Some(
+        RecordEstimate::new()
+            .with(RecordEstimate::directive_bytes(&directive))
+            .record_bytes(),
+    )
 }
 
 /// A ledger within a chosen number of bytes of `MAX_LEDGER_FILE_BYTES`, in
@@ -1129,16 +1336,19 @@ mod tests {
     }
 
     /// M-39 / R-20 through the real GraphQL mutation: a write refused at the
-    /// cap pays its L-13 reload with the write lock RELEASED, so a concurrent
-    /// reader never waits more than 100 ms — measured with a timed `read()`
-    /// probe across the whole mutation, reload included.
+    /// cap never holds the write lock long, so a concurrent reader never waits
+    /// more than 100 ms — measured with a timed `read()` probe across the
+    /// whole mutation.
     ///
-    /// The fixture's reload is a full boot of a 64 MiB file (a SHA-256 of all
-    /// of it, seconds in a debug build), so a reload under the lock is
-    /// unmistakable here.
+    /// Since T77 (L-71) the mutation is refused BEFORE staging and pays no
+    /// reload at all (`l71_refused_writes_at_the_cap_reload_nothing_…` pins
+    /// that); this test still guards the lock hold on that path. The
+    /// reload-off-the-lock half is pinned by
+    /// `m39_a_prepare_refused_at_the_cap_rebuilds_off_the_lock`.
     ///
-    /// Bug-catch: the pre-T69 synchronous body (`service.recover_failed_commit()`
-    /// under the guard) and the probe's worst wait is the whole reload.
+    /// Bug-catch (pre-T77): the pre-T69 synchronous body
+    /// (`service.recover_failed_commit()` under the guard) and the probe's
+    /// worst wait is the whole reload.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn m39_a_mutation_refused_at_the_cap_does_not_hold_the_lock_across_its_reload() {
         let dir = tempfile::tempdir().unwrap();
@@ -1192,5 +1402,260 @@ mod tests {
         let service = ledger.read().await;
         assert!(!service.accounts().is_open("Assets:Over"), "rolled back");
         assert_eq!(service.uncommitted_count(), 0);
+    }
+
+    // ── T77 / L-71: the mutations' pre-stage headroom check ─────────────
+
+    fn day(day: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2024, 1, day).unwrap()
+    }
+
+    /// `appendTransaction` of a 5 USD lunch with a `narration_len`-byte
+    /// narration, dated January `day`.
+    fn lunch_mutation(narration_len: usize, day: u32) -> String {
+        format!(
+            r#"mutation {{ appendTransaction(input: {{ date: "2024-01-{day:02}" flag: "*"
+                narration: "{}" postings: [
+                    {{ account: "Assets:Cash", amount: {{ number: "-5", currency: "USD" }} }},
+                    {{ account: "Expenses:Food", amount: {{ number: "5", currency: "USD" }} }}
+                ] }}) {{ txid alreadyExisted }} }}"#,
+            "n".repeat(narration_len)
+        )
+    }
+
+    fn error_codes(response: &async_graphql::Response) -> Vec<String> {
+        response
+            .errors
+            .iter()
+            .filter_map(|error| {
+                error
+                    .extensions
+                    .as_ref()
+                    .and_then(|ext| ext.get("code"))
+                    .map(|code| code.to_string())
+            })
+            .collect()
+    }
+
+    /// L-71 KEY TEST — `x3probe cap 4`, through the real GraphQL mutations.
+    /// ~880 bytes below the cap, an API-key holder retries a write whose
+    /// record cannot fit (a 2,000-byte narration) four times while an honest
+    /// writer keeps taking the single-writer permit. Every attempt is refused
+    /// with `RESOURCE_LIMIT_EXCEEDED`, NONE pays an L-13 reload (no
+    /// "reload installed" line), the permit is never held long enough to make
+    /// the honest writer wait 10 ms, and an honest ~250-byte `openAccount`
+    /// then succeeds.
+    ///
+    /// Before T77 each attempt staged, failed its prepare and reloaded the
+    /// 64 MiB ledger with the permit held — 0.5–2.6 s per attempt in the
+    /// audit's run, an honest open waiting 814 ms behind four of them.
+    ///
+    /// Bug-catch: remove the `refuse_if_local_write_cannot_fit` call from
+    /// `appendTransaction` — four reload lines, and a permit wait of whole
+    /// reloads.
+    #[tokio::test]
+    async fn l71_refused_writes_at_the_cap_reload_nothing_and_never_hold_the_permit() {
+        let (guard, raw, _filtered) = crate::anti_entropy_alpn::tests::capture_logs();
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = near_cap::near_cap_ledger(&dir.path().join("l71.bean"), 1200);
+        {
+            let mut service = ledger.write().await;
+            service
+                .open_account("Assets:Cash".into(), day(1), vec![])
+                .unwrap();
+            service
+                .open_account("Expenses:Food".into(), day(1), vec![])
+                .unwrap();
+        }
+        let headroom = ledger.read().await.append_headroom();
+        let schema = build_schema_with_service(
+            Arc::clone(&ledger),
+            TransactionBroadcast::new(),
+            p2p::node::PeerRegistry::new(),
+            Arc::new(security::signing::NoopSignatureProvider),
+            true,
+            None,
+        );
+
+        let done = Arc::new(AtomicBool::new(false));
+        let honest = tokio::spawn({
+            let ledger = Arc::clone(&ledger);
+            let done = Arc::clone(&done);
+            async move {
+                let mut worst = Duration::ZERO;
+                let mut samples = 0usize;
+                while !done.load(Ordering::SeqCst) {
+                    let started = std::time::Instant::now();
+                    let permit = acquire_write_permit(&ledger).await;
+                    worst = worst.max(started.elapsed());
+                    samples += 1;
+                    drop(permit);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                (worst, samples)
+            }
+        });
+        let mut refusals = Vec::new();
+        let started = std::time::Instant::now();
+        for attempt in 0..4 {
+            let response = schema.execute(lunch_mutation(2000, 2 + attempt)).await;
+            refusals.push((error_codes(&response), format!("{:?}", response.errors)));
+            tokio::task::yield_now().await;
+        }
+        let attacker_took = started.elapsed();
+        done.store(true, Ordering::SeqCst);
+        let (worst_wait, samples) = honest.await.unwrap();
+        let opened = schema
+            .execute(r#"mutation { openAccount(name: "Assets:Honest", date: "2024-01-05") }"#)
+            .await;
+        drop(guard);
+
+        eprintln!(
+            "l71: headroom {headroom} B; 4 refused attempts in {attacker_took:?}; worst permit \
+             wait {worst_wait:?} over {samples} samples"
+        );
+        let reloads = raw.text().matches("reload installed").count();
+        assert_eq!(
+            reloads,
+            0,
+            "a refused write must not reload:\n{}",
+            raw.text()
+        );
+        assert!(
+            worst_wait < Duration::from_millis(10),
+            "an honest writer waited {worst_wait:?} for the permit"
+        );
+        for (codes, errors) in &refusals {
+            assert!(
+                codes
+                    .iter()
+                    .any(|code| code.contains("RESOURCE_LIMIT_EXCEEDED")),
+                "refused at the cap: {errors}"
+            );
+            assert!(errors.contains("refused before staging"), "{errors}");
+        }
+        assert!(opened.errors.is_empty(), "{:?}", opened.errors);
+        let service = ledger.read().await;
+        assert!(service.accounts().is_open("Assets:Honest"));
+        assert_eq!(service.uncommitted_count(), 0);
+    }
+
+    /// T77 / L-71: the pre-stage estimate is the record the stage produces —
+    /// for a transaction naming several heads, an `open`, and a `close`, each
+    /// signed by a real Ed25519 key — so the check never refuses a write that
+    /// would fit, and a write it admits never fails the projection.
+    ///
+    /// Bug-catch: estimate without the signature (or without the parents) and
+    /// the estimate falls short of the staged record.
+    #[test]
+    fn l71_the_pre_stage_estimate_is_the_staged_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("estimate.bean");
+        std::fs::write(&path, "").unwrap();
+        let mut service = LedgerService::boot(&path, "a".repeat(64)).unwrap();
+        let signer =
+            security::signing::PeerKeySignatureProvider::from_bytes(&[7u8; 32], "mesh".to_owned());
+        let sign = |is_transaction: bool| {
+            let signer = &signer;
+            move |id: &str, parents: &str, lamport: &str| {
+                signer.sign(&SignableMessage {
+                    content_id: id,
+                    is_transaction,
+                    parents,
+                    lamport,
+                })
+            }
+        };
+        let record_of = |service: &LedgerService, id: &str| {
+            RecordEstimate::new()
+                .with(RecordEstimate::directive_bytes(
+                    service.get_directive(id).unwrap(),
+                ))
+                .record_bytes()
+        };
+        for account in ["Assets:Cash", "Expenses:Food"] {
+            service
+                .open_account_signing(account.into(), day(1), vec!["USD".into()], sign(false))
+                .unwrap();
+        }
+        // Several heads for the next transaction to name.
+        for index in 0..3 {
+            let mut input = lunch_input(10 + index, 2);
+            input.narration = Some(format!("head {index}"));
+            service.append_transaction(input).unwrap();
+        }
+
+        let input = lunch_input(300, 3);
+        let predicted =
+            local_write_record_bytes(&service, LocalWrite::Transaction(&input), Some(&signer))
+                .expect("predictable");
+        let id = service
+            .append_transaction_staged(input, sign(true))
+            .unwrap()
+            .txid;
+        assert!(
+            service
+                .get_directive(&id)
+                .unwrap()
+                .metadata()
+                .contains_key("openledger-signature"),
+            "the fixture signs"
+        );
+        assert_eq!(predicted, record_of(&service, &id), "transaction");
+        service.persist_or_reload().unwrap();
+
+        let currencies = vec!["USD".to_owned(), "EUR".to_owned()];
+        let predicted = local_write_record_bytes(
+            &service,
+            LocalWrite::Open {
+                account: "Assets:Bank",
+                date: day(4),
+                currencies: &currencies,
+            },
+            Some(&signer),
+        )
+        .expect("predictable");
+        let id = service
+            .open_account_staged("Assets:Bank".into(), day(4), currencies, sign(false))
+            .unwrap();
+        assert_eq!(predicted, record_of(&service, &id), "open");
+        service.persist_or_reload().unwrap();
+
+        let predicted = local_write_record_bytes(
+            &service,
+            LocalWrite::Close {
+                account: "Assets:Bank",
+                date: day(5),
+            },
+            Some(&signer),
+        )
+        .expect("predictable");
+        let id = service
+            .close_account_staged("Assets:Bank".into(), day(5), sign(false))
+            .unwrap();
+        assert_eq!(predicted, record_of(&service, &id), "close");
+    }
+
+    fn lunch_input(narration_len: usize, on: u32) -> ledger::service::TransactionInput {
+        use ledger::model::{Amount, Flag};
+        use ledger::service::PostingInput;
+        let posting = |account: &str, number: i64| PostingInput {
+            account: account.to_owned(),
+            amount: Some(Amount {
+                number: rust_decimal::Decimal::from(number),
+                currency: "USD".to_owned(),
+            }),
+            cost: None,
+            price: None,
+        };
+        ledger::service::TransactionInput {
+            date: day(on),
+            flag: Flag::Complete,
+            payee: None,
+            narration: Some("n".repeat(narration_len)),
+            tags: Vec::new(),
+            links: Vec::new(),
+            postings: vec![posting("Assets:Cash", -5), posting("Expenses:Food", 5)],
+        }
     }
 }

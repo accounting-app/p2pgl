@@ -7,7 +7,10 @@ use super::query::txn_to_graphql;
 use super::scalars::DateScalar;
 use super::types::AppendedTransaction;
 use super::{GossipSender, SharedLedger, HEAVY_RESOLVER_COMPLEXITY};
-use crate::ledger_commit::{acquire_write_permit, commit_pending, prepare_or_recover};
+use crate::ledger_commit::{
+    acquire_write_permit, commit_pending, prepare_or_recover, refuse_if_local_write_cannot_fit,
+    LocalWrite,
+};
 
 use ledger::model::{Amount, CostSpec, Flag, PriceSpec};
 use ledger::service::{PostingInput, ServiceError, TransactionInput};
@@ -93,6 +96,17 @@ impl MutationRoot {
         let permit = acquire_write_permit(ledger).await;
         let mut svc = ledger.write().await;
         let signer = ctx.data::<Arc<dyn SignatureProvider>>().ok().cloned();
+        // T77 / L-71: at the size cap, refuse BEFORE staging — see
+        // `refuse_if_local_write_cannot_fit`.
+        if let Err(error) = refuse_if_local_write_cannot_fit(
+            &svc,
+            LocalWrite::Transaction(&domain_input),
+            signer.as_deref(),
+        ) {
+            drop(svc);
+            drop(permit);
+            return Err(service_error_to_graphql(error));
+        }
         // M-10: the service tells us whether this body was already in the DAG.
         // It is the only party that can — re-checking here would be a
         // get-then-append race — and the answer rides out on `alreadyExisted`.
@@ -203,22 +217,32 @@ impl MutationRoot {
         let permit = acquire_write_permit(ledger).await;
         let mut svc = ledger.write().await;
         let signer = ctx.data::<Arc<dyn SignatureProvider>>().ok().cloned();
+        let currencies = currencies.unwrap_or_default();
+        // T77 / L-71: see `append_transaction`.
+        if let Err(error) = refuse_if_local_write_cannot_fit(
+            &svc,
+            LocalWrite::Open {
+                account: &name,
+                date: date.0,
+                currencies: &currencies,
+            },
+            signer.as_deref(),
+        ) {
+            drop(svc);
+            drop(permit);
+            return Err(service_error_to_graphql(error));
+        }
         let content_id = svc
-            .open_account_staged(
-                name,
-                date.0,
-                currencies.unwrap_or_default(),
-                |id, parents, lamport| {
-                    signer.as_ref().and_then(|provider| {
-                        provider.sign(&SignableMessage {
-                            content_id: id,
-                            is_transaction: false,
-                            parents,
-                            lamport,
-                        })
+            .open_account_staged(name, date.0, currencies, |id, parents, lamport| {
+                signer.as_ref().and_then(|provider| {
+                    provider.sign(&SignableMessage {
+                        content_id: id,
+                        is_transaction: false,
+                        parents,
+                        lamport,
                     })
-                },
-            )
+                })
+            })
             .map_err(service_error_to_graphql)?;
         // M-39: see `append_transaction`.
         let (svc, pending, permit) = prepare_or_recover(ledger, svc, false, permit)
@@ -268,6 +292,19 @@ impl MutationRoot {
         let permit = acquire_write_permit(ledger).await;
         let mut svc = ledger.write().await;
         let signer = ctx.data::<Arc<dyn SignatureProvider>>().ok().cloned();
+        // T77 / L-71: see `append_transaction`.
+        if let Err(error) = refuse_if_local_write_cannot_fit(
+            &svc,
+            LocalWrite::Close {
+                account: &name,
+                date: date.0,
+            },
+            signer.as_deref(),
+        ) {
+            drop(svc);
+            drop(permit);
+            return Err(service_error_to_graphql(error));
+        }
         let content_id = svc
             .close_account_staged(name, date.0, |id, parents, lamport| {
                 signer.as_ref().and_then(|provider| {

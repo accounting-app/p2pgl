@@ -29,6 +29,7 @@ known residuals, see that task's "Done" note in the tracker.
 - `"null"` in `cors.allowedOrigins` is refused at boot, and the guard refuses `Origin: null` whatever the config says (L-52, T55).
 - `p2p.swarmTopic` now follows the `meshId` rules: non-empty, no surrounding whitespace, only ASCII letters, digits and `- _ . : /`, and at most 128 bytes. A topic containing a space or `|` no longer boots (M-31, T57).
 - `allowedHosts` entries with a port, IPv6 brackets or a trailing dot are refused at boot, and the error names the spelling to use. Such entries never matched a request, so every request got `403` (0922-v2 §5, T71).
+- The config file must be a regular file (a symlink to one is followed) of at most 1 MiB. A FIFO, directory, device or dangling link at `GL_NODE_CONFIG` is refused at once instead of hanging boot and `--health-check` (L-73, T77).
 
 **HTTP**
 
@@ -46,7 +47,7 @@ known residuals, see that task's "Done" note in the tracker.
 - A block that starts with U+FEFF in the middle of the file is refused (L-62, T61). The parser refuses trailing tokens it cannot read instead of silently dropping them (M-25, T52).
 - If the `.bean` is missing but a `.journal` exists beside it, boot refuses (H-15, T62).
 - A FIFO, socket, device, directory or dangling symlink at the `.bean` or journal path refuses boot. A symlinked `.bean` is followed to a regular file, and the first compaction replaces the link with a regular file (M-36, T67).
-- The journal, `.lock` and key file must be regular files owned by the node's uid, with a single link. The lock and key must be `0600`, and the journal must not be group- or world-writable. A key file over 4 KiB is refused (M-36, L-58, L-59, T67; L-49, T60).
+- The journal, `.lock` and key file must be regular files owned by the node's uid, with a single link. The lock and key must be `0600`, and the journal appender requires an existing journal to have no group or other permission bits (0600 or stricter). A journal readable but not writable by others still loads at boot with a warning and is compacted away; one writable by others refuses boot. A key file over 4 KiB is refused (M-36, L-58, L-59, T67; L-49, T60).
 - Damage anywhere in the journal except its final record refuses boot, and the error names the byte offset. A record length above the journal budget also refuses boot (M-43, T68).
 - Every amount that is summed into a balance (posting units, cost, price, and the resolved elided leg) must have magnitude at most 10^21 (`MAX_AMOUNT_MAGNITUDE`), at any precision. The limit is inclusive, and trailing zeros no longer count against it. It is enforced identically by the API, the GraphQL scalar, peers, the journal and the file. A directive past it that is already on disk is quarantined at boot. `balance` and `price` directive amounts are not capped. More than 28 fractional digits are still refused instead of rounded (H-17, T65; M-50, T76).
 - A directive a T65–T75 build quarantined for the old 21-significant-digit cap (for example `1.00000000 BTC @ 100000.00000000 USD`, or a `10^21` posting) loads again. It keeps the same content id and envelope, its children's parents resolve, and `verify` no longer reports `MissingParent`. Upgraded peers accept it (M-50, T76).
@@ -70,12 +71,21 @@ known residuals, see that task's "Done" note in the tracker.
 
 **Rust API (`gl-node` modules; it is a binary crate, so this affects forks and in-tree code only)**
 
+- `ConnectionLimiter::should_log_refusal` takes a `RefusalSource` (`Peer(EndpointId, Refusal)` or `NotAllowlisted`), and `Refusal` derives `Hash`. `drain_orphans` no longer takes a `TransactionBroadcast`: it takes a `&mut DrainBudget` and returns `DrainOutcome` (was `DrainRefusals`), whose `announce` the caller publishes after its commit. `ledger::journal::FileTrust` has a new variant, `OperatorConfig` (T77).
+- `ConnectionLimiter::try_acquire` returns `Result<ConnectionGuard, Refusal>` instead of an `Option`, and `pub enum Refusal { Global, PerPeer, AcceptRate }` is new; `Refusal::close_code()` gives the QUIC close code (M-16, M-40, T70).
 - `AntiEntropyHandler` has a new public field, `supply_backoff: SupplyBackoff` (T69), and `AntiEntropyTimeouts` has `supply_backoff: Duration` (T71). Struct literals without `..Default::default()` must add them.
 
 ### Changed
 
 - `verify.errors` has one entry per offending node, capped at the first 1,000. The new `truncated` field counts the rest (L-63, T69).
 - `journal` query complexity now scales with `limit` and the selection: `max(512, (limit/100) × (1 + child))`. Large aliased requests may be refused (M-45, T69). `verify` weighs 2048, and a request may contain at most 2 (M-23, T54).
+- A local write whose journal record cannot fit under the 64 MiB cap is refused before staging with `RESOURCE_LIMIT_EXCEEDED` ("refused before staging, nothing changed"). It no longer stages, reloads and holds every other writer behind the reload (L-71, T77).
+- The Supply size check uses the exact journal record, not a per-entry wire estimate that over-counted ~150–190 B, so the last ~40 KB below the cap are usable. Orphans a batch frees are staged only while they fit; the rest wait, and the peer is backed off with one warning. Any cap-refused prepare or commit also backs the peer off (L-70, T77).
+- GraphQL subscribers hear about a transaction supplied by a peer only after it is durable (L-70, T77).
+- A `Supply` frame whose parsed directives weigh more than 16 MiB is applied in several chunks, one journal record each, so phase 1 never holds more than 16 MiB of them. A pushed `Supply` also charges that weight to the inbound byte budget. The densest frame inside every cap peaked at 12.8× the frame and now peaks at 2.7× (T75 residual, T77).
+- The default log filter is `info,iroh::protocol=error`; an explicit `RUST_LOG` replaces it (L-72, T77).
+- Refused anti-entropy connections are logged once per 10 s per `(peer, reason)`, and not-allowlisted dialers once per 10 s as one class, closed with `Ok` so iroh logs nothing more. Guard refusals are logged once per 10 s per client address. What a window swallowed is reported when it closes, not only by the next refusal (M-40, M-41, L-72, T77).
+- The "failed to persist ALPN supply batch" warning says whether the batch was rolled back or stays staged (T77).
 - A peer batch that would not fit under the 64 MiB ledger cap is deferred without staging. That peer's Supply is then paused for `p2p.antiEntropySupplyBackoffSeconds` (default 60 s), with one warning (M-39, T69).
 - At most `p2p.antiEntropyMaxConcurrentExchanges` outbound exchanges run at once (default 8). Other peers queue in order (R-5, T69).
 - An outbound session is capped at 300 s, 512 advert pages and 64 MiB of advertised ids. A 64-hex id form is required (H-10, M-26, M-27, M-28, T49).
@@ -104,7 +114,13 @@ known residuals, see that task's "Done" note in the tracker.
 - A padded `swarmTopic` or `meshId` boot error shows the length, prefix and whitespace offset, never the value (L-56, T71).
 - A signing node with `p2p.meshId` unset logs a WARN whose remedy is to set it to the current `swarmTopic` verbatim. `meshId` becomes required in a later release (R-9, T71).
 - `GL_NODE_API_KEY` set while `auth.enabled: false` logs a boot warning without the key (0922-v2 §5, T71).
-- GraphiQL assets are pinned to graphiql 4.1.2 instead of the floating `4`. No SRI yet (L-66, T71).
+- The GraphiQL page loads only pinned assets, each with a Subresource Integrity hash (`integrity="sha384-…"`, `crossorigin="anonymous"`): graphiql 4.1.2 (js and css) and React/React-DOM 18.3.1 production builds from `unpkg.com`, replacing the floating `react@18` development builds. The `https://graphql.org/favicon.ico` link, a third origin the page contacted on every load, is removed. A CDN that serves other bytes is refused by the browser (L-66, T71, T78).
+- A journal whose final record is complete but fails its checksum is treated as a torn tail when no intact record starts inside it. This is the ext4 `data=writeback` crash shape: stale block contents, no NUL. The node boots with the torn-record warning and the journal is kept as `<ledger>.journal.torn-<unix-seconds>`. A checksum failure before the last record, or a damaged length that swallows intact later records, still refuses boot (0923 §5, T78).
+- The startup sweep removes only the reserved temporary names `<name>.tmp` and `<name>.tmp.<pid>.<16 hex digits>`. Other `<name>.tmp.*` files, such as `ledger.bean.tmp.backup`, are left alone (0923 §5, T78).
+- A node that boots under a placeholder author and learns its id afterwards (every `gl-node` with P2P on) now resumes its lamport clock above its own quarantined records when the id is set. Operator input adopted at that boot gets the same lamport a restart or recovery reload would give it. Records written by this node and held as unparsable text now count toward the boot clock too (L-67, T78).
+- Boot logs a WARN naming both sizes and the remedy when the ledger's canonical form (what every compaction writes) is larger than the 64 MiB file cap although the file on disk is not; every compaction of such a ledger fails until it is made smaller (L-64, T78).
+- A dangling symlink at the journal path beside a missing `.bean` refuses boot without first creating an empty `.bean` (0923 §5, T78).
+- ALPN: a `Supply` answering a `Want` is filtered to the ids that were asked for. Unsolicited entries are dropped before any parse, with a WARN. Refusals of entries a peer pushed on its own are never recorded against its refusal quota (L-60, T66).
 - `deploy/gl-node.docker.json` sets `"meshId": "openledger/docker-dev"`, its own `swarmTopic`, so the stack's signed history stays valid (R-9, T71).
 - Balances are exact sums, in any arrival order. A figure that does not fit a `Decimal` at its usual scale is rounded once, half to even, instead of at each scale. This is reachable only through amounts at widely different scales, such as `1000` plus `0.0000000000000000000000000001`. Such figures print up to one unit in the last place differently from before (L-79, T76).
 - `balance` assertions and `verify` compare against the exact sum. A claim that matches only the rounded figure now fails (L-79, T76).
@@ -141,6 +157,7 @@ known residuals, see that task's "Done" note in the tracker.
 - **H-13 / H-14 / M-37 / M-38:** the stop → edit → start workflow produces signed records. A failed reconcile no longer overwrites the operator's edit (T61).
 - **H-15 / M-35:** removing the `.bean` under a running node, or crashing mid-compaction, can no longer install an emptier ledger or brick boot (T62).
 - **M-46 / M-49:** a live file replacement plus one failed commit can no longer drop acknowledged records, and a failed recovery reload can no longer leave the next commit appending behind a torn journal tail, which bricked the next boot (T74).
+- **L-70 / L-71 / L-72 / L-73:** near-cap writes and peer batches no longer pay a ledger reload per attempt, a public QUIC bind no longer turns every refused handshake into unthrottled log lines, and the config file no longer hangs boot or loads without bound (T77).
 - **M-48 / L-78:** peer `Supply` entries are held to the §3.12 caps while they are parsed and again right after, before a batch can queue them. A 1 MiB body of 41,941 postings used to peak at 42× its size and be refused only at stage; a 15 MiB frame of them held 546 MB. Both now peak under 0.1× and nothing is queued (T75).
 - **H-16:** an allowlisted peer can no longer inflate the head set until this node's own appends are refused everywhere (T64).
 - **H-19 / H-21 / L-68 / L-69:** replication rules are stated on the content, not on the replica. The per-replica head bound that let one peer's split delivery leave two honest replicas with permanently different committed DAGs is gone; parent choice can no longer be gamed to starve honest heads; the one bound that remains relative to this node's clock (the ratchet) is diagnosed at boot and on adoption instead of partitioning later joiners silently, with the bootstrap join documented and pinned by the convergence harness; and manufactured ratchet refusals cost one fetch per clock step, not one per tick (T72).
@@ -148,4 +165,4 @@ known residuals, see that task's "Done" note in the tracker.
 - **M-50 / L-79:** balances are exact integer sums that no ingress can overflow, a history written before T65 loads whole again and a fresh replica can sync it, and `balance` assertions compare against the exact sum (T76).
 - **H-20 / M-47 / L-74 / L-75 / L-76 / L-77:** boot verifies what it loads. An edited or split node-written record, a half envelope, a dangling hand-typed parent or a re-open can no longer be served under a signature no peer accepts and become the parent of everything the node authors afterwards (T73).
 - **M-36 / M-43 / M-44:** ledger-side opens enforce file-type discipline, and journal policy fails closed (T67, T68).
-- **Known residuals** remain listed in the trackers. They include the IPv6 /48 reach of the per-IP cap (L-61) and GraphiQL's CDN assets without SRI (L-66).
+- **Known residuals** remain listed in the trackers. They include the IPv6 /48 reach of the per-IP cap (L-61).

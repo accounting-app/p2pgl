@@ -48,6 +48,21 @@ use tracing::{debug, error, info, warn};
 /// `into_data_stream()`, so the cap never binds and bodies buffer unbounded.
 const GRAPHQL_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
+/// The log filter a node runs under when `RUST_LOG` is unset (T77 / L-72).
+///
+/// `info` for this node's own lines, and `error` for iroh's protocol router:
+/// that module logs one `WARN` per failed inbound handshake — an unknown ALPN
+/// dies in the TLS handshake (`accepting failed`), and a handler returning
+/// `Err` is logged again (`ended with error`) — so on a public QUIC bind any
+/// dialer could drive ~290–730 B of log per handshake, unthrottled (the audit
+/// measured ≈ 83 KB/s from eight loopback dialers at 0.8 % CPU). This node's
+/// own handler never returns `Err` for a refusal and throttles its own refusal
+/// lines per source; the router's lines carry nothing an operator can act on
+/// that this node does not already log. An explicit `RUST_LOG` replaces this
+/// whole string, so an operator who sets one on a public bind should keep
+/// `iroh::protocol=error` in it (README, "Log volume on a public bind").
+const DEFAULT_LOG_FILTER: &str = "info,iroh::protocol=error";
+
 enum CliAction {
     Serve,
     Version,
@@ -156,7 +171,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER)),
         )
         .init();
 

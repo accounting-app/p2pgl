@@ -14,6 +14,14 @@
 //! `|amount| ≤ 10^21` ([`crate::limits::MAX_AMOUNT_MAGNITUDE`]) every total
 //! fits at scale 0, so only mixed-scale dust (`1000 + 10^-28` needs 32
 //! digits) is ever rounded.
+//!
+//! The bound, stated (T78, L-79): an inexact figure is within **half a unit
+//! in its last printed place** of the exact sum (one rounding, never two), and
+//! is the same figure on every path, every replica and every arrival order.
+//! What it is not is the exact value: `1000 + 10^-28` prints
+//! `1000.0000000000000000000000000` (the dust is below the last place kept),
+//! and a `balance` assertion of `1000` on that account **fails**, because it
+//! is compared with the exact sum, not with the printed figure.
 
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
