@@ -184,6 +184,12 @@ pub struct VerifyResult {
     pub truncated: i32,
     /// Balance assertions evaluated during this verification (§3.6, M-08).
     pub balance_assertions: BalanceAssertionReport,
+    /// Content ids of the records this node holds in its quarantine — in the
+    /// file, NOT in the DAG, NOT in any balance and NOT served (T81 / M-51,
+    /// M-52). Sorted. The boot log names why each is there.
+    pub quarantined: Vec<String>,
+    /// Blocks held as unparsable text, which have no content id (L-45).
+    pub unparsable_blocks: i32,
 }
 
 /// Node health status (matches REST `/health` per §2.9).

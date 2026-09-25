@@ -496,16 +496,17 @@ fn balance_and_price_amounts_above_the_cap_cross_the_wire_signed() {
     let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
 }
 
-/// A5 (0924): the M-50 fixture and the T75 caps together. A pre-T65 amount
-/// (`10^21`, 22 digits) crosses the wire; a pre-T75 `open` with one currency
-/// past `MAX_CURRENCIES_PER_OPEN`, and a transaction with one posting past
-/// `MAX_POSTINGS_PER_TRANSACTION`, do not — refused as
-/// `ResourceLimitExceeded`, permanent — although an upgraded node boots
-/// both as history and serves them. On a fresh replica the `open` is refused
-/// and every later posting to that account is `ACCOUNT_NOT_OPEN`: the R-10 /
-/// T51 residual class, which is M-50's consequence under another cap.
+/// A5 (0924), updated by T81 (M-51, decision (6)): the M-50 fixture and the
+/// T75 caps together. A pre-T65 amount (`10^21`, 22 digits) crosses the wire;
+/// so, since T81, does a pre-T75 `open` with one currency past
+/// `MAX_CURRENCIES_PER_OPEN` — the wire holds history to the legacy ceiling —
+/// and a fresh replica takes the account and the posting on it (at `3d64a16`
+/// it refused the `open` and every posting was `ACCOUNT_NOT_OPEN`, the M-50
+/// shape under another cap). One currency past the legacy ceiling, and one
+/// posting past `MAX_POSTINGS_PER_TRANSACTION` (not a T75 cap), are still
+/// refused, permanently.
 #[test]
-fn a_pre_t65_amount_crosses_the_wire_but_an_over_t75_cap_directive_never_does() {
+fn a_pre_t65_amount_and_pre_t75_history_cross_the_wire_up_to_the_legacy_ceilings() {
     let key = key();
     let ten_pow_21 =
         Decimal::from_i128_with_scale(i128::try_from(MAX_AMOUNT_MAGNITUDE).expect("fits"), 0);
@@ -520,14 +521,27 @@ fn a_pre_t65_amount_crosses_the_wire_but_an_over_t75_cap_directive_never_does() 
     .expect("the pre-T65 amount is inside the magnitude cap");
 
     let wide_open = signed_open(&key, "Assets:Many", MAX_CURRENCIES_PER_OPEN + 1, 2);
-    let error = through_the_wire(&wide_open).expect_err("65 currencies");
+    through_the_wire(&wide_open)
+        .expect("65 currencies is pre-T75 history, inside the legacy ceiling");
+    through_the_wire(&signed_open(
+        &key,
+        "Assets:Legacy",
+        ledger::limits::MAX_CURRENCIES_PER_OPEN_LEGACY,
+        2,
+    ))
+    .expect("the legacy ceiling is inclusive");
+    let error = through_the_wire(&signed_open(
+        &key,
+        "Assets:Flood",
+        ledger::limits::MAX_CURRENCIES_PER_OPEN_LEGACY + 1,
+        2,
+    ))
+    .expect_err("one past the legacy ceiling");
     assert!(
         matches!(error, MergeError::ResourceLimitExceeded(_)),
         "{error:?}"
     );
     assert!(intake_refusal_is_permanent(&error));
-    through_the_wire(&signed_open(&key, "Assets:Few", MAX_CURRENCIES_PER_OPEN, 2))
-        .expect("64 currencies is the cap, inclusive");
 
     let wide_transfer = signed_wide_transfer(&key, MAX_POSTINGS_PER_TRANSACTION + 1, 3);
     let error = through_the_wire(&wide_transfer).expect_err("1001 postings");
@@ -586,7 +600,7 @@ fn a_pre_t65_amount_crosses_the_wire_but_an_over_t75_cap_directive_never_does() 
     assert!(upgraded.contains_directive(&compute_content_id(&wide_open)));
     assert!(upgraded.contains_directive(&compute_content_id(&on_many)));
 
-    // … and a fresh replica can never take the account or anything on it.
+    // … and, since T81, a fresh replica takes the account and the posting.
     let fresh_path = scratch_ledger("t75-fresh");
     let mut fresh = LedgerService::boot(&fresh_path, "fresh".to_owned()).expect("boot fresh");
     let mut codes = Vec::new();
@@ -602,7 +616,7 @@ fn a_pre_t65_amount_crosses_the_wire_but_an_over_t75_cap_directive_never_does() 
             }
         });
     }
-    assert_eq!(codes, vec!["OK", "WIRE_REFUSED", "ACCOUNT_NOT_OPEN"]);
+    assert_eq!(codes, vec!["OK", "OK", "OK"]);
     drop(upgraded);
     drop(fresh);
     let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
@@ -652,4 +666,119 @@ fn an_over_cap_parent_a_pre_t65_node_serves_strands_its_child_on_every_fresh_rep
     assert!(!fresh.contains_directive(&compute_content_id(&c)));
     drop(fresh);
     let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+}
+
+/// A hand-typed transaction with `keys` directive metadata keys, as an
+/// operator would append it to the `.bean` (M-55).
+fn hand_transaction_with_keys(keys: usize) -> String {
+    let mut block = format!("\n2024-01-20 * \"Hand\" \"keys {keys}\"\n");
+    for index in 0..keys {
+        block.push_str(&format!("  k{index:03}: \"v\"\n"));
+    }
+    block.push_str("  Assets:Cash                                         5 USD\n");
+    block.push_str("  Equity:Opening                                     -5 USD\n");
+    block
+}
+
+/// M-55 (0924 A4-1), closed by T81 (decision (10)): the metadata-key cap
+/// counts the whole map, envelope included, and a peer counts the map it
+/// receives — body keys plus author, lamport, parents and signature. The
+/// file path used to count before the signature was added, so a hand
+/// transaction with 97 body keys was adopted and signed here and refused by
+/// every peer (101 keys), with every later write of this node naming it as a
+/// parent. Now the file path counts the envelope the stored record will
+/// carry: 96 body keys are adopted, signed with a real key, cross the wire
+/// and stage on a second node; 97 are refused here, before anything is
+/// stamped or served.
+#[test]
+fn a_hand_transaction_adopted_with_a_signer_is_one_every_peer_accepts() {
+    let key = std::sync::Arc::new(key());
+    let signing = std::sync::Arc::clone(&key);
+    let path = scratch_ledger("m55");
+    let mut node = LedgerService::boot(&path, key.public_key_hex()).expect("boot");
+    node.set_signer(std::sync::Arc::new(
+        move |content_id: &str, is_transaction: bool, parents: &str, lamport: &str| {
+            signing.sign(&SignableMessage {
+                content_id,
+                is_transaction,
+                parents,
+                lamport,
+            })
+        },
+    ));
+    let sign_open = |key: std::sync::Arc<PeerKeySignatureProvider>| {
+        move |content_id: &str, parents: &str, lamport: &str| {
+            key.sign(&SignableMessage {
+                content_id,
+                is_transaction: false,
+                parents,
+                lamport,
+            })
+        }
+    };
+    for (account, currencies) in [
+        ("Assets:Cash", vec!["USD".to_owned()]),
+        ("Equity:Opening", vec![]),
+    ] {
+        node.open_account_signing(
+            account.to_owned(),
+            date(1),
+            currencies,
+            sign_open(std::sync::Arc::clone(&key)),
+        )
+        .expect("open");
+    }
+
+    let append = |text: &str| {
+        let mut content = std::fs::read_to_string(&path).expect("read");
+        content.push_str(text);
+        std::fs::write(&path, content).expect("write");
+    };
+    append(&hand_transaction_with_keys(97));
+    let result = node.reconcile_file().expect("reconcile");
+    assert_eq!(
+        result.new_directives, 0,
+        "97 body keys + 4 envelope keys is over the cap"
+    );
+    assert_eq!(result.rejected, 1);
+
+    append(&hand_transaction_with_keys(96));
+    let result = node.reconcile_file().expect("reconcile");
+    assert_eq!(result.new_directives, 1, "96 + 4 is the cap, inclusive");
+    let hand = node
+        .dag()
+        .directives()
+        .into_iter()
+        .find(|directive| {
+            matches!(directive, Directive::Transaction(txn)
+                if txn.narration.as_deref() == Some("keys 96"))
+        })
+        .expect("adopted")
+        .clone();
+    assert_eq!(
+        hand.metadata().len(),
+        100,
+        "96 body keys and the full envelope"
+    );
+
+    let fresh_path = scratch_ledger("m55-fresh");
+    let mut fresh = LedgerService::boot(&fresh_path, "fresh".to_owned()).expect("boot fresh");
+    let mut served: Vec<Directive> = node
+        .dag()
+        .directives()
+        .into_iter()
+        .filter(|directive| matches!(directive, Directive::Open(_)))
+        .cloned()
+        .collect();
+    served.push(hand);
+    for directive in &served {
+        let admitted = through_the_wire(directive).expect("every peer accepts what was served");
+        fresh
+            .stage_remote_directive(admitted)
+            .expect("and stages it");
+    }
+    drop(node);
+    drop(fresh);
+    let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    let _ = std::fs::remove_dir_all(fresh_path.parent().expect("dir"));
 }

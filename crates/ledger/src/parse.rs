@@ -36,6 +36,8 @@ struct Scanner<'line> {
     /// The part of the line not yet in `chars`.
     rest: std::str::Chars<'line>,
     position: usize,
+    /// [`ParseLimits::amount_cap`] for the line this scanner reads.
+    amount_cap: bool,
 }
 
 impl<'line> Scanner<'line> {
@@ -44,6 +46,7 @@ impl<'line> Scanner<'line> {
             chars: Vec::new(),
             rest: line.chars(),
             position: 0,
+            amount_cap: true,
         }
     }
 
@@ -286,8 +289,10 @@ impl<'line> Scanner<'line> {
     /// its magnitude, so trailing zeros are never counted against it.
     fn read_summed_amount(&mut self, label: &'static str) -> Result<Amount, String> {
         let amount = self.read_amount()?;
-        crate::validate::check_amount_cap(label, amount.number)
-            .map_err(|error| error.to_string())?;
+        if self.amount_cap {
+            crate::validate::check_amount_cap(label, amount.number)
+                .map_err(|error| error.to_string())?;
+        }
         Ok(amount)
     }
 
@@ -671,6 +676,10 @@ pub struct ParseLimits {
     pub max_posting_metadata_keys: usize,
     /// Currencies in one `open` directive's constraint list.
     pub max_currencies: usize,
+    /// Whether a summed amount past [`crate::limits::MAX_AMOUNT_MAGNITUDE`]
+    /// is refused while it is read (T76). On for every ingress; off only in
+    /// [`ParseLimits::IDENTIFY`] (T81).
+    pub amount_cap: bool,
 }
 
 impl ParseLimits {
@@ -682,6 +691,31 @@ impl ParseLimits {
         max_metadata_keys: usize::MAX,
         max_posting_metadata_keys: usize::MAX,
         max_currencies: usize::MAX,
+        amount_cap: true,
+    };
+
+    /// No caps at all, the amount cap included — used by exactly one caller,
+    /// boot, to learn the content id of a block it has ALREADY refused for an
+    /// amount past the cap (T81 / M-52). Such a block is held as text, and
+    /// without its id the records that name it as a parent cannot be found:
+    /// they would load with a dangling parent, be served, and be refused by
+    /// every peer forever. Never used to admit anything.
+    pub const IDENTIFY: ParseLimits = ParseLimits {
+        amount_cap: false,
+        ..ParseLimits::UNLIMITED
+    };
+
+    /// What the WIRE parser admits (T81 / M-51, decision (6)): the §3.12
+    /// limits, except the two T75 introduced — currencies per `open` and
+    /// posting metadata keys per transaction — which take their legacy
+    /// ceilings, so history written before T75 crosses the wire.
+    /// `validate_supply_entry` uses this; see
+    /// [`crate::service::ResourceRule::History`] for the matching check on
+    /// the parsed directive.
+    pub const WIRE: ParseLimits = ParseLimits {
+        max_posting_metadata_keys: crate::limits::MAX_POSTING_METADATA_KEYS_PER_TRANSACTION_LEGACY,
+        max_currencies: crate::limits::MAX_CURRENCIES_PER_OPEN_LEGACY,
+        ..ParseLimits::RESOURCE
     };
 
     /// The §3.12 resource limits, each the constant
@@ -694,6 +728,7 @@ impl ParseLimits {
         max_metadata_keys: crate::service::MAX_METADATA_KEYS_PER_DIRECTIVE,
         max_posting_metadata_keys: crate::limits::MAX_POSTING_METADATA_KEYS_PER_TRANSACTION,
         max_currencies: crate::limits::MAX_CURRENCIES_PER_OPEN,
+        amount_cap: true,
     };
 
     /// The most non-blank, non-comment body lines one block can have and still
@@ -1640,7 +1675,7 @@ fn parse_transaction_body(
                 postings.push(posting);
             }
             // Parse new posting line.
-            let posting = parse_posting_line(trimmed, line_number)?;
+            let posting = parse_posting_line(trimmed, line_number, gate.limits.amount_cap)?;
             current_posting = Some(posting);
         }
     }
@@ -1757,8 +1792,13 @@ fn parse_metadata_line(trimmed: &str, line_number: usize) -> Result<(String, Str
 }
 
 /// Parse a single posting line (already trimmed).
-fn parse_posting_line(trimmed: &str, line_number: usize) -> Result<Posting, ParseError> {
+fn parse_posting_line(
+    trimmed: &str,
+    line_number: usize,
+    amount_cap: bool,
+) -> Result<Posting, ParseError> {
     let mut scanner = Scanner::new(trimmed);
+    scanner.amount_cap = amount_cap;
 
     // Read account name.
     let account = scanner.read_account().map_err(|message| {

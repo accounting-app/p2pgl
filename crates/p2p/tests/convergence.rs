@@ -2464,17 +2464,15 @@ fn h19_bootstrap_join_with_the_wrong_mesh_id_quarantines_everything_at_boot() {
 
 // ─── A1 / T75 residual: pre-cap history in one replica's file ───────────────
 
-/// A's file (pre-T75 history) holds an `open` with `MAX_CURRENCIES_PER_OPEN + 1`
-/// currencies; A boots on it (the file path applies no cardinality cap) and
-/// posts to that account. A fresh F joining by anti-entropy refuses the `open`
-/// at intake (`ResourceLimitExceeded`, cached for good) and buffers every
-/// transaction on that account awaiting it, forever. Same available set, two
-/// permanently different committed DAGs and balances — the M-50 shape restated
-/// for the T75 caps ("existing history over these caps still loads at boot
-/// and is served, but upgraded peers refuse it"). Fails at HEAD: F holds 2 of
-/// 4 with the posting orphaned on the account.
+/// M-51 (0924 A1-2), closed by T81: A's file (pre-T75 history) holds an `open`
+/// with `MAX_CURRENCIES_PER_OPEN + 1` currencies; A boots on it and posts to
+/// that account. Before T81 a fresh F joining by anti-entropy refused the
+/// `open` at intake (`ResourceLimitExceeded`, cached for good) and buffered
+/// every transaction on that account forever — the M-50 shape for the T75
+/// caps (failed at `3d64a16` with F holding 2 of 4). The wire, staging and
+/// boot now hold history to the legacy ceilings (decision (6)), so the join
+/// converges.
 #[test]
-#[ignore = "A1-2: a pre-T75 over-cap record loaded from the file is served but refused by every upgraded peer, so an anti-entropy join never converges on that account"]
 fn t75_over_cap_open_loaded_from_a_file_partitions_anti_entropy_joiners() {
     let mut mesh = Mesh::new(9245);
     let peer = key(1);

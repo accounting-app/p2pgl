@@ -291,6 +291,12 @@ impl QueryRoot {
                 errors: report.errors.iter().map(|e| e.to_string()).collect(),
                 truncated: i32::try_from(report.truncated).unwrap_or(i32::MAX),
                 balance_assertions: assertion_report(&report.assertions),
+                quarantined: svc
+                    .quarantined_ids()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                unparsable_blocks: i32::try_from(svc.unparsable_block_count()).unwrap_or(i32::MAX),
             }
         } else {
             VerifyResult {
@@ -299,6 +305,8 @@ impl QueryRoot {
                 errors: Vec::new(),
                 truncated: 0,
                 balance_assertions: assertion_report(&Default::default()),
+                quarantined: Vec::new(),
+                unparsable_blocks: 0,
             }
         }
     }

@@ -495,6 +495,19 @@ impl LedgerDag {
         self.nodes.get(content_id).map(|n| n.children.as_slice())
     }
 
+    /// The transactions in the G-Set that name `missing` as a parent while it
+    /// is absent — inserted leniently, waiting on it (T81 / M-51, M-52).
+    ///
+    /// Empty once `missing` is inserted (its children then hang off it and
+    /// [`Self::children_of`] answers). Boot uses this to find what descends
+    /// from a record it refused.
+    pub fn children_awaiting(&self, missing: &str) -> &[String] {
+        self.pending_children
+            .get(missing)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     /// Every content ID in the G-Set, in no particular order, without
     /// allocating — for membership sweeps such as the L-13 rebuild check
     /// (M-46), where [`Self::content_ids`]' insertion order is not needed.

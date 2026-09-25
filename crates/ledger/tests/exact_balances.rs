@@ -2311,20 +2311,19 @@ fn a_negative_zero_is_a_library_artifact_no_ingress_returns() {
 
 // ─── A5-1: the over-cap remainder of M-50 ────────────────────────────────────
 
-/// A5-1 (0924, EXECUTED at HEAD): M-50's shape is closed only up to `10^21`.
-/// A pre-T65 history holding an amount PAST the new cap — a base-unit token
-/// ledger's `50000000000000000000000 WEI` (50,000 ETH), or the `±Decimal::MAX`
-/// H-17's peer could plant before T65 — is quarantined as text at boot with
-/// exactly M-50's consequences: its children load with a dangling parent,
-/// balances silently exclude it, `verify` reports `MissingParent` forever,
-/// and a fresh replica refuses the parent for good (`INVALID_POSTING`,
-/// permanent-class) and gets `MISSING_PARENT` on every descendant. The 0923
-/// regression requirement — "keep the descendants' parents resolvable, or
-/// refuse loudly" — is what this asserts; boot only warns with L-45's
-/// Unicode-account wording. Fails at HEAD; enable when the remainder has a
-/// remedy (quarantine the descendant closure, or refuse boot naming the id).
+/// M-52 (0924 A5-1), closed by T81: M-50's shape was closed only up to
+/// `10^21`. A pre-T65 history holding an amount PAST the cap — a base-unit
+/// token ledger's `50000000000000000000000 WEI` (50,000 ETH), or the
+/// `±Decimal::MAX` H-17's peer could plant before T65 — was quarantined as
+/// text at boot with exactly M-50's consequences: children loaded with a
+/// dangling parent, `verify` reported `MissingParent` forever, and a fresh
+/// replica refused the parent for good and got `MISSING_PARENT` on every
+/// descendant (failed at `3d64a16`). The 0923 requirement — "keep the
+/// descendants' parents resolvable, or refuse loudly" — is what this asserts;
+/// since T81 (decision (6)) boot names the block's id and quarantines its
+/// descendant closure, loudly, so what the node serves is what a fresh
+/// replica can hold.
 #[test]
-#[ignore = "A5-1: a pre-T65 amount past 10^21 still gets M-50's dangling children and unsyncable fresh replica"]
 fn over_cap_history_keeps_its_descendants_parents_resolvable_or_refuses_loudly() {
     let wei = "WEI";
     let x_amount = Decimal::from_str_exact("50000000000000000000000").expect("5 × 10^22");

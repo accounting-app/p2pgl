@@ -44,6 +44,37 @@ pub const MAX_CURRENCIES_PER_OPEN: usize = 64;
 /// (at reconcile) and peers.
 pub const MAX_POSTING_METADATA_KEYS_PER_TRANSACTION: usize = MAX_METADATA_KEYS_PER_DIRECTIVE;
 
+/// The ceiling on currencies per `open` for HISTORY — what the wire, peer
+/// staging and boot admit — where [`MAX_CURRENCIES_PER_OPEN`] (64) binds only
+/// what this node authors (T81 / M-51, decision (6) of 2026-09-24).
+///
+/// # Why two numbers
+///
+/// T75 introduced the 64 cap with no upgrade path. Every build before it
+/// accepted an `open` of any length from the local API, so a history can
+/// hold a 65-currency `open` written honestly. Refused on the wire, such a
+/// record partitioned every replica that lacked it from everything authored
+/// after it (the M-50 shape): transactions on the account waited forever for
+/// an `open` that never arrived. The amount cap got its upgrade path in T76;
+/// this is the same for the T75 caps.
+///
+/// # Why 4,096
+///
+/// Far above any honest constraint list — a brokerage account lists the few
+/// securities it trades, and 64 is already several times the longest one —
+/// and far below the floods M-48 measured (262,137 currencies in one 786 KB
+/// `open`, 17× its body when parsed). 4,096 three-letter codes are ~16 KB of
+/// body, well inside every per-entry budget, so admitting them costs nothing
+/// the frame caps do not already bound.
+pub const MAX_CURRENCIES_PER_OPEN_LEGACY: usize = 4_096;
+
+/// The ceiling on posting metadata keys per transaction for HISTORY, where
+/// [`MAX_POSTING_METADATA_KEYS_PER_TRANSACTION`] (100) binds only what this
+/// node authors (T81 / M-51, decision (6)). Same argument as
+/// [`MAX_CURRENCIES_PER_OPEN_LEGACY`]: nothing counted posting metadata before
+/// T75, so honest history can exceed 100, and the M-48 flood was 74,896 keys.
+pub const MAX_POSTING_METADATA_KEYS_PER_TRANSACTION_LEGACY: usize = 4_096;
+
 /// The largest magnitude any summed amount may carry: `|amount| ≤ 10^21`, at
 /// any precision (T76, M-50; replaces H-17's 21-significant-digit cap).
 ///

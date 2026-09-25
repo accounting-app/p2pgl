@@ -55,7 +55,7 @@ The playground is **off** by default. Turn it on with `"graphiql": true` and vis
 
 ### Upgrading
 
-Read [`CHANGELOG.md`](CHANGELOG.md) before upgrading, starting with *Breaking*. Config files are parsed strictly, so an **older binary refuses a config that uses a key added in a newer one**: upgrade the binary before editing the config, and remove new keys before rolling back. A newer node may also refuse history an older one accepted (the cardinality and amount caps); the CHANGELOG lists each case and its remedy.
+Read [`CHANGELOG.md`](CHANGELOG.md) before upgrading, starting with *Breaking*. Config files are parsed strictly, so an **older binary refuses a config that uses a key added in a newer one**: upgrade the binary before editing the config, and remove new keys before rolling back. A newer node holds what it **writes** to tighter limits than what it **takes as history**, so that history an older build wrote keeps replicating: an `open` may list up to 64 currencies and a transaction's postings up to 100 metadata keys when this node authors them, but a peer's record or an existing file is held only to 4,096 of each. One case still cannot replicate: an amount past 10^21 in a history written before T65 (a ledger kept in base units, such as wei). Boot keeps that record in the file, names it, and quarantines it together with every record that depends on it, so the node serves only what a fresh replica can hold; `verify` lists what is quarantined. Restate such amounts in a larger unit, or join nodes by bootstrap (§Mesh identity). The CHANGELOG lists each case.
 
 ---
 
@@ -244,6 +244,8 @@ Any amount that is added into a balance (posting units, `{cost}`, `@`/`@@` price
 elided amount) must have magnitude at most **10^21** (`1000000000000000000000`). The limit includes 10^21
 itself and allows any precision up to 28 fractional digits, and trailing zeros are free. The API, peers
 and the `.bean` file all apply the same rule. `balance` and `price` directive amounts are not limited.
+A history record past the limit (written before T65) is held in the file and quarantined at boot with
+everything that descends from it — see Upgrading above.
 
 Every balance is kept as its exact sum. A reported figure is that exact sum whenever it fits a
 `Decimal`'s 96-bit mantissa at the scale its amounts are written in. If it does not fit, which only

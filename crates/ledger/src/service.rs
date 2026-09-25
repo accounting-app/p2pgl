@@ -679,6 +679,26 @@ fn salvage_unparsable_blocks(content: &str) -> (Vec<Directive>, Vec<UnparsableBl
 /// ([`salvage_unparsable_blocks`] and
 /// [`LedgerService::parse_around_quarantined_text`]) go through this one
 /// function so they cannot disagree with each other either.
+/// The content ids of a block boot refused as text, when the ONLY thing
+/// wrong with it is an amount past the cap (T81 / M-52).
+///
+/// The capped parse refused it; a parse with every cap lifted
+/// ([`crate::parse::ParseLimits::IDENTIFY`]) accepting it is the proof that
+/// the amount cap was the reason. `None` for any other unparsable block
+/// (a Unicode account name, a split record). Nothing it returns is admitted:
+/// the ids only let boot find the records that name the block as a parent.
+fn amount_cap_refused_block_ids(text: &str) -> Option<Vec<String>> {
+    if text.starts_with(crate::parse::BYTE_ORDER_MARK) {
+        return None;
+    }
+    let directives =
+        crate::parse::parse_file_bounded(text, 0, crate::parse::ParseLimits::IDENTIFY).ok()?;
+    if directives.is_empty() {
+        return None;
+    }
+    Some(directives.iter().map(compute_content_id).collect())
+}
+
 fn parse_block(text: &str) -> Result<Vec<Directive>, Vec<ParseError>> {
     if text.starts_with(crate::parse::BYTE_ORDER_MARK) {
         return Err(vec![ParseError {
@@ -776,8 +796,73 @@ fn directives_blocked_by_parent_cycles(directives: &[&Directive]) -> BTreeSet<St
         .collect()
 }
 
-/// §3.12 limits for any write path (local, remote, reconcile).
+/// Which §3.12 rule set a directive is held to (T81 / M-51, decision (6)).
+///
+/// Every cap is the same for both except the two T75 introduced — currencies
+/// per `open` and posting metadata keys per transaction. What this node
+/// AUTHORS keeps T75's caps (64, 100); what it takes as HISTORY — a peer's
+/// directive on the wire and at staging, an enveloped record at boot or
+/// pasted into the file — is held to the legacy ceilings
+/// ([`crate::limits::MAX_CURRENCIES_PER_OPEN_LEGACY`],
+/// [`crate::limits::MAX_POSTING_METADATA_KEYS_PER_TRANSACTION_LEGACY`]), so
+/// history written before T75 replicates instead of partitioning every
+/// replica that lacks it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceRule {
+    /// What this node writes: the local API and operator input.
+    Authoring,
+    /// What this node takes from elsewhere: peers, and enveloped history.
+    History,
+}
+
+/// §3.12 limits for what this node authors — [`ResourceRule::Authoring`].
 pub fn enforce_resource_limits(directive: &Directive) -> Result<(), ServiceError> {
+    enforce_resource_limits_for(directive, ResourceRule::Authoring)
+}
+
+/// §3.12 limits for operator input, counted as the record will be STORED
+/// (T81 / M-55, decision (10)).
+///
+/// The metadata-key cap counts the whole map, envelope included, on every
+/// path, and a peer counts the map it receives: body keys plus the full
+/// envelope (author, lamport, signature, and parents for a transaction). The
+/// file path used to count before the signature was added — 97 body keys on a
+/// transaction passed here and arrived at every peer as 101, refused for
+/// good, with every later write of this node naming it as a parent. Counting
+/// the envelope the stored record will carry closes that gap without changing
+/// the wire rule.
+pub fn enforce_resource_limits_as_stored(directive: &Directive) -> Result<(), ServiceError> {
+    let mut stored = directive.clone();
+    let is_transaction = matches!(stored, Directive::Transaction(_));
+    let metadata = directive_metadata_mut(&mut stored);
+    for key in [
+        ENVELOPE_KEY_AUTHOR,
+        ENVELOPE_KEY_LAMPORT,
+        ENVELOPE_KEY_SIGNATURE,
+    ] {
+        metadata.entry(key.to_owned()).or_default();
+    }
+    if is_transaction {
+        metadata.entry(ENVELOPE_KEY_PARENTS.to_owned()).or_default();
+    }
+    enforce_resource_limits_for(&stored, ResourceRule::Authoring)
+}
+
+/// §3.12 limits under `rule` — see [`ResourceRule`].
+pub fn enforce_resource_limits_for(
+    directive: &Directive,
+    rule: ResourceRule,
+) -> Result<(), ServiceError> {
+    let (max_currencies, max_posting_metadata_keys) = match rule {
+        ResourceRule::Authoring => (
+            MAX_CURRENCIES_PER_OPEN,
+            MAX_POSTING_METADATA_KEYS_PER_TRANSACTION,
+        ),
+        ResourceRule::History => (
+            crate::limits::MAX_CURRENCIES_PER_OPEN_LEGACY,
+            crate::limits::MAX_POSTING_METADATA_KEYS_PER_TRANSACTION_LEGACY,
+        ),
+    };
     if directive.metadata().len() > MAX_METADATA_KEYS_PER_DIRECTIVE {
         return Err(ServiceError::ResourceLimitExceeded {
             message: format!(
@@ -793,12 +878,11 @@ pub fn enforce_resource_limits(directive: &Directive) -> Result<(), ServiceError
     // The wire's parser refuses the same count while it reads
     // (`ParseLimits::RESOURCE`); this is the rule for every write path.
     if let Directive::Open(open) = directive {
-        if open.currencies.len() > MAX_CURRENCIES_PER_OPEN {
+        if open.currencies.len() > max_currencies {
             return Err(ServiceError::ResourceLimitExceeded {
                 message: format!(
-                    "Too many currencies in one open: {} (max {})",
+                    "Too many currencies in one open: {} (max {max_currencies})",
                     open.currencies.len(),
-                    MAX_CURRENCIES_PER_OPEN
                 ),
             });
         }
@@ -871,11 +955,11 @@ pub fn enforce_resource_limits(directive: &Directive) -> Result<(), ServiceError
         .iter()
         .map(|posting| posting.metadata.len())
         .sum();
-    if posting_metadata_keys > MAX_POSTING_METADATA_KEYS_PER_TRANSACTION {
+    if posting_metadata_keys > max_posting_metadata_keys {
         return Err(ServiceError::ResourceLimitExceeded {
             message: format!(
                 "Too many posting metadata keys in one transaction: {posting_metadata_keys} \
-                 (max {MAX_POSTING_METADATA_KEYS_PER_TRANSACTION})"
+                 (max {max_posting_metadata_keys})"
             ),
         });
     }
@@ -2804,6 +2888,13 @@ pub struct LedgerService {
     /// and a caller that reports only the last one's return misses what the
     /// earlier ones quarantined.
     signature_quarantined_total: usize,
+    /// History boot refused under a content rule every peer holds it to,
+    /// and everything that descends from it (T81 / M-51, M-52) — see
+    /// [`Self::quarantine_descendants_of_refused_history`]. Kept so the live
+    /// reconcile, which re-reads the whole file after any hand edit, refuses
+    /// a descendant again instead of re-adopting it: it is a valid record
+    /// whose only fault is its parent. Re-derived by every boot and reload.
+    refused_history_closure: BTreeSet<String>,
     /// Content ids of the directives [`Self::boot`] adopted as **operator
     /// input** whose envelope is not final yet (H-13).
     ///
@@ -3220,6 +3311,9 @@ impl LedgerService {
         // Their raw text goes into `quarantined_text` and is spliced back by
         // every rewrite ([`Self::compaction_text`]).
         let mut unparsable: Vec<UnparsableBlock> = Vec::new();
+        // T81 / M-52: content ids of text-held blocks refused only for an
+        // amount past the cap — see `amount_cap_refused_block_ids`.
+        let mut amount_cap_refused: BTreeSet<String> = BTreeSet::new();
         // H-20 door (b): set when the per-block salvage produced the
         // directives, which is the one path that can yield a fragment of a
         // record — the I1 arm below runs only then.
@@ -3243,6 +3337,28 @@ impl LedgerService {
                         return Err(ServiceError::Parse(errors));
                     }
                     for block in &refused {
+                        // T81 / M-52: a block refused only for an amount past
+                        // the cap parses once the cap is lifted. Held as text
+                        // all the same (nothing is admitted); what the lifted
+                        // parse buys is its content id, so the records that
+                        // name it as a parent can be found below.
+                        if let Some(ids) = amount_cap_refused_block_ids(&block.text) {
+                            warn!(
+                                line = block.line,
+                                ids = %ids.join(", "),
+                                max = %crate::limits::MAX_AMOUNT_MAGNITUDE,
+                                file = %file_path.display(),
+                                "quarantining a ledger-file block with an amount past the cap \
+                                 (|amount| ≤ 10^21) — kept in the file byte-for-byte, kept out of \
+                                 the DAG, NOT in any balance, and with it every record that \
+                                 descends from it (named below): no peer accepts the block, so \
+                                 nothing built on it can replicate. A history written before T65 \
+                                 with base-unit amounts looks like this; restate the amounts in \
+                                 a larger unit, or join nodes by bootstrap (M-52, M-50, H-08)"
+                            );
+                            amount_cap_refused.extend(ids);
+                            continue;
+                        }
                         warn!(
                             line = block.line,
                             reason = %block.reason,
@@ -3306,6 +3422,9 @@ impl LedgerService {
         // pass that runs once a signer or verifier is installed. See
         // `LedgerService::unverified_history`.
         let mut unverified_history: BTreeSet<String> = BTreeSet::new();
+        // T81 / M-51: records the history arm refused under a content rule,
+        // seeding the closure quarantine after construction.
+        let mut content_rule_refused: BTreeSet<String> = BTreeSet::new();
 
         for directive in &sorted {
             // M-18 / T63: the clock is folded at each FATE below, not here.
@@ -3413,6 +3532,32 @@ impl LedgerService {
             //   T63 a directive quarantined here no longer feeds the clock
             //   unless it is this node's own (`BootLamportHigh`), so a
             //   quarantined FOREIGN value cannot poison authoring either.
+            // T81 / M-51: the content rules peers hold history to — the §3.12
+            // limits with the legacy ceilings, and the amount cap below. A
+            // record refused by one of THESE is refused by every peer, so what
+            // descends from it cannot replicate either: it seeds the closure
+            // quarantine after the loop. (Fan-in and envelope form refuse the
+            // record's envelope, not its content, and keep H-08's
+            // record-only quarantine.)
+            if let Err(error) = enforce_resource_limits_for(directive, ResourceRule::History) {
+                let content_id = compute_content_id(directive);
+                warn!(
+                    %error,
+                    id = %content_id,
+                    file = %file_path.display(),
+                    "quarantining a ledger-file directive over a limit every peer holds history \
+                     to — kept in the file, kept out of the DAG, and with it every record that \
+                     descends from it (named below) (M-51, H-08)"
+                );
+                lamport_high.note_if_own(directive, &author_id);
+                content_rule_refused.insert(content_id.clone());
+                Self::quarantine_keeping_envelope(
+                    &mut quarantined,
+                    content_id,
+                    (*directive).clone(),
+                );
+                continue;
+            }
             if let Err(error) = validate_parent_fan_in(directive)
                 .and_then(|()| validate_file_envelope_form(directive))
                 // H-17 (T65, T76): the amount cap as a directive-level
@@ -3676,6 +3821,7 @@ impl LedgerService {
             verifier: None,
             unverified_history,
             signature_quarantined_total: 0,
+            refused_history_closure: BTreeSet::new(),
             unsigned_operator_input: Vec::new(),
             operator_input_with_file_author: BTreeSet::new(),
             operator_input_as_written: BTreeMap::new(),
@@ -3710,6 +3856,12 @@ impl LedgerService {
             commit_observer: None,
             directive_id_snapshot: std::sync::Mutex::new(None),
         };
+
+        // T81 / M-51, M-52: what descends from a record refused under a
+        // content rule goes with it — before the operator input, so its
+        // parents are chosen from what stays.
+        content_rule_refused.extend(amount_cap_refused);
+        service.quarantine_descendants_of_refused_history(&content_rule_refused);
 
         // H-13: adopt the operator input, now that the whole history is in
         // place. Same path as a live hand edit, same order boot itself used.
@@ -4578,6 +4730,88 @@ impl LedgerService {
                  depended on a record this boot has since quarantined (H-22, H-08)"
             );
         }
+    }
+
+    /// Quarantine every record that descends from `refused` — history boot
+    /// refused under a content rule every peer holds it to (T81 / M-51,
+    /// M-52; decision (6)).
+    ///
+    /// No peer accepts a refused record, so nothing whose parents reach it can
+    /// replicate: each would be buffered on its missing parent on every peer,
+    /// forever, while this node served it and counted it. Quarantining the
+    /// closure makes what this node serves the set a fresh replica can hold —
+    /// loudly, every id named, every record kept in the file (H-08) — rather
+    /// than a history no one can sync past. Walks both the children a record
+    /// in the DAG has and the children still waiting on one that is absent.
+    ///
+    /// A refused `open` has dependants without being anyone's parent: every
+    /// transaction or `close` on an account that no surviving `open` opens
+    /// waits on every peer for the `open` that never arrives (the M-51 shape
+    /// exactly), so those join the closure too, with their descendants.
+    fn quarantine_descendants_of_refused_history(&mut self, refused: &BTreeSet<String>) {
+        if refused.is_empty() {
+            return;
+        }
+        let mut closure: BTreeSet<String> = BTreeSet::new();
+        let mut frontier: Vec<String> = refused.iter().cloned().collect();
+        let orphaned_accounts: BTreeSet<String> = refused
+            .iter()
+            .filter_map(|id| match self.quarantined.get(id) {
+                Some(Directive::Open(open)) => Some(open.account.clone()),
+                _ => None,
+            })
+            .filter(|account| {
+                !self.dag.directives().into_iter().any(|directive| {
+                    matches!(directive, Directive::Open(open) if &open.account == account)
+                })
+            })
+            .collect();
+        if !orphaned_accounts.is_empty() {
+            for directive in self.dag.directives() {
+                let on_orphaned_account = match directive {
+                    Directive::Transaction(txn) => txn
+                        .postings
+                        .iter()
+                        .any(|posting| orphaned_accounts.contains(&posting.account)),
+                    Directive::Close(close) => orphaned_accounts.contains(&close.account),
+                    _ => false,
+                };
+                if on_orphaned_account {
+                    let id = compute_content_id(directive);
+                    if closure.insert(id.clone()) {
+                        frontier.push(id);
+                    }
+                }
+            }
+        }
+        while let Some(id) = frontier.pop() {
+            let children: Vec<String> = match self.dag.children_of(&id) {
+                Some(children) => children.to_vec(),
+                None => self.dag.children_awaiting(&id).to_vec(),
+            };
+            for child in children {
+                if !refused.contains(&child) && closure.insert(child.clone()) {
+                    frontier.push(child);
+                }
+            }
+        }
+        self.refused_history_closure
+            .extend(refused.iter().cloned().chain(closure.iter().cloned()));
+        if closure.is_empty() {
+            return;
+        }
+        warn!(
+            quarantined = closure.len(),
+            ids = %closure.iter().cloned().collect::<Vec<_>>().join(", "),
+            refused = %refused.iter().cloned().collect::<Vec<_>>().join(", "),
+            file = %self.file_path.display(),
+            "quarantining every record that descends from a ledger record no peer accepts — \
+             kept in the file, kept out of the DAG and every balance: nothing built on a \
+             refused record can replicate, so serving it would leave this node and every \
+             fresh replica with different ledgers. Repair the refused record, or join nodes \
+             by bootstrap (M-51, M-52, H-08)"
+        );
+        self.quarantine_out_of_dag(&closure);
     }
 
     /// Hold a directive the rebuild refused in [`Self::quarantined`] (T79):
@@ -6890,6 +7124,39 @@ impl LedgerService {
             }
         }
 
+        // T81 / M-51, M-52: a complete-envelope transaction descending from
+        // history boot refused under a content rule stays quarantined with
+        // it — the live reconcile re-reads the whole file, and would
+        // otherwise re-adopt the descendants boot held back.
+        if !needs_stamp && self.refused_history_closure.contains(&content_id) {
+            tally.refuse(
+                content_id,
+                "depends on a record no peer accepts (over a limit peers hold history to, or \
+                 an amount past the cap); quarantined with it at boot (M-51, M-52)"
+                    .to_owned(),
+            );
+            return FileAdoption::Refused;
+        }
+        if !needs_stamp {
+            if let Directive::Transaction(txn) = &directive {
+                if let Some(parent) = txn
+                    .parent_ids()
+                    .into_iter()
+                    .find(|parent| self.refused_history_closure.contains(*parent))
+                {
+                    tally.refuse(
+                        content_id,
+                        format!(
+                            "descends from {parent}, a record no peer accepts (over a limit peers \
+                             hold history to, or an amount past the cap); quarantined with it \
+                             (M-51, M-52)"
+                        ),
+                    );
+                    return FileAdoption::Refused;
+                }
+            }
+        }
+
         // L-75: parents the operator spelled must resolve. They are honoured
         // verbatim below, and a parent that exists nowhere became a signed
         // head every later write descended from — orphaned on every peer, no
@@ -7033,7 +7300,17 @@ impl LedgerService {
         }
 
         // Validate transactions (I1–I3, I9).
-        if let Err(error) = enforce_resource_limits(&directive) {
+        //
+        // T81: operator input is this node's authorship and is counted as it
+        // will be stored, signature included (M-55); a complete envelope is
+        // history — a peer's record, or this node's own round-tripped — and
+        // is held to the rule every peer and boot hold history to (M-51).
+        let limits = if needs_stamp {
+            enforce_resource_limits_as_stored(&directive)
+        } else {
+            enforce_resource_limits_for(&directive, ResourceRule::History)
+        };
+        if let Err(error) = limits {
             tally.refuse(content_id, error.to_string());
             return FileAdoption::Refused;
         }
@@ -7769,7 +8046,9 @@ impl LedgerService {
             return Ok(None);
         }
 
-        enforce_resource_limits(&directive)?;
+        // T81 / M-51: a peer's directive is history — the legacy ceilings
+        // for the two T75 caps, as the wire's parser and boot apply them.
+        enforce_resource_limits_for(&directive, ResourceRule::History)?;
         // H-04: reject before the Lamport clock is adopted or the DAG touched.
         validate_directive_dates(&directive)?;
         // H-06: the merged envelope legitimately sits at directive level here,
@@ -10524,7 +10803,10 @@ mod tests {
     }
 
     /// T75 / M-48: posting-level metadata is capped as a sum over the
-    /// postings, at stage as on the wire.
+    /// postings, at stage as on the wire. Since T81 (M-51, decision (6))
+    /// staging holds a peer's directive to the HISTORY ceiling, so the T75
+    /// cap of 100 binds only what this node authors: 101 keys stage, and are
+    /// refused for authoring; one past the legacy ceiling is refused at stage.
     #[test]
     fn test_stage_refuses_too_many_posting_metadata_keys() {
         let (mut svc, path) = setup_with_accounts();
@@ -10559,8 +10841,9 @@ mod tests {
             })
         };
         let cap = MAX_POSTING_METADATA_KEYS_PER_TRANSACTION;
+        let legacy = crate::limits::MAX_POSTING_METADATA_KEYS_PER_TRANSACTION_LEGACY;
         let error = svc
-            .stage_remote_directive(transaction(cap / 2, cap + 1))
+            .stage_remote_directive(transaction(legacy / 2, legacy + 1))
             .unwrap_err();
         assert_eq!(error.error_code(), "RESOURCE_LIMIT_EXCEEDED", "{error}");
         assert!(
@@ -10570,6 +10853,15 @@ mod tests {
         assert!(
             enforce_resource_limits(&transaction(cap / 2, cap)).is_ok(),
             "a transaction at the cap is admitted"
+        );
+        assert!(
+            enforce_resource_limits(&transaction(cap / 2, cap + 1)).is_err(),
+            "authoring keeps the T75 cap"
+        );
+        assert!(
+            svc.stage_remote_directive(transaction(cap / 2, cap + 1))
+                .is_ok(),
+            "history over the T75 cap but within the legacy ceiling stages (M-51)"
         );
         std::fs::remove_file(path).ok();
     }
@@ -19878,6 +20170,292 @@ mod tests {
             }
             other => panic!("expected LamportCeiling, got {other:?}"),
         }
+        remove_ledger_and_journal(&path);
+    }
+
+    // ── T81: upgrade paths for every content rule; count the envelope ──
+
+    /// A marker-signed history transaction by `test-peer` on two accounts.
+    fn signed_history_transaction(
+        narration: &str,
+        day: u32,
+        debit: (&str, &str),
+        parents: &str,
+        lamport: u64,
+    ) -> Directive {
+        let posting = |account: &str, number: rust_decimal::Decimal, currency: &str| Posting {
+            account: account.to_owned(),
+            amount: Some(Amount {
+                number,
+                currency: currency.to_owned(),
+            }),
+            cost: None,
+            price: None,
+            metadata: BTreeMap::new(),
+        };
+        marker_signed(Directive::Transaction(Transaction {
+            date: make_date(2024, 2, day),
+            flag: Flag::Complete,
+            payee: None,
+            narration: Some(narration.to_owned()),
+            tags: vec![],
+            links: vec![],
+            postings: vec![
+                posting(debit.0, dec!(5), debit.1),
+                posting("Equity:Opening", dec!(-5), debit.1),
+            ],
+            metadata: BTreeMap::from([
+                (ENVELOPE_KEY_AUTHOR.to_owned(), "test-peer".to_owned()),
+                (ENVELOPE_KEY_LAMPORT.to_owned(), lamport.to_string()),
+                (ENVELOPE_KEY_PARENTS.to_owned(), parents.to_owned()),
+            ]),
+        }))
+    }
+
+    /// M-51 (T81, decision (6)): history over the LEGACY ceiling — an `open`
+    /// of 4,097 currencies, the M-48 flood class — is quarantined at boot
+    /// with everything that depends on it: the transaction on its account
+    /// (peers wait forever for the `open`) and that transaction's child
+    /// (peers wait forever for its parent). An unrelated record stays served,
+    /// and a later live reconcile of the whole file re-adopts none of them.
+    ///
+    /// Bug-catch: drop the closure call in boot and the account's transaction
+    /// and its child are served; drop the history rule in boot's arm and the
+    /// flood `open` is served; drop the reconcile guard and a hand edit
+    /// brings the child back.
+    #[test]
+    fn m51_history_over_the_legacy_ceiling_is_quarantined_with_everything_that_depends_on_it() {
+        let (svc, path) = setup_with_signed_accounts();
+        drop(svc);
+        let flood = marker_signed(Directive::Open(Open {
+            date: make_date(2024, 1, 2),
+            account: "Assets:Flood".to_owned(),
+            currencies: (0..=crate::limits::MAX_CURRENCIES_PER_OPEN_LEGACY)
+                .map(|index| format!("C{index:04}"))
+                .collect(),
+            metadata: BTreeMap::from([
+                (ENVELOPE_KEY_AUTHOR.to_owned(), "test-peer".to_owned()),
+                (ENVELOPE_KEY_LAMPORT.to_owned(), "10".to_owned()),
+            ]),
+        }));
+        let on_flood = signed_history_transaction(
+            "on the flood account",
+            1,
+            ("Assets:Flood", "C0001"),
+            "",
+            11,
+        );
+        let on_flood_id = compute_content_id(&on_flood);
+        let child =
+            signed_history_transaction("child", 2, ("Assets:Cash", "USD"), &on_flood_id, 12);
+        let unrelated = signed_history_transaction("unrelated", 3, ("Assets:Cash", "USD"), "", 13);
+        append_to_file(
+            &path,
+            &format!(
+                "\n{}",
+                full_file_serialize(
+                    &[
+                        flood.clone(),
+                        on_flood.clone(),
+                        child.clone(),
+                        unrelated.clone()
+                    ],
+                    &[]
+                )
+            ),
+        );
+
+        let (booted, logged) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "test-peer".to_owned()));
+        let mut svc = booted.unwrap();
+        svc.set_signer(marker_signer());
+        let held: BTreeSet<&str> = svc.quarantined_ids().into_iter().collect();
+        for directive in [&flood, &on_flood, &child] {
+            assert!(
+                held.contains(compute_content_id(directive).as_str()),
+                "quarantined: {directive:?}\n{logged}"
+            );
+        }
+        assert!(transaction_named(&svc, "unrelated").is_some());
+        assert!(
+            logged.contains("(M-51, H-08)")
+                && logged.contains("descends from a ledger record no peer accepts"),
+            "{logged}"
+        );
+
+        // A hand edit makes the live reconcile re-read the whole file.
+        svc.compact().unwrap();
+        append_to_file(&path, &h22_hand_line("hand after the closure", None));
+        let result = svc.reconcile_file().unwrap();
+        assert_eq!(result.new_directives, 1, "only the hand line");
+        assert!(transaction_named(&svc, "on the flood account").is_none());
+        assert!(transaction_named(&svc, "child").is_none());
+        remove_ledger_and_journal(&path);
+    }
+
+    /// M-51 (T81): history over a T75 AUTHORING cap but inside the legacy
+    /// ceiling — a 65-currency `open`, pre-T75 — loads at boot as history,
+    /// while the local API still refuses it.
+    #[test]
+    fn m51_history_over_the_authoring_cap_loads_and_the_api_still_refuses_it() {
+        let (svc, path) = setup_with_signed_accounts();
+        drop(svc);
+        let currencies: Vec<String> = (0..=MAX_CURRENCIES_PER_OPEN)
+            .map(|index| format!("C{index:03}"))
+            .collect();
+        let wide = marker_signed(Directive::Open(Open {
+            date: make_date(2024, 1, 2),
+            account: "Assets:Wide".to_owned(),
+            currencies: currencies.clone(),
+            metadata: BTreeMap::from([
+                (ENVELOPE_KEY_AUTHOR.to_owned(), "test-peer".to_owned()),
+                (ENVELOPE_KEY_LAMPORT.to_owned(), "10".to_owned()),
+            ]),
+        }));
+        append_to_file(
+            &path,
+            &format!(
+                "\n{}",
+                full_file_serialize(std::slice::from_ref(&wide), &[])
+            ),
+        );
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.set_signer(marker_signer());
+        assert_eq!(svc.quarantined_count(), 0);
+        assert!(svc.contains_directive(&compute_content_id(&wide)));
+        let error = svc
+            .open_account("Assets:Other".to_owned(), make_date(2024, 1, 3), currencies)
+            .unwrap_err();
+        assert_eq!(error.error_code(), "RESOURCE_LIMIT_EXCEEDED", "{error}");
+        remove_ledger_and_journal(&path);
+    }
+
+    /// M-55 (T81, decision (10)): operator input is counted as it will be
+    /// stored — signature included — on both file paths. A transaction
+    /// carries four envelope keys, anything else three, so 96 / 97 body keys
+    /// are the most each may have.
+    ///
+    /// Bug-catch: count before the signature (the pre-T81
+    /// `enforce_resource_limits` call) and the 97-key transaction is adopted.
+    #[test]
+    fn m55_operator_input_is_counted_as_stored_on_both_file_paths() {
+        let with_keys = |narration: &str, keys: usize| {
+            let mut block = format!("\n2024-01-20 * \"Hand\" \"{narration}\"\n");
+            for index in 0..keys {
+                block.push_str(&format!("  k{index:03}: \"v\"\n"));
+            }
+            block.push_str("  Assets:Cash                                         5.00 USD\n");
+            block.push_str("  Equity:Opening                                     -5.00 USD\n");
+            block
+        };
+        let open_with_keys = |account: &str, keys: usize| {
+            let mut block = format!("\n2024-01-20 open {account}\n");
+            for index in 0..keys {
+                block.push_str(&format!("  k{index:03}: \"v\"\n"));
+            }
+            block
+        };
+
+        // Boot: over the cap is quarantined, at it is adopted and signed.
+        let (path, _) = signed_node_written_file();
+        append_to_file(&path, &with_keys("ninety-seven", 97));
+        append_to_file(&path, &with_keys("ninety-six", 96));
+        append_to_file(&path, &open_with_keys("Assets:NinetyEight", 98));
+        append_to_file(&path, &open_with_keys("Assets:NinetySeven", 97));
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.set_signer(marker_signer());
+        assert_eq!(svc.finalize_operator_input(), 2);
+        assert!(transaction_named(&svc, "ninety-seven").is_none());
+        let adopted = transaction_named(&svc, "ninety-six").unwrap();
+        assert_eq!(adopted.metadata().len(), MAX_METADATA_KEYS_PER_DIRECTIVE);
+        assert!(!svc.accounts().is_open("Assets:NinetyEight"));
+        assert!(svc.accounts().is_open("Assets:NinetySeven"));
+        assert_eq!(svc.quarantined_count(), 2);
+        remove_ledger_and_journal(&path);
+
+        // Live.
+        let (mut svc, path) = setup_with_signed_accounts();
+        append_to_file(&path, &with_keys("ninety-seven", 97));
+        let result = svc.reconcile_file().unwrap();
+        assert_eq!((result.new_directives, result.rejected), (0, 1));
+        append_to_file(&path, &with_keys("ninety-six", 96));
+        assert_eq!(svc.reconcile_file().unwrap().new_directives, 1);
+        let adopted = transaction_named(&svc, "ninety-six").unwrap();
+        assert_eq!(adopted.metadata().len(), MAX_METADATA_KEYS_PER_DIRECTIVE);
+        assert!(
+            enforce_resource_limits_for(adopted, ResourceRule::History).is_ok(),
+            "what was signed is what a peer admits"
+        );
+        remove_ledger_and_journal(&path);
+    }
+
+    /// M-52 (T81): a history block with an amount past the cap is held as
+    /// text, but boot now names its id and says why — not L-45's
+    /// Unicode-account wording — and its descendants are quarantined with
+    /// it and stay quarantined across a live reconcile.
+    ///
+    /// Bug-catch: drop `amount_cap_refused_block_ids` from boot and the child
+    /// is served with a dangling parent.
+    #[test]
+    fn m52_an_amount_past_the_cap_in_history_takes_its_descendants_with_it_loudly() {
+        let (svc, path) = setup_with_signed_accounts();
+        drop(svc);
+        let posting = |account: &str, number: rust_decimal::Decimal| Posting {
+            account: account.to_owned(),
+            amount: Some(Amount {
+                number,
+                currency: "USD".to_owned(),
+            }),
+            cost: None,
+            price: None,
+            metadata: BTreeMap::new(),
+        };
+        let over = rust_decimal::Decimal::from_str_exact("50000000000000000000000").unwrap();
+        let x = marker_signed(Directive::Transaction(Transaction {
+            date: make_date(2024, 2, 1),
+            flag: Flag::Complete,
+            payee: None,
+            narration: Some("X pre-upgrade".to_owned()),
+            tags: vec![],
+            links: vec![],
+            postings: vec![
+                posting("Assets:Cash", over),
+                posting("Equity:Opening", -over),
+            ],
+            metadata: BTreeMap::from([
+                (ENVELOPE_KEY_AUTHOR.to_owned(), "test-peer".to_owned()),
+                (ENVELOPE_KEY_LAMPORT.to_owned(), "10".to_owned()),
+                (ENVELOPE_KEY_PARENTS.to_owned(), String::new()),
+            ]),
+        }));
+        let x_id = compute_content_id(&x);
+        let child = signed_history_transaction("child of X", 2, ("Assets:Cash", "USD"), &x_id, 11);
+        append_to_file(
+            &path,
+            &format!("\n{}", full_file_serialize(&[x, child.clone()], &[])),
+        );
+
+        let (booted, logged) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "test-peer".to_owned()));
+        let mut svc = booted.unwrap();
+        svc.set_signer(marker_signer());
+        assert!(
+            logged.contains("(M-52, M-50, H-08)") && logged.contains(&x_id),
+            "{logged}"
+        );
+        assert!(!logged.contains("Unicode account name"), "{logged}");
+        assert!(transaction_named(&svc, "child of X").is_none());
+        assert!(svc
+            .quarantined_ids()
+            .contains(&compute_content_id(&child).as_str()));
+
+        svc.compact().unwrap();
+        append_to_file(&path, &h22_hand_line("hand after M-52", None));
+        assert_eq!(svc.reconcile_file().unwrap().new_directives, 1);
+        assert!(transaction_named(&svc, "child of X").is_none());
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("X pre-upgrade"));
         remove_ledger_and_journal(&path);
     }
 }

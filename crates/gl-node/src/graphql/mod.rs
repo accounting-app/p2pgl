@@ -696,6 +696,49 @@ mod tests {
         } }
     ";
 
+    /// T81 (M-51, M-52): `verify` names what the node holds back. A history
+    /// record with an amount past the cap is held as text (an unparsable
+    /// block, no id) and its child is quarantined with it; both are visible
+    /// through the API, not only in the boot log.
+    #[tokio::test]
+    async fn test_verify_lists_the_quarantine() {
+        let x_block = "2024-01-15 * \"X pre-upgrade\"\n  \
+               openledger-author: \"test\"\n  \
+               openledger-lamport: \"1\"\n  \
+               openledger-parents: \"\"\n  \
+               Assets:Cash                                      50000000000000000000000 USD\n  \
+               Equity:Opening                                  -50000000000000000000000 USD\n";
+        let x = ledger::parse::parse_file_bounded(x_block, 0, ledger::parse::ParseLimits::IDENTIFY)
+            .expect("parses with the cap lifted")
+            .remove(0);
+        let x_id = ledger::hash::compute_content_id(&x);
+        let child_block = format!(
+            "2024-01-16 * \"Child\"\n  \
+               openledger-author: \"test\"\n  \
+               openledger-lamport: \"2\"\n  \
+               openledger-parents: \"{x_id}\"\n  \
+               Assets:Cash                                      5.00 USD\n  \
+               Equity:Opening                                  -5.00 USD\n"
+        );
+        let child = ledger::parse::parse_file(&child_block).unwrap().remove(0);
+        let child_id = ledger::hash::compute_content_id(&child);
+        let text = format!(
+            "2024-01-01 open Assets:Cash USD\n\n2024-01-01 open Equity:Opening\n\n{x_block}\n{child_block}"
+        );
+        let (_dir, schema) = schema_over_ledger(&text);
+        let result = schema
+            .execute("{ verify { quarantined unparsableBlocks } }")
+            .await;
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let data = result.data.into_json().unwrap();
+        assert_eq!(data["verify"]["unparsableBlocks"], 1);
+        assert_eq!(
+            data["verify"]["quarantined"],
+            serde_json::json!([child_id]),
+            "the child of the refused record is quarantined and named"
+        );
+    }
+
     #[tokio::test]
     async fn test_verify_surfaces_failing_balance_assertion() {
         // M-08 regression: `balance` directives reach the file through the

@@ -236,7 +236,10 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
     let directives = parse_file_bounded(
         &entry.economic_bean,
         MAX_REPORTED_PARSE_ERRORS,
-        ParseLimits::RESOURCE,
+        // T81 / M-51: `WIRE`, not `RESOURCE` — a peer's directive is
+        // history, so the two caps T75 introduced take their legacy ceilings
+        // here, as `stage_remote_directive` and boot apply them.
+        ParseLimits::WIRE,
     )
     .map_err(|bounded| match &bounded.limit {
         Some(limit) => MergeError::ResourceLimitExceeded(limit.to_string()),
@@ -255,7 +258,11 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
     // function docs. This is the same function every write path runs, so the
     // wire refuses here exactly what `stage_remote_directive` would refuse
     // later, before the entry can be queued behind the rest of its frame.
-    ledger::service::enforce_resource_limits(&directive).map_err(|error| {
+    ledger::service::enforce_resource_limits_for(
+        &directive,
+        ledger::service::ResourceRule::History,
+    )
+    .map_err(|error| {
         MergeError::ResourceLimitExceeded(match error {
             ledger::service::ServiceError::ResourceLimitExceeded { message } => message,
             other => other.to_string(),
@@ -2668,9 +2675,17 @@ mod tests {
     /// `validate_supply_entry`, under a correct id — one past its cap, and
     /// admitted at it. Before T75 every one of these returned `Ok` and was
     /// refused only at `stage_remote_directive`, after the frame had queued it.
+    /// Since T81 (M-51, decision (6)) the wire holds a peer's directive to the
+    /// HISTORY rule: the two caps T75 introduced — posting metadata keys and
+    /// currencies per `open` — are their legacy ceilings here, and one past
+    /// T75's authoring cap crosses.
     #[test]
     fn test_validate_refuses_each_cardinality_cap_on_the_wire() {
-        use ledger::limits::{MAX_CURRENCIES_PER_OPEN, MAX_POSTING_METADATA_KEYS_PER_TRANSACTION};
+        use ledger::limits::{
+            MAX_CURRENCIES_PER_OPEN, MAX_CURRENCIES_PER_OPEN_LEGACY,
+            MAX_POSTING_METADATA_KEYS_PER_TRANSACTION,
+            MAX_POSTING_METADATA_KEYS_PER_TRANSACTION_LEGACY,
+        };
         use ledger::service::{
             MAX_LINKS_PER_TRANSACTION, MAX_METADATA_KEYS_PER_DIRECTIVE,
             MAX_POSTINGS_PER_TRANSACTION, MAX_TAGS_PER_TRANSACTION,
@@ -2679,7 +2694,7 @@ mod tests {
         let tags = MAX_TAGS_PER_TRANSACTION;
         let links = MAX_LINKS_PER_TRANSACTION;
         let metadata = MAX_METADATA_KEYS_PER_DIRECTIVE;
-        let posting_metadata = MAX_POSTING_METADATA_KEYS_PER_TRANSACTION;
+        let posting_metadata = MAX_POSTING_METADATA_KEYS_PER_TRANSACTION_LEGACY;
 
         // Every count at its cap at once: admitted.
         validate_body(
@@ -2723,16 +2738,26 @@ mod tests {
             ),
             "Too many posting metadata keys",
         );
+        validate_body(
+            DirectiveKind::Transaction,
+            capped_transaction_body(2, 0, 0, 0, MAX_POSTING_METADATA_KEYS_PER_TRANSACTION + 1),
+        )
+        .expect("history over T75's authoring cap crosses the wire (M-51)");
 
         // L-78: currencies in an `open`.
         let open = |count: usize| {
             let list: Vec<String> = (0..count).map(|i| format!("C{i:03}")).collect();
             format!("2024-01-01 open Assets:Cash {}\n", list.join(","))
         };
-        validate_body(DirectiveKind::Open, open(MAX_CURRENCIES_PER_OPEN))
-            .expect("an open at the currency cap is admitted");
+        validate_body(DirectiveKind::Open, open(MAX_CURRENCIES_PER_OPEN_LEGACY))
+            .expect("an open at the legacy currency ceiling is admitted");
+        validate_body(DirectiveKind::Open, open(MAX_CURRENCIES_PER_OPEN + 1))
+            .expect("history over T75's authoring cap crosses the wire (M-51)");
         assert_resource_refusal(
-            validate_body(DirectiveKind::Open, open(MAX_CURRENCIES_PER_OPEN + 1)),
+            validate_body(
+                DirectiveKind::Open,
+                open(MAX_CURRENCIES_PER_OPEN_LEGACY + 1),
+            ),
             "Too many currencies in one open",
         );
     }
