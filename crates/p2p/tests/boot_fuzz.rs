@@ -75,7 +75,7 @@ use ledger::service::{
 };
 use p2p::allowlist::PeerAllowlist;
 use p2p::gossip::make_supply_entry;
-use p2p::protocol::SupplyEntry;
+use p2p::protocol::{DirectiveKind, SupplyEntry};
 use p2p::union_merge::{validate_supply_entry, verify_author_allowlisted, verify_remote_signature};
 use proptest::prelude::*;
 use rust_decimal::Decimal;
@@ -533,11 +533,18 @@ struct Checks {
     /// envelope of every served transaction. Failed at HEAD for every operator
     /// that adopts operator input; T73 re-indexes the finalised copy.
     read_model_parity: bool,
+    /// T84 / H-23 (decision (15)), the single-node oracle: every transaction
+    /// the node serves names only parents it serves. `known_ids` below lets a
+    /// parent resolve in the truth — right on a mesh, where a peer holds it —
+    /// so it could not see a node that serves a record whose parent no
+    /// replica it talks to may hold (X1 `c3j`, A1 `strand`).
+    served_set_self_contained: bool,
 }
 
 impl Checks {
     const ALL: Checks = Checks {
         read_model_parity: true,
+        served_set_self_contained: true,
     };
 }
 
@@ -752,6 +759,24 @@ fn audit_with(
 
     // 4. What the file path adopted, the local API would have accepted.
     failures.extend(replay_through_local_api(snapshot, truth));
+
+    // 6. T84 / H-23: nothing served names a parent the node does not serve.
+    if checks.served_set_self_contained {
+        for (id, directive) in &snapshot.served {
+            let Directive::Transaction(txn) = directive else {
+                continue;
+            };
+            for parent in txn.parent_ids() {
+                if !snapshot.served.contains_key(parent) {
+                    failures.push(format!(
+                        "served {} names parent {}, which this node does not serve (H-23)",
+                        short(id),
+                        short(parent)
+                    ));
+                }
+            }
+        }
+    }
 
     // 5. L-74: the read model and the DAG agree on every served transaction.
     if checks.read_model_parity {
@@ -1559,6 +1584,40 @@ fn assert_holds(operator: Operator, seed: u64, position: usize, checks: Checks) 
     report
 }
 
+/// T84 / H-23 (decision (15)): the quarantine holds the `refused` records the
+/// edit itself made unacceptable and, beyond them, only node-written
+/// transactions — the ones that depend on a refused record (they name it as a
+/// parent, directly or through another held record, or post to an account
+/// only it opened) and so go with it. (Check 6 of the oracle shows the
+/// converse: nothing served names what is not served.)
+fn assert_refused_with_descendants(
+    snapshot: &Snapshot,
+    truth: &Truth,
+    refused: usize,
+    context: &str,
+) {
+    let held = snapshot.quarantined_ids.len();
+    assert!(
+        held >= refused,
+        "{context}: {held} quarantined, expected at least the {refused} refused"
+    );
+    let node_written = snapshot
+        .quarantined_ids
+        .iter()
+        .filter(|id| {
+            truth
+                .entries
+                .get(*id)
+                .is_some_and(|entry| entry.kind == DirectiveKind::Transaction)
+        })
+        .count();
+    assert!(
+        held <= refused + node_written,
+        "{context}: {held} quarantined, {node_written} of them node-written transactions; \
+         the rest exceed the {refused} refused"
+    );
+}
+
 // ─── Per-operator tests (named failures) ─────────────────────────────────────
 
 #[test]
@@ -1663,7 +1722,11 @@ fn op_m_delete_signed_block_drops_only_that_record() {
         let report = assert_holds(Operator::DeleteSignedBlock, 15, position, Checks::ALL);
         let first = report.first.unwrap();
         assert!(report.adopted.is_empty(), "position {position}");
-        assert_eq!(first.quarantined_count, 0, "position {position}");
+        // T84 / H-23: the deleted record's descendants are held until a peer
+        // re-supplies it (they name it; no replica lacking it could adopt
+        // them); nothing else is.
+        let truth = generate_fixture(15);
+        assert_refused_with_descendants(&first, &truth, 0, &format!("position {position}"));
     }
 }
 
@@ -1706,7 +1769,8 @@ fn op_p_identity() {
 #[test]
 fn op_q_edit_parents_line_of_signed_record_is_quarantined() {
     let report = assert_holds(Operator::EditParentsLine, 31, 1, Checks::ALL);
-    assert_eq!(report.first.unwrap().quarantined_ids.len(), 1);
+    // T84: with what descends from it.
+    assert_refused_with_descendants(&report.first.unwrap(), &generate_fixture(31), 1, "op_q");
 }
 
 /// The signature covers `openledger-lamport`: an edited lamport line is
@@ -1714,7 +1778,8 @@ fn op_q_edit_parents_line_of_signed_record_is_quarantined() {
 #[test]
 fn op_r_edit_lamport_line_of_signed_record_is_quarantined() {
     let report = assert_holds(Operator::EditLamportLine, 32, 2, Checks::ALL);
-    assert_eq!(report.first.unwrap().quarantined_ids.len(), 1);
+    // T84: with what descends from it.
+    assert_refused_with_descendants(&report.first.unwrap(), &generate_fixture(32), 1, "op_r");
 }
 
 /// A duplicated envelope line resolves last-wins in the parser
@@ -1724,7 +1789,8 @@ fn op_r_edit_lamport_line_of_signed_record_is_quarantined() {
 #[test]
 fn op_s_duplicated_lamport_line_resolves_to_the_last_spelling() {
     let report = assert_holds(Operator::DuplicateLamportLineEdited, 33, 0, Checks::ALL);
-    assert_eq!(report.first.unwrap().quarantined_ids.len(), 1);
+    // T84: with what descends from it.
+    assert_refused_with_descendants(&report.first.unwrap(), &generate_fixture(33), 1, "op_s");
 }
 
 /// A record replayed from the commit journal takes the same loop as the
@@ -1753,12 +1819,10 @@ fn op_u_stray_word_after_header_holds_the_block_whole() {
     let report = assert_holds(Operator::StrayWordAfterHeader, 35, 0, Checks::ALL);
     assert!(report.adopted.is_empty(), "the bare header is not adopted");
     let first = report.first.unwrap();
-    assert_eq!(
-        first.quarantined_ids.len(),
-        0,
-        "held as raw text, not by id"
-    );
-    assert_eq!(first.quarantined_count, 1);
+    // T84 / H-23: the block itself is held as raw text, not by id; what
+    // names it is held by id with it (no peer could adopt it).
+    assert_refused_with_descendants(&first, &generate_fixture(35), 0, "op_u");
+    assert_eq!(first.quarantined_count, 1 + first.quarantined_ids.len());
 }
 
 /// A block signed by another allowlisted peer, pasted in, is verified with
@@ -1868,11 +1932,8 @@ fn op_ab_huge_lamport_edit_of_a_quarantined_record_does_not_move_the_clock() {
     let path = dir.join("ledger.bean");
     std::fs::write(&path, &mutation.text).unwrap();
     let svc = run_pipeline(&path, &truth.provider).unwrap();
-    assert_eq!(
-        svc.quarantined_ids().len(),
-        1,
-        "the edited record is quarantined"
-    );
+    // T84: the edited record, with what descends from it.
+    assert_refused_with_descendants(&snapshot_of(&svc), &truth, 1, "op_ab");
     let clock = svc.lamport_clock();
     drop(svc);
     std::fs::remove_dir_all(dir).ok();
@@ -1905,7 +1966,8 @@ fn composite_crash_between_finalize_and_compaction_is_byte_identical() {
     };
     let first = run_pipeline_until(&path, &truth.provider, false).unwrap();
     let entry_first = hand_entry(&first);
-    assert_eq!(first.quarantined_ids().len(), 1);
+    // T84: the edited record, with what descends from it.
+    assert_refused_with_descendants(&snapshot_of(&first), &truth, 1, "composite crash");
     drop(first);
     let mut second = run_pipeline_until(&path, &truth.provider, false).unwrap();
     let entry_second = hand_entry(&second);
@@ -2247,11 +2309,9 @@ fn a1_two_passes_rebase_to_what_a_boot_without_the_refused_records_stamps() {
         Checks::ALL,
     );
     let first = report.first.expect("ran");
-    assert_eq!(
-        first.quarantined_ids.len(),
-        2,
-        "the edited record and the forged block"
-    );
+    // The edited record and the forged block — with, since T84, what descends
+    // from the edited record.
+    assert_refused_with_descendants(&first, &truth, 2, "two passes");
     let (_, rebased) =
         served_named(&first, "stamped on top of the other edits").expect("the hand line is served");
 
@@ -2305,10 +2365,14 @@ fn a1_an_edited_open_with_a_hand_reopen_and_transaction_is_held_whole() {
         Checks::ALL,
     );
     assert!(report.adopted.is_empty(), "nothing hand-typed is served");
-    assert_eq!(
-        report.first.expect("ran").quarantined_ids.len(),
+    // The edited open, the hand re-open and the hand transaction — with, since
+    // T84, the history on the account only the edited open opened here (a
+    // peer holding the original open re-supplies it, and them).
+    assert_refused_with_descendants(
+        &report.first.expect("ran"),
+        &generate_fixture(55),
         3,
-        "the edited open, the hand re-open and the hand transaction"
+        "edited open",
     );
 }
 
@@ -2346,14 +2410,16 @@ fn a1_crash_between_finalize_and_compaction_with_a_refused_foreign_line() {
     std::fs::remove_dir_all(dir).ok();
 }
 
-/// T79 item (d), the deviation (A1 hunt (3)): an envelope line of a signed
-/// record that has a child is edited (its lamport, +1) — the record is
-/// quarantined under the SAME id, and its child, which this node serves,
-/// names it. A peer that already holds the record accepts the child; one
-/// that does not (a record never replicated) cannot. The WARN names the pair.
+/// T79 item (d), as decision (15) re-decided it (T84 / H-23; A1 hunt (3)):
+/// an envelope line of a signed record that has a child is edited (its
+/// lamport, +1) — the record is quarantined under the SAME id, and its child
+/// names it. A peer that already holds the record accepts the child; one that
+/// does not (a record never replicated) cannot, so the child — and what
+/// descends from it — is held with it, and the WARN names it and why. Before
+/// T84 the child was served with a WARN only.
 ///
-/// Revert-proof: drop the WARN call in `verify_own_history` (0924 R8) and
-/// nothing is said.
+/// Revert-proof: drop the `quarantine_unservable_history` call after the
+/// signature pass and the child is served, unnamed.
 #[test]
 fn a1_d_a_served_child_of_an_envelope_edited_record_is_named_in_a_warning() {
     let truth = generate_fixture(57);
@@ -2361,14 +2427,16 @@ fn a1_d_a_served_child_of_an_envelope_edited_record_is_named_in_a_warning() {
     let (svc, logged) = capture_warnings(|| run_pipeline(&path, &truth.provider).unwrap());
     let snapshot = snapshot_of(&svc);
     drop(svc);
-    assert_eq!(snapshot.quarantined_ids.len(), 1);
+    assert_refused_with_descendants(&snapshot, &truth, 1, "a1_d");
     assert!(
-        snapshot.served.contains_key(&child),
-        "premise: the child is served"
+        !snapshot.served.contains_key(&child) && snapshot.quarantined_ids.contains(&child),
+        "the child is held, not served"
     );
     assert!(
-        logged.contains("only in its quarantine") && logged.contains(&child),
-        "the (d) WARN names the child: {logged}"
+        logged.contains("no fresh replica could hold")
+            && logged.contains("only in this node's quarantine")
+            && logged.contains(&child),
+        "the H-23 WARN names the child: {logged}"
     );
     std::fs::remove_dir_all(dir).ok();
 }
@@ -2420,9 +2488,10 @@ fn a1_envelope_edited_parent_with_a_child(truth: &Truth) -> (PathBuf, PathBuf, S
 /// it. (What does work, and no WARN says: delete the record's `openledger-*`
 /// lines, so it is re-adopted under the same id.)
 ///
-/// Fails at HEAD: the reboot after the remedy logs no WARN naming the child.
+/// Failed at `45014e9`: the reboot after the remedy logged no WARN naming the
+/// child, which stayed served. Since T84 (decision (15)) the child is held,
+/// not served, and named — the premise below changed with that decision.
 #[test]
-#[ignore = "A1-2: after the per-record H-20 remedy the (d) WARN is silent while the served child stays unadoptable"]
 fn a1_2_the_prescribed_remedy_leaves_a_stranded_child_and_no_warning() {
     let truth = generate_fixture(58);
     let (dir, path, child) = a1_envelope_edited_parent_with_a_child(&truth);
@@ -2433,7 +2502,11 @@ fn a1_2_the_prescribed_remedy_leaves_a_stranded_child_and_no_warning() {
         .map(str::to_owned)
         .collect();
     drop(svc);
-    assert_eq!(quarantined.len(), 1);
+    // T84: the edited record and, with it, the child and what descends from
+    // it; the block to delete is the child's parent.
+    let parent = truth.entries[&child].envelope[KEY_PARENTS].clone();
+    assert!(quarantined.contains(&parent) && quarantined.contains(&child));
+    let quarantined = [parent];
     // "delete the edited block"
     let text = std::fs::read_to_string(&path).unwrap();
     let blocks: Vec<String> = split_blocks(&text)
@@ -2452,17 +2525,17 @@ fn a1_2_the_prescribed_remedy_leaves_a_stranded_child_and_no_warning() {
     let snapshot = snapshot_of(&svc);
     drop(svc);
     assert!(
-        snapshot.served.contains_key(&child),
-        "premise: the child is still served"
-    );
-    assert!(
         !snapshot.served.contains_key(&quarantined[0]),
         "premise: its parent is served by no one"
     );
     std::fs::remove_dir_all(dir).ok();
     assert!(
-        logged.contains(&child),
-        "a served record whose parent no replica can hold must be named at boot; logged:\n{logged}"
+        !snapshot.served.contains_key(&child),
+        "a record whose parent no replica can hold is not served (decision (15))"
+    );
+    assert!(
+        logged.contains(&child) && logged.contains("openledger-* lines"),
+        "it is named at boot, with the remedy that works; logged:\n{logged}"
     );
 }
 
@@ -2476,9 +2549,10 @@ fn a1_2_the_prescribed_remedy_leaves_a_stranded_child_and_no_warning() {
 /// write of this node descends from it: H-22's consequence, through the edit
 /// L-87 exists to neutralise. The control (`op_ab`, no hand line) holds.
 ///
-/// Fails at HEAD: the peer's `stage_remote_directive` refuses the hand line.
+/// Failed at `45014e9`: the peer's `stage_remote_directive` refused the hand
+/// line. Since T84 operator input is stamped at finalisation, from the clock
+/// the release has settled (decision (16)).
 #[test]
-#[ignore = "A1-1: the T79 rebase keeps the boot lamport of operator input stamped above an edited lamport; peers refuse it"]
 fn a1_1_a_hand_line_stamped_over_an_edited_lamport_is_accepted_by_a_peer() {
     let truth = generate_fixture(59);
     let mutation = mutate(

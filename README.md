@@ -55,7 +55,7 @@ The playground is **off** by default. Turn it on with `"graphiql": true` and vis
 
 ### Upgrading
 
-Read [`CHANGELOG.md`](CHANGELOG.md) before upgrading, starting with *Breaking*. Config files are parsed strictly, so an **older binary refuses a config that uses a key added in a newer one**: upgrade the binary before editing the config, and remove new keys before rolling back. A newer node holds what it **writes** to tighter limits than what it **takes as history**, so that history an older build wrote keeps replicating: an `open` may list up to 64 currencies and a transaction's postings up to 100 metadata keys when this node authors them, but a peer's record or an existing file is held only to 4,096 of each. One case still cannot replicate: an amount past 10^21 in a history written before T65 (a ledger kept in base units, such as wei). Boot keeps that record in the file, names it, and quarantines it together with every record that depends on it, so the node serves only what a fresh replica can hold; `verify` lists what is quarantined. Restate such amounts in a larger unit, or join nodes by bootstrap (§Mesh identity). The CHANGELOG lists each case.
+Read [`CHANGELOG.md`](CHANGELOG.md) before upgrading, starting with *Breaking*. Config files are parsed strictly, so an **older binary refuses a config that uses a key added in a newer one**: upgrade the binary before editing the config, and remove new keys before rolling back. A newer node holds what it **writes** to tighter limits than what it **takes as history**, so that history an older build wrote keeps replicating: an `open` may list up to 64 currencies and a transaction's postings up to 100 metadata keys when this node authors them, but a peer's record or an existing file is held only to 4,096 of each. One case still cannot replicate: an amount past 10^21 in a history written before T65 (a ledger kept in base units, such as wei). Boot keeps that record in the file, names it, and quarantines it together with every record that depends on it, so the node serves only what a fresh replica can hold; `verify` lists what is quarantined. Restating such an amount in a larger unit gives the record a new id, so its descendants (whose parents name the old id) stay quarantined: restate the chain, or join nodes by bootstrap (§Mesh identity). The CHANGELOG lists each case.
 
 ---
 
@@ -833,11 +833,31 @@ enabled — and a record that does not verify is **quarantined**: kept in the
 file exactly as it is, kept out of the ledger, not served, not in any balance,
 named in the boot banner as *"quarantined: signature does not verify — was this
 record edited? (H-20)"*. To repair it, restore the original line from a peer's
-copy of the ledger (or from the node's `.journal`/backup), or delete the edited
-block; then append a new transaction that reverses the mistake. A record you
-**delete** from the file is not gone either: peers re-supply it on the next
-anti-entropy round, because the mesh keeps what it accepted. Adoption is
-one-way: the file is how records get *into* this node, never how they leave it.
+copy of the ledger (or from the node's `.journal`/backup); then append a new
+transaction that reverses the mistake. If no peer holds the original (a node
+that ran with P2P off, or wrote the record while offline) and only an
+`openledger-*` line was edited, delete that block's `openledger-*` lines instead:
+the content id is unchanged, so the record is re-adopted as this node's own and
+everything that names it resolves again. A record you **delete** from the file
+is not gone either: peers re-supply it on the next anti-entropy round, because
+the mesh keeps what it accepted. Adoption is one-way: the file is how records
+get *into* this node, never how they leave it.
+
+**What no peer could hold is not served.** A peer adopts a transaction only when
+every parent it names is already in its ledger and the accounts it posts to are
+open, on its date, for its currencies. A record this node holds that fails either
+test — its parent was edited, deleted, restated or held as unparsable text; the
+`open` it relies on was removed, or is dated after it — would be refused by every
+replica that lacks it, and so would everything this node writes afterwards. Boot
+quarantines such records together with what descends from them, names each one
+and why in the log (*"quarantining a ledger record no fresh replica could hold"*,
+H-23), and keeps them in the file. On a mesh they come back by themselves: a peer
+that holds the missing parent re-supplies it, and then them. On a node no peer
+can help, restore the missing record from a backup, strip the `openledger-*`
+lines as above, or add the missing `open` dated no later than the first
+transaction on the account, and restart. Restating a record in a different form
+(a larger unit, a corrected body) gives it a new id, so what named the old id
+stays held; restate the chain, or join nodes by bootstrap (§Mesh identity).
 
 Three edits an editor makes by accident are caught the same way: a stray
 dedent, a byte-order mark glued to a posting, or a stray word inside a
@@ -884,7 +904,10 @@ of the history under them, so the edited record (quarantined a moment later) can
 be what they were first stamped against; the quarantine re-chooses the parents
 of every line not yet signed from what survives, and refuses — as written — a
 new line that can no longer stand without the quarantined record (one whose
-hand-typed parent it was, or a transaction on an account only it opened). And a
+hand-typed parent it was, or a transaction on an account only it opened). The
+new lines' `openledger-lamport` is stamped only after every signature has been
+checked, so an edited lamport line can no longer lift them above a value the
+mesh accepts. And a
 node that **enables signing over a history it wrote unsigned** finds that
 history quarantined at the first signing boot; delete the `openledger-*` lines
 from those blocks to re-adopt them as this node's own, signed, operator input.

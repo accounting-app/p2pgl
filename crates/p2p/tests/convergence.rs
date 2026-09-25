@@ -3045,8 +3045,10 @@ fn edited_own_record_scenario(
     std::fs::write(&path, edited).expect("write the edited .bean");
     let report = mesh.restart_like_gl_node(a, path.clone(), MESH_ID);
     let quarantined = mesh.replicas[a].svc.quarantined_count();
-    assert_eq!(
-        quarantined, 1,
+    // T84 / H-23 (decision (15)): with, when the edited record is not the
+    // latest, what names its original id — held until B re-supplies it.
+    assert!(
+        quarantined >= 1,
         "the edited record is quarantined (H-20): {report:?}"
     );
     let clock = mesh.replicas[a].svc.lamport_clock();
@@ -3113,9 +3115,9 @@ fn l87_an_edit_of_a_middle_own_record_neither_carries_the_clock_nor_reissues_a_p
 /// issued, held by every peer) then resumes the clock one below it, and the
 /// node's next write re-issues that `(author, lamport)` pair (M-18): B holds
 /// `(A, l3)` twice. Before T83 the clock resumed above the file's lamport.
-/// Fails at HEAD.
+/// Failed at `45014e9`. Since T84 the release counts an edited record's own
+/// lamport unless it lies 2^28 or more above what remains (decision (17)).
 #[test]
-#[ignore = "A6-1: after an adoption between the node's last two writes, the L-87 clock release resumes one below the edited record's issued lamport and the next write re-issues an (author, lamport) pair every peer holds (M-18)"]
 fn l87_the_clock_release_does_not_reissue_a_pair_a_peer_holds_after_a_body_edit() {
     let (clock, l3, l4, duplicates) = edited_own_record_scenario(9254, |text, _, _| {
         text.replace("\"r3\"", "\"r3 (typo fixed)\"")

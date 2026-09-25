@@ -35,49 +35,43 @@ items worth a line of code, and the carried partials (L-23, H-01).
 > changed.** The two pre-existing ignored cases (`h19_fresh_node_converges_after_a_maximal_legal_jump…`,
 > `h19_pre_t63_history_with_one_large_jump_is_joinable`) stay ignored by decision (1) of 2026-09-23.
 
-> **Decisions this backlog needs** (user), numbered on from (14) of 2026-09-24 and referenced from the tasks —
-> none taken yet: **(15)** T84 / H-23: a served transaction whose parent exists nowhere, or that fails I3/I9
-> against the surviving state, is **quarantined with its descendants** (the closure rule T81 chose) or **named
-> in a WARN** (the rule T79 (d) chose); one rule for both. **(16)** T84 / M-57: pending operator-input lamports
-> are **re-stamped at the clock release** or **stamped at finalize**. **(17)** T84 / L-97: the release counts an
-> edited record's own lamport unless it is implausible — bound `LAMPORT_GAP_WARN` (2^28) or `MAX_LAMPORT_ADVANCE`
-> (2^32) — or recovers the original from the journal / a peer; and whether a re-issued `(author, lamport)` pair
-> is rated Medium (M-18) or Low (L-67). **(18)** T85 / M-56: a hand `open` of a closure-orphaned account is
-> **refused** (L-77-style; the closure stays a fixed point) or the closure is **re-judged after operator input**
-> (the transactions are served once a hand `open` admits them); and whether `refused_history_closure` is applied
-> on the wire path. **(19)** T85 / L-101: the 1 MiB body cap **seeds the closure** at boot (record and
-> descendants leave local balances, loudly) or stays T51's load-and-serve with the H-23 WARN. **(20)** T85 /
-> L-110: a hand `open` whose account has a quarantined `open` is refused on the live path, or the two-`open`s
-> outcome is accepted and documented. **(21)** T86 / M-58: a `ResourceLimitExceeded` from `prepare_compaction`
-> **skips the L-13 reload** in both drivers (nothing was written; removes the startup/shutdown reload too) or the
-> reload stays and the fact is **re-measured after every install**; and whether M-58 keeps L-80's Low.
-> **(22)** T86 / M-59: a kept envelope with a parent the rebuild lacks **refuses the install** (memory ahead of
-> disk, `REFUSING`) or **keeps the rebuild's re-stamped copy**. **(23)** T86 / L-104: the floor's exemption keys
-> on "finalised" (author + lamport), making a signing-off node's hand line irrevocable after one boot. **(24)**
-> T87 / M-60: close the race with a **directory-ownership rule** (follow only when the link's directory is owned
-> by this uid and not group/world-writable), with **fd-based resolution** (`O_PATH|O_NOFOLLOW` + `fstat`), or
-> **retract decision (11)** and refuse links; and whether link chains and directory links are followed by design
-> or refused. **(25)** T87 / M-61: a journal beside the link **refuses boot** (H-15's precedent) or **warns**.
-> **(26)** T88 / M-62: **cap the uncharged residue per connection** (size — 1 MiB?) or give each peer an
-> uncharged allowance, or accept the L-90 trade and document the bound. **(27)** T88 / L-106: give the wire path
-> a **bounded per-peer suppression** of orphans whose only missing parent is permanently refused, or document the
-> per-tick cost. **(28)** T88 / L-107: **per-remote hint budget** or **evict-oldest**. **(29)** T88 / L-102:
-> re-calibrate `HONEST_FRAME_PEAK_MULTIPLE` to the densest admitted shape (≈15×) or **lower the legacy
-> posting-metadata ceiling to 1,024**. **(30)** T88 / L-103: cap `VerifyResult.quarantined` (1,000) and add
-> `quarantinedTotal: Int!` (schema addition). **(31)** T89 / L-96: `PLACEHOLDER_AUTHOR` counts as this node in
-> every own lookup once `set_author_id` has run, or `set_author_id` re-keys `boot_outside_dag_lamports["local"]`
-> only when at least one `"local"` DAG record verified as this node's. **(32)** T89 / L-99: a node **refuses to
-> author** while every checked signature failed (writes under a wrong domain are quarantined at the next correct
-> boot), or only skips the release. **(33)** T89 / L-113 and L-111: **reword only**, or distinguish "diagnosed"
-> (≥ 2^28) from "uncrossable" (≥ 2^32) in the WARN and the remedy. **(34)** T89 / L-109 and L-112: the live
-> path **strips** like boot or **quarantines** the block; the strip extends to posting level or quarantines
-> there. **(35)** Execution: one task per go-ahead, as decision (14).
+> **Decisions taken 2026-09-25** (user), numbered on from (14) of 2026-09-24, recorded once here and referenced
+> from the tasks. **(15)** T84 / H-23: a served transaction whose parent exists nowhere, or that fails I3/I9
+> against the surviving `AccountState`, is **quarantined with its descendants and named in a WARN** — the rule T81
+> chose, now the one rule for both (T79 (d)'s warn-only arm goes). **(16)** T84 / M-57: operator-input lamports
+> are **stamped in `finalize_operator_input`**, after every pass has settled the clock. **(17)** T84 / L-97: the
+> release counts an edited record's own lamport unless it lies **≥ 2^28 (`LAMPORT_GAP_WARN`)** above the
+> survivors; a re-issued pair stays rated **Low** (L-67's rating). **(18)** T85 / M-56: the closure judges each
+> transaction **with the peer's own predicate** (`check_account_open` + `check_currency_constraint_at`) against
+> the surviving state **after operator input is adopted** — a back-dated hand `open` that admits it frees it, a
+> late one does not; and `refused_history_closure` is applied **on the wire path too**. **(19)** T85 / L-101: the
+> 1 MiB body cap **seeds the closure** at boot (T51's load-and-serve for this cap goes). **(20)** T85 / L-110: the
+> live path **refuses** an `open` whose account has a quarantined `open`. **(21)** T86 / M-58: **both** — a
+> `ResourceLimitExceeded` from `prepare_compaction` skips the L-13 reload in `commit_inline` and gl-node's
+> `prepare_or_recover`, and every reload install re-measures the fact; M-58 stays **Medium**. **(22)** T86 /
+> M-59: a kept envelope whose parent the rebuild lacks **refuses the install** (`REFUSING`, memory kept).
+> **(23)** T86 / L-104: the floor's exemption is keyed on **"finalised"** (author and lamport stamped), not on the
+> signature. **(24)** T87 / M-60: a link is followed only when **its directory is owned by this uid and is not
+> group- or world-writable**; **link chains are refused**; a directory link in the path is followed by documented
+> policy. **(25)** T87 / M-61: a journal beside the link **refuses boot** (H-15's precedent). **(26)** T88 / M-62:
+> the uncharged residue is **capped at 1 MiB per connection**, then flushed. **(27)** T88 / L-106: **per-peer
+> suppression** of orphans whose only missing parent that peer had refused for a content reason. **(28)** T88 /
+> L-107: a **per-peer hint budget**. **(29)** T88 / L-102: **recalibrate** the honest-frame budget to ≈15× with
+> the densest admitted shape in the control; decision (6)'s 4,096 ceiling stays. **(30)** T88 / L-103: cap
+> `VerifyResult.quarantined` at **1,000** and add **`quarantinedTotal: Int!`**. **(31)** T89 / L-96:
+> `PLACEHOLDER_AUTHOR` **counts as this node in every own lookup** once `set_author_id` has run. **(32)** T89 /
+> L-99: when every checked signature failed, **skip the release and WARN** not to author until the domain or key
+> is fixed (the node still accepts writes). **(33)** T89 / L-113, L-111: keep the 2^28 threshold and
+> **distinguish "diagnosed" (below 2^32) from "needs a bootstrap join" (2^32 or more)**; name the author as the
+> one at the top of the gap, possibly the first honest record above a removed one. **(34)** T89 / L-109, L-112:
+> **strip everywhere** — on the live path as at boot, and at posting level. **(35)** Execution — **one task per
+> go-ahead**, as decision (14): full gate and revert-proofs, stop for the commit, ask before the next; T84 first.
 
 ## Priority order at a glance
 
 | # | Findings addressed | Sev | Effort | Status |
 |---|---|---|---|---|
-| T84 | H-23 + M-57 + L-97 — the served-set rule; the rebase and the release under it | **High** | S–M | ☐ |
+| T84 | H-23 + M-57 + L-97 — the served-set rule; the rebase and the release under it | **High** | S–M | ☑ |
 | T85 | M-56 + L-101 + L-110 — the closure judged as a peer would, on both paths | Med | S | ☐ |
 | T86 | M-58 + M-59 + L-104 + L-105 — the recovery reload keeps its facts and checks its parents | Med | S–M | ☐ |
 | T87 | M-60 + M-61 — the symlinked ledger: an atomic guard, every hop, the journal beside the link | Med | S | ☐ |
@@ -108,7 +102,8 @@ gate at HEAD with the extended files is ****1,336 passed, 0 failed, 12 ignored**
 
 ## Tier 1 — ship-blocker (the new High)
 
-### ☐ T84 — The served-set rule: a served record's parent must exist, the rebase must not build on one that does not, and operator input is stamped after the release (H-23, M-57, L-97) — S–M, decisions (15), (16), (17)
+### ☑ T84 — The served-set rule: a served record's parent must exist, the rebase must not build on one that does not, and operator input is stamped after the release (H-23, M-57, L-97) — S–M, decisions (15), (16), (17) taken
+> **Done 2026-09-25 (working tree, not committed).** All in `crates/ledger/src/service.rs`, plus README §Editing and §Upgrading, the CHANGELOG, gl-node's quarantine banner text, and the four invariant files. **(a) H-23, decision (15):** new `unservable_history(exempt)` asks the peer's two questions of every served transaction — every parent in the DAG (not merely "not in the quarantine"), and `validate_transaction` against the surviving `AccountState` (the exact call `stage_remote_directive` makes: I1, I2, I3, I9) — and adds every descendant (`children_of`); `quarantine_unservable_history` quarantines the result through `quarantine_out_of_dag` (kept in the file as loaded, H-08) with one WARN per record naming its reason ("its parent X is not served, which exists nowhere on this node / which is only in this node's quarantine", or the peer's validation error, or "it descends from X") and one summary WARN with the remedies. It runs **at boot after operator-input adoption** (a very old build's envelope-less `open`s are operator input and part of the accounts a peer judges against; the first placement, before adoption, quarantined every transaction of the golden fixture), **after the signature pass's quarantine and release**, and **after finalize's M-54 refusal**; operator input still pending is exempt (the rebuild rebases it). The T79 (d) warn-only function (`warn_about_served_children_of_quarantined_records`) is gone. **(b)** falls out of (a): a stranded head is quarantined before any hand line is stamped at boot, and again before the rebase in the pass, so no hand line is ever signed over one (X1 `c3j` at HEAD: J held, H signed over T1, a peer stages 5 of 5, fixed point). **(c) M-57, decision (16):** operator input adopted at boot gets a provisional lamport that no longer moves the clock (`provisional_stamp` in `adopt_file_directive`, boot path only; the live path is unchanged); `finalize_operator_input` stamps the real lamport in adoption order from the settled clock (a stamp past the ceiling quarantines the entry as written); `set_author_id` no longer re-stamps pending lines, it only raises the clock (L-67 holds through the finalize stamp). **(d) L-97, decision (17):** `release_clock_carried_by_edited_records` leaves pending operator input out of its floor and counts each edited record's own lamport unless it lies ≥ `LAMPORT_GAP_WARN` (2^28) above what remains; the INFO now says "a value no honest mesh reaches". **(e)** Reworded, existing log tags kept verbatim: the H-20 per-record WARN (restore from a peer or backup; strip the `openledger-*` lines of an envelope-only edit; deleting the block leaves its descendants held), the M-52 WARN and the closure WARN (restating/repairing gives a new id, the descendants stay held: repair the chain or join by bootstrap), gl-node's quarantine banner. README §Editing: the remedy paragraph, a new "What no peer could hold is not served" paragraph, the lamport sentence in "fixing and appending in one edit"; §Upgrading: the restate remedy. CHANGELOG: two *Ledger files* bullets amended, one new, the L-87 bullet amended, one *Security* bullet. **(f)** the new WARN names the vanished parent and whether it is quarantined or absent; there is no warn-only arm left. **(g)** `boot_fuzz.rs`: new oracle check 6 (`served_set_self_contained`, in `Checks::ALL`) — nothing served names a parent the node does not serve — so every operator and both proptest sweeps now judge the single-node property. **Acceptance:** un-ignored and green: `a1_1_…`, `a1_2_…` (fuzzer), `a4_2_…` ×2, `a4_3_…` (`exact_balances`), `l87_the_clock_release_does_not_reissue_a_pair…` (harness) — and `a4_1_…`, T85's case, which T84's rule also closes (it judges each transaction with the peer's own check after operator input, decision (18)'s rule). **New tests (1 + an oracle check):** `h23_a_hand_line_is_never_signed_over_a_served_record_whose_parent_vanished` (X1 `c3j` as a unit test); fuzzer check 6 and helper `assert_refused_with_descendants`. **Existing tests changed, by decision (15)/(16):** ledger — `test_boot_from_golden_fixture` (the fixture's "Pending refund" names the §3.3.3 worked-example id, a record the fixture does not hold: 15 served + 1 held), `l40_a_dangling_parent…` (the planted entry is held at boot instead of served as a head; the append and the acyclic reboot are asserted as before), `parent_fan_in_cap…` (the at-cap control now asserts "not refused for fan-in"; its fabricated parents make it an H-23 hold), `test_adversarial_parent_chain…` (the chain fixture gains its two `open`s; counts +2), `test_a_cycle_check_exhaustion…` (the refused directive's descendants are held with it; every record still on disk), the T79 (d) unit test renamed `h22_a_served_record_naming_a_quarantined_parent_is_quarantined_and_named`, and the L-67 doc comment; fuzzer — `op_m`, `op_q`, `op_r`, `op_s`, `op_u`, `op_ab`, the composite crash, the two-pass rebase and the edited-open cases (exact quarantine counts → "the refused records plus node-written transactions that depend on them"), `a1_d_…` (the child is held and named, not served), `a1_2_…` (its "still served" premise inverted, the parent picked by id); harness — `edited_own_record_scenario`'s "exactly one quarantined" relaxed to "at least the edited record". **Revert-proven (7, scratch copy of the working tree, each restored and compared equal):** R1 no boot-time rule → the four `a4_` cases, `a1_2`, `test_boot_from_golden_fixture`, `l40_*` fail; R2 no pass-time rule → `a1_d` and `h22_…_quarantined_and_named` fail; R1+R2 → `h23_*` fails (either site alone catches it); R3 no finalize stamp → `a1_1` and `l67_operator_input_gets_the_same_lamport…` fail; R4 edited lamports never counted → `l87_the_clock_release…` fails; R5 the release counts pending operator input → `a1_1` fails; R6 boot adoption moves the clock again → `l67_operator_input_gets_the_same_lamport…` fails. **Audit probes, re-run against this code:** X1 `c3j` above; X1 `c6a`/`c6b` `RE-ISSUED = false` (next stamp 8, T2's pair 6); X1 `c1`, `c2a`–`c2c`, `c3`, `c4`, `c7 i–iii`, `c8` fixed points as before (the one-slot clock difference across a reboot is identical on `45014e9`); A1 `strand` — every boot serves only what a fresh peer adopts (5 of 5), the strip-the-envelope remedy restores 8 of 8; A1 `lamport` — the hand line stamped at 8, not 5,000,000,002, B accepts everything; A4 `P1`–`P7` — upgraded equals fresh on every shape (`P5-late` held, `P5-early` served). **Cost:** one `validate_transaction` pass per boot (twice when the signature pass quarantines): 150,000 transactions boot in 3.44 s vs 3.17 s on `45014e9` (release, best of 3). **Gate:** clippy `-D warnings` and `fmt --check` clean; `cargo test --workspace --locked --no-fail-fast` **1,344 passed, 0 failed, 5 ignored** (gl-node 418, integration 8, ledger 573, exact_balances 31, property 10, p2p 187, boot_fuzz 48, convergence 26/4, decode_memory 7, m50_wire 10/1, property 5, security 21); the 5 ignored are decision (1)'s two joins and the T85/T88/T89 cases A3-1, A6-2, A6-3. **Behaviour changes:** a node no longer serves a transaction whose parent it does not serve, or that the accounts it serves do not admit — it is quarantined with its descendants, named, kept in the file, and returns by itself once a peer re-supplies the parent (a deleted, restated, edited or text-held record's descendants, a history transaction on an account whose `open` is gone or dated after it, a planted dangling pointer); operator input is stamped at finalisation, so an edited lamport beside a hand line no longer lifts it; a narration fix no longer lets the next write re-issue the edited record's lamport; as a side effect the L-99 walk to 0 on a domain mismatch is gone (every failed signature's lamport is plausible and counted — T89 still owns the WARN). **Residuals:** M-56's same-boot half stays T85's — a hand `open` adopted at boot frees a closure-held transaction only at the next boot (X1 `c2d`, not a fixed point across the first restart), and the wire path does not check `refused_history_closure`; a `balance`/`price`/`note`/`document`/`pad` on an account no served `open` opens stays served (peers insert them unchecked too); a same-date child placed before its hand parent is refused at boot 1 and adopted at boot 2 (L-108, T89); a library caller that appends before `finalize_operator_input` gets a child whose lamport is below its pending parent's final stamp (gl-node and `prepare` always finalise first); the new rule costs one validation pass per boot.
 - **Why:** **H-23.** T79 (d)'s WARN ([service.rs:4377-4410](../crates/ledger/src/service.rs#L4377)) asks
   `self.quarantined.contains_key(parent)`; T81's closure is seeded only by what *this* boot refused
   (`content_rule_refused` [:3608](../crates/ledger/src/service.rs#L3608), `amount_cap_refused` [:3375](../crates/ledger/src/service.rs#L3375));
@@ -170,7 +165,7 @@ gate at HEAD with the extended files is ****1,336 passed, 0 failed, 12 ignored**
 
 ## Tier 2 — the closure, the recovery reload, the symlinked ledger, the cost bounds
 
-### ☐ T85 — The closure judged as a peer would, on both paths (M-56, L-101, L-110) — S, decisions (18), (19), (20)
+### ☐ T85 — The closure judged as a peer would, on both paths (M-56, L-101, L-110) — S, decisions (18), (19), (20) taken
 - **Why:** **M-56.** `quarantine_descendants_of_refused_history` runs at [:3928](../crates/ledger/src/service.rs#L3928)
   before `adopt_operator_input_at_boot` ([:3932](../crates/ledger/src/service.rs#L3932)); its account term
   ([:4908-4919](../crates/ledger/src/service.rs#L4908)) drops an account when *any* `Open` for it survives — no
@@ -201,7 +196,7 @@ gate at HEAD with the extended files is ****1,336 passed, 0 failed, 12 ignored**
   X1 `c2d` fixed point holds and `c8b`'s live stage refuses; A4 `P5-late` fresh holds 5 of 5 or the upgraded
   node serves 3; A1 `reopen` per decision (20). Bug-catch proof for (a), (b), (c) separately.
 
-### ☐ T86 — The recovery reload keeps its facts and checks its parents (M-58, M-59, L-104, L-105) — S–M, decisions (21), (22), (23)
+### ☐ T86 — The recovery reload keeps its facts and checks its parents (M-58, M-59, L-104, L-105) — S–M, decisions (21), (22), (23) taken
 - **Why:** **M-58.** `boot_with` measures `canonical_over_cap` only with no operator input pending
   ([:3939-3944](../crates/ledger/src/service.rs#L3939)); the startup compaction hits `prepare`'s L-80 refusal
   ([:5861-5871](../crates/ledger/src/service.rs#L5861)), which `commit_inline` ([:6884-6905](../crates/ledger/src/service.rs#L6884))
@@ -242,7 +237,7 @@ gate at HEAD with the extended files is ****1,336 passed, 0 failed, 12 ignored**
   A5 `a5_p3` — `REFUSING`; A5 `a5_p4` — `Corrupt` at 3 and 5 header bytes. New unit tests for each with
   bug-catch proofs; `l80_*`, `l81_*`, `l93_*`, `l85_*`, `m46_*`, `m49_*`, `t78_*` unchanged.
 
-### ☐ T87 — The symlinked ledger: an atomic guard, every hop, the journal beside the link (M-60, M-61) — S, decisions (24), (25)
+### ☐ T87 — The symlinked ledger: an atomic guard, every hop, the journal beside the link (M-60, M-61) — S, decisions (24), (25) taken
 - **Why:** **M-60.** `resolve_ledger_path` ([journal.rs:164-190](../crates/ledger/src/journal.rs#L164)) reads
   the first hop's owner with `symlink_metadata` ([:165](../crates/ledger/src/journal.rs#L165)) and then
   `canonicalize`s ([:189](../crates/ledger/src/journal.rs#L189)) — two walks; whoever can write the directory
@@ -265,7 +260,7 @@ gate at HEAD with the extended files is ****1,336 passed, 0 failed, 12 ignored**
   directory links per decision (24); X3 `k4f` — boot refuses or warns and the acked record is served after the
   move; `l84_*` unchanged; unit tests for the hop rule and the journal-beside-the-link arm.
 
-### ☐ T88 — Replication cost bounds: the uncharged hold, the doomed subtree, the hint table, the proxies (M-62, L-106, L-107, L-102, L-103) — S–M, decisions (26)–(30)
+### ☐ T88 — Replication cost bounds: the uncharged hold, the doomed subtree, the hint table, the proxies (M-62, L-106, L-107, L-102, L-103) — S–M, decisions (26)–(30) taken
 - **Why:** **M-62.** Phase 1 flushes on `PHASE_ONE_WEIGHT_BUDGET` alone ([anti_entropy_alpn.rs:1894](../crates/gl-node/src/anti_entropy_alpn.rs#L1894))
   and the byte charge is best-effort ([:1918](../crates/gl-node/src/anti_entropy_alpn.rs#L1918)); nothing bounds
   the uncharged sum across connections or peers ([connection_limiter.rs:161-166](../crates/gl-node/src/connection_limiter.rs#L161)):
@@ -302,7 +297,7 @@ gate at HEAD with the extended files is ****1,336 passed, 0 failed, 12 ignored**
 
 ## Tier 3 — diagnostics and texts
 
-### ☐ T89 — The placeholder in every own lookup, WARNs judged once and after the pass, the texts (L-96, L-98, L-99, L-100, L-108, L-109, L-111, L-112, L-113, §5) — S, decisions (31)–(34)
+### ☐ T89 — The placeholder in every own lookup, WARNs judged once and after the pass, the texts (L-96, L-98, L-99, L-100, L-108, L-109, L-111, L-112, L-113, §5) — S, decisions (31)–(34) taken
 - **Why / change, one line each:**
   - **L-96** — `release_clock_carried_by_edited_records` ([service.rs:4561](../crates/ledger/src/service.rs#L4561)),
     `highest_lamport_author` ([:5526-5545](../crates/ledger/src/service.rs#L5526)) and `set_author_id`

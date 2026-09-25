@@ -2923,15 +2923,14 @@ pub struct LedgerService {
     /// service through [`Self::set_signer`] after the node has loaded its key
     /// — after `boot`, and after `set_author_id` has replaced the placeholder
     /// author `gl-node` boots with. So boot adopts (the DAG, the account
-    /// state, the parents and the lamport are all fixed here, where every
-    /// caller that asserts on `directive_count` after boot expects them) and
-    /// records the stored ids; [`Self::finalize_operator_input`] then, once
-    /// the identity is known, writes the real author id over the placeholder
-    /// and signs. Nothing in the signed message (`content_id`,
-    /// `is_transaction`, `parents`, `lamport`) changes between the two steps
-    /// except the one re-stamp [`Self::set_author_id`] may make (L-67: the
-    /// lamport a boot under the real author would have given), so the
-    /// signature covers exactly what that boot would have stamped.
+    /// state and the parents are fixed here, where every caller that asserts
+    /// on `directive_count` after boot expects them; the lamport written here
+    /// is a placeholder that does not move the clock) and records the stored
+    /// ids; [`Self::finalize_operator_input`] then, once the identity is known
+    /// and the signature pass has settled the clock, stamps the lamport (T84 /
+    /// M-57, decision (16)), writes the real author id over the placeholder
+    /// and signs. The parents may be re-chosen in between by the H-22 rebase;
+    /// the signature covers what finalisation leaves.
     ///
     /// `gl-node` calls `finalize_operator_input` right after `set_signer` and
     /// before the startup compaction and the P2P tasks; [`Self::prepare`]
@@ -2970,10 +2969,10 @@ pub struct LedgerService {
     /// One entry per distinct author outside the DAG; re-derived by every
     /// boot, so an L-13 reload replaces it.
     boot_outside_dag_lamports: BTreeMap<String, u64>,
-    /// The clock value boot resumed from, before it stamped any operator
-    /// input (L-67, T78): what [`Self::set_author_id`] compares the new
-    /// author's out-of-DAG high against to re-stamp that input exactly as a
-    /// boot under the new author would have.
+    /// The clock value boot resumed from (L-67, T78): what
+    /// [`Self::set_author_id`] compares the new author's out-of-DAG high
+    /// against, raising the clock exactly as a boot under the new author would
+    /// have. Operator input is stamped from the result at finalisation (T84).
     boot_clock_base: u64,
 
     // ── T44: append-only persistence ──────────────────────────────────────
@@ -3369,8 +3368,10 @@ impl LedgerService {
                                  the DAG, NOT in any balance, and with it every record that \
                                  descends from it (named below): no peer accepts the block, so \
                                  nothing built on it can replicate. A history written before T65 \
-                                 with base-unit amounts looks like this; restate the amounts in \
-                                 a larger unit, or join nodes by bootstrap (M-52, M-50, H-08)"
+                                 with base-unit amounts looks like this. Restating the amount in \
+                                 a larger unit gives the record a new id, so what descends from it \
+                                 (whose parents name the old id) stays held (H-23): restate the \
+                                 chain, or join nodes by bootstrap (M-52, M-50, H-08)"
                             );
                             amount_cap_refused.extend(ids);
                             continue;
@@ -3931,6 +3932,14 @@ impl LedgerService {
         // place. Same path as a live hand edit, same order boot itself used.
         service.adopt_operator_input_at_boot(operator_input);
 
+        // T84 / H-23: and what no fresh replica could hold for any other
+        // reason — a parent served nowhere, an account that does not admit it.
+        // After the operator input, whose envelope-less `open`s (a very old
+        // build's, or the operator's) are part of the accounts a peer judges
+        // against; the rebuild re-chooses the parents of any operator input
+        // that named what it takes out, so no hand line is signed over it.
+        service.quarantine_unservable_history();
+
         // L-64 (T78): a process start says so when the canonical form will not
         // fit. With operator input pending the check waits for
         // `finalize_operator_input`, whose author and signature are part of
@@ -4188,9 +4197,12 @@ impl LedgerService {
     /// * `openledger-signature` — added, never replaced, and only when a
     ///   signer is installed. Without one the entry stays unsigned, which is
     ///   precisely what [`Self::reconcile_content`] does without a signer.
-    /// * Nothing else. Parents and lamport are the DAG's edges and this
-    ///   node's clock and were fixed at boot; the signed message is built
-    ///   from them exactly as `sign_adopted_entry` builds it.
+    /// * `openledger-lamport` — stamped here, in adoption order, from the
+    ///   clock the signature pass has settled (T84 / M-57, decision (16));
+    ///   boot's stamp is a placeholder that never moved the clock.
+    /// * Nothing else. Parents are the DAG's edges, chosen at boot and re-chosen
+    ///   by the H-22 rebase; the signed message is built from them exactly as
+    ///   `sign_adopted_entry` builds it.
     ///
     /// An in-place edit of a directive that is on disk in raw form cannot be
     /// expressed by an append (the G-Set drops a journal record whose id it
@@ -4236,6 +4248,46 @@ impl LedgerService {
                 );
             }
             self.quarantine_out_of_dag(&foreign);
+            // T84 / H-23: history on an account only a refused entry opened.
+            self.quarantine_unservable_history();
+        }
+        // T84 / M-57, decision (16): the lamport, stamped here for the first
+        // time — boot's was a placeholder that never moved the clock — from
+        // the clock the signature pass and the L-87 release have settled, in
+        // adoption order. Before T84 boot stamped it above whatever the file's
+        // edited lamports had carried the clock to, and the release, seeing
+        // it, released nothing: a hand line appended beside an edited lamport
+        // was signed above the edit and every peer refused it.
+        let pending: Vec<String> = self.unsigned_operator_input.clone();
+        let mut unstampable: BTreeSet<String> = BTreeSet::new();
+        let mut restamped: Vec<Directive> = Vec::new();
+        for content_id in &pending {
+            let lamport = match self.next_stamp() {
+                Ok(lamport) => lamport,
+                Err(error) => {
+                    warn!(
+                        id = %content_id,
+                        %error,
+                        file = %self.file_path.display(),
+                        "quarantining operator input, kept in the file as written: this node's \
+                         clock cannot stamp it without passing the Lamport ceiling (H-12, H-08)"
+                    );
+                    unstampable.insert(content_id.clone());
+                    continue;
+                }
+            };
+            if let Some(directive) = self.dag.get_mut(content_id) {
+                directive_metadata_mut(directive)
+                    .insert(ENVELOPE_KEY_LAMPORT.to_owned(), lamport.to_string());
+                self.lamport_clock = lamport;
+                restamped.push(directive.clone());
+            }
+        }
+        for directive in &restamped {
+            self.read_model.reindex_directive(directive);
+        }
+        if !unstampable.is_empty() {
+            self.quarantine_out_of_dag(&unstampable);
         }
         let ids = std::mem::take(&mut self.unsigned_operator_input);
         // Every file-spelled author left names this node (the rest were
@@ -4341,7 +4393,6 @@ impl LedgerService {
     /// boot is never refused. Returns how many directives were quarantined.
     pub fn verify_own_history(&mut self) -> usize {
         let quarantined = self.verify_history_pass();
-        self.warn_about_served_children_of_quarantined_records();
         if !self.unverified_history.is_empty() {
             warn!(
                 unverified = self.unverified_history.len(),
@@ -4359,56 +4410,119 @@ impl LedgerService {
         quarantined
     }
 
-    /// Say so when a record this node serves names a parent that is only in
-    /// its quarantine (T79 / H-22, item (d)).
+    /// The served records no fresh replica could hold, each with the reason a
+    /// peer would give, and every record that descends from them (T84 / H-23,
+    /// decision (15)).
     ///
-    /// No peer can adopt such a record — a quarantined record is never
-    /// served — nor anything that descends from it. Since T79 boot never
-    /// signs operator input over such a parent, so this finds what an older
-    /// build left in the file (a hand line signed over an edited record's
-    /// id), or a signed record whose parent this boot quarantined for another
-    /// reason (history written before signing was enabled). A WARN, not a
-    /// quarantine: the records are this node's acknowledged history, often
-    /// with long chains of descendants, and quarantining them would take all
-    /// of that out of local balances on the strength of what the mesh lacks —
-    /// the operator decides (restore the parent, or rebuild this node by the
-    /// bootstrap join). One pass over the DAG, only when something is
-    /// quarantined.
-    fn warn_about_served_children_of_quarantined_records(&self) {
-        if self.quarantined.is_empty() {
-            return;
-        }
-        let mut stranded: Vec<(&str, &str)> = Vec::new();
+    /// A peer adopts a transaction only when every parent it names is already
+    /// in its DAG (`require_parents`) and it validates against the account
+    /// state (`validate_transaction`: I1, I2, I3, I9) — the two checks
+    /// [`Self::stage_remote_directive`] applies. A record this node serves that
+    /// fails either is refused by every replica that lacks it, and so is
+    /// everything written after it: its descendants wait on a parent that
+    /// never arrives. T79 (d) asked only "is the parent in my quarantine", and
+    /// T81 only "did this boot refuse it under a content rule"; a parent whose
+    /// id vanished under an edit, a block held as text with no id, a record
+    /// the operator deleted, and an account whose `open` is gone or does not
+    /// admit the transaction are in neither. This asks the peer's question.
+    ///
+    /// Judged against the DAG and account state as they stand — call it once
+    /// the history the node will serve is settled. `exempt` is operator input
+    /// still awaiting finalisation: its parents are re-chosen by the rebase
+    /// and its body was validated at adoption, so it is neither a seed nor a
+    /// member here (the rebuild that quarantines the result rebases it).
+    fn unservable_history(&self, exempt: &HashSet<String>) -> BTreeMap<String, String> {
+        let mut unservable: BTreeMap<String, String> = BTreeMap::new();
         for content_id in self.dag.ids() {
+            if exempt.contains(content_id) {
+                continue;
+            }
             let Some(Directive::Transaction(txn)) = self.dag.get(content_id) else {
                 continue;
             };
             if let Some(parent) = txn
                 .parent_ids()
                 .into_iter()
-                .find(|parent| self.quarantined.contains_key(*parent))
+                .find(|parent| self.dag.get(parent).is_none())
             {
-                stranded.push((content_id, parent));
+                let whereabouts = if self.quarantined.contains_key(parent) {
+                    "which is only in this node's quarantine"
+                } else {
+                    "which exists nowhere on this node"
+                };
+                unservable.insert(
+                    content_id.to_owned(),
+                    format!("its parent {parent} is not served, {whereabouts}"),
+                );
+            } else if let Err(error) = validate_transaction(txn, &self.accounts) {
+                unservable.insert(
+                    content_id.to_owned(),
+                    format!("a peer refuses it against the accounts this node serves: {error}"),
+                );
             }
         }
-        if stranded.is_empty() {
-            return;
+        let mut frontier: Vec<String> = unservable.keys().cloned().collect();
+        while let Some(id) = frontier.pop() {
+            let children: Vec<String> = self
+                .dag
+                .children_of(&id)
+                .map(<[String]>::to_vec)
+                .unwrap_or_default();
+            for child in children {
+                if exempt.contains(&child) || unservable.contains_key(&child) {
+                    continue;
+                }
+                unservable.insert(child.clone(), format!("it descends from {id}"));
+                frontier.push(child);
+            }
         }
-        stranded.sort_unstable();
+        unservable
+    }
+
+    /// Quarantine what [`Self::unservable_history`] finds, naming every record
+    /// and its reason (T84 / H-23, decision (15)). Kept in the file as loaded,
+    /// out of the DAG and every balance, like every other quarantine (H-08);
+    /// operator input still pending is rebased by the rebuild onto what stays.
+    ///
+    /// A peer that holds the missing parent re-supplies it and then these
+    /// records (they are not in this node's DAG, so it wants them), which
+    /// enter the DAG as ordinary inserts: on a mesh this heals by itself. On a
+    /// node no peer can help, the remedy is in the file. Returns how many were
+    /// quarantined.
+    fn quarantine_unservable_history(&mut self) -> usize {
+        let exempt: HashSet<String> = self.unsigned_operator_input.iter().cloned().collect();
+        let unservable = self.unservable_history(&exempt);
+        if unservable.is_empty() {
+            return 0;
+        }
+        for (content_id, reason) in &unservable {
+            warn!(
+                id = %content_id,
+                reason = %reason,
+                file = %self.file_path.display(),
+                "quarantining a ledger record no fresh replica could hold — kept in the file \
+                 as loaded, kept out of the DAG and every balance, NOT served (H-23, H-08)"
+            );
+        }
+        let ids: BTreeSet<String> = unservable.into_keys().collect();
+        self.unverified_history.retain(|id| !ids.contains(id));
         warn!(
-            count = stranded.len(),
-            sample = %stranded
-                .iter()
-                .take(RECOVERY_MISSING_SAMPLE)
-                .map(|(child, parent)| format!("{child}->{parent}"))
-                .collect::<Vec<_>>()
-                .join(", "),
+            quarantined = ids.len(),
+            ids = %ids.iter().cloned().collect::<Vec<_>>().join(", "),
             file = %self.file_path.display(),
-            "ledger records this node serves name a parent that is only in its quarantine; no \
-             peer can adopt them or anything written after them. Restore the quarantined \
-             parent from a peer's copy of the ledger, or rebuild this node by the bootstrap \
-             join (H-22)"
+            "ledger records QUARANTINED because no peer could adopt them: a parent this node \
+             does not serve, or a transaction the accounts it serves do not admit, and what \
+             descends from them. Serving them would make everything this node writes \
+             afterwards unadoptable by every peer. If a peer holds the missing parent, it \
+             re-supplies it and these records return by themselves. If none does: restore the \
+             missing record from a backup; or, for this node's own record whose envelope \
+             lines were edited, delete that block's openledger-* lines so it is re-adopted \
+             under the same id; or add the missing open, dated no later than the first \
+             transaction on the account; then restart. Otherwise rebuild this node by the \
+             bootstrap join (H-23)"
         );
+        self.quarantine_out_of_dag(&ids);
+        ids.len()
     }
 
     /// The pass behind [`Self::verify_own_history`], without the
@@ -4485,8 +4599,11 @@ impl LedgerService {
                 file = %self.file_path.display(),
                 "quarantining a ledger-file directive whose signature this node cannot \
                  accept — kept in the file as loaded, kept out of the DAG, NOT served; \
-                 restore the original line from a peer's copy of the ledger, or delete the \
-                 edited block (H-20, H-08)"
+                 restore the original line from a peer's copy of the ledger or a backup. If no \
+                 peer holds the original and only an openledger-* line was edited, delete that \
+                 block's openledger-* lines instead, so it is re-adopted as this node's own under \
+                 the same id; deleting the block leaves what descends from it held (H-23) \
+                 (H-20, H-08)"
             );
         }
         // T80 (0924 §5): every signature this pass checked failed — not
@@ -4518,6 +4635,11 @@ impl LedgerService {
         self.signature_quarantined_total += ids.len();
         self.quarantine_out_of_dag(&ids);
         self.release_clock_carried_by_edited_records(&edited);
+        // T84 / H-23: a signed record whose parent the pass just took out is a
+        // record no peer lacking that parent can adopt; it goes too, with what
+        // descends from it, and the operator input still pending is rebased
+        // away from all of them.
+        self.quarantine_unservable_history();
         warn!(
             quarantined = ids.len(),
             verified,
@@ -4538,32 +4660,43 @@ impl LedgerService {
         self.signature_quarantined_total
     }
 
-    /// Lower the clock to what boot would have resumed at without `edited` —
-    /// records the signature pass quarantined because their signature does
-    /// not verify (T83 / L-87).
+    /// Lower the clock to what boot would have resumed at without the edited
+    /// lamports in `edited` — records the signature pass quarantined because
+    /// their signature does not verify (T83 / L-87; T84 / M-57, L-97).
     ///
     /// Boot folds every enveloped record into the clock before any signature
     /// is checked, so an own record whose lamport line was edited to ~2^32
     /// carried the clock there; quarantined, it no longer does anything else,
     /// but the node's next writes would carry the jump and the mesh would
-    /// follow. Its edited lamport was never issued by this node, so it is not
-    /// a pair M-18 protects. What stays counted is everything else boot
-    /// counts: every lamport the DAG still holds (any author), this node's
-    /// own records in the quarantine for any other reason, and its own
-    /// records boot saw outside the DAG. The original lamport of the edited
-    /// record was stamped above what the node held then — every such record
-    /// is still counted — so the next stamp stays above it. Never raises the
-    /// clock; a no-op when `edited` is empty.
+    /// follow. What stays counted is everything else boot counts: every
+    /// lamport the DAG still holds (any author) **except operator input still
+    /// awaiting finalisation** — it was never issued, and
+    /// [`Self::finalize_operator_input`] stamps it from the clock this leaves
+    /// (M-57: counting its boot stamp pinned the clock above the edit) — this
+    /// node's own records in the quarantine for any other reason, its own
+    /// records boot saw outside the DAG, **and each edited record's own
+    /// lamport unless it lies [`LAMPORT_GAP_WARN`] or more above all of that**
+    /// (decision (17)). An edited record's lamport is usually the one this
+    /// node issued — a narration fix leaves the lamport line alone, and the
+    /// record may sit more than one above what remains (the first stamp after
+    /// a restart, or after an adoption, both skip a value) — so it is a pair
+    /// M-18 protects (L-97); only a jump no honest mesh makes is released.
+    /// Never raises the clock; a no-op when `edited` is empty.
     fn release_clock_carried_by_edited_records(&mut self, edited: &BTreeSet<String>) {
         if edited.is_empty() {
             return;
         }
         let own = self.author_id.clone();
-        let highest = self
+        let pending: HashSet<&str> = self
+            .unsigned_operator_input
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let remaining = self
             .dag
-            .directives()
-            .into_iter()
-            .filter_map(Directive::lamport_clock)
+            .ids()
+            .filter(|id| !pending.contains(id))
+            .filter_map(|id| self.dag.get(id).and_then(Directive::lamport_clock))
             .chain(
                 self.quarantined
                     .iter()
@@ -4574,6 +4707,13 @@ impl LedgerService {
             .chain(self.boot_outside_dag_lamports.get(&own).copied())
             .max()
             .unwrap_or(0);
+        let plausible_edited = edited
+            .iter()
+            .filter_map(|id| self.quarantined.get(id).and_then(Directive::lamport_clock))
+            .filter(|lamport| *lamport < remaining.saturating_add(LAMPORT_GAP_WARN))
+            .max()
+            .unwrap_or(0);
+        let highest = remaining.max(plausible_edited);
         let resume = if highest > 0 {
             highest.saturating_add(1)
         } else {
@@ -4585,8 +4725,9 @@ impl LedgerService {
                 to = resume,
                 file = %self.file_path.display(),
                 "the clock boot resumed at was carried by a record quarantined because its \
-                 signature does not verify (an edited lamport line); it resumes above what \
-                 remains instead, so this node's next writes do not carry the edit (L-87)"
+                 signature does not verify, whose lamport line was edited to a value no honest \
+                 mesh reaches; it resumes above what remains instead, so this node's next \
+                 writes do not carry the edit (L-87, M-57)"
             );
             self.lamport_clock = resume;
         }
@@ -4959,8 +5100,9 @@ impl LedgerService {
             "quarantining every record that descends from a ledger record no peer accepts — \
              kept in the file, kept out of the DAG and every balance: nothing built on a \
              refused record can replicate, so serving it would leave this node and every \
-             fresh replica with different ledgers. Repair the refused record, or join nodes \
-             by bootstrap (M-51, M-52, H-08)"
+             fresh replica with different ledgers. A repair that changes the refused record's \
+             body gives it a new id, and what descends from it (whose parents name the old id) \
+             stays held (H-23): repair the chain, or join nodes by bootstrap (M-51, M-52, H-08)"
         );
         self.quarantine_out_of_dag(&closure);
     }
@@ -7361,6 +7503,10 @@ impl LedgerService {
         // pair, M-18), and a signature under a freshly stamped lamport is
         // stale by construction.
         let needs_stamp = Self::is_operator_input(&directive);
+        // T84 / M-57, decision (16): boot's operator input is stamped for real
+        // in `finalize_operator_input`, after every pass has settled the clock;
+        // the lamport written here is a placeholder that does not move it.
+        let provisional_stamp = needs_stamp && matches!(path, AdoptionPath::Boot);
 
         // M-54 (T79): operator input is this node's own authorship. An entry
         // whose file-spelled `openledger-author` names another node cannot be
@@ -7634,8 +7780,14 @@ impl LedgerService {
                     match self.dag.insert(final_directive.clone(), false) {
                         Ok(InsertResult::Inserted { .. }) => {
                             // L-55: adopted, so the clock moves — and only now.
+                            // T84 / M-57, decision (16): except for operator
+                            // input adopted at boot, whose stamp here is
+                            // provisional — `finalize_operator_input` stamps
+                            // it from the clock the signature pass settles.
                             let clock_before = self.lamport_clock;
-                            self.lamport_clock = next_lamport;
+                            if !provisional_stamp {
+                                self.lamport_clock = next_lamport;
+                            }
                             self.warn_if_adoption_opens_a_lamport_gap(
                                 clock_before,
                                 final_directive.lamport_clock(),
@@ -7715,9 +7867,11 @@ impl LedgerService {
             // event under the content id the DAG assigned (M-09).
             match self.dag.insert(directive.clone(), false) {
                 Ok(InsertResult::Inserted { .. }) => {
-                    // L-55: see the transaction arm.
+                    // L-55, T84: see the transaction arm.
                     let clock_before = self.lamport_clock;
-                    self.lamport_clock = next_lamport;
+                    if !provisional_stamp {
+                        self.lamport_clock = next_lamport;
+                    }
                     self.warn_if_adoption_opens_a_lamport_gap(
                         clock_before,
                         directive.lamport_clock(),
@@ -8025,13 +8179,13 @@ impl LedgerService {
     /// folded exactly as boot would have folded it:
     ///
     /// * the clock is raised to resume above it;
-    /// * operator input boot adopted and has not yet been finalised
-    ///   ([`Self::finalize_operator_input`] — unsigned, in memory only) is
-    ///   re-stamped by the same shift, so each record carries the lamport a
-    ///   boot under the real author — an L-13 reload — gives it, and the
-    ///   envelope the mesh sees does not depend on whether a startup
-    ///   compaction ever failed. Parents are untouched; the shift is uniform,
-    ///   so every child stays above its parents.
+    /// * operator input boot adopted and has not yet been finalised is stamped
+    ///   from that clock by [`Self::finalize_operator_input`] (T84 / M-57,
+    ///   decision (16)), so each record carries the lamport a boot under the
+    ///   real author — an L-13 reload — gives it, and the envelope the mesh
+    ///   sees does not depend on whether a startup compaction ever failed.
+    ///   (T78 re-stamped it here by the same shift; stamping at finalisation
+    ///   subsumes that.)
     ///
     /// Nothing moves when boot already counted the value (booted with this
     /// author) or the DAG already carries the clock above it. A shift that
@@ -8054,45 +8208,13 @@ impl LedgerService {
         if resume <= self.boot_clock_base {
             return;
         }
-        let shift = resume - self.boot_clock_base;
         self.boot_clock_base = resume;
-
-        let mut restamp: Vec<(String, u64)> = Vec::new();
-        for content_id in &self.unsigned_operator_input {
-            if let Some(lamport) = self.dag.get(content_id).and_then(Directive::lamport_clock) {
-                restamp.push((content_id.clone(), lamport.saturating_add(shift)));
-            }
-        }
-        let highest = restamp
-            .iter()
-            .map(|(_, lamport)| *lamport)
-            .max()
-            .unwrap_or(0);
-        if !restamp.is_empty() && !lamport_value_is_legal(highest) {
-            warn!(
-                author = %self.author_id,
-                own_high,
-                shift,
-                "this node's own records outside the DAG put its clock so high that the \
-                 operator input adopted at boot cannot be re-stamped above them without passing \
-                 the Lamport ceiling; it keeps its boot stamp, and this node will refuse to \
-                 author (L-67, H-12)"
-            );
-            restamp.clear();
-        }
-        let mut reindex: Vec<Directive> = Vec::new();
-        for (content_id, lamport) in &restamp {
-            if let Some(directive) = self.dag.get_mut(content_id) {
-                directive_metadata_mut(directive)
-                    .insert(ENVELOPE_KEY_LAMPORT.to_owned(), lamport.to_string());
-                reindex.push(directive.clone());
-            }
-        }
-        for directive in &reindex {
-            self.read_model.reindex_directive(directive);
-        }
+        // T84 / M-57, decision (16): operator input adopted at boot is stamped
+        // by `finalize_operator_input` from this clock, so raising the clock is
+        // all L-67 needs here — the re-stamp of its placeholder lamports that
+        // lived here is gone with them.
         let before = self.lamport_clock;
-        self.lamport_clock = self.lamport_clock.max(resume).max(highest);
+        self.lamport_clock = self.lamport_clock.max(resume);
         // L-91 (T80): boot warns when the next stamp will refuse, but under
         // the placeholder author it could not count this node's own records
         // outside the DAG — they are folded only here. Same predicates as
@@ -8131,7 +8253,6 @@ impl LedgerService {
                 author = %self.author_id,
                 own_high,
                 lamport_clock = self.lamport_clock,
-                restamped = restamp.len(),
                 "this node's own records outside the DAG (quarantined, or held as unparsable \
                  text) carry lamports above the clock boot resumed at under its placeholder \
                  author; the clock now resumes above them so no (author, lamport) pair is \
@@ -8812,7 +8933,12 @@ mod tests {
         let path = test_file_path();
         std::fs::write(&path, fixture).unwrap();
         let svc = LedgerService::boot(path.clone(), "peer-1".to_owned()).unwrap();
-        assert_eq!(svc.directive_count(), 16);
+        // T84 / H-23: 16 records, one of which ("Pending refund") names the
+        // §3.3.3 worked example's id as its parent — a record this fixture does
+        // not hold, so no peer could adopt it. Held, not served.
+        assert_eq!(svc.directive_count(), 15);
+        assert_eq!(svc.quarantined_count(), 1);
+        assert!(transaction_named(&svc, "Pending refund").is_none());
         assert!(svc.accounts().is_open("Assets:Cash"));
         assert!(!svc.accounts().is_open("Expenses:Food")); // closed in fixture
         std::fs::remove_file(path).ok();
@@ -9003,6 +9129,9 @@ mod tests {
     /// Every id is computable offline — parents live in the envelope, which the
     /// content hash excludes — so an attacker (or a careless merge) can write
     /// this file without running the node.
+    /// The two `open`s every [`chain_file`] carries (T84).
+    const CHAIN_OPENS: usize = 2;
+
     fn chain_file(count: usize, decoy_parents: Option<usize>) -> String {
         fn link(index: usize, parents: &str) -> Transaction {
             let mut metadata = BTreeMap::new();
@@ -9051,7 +9180,13 @@ mod tests {
             .map(|index| compute_content_id(&Directive::Transaction(link(index, ""))))
             .collect();
 
-        let mut directives: Vec<Directive> = Vec::with_capacity(count + 1);
+        // T84 / H-23: the two accounts the links post to are opened, as on any
+        // ledger a peer could adopt (the opens are the only additions; every
+        // count below adds CHAIN_OPENS).
+        let mut directives: Vec<Directive> = vec![
+            open_directive("Assets:Cash", &["USD"]),
+            open_directive("Equity:Opening", &[]),
+        ];
         if let Some(parent_count) = decoy_parents {
             // The decoy, dated earliest so it is inserted first.
             let named = &ids[..parent_count.min(ids.len())];
@@ -9112,7 +9247,7 @@ mod tests {
         const CEILING: std::time::Duration = std::time::Duration::from_secs(120);
 
         let (honest_elapsed, honest_count) = time_boot(&chain_file(LINKS, None));
-        assert_eq!(honest_count, LINKS);
+        assert_eq!(honest_count, LINKS + CHAIN_OPENS);
 
         // The worst decoy that is still LEGAL after T41's file-path fan-in cap.
         // This is the cost test proper: the directive loads, so the ancestor
@@ -9120,7 +9255,7 @@ mod tests {
         let (crafted_elapsed, crafted_count) = time_boot(&chain_file(LINKS, Some(MAX_PARENTS)));
         assert_eq!(
             crafted_count,
-            LINKS + 1,
+            LINKS + 1 + CHAIN_OPENS,
             "a decoy within the fan-in cap must still load — otherwise this measures nothing"
         );
         assert!(
@@ -9148,7 +9283,8 @@ mod tests {
         const SHORT_CHAIN: usize = MAX_PARENTS + 8;
         let (_, unbounded_count) = time_boot(&chain_file(SHORT_CHAIN, Some(SHORT_CHAIN)));
         assert_eq!(
-            unbounded_count, SHORT_CHAIN,
+            unbounded_count,
+            SHORT_CHAIN + CHAIN_OPENS,
             "the over-cap decoy must be skipped, and only it — the chain still loads"
         );
     }
@@ -9242,13 +9378,20 @@ mod tests {
             "boot must say which directive it skipped and why, got: {logged}"
         );
 
-        // The control: exactly at the cap, the same file loads in full.
+        // The control: exactly at the cap, the fan-in rule does not refuse
+        // the same file. (Its fabricated parents resolve to nothing, so since
+        // T84 the H-23 rule holds the directive instead — a record no peer
+        // could adopt — which is a different refusal, named differently.)
         std::fs::write(&path, file_with_parent_fan_in(MAX_PARENTS)).unwrap();
-        let at_cap = LedgerService::boot(path.clone(), "peer-1".to_owned()).unwrap();
-        assert_eq!(
-            at_cap.directive_count(),
-            3,
-            "the cap is a ceiling, not an off-by-one refusal"
+        let (at_cap, logged) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "peer-1".to_owned()).unwrap());
+        assert!(
+            !logged.contains("openledger-parents has"),
+            "the cap is a ceiling, not an off-by-one refusal: {logged}"
+        );
+        assert!(
+            logged.contains("no fresh replica could hold") && at_cap.quarantined_count() == 1,
+            "T84: held because its parents resolve nowhere: {logged}"
         );
         std::fs::remove_file(&path).ok();
 
@@ -15366,10 +15509,18 @@ mod tests {
             svc.get_directive(&exhaust_id).is_none(),
             "premise: the refused directive is not in the DAG"
         );
+        assert!(
+            svc.quarantined_ids().contains(&exhaust_id.as_str()),
+            "the refused directive is quarantined"
+        );
+        // T84 / H-23: so is what descends from it (the seed and the chain below
+        // it name it) and what names parents that exist nowhere (the padding
+        // above) — no peer could adopt any of them. Every one keeps its place
+        // in the file, which is what this test is about.
         assert_eq!(
-            svc.quarantined_ids(),
-            vec![exhaust_id.as_str()],
-            "exactly the refused directive is quarantined"
+            svc.directive_count() + svc.quarantined_count(),
+            total_before + 2,
+            "every transaction is either served or held, and the two opens load"
         );
 
         svc.compact().unwrap();
@@ -16877,16 +17028,15 @@ mod tests {
         drop(svc);
         append_to_file(&path, &planted_dangling_parent(&victim_id));
         let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        // T84 / H-23: a parent that exists nowhere makes the planted entry a
+        // record no peer could adopt, so boot holds it rather than serving it
+        // as a head — the pointer never reaches the parent choice at all.
         assert_eq!(
             svc.quarantined_count(),
-            0,
-            "the planted entry loads normally"
+            1,
+            "the planted entry is held, not served"
         );
-        let planted_id = svc
-            .head_txids()
-            .into_iter()
-            .next()
-            .expect("the planted entry is the only head");
+        let planted_id = svc.quarantined_ids()[0].to_owned();
 
         let outcome = svc
             .append_transaction(balanced_input())
@@ -16902,11 +17052,6 @@ mod tests {
         assert!(
             !parents.contains(&planted_id),
             "the new transaction must not name the entry that names it: {parents:?}"
-        );
-        assert_eq!(
-            svc.dag().children_of(&victim_id).unwrap(),
-            std::slice::from_ref(&planted_id),
-            "the planted edge now resolves, in the one direction that is acyclic"
         );
 
         // The file this leaves behind is acyclic: a reboot quarantines nothing
@@ -18048,12 +18193,13 @@ mod tests {
     /// operator input got its lamport from the placeholder boot's clock (7 +
     /// 1), while an L-13 reload — a boot under the REAL author — stamps it
     /// above the own quarantined record (13 + 1). Which envelope the mesh saw
-    /// depended on whether a startup compaction ever failed. `set_author_id`
-    /// re-stamps unfinalised operator input by the same shift, so the two
-    /// agree, and the signed pair is never an own quarantined one.
+    /// depended on whether a startup compaction ever failed. Since T84 the
+    /// lamport is stamped by `finalize_operator_input` from the clock
+    /// `set_author_id` raised, so the two agree, and the signed pair is never
+    /// an own quarantined one.
     ///
-    /// Bug-catch: skip the re-stamp loop in `set_author_id` and the
-    /// placeholder path finalises the hand line at 8, the reload at 14.
+    /// Bug-catch: skip the clock raise in `set_author_id` and the placeholder
+    /// path finalises the hand line at 8, the reload at 14.
     #[test]
     fn l67_operator_input_gets_the_same_lamport_on_a_placeholder_boot_and_a_reload() {
         let path = l67_file(
@@ -20116,15 +20262,87 @@ mod tests {
         remove_ledger_and_journal(&path);
     }
 
-    /// H-22 item (d): a record this node serves that names a parent only in
-    /// its quarantine — what an older build left behind, a hand line signed
-    /// over an edited record's id — is named in a WARN with the remedy. Not
-    /// quarantined: it is acknowledged history (see
-    /// `warn_about_served_children_of_quarantined_records`).
+    /// H-23 (T84), the audit's X1 `c3j`: T2's narration is edited (a new id,
+    /// quarantined by the signature pass) while J — T2's signed child, naming
+    /// T2's ORIGINAL id — keeps an envelope that verifies. That id is in no
+    /// quarantine and nowhere else on this node, so J is a record no peer
+    /// lacking T2 can adopt. Before T84 J was served as a head, the H-22 rebase
+    /// re-chose the hand line's parents onto it, and nothing was said. Now J is
+    /// held at boot, named, and the hand line is signed over T1.
     ///
-    /// Bug-catch: drop the call in `verify_own_history` and nothing is said.
+    /// Bug-catch: drop both `quarantine_unservable_history` calls (at boot and
+    /// after the signature pass — either one catches this shape) and J is
+    /// served and named by the hand line.
     #[test]
-    fn h22_a_served_record_naming_a_quarantined_parent_is_named_in_a_warning() {
+    fn h23_a_hand_line_is_never_signed_over_a_served_record_whose_parent_vanished() {
+        let (path, first, second) = two_signed_transactions_file();
+        let child = format!(
+            "2024-01-20 * \"J\" \"child of the original\"\n\
+             \x20 openledger-author: \"test-peer\"\n\
+             \x20 openledger-lamport: \"40\"\n\
+             \x20 openledger-parents: \"{second}\"\n\
+             \x20 Assets:Cash                                         3.00 USD\n\
+             \x20 Equity:Opening                                     -3.00 USD\n"
+        );
+        let signed = marker_signed(parse_file(&child).unwrap().remove(0));
+        let child_id = compute_content_id(&signed);
+        append_to_file(
+            &path,
+            &format!(
+                "\n{}",
+                full_file_serialize(std::slice::from_ref(&signed), &[])
+            ),
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, content.replace("\"T2\"", "\"T2 edited\"")).unwrap();
+        append_to_file(&path, &h22_hand_line("appended with the fix", None));
+
+        // gl-node's order.
+        let (svc, logged) = capture_warnings(|| {
+            let mut svc = LedgerService::boot(path.clone(), "local".to_owned()).unwrap();
+            svc.set_author_id("test-peer".to_owned());
+            svc.set_signer(marker_signer());
+            svc.finalize_operator_input();
+            svc
+        });
+        assert!(
+            svc.get_directive(&child_id).is_none(),
+            "J is held, not served"
+        );
+        assert!(svc.quarantined_ids().contains(&child_id.as_str()));
+        assert!(
+            logged.contains(&child_id) && logged.contains("exists nowhere on this node"),
+            "{logged}"
+        );
+        assert_eq!(
+            parents_of_named(&svc, "appended with the fix"),
+            vec![first.clone()],
+            "the hand line is signed over T1, never over J"
+        );
+        for directive in svc.dag().directives() {
+            if let Directive::Transaction(txn) = directive {
+                for parent in txn.parent_ids() {
+                    assert!(
+                        svc.get_directive(parent).is_some(),
+                        "everything served names only what is served"
+                    );
+                }
+            }
+        }
+        remove_ledger_and_journal(&path);
+    }
+
+    /// H-22 item (d), as decision (15) re-decided it (T84 / H-23): a signed
+    /// record that names a parent only in this node's quarantine — what an
+    /// older build left behind, a hand line signed over an edited record's id
+    /// — is one no peer lacking that parent can adopt. It is quarantined with
+    /// what descends from it, and the WARN names it, its parent and the remedy.
+    /// Before T84 it was served with a WARN only (T79's deviation).
+    ///
+    /// Bug-catch: drop the `quarantine_unservable_history` call after the
+    /// signature pass and the record is served.
+    #[test]
+    fn h22_a_served_record_naming_a_quarantined_parent_is_quarantined_and_named() {
         let (path, _first, _second) = two_signed_transactions_file();
         let content = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, content.replace("\"T2\"", "\"T2 edited\"")).unwrap();
@@ -20156,15 +20374,20 @@ mod tests {
         );
 
         let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
-        svc.set_signer(marker_signer());
-        assert_eq!(svc.quarantined_ids(), vec![edited.as_str()]);
         assert!(
             transaction_named(&svc, "signed by an older build").is_some(),
-            "premise: it verifies, so it is served"
+            "premise: before the signature pass its parent is served, so it is too"
         );
-        let (_, logged) = capture_warnings(|| svc.verify_own_history());
+        let (_, logged) = capture_warnings(|| svc.set_signer(marker_signer()));
         assert!(
-            logged.contains("only in its quarantine") && logged.contains(&edited),
+            transaction_named(&svc, "signed by an older build").is_none(),
+            "no peer lacking its parent can adopt it, so it is not served"
+        );
+        assert_eq!(svc.quarantined_ids().len(), 2, "the edited record and it");
+        assert!(
+            logged.contains("no fresh replica could hold")
+                && logged.contains("only in this node's quarantine")
+                && logged.contains(&edited),
             "{logged}"
         );
         remove_ledger_and_journal(&path);

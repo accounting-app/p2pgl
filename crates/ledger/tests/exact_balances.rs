@@ -2667,8 +2667,11 @@ fn m52_two_records_glued_into_one_text_block_are_identified_and_closured_togethe
 /// 2024-01-05 in `C0001` is not orphaned at HEAD — served, in the balance,
 /// a parent — while every fresh replica refuses it (`ACCOUNT_NOT_OPEN` at
 /// 2024-01-05; the currency would fail I9 too) and its child `MISSING_PARENT`.
+///
+/// Passes since T84: the H-23 rule judges every served transaction with the
+/// peer's own check (`validate_transaction`) against the accounts it serves
+/// (decision (15)); the rest of M-56 is T85's.
 #[test]
-#[ignore = "A4-1: the surviving-open test is date- and currency-blind; the upgraded node serves what a fresh replica refuses"]
 fn a4_1_a_surviving_open_that_does_not_admit_the_transaction_must_not_unstrand_it() {
     let flood = over_ceiling_open("Assets:Flood", "nodeA", 10);
     let later = Directive::Open(Open {
@@ -2726,8 +2729,10 @@ fn a4_1_a_surviving_open_that_does_not_admit_the_transaction_must_not_unstrand_i
 /// are served, are heads, and every fresh replica refuses them
 /// `MISSING_PARENT` forever. The signature covers `openledger-parents`, so
 /// they cannot be re-parented by hand either.
+///
+/// Passes since T84 (decision (15)): C and G are held, named, until X's
+/// original is restored or re-supplied.
 #[test]
-#[ignore = "A4-2: the prescribed restate-in-a-larger-unit remedy leaves the descendants served with a dangling parent"]
 fn a4_2_restating_a_past_cap_amount_must_not_leave_its_descendants_served_with_a_dangling_parent() {
     let wei = "WEI";
     let over = Decimal::from_str_exact("50000000000000000000000").expect("5 × 10^22");
@@ -2780,8 +2785,10 @@ fn a4_2_restating_a_past_cap_amount_must_not_leave_its_descendants_served_with_a
 /// closure; boot applies no lifecycle rule to history, so the transaction on
 /// the never-opened account is served — `verify` is clean — and every fresh
 /// replica refuses it `ACCOUNT_NOT_OPEN`, then its child `MISSING_PARENT`.
+///
+/// Passes since T84 (decision (15)): the transaction fails the peer's I3 against
+/// the accounts this node serves and is held with its child.
 #[test]
-#[ignore = "A4-2: deleting the refused open leaves the transactions on its account served with no open at all"]
 fn a4_2_deleting_a_refused_open_must_not_leave_the_transactions_on_its_account_served() {
     let on_flood = history_record(
         5,
@@ -2822,8 +2829,10 @@ fn a4_2_deleting_a_refused_open_must_not_leave_the_transactions_on_its_account_s
 /// are served and counted, and the T79 (d) WARN does not name them (it looks
 /// the parent up in the id-keyed quarantine). A fresh replica refuses every
 /// one of them `MISSING_PARENT`.
+///
+/// Passes since T84 (decision (15)): the rule needs no id from the text block —
+/// the children's parent is served nowhere.
 #[test]
-#[ignore = "A4-3: a text-held block without an id leaves its descendants served with a dangling parent, unnamed"]
 fn a4_3_a_text_held_block_without_an_id_must_not_leave_its_descendants_served() {
     // The id a pre-T37 node stored for the Unicode record; only its absence matters.
     let parent = "1111111111111111111111111111111111111111111111111111111111111111";

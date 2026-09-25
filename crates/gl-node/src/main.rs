@@ -293,8 +293,11 @@ async fn main() {
              the .bean (every compaction rewrites them verbatim) but are NOT served, NOT in any \
              balance and NOT replicated. The per-record boot warnings above give each one's \
              reason — its openledger-parents metadata, a disallowed character, excess fan-in, \
-             or a block that does not parse at all (named by line number; it has no id). Stop \
-             the node, repair those records in the file, and restart (H-08, L-45)"
+             a signature that does not verify, a parent no peer could resolve, or a block that \
+             does not parse at all (named by line number; it has no id). Stop the node, repair \
+             those records in the file, and restart. A repair that changes a record's body \
+             gives it a new id, and what descends from it stays held: restore the original \
+             from a peer or a backup where you can (H-23) (H-08, L-45)"
         );
     }
 
