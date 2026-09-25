@@ -988,13 +988,18 @@ enum Operator {
     /// (ab) A2-4: the lamport line of a signed record edited to a value near
     /// 2^32.
     EditLamportLineHuge,
+    /// T80 / M-53: every `openledger-author` line spelled as the boot
+    /// placeholder `"local"` — the file a node that signed with P2P off wrote
+    /// before T80. The signature does not cover the author, so every record
+    /// still verifies under the node's key.
+    PlaceholderAuthorEverywhere,
 }
 
-/// Every operator that is green at HEAD `3d64a16`: [`OPERATORS_ENABLED`] plus
-/// the A2 operators that pin an existing mechanism. The four finding-pinning
-/// operators (x, y, z, aa) and (ab) are excluded — their tests are
-/// `#[ignore]`d with the finding id.
-const OPERATORS_ALL: [Operator; 25] = [
+/// Every operator that is green: [`OPERATORS_ENABLED`] plus the A2 operators
+/// that pin an existing mechanism, the four T79 closed (x, y, z, aa) and
+/// T80's placeholder history. (ab) is excluded — its test is `#[ignore]`d
+/// with the finding id until T83.
+const OPERATORS_ALL: [Operator; 30] = [
     Operator::EditNarration,
     Operator::EditAmountBalanced,
     Operator::EditAmountUnbalanced,
@@ -1020,6 +1025,11 @@ const OPERATORS_ALL: [Operator; 25] = [
     Operator::StrayWordAfterHeader,
     Operator::PasteSignedForeignBlock,
     Operator::PasteForgedForeignBlock,
+    Operator::EditNarrationPlusAppendHand,
+    Operator::PasteHeaderInsideSignedBlock,
+    Operator::AppendHandTransactionQuarantinedParent,
+    Operator::ForeignAuthorHalfEnvelope,
+    Operator::PlaceholderAuthorEverywhere,
 ];
 
 /// A signed foreign block: the body signed by `provider` over parents `""`
@@ -1243,6 +1253,15 @@ fn mutate(truth: &Truth, operator: Operator, position: usize) -> Option<Mutation
         Operator::Crlf => return Some(Mutation::text(text.replace('\n', "\r\n"), effect)),
         Operator::LeadingBom => return Some(Mutation::text(format!("\u{feff}{text}"), effect)),
         Operator::Identity => return Some(Mutation::text(text.clone(), effect)),
+        Operator::PlaceholderAuthorEverywhere => {
+            return Some(Mutation::text(
+                text.replace(
+                    &format!("{KEY_AUTHOR}: \"{}\"", truth.author),
+                    &format!("{KEY_AUTHOR}: \"local\""),
+                ),
+                effect,
+            ))
+        }
         // ── A2 ──
         Operator::EditParentsLine => {
             let index = pick(&signed_txns);
@@ -1728,6 +1747,22 @@ fn op_z_hand_parent_naming_the_quarantined_id() {
 #[test]
 fn op_aa_foreign_author_half_envelope_is_served_unsigned() {
     assert_holds(Operator::ForeignAuthorHalfEnvelope, 41, 0, Checks::ALL);
+}
+
+/// M-53 (T80): a history a node signed with P2P off before T80 carries the
+/// boot placeholder as the author of every record. After the upgrade the
+/// author comes from the key, so boot re-attributes each record whose
+/// signature verifies under it: every record is served with its original
+/// envelope (the real author) and every peer accepts it; nothing is
+/// quarantined.
+#[test]
+fn op_ac_a_history_signed_under_the_placeholder_is_served_whole() {
+    let report = assert_holds(Operator::PlaceholderAuthorEverywhere, 43, 0, Checks::ALL);
+    assert_eq!(
+        report.first.expect("ran").quarantined_ids.len(),
+        0,
+        "nothing is quarantined"
+    );
 }
 
 /// A2-4: a lamport line of an own record edited to 4,000,000,000 is

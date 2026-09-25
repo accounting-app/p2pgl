@@ -231,7 +231,9 @@ async fn main() {
     // birth.
 
     // Boot the ledger service (§3.3).
-    let author_id = "local".to_owned(); // Replaced by Iroh EndpointId when P2P boots.
+    // Replaced by the key's EndpointId once the key is loaded, whenever signing
+    // is enabled (T80); a signing-off node keeps it.
+    let author_id = ledger::service::PLACEHOLDER_AUTHOR.to_owned();
     let service = match ledger::service::LedgerService::boot(&ledger_path, author_id) {
         Ok(service) => service,
         Err(error) => {
@@ -343,6 +345,22 @@ async fn main() {
         None
     };
 
+    // T80 / M-53: the author id is the key. Set here — as soon as the key is
+    // loaded, before the signer, the verifier and `finalize_operator_input` —
+    // whenever signing is enabled, P2P on or off. Before T80 it was set only
+    // when P2P booted, so a node that signed with P2P off wrote the boot
+    // placeholder as the author of every record under a real signature: its
+    // own hand edits failed the verifier at their first boot, and turning P2P
+    // on later quarantined its entire history at every boot. The P2P branch
+    // below derives the same value from the endpoint and checks it matches.
+    if config.signing.enabled {
+        if let Some(secret_key) = node_secret_key.as_ref() {
+            let author_id = secret_key.author_id();
+            info!(author_id = %author_id, "ledger author id derived from the node key");
+            shared_ledger.write().await.set_author_id(author_id);
+        }
+    }
+
     // Resolve the mesh signature domain ONCE (L-23), here, and hand the result
     // to every consumer. `p2p.meshId` when set, `p2p.swarmTopic` otherwise —
     // the fallback is what keeps already-persisted signatures verifiable on a
@@ -373,10 +391,22 @@ async fn main() {
         };
         match p2p_service::boot_p2p(&config.p2p, secret_key).await {
             Ok(peer_node) => {
-                // Update ledger service author to Iroh EndpointId (§3.3.1).
+                // §3.3.1: the ledger author IS the endpoint id. T80 set it from
+                // the key above (signing is forced on with P2P); the endpoint
+                // must agree, or this node would sign under one identity and
+                // announce another.
                 let iroh_author_id = peer_node.node_id();
                 info!(author_id = %iroh_author_id, "P2P identity derived from Iroh EndpointId");
-                shared_ledger.write().await.set_author_id(iroh_author_id);
+                let ledger_author = shared_ledger.read().await.author_id().to_owned();
+                if ledger_author != iroh_author_id {
+                    error!(
+                        ledger_author = %ledger_author,
+                        endpoint_id = %iroh_author_id,
+                        "the ledger author id derived from the node key differs from the P2P \
+                         endpoint id — aborting (T80)"
+                    );
+                    std::process::exit(1);
+                }
 
                 peer_registry = peer_node.registry.clone();
 
@@ -429,9 +459,12 @@ async fn main() {
 
     // L-11: hand the service a signing callback so reconcile can stamp entries
     // the operator added by hand, exactly as `appendTransaction` stamps its own.
-    // `set_author_id` above has already run when P2P is on, so the author this
-    // signs for is the same `EndpointId` the key belongs to.
-    {
+    // `set_author_id` above has already run whenever signing is on (T80), so
+    // the author this signs for is the same `EndpointId` the key belongs to.
+    // Installed only with signing enabled (T80, 0924 §5): a disabled provider
+    // signs nothing, and installing it made the ledger report
+    // `signer_installed=true` on a node that cannot sign.
+    if config.signing.enabled {
         let signer_for_reconcile = Arc::clone(&signer);
         shared_ledger.write().await.set_signer(Arc::new(
             move |content_id: &str, is_transaction: bool, parents: &str, lamport: &str| {
@@ -507,7 +540,11 @@ async fn main() {
         // any peer is served. The signer and verifier installs above already
         // ran the pass; this call is the one that reports what could NOT be
         // checked, and the banner for what was quarantined.
-        let quarantined_by_signature = service.verify_own_history();
+        service.verify_own_history();
+        // T80 (0924 §5): every pass, not only this call's — the signer and
+        // verifier installs above already quarantined, and this call's own
+        // return counts only what was left for it.
+        let quarantined_by_signature = service.signature_quarantined_total();
         if quarantined_by_signature > 0 {
             warn!(
                 quarantined = quarantined_by_signature,

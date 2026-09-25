@@ -763,6 +763,19 @@ impl NodeSecretKey {
         SecretKey::from_bytes(&self.bytes)
     }
 
+    /// This node's `openledger-author` id: the `EndpointId` this key gives
+    /// the QUIC endpoint, spelled exactly as `PeerNode::node_id` spells it —
+    /// the Ed25519 verifying key in hex, which is what
+    /// `security::signing::verify_signature` takes (T80 / M-53).
+    ///
+    /// Derived from the key rather than from a booted endpoint so a node that
+    /// signs with P2P off has its real author id too: before T80 it wrote the
+    /// boot placeholder under a real signature, and turning P2P on made its
+    /// whole history fail verification.
+    pub(crate) fn author_id(&self) -> String {
+        self.iroh_secret_key().public().to_string()
+    }
+
     /// Raw key material for the Ed25519 directive signer.
     ///
     /// ## Why one key serves two roles, and what a derived subkey would buy
@@ -2402,5 +2415,22 @@ mod tests {
             dalek.public_key_hex(),
             "openledger-author (EndpointId Display) must equal the Ed25519 verifying-key hex used to verify signatures"
         );
+    }
+
+    /// T80 / M-53: the author id `main` sets from the loaded key, before P2P
+    /// boots, is the endpoint id P2P would announce and the key the signer
+    /// signs with — so a node that signs with P2P off writes the author id it
+    /// will have with P2P on, and `main`'s consistency check never fires.
+    #[test]
+    fn t80_the_author_id_from_the_key_is_the_endpoint_id_and_the_signing_key() {
+        let secret = SecretKey::generate();
+        let key = NodeSecretKey {
+            bytes: Zeroizing::new(secret.to_bytes()),
+        };
+        let signer =
+            security::signing::PeerKeySignatureProvider::from_bytes(key.bytes(), String::new());
+        assert_eq!(key.author_id(), secret.public().to_string());
+        assert_eq!(key.author_id(), signer.public_key_hex());
+        assert_ne!(key.author_id(), ledger::service::PLACEHOLDER_AUTHOR);
     }
 }

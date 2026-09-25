@@ -1323,6 +1323,18 @@ pub fn clock_is_far_above_history(lamport_clock: u64, directive_count: usize) ->
 /// `LamportCeiling` / `LamportAdvance` error texts, so the remedy cannot drift
 /// between them. The README's "Joining a mesh / removing a peer" section is
 /// the long form.
+/// The author id a service is booted under before the node's identity is
+/// known (T80 / M-53).
+///
+/// `gl-node` boots the ledger before it loads the node key, so boot runs
+/// under this placeholder and [`LedgerService::set_author_id`] replaces it.
+/// Since T80 it is replaced whenever signing is enabled, P2P on or off, so no
+/// signed envelope carries it any more. Before T80 a node that signed with
+/// P2P off wrote it into every record: [`LedgerService::verify_own_history`]
+/// re-attributes such a record to this node when its signature verifies
+/// under this node's key (the signature does not cover the author).
+pub const PLACEHOLDER_AUTHOR: &str = "local";
+
 pub const BOOTSTRAP_JOIN_REMEDY: &str =
     "A node that joins later, or is rebuilt from an empty disk, cannot cross a gap this \
      size by anti-entropy alone once the author that made it is off the allowlist, and \
@@ -2786,6 +2798,12 @@ pub struct LedgerService {
     /// signer and the verifier are installed in two steps: the signer's pass
     /// drains this node's own records, the verifier's the rest.
     unverified_history: BTreeSet<String>,
+    /// How many directives the signature pass has quarantined in this
+    /// service's life, across every pass (T80, 0924 §5): the setters,
+    /// `finalize_operator_input` and `verify_own_history` each run the pass,
+    /// and a caller that reports only the last one's return misses what the
+    /// earlier ones quarantined.
+    signature_quarantined_total: usize,
     /// Content ids of the directives [`Self::boot`] adopted as **operator
     /// input** whose envelope is not final yet (H-13).
     ///
@@ -3657,6 +3675,7 @@ impl LedgerService {
             // is verified the moment either the signer or the verifier is.
             verifier: None,
             unverified_history,
+            signature_quarantined_total: 0,
             unsigned_operator_input: Vec::new(),
             operator_input_with_file_author: BTreeSet::new(),
             operator_input_as_written: BTreeMap::new(),
@@ -4175,7 +4194,22 @@ impl LedgerService {
         let mut refused: BTreeMap<String, String> = BTreeMap::new();
         let mut remaining: BTreeSet<String> = BTreeSet::new();
         let mut verified = 0usize;
+        let mut reattributed: Vec<Directive> = Vec::new();
         for content_id in ids {
+            let Some(directive) = self.dag.get(&content_id) else {
+                continue;
+            };
+            // T80 / M-53: this node's own record from before T80, signed
+            // under the placeholder author. The author only moves; the DAG's
+            // structure (parents) and the id are untouched.
+            if let Some(owned) = self.reattributed_placeholder_record(&content_id, directive) {
+                if let Some(slot) = self.dag.get_mut(&content_id) {
+                    *slot = owned.clone();
+                }
+                reattributed.push(owned);
+                verified += 1;
+                continue;
+            }
             let Some(directive) = self.dag.get(&content_id) else {
                 continue;
             };
@@ -4190,6 +4224,22 @@ impl LedgerService {
             }
         }
         self.unverified_history = remaining;
+        if !reattributed.is_empty() {
+            for directive in &reattributed {
+                self.read_model.reindex_directive(directive);
+            }
+            // The file still spells the placeholder until a rewrite.
+            self.force_compaction = true;
+            info!(
+                reattributed = reattributed.len(),
+                author = %self.author_id,
+                file = %self.file_path.display(),
+                "records this node signed under the placeholder author before its author id \
+                 was taken from its key now carry that id; their signatures verify under this \
+                 node's key and do not cover the author, so they are unchanged, and the next \
+                 compaction writes the new author (T80, M-53)"
+            );
+        }
         if refused.is_empty() {
             info!(
                 verified,
@@ -4210,7 +4260,28 @@ impl LedgerService {
                  edited block (H-20, H-08)"
             );
         }
+        // T80 (0924 §5): every signature this pass checked failed — not
+        // missing, failed. One edited record does not look like that; a
+        // signature domain or key that differs from the one the history was
+        // signed under does, and the per-record reason cannot say so.
+        let every_checked_failed = verified == 0
+            && refused.len() >= 2
+            && refused
+                .values()
+                .all(|reason| reason.starts_with("signature does not verify"));
+        if every_checked_failed {
+            warn!(
+                failed = refused.len(),
+                file = %self.file_path.display(),
+                "EVERY signature this node checked failed. That is not one edited record: the \
+                 signature domain (p2p.meshId, or p2p.swarmTopic when meshId is unset) or the \
+                 node key differs from the one this history was signed under. Check both \
+                 before repairing anything — the records are quarantined, not lost, and load \
+                 again once the domain and key are right (H-20, T80)"
+            );
+        }
         let ids: BTreeSet<String> = refused.into_keys().collect();
+        self.signature_quarantined_total += ids.len();
         self.quarantine_out_of_dag(&ids);
         warn!(
             quarantined = ids.len(),
@@ -4222,6 +4293,71 @@ impl LedgerService {
              reversing entry, never an edit of a signed line (H-20)"
         );
         ids.len()
+    }
+
+    /// How many directives the signature pass has quarantined in this
+    /// service's life, across every pass (T80). `gl-node` reports this at
+    /// boot: the setters' passes quarantine before its explicit
+    /// [`Self::verify_own_history`] call, whose return counts only its own.
+    pub fn signature_quarantined_total(&self) -> usize {
+        self.signature_quarantined_total
+    }
+
+    /// `directive` re-attributed to this node, when it is a record this node
+    /// signed under [`PLACEHOLDER_AUTHOR`] (T80 / M-53, decision (9)).
+    ///
+    /// Before T80 a node that signed with P2P off never learnt its author id,
+    /// so it wrote `openledger-author: "local"` over a real signature by its
+    /// key. The signature covers the content id, the transaction flag, the
+    /// parents and the lamport — not the author — so when it verifies as this
+    /// node's own, the record is this node's and only the author line was
+    /// wrong: writing this node's id there leaves the signature valid. With
+    /// P2P off such a record never left the node, so no replica holds the old
+    /// spelling. `None` when the record does not qualify — not the
+    /// placeholder, no envelope, no signature, this node still under the
+    /// placeholder itself, or a signature that does not verify as this
+    /// node's (which the normal verdict then refuses).
+    fn reattributed_placeholder_record(
+        &self,
+        content_id: &str,
+        directive: &Directive,
+    ) -> Option<Directive> {
+        if self.author_id == PLACEHOLDER_AUTHOR {
+            return None;
+        }
+        let metadata = directive.metadata();
+        if metadata.get(ENVELOPE_KEY_AUTHOR).map(String::as_str) != Some(PLACEHOLDER_AUTHOR) {
+            return None;
+        }
+        let lamport = metadata.get(ENVELOPE_KEY_LAMPORT)?;
+        let signature = metadata.get(ENVELOPE_KEY_SIGNATURE)?;
+        let parents = metadata
+            .get(ENVELOPE_KEY_PARENTS)
+            .map(String::as_str)
+            .unwrap_or("");
+        let is_transaction = matches!(directive, Directive::Transaction(_));
+        let verifies = if let Some(verifier) = &self.verifier {
+            verifier(
+                content_id,
+                is_transaction,
+                parents,
+                lamport,
+                &self.author_id,
+                signature,
+            )
+        } else if let Some(signer) = &self.signer {
+            signer(content_id, is_transaction, parents, lamport).as_deref()
+                == Some(signature.as_str())
+        } else {
+            false
+        };
+        if !verifies {
+            return None;
+        }
+        let mut owned = directive.clone();
+        directive_metadata_mut(&mut owned)
+            .insert(ENVELOPE_KEY_AUTHOR.to_owned(), self.author_id.clone());
+        Some(owned)
     }
 
     /// One directive's signature verdict — see [`Self::verify_own_history`].
@@ -5009,9 +5145,16 @@ impl LedgerService {
             .chain(self.quarantined.values())
             .filter_map(|directive| {
                 let author = directive_author(directive)?;
-                let foreign = author != self.author_id;
-                Some((foreign, directive.lamport_clock()?, author))
+                Some((directive.lamport_clock()?, author))
             })
+            // L-91 (T80): and what boot saw outside the DAG — envelopes held
+            // in unparsable text are in neither map above.
+            .chain(
+                self.boot_outside_dag_lamports
+                    .iter()
+                    .map(|(author, lamport)| (*lamport, author.as_str())),
+            )
+            .map(|(lamport, author)| (author != self.author_id, lamport, author))
             .max_by_key(|(foreign, lamport, _)| (*foreign, *lamport))
             .map(|(_, _, author)| author.to_owned())
     }
@@ -6942,8 +7085,13 @@ impl LedgerService {
                     // H-20: a full envelope is adopted as history, and the
                     // live path holds it to the same signature check boot
                     // does — against the id it is stored under.
+                    // T80 / M-53: the same re-attribution boot applies.
                     if !needs_stamp {
-                        if let HistoryVerdict::Refused(reason) =
+                        if let Some(owned) =
+                            self.reattributed_placeholder_record(&stored_id, &final_directive)
+                        {
+                            final_directive = owned;
+                        } else if let HistoryVerdict::Refused(reason) =
                             self.verify_history_directive(&stored_id, &final_directive)
                         {
                             tally.refuse(content_id, reason);
@@ -7012,9 +7160,11 @@ impl LedgerService {
                     }
                 }
             }
-            // H-20: see the transaction arm.
+            // H-20, T80: see the transaction arm.
             if !needs_stamp {
-                if let HistoryVerdict::Refused(reason) =
+                if let Some(owned) = self.reattributed_placeholder_record(&content_id, &directive) {
+                    directive = owned;
+                } else if let HistoryVerdict::Refused(reason) =
                     self.verify_history_directive(&content_id, &directive)
                 {
                     tally.refuse(content_id, reason);
@@ -7401,6 +7551,39 @@ impl LedgerService {
         }
         let before = self.lamport_clock;
         self.lamport_clock = self.lamport_clock.max(resume).max(highest);
+        // L-91 (T80): boot warns when the next stamp will refuse, but under
+        // the placeholder author it could not count this node's own records
+        // outside the DAG — they are folded only here. Same predicates as
+        // boot; the source is this node's own file, so the remedy is to repair
+        // it, never to remove an author from anyone's allowlist.
+        if self.lamport_clock != before {
+            if !lamport_value_is_legal(self.lamport_clock.saturating_add(1)) {
+                warn!(
+                    author = %self.author_id,
+                    own_high,
+                    lamport_clock = self.lamport_clock,
+                    ceiling = LAMPORT_CEILING,
+                    file = %self.file_path.display(),
+                    "this node's OWN records outside the ledger (quarantined, or held as \
+                     unparsable text) carry an openledger-lamport at the Lamport ceiling, and the \
+                     clock now resumes above them: this node will refuse to author. No other node \
+                     carried it here — find the block with this node's openledger-author and \
+                     that lamport in the .bean and delete or repair it, then restart (L-91, H-12)"
+                );
+            } else if LAMPORT_CEILING - self.lamport_clock <= MAX_LAMPORT_ADVANCE {
+                warn!(
+                    author = %self.author_id,
+                    own_high,
+                    lamport_clock = self.lamport_clock,
+                    ceiling = LAMPORT_CEILING,
+                    file = %self.file_path.display(),
+                    "this node's OWN records outside the ledger carry an openledger-lamport \
+                     within one adoption step (2^32) of the Lamport ceiling, and the clock now \
+                     resumes above them; no honest history gets here. Find the block with this \
+                     node's openledger-author and that lamport in the .bean (L-91, H-12)"
+                );
+            }
+        }
         if self.lamport_clock != before {
             info!(
                 author = %self.author_id,
@@ -19413,6 +19596,288 @@ mod tests {
             logged.contains("only in its quarantine") && logged.contains(&edited),
             "{logged}"
         );
+        remove_ledger_and_journal(&path);
+    }
+
+    // ── T80: the author id is the key (M-53, L-82, L-91) ──
+
+    /// The key [`marker_signer`] models: a signature verifies iff it is the
+    /// marker signature over the message and the claimed author is
+    /// `test-peer` — the author id IS the key, as `verify_signature` has it.
+    fn marker_verifier() -> DirectiveVerifier {
+        std::sync::Arc::new(
+            |content_id: &str,
+             is_transaction: bool,
+             parents: &str,
+             lamport: &str,
+             author: &str,
+             signature: &str| {
+                author == "test-peer"
+                    && signature
+                        == format!("sig({content_id}|{is_transaction}|{parents}|{lamport})")
+            },
+        )
+    }
+
+    /// A history written by a node that signed with P2P off before T80: booted
+    /// under the placeholder, signer installed, author never set — so every
+    /// record carries `openledger-author: "local"` over the key's signature.
+    fn pre_t80_placeholder_signed_file() -> PathBuf {
+        let path = test_file_path();
+        let mut svc = LedgerService::boot(path.clone(), PLACEHOLDER_AUTHOR.to_owned()).unwrap();
+        svc.set_signer(marker_signer());
+        for (account, currencies) in [
+            ("Assets:Cash", vec!["USD".to_owned()]),
+            ("Equity:Opening", Vec::new()),
+        ] {
+            svc.open_account_signing(
+                account.to_owned(),
+                make_date(2024, 1, 1),
+                currencies,
+                marker_sign(false),
+            )
+            .unwrap();
+        }
+        svc.append_transaction_signing(balanced_input(), marker_sign(true))
+            .unwrap();
+        svc.compact().unwrap();
+        drop(svc);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            written.matches("openledger-author: \"local\"").count(),
+            3,
+            "premise: every record carries the placeholder"
+        );
+        path
+    }
+
+    /// M-53 (T80, decision (9)): a history signed under the placeholder is
+    /// re-attributed to this node when its signatures verify under this
+    /// node's key — through the verifier (gl-node's order, P2P on) and
+    /// through the signer alone — instead of being quarantined whole. The
+    /// signatures are unchanged, the compaction writes the new author, and a
+    /// reboot is a fixed point with nothing quarantined.
+    ///
+    /// Bug-catch: drop the re-attribution in `verify_history_pass` and all
+    /// three records are quarantined ("signature does not verify").
+    #[test]
+    fn m53_a_history_signed_under_the_placeholder_is_reattributed_not_quarantined() {
+        for with_verifier in [true, false] {
+            let path = pre_t80_placeholder_signed_file();
+            let signatures_before: Vec<String> =
+                parse_file(&std::fs::read_to_string(&path).unwrap())
+                    .unwrap()
+                    .iter()
+                    .map(|directive| directive.metadata()[ENVELOPE_KEY_SIGNATURE].clone())
+                    .collect();
+
+            // gl-node's order since T80.
+            let mut svc = LedgerService::boot(path.clone(), PLACEHOLDER_AUTHOR.to_owned()).unwrap();
+            svc.set_author_id("test-peer".to_owned());
+            let (_, logged) = capture_warnings(|| {
+                svc.set_signer(marker_signer());
+                if with_verifier {
+                    svc.set_verifier(marker_verifier());
+                }
+                svc.verify_own_history()
+            });
+            assert_eq!(
+                svc.quarantined_count(),
+                0,
+                "with_verifier={with_verifier}: {logged}"
+            );
+            assert_eq!(svc.signature_quarantined_total(), 0);
+            assert_eq!(svc.directive_count(), 3);
+            assert!(svc
+                .dag()
+                .directives()
+                .into_iter()
+                .all(|directive| { directive_author(directive) == Some("test-peer") }));
+            assert!(
+                svc.compaction_pending(),
+                "the file still spells the placeholder"
+            );
+
+            svc.compact().unwrap();
+            let written = std::fs::read_to_string(&path).unwrap();
+            assert!(!written.contains("openledger-author: \"local\""));
+            let signatures_after: Vec<String> = parse_file(&written)
+                .unwrap()
+                .iter()
+                .map(|directive| directive.metadata()[ENVELOPE_KEY_SIGNATURE].clone())
+                .collect();
+            assert_eq!(
+                signatures_before, signatures_after,
+                "the signatures do not cover the author and are unchanged"
+            );
+
+            let mut rebooted = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+            rebooted.set_signer(marker_signer());
+            rebooted.set_verifier(marker_verifier());
+            assert_eq!(rebooted.quarantined_count(), 0);
+            assert_eq!(rebooted.directive_count(), 3);
+            remove_ledger_and_journal(&path);
+        }
+    }
+
+    /// M-53 control: a placeholder record whose signature does NOT verify as
+    /// this node's — edited, or signed by another key — is not re-attributed
+    /// and is quarantined by the normal verdict; the live reconcile applies
+    /// the same rule to a pasted placeholder record.
+    ///
+    /// Bug-catch: re-attribute without checking the signature and the edited
+    /// record is served under this node's author.
+    #[test]
+    fn m53_a_placeholder_record_that_does_not_verify_as_ours_is_not_reattributed() {
+        let path = pre_t80_placeholder_signed_file();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, content.replace("\"Funding\"", "\"Funding edited\"")).unwrap();
+        let mut svc = LedgerService::boot(path.clone(), PLACEHOLDER_AUTHOR.to_owned()).unwrap();
+        svc.set_author_id("test-peer".to_owned());
+        svc.set_signer(marker_signer());
+        svc.set_verifier(marker_verifier());
+        assert_eq!(svc.quarantined_count(), 1, "the edited record");
+        assert_eq!(svc.signature_quarantined_total(), 1);
+        assert!(transaction_named(&svc, "Funding edited").is_none());
+        assert_eq!(svc.directive_count(), 2, "the two opens are re-attributed");
+        remove_ledger_and_journal(&path);
+
+        // Live: a pasted, validly signed placeholder record is re-attributed.
+        let (mut svc, path) = setup_with_signed_accounts();
+        svc.set_verifier(marker_verifier());
+        let unsigned = "2024-01-25 * \"Hand\" \"pasted placeholder\"\n\
+             \x20 openledger-author: \"local\"\n\
+             \x20 openledger-lamport: \"40\"\n\
+             \x20 openledger-parents: \"\"\n\
+             \x20 Assets:Cash                                         3.00 USD\n\
+             \x20 Equity:Opening                                     -3.00 USD\n";
+        let signature = marker_signature(&parse_file(unsigned).unwrap().remove(0));
+        append_to_file(
+            &path,
+            &format!(
+                "\n{}",
+                unsigned.replacen(
+                    "  openledger-parents",
+                    &format!("  openledger-signature: \"{signature}\"\n  openledger-parents"),
+                    1
+                )
+            ),
+        );
+        assert_eq!(svc.reconcile_file().unwrap().new_directives, 1);
+        let adopted = transaction_named(&svc, "pasted placeholder").unwrap();
+        assert_eq!(directive_author(adopted), Some("test-peer"));
+        assert_eq!(
+            adopted.metadata().get(ENVELOPE_KEY_SIGNATURE),
+            Some(&signature)
+        );
+        remove_ledger_and_journal(&path);
+    }
+
+    /// 0924 §5 (T80): `signature_quarantined_total` counts every pass —
+    /// gl-node's banner used the return of the last call only, which is 0
+    /// once the setters' passes have quarantined — and a pass in which every
+    /// checked signature fails says to check the mesh id and the key.
+    ///
+    /// Bug-catch: stop counting in `verify_history_pass` and the total is 0
+    /// while the quarantine holds three.
+    #[test]
+    fn t80_the_signature_quarantine_total_counts_every_pass_and_a_total_failure_names_the_domain() {
+        let path = pre_t80_placeholder_signed_file();
+        let mut svc = LedgerService::boot(path.clone(), "another-key".to_owned()).unwrap();
+        // A verifier for a different key/domain: nothing verifies.
+        let (_, logged) = capture_warnings(|| {
+            svc.set_verifier(std::sync::Arc::new(
+                |_: &str, _, _: &str, _: &str, _: &str, _: &str| false,
+            ))
+        });
+        assert_eq!(svc.quarantined_count(), 3);
+        assert_eq!(
+            svc.verify_own_history(),
+            0,
+            "the last call finds nothing left"
+        );
+        assert_eq!(svc.signature_quarantined_total(), 3);
+        assert!(
+            logged.contains("EVERY signature this node checked failed")
+                && logged.contains("p2p.meshId"),
+            "{logged}"
+        );
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-91 (T80): an own envelope held as unparsable text at the ceiling is
+    /// folded into the clock only at `set_author_id` — boot ran under the
+    /// placeholder — so `set_author_id` now says so, naming this node's own
+    /// file as the source; and the ceiling refusal no longer names the
+    /// placeholder author.
+    ///
+    /// Bug-catch: drop the WARN in `set_author_id` and the boot is silent
+    /// until the first refused write.
+    #[test]
+    fn l91_set_author_id_warns_when_own_records_outside_the_ledger_reach_the_ceiling() {
+        let path = pre_t80_placeholder_signed_file();
+        append_to_file(
+            &path,
+            &format!(
+                "\n2024-01-26 * \"Junk\" \"unparsable\"\n\
+                 \x20 openledger-author: \"test-peer\"\n\
+                 \x20 openledger-lamport: \"{}\"\n\
+                 \x20 this line does not parse\n",
+                LAMPORT_CEILING - 3
+            ),
+        );
+        let mut svc = LedgerService::boot(path.clone(), PLACEHOLDER_AUTHOR.to_owned()).unwrap();
+        let (_, logged) = capture_warnings(|| svc.set_author_id("test-peer".to_owned()));
+        assert!(
+            logged.contains("OWN records outside the ledger") && logged.contains("(L-91"),
+            "{logged}"
+        );
+        svc.set_signer(marker_signer());
+        svc.set_verifier(marker_verifier());
+        let error = svc
+            .open_account("Assets:After".to_owned(), make_date(2024, 2, 1), vec![])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !error.contains("from author local"),
+            "the refusal must not blame the placeholder: {error}"
+        );
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-91 (T80): when this node's own envelope held as unparsable text is
+    /// the only record that carries the clock, the ceiling refusal names this
+    /// node — the text-held pair is a candidate — instead of naming no one.
+    ///
+    /// Bug-catch: drop `boot_outside_dag_lamports` from
+    /// `highest_lamport_author` and the refusal names no author.
+    #[test]
+    fn l91_the_ceiling_refusal_names_an_own_record_held_as_text_when_it_is_the_only_carrier() {
+        let path = test_file_path();
+        std::fs::write(
+            &path,
+            format!(
+                "2024-01-26 * \"Junk\" \"unparsable\"\n\
+                 \x20 openledger-author: \"test-peer\"\n\
+                 \x20 openledger-lamport: \"{}\"\n\
+                 \x20 this line does not parse\n",
+                LAMPORT_CEILING - 3
+            ),
+        )
+        .unwrap();
+        let mut svc = LedgerService::boot(path.clone(), PLACEHOLDER_AUTHOR.to_owned()).unwrap();
+        svc.set_author_id("test-peer".to_owned());
+        assert_eq!(
+            svc.directive_count(),
+            0,
+            "premise: only the text-held record"
+        );
+        match svc.open_account("Assets:After".to_owned(), make_date(2024, 2, 1), vec![]) {
+            Err(ServiceError::LamportCeiling { author, .. }) => {
+                assert_eq!(author.as_deref(), Some("test-peer"));
+            }
+            other => panic!("expected LamportCeiling, got {other:?}"),
+        }
         remove_ledger_and_journal(&path);
     }
 }

@@ -488,7 +488,7 @@ boot saying so; `meshId` becomes required in a later release.
 | `http.requestTimeoutSeconds` | `30` | Whole-request ceiling, body read and GraphQL execution included (`408` on expiry). `1`–`300` |
 | `http.maxConnections` | `1024` | Concurrently served connections; excess stays in the kernel backlog. `8`–`65536` |
 | `http.maxConnectionsPerIp` | `64` | Concurrent connections one client may hold (keyed per IPv4 address or IPv6 /64, like the rate limiter), so one address cannot take every slot. **It bounds one address or one /64, not one network:** a routed IPv6 /48 is 65,536 /64 keys, far past the global cap, so per-prefix limits wider than a /64 belong in your proxy or firewall. Addresses listed in `trustedProxies` are exempt — list your reverse proxy there, or every client behind it shares this cap. Clamped to `maxConnections`. `8`–`65536` |
-| `signing.enabled` | `false` | Sign transactions with Ed25519. Forced on when `p2p.enabled` |
+| `signing.enabled` | `false` | Sign transactions with Ed25519. Forced on when `p2p.enabled`. When on, the node's author id is its key's public half, P2P on or off |
 | `p2p.enabled` | `false` | Enable Iroh mesh replication |
 | `p2p.secretKeyPath` | `./data/iroh.secret` | The node's Ed25519 key — its QUIC identity **and** its signing key. Created `0600` if absent. An existing file is refused unless it is a regular file (not a symlink), owned by the uid the node runs as, and not readable by group or other |
 | `p2p.bootstrapEndpointIds` | `[]` | Allowlisted peer EndpointIds; empty drops inbound `Supply` |
@@ -880,6 +880,18 @@ node that **enables signing over a history it wrote unsigned** finds that
 history quarantined at the first signing boot — it never replicated to a signing
 mesh anyway; delete the `openledger-*` lines from those blocks to re-adopt them
 as this node's own, signed, operator input.
+
+A node that signs is always its key. Its author id — the `openledger-author` it
+writes — is the node key's public half, the same value its P2P endpoint id would
+be, whether or not P2P is enabled. So a single signing node can join a mesh
+later by turning P2P on, and its history verifies as it is. Builds before T80
+set the author only when P2P booted, so a node that signed with P2P off wrote
+`openledger-author: "local"` over a real signature; this build re-attributes
+every such record whose signature verifies under the node's own key (the
+signature does not cover the author, so it stays valid), logs it once, and the
+next compaction writes the real author. Nothing to do by hand. A `"local"` record
+whose signature does **not** verify as this node's is quarantined like any
+edited record.
 
 The node treats its ledger file as something it writes, and a persist is a
 full-file atomic rewrite. Two mechanisms make a concurrent hand edit *less*
