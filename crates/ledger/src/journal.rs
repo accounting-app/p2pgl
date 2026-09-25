@@ -486,7 +486,8 @@ fn has_later_record_header(rest: &[u8]) -> bool {
 ///
 /// T82 / L-85: the candidate may itself be TORN — a crash mid-append after
 /// this record's length was damaged to run to the end of the file — cut in
-/// its header or in its payload. Before T82 that read as "no later record",
+/// its header or in its payload (T86 / L-105: including inside the first five
+/// bytes of `;;olj `, before a complete tag exists to find). Before T82 that read as "no later record",
 /// so an acknowledged record was dropped as a torn tail. The discriminator is
 /// this record's own checksum: when the bytes before the candidate — exactly
 /// this record's payload, if only its length was damaged — verify against
@@ -503,7 +504,25 @@ fn has_later_intact_record(region: &[u8], own_hash: &str) -> bool {
             .position(|window| window[0] == b'\n' && &window[1..] == TAG)
         {
             Some(newline) => newline + 1,
-            None => return false,
+            // T86 / L-105: no complete `;;olj ` line — but the later append
+            // may have been torn inside its first five header bytes (`;`,
+            // `;;`, … `;;olj`). Then the region is this record's payload
+            // followed by that fragment at a line start, and the payload
+            // verifies against `own_hash`: fail closed, as for a later
+            // append torn anywhere else.
+            None => {
+                return (1..TAG.len()).any(|cut| {
+                    region.len() >= cut
+                        && region.ends_with(&TAG[..cut])
+                        && (region.len() == cut || region[region.len() - cut - 1] == b'\n')
+                        && {
+                            let digest = Sha256::digest(&region[..region.len() - cut]);
+                            let hash: String =
+                                digest.iter().map(|byte| format!("{byte:02x}")).collect();
+                            hash == own_hash
+                        }
+                });
+            }
         }
     };
     // T82 / L-85: see the doc comment.
@@ -1588,6 +1607,55 @@ mod tests {
             Err(other) => panic!("expected Corrupt, got {other}"),
         }
         std::fs::remove_file(path).ok();
+    }
+
+    /// L-105 (T86): L-85's shape with the third record torn inside the first
+    /// five bytes of its header (`;` … `;;olj`), before a complete `;;olj `
+    /// exists to be found. T82's discriminator needed that complete tag, so
+    /// the damaged, acknowledged second record was still dropped as a torn
+    /// tail (A5 `a5_p4`: cuts of 3 and 5 bytes). It fails closed now, like
+    /// every longer cut; the control — the same short tail after an intact
+    /// second record — is an ordinary torn tail.
+    ///
+    /// Bug-catch: drop the no-candidate branch in `has_later_intact_record`
+    /// and every cut here reads `Ok` with one intact record.
+    #[test]
+    fn l105_a_damaged_length_over_an_append_torn_inside_its_tag_is_corrupt() {
+        for cut in 1..=5usize {
+            let path = temp_journal(&format!("l105-cut-{cut}"));
+            let (bytes, second) = three_records(&path);
+            let third = second
+                + bytes[second..]
+                    .windows(6)
+                    .skip(1)
+                    .position(|window| window == b";;olj ")
+                    .unwrap()
+                + 1;
+            let torn = bytes[..third + cut].to_vec();
+            let header_end = second + torn[second..].iter().position(|b| *b == b'\n').unwrap() + 1;
+            let damaged = with_length(&torn, second, &(torn.len() - header_end).to_string());
+            write_private(&path, &damaged);
+            match read_journal(&path, 64 * 1024 * 1024) {
+                Err(JournalError::Corrupt { offset, .. }) => {
+                    assert_eq!(offset, second as u64, "cut {cut}")
+                }
+                Ok(scan) => panic!(
+                    "cut {cut}: an acknowledged record behind a damaged length was dropped as \
+                     torn ({} payloads, {} torn bytes)",
+                    scan.payloads.len(),
+                    scan.torn_tail_bytes
+                ),
+                Err(other) => panic!("cut {cut}: expected Corrupt, got {other}"),
+            }
+            std::fs::remove_file(&path).ok();
+
+            let path = temp_journal(&format!("l105-control-{cut}"));
+            write_private(&path, &torn);
+            let scan = read_journal(&path, 64 * 1024 * 1024).expect("a torn tail");
+            assert_eq!(scan.payloads.len(), 2, "control, cut {cut}");
+            assert_eq!(scan.torn_tail_bytes, cut as u64, "control, cut {cut}");
+            std::fs::remove_file(&path).ok();
+        }
     }
 
     /// L-85 (T82): the second of three records has its length damaged to run

@@ -459,6 +459,11 @@ where
         Ok(pending) => Ok((service, pending, permit)),
         Err(ServiceError::CommitInFlight) => Err(ServiceError::CommitInFlight),
         Err(error @ ServiceError::Parse(_)) => Err(error),
+        // T86 / M-58: the L-80 refusal with nothing staged — nothing was
+        // written and nothing needs rolling back, so no reload (one per
+        // startup, shutdown and watcher compaction before T86, and the reload
+        // on a file with hand lines lost the over-cap fact).
+        Err(error) if service.prepare_refusal_needs_no_reload(&error) => Err(error),
         Err(error) => {
             // M-39: release the lock BEFORE the rebuild; the permit, moved into
             // the recovery task, is what keeps the files and the service still
@@ -1501,6 +1506,76 @@ mod tests {
             raw.text()
         );
         assert_eq!(ledger.read().await.directive_count(), 0, "nothing staged");
+    }
+
+    /// M-58 (T86, decision (21)): the L-80 test above, in gl-node's real
+    /// order on the shape the README names — hand-typed lines whose envelopes
+    /// push the canonical form over the cap — and with the startup compaction
+    /// run FIRST, as `main.rs` runs it. Before T86 that compaction's refusal
+    /// was answered with a reload, the reload (whose operator input the L-81
+    /// keep emptied) never measured the fact, and every mutation after it
+    /// was admitted, staged, failed in the write and reloaded again (D1's
+    /// real-binary run: four reloads, `408`s). Now the compaction is refused
+    /// with no reload and every mutation is refused before staging.
+    ///
+    /// Bug-catch: drop the `prepare_refusal_needs_no_reload` arm from
+    /// `prepare_or_recover_with_reload` and the compaction reloads (and, with
+    /// the re-measure also gone, the mutations stage and reload).
+    #[tokio::test]
+    async fn m58_after_the_refused_startup_compaction_writes_are_still_refused_before_staging() {
+        let (guard, raw, _filtered) = crate::anti_entropy_alpn::tests::capture_logs();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m58.bean");
+        let cap = ledger::service::MAX_LEDGER_FILE_BYTES as usize;
+        let line = format!("; {}\n", "x".repeat((1 << 20) - 3));
+        let hand = "2024-01-02 open Assets:HandA USD\n\n2024-01-02 open Assets:HandB USD\n\n\
+                    2024-01-02 open Assets:HandC USD\n";
+        let used = line.len() * 63 + hand.len() + 1;
+        let last = format!("; {}\n", "x".repeat(cap - used - 3 - 60));
+        let content = format!("{}{last}{hand}", line.repeat(63));
+        assert!(content.len() <= cap);
+        std::fs::write(&path, content).unwrap();
+        let mut service = LedgerService::boot(&path, "m58".to_owned()).unwrap();
+        assert_eq!(service.finalize_operator_input(), 3, "gl-node's order");
+        assert_eq!(service.append_headroom(), 0, "premise: over the cap");
+        let ledger: SharedLedger = Arc::new(tokio::sync::RwLock::new(service));
+
+        let compacted = compact(&ledger).await;
+        assert!(
+            matches!(compacted, Err(ServiceError::ResourceLimitExceeded { .. })),
+            "{compacted:?}"
+        );
+        assert_eq!(ledger.read().await.append_headroom(), 0, "the fact holds");
+
+        let schema = build_schema_with_service(
+            Arc::clone(&ledger),
+            TransactionBroadcast::new(),
+            p2p::node::PeerRegistry::new(),
+            Arc::new(security::signing::NoopSignatureProvider),
+            true,
+            None,
+        );
+        for attempt in 0..3 {
+            let response = schema
+                .execute(format!(
+                    r#"mutation {{ openAccount(name: "Assets:A{attempt}", date: "2024-01-05") }}"#
+                ))
+                .await;
+            assert_eq!(
+                error_codes(&response),
+                vec!["\"RESOURCE_LIMIT_EXCEEDED\"".to_owned()],
+                "{:?}",
+                response.errors
+            );
+        }
+        drop(guard);
+        assert_eq!(
+            raw.text().matches("reload installed").count(),
+            0,
+            "neither the refused compaction nor a refused write reloads:\n{}",
+            raw.text()
+        );
+        assert_eq!(ledger.read().await.directive_count(), 3, "nothing staged");
     }
 
     #[tokio::test]

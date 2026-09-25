@@ -5876,6 +5876,25 @@ impl LedgerService {
     /// and the compaction that re-spells them canonically is reported by
     /// [`Self::compaction_pending`] instead (M-46). So this is 0 right after
     /// any boot, operator input or not.
+    /// Whether a `prepare` refusal leaves nothing an L-13 reload could repair
+    /// (T86 / M-58, decision (21)), beyond the two arms every caller already
+    /// exempts (`CommitInFlight`, `Parse`).
+    ///
+    /// `prepare`'s compaction arm refuses with `ResourceLimitExceeded` while
+    /// the canonical form is over the file cap (L-80). Nothing was written;
+    /// what the refusal's adopt-before-persist took in came from the file, so
+    /// memory is exactly what a rebuild would derive. Before T86 both commit
+    /// drivers answered it with a full reload anyway — one per startup,
+    /// shutdown and watcher compaction — and that reload, on a file with hand
+    /// lines, lost the over-cap fact itself, so every write after it staged,
+    /// failed and reloaded again. When records ARE staged the reload still
+    /// runs: it is what rolls them back, and it re-measures the fact.
+    pub fn prepare_refusal_needs_no_reload(&self, error: &ServiceError) -> bool {
+        matches!(error, ServiceError::ResourceLimitExceeded { .. })
+            && self.canonical_over_cap
+            && self.pending_ids.is_empty()
+    }
+
     pub fn uncommitted_count(&self) -> usize {
         self.pending_ids.len()
     }
@@ -6546,7 +6565,7 @@ impl LedgerService {
                         file = %self.file_path.display(),
                         "REFUSING to install an L-13 rebuild that lacks directives memory holds \
                          and no failed commit can explain — neither staged since the last commit \
-                         nor adopted from the file, still unsigned, since the last compaction: \
+                         nor adopted from the file, still unstamped, since the last compaction: \
                          the files lost records memory still holds. Memory is kept, ahead of disk; the next \
                          commit is a full rewrite that puts every in-memory directive back on \
                          disk (H-15, M-46)"
@@ -6557,6 +6576,30 @@ impl LedgerService {
                     self.journal_torn_at_boot |= reloaded.journal_torn_at_boot;
                     return;
                 }
+                let mut reloaded = reloaded;
+                let kept = match self.keep_committed_envelopes_in(&mut reloaded) {
+                    Ok(kept) => kept,
+                    Err(unresolved) => {
+                        error!(
+                            records = unresolved.len(),
+                            sample = %unresolved
+                                .iter()
+                                .take(RECOVERY_MISSING_SAMPLE)
+                                .map(|(id, parent)| format!("{id}->{parent}"))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            file = %self.file_path.display(),
+                            "REFUSING to install an L-13 rebuild: records this node committed name \
+                             parents the rebuild does not hold (a write staged in the failed commit, \
+                             or a record the file no longer has). Installing it would serve them \
+                             with a parent no replica can resolve. Memory is kept, ahead of disk; \
+                             the next commit is a full rewrite that puts both back (M-59, L-81)"
+                        );
+                        self.force_compaction = true;
+                        self.journal_torn_at_boot |= reloaded.journal_torn_at_boot;
+                        return;
+                    }
+                };
                 let discarded_staged = self
                     .pending_ids
                     .iter()
@@ -6575,8 +6618,6 @@ impl LedgerService {
                     file = %self.file_path.display(),
                     "L-13 reload installed: memory rebuilt from disk after a failed commit"
                 );
-                let mut reloaded = reloaded;
-                let kept = self.keep_committed_envelopes_in(&mut reloaded);
                 if kept > 0 {
                     warn!(
                         kept,
@@ -6597,6 +6638,12 @@ impl LedgerService {
                 // signed record no peer can resolve.
                 self.verify_own_history();
                 self.finalize_operator_input();
+                // T86 / M-58, decision (21): the fact decides whether writes
+                // are refused before staging, and a rebuild whose operator
+                // input the L-81 keep just emptied never measured it (boot
+                // defers to finalisation, finalisation has nothing to do), so
+                // it is measured here, over the history just installed.
+                self.measure_canonical_over_cap(false);
             }
             Err(reload_error) => {
                 // M-49: see the doc comment — the refusing arm's two facts,
@@ -6623,24 +6670,32 @@ impl LedgerService {
     /// last commit, so a rebuild of the same files holds it under the same
     /// id. One set lookup per directive, no content hashing.
     ///
-    /// T82 / L-93: a file-adopted id is exempt only while memory's copy is
-    /// still UNSIGNED. Once this node has signed it — finalised at boot, or
-    /// signed by a live reconcile — it is this node's record and may already
-    /// have been served, even though the compaction that would clear
-    /// `adopted_from_file` has not happened yet (it failed). A rebuild that
-    /// lacks it is refused like one that lacks any other committed record, so
-    /// the next commit writes it back — what the success path (the L-30
-    /// union) does anyway.
+    /// T82 / L-93, T86 / L-104: a file-adopted id is exempt only while
+    /// memory's copy is still operator input — not yet stamped with this
+    /// node's author and lamport. Once finalised at boot, or stamped by a live
+    /// reconcile, it is this node's record and may already have been served,
+    /// even though the compaction that would clear `adopted_from_file` has not
+    /// happened yet (it failed). A rebuild that lacks it is refused like one
+    /// that lacks any other committed record, so the next commit writes it
+    /// back — what the success path (the L-30 union) does anyway. T82 keyed
+    /// this on the signature, which a signing-off node never adds.
     fn committed_ids_missing_from<'a>(&'a self, rebuilt: &LedgerDag) -> Vec<&'a str> {
         let staged: HashSet<&str> = self.pending_ids.iter().map(String::as_str).collect();
         self.dag
             .ids()
             .filter(|id| !staged.contains(id))
             .filter(|id| {
+                // T86 / L-104, decision (23): exempt only while memory's copy
+                // is still operator input (not yet finalised). T82 keyed this
+                // on the signature, so on a signing-off node — which never
+                // signs — a hand line finalised, served and written back was
+                // droppable forever; `keep_committed_envelopes_in` already
+                // treats a finalised copy as committed.
                 !self.adopted_from_file.contains(*id)
-                    || self.dag.get(id).is_some_and(|directive| {
-                        directive.metadata().contains_key(ENVELOPE_KEY_SIGNATURE)
-                    })
+                    || self
+                        .dag
+                        .get(id)
+                        .is_some_and(|directive| !Self::is_operator_input(directive))
             })
             .filter(|id| rebuilt.get(id).is_none())
             .collect()
@@ -6661,7 +6716,21 @@ impl LedgerService {
     /// re-derived around it; the next commit is a rewrite (the id stays
     /// file-adopted), which writes the committed envelope back to disk.
     /// Returns how many records kept their envelope.
-    fn keep_committed_envelopes_in(&self, reloaded: &mut LedgerService) -> usize {
+    ///
+    /// T86 / M-59, decision (22): a kept envelope names parents too, and the
+    /// rebuild must hold them. The pre-persist reconcile can adopt a hand line
+    /// with parents that include a local write staged in the SAME commit; the
+    /// commit fails, the floor lets the staged write go (it never reached
+    /// disk), and the kept envelope would name a record that exists nowhere —
+    /// served, then written, then named by every later write, and adoptable by
+    /// no peer. So when any kept envelope names a parent the rebuild lacks
+    /// (and does not itself keep), nothing is changed and the ids and parents
+    /// come back as `Err`: the install is refused, memory stays ahead of disk,
+    /// and the next commit rewrites both records.
+    fn keep_committed_envelopes_in(
+        &self,
+        reloaded: &mut LedgerService,
+    ) -> Result<usize, Vec<(String, String)>> {
         let pending_here: HashSet<&String> = self.unsigned_operator_input.iter().collect();
         let replacements: BTreeMap<String, Directive> = reloaded
             .unsigned_operator_input
@@ -6673,7 +6742,23 @@ impl LedgerService {
             })
             .collect();
         if replacements.is_empty() {
-            return 0;
+            return Ok(0);
+        }
+        let unresolved: Vec<(String, String)> = replacements
+            .iter()
+            .filter_map(|(id, directive)| match directive {
+                Directive::Transaction(txn) => txn
+                    .parent_ids()
+                    .into_iter()
+                    .find(|parent| {
+                        reloaded.dag.get(parent).is_none() && !replacements.contains_key(*parent)
+                    })
+                    .map(|parent| (id.clone(), parent.to_owned())),
+                _ => None,
+            })
+            .collect();
+        if !unresolved.is_empty() {
+            return Err(unresolved);
         }
         reloaded
             .unsigned_operator_input
@@ -6692,7 +6777,7 @@ impl LedgerService {
             .unwrap_or(0);
         reloaded.lamport_clock = reloaded.lamport_clock.max(highest);
         reloaded.rebuild_dag(&BTreeSet::new(), &replacements);
-        replacements.len()
+        Ok(replacements.len())
     }
 
     /// Everything a writer changes, cheaply (L-43) — see [`RecoveryReload`].
@@ -7052,6 +7137,9 @@ impl LedgerService {
             // commit after the repair (see `prepare_or_recover` in `gl-node`
             // for the same arm and the same argument).
             Err(error @ ServiceError::Parse(_)) => return Err(error),
+            // T86 / M-58: the L-80 refusal, with nothing staged — see
+            // `prepare_refusal_needs_no_reload`.
+            Err(error) if self.prepare_refusal_needs_no_reload(&error) => return Err(error),
             Err(error) => error,
         };
 
@@ -19198,17 +19286,21 @@ mod tests {
 
     /// M-46 control, the `d2probe floor (a)` shape: boot adopts two hand
     /// lines and the operator removes those same lines again before the
-    /// startup compaction, which fails. The rebuild lacks only ids adopted
-    /// from the file, so it installs, as T62 always did — the operator's
-    /// retraction of their own un-canonicalised input is obeyed. The install
-    /// log now counts them as file-adopted, not as staged.
+    /// startup compaction, which fails. Until T86 the rebuild lacked only ids
+    /// adopted from the file and still unsigned — on a signing-off node,
+    /// unsigned forever — so it installed and the retraction was obeyed (T62's
+    /// floor (a)). Since T86 (L-104, decision (23)) the exemption ends when the
+    /// line is finalised, which `prepare` does before the compaction it
+    /// attempts (and gl-node at boot): the lines are this node's committed
+    /// records, as a signed line already was, so the rebuild is refused,
+    /// memory is kept, and the next commit writes them back. A retraction is a
+    /// reversing entry, as for every other record.
     ///
-    /// Bug-catch: make the id check tolerate `pending_ids` only (not
-    /// `adopted_from_file`) and this refuses; restore the pre-M-46 label and
-    /// the `discarded_file_adopted=2` assertion fails.
+    /// Bug-catch: key the exemption on the signature again (T82) and this
+    /// installs, dropping both lines.
     #[cfg(unix)]
     #[test]
-    fn m46_a_reload_after_removing_ones_own_hand_lines_still_installs() {
+    fn m46_a_reload_after_removing_ones_own_finalised_hand_lines_is_refused() {
         let directory = t67_directory("m46-own-lines");
         let path = directory.join("ledger.bean");
         std::fs::write(&path, large_ledger_with_two_hand_lines()).unwrap();
@@ -19219,14 +19311,19 @@ mod tests {
         let (outcome, logged) =
             capture_warnings(|| with_read_only_directory(&directory, || svc.persist_or_reload()));
         assert!(outcome.is_err(), "premise: the commit fails");
-        assert!(logged.contains("L-13 reload installed"), "{logged}");
-        assert!(
-            logged.contains("discarded_staged=0") && logged.contains("discarded_file_adopted=2"),
-            "the label separates staged from file-adopted: {logged}"
+        assert!(logged.contains("REFUSING"), "{logged}");
+        assert!(!logged.contains("L-13 reload installed"), "{logged}");
+        assert_eq!(svc.directive_count(), 504, "memory is kept");
+        assert!(svc.accounts().is_open("Assets:HandOne"));
+        assert!(svc.accounts().is_open("Assets:HandTwo"));
+
+        svc.persist_or_reload().unwrap();
+        let on_disk = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert_eq!(
+            on_disk.directive_count(),
+            504,
+            "the next commit writes them back"
         );
-        assert_eq!(svc.directive_count(), 502);
-        assert!(!svc.accounts().is_open("Assets:HandOne"));
-        assert!(!svc.accounts().is_open("Assets:HandTwo"));
         std::fs::remove_dir_all(&directory).ok();
     }
 
@@ -21406,6 +21503,189 @@ mod tests {
         svc.open_account("Assets:Cash".to_owned(), make_date(2024, 1, 1), vec![])
             .expect("writes work again");
         remove_ledger_and_journal(&path);
+    }
+
+    /// A ledger whose file is under the cap and whose canonical form is over
+    /// it only because of the envelopes three hand-typed `open`s gain when
+    /// finalised (T86 / M-58: the L-64 shape the README names). The comments
+    /// are already canonical (`; x…`), so nothing else grows.
+    fn over_cap_by_hand_lines_ledger(path: &Path) {
+        let line = format!("; {}\n", "x".repeat((1 << 20) - 3));
+        let hand = raw_opens(
+            &["Assets:HandA", "Assets:HandB", "Assets:HandC"],
+            "2024-01-02",
+        );
+        let used = line.len() * 63 + hand.len() + 2;
+        let last = format!(
+            "; {}\n",
+            "x".repeat(MAX_LEDGER_FILE_BYTES as usize - used - 3 - 60)
+        );
+        let content = format!("{}{last}\n{hand}", line.repeat(63));
+        assert!(content.len() as u64 <= MAX_LEDGER_FILE_BYTES);
+        std::fs::write(path, content).unwrap();
+    }
+
+    /// M-58 (T86, decision (21)): the over-cap fact survives what follows the
+    /// startup compaction's refusal. Boot defers the measure while operator
+    /// input is pending; finalisation sets it. The compaction `gl-node` runs at
+    /// startup is refused by `prepare`'s L-80 arm — and, nothing being staged,
+    /// no longer reloads; a later write that stages and fails does reload, and
+    /// the reload now measures the rebuild, so the fact holds either way and
+    /// the refusal is the cap's, never the pre-T82 `Io` from the write.
+    ///
+    /// Bug-catch: take the L-80 arm out of `prepare_refusal_needs_no_reload`
+    /// and the compaction reloads; drop the measure after the install and the
+    /// write after it finds headroom and fails in `persist_atomically`.
+    #[test]
+    fn m58_a_compaction_refused_for_the_cap_neither_reloads_nor_loses_the_fact() {
+        let path = test_file_path();
+        over_cap_by_hand_lines_ledger(&path);
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.set_signer(marker_signer());
+        assert_eq!(svc.finalize_operator_input(), 3);
+        assert!(svc.compaction_text_len() > MAX_LEDGER_FILE_BYTES, "fixture");
+        assert_eq!(svc.append_headroom(), 0, "finalisation measured it");
+
+        let (outcome, logged) = capture_warnings(|| svc.compact());
+        assert!(
+            matches!(outcome, Err(ServiceError::ResourceLimitExceeded { .. })),
+            "{outcome:?}"
+        );
+        assert!(!logged.contains("reload installed"), "no reload: {logged}");
+        assert_eq!(svc.append_headroom(), 0, "the fact holds");
+
+        let (outcome, logged) = capture_warnings(|| {
+            svc.open_account("Assets:Late".to_owned(), make_date(2024, 1, 5), vec![])
+        });
+        assert!(
+            matches!(outcome, Err(ServiceError::ResourceLimitExceeded { .. })),
+            "the cap's refusal, not an I/O error from the write: {outcome:?}"
+        );
+        assert!(
+            logged.contains("reload installed"),
+            "a staged write is rolled back: {logged}"
+        );
+        assert_eq!(svc.append_headroom(), 0, "the reload measured the rebuild");
+        assert!(!svc.accounts().is_open("Assets:Late"));
+        remove_ledger_and_journal(&path);
+    }
+
+    /// M-59 (T86, decision (22)): the pre-persist reconcile adopts a hand line
+    /// under a running node with parents that include a local write staged in
+    /// the same commit; the commit fails. Memory's kept envelope names that
+    /// staged write, which the rebuild lacks — before T86 the install went
+    /// ahead, the staged write was discarded, and the hand line was served,
+    /// written and named by every later write with a parent that existed
+    /// nowhere (A5 `a5_p2`). Now the install is refused, memory is kept, and
+    /// the next commit writes both, so every parent on disk resolves.
+    ///
+    /// Bug-catch: drop the parent check in `keep_committed_envelopes_in` and
+    /// the hand line is on disk naming a parent that is not.
+    #[cfg(unix)]
+    #[test]
+    fn m59_a_kept_envelope_whose_parent_the_rebuild_lacks_refuses_the_install() {
+        let directory = t67_directory("m59-kept-parent");
+        let path = directory.join("ledger.bean");
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.set_signer(marker_signer());
+        for account in ["Assets:Cash", "Equity:Opening"] {
+            svc.open_account_signing(
+                account.to_owned(),
+                make_date(2024, 1, 1),
+                vec![],
+                marker_sign(false),
+            )
+            .unwrap();
+        }
+        svc.compact().unwrap();
+        append_to_file(&path, &h22_hand_line("hand while running", None));
+        let (outcome, logged) = capture_warnings(|| {
+            with_read_only_directory(&directory, || {
+                svc.append_transaction_signing(balanced_input(), marker_sign(true))
+            })
+        });
+        assert!(outcome.is_err(), "premise: the commit fails");
+        assert!(
+            logged.contains("REFUSING") && logged.contains("M-59"),
+            "{logged}"
+        );
+        assert!(!logged.contains("reload installed"), "{logged}");
+        let parents_resolve = |svc: &LedgerService| {
+            svc.dag()
+                .directives()
+                .into_iter()
+                .all(|directive| match directive {
+                    Directive::Transaction(txn) => txn
+                        .parent_ids()
+                        .into_iter()
+                        .all(|parent| svc.dag().get(parent).is_some()),
+                    _ => true,
+                })
+        };
+        assert!(transaction_named(&svc, "hand while running").is_some());
+        assert!(parents_resolve(&svc), "memory is self-consistent");
+
+        svc.append_transaction_signing(
+            TransactionInput {
+                narration: Some("after".to_owned()),
+                ..balanced_input()
+            },
+            marker_sign(true),
+        )
+        .unwrap();
+        let on_disk = LedgerService::boot(path.clone(), "checker".to_owned()).unwrap();
+        assert!(transaction_named(&on_disk, "hand while running").is_some());
+        assert!(parents_resolve(&on_disk), "every parent on disk resolves");
+        assert_eq!(on_disk.quarantined_count(), 0);
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// L-104 (T86, decision (23)): on a signing-off node nothing is ever
+    /// signed, so T82's "exempt while unsigned" never expired: a hand line
+    /// finalised and served, then a backup copied over the file plus one failed
+    /// commit, dropped it without `REFUSING` (A5 `a5_p3`). Keyed on
+    /// finalisation, the rebuild that lacks it is refused and the next commit
+    /// writes it back, as on a signing node.
+    ///
+    /// Bug-catch: key the exemption on the signature again and the hand line
+    /// is gone from memory and disk.
+    #[cfg(unix)]
+    #[test]
+    fn l104_a_finalised_hand_line_on_a_signing_off_node_survives_a_backup_and_a_failed_commit() {
+        let directory = t67_directory("l104-signing-off");
+        let path = directory.join("ledger.bean");
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.open_account("Assets:Cash".to_owned(), make_date(2024, 1, 1), vec![])
+            .unwrap();
+        svc.compact().unwrap();
+        drop(svc);
+        let without_hand = std::fs::read_to_string(&path).unwrap();
+        append_to_file(
+            &path,
+            &format!("\n{}", raw_opens(&["Assets:HandY"], "2024-01-02")),
+        );
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert_eq!(svc.finalize_operator_input(), 1);
+        assert!(with_read_only_directory(&directory, || svc.compact()).is_err());
+        assert!(svc.accounts().is_open("Assets:HandY"));
+
+        std::fs::write(&path, &without_hand).unwrap();
+        let (outcome, logged) = capture_warnings(|| {
+            with_read_only_directory(&directory, || {
+                svc.open_account("Assets:Staged".to_owned(), make_date(2024, 2, 1), vec![])
+            })
+        });
+        assert!(outcome.is_err(), "premise: the commit fails");
+        assert!(logged.contains("REFUSING"), "{logged}");
+        assert!(svc.accounts().is_open("Assets:HandY"), "kept in memory");
+        svc.open_account("Assets:After".to_owned(), make_date(2024, 2, 2), vec![])
+            .unwrap();
+        let on_disk = LedgerService::boot(path.clone(), "checker".to_owned()).unwrap();
+        assert!(
+            on_disk.accounts().is_open("Assets:HandY"),
+            "and written back"
+        );
+        std::fs::remove_dir_all(&directory).ok();
     }
 
     /// L-81 (T82): a backup taken while a hand line was raw, copied over the

@@ -1016,15 +1016,20 @@ same trust boundary:
   the next write recreates it from memory with every directive in it, and a
   failed write never replaces what is in memory with a file that lacks a record
   the node already wrote. That includes a backup copied over the live file, and
-  lines you added by hand once the node has signed them. Only lines you added
-  that the node has not yet signed may be dropped by that recovery. A backup
-  taken before the node rewrote your hand-added lines keeps the envelope the
-  node gave them, not a fresh one.
+  lines you added by hand once the node has stamped them — at startup, or as
+  soon as a running node adopts them — whether or not signing is enabled. A
+  line the node has stamped is its record: deleting it from the file does not
+  retract it (append a reversing entry). A backup taken before the node
+  rewrote your hand-added lines keeps the envelope the node gave them, not a
+  fresh one, and when that envelope names a record the backup does not hold,
+  the node keeps memory and rewrites both rather than install a ledger whose
+  records name a parent it lacks.
 - The 64 MiB limit applies to the file as the node writes it. Hand-typed
   directives gain an envelope of several hundred bytes each, so a file just
   under the limit can grow past it; boot then warns, and **every write fails**
   until the file is made smaller — refused before staging, with no reload, so
-  the node stays responsive. Stop the node, shrink the file, restart. Near the
+  the node stays responsive (the compaction the node attempts at startup and at
+  shutdown is refused the same way, without a reload). Stop the node, shrink the file, restart. Near the
   limit, a mutation whose record would
   not fit is refused before anything changes (`RESOURCE_LIMIT_EXCEEDED`,
   "refused before staging"), and a peer's batch that would not fit is deferred
