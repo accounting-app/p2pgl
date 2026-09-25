@@ -1220,9 +1220,9 @@ fn a_pasted_complete_envelope_is_counted_as_it_arrives_and_an_unsigned_own_one_i
 /// the upgraded node serves it and its child; `validate_supply_entry`
 /// refuses it for good, and the child waits on `MISSING_PARENT` on every
 /// fresh replica: M-51's shape, one cap over, and outside the closure that
-/// T81 built for exactly this. Fails at HEAD on the first assertion.
+/// T81 built for exactly this. Failed at `45014e9` on the first assertion;
+/// since T85 (L-101, decision (19)) the body cap seeds boot's closure.
 #[test]
-#[ignore = "A3-1: boot serves a >1 MiB history record under the legacy ceilings that every peer refuses; its child is stranded on every fresh replica"]
 fn history_over_the_wire_body_cap_is_never_served_or_always_crosses() {
     let key = key();
     let opening = sign_directive(

@@ -1093,9 +1093,13 @@ fn validate_file_envelope_form(directive: &Directive) -> Result<(), ServiceError
 /// [`validate_file_envelope_form`] plus the body-size cap — the full wire check
 /// set, for the file path that ADMITS NEW RECORDS (M-20, L-02).
 ///
-/// ## Why the bean cap is here and not at boot
+/// ## Why the bean cap is here — and, since T85, at boot too
 ///
-/// A deliberate asymmetry, recorded rather than left to be rediscovered.
+/// T51 kept it off boot, for the reason below; T85 (L-101, decision (19))
+/// applies it there as a content rule that seeds the closure quarantine,
+/// because an over-cap record a node serves is not merely refused by peers: it
+/// strands everything written on top of it on every replica that lacks it
+/// (M-51's shape). The reasoning T51 recorded, kept for the history:
 ///
 /// `reconcile_content` admits records that are not yet part of this ledger and
 /// **signs them with this node's key**, so an over-cap body it accepts is a
@@ -1112,9 +1116,9 @@ fn validate_file_envelope_form(directive: &Directive) -> Result<(), ServiceError
 /// (`close_account`'s own size check is reachable precisely because of that),
 /// and T51 does not change it.
 ///
-/// The residual is stated plainly: an over-cap directive already on disk is
-/// still loaded at boot and still served, and every peer still refuses it.
-/// What T51 closes is this node *creating* more of them through the file.
+/// T51's residual — an over-cap directive already on disk still loaded and
+/// served, refused by every peer — is closed by T85: boot quarantines it with
+/// its descendants, named, kept in the file.
 ///
 /// Costs one canonical serialization on top of
 /// [`validate_file_envelope_form`] — the same order as the
@@ -2883,8 +2887,16 @@ pub struct LedgerService {
     /// [`Self::quarantine_descendants_of_refused_history`]. Kept so the live
     /// reconcile, which re-reads the whole file after any hand edit, refuses
     /// a descendant again instead of re-adopting it: it is a valid record
-    /// whose only fault is its parent. Re-derived by every boot and reload.
+    /// whose only fault is its parent — and, since T85 (M-56), so the wire
+    /// (`stage_remote_directive`) refuses the same set, permanently. Seeded by
+    /// the two T75 ceilings, the amount cap and (T85, L-101) the body cap.
+    /// Re-derived by every boot and reload.
     refused_history_closure: BTreeSet<String>,
+    /// The content ids of the entries the live reconcile in progress is
+    /// adopting (T85): a complete-envelope record whose parent is not yet in
+    /// the DAG may name one that comes later in canonical (date) order in the
+    /// same file. Empty outside [`Self::reconcile_content`]'s adoption loop.
+    reconcile_batch_ids: HashSet<String>,
     /// Content ids of the directives [`Self::boot`] adopted as **operator
     /// input** whose envelope is not final yet (H-13).
     ///
@@ -3614,6 +3626,32 @@ impl LedgerService {
                 );
                 continue;
             }
+            // T85 / L-101, decision (19): the wire's body cap is a content rule
+            // every peer holds history to as well — `validate_supply_entry`
+            // refuses an over-cap `economic_bean` for good — so it seeds the
+            // closure like the two above. T51 kept it off boot (see
+            // `enforce_economic_bean_limit`); the record it left served was
+            // M-51's shape: counted here, refused everywhere, and everything
+            // written on top of it stranded on every fresh replica.
+            if let Err(error) = enforce_economic_bean_limit(directive) {
+                let content_id = compute_content_id(directive);
+                warn!(
+                    %error,
+                    id = %content_id,
+                    file = %file_path.display(),
+                    "quarantining a ledger-file directive whose body is over the wire's size cap, \
+                     which every peer refuses — kept in the file, kept out of the DAG, and with it \
+                     every record that descends from it (named below) (L-101, H-08)"
+                );
+                lamport_high.note_if_own(directive, &author_id);
+                content_rule_refused.insert(content_id.clone());
+                Self::quarantine_keeping_envelope(
+                    &mut quarantined,
+                    content_id,
+                    (*directive).clone(),
+                );
+                continue;
+            }
             if let Err(error) = validate_parent_fan_in(directive)
                 .and_then(|()| validate_file_envelope_form(directive))
                 // H-17 (T65, T76): the amount cap as a directive-level
@@ -3886,6 +3924,7 @@ impl LedgerService {
             unverified_history,
             signature_quarantined_total: 0,
             refused_history_closure: BTreeSet::new(),
+            reconcile_batch_ids: HashSet::new(),
             unsigned_operator_input: Vec::new(),
             operator_input_with_file_author: BTreeSet::new(),
             operator_input_as_written: BTreeMap::new(),
@@ -5036,46 +5075,22 @@ impl LedgerService {
     /// than a history no one can sync past. Walks both the children a record
     /// in the DAG has and the children still waiting on one that is absent.
     ///
-    /// A refused `open` has dependants without being anyone's parent: every
-    /// transaction or `close` on an account that no surviving `open` opens
-    /// waits on every peer for the `open` that never arrives (the M-51 shape
-    /// exactly), so those join the closure too, with their descendants.
+    /// A refused `open` has dependants without being anyone's parent: the
+    /// transactions on its account. T81 took every transaction on an account
+    /// "no surviving `open` opens" here, before the operator input — by name,
+    /// blind to dates and currencies, and to a hand `open` adopted a moment
+    /// later (M-56). Since T85 (decision (18)) those are judged by
+    /// [`Self::quarantine_unservable_history`] instead, after the operator
+    /// input, with the check a peer applies (`validate_transaction` against the
+    /// accounts this node serves), so a hand `open` that admits them frees them
+    /// in the same boot and one that does not leaves them held. What remains
+    /// here is parenthood, which no later step can repair.
     fn quarantine_descendants_of_refused_history(&mut self, refused: &BTreeSet<String>) {
         if refused.is_empty() {
             return;
         }
         let mut closure: BTreeSet<String> = BTreeSet::new();
         let mut frontier: Vec<String> = refused.iter().cloned().collect();
-        let orphaned_accounts: BTreeSet<String> = refused
-            .iter()
-            .filter_map(|id| match self.quarantined.get(id) {
-                Some(Directive::Open(open)) => Some(open.account.clone()),
-                _ => None,
-            })
-            .filter(|account| {
-                !self.dag.directives().into_iter().any(|directive| {
-                    matches!(directive, Directive::Open(open) if &open.account == account)
-                })
-            })
-            .collect();
-        if !orphaned_accounts.is_empty() {
-            for directive in self.dag.directives() {
-                let on_orphaned_account = match directive {
-                    Directive::Transaction(txn) => txn
-                        .postings
-                        .iter()
-                        .any(|posting| orphaned_accounts.contains(&posting.account)),
-                    Directive::Close(close) => orphaned_accounts.contains(&close.account),
-                    _ => false,
-                };
-                if on_orphaned_account {
-                    let id = compute_content_id(directive);
-                    if closure.insert(id.clone()) {
-                        frontier.push(id);
-                    }
-                }
-            }
-        }
         while let Some(id) = frontier.pop() {
             let children: Vec<String> = match self.dag.children_of(&id) {
                 Some(children) => children.to_vec(),
@@ -7289,6 +7304,10 @@ impl LedgerService {
             self.canonical_is_current = false;
         }
 
+        // T85: every id this reconcile may adopt — a complete envelope's parent
+        // can come later in canonical order (see `reconcile_batch_ids`).
+        self.reconcile_batch_ids = file_directives.iter().map(compute_content_id).collect();
+
         // L-12: canonical order, like boot. Stable, so equal keys keep file order.
         let mut file_directives = file_directives;
         file_directives.sort_by(|a, b| {
@@ -7346,6 +7365,11 @@ impl LedgerService {
 
             self.adopt_file_directive(directive, content_id, &mut tally, AdoptionPath::Live);
         }
+        self.reconcile_batch_ids.clear();
+        // T85 / H-23: a parent the loop admitted on the strength of being in
+        // this file can itself have been refused a moment later; what named
+        // it is then a record no peer could adopt, and goes too.
+        self.quarantine_unservable_history();
 
         // H-08: a repaired directive keeps its content id (the envelope is
         // outside the hash), so the operator's fix arrives above as an ordinary
@@ -7760,6 +7784,42 @@ impl LedgerService {
                         tally.refuse(content_id, error.to_string());
                         return FileAdoption::Refused;
                     }
+                    // T85 / M-56, H-23: a full envelope is history, and history
+                    // this node serves must be what a peer can adopt — every
+                    // parent it names already here. Boot holds such a record
+                    // (`quarantine_unservable_history`); so does the live
+                    // path, in the quarantine, so the canonical re-persist
+                    // keeps it in the file and a peer that re-supplies its
+                    // parent (and then it) heals it. Before T85 the live path
+                    // inserted it leniently with a dangling parent (0924 §5).
+                    if !needs_stamp {
+                        let missing_parent = match &final_directive {
+                            Directive::Transaction(txn) => txn
+                                .parent_ids()
+                                .into_iter()
+                                .find(|parent| {
+                                    self.dag.get(parent).is_none()
+                                        && (!self.reconcile_batch_ids.contains(*parent)
+                                            || self.quarantined.contains_key(*parent))
+                                })
+                                .map(str::to_owned),
+                            _ => None,
+                        };
+                        if let Some(parent) = missing_parent {
+                            self.quarantined
+                                .entry(stored_id.clone())
+                                .or_insert_with(|| final_directive.clone());
+                            tally.refuse(
+                                content_id,
+                                format!(
+                                    "its parent {parent} is not served by this node, so no peer \
+                                     lacking it could adopt it; held in the quarantine until a \
+                                     peer re-supplies the parent (H-23)"
+                                ),
+                            );
+                            return FileAdoption::Refused;
+                        }
+                    }
                     // H-20: a full envelope is adopted as history, and the
                     // live path holds it to the same signature check boot
                     // does — against the id it is stored under.
@@ -7845,6 +7905,36 @@ impl LedgerService {
                             }
                             .to_string(),
                         );
+                        return FileAdoption::Refused;
+                    }
+                    // T85 / L-110, decision (20): nor while this node holds a
+                    // node-written `open` of the account in its quarantine
+                    // (edited, or its signature otherwise refused). The mesh
+                    // may still hold that record and re-supply it, and then the
+                    // account would carry two `open`s mesh-wide. At boot the
+                    // same record is still in the DAG when operator input is
+                    // adopted, so the check above refuses it there; this is the
+                    // live reconcile's copy of that verdict. An `open` refused
+                    // under a content rule (the M-51 flood, in
+                    // `refused_history_closure`) does not count: no peer holds
+                    // it, and a hand `open` is the remedy decision (18) names.
+                    if let Some((held_id, _)) = self.live_quarantine().find(|(id, held)| {
+                        matches!(held, Directive::Open(held_open)
+                            if held_open.account == open.account)
+                            && !Self::is_operator_input(held)
+                            && !self.refused_history_closure.contains(*id)
+                    }) {
+                        let reason = format!(
+                            "{}: this node holds a node-written open of it in its quarantine \
+                             ({held_id}), which the mesh may still hold — restore that record \
+                             (from a peer's copy, or by deleting its openledger-* lines if only \
+                             its envelope was edited) instead of opening the account again, or \
+                             the account would carry two opens (L-110)",
+                            ServiceError::AccountAlreadyOpen {
+                                account: open.account.clone(),
+                            }
+                        );
+                        tally.refuse(content_id, reason);
                         return FileAdoption::Refused;
                     }
                 }
@@ -8443,6 +8533,37 @@ impl LedgerService {
         // G-Set dedup: if already present, no-op.
         if self.dag.get(&content_id).is_some() {
             return Ok(None);
+        }
+        // T85 / M-56, decision (18): what boot's closure holds — a record
+        // refused under a content rule every peer applies, or one descending
+        // from such a record — is refused here as the file path refuses it
+        // (`adopt_file_directive`), so a running node and a restarted one serve
+        // the same set. Permanent (`InvalidInput`): no later record can make it
+        // adoptable, and the refusal cache then spares the peer and this node a
+        // re-fetch every round.
+        if !self.refused_history_closure.is_empty() {
+            let refused_parent = match &directive {
+                Directive::Transaction(txn) => txn
+                    .parent_ids()
+                    .into_iter()
+                    .find(|parent| self.refused_history_closure.contains(*parent))
+                    .map(str::to_owned),
+                _ => None,
+            };
+            if self.refused_history_closure.contains(&content_id) || refused_parent.is_some() {
+                let why = match refused_parent {
+                    Some(parent) => format!("names parent {parent}, which"),
+                    None => "is a record that".to_owned(),
+                };
+                return Err(ServiceError::InvalidInput {
+                    message: format!(
+                        "{content_id} {why} this node's ledger holds back because it, or a \
+                         record it descends from, breaks a content rule every peer applies to \
+                         history (M-51, M-52, L-101); no later record can make it adoptable \
+                         (M-56)"
+                    ),
+                });
+            }
         }
         // T83 / L-94: for the lamport-gap diagnostic once it is adopted.
         let adopted_lamport = directive.lamport_clock();
@@ -9728,12 +9849,13 @@ mod tests {
     #[test]
     fn test_close_rejects_a_body_over_the_wire_size_cap() {
         // `close_account` cannot reach its own size check through
-        // `open_account` any more — the open is refused first — but it is
-        // reachable, and this is how: boot deliberately applies no limits to
-        // HISTORY, so a ledger written before this fix can hold an account
-        // name no `close` directive could ever be shipped for. History means
-        // node-written, i.e. enveloped (H-13): an envelope-less `open` is
-        // operator input and gets the write-path cap at boot instead.
+        // `open_account` — the open is refused first. Until T85 it was
+        // reachable through boot, which applied no body cap to HISTORY, so a
+        // ledger written before L-02 could hold an account name no `close`
+        // could ever be shipped for. Since T85 (L-101, decision (19)) boot
+        // holds such an `open` as a record every peer refuses, so the account
+        // is never open here and `close_account`'s own size check is defence
+        // in depth; the close is refused before it, and nothing moves.
         let path = test_file_path();
         let huge = long_account("Assets", MAX_ECONOMIC_BEAN_LENGTH + 1_024);
         let persisted = full_file_serialize(
@@ -9749,13 +9871,19 @@ mod tests {
 
         let mut svc = LedgerService::boot(path.clone(), "peer-1".to_owned()).unwrap();
         assert!(
-            svc.accounts().is_open(&huge),
-            "boot must still load the oversized account — the cap is on writes"
+            !svc.accounts().is_open(&huge) && svc.quarantined_count() == 1,
+            "T85: boot holds the oversized open — every peer refuses its body"
         );
 
         let lamport_before = svc.lamport_clock();
         let error = svc.close_account(huge, make_date(2024, 1, 2)).unwrap_err();
-        assert_eq!(error.error_code(), "RESOURCE_LIMIT_EXCEEDED");
+        assert!(
+            matches!(
+                error.error_code(),
+                "RESOURCE_LIMIT_EXCEEDED" | "ACCOUNT_NOT_OPEN"
+            ),
+            "{error}"
+        );
         assert_eq!(
             svc.lamport_clock(),
             lamport_before,
@@ -17079,16 +17207,38 @@ mod tests {
 
         let (mut svc, path) = setup_with_accounts();
         append_to_file(&path, &planted_dangling_parent(&victim_id));
-        assert_eq!(svc.reconcile_file().unwrap().new_directives, 1);
+        // T85 / H-23: the live path holds a complete envelope whose parent it
+        // does not serve, as boot does since T84 — in the quarantine, kept in
+        // the file — so the pointer never reaches the parent choice.
+        let planted = svc.reconcile_file().unwrap();
+        assert_eq!((planted.new_directives, svc.quarantined_count()), (0, 1));
 
         append_to_file(&path, HAND_EDITED_TRANSACTION);
         let result = svc.reconcile_file().unwrap();
+        // The hand edit, and — its parent now resolving — the held entry.
         assert_eq!(
-            result.new_directives, 1,
-            "L-40: the hand edit must be adopted, not refused as a cycle ({} rejected)",
-            result.rejected
+            (result.new_directives, result.rejected),
+            (2, 0),
+            "L-40: the hand edit must be adopted, not refused as a cycle"
         );
         assert!(svc.get_directive(&victim_id).is_some());
+        assert_eq!(svc.quarantined_count(), 0);
+        let victim_parents = svc
+            .get_directive(&victim_id)
+            .unwrap()
+            .metadata()
+            .get("openledger-parents")
+            .cloned()
+            .unwrap_or_default();
+        let planted_id = svc
+            .head_txids()
+            .into_iter()
+            .next()
+            .expect("the planted entry is the head, naming the hand edit");
+        assert!(
+            !victim_parents.contains(&planted_id),
+            "acyclic: the hand edit does not name the entry that names it"
+        );
 
         let rebooted = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
         assert_eq!(rebooted.quarantined_count(), 0);
@@ -20779,9 +20929,12 @@ mod tests {
             );
         }
         assert!(transaction_named(&svc, "unrelated").is_some());
+        // Since T85 (decision (18)) the transaction on the flood account is
+        // held by the H-23 rule — a peer's `validate_transaction` against the
+        // accounts this node serves — and its child with it; the closure itself
+        // walks parenthood only.
         assert!(
-            logged.contains("(M-51, H-08)")
-                && logged.contains("descends from a ledger record no peer accepts"),
+            logged.contains("(M-51, H-08)") && logged.contains("no fresh replica could hold"),
             "{logged}"
         );
 
@@ -20792,6 +20945,251 @@ mod tests {
         assert_eq!(result.new_directives, 1, "only the hand line");
         assert!(transaction_named(&svc, "on the flood account").is_none());
         assert!(transaction_named(&svc, "child").is_none());
+        remove_ledger_and_journal(&path);
+    }
+
+    /// The M-51 flood `open` of `Assets:Flood` (4,097 currencies, over the
+    /// legacy ceiling) as a signed history record (T85 tests).
+    fn t85_flood_open() -> Directive {
+        marker_signed(Directive::Open(Open {
+            date: make_date(2024, 1, 2),
+            account: "Assets:Flood".to_owned(),
+            currencies: (0..=crate::limits::MAX_CURRENCIES_PER_OPEN_LEGACY)
+                .map(|index| format!("C{index:04}"))
+                .collect(),
+            metadata: BTreeMap::from([
+                (ENVELOPE_KEY_AUTHOR.to_owned(), "test-peer".to_owned()),
+                (ENVELOPE_KEY_LAMPORT.to_owned(), "10".to_owned()),
+            ]),
+        }))
+    }
+
+    /// gl-node's order over `path`: boot, signer, finalise.
+    fn t85_boot(path: &Path) -> LedgerService {
+        let mut svc = LedgerService::boot(path.to_path_buf(), "test-peer".to_owned()).unwrap();
+        svc.set_signer(marker_signer());
+        svc.finalize_operator_input();
+        svc
+    }
+
+    /// M-56 (T85, decision (18)): the flood `open` is refused under a content
+    /// rule; a transaction on its account (2024-02-01, `C0001`) and the
+    /// operator's hand `open Assets:Flood C0001` — the M-51 remedy — are in the
+    /// same file. A hand `open` dated before the transaction admits it, so the
+    /// transaction is served in THIS boot and the next; one dated after it
+    /// does not, so the transaction is held in both. Before T85 the closure
+    /// judged "any surviving open" by account name before the hand `open` was
+    /// adopted: held at the first boot, served at the second — for either date
+    /// (X1 `c2d`, A4 `P5-late`).
+    ///
+    /// Bug-catch: restore the closure's name-only account term and the
+    /// back-dated case is held at the first boot and served at the second.
+    #[test]
+    fn m56_a_hand_open_frees_exactly_what_it_admits_in_the_same_boot() {
+        for (label, open_date, freed) in [
+            ("back-dated", "2024-01-05", true),
+            ("late", "2024-02-20", false),
+        ] {
+            let (svc, path) = setup_with_signed_accounts();
+            drop(svc);
+            let on_flood = signed_history_transaction(
+                "on the flood account",
+                1,
+                ("Assets:Flood", "C0001"),
+                "",
+                11,
+            );
+            append_to_file(
+                &path,
+                &format!(
+                    "\n{}\n{open_date} open Assets:Flood C0001\n",
+                    full_file_serialize(&[t85_flood_open(), on_flood], &[])
+                ),
+            );
+            let mut first = t85_boot(&path);
+            let served = transaction_named(&first, "on the flood account").is_some();
+            let held: Vec<String> = first
+                .quarantined_ids()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            first.compact().unwrap();
+            drop(first);
+            let second = t85_boot(&path);
+            assert_eq!(served, freed, "{label}: first boot");
+            assert_eq!(
+                transaction_named(&second, "on the flood account").is_some(),
+                freed,
+                "{label}: a fixed point across the restart"
+            );
+            let held_again: Vec<String> = second
+                .quarantined_ids()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(held, held_again, "{label}: the same quarantine");
+            drop(second);
+            remove_ledger_and_journal(&path);
+        }
+    }
+
+    /// M-56 (T85, decision (18)): the wire refuses what boot's closure holds,
+    /// permanently — the record refused under a content rule and every record
+    /// that descends from it — so a running node and a restarted one serve
+    /// the same set. The control: a record naming a parent this node merely
+    /// lacks is a `MISSING_PARENT` (retried), not a refusal.
+    ///
+    /// Bug-catch: drop the closure check in `stage_remote_directive` and the
+    /// child is refused only as `MISSING_PARENT`, which is retried forever.
+    #[test]
+    fn m56_the_wire_refuses_what_the_closure_holds() {
+        let (svc, path) = setup_with_signed_accounts();
+        drop(svc);
+        let Directive::Transaction(mut flood) = signed_history_transaction(
+            "over the legacy ceiling",
+            1,
+            ("Assets:Cash", "USD"),
+            "",
+            11,
+        ) else {
+            unreachable!()
+        };
+        flood.postings[0].metadata = (0
+            ..=crate::limits::MAX_POSTING_METADATA_KEYS_PER_TRANSACTION_LEGACY)
+            .map(|index| (format!("k{index}"), "v".to_owned()))
+            .collect();
+        let flood = marker_signed(Directive::Transaction(flood));
+        let flood_id = compute_content_id(&flood);
+        let child = signed_history_transaction(
+            "child of the flood",
+            2,
+            ("Assets:Cash", "USD"),
+            &flood_id,
+            12,
+        );
+        let child_id = compute_content_id(&child);
+        append_to_file(
+            &path,
+            &format!("\n{}", full_file_serialize(&[flood, child.clone()], &[])),
+        );
+        let mut svc = t85_boot(&path);
+        assert!(svc.quarantined_ids().contains(&child_id.as_str()));
+
+        let error = svc.stage_remote_directive(child).unwrap_err();
+        assert_eq!(error.error_code(), "INVALID_INPUT", "{error}");
+        let grandchild =
+            signed_history_transaction("grandchild", 3, ("Assets:Cash", "USD"), &child_id, 13);
+        let error = svc.stage_remote_directive(grandchild).unwrap_err();
+        assert_eq!(
+            error.error_code(),
+            "INVALID_INPUT",
+            "a record naming a closure member is refused as permanently: {error}"
+        );
+        let control = signed_history_transaction(
+            "names an unknown parent",
+            4,
+            ("Assets:Cash", "USD"),
+            &"a".repeat(64),
+            14,
+        );
+        assert_eq!(
+            svc.stage_remote_directive(control)
+                .unwrap_err()
+                .error_code(),
+            "MISSING_PARENT"
+        );
+        remove_ledger_and_journal(&path);
+    }
+
+    /// M-56 / H-23 (T85): a pair pasted into the file under a running node —
+    /// P with a signature that does not verify, and C, correctly signed,
+    /// naming P. The live reconcile adopts in canonical order and lets a
+    /// parent that comes later in the same file count as present, so C's check
+    /// passes; P is then refused. What named it must not stay served with a
+    /// dangling parent: the rule runs once more after the adoption loop and
+    /// holds C in the quarantine (kept in the file).
+    ///
+    /// Bug-catch: drop the `quarantine_unservable_history` call after the
+    /// reconcile's adoption loop and C is served naming a parent nobody holds.
+    #[test]
+    fn m56_a_pasted_child_of_a_pasted_parent_the_reconcile_refuses_is_held() {
+        let (mut svc, path) = setup_with_signed_accounts();
+        svc.compact().unwrap();
+        let mut parent =
+            signed_history_transaction("pasted parent", 1, ("Assets:Cash", "USD"), "", 21);
+        directive_metadata_mut(&mut parent)
+            .insert(ENVELOPE_KEY_SIGNATURE.to_owned(), "00".repeat(64));
+        let parent_id = compute_content_id(&parent);
+        let child =
+            signed_history_transaction("pasted child", 2, ("Assets:Cash", "USD"), &parent_id, 22);
+        append_to_file(
+            &path,
+            &format!("\n{}", full_file_serialize(&[parent, child], &[])),
+        );
+        let result = svc.reconcile_file().unwrap();
+        assert!(
+            transaction_named(&svc, "pasted parent").is_none(),
+            "{result:?}"
+        );
+        assert!(
+            transaction_named(&svc, "pasted child").is_none(),
+            "a record whose parent was refused is held, not served: {result:?}"
+        );
+        for directive in svc.dag().directives() {
+            if let Directive::Transaction(txn) = directive {
+                for parent in txn.parent_ids() {
+                    assert!(svc.get_directive(parent).is_some());
+                }
+            }
+        }
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-110 (T85, decision (20)): while this node holds a node-written `open`
+    /// of an account in its quarantine (here its date edited, so its
+    /// signature fails), a hand `open` of the same account is refused on the
+    /// live path as boot refuses it (L-77 there): the mesh may still re-supply
+    /// the original, and the account would carry two `open`s. The flood
+    /// `open` refused under a content rule does not block the M-51 remedy.
+    ///
+    /// Bug-catch: drop the quarantine clause in the L-77 check and the live
+    /// reconcile adopts the second `open`.
+    #[test]
+    fn l110_a_hand_open_is_refused_while_a_node_written_open_of_the_account_is_quarantined() {
+        let (mut svc, path) = setup_with_signed_accounts();
+        svc.compact().unwrap();
+        drop(svc);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let edited = content.replacen(
+            "2024-01-01 open Expenses:Food",
+            "2024-01-03 open Expenses:Food",
+            1,
+        );
+        assert_ne!(content, edited, "premise: the open line was found");
+        std::fs::write(&path, edited).unwrap();
+        let mut svc = t85_boot(&path);
+        assert_eq!(svc.quarantined_count(), 1, "the edited open");
+        assert!(!svc.accounts().is_open("Expenses:Food"));
+
+        append_to_file(&path, "\n2024-01-04 open Expenses:Food USD\n");
+        let result = svc.reconcile_file().unwrap();
+        assert_eq!(result.new_directives, 0);
+        assert!(!svc.accounts().is_open("Expenses:Food"), "no second open");
+
+        // The control: a content-refused open never blocks the hand remedy.
+        append_to_file(
+            &path,
+            &format!(
+                "\n{}\n2024-01-05 open Assets:Flood C0001\n",
+                full_file_serialize(&[t85_flood_open()], &[])
+            ),
+        );
+        drop(svc);
+        let svc = t85_boot(&path);
+        assert!(
+            svc.accounts().is_open("Assets:Flood"),
+            "the M-51 remedy is adopted"
+        );
         remove_ledger_and_journal(&path);
     }
 

@@ -855,7 +855,9 @@ H-23), and keeps them in the file. On a mesh they come back by themselves: a pee
 that holds the missing parent re-supplies it, and then them. On a node no peer
 can help, restore the missing record from a backup, strip the `openledger-*`
 lines as above, or add the missing `open` dated no later than the first
-transaction on the account, and restart. Restating a record in a different form
+transaction on the account and listing its currencies, and restart — boot judges
+the history after it has adopted what you typed, so an `open` that admits the
+transactions frees them in that same boot. Restating a record in a different form
 (a larger unit, a corrected body) gives it a new id, so what named the old id
 stays held; restate the chain, or join nodes by bootstrap (§Mesh identity).
 
@@ -896,7 +898,11 @@ peer's copy. A hand-typed `openledger-parents` line must name records this node
 quarantine (a quarantined record is never served), is refused, because a signed
 record with a parent nobody can resolve orphans everything written after it. A
 hand-typed `open` of an account that is already open is refused exactly as the
-API refuses it.
+API refuses it — and so is one of an account whose node-written `open` this node
+holds in its quarantine (edited, say): the mesh may still re-supply that `open`,
+and the account would then carry two. Restore the quarantined one instead. An
+`open` refused because no peer accepts it (over the 4,096-currency ceiling) does
+not count; opening the account by hand is the remedy there.
 
 Fixing a node-written record **and** appending new lines in the same edit is
 safe. Boot stamps your new lines' parents before it has checked the signatures
