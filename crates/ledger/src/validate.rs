@@ -153,6 +153,60 @@ impl std::fmt::Display for AmountCapError {
 
 impl std::error::Error for AmountCapError {}
 
+/// Why a well-formed decimal spelling cannot be held as an amount, when the
+/// reason is its length (T83 / L-92) — `None` for anything else, so callers
+/// keep their own message.
+///
+/// A stored amount is a `Decimal`: a 96-bit mantissa (about 7.9 × 10^28) and
+/// at most 28 fractional digits. Every digit counts toward the mantissa,
+/// trailing zeros included, so `1000000000000000000000.00000000` (10^21 with
+/// 8 decimals, 30 digits) cannot be represented although its value is within
+/// the cap — 10^21 admits at most 7 decimal places. Before T83 both ingress
+/// paths said only "Invalid decimal string" / "Invalid number".
+pub fn explain_unrepresentable_amount(text: &str) -> Option<String> {
+    let unsigned = text.strip_prefix('-').unwrap_or(text);
+    let (integer, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let digits = |part: &str| {
+        part.chars()
+            .filter(|c| *c != '_' && *c != ',')
+            .collect::<String>()
+    };
+    let (integer, fraction) = (digits(integer), digits(fraction));
+    if integer.is_empty() && fraction.is_empty()
+        || !integer
+            .chars()
+            .chain(fraction.chars())
+            .all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    if fraction.len() > 28 {
+        return Some(format!(
+            "amount {text} has {} fractional digits; at most 28 are kept, and more are refused \
+             rather than rounded (H-17)",
+            fraction.len()
+        ));
+    }
+    // Exact: the digits, as one integer, against the 96-bit mantissa.
+    let mantissa_digits = format!("{integer}{fraction}");
+    let mantissa_digits = mantissa_digits.trim_start_matches('0');
+    let significant = mantissa_digits.len();
+    const MAX_MANTISSA: u128 = (1u128 << 96) - 1;
+    let too_long = !mantissa_digits.is_empty()
+        && (significant > 38
+            || mantissa_digits
+                .parse::<u128>()
+                .map_or(true, |mantissa| mantissa > MAX_MANTISSA));
+    if too_long {
+        return Some(format!(
+            "amount {text} has {significant} significant digits, trailing zeros included; a \
+             stored amount holds at most 28 (29 below about 7.9 × 10^28), so 10^21 admits at \
+             most 7 decimal places — drop trailing zeros or decimals (L-92)"
+        ));
+    }
+    None
+}
+
 /// Refuse `number` if it is outside the amount cap.
 pub fn check_amount_cap(label: &'static str, number: Decimal) -> Result<(), AmountCapError> {
     if amount_within_cap(number) {
@@ -412,6 +466,37 @@ mod tests {
     }
 
     // ── CT-1: I1 balance ─────────────────────────────────────────────────
+
+    /// L-92 (T83): a spelling too long for a `Decimal` gets a reason, not
+    /// "Invalid number" — at the value that motivated it (10^21 with 8
+    /// decimals), at 28 fractional digits (fine) and 29 (refused), and never
+    /// for a spelling that is malformed for another reason.
+    #[test]
+    fn l92_an_over_long_amount_spelling_is_explained() {
+        let ten21_8 = "1000000000000000000000.00000000";
+        assert!(
+            rust_decimal::Decimal::from_str_exact(ten21_8).is_err(),
+            "premise"
+        );
+        let message = explain_unrepresentable_amount(ten21_8).expect("explained");
+        assert!(
+            message.contains("30 significant digits") && message.contains("7 decimal places"),
+            "{message}"
+        );
+        assert!(explain_unrepresentable_amount("1000000000000000000000.0000000").is_none());
+        assert!(explain_unrepresentable_amount("-10.0000000000000000000000000000").is_some());
+        assert!(explain_unrepresentable_amount(&format!("0.{}", "1".repeat(28))).is_none());
+        let message = explain_unrepresentable_amount(&format!("0.{}", "1".repeat(29))).unwrap();
+        assert!(message.contains("29 fractional digits"), "{message}");
+        assert!(explain_unrepresentable_amount("12abc").is_none());
+        assert!(explain_unrepresentable_amount("").is_none());
+        assert!(explain_unrepresentable_amount("0.000").is_none());
+        let parsed = crate::parse::parse_file(&format!(
+            "2024-01-01 * \"x\"\n  Assets:A {ten21_8} USD\n  Equity:B\n"
+        ));
+        let rendered = format!("{:?}", parsed.unwrap_err());
+        assert!(rendered.contains("L-92"), "{rendered}");
+    }
 
     #[test]
     fn test_ct1_balanced_transaction_accepted() {

@@ -1346,58 +1346,53 @@ pub const LAMPORT_CEILING: u64 = 1 << 53;
 /// for why it deliberately has no first-contact exemption.
 pub const MAX_LAMPORT_ADVANCE: u64 = 1 << 32;
 
-/// The clock-versus-history warning (T72 / H-19): this node's clock is
-/// suspicious when `lamport_clock > CLOCK_HISTORY_WARN_FACTOR × directive_count
-/// + CLOCK_HISTORY_WARN_SLACK` — see [`clock_is_far_above_history`].
+/// The lamport-gap warning (T72 / H-19; T83 / L-94, decision (12)): the
+/// history this node serves holds a jump of at least this size between two
+/// consecutive lamport values.
 ///
-/// # Why a warning, and why these numbers
+/// # Why a warning, and why a gap
 ///
 /// The ratchet ([`MAX_LAMPORT_ADVANCE`]) is judged against THIS node's clock,
 /// deliberately with no first-contact exemption, so joinability is a property
 /// of the history: every directive a joiner needs must sit within 2^32 of
 /// something it has already adopted. One legal directive at `local + 2^32 − 1`
-/// — or any pre-T63 jump — puts a gap of exactly that size into the history,
-/// and once the author of the bridging directive is removed from the allowlist
-/// (the H-12 remedy) every LATER joiner, and every node rebuilt from an empty
-/// disk, is stuck below the gap for good while every existing node carries on.
-/// The audit showed that no per-directive bound repairs that (an honest node
-/// that adopted the jump legitimately stamps `2^32 + 1` above its parents, and
-/// an attacker *transaction* already partitions joiners through
-/// `MissingParent`), so the ratchet stays and the join is procedural: the
-/// joiner boots from a peer's compacted `.bean`, which loads as history. What
-/// this constant buys is that the state is **diagnosed** instead of silent —
-/// on the nodes that adopted the jump (the ones an operator is looking at)
-/// and on the joiner that copied the file.
+/// — or any pre-T63 jump — puts a gap of that size into the history, and once
+/// the author of the bridging directive is removed from the allowlist (the
+/// H-12 remedy) every LATER joiner, and every node rebuilt from an empty disk,
+/// is stuck below the gap for good while every existing node carries on. The
+/// join is procedural (the joiner boots from a peer's compacted `.bean`); what
+/// this buys is that the state is **diagnosed** instead of silent.
 ///
-/// The bound is derived, not tuned. An honest Lamport clock is bounded by the
-/// events it has folded: each directive in the DAG moved it by at most one
-/// when it was stamped or adopted, and each adoption of a value *below* the
-/// clock still adds one (`max(local, remote) + 1`), so a clock is at most
-/// twice the directive count plus whatever a boot resumes above. Four times
-/// the count, plus 1024 for a small history, therefore never fires on an
-/// honest node — a dense history keeps `clock ≈ count` — and always fires on
-/// the 2^32 gap over any history the file cap allows (2^32 > 4 × 2^26).
-pub const CLOCK_HISTORY_WARN_FACTOR: u64 = 4;
+/// T72 judged it by the clock against the directive count (the clock above
+/// four times the count plus 1024). That was not a bound on honest clocks: each adoption below the
+/// clock still adds one, a fresh joiner stamps its inflated clock into its own
+/// directive, and the next joiner climbs from there, so a dozen honest joins
+/// fired it (L-94); and a quarantine that shrank the count fired it on the
+/// next honest adoption (L-83). A GAP is a property of the content: honest
+/// traffic moves the highest clock by one per event, so no honest history
+/// holds a 2^28 gap (it would take 268 million events), joins cannot compound
+/// one, and a quarantine cannot create one. 2^28 sits far below the 2^32 a
+/// ratchet-legal jump makes, so every such jump is diagnosed.
+pub const LAMPORT_GAP_WARN: u64 = 1 << 28;
 
-/// The additive slack in [`clock_is_far_above_history`]: a history of a few
-/// directives whose clocks were inflated by inversions, reloads and boots stays
-/// below it.
-pub const CLOCK_HISTORY_WARN_SLACK: u64 = 1024;
-
-/// How far the clock must move past the last clock-versus-history warning
-/// before the warning is repeated on adoption (T72 / H-19): once per boot, then
-/// once per 2^20 of clock advance, so a node holding a jump does not log a line
-/// per adopted directive.
-pub const CLOCK_HISTORY_WARN_REPEAT_ADVANCE: u64 = 1 << 20;
-
-/// Whether `lamport_clock` is beyond what `directive_count` honest events could
-/// have produced (T72 / H-19) — see [`CLOCK_HISTORY_WARN_FACTOR`].
-pub fn clock_is_far_above_history(lamport_clock: u64, directive_count: usize) -> bool {
-    let count = u64::try_from(directive_count).unwrap_or(u64::MAX);
-    lamport_clock
-        > count
-            .saturating_mul(CLOCK_HISTORY_WARN_FACTOR)
-            .saturating_add(CLOCK_HISTORY_WARN_SLACK)
+/// The largest difference between consecutive distinct values of
+/// `lamports`, counting from 0, and the value at the top of it (T83 /
+/// L-94). `(0, 0)` for an empty history. The predicate behind the H-19
+/// warning: `largest_lamport_gap(..).0 >= LAMPORT_GAP_WARN`.
+pub fn largest_lamport_gap(lamports: impl IntoIterator<Item = u64>) -> (u64, u64) {
+    let mut values: Vec<u64> = lamports.into_iter().collect();
+    values.sort_unstable();
+    values.dedup();
+    let mut previous = 0u64;
+    let mut largest = (0u64, 0u64);
+    for value in values {
+        let gap = value - previous;
+        if gap > largest.0 {
+            largest = (gap, value);
+        }
+        previous = value;
+    }
+    largest
 }
 
 /// The operator-facing sentence every H-19 diagnostic ends with: how a node
@@ -1520,8 +1515,9 @@ fn checked_lamport(value: u64, author: Option<&str>) -> Result<u64, ServiceError
 /// procedural — the **trusted-bootstrap join**, [`BOOTSTRAP_JOIN_REMEDY`]: the
 /// joiner boots from a peer's compacted `.bean`, which loads as history and
 /// puts its clock above the gap. The state is no longer silent: boot and
-/// adoption warn when the clock is far above the directive count
-/// ([`clock_is_far_above_history`]), naming the author that carried it there.
+/// adoption warn when the history holds a lamport gap of at least
+/// [`LAMPORT_GAP_WARN`] ([`largest_lamport_gap`]), naming the author of the
+/// directive at its top.
 fn check_lamport_advance(
     local: u64,
     remote: u64,
@@ -2687,12 +2683,6 @@ pub struct LedgerService {
     accounts: AccountState,
     read_model: ReadModel,
     lamport_clock: u64,
-    /// The clock at which the clock-versus-history warning last fired, or
-    /// `None` when it has not fired since boot (T72 / H-19). The gate on
-    /// [`Self::warn_if_clock_far_above_history`]: once per boot, then once per
-    /// [`CLOCK_HISTORY_WARN_REPEAT_ADVANCE`] of clock advance. Not carried
-    /// across a reload — a reload is a boot, and boot warns on its own.
-    clock_history_warned_at: Option<u64>,
     author_id: String,
     file_path: PathBuf,
     leading_comments: Vec<String>,
@@ -3008,6 +2998,18 @@ pub struct LedgerService {
     /// canonical file untouched and therefore still canonical for its own
     /// contents.
     canonical_is_current: bool,
+    /// The canonical form of this ledger — what every compaction writes — is
+    /// larger than [`MAX_LEDGER_FILE_BYTES`] (T82 / L-80).
+    ///
+    /// Set where the canonical size is measured — boot, the finalisation of
+    /// boot's operator input, a reconcile of a hand edit — and cleared by a
+    /// compaction that succeeded (which proves the canonical form fits). While
+    /// it is set every write would need a compaction that `persist_atomically`
+    /// refuses, so [`Self::append_headroom`] reports 0 — `gl-node` then refuses
+    /// a mutation and defers a peer batch before staging, with no reload — and
+    /// `prepare`'s compaction arm refuses with `ResourceLimitExceeded` instead
+    /// of building the text and failing at the write.
+    canonical_over_cap: bool,
     /// Byte length of the journal on disk, as of the last commit.
     canonical_journal_bytes: u64,
     /// Content ids inserted since the last commit and not yet written anywhere.
@@ -3145,7 +3147,18 @@ impl LedgerService {
         author_id: String,
         mode: BootMode,
     ) -> Result<Self, ServiceError> {
-        let file_path = file_path.into();
+        let configured: PathBuf = file_path.into();
+        // T82 / L-84: a symlinked `.bean` this node's user created is worked
+        // at its target — journal, temp files and compactions included.
+        let file_path = crate::journal::resolve_ledger_path(&configured)?;
+        if file_path != configured {
+            info!(
+                link = %configured.display(),
+                target = %file_path.display(),
+                "ledger path is a symbolic link; this node reads, journals and compacts at its \
+                 target, so the link is kept (L-84)"
+            );
+        }
         let journal_path = crate::journal::journal_path_for(&file_path);
 
         // Read the file, or — on a process start with nothing beside it —
@@ -3254,8 +3267,11 @@ impl LedgerService {
                 "ledger commit journal ends in a torn record; its {} trailing bytes are NOT \
                  loaded, the {} intact records before it are. This is what a crash mid-append \
                  leaves (that commit never reported success), and also what a truncated or \
-                 edited journal looks like. Nothing is deleted: the next commit compacts and \
-                 renames the journal to {}{}<unix-seconds> for inspection (M-43).",
+                 edited journal looks like, or a final record damaged on disk AFTER its commit \
+                 succeeded — then an acknowledged record is among the dropped bytes, and on a \
+                 node with no peer to re-supply it the sidecar is where it is. Nothing is \
+                 deleted: the next commit compacts and renames the journal to \
+                 {}{}<unix-seconds> for inspection (M-43, T82).",
                 scan.torn_tail_bytes,
                 scan.payloads.len(),
                 journal_path.display(),
@@ -3374,6 +3390,45 @@ impl LedgerService {
                 }
             }
         };
+
+        // T83 / L-89: H-06's closed envelope-key set. A directive-level
+        // `openledger-*` key that is not one of the four envelope keys, on a
+        // node-written record, used to load as verified history, be served
+        // locally and be written back by every compaction. It is outside the
+        // content hash and the signature, and no peer ever sees it
+        // (`extract_envelope` keeps the closed set), so it is DROPPED here, with
+        // a warning: the record keeps its id, its signature and its place in
+        // every balance, and the next compaction writes it without the key.
+        // (Operator input keeps its refusal on the file path.)
+        let mut directives = directives;
+        for directive in directives.iter_mut() {
+            if Self::is_operator_input(directive) {
+                continue;
+            }
+            let stray: Vec<String> = directive
+                .metadata()
+                .keys()
+                .filter(|key| {
+                    key.starts_with(ENVELOPE_KEY_PREFIX) && !ENVELOPE_KEYS.contains(&key.as_str())
+                })
+                .cloned()
+                .collect();
+            if stray.is_empty() {
+                continue;
+            }
+            let metadata = directive_metadata_mut(directive);
+            for key in &stray {
+                metadata.remove(key);
+            }
+            warn!(
+                id = %compute_content_id(directive),
+                keys = %stray.join(", "),
+                file = %file_path.display(),
+                "dropped openledger-* metadata keys that are not part of the envelope from a \
+                 node-written record; they are not hashed, not signed and never sent to a peer, \
+                 and the next compaction writes the record without them (L-89, H-06)"
+            );
+        }
 
         // Sort by canonical order for correct AccountState building.
         let mut sorted: Vec<&Directive> = directives.iter().collect();
@@ -3703,9 +3758,7 @@ impl LedgerService {
         // on top of a peer's jump, its own record is the highest and naming it
         // would name the victim.
         let suspect = lamport_high.suspect_author().unwrap_or("(unknown)");
-        let mut clock_history_warned_at = None;
         if !lamport_value_is_legal(lamport_clock.saturating_add(1)) {
-            clock_history_warned_at = Some(lamport_clock);
             warn!(
                 lamport_clock,
                 ceiling = LAMPORT_CEILING,
@@ -3724,7 +3777,6 @@ impl LedgerService {
             // to the ceiling is one ordinary-looking peer directive away from
             // the state above. Honest clocks are nowhere near here; say so
             // while the node can still author.
-            clock_history_warned_at = Some(lamport_clock);
             warn!(
                 lamport_clock,
                 ceiling = LAMPORT_CEILING,
@@ -3736,26 +3788,38 @@ impl LedgerService {
                  this node. Investigate the author named here (H-12). If that author is \
                  removed from the allowlist: {BOOTSTRAP_JOIN_REMEDY}"
             );
-        } else if clock_is_far_above_history(lamport_clock, dag.len()) {
-            // T72 / H-19: a clock far above the directive count means the
-            // history carries a jump — legal under the ratchet, or pre-T63 —
-            // that no later joiner can cross by anti-entropy once its author
-            // is off the allowlist. Every existing node carries on and its
-            // own writes are accepted, so without this line the state is
-            // silent; the joiner that copied the file sees it too.
-            clock_history_warned_at = Some(lamport_clock);
-            warn!(
-                lamport_clock,
-                directive_count = dag.len(),
-                factor = CLOCK_HISTORY_WARN_FACTOR,
-                slack = CLOCK_HISTORY_WARN_SLACK,
-                author = suspect,
-                file = %file_path.display(),
-                "ledger clock is far above the number of directives this node holds; honest \
-                 clocks stay within about twice the event count, so the history carries a \
-                 lamport jump, carried highest by the author named here. Existing nodes are \
-                 unaffected. {BOOTSTRAP_JOIN_REMEDY}"
+        } else {
+            // T72 / H-19, judged on the content since T83 (L-94): a lamport
+            // gap in the history — legal under the ratchet, or pre-T63 — that
+            // no later joiner can cross by anti-entropy once its author is off
+            // the allowlist. Every existing node carries on and its own writes
+            // are accepted, so without this line the state is silent; the
+            // joiner that copied the file sees it too.
+            let (gap, top) = largest_lamport_gap(
+                dag.directives()
+                    .into_iter()
+                    .filter_map(Directive::lamport_clock),
             );
+            if gap >= LAMPORT_GAP_WARN {
+                let jumper = dag
+                    .directives()
+                    .into_iter()
+                    .find(|directive| directive.lamport_clock() == Some(top))
+                    .and_then(directive_author)
+                    .unwrap_or("(unknown)")
+                    .to_owned();
+                warn!(
+                    gap,
+                    below = top - gap,
+                    top,
+                    threshold = LAMPORT_GAP_WARN,
+                    author = %jumper,
+                    file = %file_path.display(),
+                    "the ledger history carries a lamport gap no honest mesh makes — the \
+                     directive at the top of it, by the author named here, jumped the clock. \
+                     Existing nodes are unaffected. {BOOTSTRAP_JOIN_REMEDY}"
+                );
+            }
         }
 
         // H-08: one line the operator can act on, after every per-directive
@@ -3793,7 +3857,6 @@ impl LedgerService {
             accounts,
             read_model,
             lamport_clock,
-            clock_history_warned_at,
             author_id,
             file_path,
             leading_comments,
@@ -3834,6 +3897,7 @@ impl LedgerService {
             // canonical form. The first commit rewrites it, exactly as every
             // pre-T44 persist did.
             canonical_is_current: false,
+            canonical_over_cap: false,
             canonical_journal_bytes: scan.file_bytes,
             // Everything just loaded came off disk, so nothing is uncommitted.
             pending_ids: Vec::new(),
@@ -3872,8 +3936,11 @@ impl LedgerService {
         // `finalize_operator_input`, whose author and signature are part of
         // what the compaction writes; a reload is a recovery rebuild and
         // stays quiet.
-        if matches!(mode, BootMode::Fresh) && service.unsigned_operator_input.is_empty() {
-            service.warn_if_canonical_exceeds_cap();
+        if service.unsigned_operator_input.is_empty() {
+            // T82 / L-80: a reload measures too — the fact decides whether
+            // writes are refused before staging — but only a process start
+            // says so.
+            service.measure_canonical_over_cap(matches!(mode, BootMode::Fresh));
         }
 
         Ok(service)
@@ -3893,10 +3960,18 @@ impl LedgerService {
     /// finalisation of boot's operator input): no sort, no clone of the
     /// ledger, no 64 MiB string. Returns the canonical length when it is over
     /// the cap.
-    fn warn_if_canonical_exceeds_cap(&self) -> Option<u64> {
+    fn warn_if_canonical_exceeds_cap(&mut self) -> Option<u64> {
+        self.measure_canonical_over_cap(true)
+    }
+
+    /// Measure the canonical form against the cap and record the fact in
+    /// [`Self::canonical_over_cap`] (T82 / L-80), warning when `warn` and it
+    /// is over. Returns the canonical length when it is over.
+    fn measure_canonical_over_cap(&mut self, warn: bool) -> Option<u64> {
         let canonical = self.compaction_text_len();
-        if canonical <= MAX_LEDGER_FILE_BYTES {
-            return None;
+        self.canonical_over_cap = canonical > MAX_LEDGER_FILE_BYTES;
+        if !self.canonical_over_cap || !warn {
+            return self.canonical_over_cap.then_some(canonical);
         }
         warn!(
             canonical_bytes = canonical,
@@ -3906,8 +3981,10 @@ impl LedgerService {
             over_by = canonical - MAX_LEDGER_FILE_BYTES,
             file = %self.file_path.display(),
             "the canonical form of this ledger is larger than the ledger file cap, although the \
-             file on disk is not: every compaction will refuse to write it, so writes that need \
-             one fail. The difference is spelling — operator input gains its openledger \
+             file on disk is not: every compaction would refuse to write it, and every write \
+             needs one, so EVERY WRITE FAILS until the file is made smaller — this node refuses \
+             local writes and defers peer batches before staging them (L-80). The difference is \
+             spelling — operator input gains its openledger \
              envelope, a leading ';comment' gains a space, indentation is normalised. Stop the \
              node and shrink the file until its canonical form fits: remove leading comments \
              and hand-typed directives you do not need, or start a new ledger for new history \
@@ -4432,9 +4509,15 @@ impl LedgerService {
                  again once the domain and key are right (H-20, T80)"
             );
         }
+        let edited: BTreeSet<String> = refused
+            .iter()
+            .filter(|(_, reason)| reason.starts_with("signature does not verify"))
+            .map(|(id, _)| id.clone())
+            .collect();
         let ids: BTreeSet<String> = refused.into_keys().collect();
         self.signature_quarantined_total += ids.len();
         self.quarantine_out_of_dag(&ids);
+        self.release_clock_carried_by_edited_records(&edited);
         warn!(
             quarantined = ids.len(),
             verified,
@@ -4453,6 +4536,60 @@ impl LedgerService {
     /// [`Self::verify_own_history`] call, whose return counts only its own.
     pub fn signature_quarantined_total(&self) -> usize {
         self.signature_quarantined_total
+    }
+
+    /// Lower the clock to what boot would have resumed at without `edited` —
+    /// records the signature pass quarantined because their signature does
+    /// not verify (T83 / L-87).
+    ///
+    /// Boot folds every enveloped record into the clock before any signature
+    /// is checked, so an own record whose lamport line was edited to ~2^32
+    /// carried the clock there; quarantined, it no longer does anything else,
+    /// but the node's next writes would carry the jump and the mesh would
+    /// follow. Its edited lamport was never issued by this node, so it is not
+    /// a pair M-18 protects. What stays counted is everything else boot
+    /// counts: every lamport the DAG still holds (any author), this node's
+    /// own records in the quarantine for any other reason, and its own
+    /// records boot saw outside the DAG. The original lamport of the edited
+    /// record was stamped above what the node held then — every such record
+    /// is still counted — so the next stamp stays above it. Never raises the
+    /// clock; a no-op when `edited` is empty.
+    fn release_clock_carried_by_edited_records(&mut self, edited: &BTreeSet<String>) {
+        if edited.is_empty() {
+            return;
+        }
+        let own = self.author_id.clone();
+        let highest = self
+            .dag
+            .directives()
+            .into_iter()
+            .filter_map(Directive::lamport_clock)
+            .chain(
+                self.quarantined
+                    .iter()
+                    .filter(|(id, _)| !edited.contains(*id))
+                    .filter(|(_, directive)| directive_author(directive) == Some(own.as_str()))
+                    .filter_map(|(_, directive)| directive.lamport_clock()),
+            )
+            .chain(self.boot_outside_dag_lamports.get(&own).copied())
+            .max()
+            .unwrap_or(0);
+        let resume = if highest > 0 {
+            highest.saturating_add(1)
+        } else {
+            0
+        };
+        if resume < self.lamport_clock {
+            info!(
+                from = self.lamport_clock,
+                to = resume,
+                file = %self.file_path.display(),
+                "the clock boot resumed at was carried by a record quarantined because its \
+                 signature does not verify (an edited lamport line); it resumes above what \
+                 remains instead, so this node's next writes do not carry the edit (L-87)"
+            );
+            self.lamport_clock = resume;
+        }
     }
 
     /// `directive` re-attributed to this node, when it is a record this node
@@ -4625,7 +4762,18 @@ impl LedgerService {
     /// on it is judged against a DAG without it, so the refusal cascades
     /// exactly as far as it must. Signed history is never re-parented.
     fn quarantine_out_of_dag(&mut self, refused: &BTreeSet<String>) {
-        if refused.is_empty() {
+        self.rebuild_dag(refused, &BTreeMap::new());
+    }
+
+    /// [`Self::quarantine_out_of_dag`], also putting each directive in
+    /// `replacements` in place of the DAG's copy of the same id (T82 / L-81) —
+    /// envelope only: the id, and so the body, is the same.
+    fn rebuild_dag(
+        &mut self,
+        refused: &BTreeSet<String>,
+        replacements: &BTreeMap<String, Directive>,
+    ) {
+        if refused.is_empty() && replacements.is_empty() {
             return;
         }
         let entries: Vec<(String, Directive)> = self
@@ -4650,6 +4798,9 @@ impl LedgerService {
         let mut dag = LedgerDag::new();
         let mut accounts = AccountState::new();
         for (content_id, mut directive) in entries {
+            if let Some(committed) = replacements.get(&content_id) {
+                directive = committed.clone();
+            }
             if refused_now.contains(&content_id) {
                 self.hold_refused_in_quarantine(&content_id, directive);
                 continue;
@@ -5393,38 +5544,35 @@ impl LedgerService {
             .map(|(_, _, author)| author.to_owned())
     }
 
-    /// T72 / H-19: warn when an adoption has left the clock far above what the
-    /// directive count could honestly have produced — the diagnostic for a
-    /// jump in the history, which existing nodes tolerate and later joiners
-    /// cannot cross. See [`CLOCK_HISTORY_WARN_FACTOR`] for the derivation.
-    ///
-    /// Gated: once per boot, then once per
-    /// [`CLOCK_HISTORY_WARN_REPEAT_ADVANCE`] of clock advance. The predicate
-    /// is two multiplications on every adoption; the author scan runs only
-    /// when a line is actually logged.
-    fn warn_if_clock_far_above_history(&mut self) {
-        if !clock_is_far_above_history(self.lamport_clock, self.dag.len()) {
+    /// T72 / H-19 (T83 / L-94, L-83): warn when an adoption opens a lamport
+    /// gap in the history — see [`LAMPORT_GAP_WARN`]. A gap is opened by
+    /// exactly one adoption (the one whose lamport sits that far above the
+    /// clock before it), so this fires once per jump without any gating, names
+    /// the author of the jumping directive itself, and never fires on an
+    /// adoption BELOW the clock — however high this node's own records outside
+    /// the ledger carried the clock (L-83).
+    fn warn_if_adoption_opens_a_lamport_gap(
+        &self,
+        clock_before: u64,
+        lamport: Option<u64>,
+        author: Option<&str>,
+    ) {
+        let Some(lamport) = lamport else {
+            return;
+        };
+        let gap = lamport.saturating_sub(clock_before);
+        if gap < LAMPORT_GAP_WARN {
             return;
         }
-        if let Some(warned_at) = self.clock_history_warned_at {
-            if self.lamport_clock.saturating_sub(warned_at) < CLOCK_HISTORY_WARN_REPEAT_ADVANCE {
-                return;
-            }
-        }
-        self.clock_history_warned_at = Some(self.lamport_clock);
         warn!(
-            lamport_clock = self.lamport_clock,
-            directive_count = self.dag.len(),
-            factor = CLOCK_HISTORY_WARN_FACTOR,
-            slack = CLOCK_HISTORY_WARN_SLACK,
-            author = self
-                .highest_lamport_author()
-                .as_deref()
-                .unwrap_or("(unknown)"),
-            "ledger clock is far above the number of directives this node holds after an \
-             adoption; honest clocks stay within about twice the event count, so the history \
-             now carries a lamport jump, carried highest by the author named here. This node \
-             is unaffected. {BOOTSTRAP_JOIN_REMEDY}"
+            gap,
+            below = clock_before,
+            top = lamport,
+            threshold = LAMPORT_GAP_WARN,
+            author = author.unwrap_or("(unknown)"),
+            "an adopted directive opened a lamport gap in the history no honest mesh makes; \
+             its author, named here, jumped the clock. This node is unaffected. \
+             {BOOTSTRAP_JOIN_REMEDY}"
         );
     }
 
@@ -5547,6 +5695,11 @@ impl LedgerService {
     /// prepare that adopts it — it is just not predicted here. O(1): two field
     /// reads.
     pub fn append_headroom(&self) -> u64 {
+        // T82 / L-80: over the cap, no write fits — each needs a compaction
+        // that cannot be written. 0 makes every pre-stage check refuse.
+        if self.canonical_over_cap {
+            return 0;
+        }
         MAX_LEDGER_FILE_BYTES
             .saturating_sub(self.canonical_bytes)
             .saturating_sub(self.canonical_journal_bytes)
@@ -5699,6 +5852,23 @@ impl LedgerService {
             // `gl-node` used to advertise `externalFileEdits: "disabled"` as
             // that switch; the setting is gone (it never reached this line).
             self.adopt_external_edits()?;
+            // T82 / L-80: refuse before building a text the write would
+            // refuse anyway — as a resource limit, so `gl-node` backs the peer
+            // off and reports the cap, instead of an I/O error and a reload.
+            // Measured only when the fact is set (boot, finalisation and
+            // reconcile keep it current); a hand edit that shrank the file
+            // clears it here.
+            if self.canonical_over_cap {
+                if let Some(canonical) = self.measure_canonical_over_cap(false) {
+                    return Err(ServiceError::ResourceLimitExceeded {
+                        message: format!(
+                            "the canonical form of this ledger is {canonical} bytes, over the \
+                             file cap of {MAX_LEDGER_FILE_BYTES}: every write fails until the file \
+                             is made smaller (L-64, L-80)"
+                        ),
+                    });
+                }
+            }
             // H-08: DAG ∪ quarantine, not the DAG alone. This is the single
             // production write that replaces the whole `.bean`, so it is the
             // single place where "boot skipped it" could turn into "it is gone".
@@ -6024,6 +6194,8 @@ impl LedgerService {
             self.canonical_marker = receipt.canonical_marker;
             // The `.bean` now holds exactly the bytes this service wrote.
             self.canonical_is_current = true;
+            // T82 / L-80: and they fit — `persist_atomically` wrote them.
+            self.canonical_over_cap = false;
         }
     }
 
@@ -6217,8 +6389,8 @@ impl LedgerService {
                         file = %self.file_path.display(),
                         "REFUSING to install an L-13 rebuild that lacks directives memory holds \
                          and no failed commit can explain — neither staged since the last commit \
-                         nor adopted from the file since the last compaction: the files lost \
-                         records memory still holds. Memory is kept, ahead of disk; the next \
+                         nor adopted from the file, still unsigned, since the last compaction: \
+                         the files lost records memory still holds. Memory is kept, ahead of disk; the next \
                          commit is a full rewrite that puts every in-memory directive back on \
                          disk (H-15, M-46)"
                     );
@@ -6246,6 +6418,18 @@ impl LedgerService {
                     file = %self.file_path.display(),
                     "L-13 reload installed: memory rebuilt from disk after a failed commit"
                 );
+                let mut reloaded = reloaded;
+                let kept = self.keep_committed_envelopes_in(&mut reloaded);
+                if kept > 0 {
+                    warn!(
+                        kept,
+                        file = %self.file_path.display(),
+                        "the rebuilt ledger read records this node had already signed as raw hand \
+                         input — a backup taken before they were canonicalised was restored over \
+                         the file; they keep the envelope this node committed, and the next \
+                         commit writes it back (L-81)"
+                    );
+                }
                 self.adopt_reloaded(reloaded);
                 // H-20: the reload re-derived the history from the file; the
                 // carried signer and verifier were installed by assignment,
@@ -6281,13 +6465,77 @@ impl LedgerService {
     /// line). Each of those was on disk in this node's own spelling as of the
     /// last commit, so a rebuild of the same files holds it under the same
     /// id. One set lookup per directive, no content hashing.
+    ///
+    /// T82 / L-93: a file-adopted id is exempt only while memory's copy is
+    /// still UNSIGNED. Once this node has signed it — finalised at boot, or
+    /// signed by a live reconcile — it is this node's record and may already
+    /// have been served, even though the compaction that would clear
+    /// `adopted_from_file` has not happened yet (it failed). A rebuild that
+    /// lacks it is refused like one that lacks any other committed record, so
+    /// the next commit writes it back — what the success path (the L-30
+    /// union) does anyway.
     fn committed_ids_missing_from<'a>(&'a self, rebuilt: &LedgerDag) -> Vec<&'a str> {
         let staged: HashSet<&str> = self.pending_ids.iter().map(String::as_str).collect();
         self.dag
             .ids()
-            .filter(|id| !staged.contains(id) && !self.adopted_from_file.contains(*id))
+            .filter(|id| !staged.contains(id))
+            .filter(|id| {
+                !self.adopted_from_file.contains(*id)
+                    || self.dag.get(id).is_some_and(|directive| {
+                        directive.metadata().contains_key(ENVELOPE_KEY_SIGNATURE)
+                    })
+            })
             .filter(|id| rebuilt.get(id).is_none())
             .collect()
+    }
+
+    /// Keep the envelope memory already committed for records a rebuild reads
+    /// back as raw operator input (T82 / L-81).
+    ///
+    /// A backup taken while a hand line was still raw, copied over the live
+    /// file after this node had signed and acknowledged that line, is read by
+    /// the rebuild as operator input under the SAME content id (the envelope
+    /// is outside the hash), so the recovery floor passes — and the rebuild
+    /// would then stamp a fresh lamport and signature over a record the mesh
+    /// already holds under the old ones: two envelopes for one id, forever.
+    /// The success path never does that (the pre-persist reconcile sees the
+    /// raw line as a duplicate). Here memory's copy replaces the rebuilt one,
+    /// the id leaves the rebuild's operator input, and the rebuild's DAG is
+    /// re-derived around it; the next commit is a rewrite (the id stays
+    /// file-adopted), which writes the committed envelope back to disk.
+    /// Returns how many records kept their envelope.
+    fn keep_committed_envelopes_in(&self, reloaded: &mut LedgerService) -> usize {
+        let pending_here: HashSet<&String> = self.unsigned_operator_input.iter().collect();
+        let replacements: BTreeMap<String, Directive> = reloaded
+            .unsigned_operator_input
+            .iter()
+            .filter(|id| !pending_here.contains(id))
+            .filter_map(|id| {
+                let committed = self.dag.get(id)?;
+                (!Self::is_operator_input(committed)).then(|| (id.clone(), committed.clone()))
+            })
+            .collect();
+        if replacements.is_empty() {
+            return 0;
+        }
+        reloaded
+            .unsigned_operator_input
+            .retain(|id| !replacements.contains_key(id));
+        reloaded
+            .operator_input_with_file_author
+            .retain(|id| !replacements.contains_key(id));
+        reloaded
+            .operator_input_as_written
+            .retain(|id, _| !replacements.contains_key(id));
+        // M-18: the clock never falls below a lamport this node issued.
+        let highest = replacements
+            .values()
+            .filter_map(Directive::lamport_clock)
+            .max()
+            .unwrap_or(0);
+        reloaded.lamport_clock = reloaded.lamport_clock.max(highest);
+        reloaded.rebuild_dag(&BTreeSet::new(), &replacements);
+        replacements.len()
     }
 
     /// Everything a writer changes, cheaply (L-43) — see [`RecoveryReload`].
@@ -7007,6 +7255,13 @@ impl LedgerService {
             );
         }
 
+        // T82 / L-80: a hand edit can grow the canonical form past the cap
+        // (or shrink it back under); re-measure only when the file was not
+        // this service's own output.
+        if !is_own_bytes {
+            self.measure_canonical_over_cap(true);
+        }
+
         Ok(crate::file_watcher::ReconcileResult {
             new_directives: tally.new_directives,
             duplicates: tally.duplicates,
@@ -7379,8 +7634,13 @@ impl LedgerService {
                     match self.dag.insert(final_directive.clone(), false) {
                         Ok(InsertResult::Inserted { .. }) => {
                             // L-55: adopted, so the clock moves — and only now.
+                            let clock_before = self.lamport_clock;
                             self.lamport_clock = next_lamport;
-                            self.warn_if_clock_far_above_history();
+                            self.warn_if_adoption_opens_a_lamport_gap(
+                                clock_before,
+                                final_directive.lamport_clock(),
+                                directive_author(&final_directive),
+                            );
                             self.read_model.index_directive(&final_directive);
                             // M-46: adopted FROM the file, so on disk
                             // already — not staged. Tracked apart from
@@ -7456,8 +7716,13 @@ impl LedgerService {
             match self.dag.insert(directive.clone(), false) {
                 Ok(InsertResult::Inserted { .. }) => {
                     // L-55: see the transaction arm.
+                    let clock_before = self.lamport_clock;
                     self.lamport_clock = next_lamport;
-                    self.warn_if_clock_far_above_history();
+                    self.warn_if_adoption_opens_a_lamport_gap(
+                        clock_before,
+                        directive.lamport_clock(),
+                        directive_author(&directive),
+                    );
                     self.accounts.record_lifecycle(&directive, &content_id);
                     self.read_model.index_directive(&directive);
                     // M-46: see the transaction arm above.
@@ -7902,6 +8167,19 @@ impl LedgerService {
         self.verify_history_pass();
     }
 
+    /// The largest lamport gap in the history this node serves (T83 / L-94) —
+    /// the quantity the H-19 warning compares with [`LAMPORT_GAP_WARN`]. O(n
+    /// log n); diagnostics and tests only.
+    pub fn lamport_gap(&self) -> u64 {
+        largest_lamport_gap(
+            self.dag
+                .directives()
+                .into_iter()
+                .filter_map(Directive::lamport_clock),
+        )
+        .0
+    }
+
     /// Get the set of current DAG head txids (for anti-entropy exchange).
     pub fn head_txids(&self) -> std::collections::HashSet<String> {
         self.dag.heads().iter().cloned().collect()
@@ -8045,6 +8323,9 @@ impl LedgerService {
         if self.dag.get(&content_id).is_some() {
             return Ok(None);
         }
+        // T83 / L-94: for the lamport-gap diagnostic once it is adopted.
+        let adopted_lamport = directive.lamport_clock();
+        let adopted_author = directive_author(&directive).map(str::to_owned);
 
         // T81 / M-51: a peer's directive is history — the legacy ceilings
         // for the two T75 caps, as the wire's parser and boot apply them.
@@ -8229,8 +8510,13 @@ impl LedgerService {
         // would let a peer ratchet the clock by one per replayed copy.
         if outcome.is_some() {
             if let Some(next) = next_lamport {
+                let clock_before = self.lamport_clock;
                 self.lamport_clock = next;
-                self.warn_if_clock_far_above_history();
+                self.warn_if_adoption_opens_a_lamport_gap(
+                    clock_before,
+                    adopted_lamport,
+                    adopted_author.as_deref(),
+                );
             }
         }
 
@@ -12062,9 +12348,10 @@ mod tests {
     /// 5 × 10⁹ over a handful of directives boots with zero warnings at HEAD
     /// (both boot warnings are anchored to the ceiling, 2^53). T72 warns,
     /// names the author that carried the clock there, and states the
-    /// bootstrap join.
+    /// bootstrap join. Since T83 (L-94) the warning is judged on the lamport
+    /// gap, not on the clock against the directive count.
     #[test]
-    fn test_h19_boot_warns_when_the_clock_is_far_above_the_directive_count() {
+    fn test_h19_boot_warns_on_a_lamport_gap_in_the_history() {
         let path = test_file_path();
         std::fs::write(&path, history_file_at(5_000_000_000)).unwrap();
         let (svc, logged) =
@@ -12072,7 +12359,7 @@ mod tests {
         assert_eq!(svc.directive_count(), 3);
         assert_eq!(svc.lamport_clock(), 5_000_000_001);
         assert!(
-            logged.contains("far above the number of directives")
+            logged.contains("lamport gap")
                 && logged.contains("peer-history")
                 && logged.contains("H-19")
                 && logged.contains("compacted .bean"),
@@ -12085,30 +12372,32 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
-    /// The predicate itself, at its edges: derived from "an honest clock is at
-    /// most twice the events plus a boot's resume", so 4× plus slack is silent
-    /// on every honest shape and loud on a 2^32 gap over any history the file
-    /// cap allows.
+    /// The predicate itself, at its edges (T83 / L-94): the largest step
+    /// between consecutive distinct lamports, counting from 0, with the value
+    /// at its top. Order and repeats do not matter; a ratchet-legal jump is
+    /// always over the threshold; a dense history of any length never is.
     #[test]
-    fn test_h19_clock_is_far_above_history_predicate() {
-        assert!(!clock_is_far_above_history(0, 0));
-        assert!(!clock_is_far_above_history(CLOCK_HISTORY_WARN_SLACK, 0));
-        assert!(clock_is_far_above_history(CLOCK_HISTORY_WARN_SLACK + 1, 0));
-        let dense = 10_000usize;
-        assert!(!clock_is_far_above_history(2 * dense as u64 + 1, dense));
-        assert!(!clock_is_far_above_history(
-            CLOCK_HISTORY_WARN_FACTOR * dense as u64 + CLOCK_HISTORY_WARN_SLACK,
-            dense
-        ));
-        assert!(clock_is_far_above_history(
-            CLOCK_HISTORY_WARN_FACTOR * dense as u64 + CLOCK_HISTORY_WARN_SLACK + 1,
-            dense
-        ));
-        // The largest directive count the 64 MiB file cap allows is far below
-        // 2^26 (a directive is more than one byte), so a ratchet-sized gap is
-        // always diagnosed.
-        assert!(clock_is_far_above_history(MAX_LAMPORT_ADVANCE, 1 << 26));
-        assert!(!clock_is_far_above_history(u64::MAX, usize::MAX));
+    fn test_h19_lamport_gap_predicate() {
+        assert_eq!(largest_lamport_gap(std::iter::empty()), (0, 0));
+        assert_eq!(largest_lamport_gap([3, 1, 2, 2]), (1, 1));
+        assert_eq!(largest_lamport_gap([1, 2, 10, 11]), (8, 10));
+        assert_eq!(largest_lamport_gap([5]), (5, 5));
+        let dense: Vec<u64> = (1..=1_000_000).collect();
+        assert!(largest_lamport_gap(dense).0 < LAMPORT_GAP_WARN);
+        let jump = [
+            1,
+            2,
+            3,
+            3 + MAX_LAMPORT_ADVANCE - 1,
+            3 + MAX_LAMPORT_ADVANCE,
+        ];
+        assert_eq!(
+            largest_lamport_gap(jump),
+            (MAX_LAMPORT_ADVANCE - 1, 3 + MAX_LAMPORT_ADVANCE - 1)
+        );
+        const { assert!(MAX_LAMPORT_ADVANCE > LAMPORT_GAP_WARN) };
+        assert!(largest_lamport_gap([LAMPORT_GAP_WARN - 1]).0 < LAMPORT_GAP_WARN);
+        assert!(largest_lamport_gap([u64::MAX]).0 >= LAMPORT_GAP_WARN);
     }
 
     /// A dense history — every clock value accounted for by an event — boots
@@ -12134,7 +12423,7 @@ mod tests {
                     .expect("adopted");
             }
         });
-        assert!(!logged.contains("far above"), "{logged}");
+        assert!(!logged.contains("lamport gap"), "{logged}");
         svc.persist_or_reload().unwrap();
         drop(svc);
         let (rebooted, logged) =
@@ -12150,11 +12439,13 @@ mod tests {
     }
 
     /// Adoption of a maximal legal jump (the `h1b` shape) warns once, naming
-    /// the jumping author; the gate then holds through ordinary adoptions and
-    /// reopens after `CLOCK_HISTORY_WARN_REPEAT_ADVANCE` of clock advance.
-    /// Harness finding F1: a remote BELOW the local clock still moves the
-    /// clock by one, so converged replicas legitimately hold different
-    /// clocks; the warning's slack is what makes that not fire.
+    /// the jumping author; ordinary adoptions after it — below or just above
+    /// the clock — and a local append are silent; a second jump warns again.
+    /// Since T83 (L-94) the warning is judged on the gap one adoption opens,
+    /// so "once per jump" holds by construction and needs no gate. Harness
+    /// finding F1: a remote BELOW the local clock still moves the clock by
+    /// one, so converged replicas legitimately hold different clocks — which
+    /// never opens a gap.
     #[test]
     fn test_h19_adoption_warns_once_per_jump_and_names_the_jumping_author() {
         let (mut svc, path) = setup_with_accounts();
@@ -12170,11 +12461,7 @@ mod tests {
             .expect("the maximal legal jump is adopted — the ratchet is unchanged");
         });
         assert_eq!(svc.lamport_clock(), local + MAX_LAMPORT_ADVANCE);
-        assert_eq!(
-            logged.matches("far above the number of directives").count(),
-            1,
-            "{logged}"
-        );
+        assert_eq!(logged.matches("lamport gap").count(), 1, "{logged}");
         assert!(
             logged.contains("peer-remote") && logged.contains("H-19"),
             "names the jumping author: {logged}"
@@ -12194,22 +12481,14 @@ mod tests {
         });
         assert!(logged.is_empty(), "gated: {logged}");
 
-        // Reopens after a further 2^20 of advance.
+        // A second jump is a second gap, and warns again.
         let clock = svc.lamport_clock();
         let (_, logged) = capture_warnings(|| {
-            svc.stage_remote_directive(remote_open(
-                "Assets:Later",
-                date,
-                clock + CLOCK_HISTORY_WARN_REPEAT_ADVANCE,
-            ))
-            .unwrap()
-            .expect("adopted");
+            svc.stage_remote_directive(remote_open("Assets:Later", date, clock + LAMPORT_GAP_WARN))
+                .unwrap()
+                .expect("adopted");
         });
-        assert_eq!(
-            logged.matches("far above the number of directives").count(),
-            1,
-            "{logged}"
-        );
+        assert_eq!(logged.matches("lamport gap").count(), 1, "{logged}");
 
         // And the file path's adoption warns too (a hand-typed jump, M-20).
         let (mut fresh, fresh_path) = setup_with_accounts();
@@ -12223,7 +12502,7 @@ mod tests {
         let (result, logged) = capture_warnings(|| fresh.reconcile_file().unwrap());
         assert_eq!(result.new_directives, 1);
         assert!(
-            logged.contains("far above the number of directives") && logged.contains("peer-paste"),
+            logged.contains("lamport gap") && logged.contains("peer-paste"),
             "{logged}"
         );
 
@@ -20457,5 +20736,304 @@ mod tests {
             .unwrap()
             .contains("X pre-upgrade"));
         remove_ledger_and_journal(&path);
+    }
+
+    // ── T82: over-cap canonical state, floor identity, symlinked ledger ──
+
+    /// A ledger whose file is just under the cap and whose canonical form is
+    /// just over it: 64 leading `;x…` comment lines of 1 MiB, each gaining a
+    /// space when canonicalised (the L-64 fixture).
+    fn over_cap_canonical_ledger(path: &Path) {
+        let line = format!(";{}\n", "x".repeat((1 << 20) - 2));
+        let content = line.repeat(64 - 1) + &format!(";{}\n", "x".repeat((1 << 20) - 64));
+        assert!(content.len() as u64 <= MAX_LEDGER_FILE_BYTES);
+        std::fs::write(path, content).unwrap();
+    }
+
+    /// L-80 (T82): on a ledger whose canonical form is over the cap, every
+    /// write needs a compaction that cannot be written. `append_headroom` is 0
+    /// (so `gl-node` refuses and defers before staging) and a prepare refuses
+    /// with `ResourceLimitExceeded` — not an I/O error from the write — naming
+    /// L-80. Shrinking the file clears the fact at the next reconcile.
+    ///
+    /// Bug-catch: drop the `canonical_over_cap` term from `append_headroom`
+    /// and headroom is ~64 bytes of a file the node cannot rewrite; drop the
+    /// compaction-arm check and the prepare returns `Some` and the write fails
+    /// in `persist_atomically`.
+    #[test]
+    fn l80_an_over_cap_canonical_form_refuses_every_write_before_it_is_built() {
+        let path = test_file_path();
+        over_cap_canonical_ledger(&path);
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert!(svc.compaction_text_len() > MAX_LEDGER_FILE_BYTES, "fixture");
+        assert_eq!(svc.append_headroom(), 0, "nothing fits");
+        match svc.prepare_compaction() {
+            Err(ServiceError::ResourceLimitExceeded { message }) => {
+                assert!(message.contains("(L-64, L-80)"), "{message}");
+            }
+            Err(other) => panic!("expected ResourceLimitExceeded, got {other}"),
+            Ok(_) => panic!("expected ResourceLimitExceeded, got a prepared commit"),
+        }
+        assert!(svc.compact().is_err());
+        assert_eq!(svc.directive_count(), 0);
+
+        // The WARN's remedy: stop the node, shrink the file, restart.
+        drop(svc);
+        std::fs::write(&path, ";a small ledger now\n").unwrap();
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert!(svc.append_headroom() > 0, "headroom is back");
+        svc.open_account("Assets:Cash".to_owned(), make_date(2024, 1, 1), vec![])
+            .expect("writes work again");
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-81 (T82): a backup taken while a hand line was raw, copied over the
+    /// live file after the line was signed, acknowledged and compacted, plus
+    /// one failed commit: the rebuild reads the raw line as operator input
+    /// under the same id. It keeps the envelope this node committed — same
+    /// lamport, same signature — and the next commit writes that back, as the
+    /// success path would.
+    ///
+    /// Bug-catch: drop `keep_committed_envelopes_in` and the rebuild re-stamps
+    /// the record with a fresh lamport and signature.
+    #[cfg(unix)]
+    #[test]
+    fn l81_a_restored_pre_canonical_backup_keeps_the_committed_envelope_across_a_failed_commit() {
+        let directory = t67_directory("l81-backup");
+        let path = directory.join("ledger.bean");
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.set_signer(marker_signer());
+        svc.open_account_signing(
+            "Assets:Cash".to_owned(),
+            make_date(2024, 1, 1),
+            vec![],
+            marker_sign(false),
+        )
+        .unwrap();
+        svc.compact().unwrap();
+        append_to_file(
+            &path,
+            &format!("\n{}", raw_opens(&["Assets:HandX"], "2024-01-02")),
+        );
+        let backup = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(svc.reconcile_file().unwrap().new_directives, 1);
+        svc.compact().unwrap();
+        let envelope = |svc: &LedgerService| {
+            let hand = svc
+                .dag()
+                .directives()
+                .into_iter()
+                .find(|directive| {
+                    matches!(directive, Directive::Open(open) if open.account == "Assets:HandX")
+                })
+                .expect("HandX in memory")
+                .clone();
+            (
+                hand.metadata().get(ENVELOPE_KEY_LAMPORT).cloned(),
+                hand.metadata().get(ENVELOPE_KEY_SIGNATURE).cloned(),
+            )
+        };
+        let acked = envelope(&svc);
+        assert!(acked.1.is_some(), "premise: signed");
+
+        std::fs::write(&path, &backup).unwrap();
+        let (outcome, logged) = capture_warnings(|| {
+            with_read_only_directory(&directory, || {
+                svc.open_account("Assets:Staged".to_owned(), make_date(2024, 2, 1), vec![])
+            })
+        });
+        assert!(outcome.is_err(), "premise: the commit fails");
+        assert!(logged.contains("L-13 reload installed"), "{logged}");
+        assert!(logged.contains("(L-81)"), "{logged}");
+        assert_eq!(envelope(&svc), acked, "the committed envelope is kept");
+
+        svc.open_account("Assets:After".to_owned(), make_date(2024, 2, 2), vec![])
+            .unwrap();
+        let mut on_disk = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        on_disk.set_signer(marker_signer());
+        assert_eq!(envelope(&on_disk), acked, "and it is what the disk holds");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// L-93 (T82): a hand line boot adopted and SIGNED, whose startup
+    /// compaction failed (so it is still "adopted from the file"), is not
+    /// exempt from the recovery floor: a backup without it copied over the
+    /// file plus one failed commit is REFUSED, the line stays in memory, and
+    /// the next commit writes it back — as the success path would.
+    ///
+    /// Bug-catch: exempt every file-adopted id again and the rebuild installs
+    /// without the signed line (`discarded_file_adopted=1`).
+    #[cfg(unix)]
+    #[test]
+    fn l93_a_signed_hand_line_is_not_exempt_from_the_recovery_floor() {
+        let directory = t67_directory("l93-floor");
+        let path = directory.join("ledger.bean");
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.set_signer(marker_signer());
+        svc.open_account_signing(
+            "Assets:Cash".to_owned(),
+            make_date(2024, 1, 1),
+            vec![],
+            marker_sign(false),
+        )
+        .unwrap();
+        svc.compact().unwrap();
+        drop(svc);
+        let without_hand = std::fs::read_to_string(&path).unwrap();
+        append_to_file(
+            &path,
+            &format!("\n{}", raw_opens(&["Assets:HandY"], "2024-01-02")),
+        );
+
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.set_signer(marker_signer());
+        assert_eq!(svc.finalize_operator_input(), 1);
+        let compacted = with_read_only_directory(&directory, || svc.compact());
+        assert!(compacted.is_err(), "premise: the startup compaction fails");
+        assert!(svc.accounts().is_open("Assets:HandY"));
+
+        std::fs::write(&path, &without_hand).unwrap();
+        let (outcome, logged) = capture_warnings(|| {
+            with_read_only_directory(&directory, || {
+                svc.open_account("Assets:Staged".to_owned(), make_date(2024, 2, 1), vec![])
+            })
+        });
+        assert!(outcome.is_err(), "premise: the commit fails");
+        assert!(logged.contains("REFUSING"), "{logged}");
+        assert!(svc.accounts().is_open("Assets:HandY"), "kept in memory");
+
+        svc.open_account("Assets:After".to_owned(), make_date(2024, 2, 2), vec![])
+            .unwrap();
+        let on_disk = LedgerService::boot(path.clone(), "checker".to_owned()).unwrap();
+        assert!(on_disk.accounts().is_open("Assets:HandY"), "written back");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// L-84 (T82, decision (11)): a `.bean` that is a symbolic link this
+    /// node's user created is worked at its target — the target's journal is
+    /// read (its record is served), and the compaction writes the target in
+    /// place, so the link survives.
+    ///
+    /// Bug-catch: drop `resolve_ledger_path` from `boot_with` and the
+    /// target's journal record is missing and the link becomes a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn l84_a_symlinked_ledger_is_worked_at_its_target_and_the_link_is_kept() {
+        let directory = t67_directory("l84-link");
+        let data = directory.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let target = data.join("ledger.bean");
+        // Large enough that the next write appends instead of compacting.
+        std::fs::write(&target, large_ledger_content()).unwrap();
+        let mut svc = LedgerService::boot(target.clone(), "test-peer".to_owned()).unwrap();
+        svc.compact().unwrap();
+        // One more write that stays in the TARGET's journal.
+        let staged = svc
+            .open_account_staged(
+                "Assets:InJournal".to_owned(),
+                make_date(2024, 1, 2),
+                vec![],
+                |_, _, _| None,
+            )
+            .unwrap();
+        let pending = svc.prepare_commit().unwrap().expect("a commit");
+        assert_eq!(pending.kind(), CommitKind::Append, "premise: an append");
+        let receipt = pending.commit().unwrap();
+        svc.finish_commit(receipt);
+        drop(svc);
+        assert!(
+            crate::journal::journal_path_for(&target).exists(),
+            "premise"
+        );
+
+        let link = directory.join("ledger.bean");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut via_link = LedgerService::boot(link.clone(), "test-peer".to_owned()).unwrap();
+        assert!(
+            via_link.get_directive(&staged).is_some(),
+            "the target's journal record is served"
+        );
+        via_link.compact().unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link is kept"
+        );
+        assert!(
+            !crate::journal::journal_path_for(&target).exists(),
+            "folded"
+        );
+        let reread = LedgerService::boot(target.clone(), "checker".to_owned()).unwrap();
+        assert!(
+            reread.get_directive(&staged).is_some(),
+            "the target holds it"
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    // ── T83: diagnostics (L-83, L-89) ──
+
+    /// L-89 (T83): a node-written record carrying a stray directive-level
+    /// `openledger-*` key (not one of the four envelope keys) keeps loading —
+    /// same id, same signature, same balances — but without the key, and the
+    /// compaction writes it back without it. Before T83 it loaded with the
+    /// key, served it locally and wrote it back on every compaction.
+    ///
+    /// Bug-catch: drop the strip at boot and the record is served with
+    /// `openledger-note`.
+    #[test]
+    fn l89_a_stray_envelope_key_on_history_is_dropped_at_boot() {
+        let (path, txid) = signed_node_written_file();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let edited = content.replacen(
+            "  openledger-author: \"test-peer\"\n",
+            "  openledger-author: \"test-peer\"\n  openledger-note: \"stray\"\n",
+            1,
+        );
+        assert_ne!(edited, content, "premise");
+        std::fs::write(&path, &edited).unwrap();
+        let (booted, logged) =
+            capture_warnings(|| LedgerService::boot(path.clone(), "test-peer".to_owned()));
+        let mut svc = booted.unwrap();
+        svc.set_signer(marker_signer());
+        assert_eq!(svc.quarantined_count(), 0, "{logged}");
+        assert!(svc.get_directive(&txid).is_some(), "still served");
+        assert!(
+            svc.dag()
+                .directives()
+                .into_iter()
+                .all(|directive| !directive.metadata().contains_key("openledger-note")),
+            "nothing served carries the stray key"
+        );
+        assert!(
+            logged.contains("openledger-note") && logged.contains("(L-89"),
+            "{logged}"
+        );
+        svc.compact().unwrap();
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("openledger-note"));
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-83 (T83): a clock carried high by this node's own records outside
+    /// the ledger (here: quarantined own records, as after a first signing
+    /// boot over an unsigned history) does not make the next honest adoption
+    /// warn — an adoption BELOW the clock opens no gap. Before T83 the
+    /// adoption-site check compared the clock with the shrunken directive
+    /// count and named the honest peer.
+    #[test]
+    fn l83_an_honest_adoption_below_a_high_clock_does_not_warn() {
+        let (mut svc, path) = setup_with_accounts();
+        svc.lamport_clock = 2_003;
+        let (_, logged) = capture_warnings(|| {
+            svc.stage_remote_directive(remote_open("Assets:Peer", make_date(2024, 1, 1), 1))
+                .unwrap()
+                .expect("adopted");
+        });
+        assert!(!logged.contains("lamport gap"), "{logged}");
+        std::fs::remove_file(path).ok();
     }
 }

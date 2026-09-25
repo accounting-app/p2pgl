@@ -247,7 +247,28 @@ pub struct OrphanBuffer {
     /// site of the ALPN handler. It shares NO budget with the orphans: a refused
     /// id is never buffered, and an orphan is never a refusal.
     refusals: RefusalCache,
+    /// Parent links of directives this buffer had to REFUSE for lack of room
+    /// (T83 / L-95): id → the parents it was missing, and when that was seen.
+    ///
+    /// A chain longer than [`MAX_ORPHANS_PER_PEER`], delivered in advert (hex)
+    /// order, used to join a few directives per round: once the buffer was
+    /// full, a directive whose parent had not yet arrived was dropped, and
+    /// the next round fetched the chain in the same order again. The links
+    /// the node DID see are what let the next round's Want be ordered
+    /// ancestors-first ([`crate::anti_entropy::order_want_ancestors_first`]),
+    /// so the chain arrives parent before child and stages without buffering.
+    /// A hint only — it orders what is asked for, never what is accepted —
+    /// bounded by [`MAX_PARENT_HINT_IDS`] ids and aged out with the orphans.
+    parent_hints: HashMap<String, (Vec<String>, Instant)>,
+    /// Ids held in `parent_hints`, keys and parents together.
+    parent_hint_ids: usize,
 }
+
+/// The most ids [`OrphanBuffer`]'s parent hints hold, keys and parents
+/// counted (T83 / L-95): 65,536 64-character ids, ~4 MiB of id text. Past it
+/// a hint is not recorded (after expired ones are dropped); a hint only
+/// orders the next Want, so a full table costs speed, never correctness.
+pub const MAX_PARENT_HINT_IDS: usize = 65_536;
 
 impl OrphanBuffer {
     pub fn new() -> Self {
@@ -264,6 +285,53 @@ impl OrphanBuffer {
             #[cfg(test)]
             sweeps: 0,
             refusals: RefusalCache::new(),
+            parent_hints: HashMap::new(),
+            parent_hint_ids: 0,
+        }
+    }
+
+    /// The parents `id` is known to be missing — from its buffered entry, or
+    /// from the hint left when it was refused for lack of room (T83 / L-95).
+    /// Empty when nothing is known.
+    pub fn known_missing_parents(&self, id: &str) -> Vec<String> {
+        if let Some(entry) = self.entries.get(id) {
+            return entry.missing_parents.clone();
+        }
+        self.parent_hints
+            .get(id)
+            .map(|(parents, _)| parents.clone())
+            .unwrap_or_default()
+    }
+
+    /// Remember that `id` was refused for lack of room while missing
+    /// `parents` (T83 / L-95) — see [`Self::parent_hints`].
+    fn remember_parent_hint(&mut self, id: &str, parents: &[String], now: Instant) {
+        if parents.is_empty() || self.parent_hints.contains_key(id) {
+            return;
+        }
+        let cost = 1 + parents.len();
+        if self.parent_hint_ids + cost > MAX_PARENT_HINT_IDS {
+            // Expired hints first; the counter is recomputed below.
+            self.parent_hints
+                .retain(|_, (_, seen)| now.saturating_duration_since(*seen) < MAX_ORPHAN_AGE);
+            self.parent_hint_ids = self
+                .parent_hints
+                .values()
+                .map(|(parents, _)| 1 + parents.len())
+                .sum();
+            if self.parent_hint_ids + cost > MAX_PARENT_HINT_IDS {
+                return;
+            }
+        }
+        self.parent_hint_ids += cost;
+        self.parent_hints
+            .insert(id.to_owned(), (parents.to_vec(), now));
+    }
+
+    /// Forget the hint for `id` (it was buffered, or it arrived).
+    fn forget_parent_hint(&mut self, id: &str) {
+        if let Some((parents, _)) = self.parent_hints.remove(id) {
+            self.parent_hint_ids = self.parent_hint_ids.saturating_sub(1 + parents.len());
         }
     }
 
@@ -342,6 +410,7 @@ impl OrphanBuffer {
         }
 
         if self.entries.len() >= MAX_ORPHANS {
+            self.remember_parent_hint(&id, &missing_parents, now);
             return OrphanInsert::BudgetExhausted;
         }
 
@@ -350,19 +419,23 @@ impl OrphanBuffer {
         // is the entry's full cost, not its body alone (L-20).
         let cost_bytes = entry_cost_bytes(&id, &directive, &missing_parents, &missing_accounts);
         if self.total_bytes.saturating_add(cost_bytes) > self.max_bytes {
+            self.remember_parent_hint(&id, &missing_parents, now);
             return OrphanInsert::BudgetExhausted;
         }
 
         if let Some(ref peer_id) = from_peer {
             let count = self.peer_counts.get(peer_id).copied().unwrap_or(0);
             if count >= MAX_ORPHANS_PER_PEER {
+                self.remember_parent_hint(&id, &missing_parents, now);
                 return OrphanInsert::BudgetExhausted;
             }
             let bytes = self.peer_bytes.get(peer_id).copied().unwrap_or(0);
             if bytes.saturating_add(cost_bytes) > self.max_bytes_per_peer {
+                self.remember_parent_hint(&id, &missing_parents, now);
                 return OrphanInsert::BudgetExhausted;
             }
         }
+        self.forget_parent_hint(&id);
 
         // Build reverse indexes.
         for parent in &missing_parents {
@@ -407,6 +480,8 @@ impl OrphanBuffer {
     /// Notify the buffer that a parent ID has arrived.
     /// Returns any orphans that are now fully resolved.
     pub fn parent_arrived(&mut self, parent_id: &str) -> Vec<OrphanEntry> {
+        // T83 / L-95: it is here now; nothing needs to be asked for it.
+        self.forget_parent_hint(parent_id);
         let Some(orphan_ids) = self.waiting_on.remove(parent_id) else {
             return Vec::new();
         };
@@ -688,6 +763,56 @@ mod tests {
             ],
             metadata: BTreeMap::new(),
         })
+    }
+
+    /// T83 / L-95: a directive refused for lack of room leaves its missing
+    /// parents behind as a hint; buffering it, or its arrival as a parent,
+    /// forgets the hint; the hint table is bounded.
+    #[test]
+    fn l95_a_refused_orphan_leaves_its_parent_links_behind() {
+        let mut buffer = OrphanBuffer::new();
+        let peer = Some("peer".to_owned());
+        for index in 0..MAX_ORPHANS_PER_PEER {
+            let outcome = buffer.insert(
+                format!("full{index}"),
+                make_directive("filler"),
+                vec![format!("missing{index}")],
+                peer.clone(),
+            );
+            assert!(matches!(outcome, OrphanInsert::Buffered));
+        }
+        let outcome = buffer.insert(
+            "late".to_owned(),
+            make_directive("late"),
+            vec!["late-parent".to_owned()],
+            peer.clone(),
+        );
+        assert!(matches!(outcome, OrphanInsert::BudgetExhausted));
+        assert_eq!(
+            buffer.known_missing_parents("late"),
+            vec!["late-parent".to_owned()]
+        );
+        assert_eq!(
+            buffer.known_missing_parents("full7"),
+            vec!["missing7".to_owned()],
+            "a buffered entry answers from itself"
+        );
+        assert!(buffer.known_missing_parents("unknown").is_empty());
+
+        // It arrives (as a parent of nothing buffered): the hint is gone.
+        buffer.parent_arrived("late");
+        assert!(buffer.known_missing_parents("late").is_empty());
+
+        // Bounded: a hint table at its cap records nothing more.
+        let mut bounded = OrphanBuffer::new();
+        let now = Instant::now();
+        for index in 0..MAX_PARENT_HINT_IDS / 2 {
+            bounded.remember_parent_hint(&format!("h{index}"), &[format!("p{index}")], now);
+        }
+        assert_eq!(bounded.parent_hint_ids, MAX_PARENT_HINT_IDS);
+        bounded.remember_parent_hint("one-more", &["p".to_owned()], now);
+        assert!(bounded.known_missing_parents("one-more").is_empty());
+        assert_eq!(bounded.parent_hints.len(), MAX_PARENT_HINT_IDS / 2);
     }
 
     #[test]

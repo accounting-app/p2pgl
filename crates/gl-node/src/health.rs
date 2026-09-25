@@ -119,8 +119,12 @@ pub fn probe_local_health(bind_address: &str, port: u16) -> Result<(), String> {
     stream
         .write_all(request.as_bytes())
         .map_err(|error| format!("health probe write: {error}"))?;
+    // T83 (0924 §5): bounded. Only the status line matters, and whatever
+    // answers on the port could otherwise stream without end (the socket
+    // timeout bounds the wait between reads, not the total).
     let mut body = String::new();
-    stream
+    (&mut stream)
+        .take(64 * 1024)
         .read_to_string(&mut body)
         .map_err(|error| format!("health probe read: {error}"))?;
     let status_line = body.lines().next().unwrap_or("");

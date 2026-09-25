@@ -1291,6 +1291,15 @@ async fn run_head_exchange(
     if ratcheted > 0 {
         debug!(peer = %remote, ratcheted, local_clock, "not re-wanting directives this peer served that the adoption ratchet refused at this clock");
     }
+    // T83 / L-95: ask for known ancestors before their descendants, so a
+    // chain longer than the orphan buffer arrives parent before child and
+    // stages as it lands instead of crawling a few directives per round.
+    {
+        let buffer = handler.orphan_buffer.read().await;
+        p2p::anti_entropy::order_want_ancestors_first(&mut want, |id| {
+            buffer.known_missing_parents(id)
+        });
+    }
     for chunk in want.chunks(MAX_SUPPLY_ENTRIES) {
         fetch_want_chunk(send, recv, chunk, handler, remote, budget).await?;
     }
@@ -1874,8 +1883,15 @@ async fn apply_supply_entries_from(
         let bytes = RecordEstimate::directive_bytes(&directive);
         // T77: stage what is held before holding more than the budget — or
         // more than the limiter's byte budget will cover — at once.
-        let fits = chunk.weight.saturating_add(resident) <= PHASE_ONE_WEIGHT_BUDGET
-            && weight.grow_to(base + chunk.weight.saturating_add(resident));
+        // T83 / L-90: the chunk flushes on the WEIGHT budget only. A failed
+        // charge used to flush too, and once a peer's share of the byte
+        // budget was exhausted every directive failed its charge, so each
+        // 256-entry frame became 256 commits and fsyncs under the write
+        // permit. Now the charge below is best effort: what it cannot cover
+        // is held uncharged, never more than `PHASE_ONE_WEIGHT_BUDGET` per
+        // connection — and only connections whose frame body WAS charged
+        // get here, so the uncharged hold is bounded by the charged bodies.
+        let fits = chunk.weight.saturating_add(resident) <= PHASE_ONE_WEIGHT_BUDGET;
         if !fits && !chunk.is_empty() {
             let verdict = stage_and_commit_batch(
                 handler,
@@ -1896,12 +1912,10 @@ async fn apply_supply_entries_from(
                 outcome.deferred += 1;
                 continue;
             }
-            // Charge the directive that did not fit to the emptied chunk. If
-            // even that cannot be covered (other connections hold the whole
-            // budget) it is held uncharged: one directive, staged as the next
-            // chunk at the latest, never an accumulation.
-            let _ = weight.grow_to(base + resident);
         }
+        // Charge what the chunk now holds, as far as the budget allows (see
+        // above).
+        let _ = weight.grow_to(base + chunk.weight.saturating_add(resident));
         // Preserve arrival order so an open/parent earlier in the batch is
         // visible to a later child's checks in phase 2.
         chunk.push(directive, bytes, resident);
@@ -6747,6 +6761,109 @@ pub(crate) mod tests {
     /// MiB, so the first reply is cut by the byte budget (not the entry cap)
     /// and the client must re-`Want` the tail. It converges, and the server's
     /// per-reply serialization stays within one entry of what it sends.
+    /// L-95 (T83): a fresh node catching up a chain longer than the per-peer
+    /// orphan budget, over real loopback QUIC through the Want session. The
+    /// first round buffers what it can and drops the rest; the buffer keeps
+    /// the parent links of what it dropped, and the next round's Want asks for
+    /// ancestors first, so the chain arrives parent before child and stages
+    /// as it lands. The audit measured 30 rounds for a 1,300-chain.
+    ///
+    /// Bug-catch: drop the `order_want_ancestors_first` call from the Want
+    /// session and the sink needs tens of rounds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn l95_a_chain_longer_than_the_orphan_budget_catches_up_in_a_few_rounds() {
+        const CHAIN: usize = p2p::orphan_buffer::MAX_ORPHANS_PER_PEER + 300;
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_source = bind_direct_endpoint().await;
+        let endpoint_sink = bind_direct_endpoint().await;
+        let id_source = endpoint_source.id();
+        let id_sink = endpoint_sink.id();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut source =
+            LedgerService::boot(temp_dir.path().join("source.bean"), id_source.to_string())
+                .expect("boot source");
+        let day = NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid date");
+        source
+            .open_account("Assets:Cash".to_owned(), day, vec![])
+            .expect("open");
+        source
+            .open_account("Equity:Opening".to_owned(), day, vec![])
+            .expect("open");
+        for index in 0..CHAIN {
+            source
+                .append_transaction_staged(
+                    ledger::service::TransactionInput {
+                        date: day,
+                        flag: ledger::model::Flag::Complete,
+                        payee: None,
+                        narration: Some(format!("link {index}")),
+                        tags: vec![],
+                        links: vec![],
+                        postings: vec![
+                            ledger::service::PostingInput {
+                                account: "Assets:Cash".to_owned(),
+                                amount: Some(ledger::model::Amount {
+                                    number: rust_decimal::Decimal::from(1),
+                                    currency: "USD".to_owned(),
+                                }),
+                                cost: None,
+                                price: None,
+                            },
+                            ledger::service::PostingInput {
+                                account: "Equity:Opening".to_owned(),
+                                amount: Some(ledger::model::Amount {
+                                    number: rust_decimal::Decimal::from(-1),
+                                    currency: "USD".to_owned(),
+                                }),
+                                cost: None,
+                                price: None,
+                            },
+                        ],
+                    },
+                    |_, _, _| None,
+                )
+                .expect("append");
+        }
+        source.persist_or_reload().expect("persist");
+        let total = source.directive_count();
+
+        let ledger_source: SharedLedger = Arc::new(RwLock::new(source));
+        let ledger_sink: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("sink.bean"), id_sink.to_string())
+                .expect("boot sink"),
+        ));
+        let handler_source = make_handler(
+            ledger_source,
+            PeerAllowlist::parse(&[id_sink.to_string()]).expect("allowlist source"),
+        );
+        let handler_sink = make_handler(
+            ledger_sink.clone(),
+            PeerAllowlist::parse(&[id_source.to_string()]).expect("allowlist sink"),
+        );
+        let router_source = Router::builder(endpoint_source.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler_source)
+            .spawn();
+        wait_until_dialable(&endpoint_source).await;
+        wait_until_dialable(&endpoint_sink).await;
+
+        let mut rounds = 0usize;
+        loop {
+            exchange_with_peer(&endpoint_sink, endpoint_source.addr(), &handler_sink).await;
+            rounds += 1;
+            let count = ledger_sink.read().await.directive_count();
+            if count == total {
+                break;
+            }
+            if rounds >= 8 {
+                let _ = router_source.shutdown().await;
+                panic!("L-95: {count} of {total} after {rounds} rounds");
+            }
+        }
+        eprintln!("l95: a {CHAIN}-transaction chain caught up in {rounds} rounds");
+        let _ = router_source.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn catchup_converges_when_the_byte_budget_cuts_each_reply() {
         const COUNT: usize = 20;
@@ -8353,6 +8470,124 @@ pub(crate) mod tests {
     /// T77: the pushed path charges phase 1's held weight to the connection
     /// limiter's byte budget and gives it back — nothing stays charged, and
     /// the budget's high-water mark saw the weight on top of the frame.
+    /// L-90 (0924 A4-2), closed by T83: two connections from the same peer
+    /// hold its whole 32 MiB byte budget, and a third applies a 256-entry
+    /// frame. Before T83 every directive then failed its weight charge, and a
+    /// failed charge flushed the chunk, so the frame took one commit (journal
+    /// record and fsync) per directive — 256 against 4 for the same frame with
+    /// the budget free. Phase 1 now flushes on the weight budget only, so the
+    /// frame takes no more commits than the control. Both ledgers are
+    /// 44 MiB-canonical so every commit is an append and journal records
+    /// count commits exactly.
+    #[test]
+    fn l90_an_exhausted_byte_budget_does_not_split_a_frame_into_one_commit_per_directive() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let author = iroh::SecretKey::generate().public();
+        let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let remote = iroh::SecretKey::generate().public();
+        let entries: Vec<_> = (0..MAX_SUPPLY_ENTRIES)
+            .map(|index| {
+                let mut body = format!("2024-01-01 * \"honest {index:03}\"\n");
+                for _ in 0..999 {
+                    body.push_str("  Assets:A 1 USD\n");
+                }
+                body.push_str("  Equity:O -999 USD\n");
+                let parsed = ledger::parse::parse_file(&body).expect("parses");
+                p2p::protocol::SupplyEntry {
+                    id: ledger::hash::compute_content_id(&parsed[0]),
+                    kind: p2p::protocol::DirectiveKind::Transaction,
+                    economic_bean: body,
+                    envelope: std::collections::BTreeMap::from([
+                        ("openledger-author".to_owned(), author.to_string()),
+                        (
+                            "openledger-lamport".to_owned(),
+                            (index as u64 + 1).to_string(),
+                        ),
+                        ("openledger-parents".to_owned(), String::new()),
+                    ]),
+                }
+            })
+            .collect();
+        let records = |path: &std::path::Path| -> usize {
+            std::fs::read_to_string(ledger::journal::journal_path_for(path))
+                .map(|text| {
+                    text.lines()
+                        .filter(|line| line.starts_with(";;olj "))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        let make = |name: &str| -> (SharedLedger, std::path::PathBuf) {
+            let bean = temp_dir.path().join(name);
+            let ledger = crate::ledger_commit::near_cap::near_cap_ledger(&bean, 20 * 1024 * 1024);
+            runtime.block_on(async {
+                let mut service = ledger.write().await;
+                let day = NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid date");
+                service
+                    .open_account("Assets:A".to_owned(), day, vec![])
+                    .expect("open");
+                service
+                    .open_account("Equity:O".to_owned(), day, vec![])
+                    .expect("open");
+            });
+            (ledger, bean)
+        };
+
+        // Control: the same frame with the budget free.
+        let (ledger, bean) = make("a4-onechunk-control.bean");
+        let handler = make_handler(Arc::clone(&ledger), allow.clone());
+        let mut free = handler.limiter.frame_reservation(remote);
+        assert!(free.grow_to(4 * 1024 * 1024), "the frame body");
+        let before = records(&bean);
+        let control_started = std::time::Instant::now();
+        let outcome = runtime.block_on(apply_supply_entries_from(
+            &handler,
+            entries.clone(),
+            remote,
+            SupplyOrigin::Pushed,
+            &mut free,
+        ));
+        let control_took = control_started.elapsed();
+        let control_records = records(&bean) - before;
+        drop(free);
+        assert_eq!(outcome.merged, MAX_SUPPLY_ENTRIES, "{outcome:?}");
+
+        // Attack: two other connections from the SAME peer hold 16 MiB each
+        // (the per-peer budget is 32 MiB), then this frame is applied.
+        let (ledger, bean) = make("a4-onechunk-attack.bean");
+        let handler = make_handler(Arc::clone(&ledger), allow);
+        let mut other_a = handler.limiter.frame_reservation(remote);
+        let mut other_b = handler.limiter.frame_reservation(remote);
+        assert!(other_a.grow_to(MAX_MESSAGE_SIZE as usize));
+        assert!(other_b.grow_to(MAX_MESSAGE_SIZE as usize));
+        let mut reservation = handler.limiter.frame_reservation(remote);
+        let ok = reservation.grow_to(4 * 1024 * 1024);
+        let before = records(&bean);
+        let started = std::time::Instant::now();
+        let outcome = runtime.block_on(apply_supply_entries_from(
+            &handler,
+            entries,
+            remote,
+            SupplyOrigin::Pushed,
+            &mut reservation,
+        ));
+        let took = started.elapsed();
+        let attack_records = records(&bean) - before;
+        eprintln!(
+            "l90: body grow_to ok={ok}; control frame → {control_records} journal records in {control_took:?}; \
+             budget-exhausted frame → {attack_records} journal records in {took:?}; {outcome:?}"
+        );
+        assert_eq!(outcome.merged, MAX_SUPPLY_ENTRIES, "{outcome:?}");
+        assert!(
+            attack_records <= control_records,
+            "an exhausted budget must not split the frame: {attack_records} commits vs {control_records}"
+        );
+    }
+
     #[test]
     fn t77_phase_one_weight_is_charged_to_the_inbound_budget() {
         let runtime = tokio::runtime::Builder::new_current_thread()

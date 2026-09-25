@@ -103,6 +103,60 @@ where
     want
 }
 
+/// Reorder `want` so every id comes after the ids it is known to be missing
+/// as parents — ancestors first (T83 / L-95, decision (13)).
+///
+/// A chain longer than the per-peer orphan buffer, asked for in advert (hex)
+/// order, joined a few directives per round: a child that arrives before its
+/// parent must be buffered, and a full buffer drops it. Asked for
+/// ancestors-first, the chain arrives parent before child and each directive
+/// stages as it lands. `missing_parents_of` says what is known — the orphan
+/// buffer's entries and the parent hints it kept for what it had to drop
+/// ([`crate::orphan_buffer::OrphanBuffer::known_missing_parents`]). Only ids
+/// already in `want` are moved; nothing is added or removed. Stable: ids with
+/// no known parents keep their order. Linear in `want` plus the known links;
+/// iterative, so a 64 MiB chain cannot overflow the stack, and a cycle in the
+/// hints (a hostile peer's) cannot loop.
+pub fn order_want_ancestors_first<F>(want: &mut Vec<String>, missing_parents_of: F)
+where
+    F: Fn(&str) -> Vec<String>,
+{
+    let wanted: HashSet<String> = want.iter().cloned().collect();
+    let mut placed: HashSet<String> = HashSet::with_capacity(want.len());
+    let mut open: HashSet<String> = HashSet::new();
+    let mut ordered: Vec<String> = Vec::with_capacity(want.len());
+    for root in want.iter() {
+        if placed.contains(root) {
+            continue;
+        }
+        let mut stack: Vec<(String, bool)> = vec![(root.clone(), false)];
+        while let Some((id, expanded)) = stack.pop() {
+            if placed.contains(&id) {
+                continue;
+            }
+            if expanded {
+                open.remove(&id);
+                placed.insert(id.clone());
+                ordered.push(id);
+                continue;
+            }
+            if !open.insert(id.clone()) {
+                // Already on the path: a cycle in the hints. Placed when the
+                // outer visit finishes.
+                continue;
+            }
+            stack.push((id.clone(), true));
+            for parent in missing_parents_of(&id).into_iter().rev() {
+                if wanted.contains(&parent) && !placed.contains(&parent) && !open.contains(&parent)
+                {
+                    stack.push((parent, false));
+                }
+            }
+        }
+    }
+    *want = ordered;
+}
+
 /// Compute the `have_heads` message for our local state.
 ///
 /// This advertises our DAG frontier to the remote peer so they can
@@ -812,6 +866,55 @@ impl Default for RefusalCache {
 
 #[cfg(test)]
 mod tests {
+    /// T83 / L-95: `order_want_ancestors_first` puts every id after its known
+    /// missing parents, is stable for ids with none, ignores parents not in
+    /// the Want, and terminates on a cycle in the hints.
+    #[test]
+    fn l95_ancestors_come_first_stably_and_cycles_terminate() {
+        let ids = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        // A chain c3 → c2 → c1 (each names the previous), asked in reverse,
+        // with an unrelated `x` and a parent `gone` that is not wanted.
+        let parents = |id: &str| -> Vec<String> {
+            match id {
+                "c3" => vec!["c2".to_owned()],
+                "c2" => vec!["c1".to_owned(), "gone".to_owned()],
+                _ => Vec::new(),
+            }
+        };
+        let mut want = ids(&["x", "c3", "c2", "c1"]);
+        super::order_want_ancestors_first(&mut want, parents);
+        assert_eq!(want, ids(&["x", "c1", "c2", "c3"]));
+
+        let mut want = ids(&["b", "a"]);
+        super::order_want_ancestors_first(&mut want, |_| Vec::new());
+        assert_eq!(want, ids(&["b", "a"]), "stable with nothing known");
+
+        // A hostile cycle a ↔ b: every id placed once, and it returns.
+        let mut want = ids(&["a", "b", "c"]);
+        super::order_want_ancestors_first(&mut want, |id| match id {
+            "a" => vec!["b".to_owned()],
+            "b" => vec!["a".to_owned()],
+            _ => Vec::new(),
+        });
+        let mut sorted = want.clone();
+        sorted.sort();
+        assert_eq!(sorted, ids(&["a", "b", "c"]));
+
+        // A long chain does not recurse.
+        let n = 50_000;
+        let mut want: Vec<String> = (0..n).rev().map(|i| format!("c{i}")).collect();
+        super::order_want_ancestors_first(&mut want, |id| {
+            let index: usize = id[1..].parse().unwrap();
+            if index == 0 {
+                Vec::new()
+            } else {
+                vec![format!("c{}", index - 1)]
+            }
+        });
+        assert_eq!(want.first().map(String::as_str), Some("c0"));
+        assert_eq!(want.last().map(String::as_str), Some("c49999"));
+    }
+
     use super::*;
     use crate::protocol::{DirectiveKind, MAX_MESSAGE_SIZE};
     use std::collections::BTreeMap;

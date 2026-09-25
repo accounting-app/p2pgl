@@ -67,8 +67,13 @@ impl ScalarType for DecimalScalar {
     fn parse(value: Value) -> InputValueResult<Self> {
         match &value {
             Value::String(decimal_string) => {
-                let decimal = Decimal::from_str_exact(decimal_string)
-                    .map_err(|_| InputValueError::custom("Invalid decimal string"))?;
+                let decimal = Decimal::from_str_exact(decimal_string).map_err(|_| {
+                    // T83 / L-92: say why when the spelling is too long.
+                    InputValueError::custom(
+                        ledger::validate::explain_unrepresentable_amount(decimal_string)
+                            .unwrap_or_else(|| "Invalid decimal string".to_owned()),
+                    )
+                })?;
                 ledger::validate::check_amount_cap("Decimal", decimal)
                     .map_err(|error| InputValueError::custom(error.to_string()))?;
                 Ok(DecimalScalar(decimal))
@@ -116,6 +121,24 @@ impl ScalarType for TransactionId {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    /// L-92 (T83): the scalar says why an over-long amount spelling is
+    /// refused, instead of "Invalid decimal string".
+    #[test]
+    fn l92_the_scalar_explains_an_over_long_amount() {
+        let error = <DecimalScalar as ScalarType>::parse(Value::String(
+            "1000000000000000000000.00000000".to_owned(),
+        ))
+        .expect_err("30 digits");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("7 decimal places") && message.contains("L-92"),
+            "{message}"
+        );
+        let error = <DecimalScalar as ScalarType>::parse(Value::String("12x".to_owned()))
+            .expect_err("malformed");
+        assert!(format!("{error:?}").contains("Invalid decimal string"));
+    }
 
     #[test]
     fn test_date_scalar_round_trip() {

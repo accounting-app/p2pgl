@@ -421,7 +421,8 @@ fn ten_pow_21_at_every_representable_scale_crosses_the_wire_signed() {
         Decimal::from_str_exact(unrepresentable).is_err(),
         "10^21 with eight zeros is 10^29 in the mantissa: no Decimal"
     );
-    // The same string in a body: the number reader refuses it before the cap.
+    // The same string in a body: the number reader refuses it before the cap,
+    // and since T83 (L-92) says why instead of "Invalid number".
     let mut entry = make_supply_entry(&signed_transfer(
         &key,
         2,
@@ -436,7 +437,10 @@ fn ten_pow_21_at_every_representable_scale_crosses_the_wire_signed() {
         .replace("-1 USD", &format!("-{unrepresentable} USD"));
     let error = validate_supply_entry(&entry).expect_err("no Decimal holds it");
     assert!(
-        matches!(error, MergeError::ParseError(ref message) if message.contains("Invalid number")),
+        matches!(error, MergeError::ParseError(ref message)
+            if message.contains("30 significant digits")
+                && message.contains("at most 7 decimal places")
+                && message.contains("(L-92)")),
         "{error:?}"
     );
 }

@@ -240,7 +240,11 @@ impl<'line> Scanner<'line> {
         // fraction longer than 28 digits, so the number held — and hashed, and
         // judged against the cap in `read_summed_amount` — was not the number
         // the file says.
-        Decimal::from_str_exact(&number_string).map_err(|e| format!("Invalid number: {e}"))
+        Decimal::from_str_exact(&number_string).map_err(|e| {
+            // T83 / L-92: say why when the spelling is too long.
+            crate::validate::explain_unrepresentable_amount(&number_string)
+                .unwrap_or_else(|| format!("Invalid number: {e}"))
+        })
     }
 
     fn read_currency(&mut self) -> Result<String, String> {

@@ -1765,12 +1765,11 @@ fn op_ac_a_history_signed_under_the_placeholder_is_served_whole() {
     );
 }
 
-/// A2-4: a lamport line of an own record edited to 4,000,000,000 is
-/// quarantined by the verify pass, yet the clock boot folded from it stays:
-/// the node's next write carries ~2^32 and the mesh follows (T72's
-/// "far above" WARN fires on every later boot).
+/// L-87 (0924 A2-4), closed by T83: a lamport line of an own record edited
+/// to 4,000,000,000 is quarantined by the verify pass. Before T83 the clock
+/// boot folded from it stayed, so the node's next write carried ~2^32 and the
+/// mesh followed; the clock now resumes above what remains.
 #[test]
-#[ignore = "A2-4: an own record's edited lamport moves the clock although the record is quarantined"]
 fn op_ab_huge_lamport_edit_of_a_quarantined_record_does_not_move_the_clock() {
     let truth = generate_fixture(42);
     let mutation = mutate(&truth, Operator::EditLamportLineHuge, 0).unwrap();

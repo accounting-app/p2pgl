@@ -50,7 +50,7 @@ use ledger::service::{
 };
 use ledger::validate::ValidationError;
 use p2p::allowlist::PeerAllowlist;
-use p2p::anti_entropy::build_supply;
+use p2p::anti_entropy::{build_supply, order_want_ancestors_first};
 use p2p::gossip::make_supply_entry;
 use p2p::orphan_buffer::{OrphanBuffer, OrphanEntry};
 use p2p::protocol::{SupplyEntry, WireMessage};
@@ -678,6 +678,15 @@ fn balances_text(svc: &LedgerService) -> String {
     text
 }
 
+/// What "converged" compares across replicas: membership, heads and balances.
+///
+/// L-86 (0924, documented in T83): heads are compared on purpose, and one
+/// honest shape differs in heads only — a local write whose commit failed
+/// after a peer had already fetched it, then retried by the caller: same
+/// content id, a different envelope (lamport, parents, signature), and each
+/// node keeps the copy it got first. Membership and balances agree; the head
+/// sets do not. The harness never produces a failed commit, so it never meets
+/// that shape; a case that does must compare membership and balances only.
 struct Snapshot {
     ids: BTreeSet<String>,
     heads: BTreeSet<String>,
@@ -1818,7 +1827,7 @@ fn t76_cap_sized_amounts_and_mixed_scale_dust_converge_to_equal_exact_balances()
 // caps, a pre-T75 over-cap record in one replica's file, and the H-19
 // clock-versus-history warning on an honest mesh with repeated fresh joins.
 
-use ledger::service::{clock_is_far_above_history, DirectiveVerifier};
+use ledger::service::{DirectiveVerifier, LAMPORT_GAP_WARN};
 use p2p::anti_entropy::compute_want_by_membership;
 use p2p::orphan_buffer::MAX_ORPHANS_PER_PEER;
 use p2p::protocol::MAX_SUPPLY_ENTRIES;
@@ -2018,11 +2027,14 @@ impl Mesh {
             heads.sort();
             let mut ids: Vec<String> = holder.svc.all_directive_ids().into_iter().collect();
             ids.sort();
-            compute_want_by_membership(
+            let mut want = compute_want_by_membership(
                 |id| receiver.svc.contains_directive(id) || receiver.permanent.contains_key(id),
                 &heads,
                 &ids,
-            )
+            );
+            // gl-node's Want path since T83 (L-95): known ancestors first.
+            order_want_ancestors_first(&mut want, |id| receiver.orphans.known_missing_parents(id));
+            want
         };
         let wanted = match order {
             Some(order) => self.order_ids(wanted, order),
@@ -2525,8 +2537,9 @@ fn t75_over_cap_open_loaded_from_a_file_partitions_anti_entropy_joiners() {
 /// next joiner starts from there: clocks compound across joins whenever the
 /// highest-lamport directive is parentless (a transaction at the tip is
 /// drained last, after its parents, so it does not compound). Returns R0's
-/// clock and count and whether `clock_is_far_above_history` — the exact
-/// predicate behind the boot and adoption WARN — fired on any node.
+/// clock and count and whether the H-19 predicate fired on any node — since
+/// T83 (L-94) the history's lamport gap against `LAMPORT_GAP_WARN`, the exact
+/// comparison behind the boot and adoption WARN.
 fn honest_mesh_clock_after_fresh_joins(
     opens: usize,
     joiners: usize,
@@ -2554,11 +2567,11 @@ fn honest_mesh_clock_after_fresh_joins(
         mesh.run_to_fixed_point(Order::Ascending);
         let clock = mesh.replicas[f].svc.lamport_clock();
         let count = mesh.replicas[f].svc.directive_count();
-        let far = clock_is_far_above_history(clock, count);
+        let gap = mesh.replicas[f].svc.lamport_gap();
+        let far = gap >= LAMPORT_GAP_WARN;
         eprintln!(
             "A1 / H-19 warn: joiner {j}: ticks {ticks}, clock {clock}, count {count}, \
-             threshold {}, fires {far}",
-            4 * count + 1024
+             gap {gap}, fires {far}"
         );
         fired |= far;
     }
@@ -2567,36 +2580,31 @@ fn honest_mesh_clock_after_fresh_joins(
     (
         clock,
         count,
-        fired || clock_is_far_above_history(clock, count),
+        fired || mesh.replicas[0].svc.lamport_gap() >= LAMPORT_GAP_WARN,
     )
 }
 
-/// `CLOCK_HISTORY_WARN_FACTOR`'s doc derives "a clock is at most twice the
-/// directive count … four times the count, plus 1024, therefore never fires
-/// on an honest node". The bound holds for one join and compounds across
-/// joins: a 300-account ledger, twelve fresh nodes joining by anti-entropy
-/// in the real advert order and each opening an account, ends with R0's clock
-/// above `4 × count + 1024` with no jump in the history, and the boot /
-/// adoption WARN prescribes the bootstrap join. Fails at HEAD (clock 2,314
-/// over 317 directives, threshold 2,292; 4,042 when served newest-first).
+/// L-94 (0924 A1-1), closed by T83: T72's `4 × count + 1024` was not a bound
+/// on honest clocks — they compound across fresh joins — so a 300-account
+/// ledger with twelve fresh nodes joining by anti-entropy in the real advert
+/// order, each opening an account, ended with R0's clock above it with no jump
+/// in the history, and the WARN prescribed the bootstrap join (failed at
+/// `3d64a16`: clock 2,314 over 317 directives, threshold 2,292). The warning
+/// is now judged on the lamport gap (decision (12)), which honest joins
+/// cannot compound.
 #[test]
-#[ignore = "A1-1: the clock-versus-history WARN fires on an honest mesh after repeated fresh joins — clocks compound across joins, so the 4 × count + 1024 bound is not a bound on honest clocks"]
 fn h19_clock_warning_is_silent_on_an_honest_mesh_with_repeated_fresh_joins() {
     let (clock, count, fired) = honest_mesh_clock_after_fresh_joins(300, 12, None, true);
-    eprintln!(
-        "A1 / H-19 warn: R0 clock {clock}, count {count}, threshold {}, fires {fired}",
-        4 * count + 1024
-    );
+    eprintln!("A1 / H-19 warn: R0 clock {clock}, count {count}, fires {fired}");
     assert!(
         !fired,
         "the H-19 warning fired on an honest mesh: clock {clock} over {count} directives"
     );
 }
 
-/// The one-join case the doc's derivation does cover: a single fresh join of
-/// the same ledger, in advert order and newest-first, stays under the bound,
-/// and so do eight joins that each author a transaction (the tip is drained
-/// last, so nothing compounds). Passes at HEAD.
+/// A single fresh join of the same ledger, in advert order and newest-first,
+/// and eight joins that each author a transaction, stay silent (they did
+/// under T72's ratio too; kept as the control).
 #[test]
 fn h19_clock_warning_is_silent_after_one_fresh_join_or_transaction_authoring_joins() {
     for (joiners, order, joiner_opens) in [
@@ -2608,8 +2616,7 @@ fn h19_clock_warning_is_silent_after_one_fresh_join_or_transaction_authoring_joi
             honest_mesh_clock_after_fresh_joins(300, joiners, order, joiner_opens);
         eprintln!(
             "A1 / H-19 warn: joiners {joiners}, order {order:?}, joiner opens {joiner_opens}: \
-             R0 clock {clock}, count {count}, threshold {}, fires {fired}",
-            4 * count + 1024
+             R0 clock {clock}, count {count}, fires {fired}"
         );
         assert!(
             !fired,
@@ -2659,15 +2666,15 @@ fn chain_under_the_orphan_cap_joins_in_two_ticks_in_advert_and_reverse_order() {
     assert!(advert <= 3 && reverse <= 3);
 }
 
-/// A chain longer than the per-peer orphan budget: the buffer refuses (never
-/// evicts) what arrives past 1,000 entries and the Want is in hex order, so
-/// each tick stages only the prefix that happens to percolate through what
-/// is buffered. Measured at HEAD: 1,300 transactions take exactly 30 ticks
-/// (150 s at the default 5 s interval); 1,500 hold 350 of 1,503 after 60
-/// ticks; 3,000 do not finish in 30 ticks. Served newest-first by a peer that
-/// ignores the Want's order it is one directive per tick. Fails at HEAD.
+/// L-95 (0924 A1-4), closed by T83: a chain longer than the per-peer orphan
+/// budget. The buffer refuses (never evicts) what arrives past 1,000 entries,
+/// and the Want was in hex order, so each tick staged only what happened to
+/// percolate through the buffer (at `3d64a16`: 1,300 transactions took
+/// exactly 30 ticks, 3,000 held 83 of 3,003 after 30). The buffer now keeps
+/// the parent links of what it drops, and the Want is ordered ancestors-first
+/// (decision (13)), so the chain arrives parent before child: 3 ticks. A peer
+/// that ignores the Want's order and serves newest-first is not helped.
 #[test]
-#[ignore = "A1-4: a fresh anti-entropy join of a chain longer than MAX_ORPHANS_PER_PEER progresses a few directives per tick — the per-peer orphan cap refuses instead of evicting and the Want is in hex order"]
 fn chain_over_the_orphan_cap_joins_within_thirty_ticks_in_advert_order() {
     let n = 3 * MAX_ORPHANS_PER_PEER;
     let ticks = chain_join_ticks(n, None, 30);

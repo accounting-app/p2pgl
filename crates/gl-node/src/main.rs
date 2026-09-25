@@ -210,6 +210,16 @@ async fn main() {
     // a boot-level lock would refuse its own reload. See `ledger_lock` for the
     // full rationale. Taken before `LedgerService::boot`, so the ledger's own
     // first write is serialized too.
+    // T82 / L-84: a symlinked `.bean` is worked at its target, so the lock
+    // sits beside the target too — two nodes pointed at one ledger through
+    // different links exclude each other.
+    let ledger_path = match ledger::journal::resolve_ledger_path(&ledger_path) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            error!(%error, "cannot use the configured ledger path — aborting");
+            std::process::exit(1);
+        }
+    };
     let _ledger_lock = match ledger_lock::acquire(&ledger_path) {
         Ok(guard) => {
             info!(lock = %guard.path().display(), "ledger lock acquired");

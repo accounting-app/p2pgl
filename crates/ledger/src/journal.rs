@@ -140,6 +140,55 @@ const RECORD_TAG: &str = ";;olj";
 /// `ledger.bean.journal`), matching the `<ledger>.lock` convention T30 uses.
 const JOURNAL_EXTENSION: &str = "journal";
 
+/// The path the node works at for a configured ledger path (T82 / L-84,
+/// decision (11)): the configured path itself, or — when it is a symbolic
+/// link this node's own user created — the file it points to.
+///
+/// T67 followed a symlinked `.bean` to READ it but derived the journal, the
+/// lock and the temp files from the link's path, and the first compaction
+/// renamed a regular file over the link. So the target's own journal was
+/// never read (an acknowledged record silently missing) and the operator's
+/// link — a ledger kept on another volume — was undone with no warning.
+/// Resolving the link once, at boot, and working at the target from then on
+/// fixes both: journal, lock and temp files sit beside the target, and every
+/// compaction writes the target in place.
+///
+/// Only a link owned by this process's effective uid is followed. Whoever can
+/// write the ledger's DIRECTORY (threat (e)) could otherwise plant
+/// `ledger.bean -> <any file this user owns>` and have the next compaction
+/// overwrite it; another account cannot create a link this uid owns. A link
+/// owned by anyone else is an error. A dangling link, or one whose target
+/// cannot be resolved, is returned unresolved, and the ledger's checked open
+/// refuses it exactly as before (T67). Resolved once: a link planted after
+/// boot is replaced by the next compaction, never followed (L-44).
+pub fn resolve_ledger_path(configured: &Path) -> std::io::Result<PathBuf> {
+    let Ok(metadata) = std::fs::symlink_metadata(configured) else {
+        return Ok(configured.to_path_buf());
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(configured.to_path_buf());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let owner = metadata.uid();
+        let this_uid = effective_uid();
+        if owner != this_uid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "ledger path {} is a symbolic link owned by uid {owner}, not by this \
+                     node's uid {this_uid}; a ledger link is followed only when this node's own \
+                     user created it — point ledgerPath at the real file, or recreate the link \
+                     as this user (L-84)",
+                    configured.display()
+                ),
+            ));
+        }
+    }
+    Ok(std::fs::canonicalize(configured).unwrap_or_else(|_| configured.to_path_buf()))
+}
+
 /// The journal path for a ledger file.
 pub fn journal_path_for(ledger_path: &Path) -> PathBuf {
     let file_name = ledger_path
@@ -383,7 +432,7 @@ pub fn read_journal(path: &Path, budget: u64) -> Result<JournalScan, JournalErro
             // record's length was damaged to swallow records appended after
             // it, which a crash cannot do (M-43), and it fails closed.
             // Anywhere but the end a checksum failure is still corrupt.
-            if cursor == bytes.len() && !has_later_intact_record(payload) {
+            if cursor == bytes.len() && !has_later_intact_record(payload, expected_hash) {
                 scan.torn_tail_bytes = (bytes.len() - record_start) as u64;
                 break;
             }
@@ -434,7 +483,17 @@ fn has_later_record_header(rest: &[u8]) -> bool {
 /// Those do not verify against the bytes that follow them; a real later
 /// record does. (A stale block that happens to hold one whole old record
 /// verifies too, and fails closed — the pre-T78 answer.)
-fn has_later_intact_record(region: &[u8]) -> bool {
+///
+/// T82 / L-85: the candidate may itself be TORN — a crash mid-append after
+/// this record's length was damaged to run to the end of the file — cut in
+/// its header or in its payload. Before T82 that read as "no later record",
+/// so an acknowledged record was dropped as a torn tail. The discriminator is
+/// this record's own checksum: when the bytes before the candidate — exactly
+/// this record's payload, if only its length was damaged — verify against
+/// `own_hash`, the candidate is a real later append, whatever state it is in,
+/// and the record fails closed. Stale ext4 bytes never verify against it, so
+/// T78's torn classification of a stale block is unchanged.
+fn has_later_intact_record(region: &[u8], own_hash: &str) -> bool {
     const TAG: &[u8] = b";;olj ";
     let start = if region.starts_with(TAG) {
         0
@@ -447,6 +506,12 @@ fn has_later_intact_record(region: &[u8]) -> bool {
             None => return false,
         }
     };
+    // T82 / L-85: see the doc comment.
+    let prefix = Sha256::digest(&region[..start]);
+    let prefix_hash: String = prefix.iter().map(|byte| format!("{byte:02x}")).collect();
+    if prefix_hash == own_hash {
+        return true;
+    }
     let candidate = &region[start..];
     let Some(header_end) = candidate.iter().position(|byte| *byte == b'\n') else {
         return false;
@@ -746,6 +811,16 @@ fn open_checked_impl(
             // rather than letting a create resolve it (M-36's `symlink-bean`).
             if follow {
                 if let Ok(link) = std::fs::symlink_metadata(path) {
+                    // T83 (0924 §5): a followed path IS allowed to be a link;
+                    // what is wrong here is that its target is missing.
+                    if link.file_type().is_symlink() {
+                        return Err(refuse(
+                            path,
+                            label,
+                            "is a dangling symbolic link (its target does not exist); refusing \
+                             to follow it or to create anything through it",
+                        ));
+                    }
                     return Err(refuse_file_type(path, label, &link.file_type()));
                 }
             }
@@ -1513,6 +1588,88 @@ mod tests {
             Err(other) => panic!("expected Corrupt, got {other}"),
         }
         std::fs::remove_file(path).ok();
+    }
+
+    /// L-85 (T82): the second of three records has its length damaged to run
+    /// to the end of the file, and the third is torn (a crash mid-append).
+    /// The torn third's header parses but claims more than is left, and the
+    /// second's payload up to it verifies against the second's own hash — so
+    /// this is a damaged, acknowledged record, and it fails closed. Before
+    /// T82 it was read as a torn tail and the second record was dropped.
+    /// The stale-block shape (T78) is unchanged: a region whose prefix does
+    /// not verify stays torn.
+    ///
+    /// Bug-catch: drop the prefix check in `has_later_intact_record` and the
+    /// read returns `Ok` with one intact record.
+    #[test]
+    fn l85_a_damaged_length_over_a_torn_later_append_is_corrupt() {
+        let path = temp_journal("l85-torn-successor");
+        let (bytes, second) = three_records(&path);
+        let third = second
+            + bytes[second..]
+                .windows(6)
+                .skip(1)
+                .position(|window| window == b";;olj ")
+                .unwrap()
+            + 1;
+        let torn = bytes[..third + (bytes.len() - third) / 2].to_vec();
+        let header_end = second + torn[second..].iter().position(|b| *b == b'\n').unwrap() + 1;
+        let to_end = (torn.len() - header_end).to_string();
+        let damaged = with_length(&torn, second, &to_end);
+        write_private(&path, &damaged);
+        match read_journal(&path, 64 * 1024 * 1024) {
+            Err(JournalError::Corrupt { offset, .. }) => assert_eq!(offset, second as u64),
+            Ok(scan) => panic!(
+                "an acknowledged record behind a damaged length was dropped as torn ({} \
+                 payloads, {} torn bytes)",
+                scan.payloads.len(),
+                scan.torn_tail_bytes
+            ),
+            Err(other) => panic!("expected Corrupt, got {other}"),
+        }
+        std::fs::remove_file(&path).ok();
+
+        // Control: the same torn third with the second record intact is an
+        // ordinary torn tail.
+        let path = temp_journal("l85-control");
+        let (bytes, second) = three_records(&path);
+        let third = second
+            + bytes[second..]
+                .windows(6)
+                .skip(1)
+                .position(|window| window == b";;olj ")
+                .unwrap()
+            + 1;
+        write_private(&path, &bytes[..third + (bytes.len() - third) / 2]);
+        let scan = read_journal(&path, 64 * 1024 * 1024).expect("a torn tail");
+        assert_eq!(scan.payloads.len(), 2);
+        assert!(scan.torn_tail_bytes > 0);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 0924 §5 (T83): a followed path (the operator's `.bean` or config) may
+    /// be a symbolic link, so a dangling one is refused as DANGLING — the old
+    /// message said symbolic links are refused, which they are not.
+    #[cfg(unix)]
+    #[test]
+    fn t83_a_dangling_followed_link_is_named_dangling() {
+        let directory =
+            std::env::temp_dir().join(format!("openledger-t83-dangling-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let link = directory.join("config.json");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(directory.join("absent.json"), &link).unwrap();
+        let mut options = OpenOptions::new();
+        options.read(true);
+        let error = match open_checked(&link, &options, FileTrust::OperatorConfig, "config file") {
+            Ok(_) => panic!("a dangling link must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("dangling symbolic link"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(&directory).ok();
     }
 
     // ── T67: file-type discipline (M-36, L-58) ──────────────────────────

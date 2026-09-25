@@ -1453,6 +1453,56 @@ mod tests {
     /// Bug-catch: remove the `refuse_if_local_write_cannot_fit` call from
     /// `appendTransaction` — four reload lines, and a permit wait of whole
     /// reloads.
+    /// L-80 (T82): on a ledger whose canonical form is over the cap — the
+    /// file itself is under it — every write needs a compaction that cannot
+    /// be written. Before T82 each mutation was admitted by the pre-stage
+    /// check (the append headroom looked fine), staged, failed in
+    /// `persist_atomically`, and paid a full reload with the permit held; now
+    /// `append_headroom` is 0 and the mutation is refused before staging,
+    /// with the cap's error code and no reload.
+    #[tokio::test]
+    async fn l80_writes_on_an_over_cap_canonical_ledger_are_refused_before_staging() {
+        let (guard, raw, _filtered) = crate::anti_entropy_alpn::tests::capture_logs();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("l80.bean");
+        let line = format!(";{}\n", "x".repeat((1 << 20) - 2));
+        let content = line.repeat(63) + &format!(";{}\n", "x".repeat((1 << 20) - 64));
+        assert!(content.len() as u64 <= ledger::service::MAX_LEDGER_FILE_BYTES);
+        std::fs::write(&path, content).unwrap();
+        let service = LedgerService::boot(&path, "l80".to_owned()).unwrap();
+        assert_eq!(service.append_headroom(), 0, "premise: over the cap");
+        let ledger: SharedLedger = Arc::new(tokio::sync::RwLock::new(service));
+        let schema = build_schema_with_service(
+            Arc::clone(&ledger),
+            TransactionBroadcast::new(),
+            p2p::node::PeerRegistry::new(),
+            Arc::new(security::signing::NoopSignatureProvider),
+            true,
+            None,
+        );
+        for attempt in 0..3 {
+            let response = schema
+                .execute(format!(
+                    r#"mutation {{ openAccount(name: "Assets:A{attempt}", date: "2024-01-05") }}"#
+                ))
+                .await;
+            assert_eq!(
+                error_codes(&response),
+                vec!["\"RESOURCE_LIMIT_EXCEEDED\"".to_owned()],
+                "{:?}",
+                response.errors
+            );
+        }
+        drop(guard);
+        assert_eq!(
+            raw.text().matches("reload installed").count(),
+            0,
+            "a refused write must not reload:\n{}",
+            raw.text()
+        );
+        assert_eq!(ledger.read().await.directive_count(), 0, "nothing staged");
+    }
+
     #[tokio::test]
     async fn l71_refused_writes_at_the_cap_reload_nothing_and_never_hold_the_permit() {
         let (guard, raw, _filtered) = crate::anti_entropy_alpn::tests::capture_logs();

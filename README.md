@@ -242,7 +242,10 @@ curl -s -X POST http://127.0.0.1:4000/graphql \
 
 Any amount that is added into a balance (posting units, `{cost}`, `@`/`@@` price, and the auto-calculated
 elided amount) must have magnitude at most **10^21** (`1000000000000000000000`). The limit includes 10^21
-itself and allows any precision up to 28 fractional digits, and trailing zeros are free. The API, peers
+itself and allows up to 28 fractional digits; trailing zeros do not count against the 10^21 limit, but
+they do count as digits: a stored amount holds at most 28 significant digits in all (29 below about
+7.9 × 10^28), so 10^21 admits at most 7 decimal places, and a longer spelling is refused with a message
+that says so. The API, peers
 and the `.bean` file all apply the same rule. `balance` and `price` directive amounts are not limited.
 A history record past the limit (written before T65) is held in the file and quarantined at boot with
 everything that descends from it — see Upgrading above.
@@ -740,12 +743,15 @@ without any lamport rule when the removed author's directive is a
 node that refuses the parent buffers all of it as orphans forever
 (`MISSING_PARENT`).
 
-The node **tells you** when it is in this state: at boot, and after an
-adoption, it logs *"ledger clock is far above the number of directives this
-node holds"* naming the author whose directive carried the clock there (a
-clock is bounded by the events it has folded; a clock of 5 × 10⁹ over a few
-thousand directives is a jump). A `LAMPORT_ADVANCE` refusal that repeats tick
-after tick on a fresh node is the same state seen from the other side.
+The node **tells you** when it is in this state: at boot, and when an adoption
+opens one, it logs *"the ledger history carries a lamport gap no honest mesh
+makes"* (or *"an adopted directive opened a lamport gap"*), naming the author
+of the directive at the top of the gap. It is judged on the history itself —
+two consecutive lamport values at least 2^28 apart, which honest traffic never
+produces (each event moves the highest clock by one) — so honest meshes,
+however many nodes join them, never see it. A `LAMPORT_ADVANCE` refusal that
+repeats tick after tick on a fresh node is the same state seen from the other
+side.
 
 **Removing a peer from the allowlist** is therefore a two-part decision. Its
 directives already in the history stay there (the mesh keeps what it accepted,
@@ -773,8 +779,9 @@ later joiner must be joined by bootstrap, not by anti-entropy alone**:
 4. **Start the peer again and let anti-entropy finish the join.** Everything
    authored since the copy is within one ratchet step of the joiner's clock and
    arrives normally; the joiner's own writes are accepted by every node. The
-   boot warning above fires on the joiner once, naming the jump's author; that
-   is expected, and it is your confirmation that the copy carried the gap.
+   boot warning above fires on the joiner at every boot, naming the jump's
+   author; that is expected — the gap is in the history it now serves — and it
+   is your confirmation that the copy carried the gap.
 
 This is the join the test `h19_fresh_node_bootstrapped_from_a_peers_file_converges`
 performs (`crates/p2p/tests/convergence.rs`): the copy boots with the peer's
@@ -787,8 +794,8 @@ contact" is exactly the unbounded jump the ratchet exists to remove, on the
 nodes least able to notice.
 
 Two related rules that do **not** change: a transaction's parents are chosen
-so that no author's heads can crowd out another's (at most `256 / authors` per
-author, then smallest id — so a peer that grinds content ids cannot keep an
+so that no author's heads can crowd out another's (at most `max(1, 256 /
+authors)` per author, then smallest id — so a peer that grinds content ids cannot keep an
 honest head unmerged), and a peer's transaction is never refused for the number
 of heads its author holds on this node (that bound made DAG membership depend on
 which subset a peer chose to serve first; frontier size is a cost every replica
@@ -879,9 +886,19 @@ of every line not yet signed from what survives, and refuses — as written — 
 new line that can no longer stand without the quarantined record (one whose
 hand-typed parent it was, or a transaction on an account only it opened). And a
 node that **enables signing over a history it wrote unsigned** finds that
-history quarantined at the first signing boot — it never replicated to a signing
-mesh anyway; delete the `openledger-*` lines from those blocks to re-adopt them
-as this node's own, signed, operator input.
+history quarantined at the first signing boot; delete the `openledger-*` lines
+from those blocks to re-adopt them as this node's own, signed, operator input.
+If the mesh ran with signing off, other nodes hold copies of those records too,
+and each would re-adopt them under its own key if it applied the same remedy —
+the records would then carry a different author on each node. Apply the remedy
+on **one** node (the one that wrote them), and on every other node delete those
+blocks instead; the peers re-supply the re-signed copies.
+
+An edit that changes a node-written record **and** removes one of its
+`openledger-*` lines is not refused as an edit: without its full envelope the
+record is operator input, so it is adopted as a **new** record beside the
+original (which peers still hold and re-supply). To correct a record, append a
+reversing entry; never edit the record itself.
 
 A node that signs is always its key. Its author id — the `openledger-author` it
 writes — is the node key's public half, the same value its P2P endpoint id would
@@ -969,13 +986,17 @@ same trust boundary:
 - Removing or renaming the `.bean` under a running node does not lose anything:
   the next write recreates it from memory with every directive in it, and a
   failed write never replaces what is in memory with a file that lacks a record
-  the node already wrote. That includes a backup copied over the live file. Only
-  lines you added since the node last rewrote the file may be dropped by that
-  recovery.
+  the node already wrote. That includes a backup copied over the live file, and
+  lines you added by hand once the node has signed them. Only lines you added
+  that the node has not yet signed may be dropped by that recovery. A backup
+  taken before the node rewrote your hand-added lines keeps the envelope the
+  node gave them, not a fresh one.
 - The 64 MiB limit applies to the file as the node writes it. Hand-typed
   directives gain an envelope of several hundred bytes each, so a file just
-  under the limit can grow past it; boot then warns, and every compaction fails
-  until the file is made smaller. Near the limit, a mutation whose record would
+  under the limit can grow past it; boot then warns, and **every write fails**
+  until the file is made smaller — refused before staging, with no reload, so
+  the node stays responsive. Stop the node, shrink the file, restart. Near the
+  limit, a mutation whose record would
   not fit is refused before anything changes (`RESOURCE_LIMIT_EXCEEDED`,
   "refused before staging"), and a peer's batch that would not fit is deferred
   and that peer paused for `p2p.antiEntropySupplyBackoffSeconds`. Archive or
@@ -995,13 +1016,23 @@ cases where you might:
   loads with a warning and is compacted away). The node appends only to a
   journal with no group or other permission bits (0600 or stricter). A FIFO,
   directory or dangling symlink at the `.bean` or the journal refuses boot.
+- **A `.bean` that is a symbolic link** you created as the node's user is
+  followed: the node reads, journals, locks and rewrites at the link's target,
+  so the journal, `.lock` and temporary files sit beside the target and the
+  link is kept (a ledger on another volume works). A link owned by any other
+  user refuses boot — otherwise whoever can write the ledger's directory could
+  point it at any file the node's user owns and have it overwritten.
 - **A `.bean` missing beside a journal refuses boot** rather than starting an
   empty ledger with the journal's writes on top.
 - **A torn final record** — a crash mid-append — is dropped with a warning. On
   some filesystems the crashed record reads back at full length but with zeros
   (XFS) or old disk contents (ext4 `data=writeback`); a final record that fails
-  its checksum is treated the same way, unless an intact record follows inside
-  it. The same applies to a journal whose recovery reload after a failed write
+  its checksum is treated the same way, unless another record follows inside it
+  — an intact one, or a torn one behind a record whose own bytes still verify
+  (a damaged length field on a record that was acknowledged), which refuses
+  boot instead. A final record damaged on disk after its write succeeded looks
+  torn too: it is dropped loudly, and on a single node that has no peer to
+  re-supply it, the sidecar below is where it is. The same applies to a journal whose recovery reload after a failed write
   could not read the files. The journal is kept as
   `<ledgerPath>.journal.torn-<unix-seconds>` instead of being deleted. No boot
   reads it; inspect it, then remove it.
@@ -1020,6 +1051,14 @@ cases where you might:
   disk**, and the node's reload shows it. Before retrying a failed mutation,
   look for it (`journal`, or `transaction(txid:)` if you have the id) — a blind
   retry can book it twice.
+- **A failed write may already have been seen by a peer.** Between staging a
+  write and the reload that follows a failed commit, a peer can fetch it. A
+  retry of the same entry has the same content id (the body is the same) but a
+  new lamport, parents and signature, and every node keeps whichever envelope
+  it got first. Balances and membership still agree everywhere; only that
+  record's parents, and so the head sets, differ between the nodes that took
+  one copy and those that took the other. It is the same property as two
+  nodes entering the same body independently.
 
 ---
 
