@@ -2409,3 +2409,460 @@ fn over_cap_history_keeps_its_descendants_parents_resolvable_or_refuses_loudly()
     let withheld = !upgraded.contains_directive(&c_id) && refused.is_empty();
     assert!(whole || withheld, "{outcome}");
 }
+
+// ─── A4 (0925): the closure quarantine against a fresh replica ───────────────
+//
+// T81 (b)'s contract, stated as this file's invariant: after an upgrade over
+// a history holding a record no peer accepts, the node serves exactly the set
+// a fresh replica can hold, so its balances are the fresh replica's. Each
+// case below builds the pre-upgrade file, boots it at HEAD, feeds everything
+// it serves into a fresh replica the way anti-entropy would, and compares.
+
+/// A 4,097-currency `open` — one past the legacy ceiling, the M-48 flood
+/// class — as pre-T75 history by `author`.
+fn over_ceiling_open(account: &str, author: &str, lamport: u64) -> Directive {
+    Directive::Open(Open {
+        date: date(2024, 1, 2),
+        account: account.to_owned(),
+        currencies: (0..=ledger::limits::MAX_CURRENCIES_PER_OPEN_LEGACY)
+            .map(|index| format!("C{index:04}"))
+            .collect(),
+        metadata: BTreeMap::from([
+            ("openledger-author".to_owned(), author.to_owned()),
+            ("openledger-lamport".to_owned(), lamport.to_string()),
+        ]),
+    })
+}
+
+/// A signed-history transaction of `amount` `currency` into `account` by
+/// `(author, lamport)`, naming `parents`.
+fn history_record(
+    day: u32,
+    narration: &str,
+    account: &str,
+    amount: Decimal,
+    currency: &str,
+    by: (&str, u64),
+    parents: &str,
+) -> Directive {
+    let (author, lamport) = by;
+    Directive::Transaction(Transaction {
+        date: date(2024, 1, day),
+        flag: Flag::Complete,
+        payee: None,
+        narration: Some(narration.to_owned()),
+        tags: Vec::new(),
+        links: Vec::new(),
+        postings: vec![
+            posting(account, amount, currency),
+            posting(OPENING, -amount, currency),
+        ],
+        metadata: BTreeMap::from([
+            ("openledger-author".to_owned(), author.to_owned()),
+            ("openledger-lamport".to_owned(), lamport.to_string()),
+            ("openledger-parents".to_owned(), parents.to_owned()),
+        ]),
+    })
+}
+
+/// Boot `file` at HEAD as the upgraded node, feed what it serves to a fresh
+/// replica (`open`s first, then by lamport, as a Supply would be drained), and
+/// return both plus what the replica refused. The two `Assets:Cash` balances
+/// and the two directive sets are the invariant every caller checks.
+fn upgraded_and_fresh(label: &str, file: &str) -> (LedgerService, LedgerService, Vec<String>) {
+    let path = scratch_ledger(&format!("a4-{label}"));
+    std::fs::write(&path, file).expect("write the pre-upgrade file");
+    let upgraded = LedgerService::boot(&path, "nodeA".to_owned()).expect("boot");
+    let mut served: Vec<Directive> = upgraded.dag().directives().into_iter().cloned().collect();
+    served.sort_by_key(|directive| {
+        let lamport = directive
+            .metadata()
+            .get("openledger-lamport")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        (!matches!(directive, Directive::Open(_)), lamport)
+    });
+    let fresh_path = scratch_ledger(&format!("a4-{label}-fresh"));
+    let mut fresh = LedgerService::boot(&fresh_path, "fresh".to_owned()).expect("boot fresh");
+    let refused = sync_from_served(&mut fresh, served);
+    remove_scratch(&path);
+    remove_scratch(&fresh_path);
+    (upgraded, fresh, refused)
+}
+
+fn cash_in(service: &LedgerService, currency: &str) -> Option<String> {
+    service
+        .read_model()
+        .account_balance(CASH, None)
+        .and_then(|entry| entry.balances.get(currency).map(Decimal::to_string))
+}
+
+/// The invariant: nothing refused, the same directive set, the same balance.
+fn assert_upgraded_is_a_fresh_replica(
+    context: &str,
+    upgraded: &LedgerService,
+    fresh: &LedgerService,
+    refused: &[String],
+    currency: &str,
+) {
+    let report = verify_dag(upgraded.dag(), upgraded.read_model());
+    assert!(
+        refused.is_empty()
+            && upgraded.directive_count() == fresh.directive_count()
+            && cash_in(upgraded, currency) == cash_in(fresh, currency),
+        "{context}: upgraded serves {} (Cash {currency} {:?}, verify.ok={} errors={:?}, \
+         quarantined={}), fresh holds {} (Cash {currency} {:?}), refused={refused:?}",
+        upgraded.directive_count(),
+        cash_in(upgraded, currency),
+        report.ok,
+        report.errors,
+        upgraded.quarantined_count(),
+        fresh.directive_count(),
+        cash_in(fresh, currency),
+    );
+}
+
+/// M-51 (T81 (b)): an `open` over the legacy ceiling, a transaction on its
+/// account, that transaction's child on `Assets:Cash`, and an unrelated
+/// transaction on `Assets:Cash`. The closure takes the first three — the
+/// transaction by account dependence, its child by parenthood — and leaves
+/// the fourth, so the upgraded node's Cash balance is the fresh replica's
+/// (the unrelated amount alone) and the replica refuses nothing.
+///
+/// Bug-catch: without the closure the upgraded node serves the transaction
+/// and its child (Cash 5 + 7 more than the replica's), and the replica
+/// refuses `ACCOUNT_NOT_OPEN` then `MISSING_PARENT`; without the account
+/// dependants the same, minus the child's `MISSING_PARENT`.
+#[test]
+fn m51_the_closure_leaves_an_upgraded_node_with_a_fresh_replicas_balances() {
+    let flood = over_ceiling_open("Assets:Flood", "nodeA", 10);
+    let on_flood = history_record(
+        5,
+        "on flood",
+        "Assets:Flood",
+        Decimal::from(5),
+        "C0001",
+        ("nodeA", 11),
+        "",
+    );
+    let on_flood_id = compute_content_id(&on_flood);
+    let child = history_record(
+        6,
+        "child",
+        CASH,
+        Decimal::from(7),
+        USD,
+        ("nodeA", 12),
+        &on_flood_id,
+    );
+    let unrelated = history_record(
+        7,
+        "unrelated",
+        CASH,
+        Decimal::from(11),
+        USD,
+        ("nodeB", 13),
+        "",
+    );
+    let file = ledger::serialize::full_file_serialize(
+        &[
+            open(CASH, BTreeMap::new()),
+            open(OPENING, BTreeMap::new()),
+            flood,
+            on_flood,
+            child.clone(),
+            unrelated.clone(),
+        ],
+        &[],
+    );
+    let (upgraded, fresh, refused) = upgraded_and_fresh("m51-closure", &file);
+    assert_upgraded_is_a_fresh_replica("M-51 closure", &upgraded, &fresh, &refused, USD);
+    assert_eq!(
+        cash_in(&upgraded, USD).as_deref(),
+        Some("11"),
+        "the unrelated amount alone"
+    );
+    assert!(upgraded.contains_directive(&compute_content_id(&unrelated)));
+    assert!(!upgraded.contains_directive(&compute_content_id(&child)));
+    assert_eq!(
+        upgraded.quarantined_count(),
+        3,
+        "the open, the transaction on it, its child"
+    );
+}
+
+/// M-52 (T81 (b)): two records with no blank line between them — a fine
+/// record R and a past-cap X — are one block to the splitter, and H-20 holds
+/// the pair whole as text rather than loading R truncated. `IDENTIFY` then
+/// yields BOTH ids, so R's child is closured with X's: what the node serves
+/// is what the replica holds, and neither child is in any balance.
+///
+/// Bug-catch: identify nothing (the pre-T81 text hold) and R's child is
+/// served with a dangling parent — the replica refuses it `MISSING_PARENT`.
+#[test]
+fn m52_two_records_glued_into_one_text_block_are_identified_and_closured_together() {
+    let over = Decimal::from_str_exact("50000000000000000000000").expect("5 × 10^22");
+    let r = history_record(2, "R fine", CASH, Decimal::from(3), USD, ("nodeA", 3), "");
+    let x = history_record(2, "X over", CASH, over, USD, ("nodeA", 4), "");
+    let child_of_r = history_record(
+        3,
+        "child of R",
+        CASH,
+        Decimal::from(5),
+        USD,
+        ("nodeA", 5),
+        &compute_content_id(&r),
+    );
+    let child_of_x = history_record(
+        3,
+        "child of X",
+        CASH,
+        Decimal::from(6),
+        USD,
+        ("nodeA", 6),
+        &compute_content_id(&x),
+    );
+    let unrelated = history_record(
+        4,
+        "unrelated",
+        CASH,
+        Decimal::from(11),
+        USD,
+        ("nodeB", 7),
+        "",
+    );
+    let opens = ledger::serialize::full_file_serialize(
+        &[open(CASH, BTreeMap::new()), open(OPENING, BTreeMap::new())],
+        &[],
+    );
+    let r_block = ledger::serialize::full_file_serialize(std::slice::from_ref(&r), &[]);
+    let x_block = ledger::serialize::full_file_serialize(std::slice::from_ref(&x), &[]);
+    let rest = ledger::serialize::full_file_serialize(
+        &[child_of_r.clone(), child_of_x.clone(), unrelated],
+        &[],
+    );
+    let file = format!(
+        "{opens}\n{}\n{}\n\n{rest}",
+        r_block.trim_end(),
+        x_block.trim_end()
+    );
+    let (upgraded, fresh, refused) = upgraded_and_fresh("m52-glued", &file);
+    assert_upgraded_is_a_fresh_replica("M-52 glued block", &upgraded, &fresh, &refused, USD);
+    assert_eq!(
+        upgraded.unparsable_block_count(),
+        1,
+        "R and X held as one block"
+    );
+    assert!(!upgraded.contains_directive(&compute_content_id(&child_of_r)));
+    assert!(!upgraded.contains_directive(&compute_content_id(&child_of_x)));
+    assert_eq!(cash_in(&upgraded, USD).as_deref(), Some("11"));
+}
+
+/// A4-1 (0925): the closure's account dependence asks only whether ANY
+/// surviving `open` opens the account, not whether that `open` admits the
+/// transaction. History can carry an account opened twice (boot applies no
+/// lifecycle policy; a pre-L-77 mesh, or the operator's own re-open remedy
+/// dated today): the refused 4,097-currency `open` of 2024-01-02 and a
+/// surviving `open Assets:Flood USD` of 2024-01-10. The transaction of
+/// 2024-01-05 in `C0001` is not orphaned at HEAD — served, in the balance,
+/// a parent — while every fresh replica refuses it (`ACCOUNT_NOT_OPEN` at
+/// 2024-01-05; the currency would fail I9 too) and its child `MISSING_PARENT`.
+#[test]
+#[ignore = "A4-1: the surviving-open test is date- and currency-blind; the upgraded node serves what a fresh replica refuses"]
+fn a4_1_a_surviving_open_that_does_not_admit_the_transaction_must_not_unstrand_it() {
+    let flood = over_ceiling_open("Assets:Flood", "nodeA", 10);
+    let later = Directive::Open(Open {
+        date: date(2024, 1, 10),
+        account: "Assets:Flood".to_owned(),
+        currencies: vec![USD.to_owned()],
+        metadata: BTreeMap::from([
+            ("openledger-author".to_owned(), "nodeB".to_owned()),
+            ("openledger-lamport".to_owned(), "12".to_owned()),
+        ]),
+    });
+    let on_flood = history_record(
+        5,
+        "on flood",
+        "Assets:Flood",
+        Decimal::from(5),
+        "C0001",
+        ("nodeA", 11),
+        "",
+    );
+    let child = history_record(
+        12,
+        "child",
+        CASH,
+        Decimal::from(7),
+        USD,
+        ("nodeA", 13),
+        &compute_content_id(&on_flood),
+    );
+    let file = ledger::serialize::full_file_serialize(
+        &[
+            open(CASH, BTreeMap::new()),
+            open(OPENING, BTreeMap::new()),
+            flood,
+            later,
+            on_flood,
+            child,
+        ],
+        &[],
+    );
+    let (upgraded, fresh, refused) = upgraded_and_fresh("a4-1-twice-opened", &file);
+    assert_upgraded_is_a_fresh_replica(
+        "A4-1 twice-opened account",
+        &upgraded,
+        &fresh,
+        &refused,
+        USD,
+    );
+}
+
+/// A4-2 (0925): the remedy the M-52 WARN and README §Upgrading prescribe —
+/// "restate the amount in a larger unit" — gives X a new id. Its
+/// descendants still name the old one; the next boot has no refused record
+/// to seed the closure, so C and G load leniently with a dangling parent,
+/// are served, are heads, and every fresh replica refuses them
+/// `MISSING_PARENT` forever. The signature covers `openledger-parents`, so
+/// they cannot be re-parented by hand either.
+#[test]
+#[ignore = "A4-2: the prescribed restate-in-a-larger-unit remedy leaves the descendants served with a dangling parent"]
+fn a4_2_restating_a_past_cap_amount_must_not_leave_its_descendants_served_with_a_dangling_parent() {
+    let wei = "WEI";
+    let over = Decimal::from_str_exact("50000000000000000000000").expect("5 × 10^22");
+    let x = history_record(2, "X pre-upgrade", CASH, over, wei, ("nodeA", 3), "");
+    let c = history_record(
+        3,
+        "C child",
+        CASH,
+        Decimal::from(5),
+        wei,
+        ("nodeA", 4),
+        &compute_content_id(&x),
+    );
+    let g = history_record(
+        4,
+        "G grandchild",
+        CASH,
+        Decimal::from(9),
+        wei,
+        ("nodeB", 5),
+        &compute_content_id(&c),
+    );
+    // The operator's edit: the same record restated as 50,000 ETH.
+    let restated = history_record(
+        2,
+        "X pre-upgrade",
+        CASH,
+        Decimal::from(50_000),
+        "ETH",
+        ("nodeA", 3),
+        "",
+    );
+    let file = ledger::serialize::full_file_serialize(
+        &[
+            open(CASH, BTreeMap::new()),
+            open(OPENING, BTreeMap::new()),
+            restated,
+            c,
+            g,
+        ],
+        &[],
+    );
+    let (upgraded, fresh, refused) = upgraded_and_fresh("a4-2-restated", &file);
+    assert_upgraded_is_a_fresh_replica("A4-2 restated amount", &upgraded, &fresh, &refused, wei);
+}
+
+/// A4-2 (0925), the M-51 shape: the operator stops the node and deletes the
+/// refused `open` (README §Editing's supported edit; the WARN says "repair
+/// the refused record"). The next boot refuses nothing, so nothing seeds the
+/// closure; boot applies no lifecycle rule to history, so the transaction on
+/// the never-opened account is served — `verify` is clean — and every fresh
+/// replica refuses it `ACCOUNT_NOT_OPEN`, then its child `MISSING_PARENT`.
+#[test]
+#[ignore = "A4-2: deleting the refused open leaves the transactions on its account served with no open at all"]
+fn a4_2_deleting_a_refused_open_must_not_leave_the_transactions_on_its_account_served() {
+    let on_flood = history_record(
+        5,
+        "on flood",
+        "Assets:Flood",
+        Decimal::from(5),
+        "C0001",
+        ("nodeA", 11),
+        "",
+    );
+    let child = history_record(
+        6,
+        "child",
+        CASH,
+        Decimal::from(7),
+        USD,
+        ("nodeA", 12),
+        &compute_content_id(&on_flood),
+    );
+    // The file after the edit: the 4,097-currency open is gone.
+    let file = ledger::serialize::full_file_serialize(
+        &[
+            open(CASH, BTreeMap::new()),
+            open(OPENING, BTreeMap::new()),
+            on_flood,
+            child,
+        ],
+        &[],
+    );
+    let (upgraded, fresh, refused) = upgraded_and_fresh("a4-2-deleted-open", &file);
+    assert_upgraded_is_a_fresh_replica("A4-2 deleted open", &upgraded, &fresh, &refused, USD);
+}
+
+/// A4-3 (0925): the closure is seeded by ids, and a block held as text for
+/// any reason other than the amount cap has none — a pre-T37 Unicode account
+/// name (L-45's own example, "storable AND replicable before T37"), or a
+/// past-cap block glued to one. Its descendants load with a dangling parent,
+/// are served and counted, and the T79 (d) WARN does not name them (it looks
+/// the parent up in the id-keyed quarantine). A fresh replica refuses every
+/// one of them `MISSING_PARENT`.
+#[test]
+#[ignore = "A4-3: a text-held block without an id leaves its descendants served with a dangling parent, unnamed"]
+fn a4_3_a_text_held_block_without_an_id_must_not_leave_its_descendants_served() {
+    // The id a pre-T37 node stored for the Unicode record; only its absence matters.
+    let parent = "1111111111111111111111111111111111111111111111111111111111111111";
+    let unicode_block = "2024-01-02 * \"U pre-T37\"\n  openledger-author: \"nodeA\"\n  openledger-lamport: \"10\"\n  openledger-parents: \"\"\n  Assets:C\u{0430}sh 5 USD\n  Equity:Opening -5 USD\n";
+    let child = history_record(
+        3,
+        "child of U",
+        CASH,
+        Decimal::from(9),
+        USD,
+        ("nodeA", 11),
+        parent,
+    );
+    let grand = history_record(
+        4,
+        "grandchild of U",
+        CASH,
+        Decimal::from(2),
+        USD,
+        ("nodeB", 12),
+        &compute_content_id(&child),
+    );
+    let opens = ledger::serialize::full_file_serialize(
+        &[open(CASH, BTreeMap::new()), open(OPENING, BTreeMap::new())],
+        &[],
+    );
+    let rest = ledger::serialize::full_file_serialize(&[child, grand], &[]);
+    let file = format!("{opens}\n{unicode_block}\n{rest}");
+    let (upgraded, fresh, refused) = upgraded_and_fresh("a4-3-unicode", &file);
+    assert_eq!(
+        upgraded.unparsable_block_count(),
+        1,
+        "the Unicode block is held as text"
+    );
+    assert_upgraded_is_a_fresh_replica(
+        "A4-3 text block without an id",
+        &upgraded,
+        &fresh,
+        &refused,
+        USD,
+    );
+}

@@ -46,6 +46,18 @@
 //! a hand parent naming the quarantined id (A2-3) and a lamport edit that
 //! moves the clock (A2-4). `boot_fuzz_all_operators_including_a2` sweeps
 //! every green operator.
+//!
+//! ## A1 (0925 re-audit of T79)
+//!
+//! The `(ad)`–`(ah)` operators and the `a1_*` cases pin T79's compositions:
+//! a foreign-author line with a hand line stamped on top of it, two
+//! verification passes rebasing the same line, the placeholder author spelled
+//! by hand, an edited `open` with a hand re-open and transaction, the crash
+//! window on a refused line, decision (7) itself, and item (d)'s WARN. Two are
+//! `#[ignore]`d with their finding: A1-1 (a hand line stamped over an edited
+//! lamport keeps that lamport through the rebase) and A1-2 (the per-record
+//! remedy silences (d) while the child stays unadoptable).
+//! `boot_fuzz_a1_operators` sweeps the green A1 operators.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -993,6 +1005,28 @@ enum Operator {
     /// before T80. The signature does not cover the author, so every record
     /// still verifies under the node's key.
     PlaceholderAuthorEverywhere,
+    // ── A1 (0925 re-audit of T79) ──
+    /// (ad) M-54 × H-22: a foreign-author half envelope AND a later hand line
+    /// with no parents. Boot stamps the later line over the foreign one (a
+    /// head at adoption); finalisation refuses the foreign one, so the later
+    /// line must be rebased before it is signed.
+    ForeignAuthorPlusHandOnTop,
+    /// (ae) Two verification passes, two rebases: an edited own record (the
+    /// signer's pass refuses it), a pasted block with a forged signature (the
+    /// verifier's pass refuses it) and a hand line stamped over both.
+    EditNarrationPlusForgedForeignPlusHand,
+    /// (af) A hand line spelling `openledger-author: "local"` — the boot
+    /// placeholder — with no lamport, on a signing node.
+    PlaceholderSpelledHandLine,
+    /// (ag) The T79 residual's shape: the history `open` of an account is
+    /// edited (its date: new id, old envelope, no constraint changed), a hand
+    /// re-`open` of the same account and a hand transaction on it are
+    /// appended in the same edit.
+    EditOpenPlusHandReopenAndTransaction,
+    /// (ah) A1-1: the lamport line of a signed record edited past the
+    /// adoption ratchet (5,000,000,000) AND a hand line appended in the same
+    /// edit.
+    EditLamportLinePastRatchetPlusAppendHand,
 }
 
 /// Every operator that is green: [`OPERATORS_ENABLED`] plus the A2 operators
@@ -1129,6 +1163,14 @@ const OPERATORS_ENABLED: [Operator; 18] = [
 ];
 
 const HAND_TRANSACTION: &str = "2024-01-29 * \"Hand\" \"appended while the node was stopped\"\n  Expenses:Food                                      7.50 USD\n  Assets:Cash                                       -7.50 USD";
+
+/// A second hand line, dated after every other operator's (A1): no
+/// envelope, so boot chooses its parents from the heads it holds.
+const A1_LATER_HAND_TRANSACTION: &str = "2024-01-31 * \"Hand\" \"stamped on top of the other edits\"\n  Expenses:Rent                                      3.25 USD\n  Assets:Cash                                       -3.25 USD";
+
+/// A lamport past the adoption ratchet from any fixture clock: more than
+/// [`ledger::service::MAX_LAMPORT_ADVANCE`] above it (A1-1).
+const A1_PAST_RATCHET: u64 = 5_000_000_000;
 
 /// Apply `operator` to the node-written `text`; `position` picks the target
 /// block/line. `None` means the operator does not apply to this fixture.
@@ -1367,6 +1409,55 @@ fn mutate(truth: &Truth, operator: Operator, position: usize) -> Option<Mutation
                     format!("  {KEY_AUTHOR}: \"{}\"", provider.public_key_hex()),
                 )
             }));
+        }
+        // ── A1 ──
+        Operator::ForeignAuthorPlusHandOnTop => {
+            let provider = foreign_provider(truth);
+            extra_authors.push(provider.public_key_hex());
+            blocks.push(set_lines(HAND_TRANSACTION, |lines| {
+                lines.insert(
+                    1,
+                    format!("  {KEY_AUTHOR}: \"{}\"", provider.public_key_hex()),
+                )
+            }));
+            blocks.push(A1_LATER_HAND_TRANSACTION.to_owned());
+        }
+        Operator::EditNarrationPlusForgedForeignPlusHand => {
+            let index = pick(&signed_txns);
+            touch(&mut effect, &blocks[index]);
+            blocks[index] = edit_narration(&blocks[index]);
+            let provider = foreign_provider(truth);
+            extra_authors.push(provider.public_key_hex());
+            blocks.push(signed_foreign_block(&provider, true));
+            blocks.push(A1_LATER_HAND_TRANSACTION.to_owned());
+        }
+        Operator::PlaceholderSpelledHandLine => {
+            blocks.push(set_lines(HAND_TRANSACTION, |lines| {
+                lines.insert(1, format!("  {KEY_AUTHOR}: \"local\""))
+            }));
+        }
+        Operator::EditOpenPlusHandReopenAndTransaction => {
+            let index = blocks
+                .iter()
+                .position(|block| block.starts_with("2024-01-01 open Expenses:Food"))?;
+            touch(&mut effect, &blocks[index]);
+            blocks[index] = set_lines(&blocks[index], |lines| {
+                lines[0] = "2023-12-31 open Expenses:Food".to_owned();
+            });
+            blocks.push("2024-01-01 open Expenses:Food".to_owned());
+            blocks.push(HAND_TRANSACTION.to_owned());
+        }
+        Operator::EditLamportLinePastRatchetPlusAppendHand => {
+            let index = pick(&signed_txns);
+            touch(&mut effect, &blocks[index]);
+            blocks[index] = set_lines(&blocks[index], |lines| {
+                for line in lines.iter_mut() {
+                    if line.trim_start().starts_with(KEY_LAMPORT) {
+                        *line = format!("  {KEY_LAMPORT}: \"{A1_PAST_RATCHET}\"");
+                    }
+                }
+            });
+            blocks.push(HAND_TRANSACTION.to_owned());
         }
     }
     Some(Mutation {
@@ -1999,6 +2090,455 @@ proptest! {
     fn boot_fuzz_all_operators_including_a2(
         seed in any::<u64>(),
         operator in any_operator(&OPERATORS_ALL),
+        position in 0..64usize,
+    ) {
+        let truth = generate_fixture(seed);
+        let report = run_case(&truth, operator, position, Checks::ALL);
+        if !report.applied {
+            return Ok(());
+        }
+        prop_assert!(
+            report.failures.is_empty(),
+            "{operator:?} (seed {seed}, position {position}):\n  {}",
+            report.failures.join("\n  ")
+        );
+    }
+}
+
+// ─── A1 (0925 re-audit of T79) ───────────────────────────────────────────────
+//
+// T79 moved every judgement of operator input to the point where its input is
+// final: the H-20 pass's rebuild rebases what is still unsigned
+// (`quarantine_out_of_dag`), a foreign author is refused at finalisation, a
+// hand parent must be served, and a served record naming a quarantined parent
+// is named in a WARN (item (d), a deviation from the quarantine the task
+// specified). The cases below pin the compositions the re-audit probed.
+
+/// The operators of this section that hold at HEAD.
+const OPERATORS_A1: [Operator; 4] = [
+    Operator::ForeignAuthorPlusHandOnTop,
+    Operator::EditNarrationPlusForgedForeignPlusHand,
+    Operator::PlaceholderSpelledHandLine,
+    Operator::EditOpenPlusHandReopenAndTransaction,
+];
+
+/// Every WARN (and ERROR) `body` logs on this thread, one line per event with
+/// its fields — the diagnostics are part of the contract where a deviation
+/// replaced a mechanism by a warning (T79 (d)). A minimal subscriber, so the
+/// test needs nothing beyond `tracing`.
+fn capture_warnings<T>(body: impl FnOnce() -> T) -> (T, String) {
+    use std::fmt::Write as _;
+    use std::sync::Mutex;
+
+    struct Fields(String);
+    impl tracing::field::Visit for Fields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let _ = write!(self.0, "{}={:?} ", field.name(), value);
+        }
+    }
+    struct Capture(Arc<Mutex<String>>);
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            let mut logged = self.0.lock().unwrap();
+            logged.push_str(&fields.0);
+            logged.push('\n');
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+    let logged = Arc::new(Mutex::new(String::new()));
+    let value = tracing::subscriber::with_default(Capture(Arc::clone(&logged)), body);
+    let text = logged.lock().unwrap().clone();
+    (value, text)
+}
+
+/// The served transaction with `narration`, if any.
+fn served_named<'a>(
+    snapshot: &'a Snapshot,
+    narration: &str,
+) -> Option<(&'a String, &'a Directive)> {
+    snapshot.served.iter().find(|(_, directive)| {
+        matches!(directive, Directive::Transaction(txn) if txn.narration.as_deref() == Some(narration))
+    })
+}
+
+fn parents_of(directive: &Directive) -> Vec<String> {
+    match directive {
+        Directive::Transaction(txn) => txn.parent_ids().into_iter().map(str::to_owned).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// M-54 × H-22 (A1 hunt (5)): the foreign-author half envelope is a head
+/// when boot adopts the hand line typed after it, so the later line is
+/// stamped naming it; `finalize_operator_input` refuses the foreign line
+/// only then. The refusal goes through the rebuild, so the later line is
+/// rebased onto what survives before it is signed, and every peer accepts
+/// it; the foreign line stays in the quarantine as written, at every boot.
+///
+/// Revert-proof: drop the rebase in `rebuild_dag` (0924 R1) and the later
+/// line is served naming the foreign line, which exists nowhere a peer can
+/// see.
+#[test]
+fn a1_foreign_author_line_with_a_hand_line_stamped_on_top() {
+    let report = assert_holds(Operator::ForeignAuthorPlusHandOnTop, 51, 0, Checks::ALL);
+    let first = report.first.expect("ran");
+    assert_eq!(first.quarantined_ids.len(), 1, "the foreign line");
+    let (_, later) = served_named(&first, "stamped on top of the other edits")
+        .expect("the later line is served");
+    let foreign = first.quarantined_ids.iter().next().unwrap();
+    assert!(
+        !parents_of(later).contains(foreign),
+        "the later line was rebased off the refused foreign line"
+    );
+}
+
+/// Decision (7) itself (A1): a foreign-author half envelope is REFUSED —
+/// held in the quarantine as the file spelled it, never adopted under this
+/// node's author. `op_aa` checks only that nothing served is refused by a
+/// peer, which the rejected option (re-attribute and sign) satisfies too; the
+/// 0924 revert R4 passed it.
+///
+/// Revert-proof: drop the foreign refusal at the top of
+/// `finalize_operator_input` (0924 R4) and the line is adopted and signed as
+/// this node's own.
+#[test]
+fn a1_foreign_author_half_envelope_is_refused_not_reattributed() {
+    let report = assert_holds(Operator::ForeignAuthorHalfEnvelope, 52, 0, Checks::ALL);
+    assert!(
+        report.adopted.is_empty(),
+        "nothing is adopted: {:?}",
+        report
+            .adopted
+            .values()
+            .map(envelope_summary)
+            .collect::<Vec<_>>()
+    );
+    let first = report.first.expect("ran");
+    assert_eq!(first.quarantined_ids.len(), 1, "held in the quarantine");
+}
+
+/// Two verification passes, two rebases (A1 hunt (1)): `set_signer`'s pass
+/// quarantines the edited own record, `set_verifier`'s the forged foreign
+/// block; the hand line boot stamped over both is rebased by each. Its
+/// parents must be exactly what a boot over the file WITHOUT the two refused
+/// blocks stamps — the rebase runs over the DAG's insertion order, which is
+/// the order boot adopted in.
+///
+/// Revert-proof: drop the rebase (0924 R1) and the line is signed naming
+/// both quarantined ids.
+#[test]
+fn a1_two_passes_rebase_to_what_a_boot_without_the_refused_records_stamps() {
+    let truth = generate_fixture(53);
+    let report = assert_holds(
+        Operator::EditNarrationPlusForgedForeignPlusHand,
+        53,
+        0,
+        Checks::ALL,
+    );
+    let first = report.first.expect("ran");
+    assert_eq!(
+        first.quarantined_ids.len(),
+        2,
+        "the edited record and the forged block"
+    );
+    let (_, rebased) =
+        served_named(&first, "stamped on top of the other edits").expect("the hand line is served");
+
+    // The same file without the two refused blocks.
+    let mutation = mutate(&truth, Operator::EditNarrationPlusForgedForeignPlusHand, 0).unwrap();
+    let kept: Vec<String> = split_blocks(&mutation.text)
+        .into_iter()
+        .filter(|block| !block.contains("(edited)") && !block.contains("\"Peer\""))
+        .collect();
+    let dir = fresh_dir("a1-clean");
+    let path = dir.join("ledger.bean");
+    std::fs::write(&path, join_blocks(&kept)).unwrap();
+    let clean = run_pipeline(&path, &truth.provider).unwrap();
+    let clean = snapshot_of(&clean);
+    std::fs::remove_dir_all(dir).ok();
+    let (_, reference) = served_named(&clean, "stamped on top of the other edits")
+        .expect("served on the clean boot");
+    assert_eq!(parents_of(rebased), parents_of(reference));
+}
+
+/// The boot placeholder spelled by hand (A1 hunt (6)): on a signing node the
+/// author id is the key, so `openledger-author: "local"` on a line with no
+/// lamport names another author and is refused like any foreign one (decision
+/// (7)); T80's re-attribution covers only a record whose signature verifies
+/// under this node's key, which a half envelope does not carry.
+#[test]
+fn a1_a_hand_line_spelling_the_placeholder_author_is_refused_on_a_signing_node() {
+    let report = assert_holds(Operator::PlaceholderSpelledHandLine, 54, 0, Checks::ALL);
+    assert!(report.adopted.is_empty());
+    assert_eq!(report.first.expect("ran").quarantined_ids.len(), 1);
+}
+
+/// The T79 residual's shape at boot (A1 hunt (2)): the history `open` of an
+/// account is edited, so the signature pass quarantines it; a hand re-`open`
+/// of the account was refused at adoption as already open (the edited copy
+/// was still in the DAG), and a hand transaction on it — valid at adoption —
+/// no longer validates once the pass has run, so the rebase refuses it with
+/// it. Everything is held in the file; nothing half-stamped is served; the
+/// reboot is a fixed point. (Conservative: every peer holds the original
+/// `open`, so the transaction would replicate; the live reconcile adopts both
+/// hand lines at the next hand edit — see the A1 report.)
+///
+/// Revert-proof: drop the `validate_transaction` call in
+/// `rebase_operator_input` (0924 R7) and the hand transaction is served.
+#[test]
+fn a1_an_edited_open_with_a_hand_reopen_and_transaction_is_held_whole() {
+    let report = assert_holds(
+        Operator::EditOpenPlusHandReopenAndTransaction,
+        55,
+        0,
+        Checks::ALL,
+    );
+    assert!(report.adopted.is_empty(), "nothing hand-typed is served");
+    assert_eq!(
+        report.first.expect("ran").quarantined_ids.len(),
+        3,
+        "the edited open, the hand re-open and the hand transaction"
+    );
+}
+
+/// The crash window between `finalize_operator_input` and the startup
+/// compaction on the M-54 × H-22 shape (A1 hunt (4)): the foreign line is
+/// refused again as written, the later line is rebased and signed again
+/// byte-identically, and a second finalisation is a no-op.
+#[test]
+fn a1_crash_between_finalize_and_compaction_with_a_refused_foreign_line() {
+    let truth = generate_fixture(56);
+    let mutation = mutate(&truth, Operator::ForeignAuthorPlusHandOnTop, 0).unwrap();
+    let dir = fresh_dir("a1-crash");
+    let path = dir.join("ledger.bean");
+    std::fs::write(&path, &mutation.text).unwrap();
+    let later = |svc: &LedgerService| {
+        let snapshot = snapshot_of(svc);
+        let (id, directive) =
+            served_named(&snapshot, "stamped on top of the other edits").expect("served");
+        (
+            id.clone(),
+            make_supply_entry(directive),
+            snapshot.quarantined_ids,
+        )
+    };
+    let first = run_pipeline_until(&path, &truth.provider, false).unwrap();
+    let (id_first, entry_first, quarantined_first) = later(&first);
+    drop(first);
+    let mut second = run_pipeline_until(&path, &truth.provider, false).unwrap();
+    let (id_second, entry_second, quarantined_second) = later(&second);
+    assert_eq!(id_first, id_second);
+    assert_eq!(entry_first, entry_second, "byte-identical across the crash");
+    assert_eq!(quarantined_first, quarantined_second);
+    assert_eq!(second.finalize_operator_input(), 0, "idempotent");
+    drop(second);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// T79 item (d), the deviation (A1 hunt (3)): an envelope line of a signed
+/// record that has a child is edited (its lamport, +1) — the record is
+/// quarantined under the SAME id, and its child, which this node serves,
+/// names it. A peer that already holds the record accepts the child; one
+/// that does not (a record never replicated) cannot. The WARN names the pair.
+///
+/// Revert-proof: drop the WARN call in `verify_own_history` (0924 R8) and
+/// nothing is said.
+#[test]
+fn a1_d_a_served_child_of_an_envelope_edited_record_is_named_in_a_warning() {
+    let truth = generate_fixture(57);
+    let (dir, path, child) = a1_envelope_edited_parent_with_a_child(&truth);
+    let (svc, logged) = capture_warnings(|| run_pipeline(&path, &truth.provider).unwrap());
+    let snapshot = snapshot_of(&svc);
+    drop(svc);
+    assert_eq!(snapshot.quarantined_ids.len(), 1);
+    assert!(
+        snapshot.served.contains_key(&child),
+        "premise: the child is served"
+    );
+    assert!(
+        logged.contains("only in its quarantine") && logged.contains(&child),
+        "the (d) WARN names the child: {logged}"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// The first signed transaction that another signed transaction names as a
+/// parent, with its lamport line edited by +1, written to a fresh case
+/// directory: `(dir, path, the child's id)`.
+fn a1_envelope_edited_parent_with_a_child(truth: &Truth) -> (PathBuf, PathBuf, String) {
+    let mut blocks = split_blocks(&truth.text);
+    let signed: Vec<usize> = (0..blocks.len())
+        .filter(|index| is_transaction_block(&blocks[*index]) && is_signed_block(&blocks[*index]))
+        .collect();
+    let (parent, child) = signed
+        .iter()
+        .find_map(|parent| {
+            let parent_id = truth_id_of(truth, &blocks[*parent])?;
+            let child = signed.iter().find(|child| {
+                envelope_value(&blocks[**child], KEY_PARENTS)
+                    .is_some_and(|parents| parents.contains(&parent_id))
+            })?;
+            Some((*parent, *child))
+        })
+        .expect("the fixture is a chain");
+    let child_id = truth_id_of(truth, &blocks[child]).unwrap();
+    let lamport: u64 = envelope_value(&blocks[parent], KEY_LAMPORT)
+        .unwrap()
+        .parse()
+        .unwrap();
+    blocks[parent] = set_lines(&blocks[parent], |lines| {
+        for line in lines.iter_mut() {
+            if line.trim_start().starts_with(KEY_LAMPORT) {
+                *line = format!("  {KEY_LAMPORT}: \"{}\"", lamport + 1);
+            }
+        }
+    });
+    let dir = fresh_dir("a1-d");
+    let path = dir.join("ledger.bean");
+    std::fs::write(&path, join_blocks(&blocks)).unwrap();
+    (dir, path, child_id)
+}
+
+/// A1-2 (0925): the operator follows the per-record H-20 remedy for the (d)
+/// shape — "restore the original line from a peer's copy of the ledger, or
+/// delete the edited block". For a record no peer holds (a signing node that
+/// ran with P2P off, or authored offline) only the second is possible; once
+/// the block is gone its id is in no quarantine, the (d) WARN falls silent,
+/// and the child — and everything this node writes after it — is still
+/// refused by every peer that joins by anti-entropy. Nothing at boot names
+/// it. (What does work, and no WARN says: delete the record's `openledger-*`
+/// lines, so it is re-adopted under the same id.)
+///
+/// Fails at HEAD: the reboot after the remedy logs no WARN naming the child.
+#[test]
+#[ignore = "A1-2: after the per-record H-20 remedy the (d) WARN is silent while the served child stays unadoptable"]
+fn a1_2_the_prescribed_remedy_leaves_a_stranded_child_and_no_warning() {
+    let truth = generate_fixture(58);
+    let (dir, path, child) = a1_envelope_edited_parent_with_a_child(&truth);
+    let svc = run_pipeline(&path, &truth.provider).unwrap();
+    let quarantined: Vec<String> = svc
+        .quarantined_ids()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    drop(svc);
+    assert_eq!(quarantined.len(), 1);
+    // "delete the edited block"
+    let text = std::fs::read_to_string(&path).unwrap();
+    let blocks: Vec<String> = split_blocks(&text)
+        .into_iter()
+        .filter(|block| {
+            parse_file(&format!("{block}\n"))
+                .ok()
+                .and_then(|mut parsed| parsed.pop())
+                .map(|directive| compute_content_id(&directive))
+                .as_ref()
+                != Some(&quarantined[0])
+        })
+        .collect();
+    std::fs::write(&path, join_blocks(&blocks)).unwrap();
+    let (svc, logged) = capture_warnings(|| run_pipeline(&path, &truth.provider).unwrap());
+    let snapshot = snapshot_of(&svc);
+    drop(svc);
+    assert!(
+        snapshot.served.contains_key(&child),
+        "premise: the child is still served"
+    );
+    assert!(
+        !snapshot.served.contains_key(&quarantined[0]),
+        "premise: its parent is served by no one"
+    );
+    std::fs::remove_dir_all(dir).ok();
+    assert!(
+        logged.contains(&child),
+        "a served record whose parent no replica can hold must be named at boot; logged:\n{logged}"
+    );
+}
+
+/// A1-1 (0925): an own record's lamport line edited past the adoption
+/// ratchet AND a hand line appended in the same edit. L-87 (T83) releases
+/// the clock the edited record carried — but boot stamped the hand line
+/// above it before the signature pass ran, and T79's rebase re-chooses the
+/// line's PARENTS only: its lamport stays at edit + 2, pins the clock there
+/// through the release, and is signed. Every peer refuses it
+/// (`LamportAdvance`, deferred until its clock climbs 2^32), and every later
+/// write of this node descends from it: H-22's consequence, through the edit
+/// L-87 exists to neutralise. The control (`op_ab`, no hand line) holds.
+///
+/// Fails at HEAD: the peer's `stage_remote_directive` refuses the hand line.
+#[test]
+#[ignore = "A1-1: the T79 rebase keeps the boot lamport of operator input stamped above an edited lamport; peers refuse it"]
+fn a1_1_a_hand_line_stamped_over_an_edited_lamport_is_accepted_by_a_peer() {
+    let truth = generate_fixture(59);
+    let mutation = mutate(
+        &truth,
+        Operator::EditLamportLinePastRatchetPlusAppendHand,
+        0,
+    )
+    .unwrap();
+    let dir = fresh_dir("a1-1");
+    let path = dir.join("ledger.bean");
+    std::fs::write(&path, &mutation.text).unwrap();
+    let svc = run_pipeline(&path, &truth.provider).unwrap();
+    let snapshot = snapshot_of(&svc);
+    let clock = svc.lamport_clock();
+    drop(svc);
+    let (hand_id, hand) = served_named(&snapshot, "appended while the node was stopped")
+        .map(|(id, directive)| (id.clone(), directive.clone()))
+        .expect("the hand line is served");
+
+    // A signing peer that holds the truth, on the real intake + stage path.
+    let peer_dir = fresh_dir("a1-1-peer");
+    let peer_path = peer_dir.join("ledger.bean");
+    std::fs::write(&peer_path, &truth.text).unwrap();
+    let mut peer =
+        LedgerService::boot(peer_path, foreign_provider(&truth).public_key_hex()).unwrap();
+    let entry = make_supply_entry(&hand);
+    let parsed = validate_supply_entry(&entry).expect("intake");
+    verify_remote_signature(&parsed, true, MESH_ID).expect("signed by the node");
+    let staged = peer.stage_remote_directive(parsed);
+    drop(peer);
+    std::fs::remove_dir_all(dir).ok();
+    std::fs::remove_dir_all(peer_dir).ok();
+    assert!(
+        staged.is_ok(),
+        "hand line {} ({}) refused by a peer: {:?}",
+        short(&hand_id),
+        envelope_summary(&hand),
+        staged
+            .err()
+            .map(|error| error.to_string().chars().take(120).collect::<String>())
+    );
+    assert!(
+        clock < A1_PAST_RATCHET,
+        "the clock ({clock}) follows a lamport the node never served"
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 32,
+        max_shrink_iters: 0,
+        failure_persistence: None,
+        .. ProptestConfig::default()
+    })]
+
+    /// Every green A1 operator, every check (A1).
+    #[test]
+    fn boot_fuzz_a1_operators(
+        seed in any::<u64>(),
+        operator in any_operator(&OPERATORS_A1),
         position in 0..64usize,
     ) {
         let truth = generate_fixture(seed);

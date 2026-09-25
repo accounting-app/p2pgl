@@ -2683,3 +2683,450 @@ fn chain_over_the_orphan_cap_joins_within_thirty_ticks_in_advert_order() {
         "a {n}-transaction chain did not join in 30 ticks"
     );
 }
+
+// ─── A6 (0925): T83 — L-95 ancestors-first under hostile hints, L-94 gap, L-87 release ───
+
+use ledger::service::largest_lamport_gap;
+use p2p::orphan_buffer::{OrphanInsert, MAX_PARENT_HINT_IDS};
+
+/// A hostile allowlisted peer's records, delivered to `to` before an honest
+/// join, each one leaving a parent hint in `to`'s orphan buffer: a hint
+/// cycle (two transactions naming each other — the id ignores the envelope,
+/// so both can be built), a transaction naming a parent that exists nowhere,
+/// and one that names `holder`'s current heads (delivered to `holder` too, so
+/// it is served with the chain and resolves on `to` once the heads arrive).
+/// Returns the four ids; the first three stage nowhere.
+fn hostile_parent_hints(
+    mesh: &mut Mesh,
+    attacker: &PeerKeySignatureProvider,
+    holder: usize,
+    to: usize,
+) -> Vec<String> {
+    let body_b = Directive::Transaction(transaction_body("x-cycle-b", 1, "Assets:Cash"));
+    let id_b = compute_content_id(&body_b);
+    let cycle_a = hand_transaction(attacker, "x-cycle-a", 1, std::slice::from_ref(&id_b), 500);
+    let id_a = compute_content_id(&cycle_a);
+    let cycle_b = hand_transaction(attacker, "x-cycle-b", 1, &[id_a], 501);
+    assert_eq!(
+        compute_content_id(&cycle_b),
+        id_b,
+        "the id ignores the envelope"
+    );
+    let phantom = hand_transaction(attacker, "x-phantom", 1, &["f".repeat(64)], 502);
+    let mut heads: Vec<String> = mesh.replicas[holder].svc.head_txids().into_iter().collect();
+    heads.sort();
+    let piggyback = hand_transaction(attacker, "x-piggyback", 1, &heads, 503);
+    let ids: Vec<String> = [cycle_a, cycle_b, phantom, piggyback]
+        .iter()
+        .map(|directive| mesh.record(directive))
+        .collect();
+    let staged = mesh.deliver(to, ids.clone(), Order::Causal);
+    assert_eq!(
+        staged, 0,
+        "every hostile record waits on a parent the joiner lacks"
+    );
+    for id in &ids {
+        assert!(
+            !mesh.replicas[to]
+                .orphans
+                .known_missing_parents(id)
+                .is_empty(),
+            "{id} must leave a parent hint"
+        );
+    }
+    let staged = mesh.deliver(holder, vec![ids[3].clone()], Order::Causal);
+    assert_eq!(staged, 1, "the holder has the piggyback's parents");
+    ids
+}
+
+/// L-95 (T83, decision (13)) under threat (c): the parent hints that order
+/// the Want are filled from each record's signed `openledger-parents` line as
+/// the receiver saw it, so an allowlisted peer chooses what they say. A hint
+/// cycle, a parent that exists nowhere and a record riding on the honest
+/// heads are all in F's buffer and hint table before F joins A's chain of
+/// `MAX_ORPHANS_PER_PEER + 300` (30 ticks at `3d64a16`, 3 with hints); the
+/// ordering is stable, cycle-safe and moves only wanted ids, so the join is
+/// as fast as without them and the mesh converges modulo the three records
+/// that stage nowhere. Passes at HEAD.
+#[test]
+fn l95_ancestors_first_join_converges_under_a_hostile_peers_parent_hints() {
+    let n = MAX_ORPHANS_PER_PEER + 300;
+    let mut mesh = seeded_mesh(9250, 1);
+    for k in 0..n {
+        mesh.append(0, &format!("c{k}"), amount_for(k), account_for(k));
+    }
+    let f = mesh.add("F", 10);
+    let attacker = key(202);
+    mesh.allow_also(&attacker.public_key_hex());
+    let hostile = hostile_parent_hints(&mut mesh, &attacker, 0, f);
+    let ticks = mesh
+        .join_like_gl_node(0, f, None, 30)
+        .expect("joins within 30 ticks");
+    let joiner = &mesh.replicas[f];
+    eprintln!(
+        "A6 / L-95 hostile hints: {n}-chain joined in {ticks} ticks; F holds {} of {}, \
+         orphans {} waiting on {:?}",
+        joiner.svc.directive_count(),
+        mesh.replicas[0].svc.directive_count(),
+        joiner.orphans.len(),
+        joiner.orphans.wanted_parent_ids().len()
+    );
+    assert!(
+        ticks <= 5,
+        "the hostile hints slowed the join to {ticks} ticks"
+    );
+    assert!(
+        joiner.svc.contains_directive(&hostile[3]),
+        "the piggyback resolved once the heads arrived"
+    );
+    let excluded: Vec<String> = hostile[..3].to_vec();
+    let among = mesh.all();
+    mesh.assert_converged_among("A6 / L-95 hostile hints", &among, &excluded);
+}
+
+/// A6-2 (0925): the parent-hint table is one global budget
+/// (`MAX_PARENT_HINT_IDS`, keys and parents counted), pruned only when full
+/// and only of hints older than `MAX_ORPHAN_AGE`. One allowlisted peer whose
+/// records name parents nobody holds fills its per-peer share of F's orphan
+/// buffer (1,000) and leaves a two-id hint for every record refused after it:
+/// 32,768 of them fill the table. A refused honest orphan then records
+/// nothing, so an honest chain longer than the buffer joins at the pre-T83
+/// speed (the L-95 crawl) for as long as the hostile hints are renewed. The
+/// Done note's residual says "one extra round per lost hint"; it is the whole
+/// join. Fails at HEAD: the chain that joins in 3 ticks with a free table
+/// does not join in 30 with a full one.
+#[test]
+#[ignore = "A6-2: one allowlisted peer fills the global parent-hint table (MAX_PARENT_HINT_IDS is not per peer) with orphans refused at its per-peer cap, and every later honest chain join crawls at the pre-T83 speed until the hints age out"]
+fn l95_a_peer_that_fills_the_parent_hint_table_restores_the_crawl_for_honest_joins() {
+    let n = MAX_ORPHANS_PER_PEER + 300;
+    let mut mesh = seeded_mesh(9251, 1);
+    for k in 0..n {
+        mesh.append(0, &format!("c{k}"), amount_for(k), account_for(k));
+    }
+    let f = mesh.add("F", 10);
+    let attacker = key(203);
+    mesh.allow_also(&attacker.public_key_hex());
+    // gl-node's stage, keyed by the remote: X's share of F's buffer fills at
+    // `MAX_ORPHANS_PER_PEER`, and every record after it is refused with a
+    // hint costing two ids (its own and its one parent). Each record is what
+    // intake admits — signed by an allowlisted key, a well-formed parent id.
+    let flood = MAX_ORPHANS_PER_PEER + MAX_PARENT_HINT_IDS / 2;
+    let (mut buffered, mut refused) = (0usize, 0usize);
+    let mut last = String::new();
+    for i in 0..flood {
+        let lamport = 1_000 + u64::try_from(i).expect("small");
+        let directive = hand_transaction(
+            &attacker,
+            &format!("x-fill{i}"),
+            1,
+            &[format!("{i:064x}")],
+            lamport,
+        );
+        let id = compute_content_id(&directive);
+        let missing = mesh.replicas[f].svc.missing_parent_ids(&directive);
+        assert_eq!(missing.len(), 1);
+        match mesh.replicas[f].orphans.insert(
+            id.clone(),
+            directive,
+            missing,
+            Some(attacker.public_key_hex()),
+        ) {
+            OrphanInsert::Buffered => buffered += 1,
+            OrphanInsert::BudgetExhausted => refused += 1,
+            OrphanInsert::Duplicate => panic!("distinct bodies"),
+        }
+        last = id;
+    }
+    assert_eq!(buffered, MAX_ORPHANS_PER_PEER);
+    assert_eq!(refused, MAX_PARENT_HINT_IDS / 2);
+    assert!(
+        !mesh.replicas[f]
+            .orphans
+            .known_missing_parents(&last)
+            .is_empty(),
+        "the last hostile hint fits exactly"
+    );
+    let ticks = mesh.join_like_gl_node(0, f, None, 30);
+    let joiner = &mesh.replicas[f];
+    eprintln!(
+        "A6-2 / hint table full ({buffered} buffered, {refused} refused by X): {n}-chain ticks \
+         {ticks:?}; F holds {} of {}, orphans {}",
+        joiner.svc.directive_count(),
+        mesh.replicas[0].svc.directive_count(),
+        joiner.orphans.len()
+    );
+    assert!(
+        ticks.is_some_and(|ticks| ticks <= 5),
+        "an honest chain join must not depend on a hostile peer's hint budget: ticks {ticks:?}"
+    );
+}
+
+/// L-94 (T83, decision (12)): the gap is a content property, so the
+/// trusted-bootstrap join — the remedy the warning prescribes — cannot open
+/// one. Three honest replicas with a dense history; F boots on a copy of R0's
+/// compacted file, G on a copy of F's, both author, everyone syncs: no
+/// replica's history holds a gap near `LAMPORT_GAP_WARN` and the mesh
+/// converges. Passes at HEAD.
+#[test]
+fn h19_gap_warning_stays_silent_when_honest_nodes_bootstrap_from_a_copy() {
+    let mut mesh = seeded_mesh(9252, 3);
+    author_dense_history(&mut mesh, 150);
+    mesh.run_to_fixed_point(Order::Ascending);
+    let f = mesh.add_bootstrapped_from("F", 11, 0);
+    mesh.open(f, "Assets:F");
+    mesh.append(f, "after-f", 8, "Assets:F");
+    let g = mesh.add_bootstrapped_from("G", 12, f);
+    mesh.append(g, "after-g", 9, "Assets:Cash");
+    for k in 0..50 {
+        let author = mesh.rng.below(mesh.replicas.len());
+        mesh.append(author, &format!("u{k}"), amount_for(k), account_for(k));
+    }
+    mesh.run_to_fixed_point(Order::Ascending);
+    let gaps: Vec<u64> = mesh
+        .replicas
+        .iter()
+        .map(|replica| replica.svc.lamport_gap())
+        .collect();
+    eprintln!(
+        "A6 / L-94 bootstrap copies: gaps {gaps:?} (threshold {LAMPORT_GAP_WARN}), clocks {:?}",
+        mesh.replicas
+            .iter()
+            .map(|replica| replica.svc.lamport_clock())
+            .collect::<Vec<_>>()
+    );
+    assert!(gaps.iter().all(|gap| *gap < LAMPORT_GAP_WARN), "{gaps:?}");
+    mesh.assert_converged("A6 / L-94 bootstrap copies");
+}
+
+/// A and B with history, X allowlisted, X's one `open` at
+/// `min(clock) + LAMPORT_GAP_WARN` — one ratchet-legal step of 2^28, a
+/// sixteenth of `MAX_LAMPORT_ADVANCE` — adopted by both, honest authoring on
+/// top, A↔B synced, then X removed from the allowlist. Returns the mesh, X's
+/// id and X's key.
+fn gap_warn_jump_mesh(seed: u64) -> (Mesh, String, Arc<PeerKeySignatureProvider>) {
+    let mut mesh = seeded_mesh(seed, 2);
+    let (a, b) = (0, 1);
+    let attacker = key(204);
+    mesh.allow_also(&attacker.public_key_hex());
+    mesh.append(a, "pre-1", 10, "Assets:Cash");
+    mesh.run_to_fixed_point(Order::Ascending);
+    let local = mesh.replicas[a]
+        .svc
+        .lamport_clock()
+        .min(mesh.replicas[b].svc.lamport_clock());
+    let jump_id = mesh.record(&hand_open(
+        &attacker,
+        "Assets:Jump",
+        local + LAMPORT_GAP_WARN,
+    ));
+    for replica in [a, b] {
+        mesh.deliver(replica, vec![jump_id.clone()], Order::Causal);
+        assert!(
+            mesh.replicas[replica].svc.contains_directive(&jump_id),
+            "a 2^28 step is under the ratchet"
+        );
+    }
+    mesh.append(a, "post-a", 5, "Assets:Cash");
+    mesh.open(b, "Assets:Bank");
+    mesh.append(b, "post-b", 7, "Assets:Bank");
+    mesh.run_to_fixed_point(Order::Ascending);
+    assert!(mesh.divergence_among(&[a, b], &[]).is_none());
+    let honest = [mesh.replicas[a].author(), mesh.replicas[b].author()];
+    mesh.allow_exactly(&honest);
+    (mesh, jump_id, attacker)
+}
+
+/// L-94 / H-19 at `LAMPORT_GAP_WARN` exactly: a peer's single 2^28 jump is
+/// diagnosed on every node that holds the history (A, B, a fresh joiner and a
+/// bootstrap copy — the gap is content, so forever), and yet, the step being
+/// far below `MAX_LAMPORT_ADVANCE`, a fresh node still joins by anti-entropy
+/// after X's removal: the honest records above the gap sit within one ratchet
+/// step of the joiner's clock. Pins the fact the warning's remedy text is
+/// judged against (A6, 0925 §3). Passes at HEAD.
+#[test]
+fn h19_a_peers_2_28_jump_is_diagnosed_everywhere_yet_a_fresh_node_still_joins_by_anti_entropy() {
+    let (mut mesh, jump_id, _attacker) = gap_warn_jump_mesh(9253);
+    let (a, b) = (0, 1);
+    for replica in [a, b] {
+        assert!(mesh.replicas[replica].svc.lamport_gap() >= LAMPORT_GAP_WARN);
+    }
+    let f = mesh.add("F", 13);
+    let rounds = mesh.run_to_fixed_point(Order::Ascending);
+    eprintln!(
+        "A6 / L-94 2^28 jump: F joined by anti-entropy in {rounds} rounds, holds {} of {}, \
+         gaps {:?}",
+        mesh.replicas[f].svc.directive_count(),
+        mesh.replicas[a].svc.directive_count(),
+        mesh.replicas
+            .iter()
+            .map(|replica| replica.svc.lamport_gap())
+            .collect::<Vec<_>>()
+    );
+    assert!(!mesh.replicas[f].svc.contains_directive(&jump_id));
+    mesh.assert_converged_among("A6 / L-94 2^28 jump", &[a, b, f], &[jump_id]);
+    assert!(mesh.replicas[f].svc.lamport_gap() >= LAMPORT_GAP_WARN);
+    let g = mesh.add_bootstrapped_from("G", 14, a);
+    assert!(mesh.replicas[g].svc.lamport_gap() >= LAMPORT_GAP_WARN);
+}
+
+/// A6-3 (0925): the boot warning names "the author of the directive at the
+/// top of the gap" (service.rs, boot's third branch). On a node that holds
+/// the history above a removed author's jump but not the jump itself — one
+/// that joined by anti-entropy after the remedy, or a copy from which the
+/// operator deleted the jumping directive as the H-12 remedy instructs — the
+/// directive at the top of the gap is the first HONEST record stamped above
+/// it, so every boot accuses an honest author of jumping the clock. The same
+/// expression as the boot branch, on F's DAG. Fails at HEAD: names A.
+#[test]
+#[ignore = "A6-3: on a node without the jumping directive (joined after the remedy, or the jump deleted per H-12), the gap warning names the first honest author above the gap as the one that jumped the clock"]
+fn h19_the_gap_warning_on_a_node_without_the_jump_names_the_removed_author() {
+    let (mut mesh, _jump_id, attacker) = gap_warn_jump_mesh(9256);
+    let f = mesh.add("F", 13);
+    mesh.run_to_fixed_point(Order::Ascending);
+    let svc = &mesh.replicas[f].svc;
+    let (gap, top) = largest_lamport_gap(
+        svc.dag()
+            .directives()
+            .into_iter()
+            .filter_map(Directive::lamport_clock),
+    );
+    let named = svc
+        .dag()
+        .directives()
+        .into_iter()
+        .find(|directive| directive.lamport_clock() == Some(top))
+        .and_then(author_of);
+    eprintln!(
+        "A6-3: F's gap {gap} (top {top}); the warning would name {named:?}; X is {}; A is {}",
+        attacker.public_key_hex(),
+        mesh.replicas[0].author()
+    );
+    assert!(gap >= LAMPORT_GAP_WARN);
+    assert_eq!(
+        named.as_deref(),
+        Some(attacker.public_key_hex().as_str()),
+        "the warning names an honest author as the jumper"
+    );
+}
+
+/// A writes r1 and r2 (signed), B writes one record A adopts — the ordinary
+/// mesh shape, and the one that matters: adoption sets the clock to
+/// `max(local, remote) + 1`, a value nobody stamped — then A writes r3, B
+/// syncs; A stops, `edit` rewrites its file (given the issued lamports of r2
+/// and r3), A restarts in gl-node order and writes r4; anti-entropy to a
+/// fixed point. Returns A's clock after the restart, r3's issued lamport,
+/// r4's lamport, and every `(author, lamport)` pair B holds more than once.
+fn edited_own_record_scenario(
+    seed: u64,
+    edit: impl Fn(&str, u64, u64) -> String,
+) -> (u64, u64, u64, Vec<(String, u64)>) {
+    let mut mesh = seeded_mesh(seed, 2);
+    let (a, b) = (0, 1);
+    mesh.append(a, "r1", 1, "Assets:Cash");
+    let r2 = mesh.append(a, "r2", 2, "Assets:Cash");
+    mesh.run_to_fixed_point(Order::Ascending);
+    mesh.append(b, "b1", 5, "Assets:Cash");
+    mesh.run_to_fixed_point(Order::Ascending);
+    let r3 = mesh.append(a, "r3", 3, "Assets:Cash");
+    mesh.run_to_fixed_point(Order::Ascending);
+    let lamport_of = |mesh: &Mesh, replica: usize, id: &str| {
+        mesh.replicas[replica]
+            .svc
+            .get_directive(id)
+            .and_then(Directive::lamport_clock)
+            .expect("held with an envelope")
+    };
+    let l2 = lamport_of(&mesh, b, &r2);
+    let l3 = lamport_of(&mesh, b, &r3);
+    let path = mesh.stop(a);
+    let text = std::fs::read_to_string(&path).expect("read A's .bean");
+    let edited = edit(&text, l2, l3);
+    assert_ne!(text, edited, "the edit must change the file");
+    std::fs::write(&path, edited).expect("write the edited .bean");
+    let report = mesh.restart_like_gl_node(a, path.clone(), MESH_ID);
+    let quarantined = mesh.replicas[a].svc.quarantined_count();
+    assert_eq!(
+        quarantined, 1,
+        "the edited record is quarantined (H-20): {report:?}"
+    );
+    let clock = mesh.replicas[a].svc.lamport_clock();
+    let r4 = mesh.append(a, "r4", 4, "Assets:Cash");
+    let l4 = lamport_of(&mesh, a, &r4);
+    mesh.run_to_fixed_point(Order::Ascending);
+    assert!(mesh.replicas[b].svc.contains_directive(&r4), "B adopts r4");
+    let mut counts: BTreeMap<(String, u64), usize> = BTreeMap::new();
+    for directive in mesh.replicas[b].svc.dag().directives() {
+        if let (Some(author), Some(lamport)) = (author_of(directive), directive.lamport_clock()) {
+            *counts.entry((author, lamport)).or_insert(0) += 1;
+        }
+    }
+    let duplicates: Vec<(String, u64)> = counts
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(pair, _)| pair)
+        .collect();
+    eprintln!(
+        "A6 / L-87 edit: A restarted at clock {clock} (r3 issued at {l3}); r4 stamped {l4}; \
+         B's duplicate pairs {duplicates:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+    (clock, l3, l4, duplicates)
+}
+
+/// L-87 (T83) where it holds: the edited record is not the latest own
+/// record. Its body edited, or its lamport line edited to 4,000,000,000, r2
+/// is quarantined, the clock resumes above r3 (still held, still counted),
+/// the next write carries neither the edit nor a lamport a peer already holds
+/// under A's key. Passes at HEAD.
+#[test]
+fn l87_an_edit_of_a_middle_own_record_neither_carries_the_clock_nor_reissues_a_pair() {
+    for (label, huge) in [("body", false), ("lamport", true)] {
+        let (clock, l3, l4, duplicates) = edited_own_record_scenario(9255, |text, l2, _| {
+            if huge {
+                text.replace(
+                    &format!("openledger-lamport: \"{l2}\""),
+                    "openledger-lamport: \"4000000000\"",
+                )
+            } else {
+                text.replace("\"r2\"", "\"r2 (typo fixed)\"")
+            }
+        });
+        assert!(
+            clock < 4_000_000_000,
+            "{label}: the clock carried the edit: {clock}"
+        );
+        assert!(l4 > l3, "{label}: r4 at {l4} is not above r3's {l3}");
+        assert!(
+            duplicates.is_empty(),
+            "{label}: B holds duplicate pairs {duplicates:?}"
+        );
+    }
+}
+
+/// A6-1 (0925): `release_clock_carried_by_edited_records` resumes the clock
+/// at `max(what remains) + 1`, reasoning that the edited record was stamped
+/// above what remains "so the next stamp stays above it". That holds only
+/// when the edited record's lamport is exactly one above what remains. Every
+/// adoption sets the clock to `max(local, remote) + 1` — one value nobody
+/// stamped — so an own record written after any adoption sits TWO above the
+/// highest surviving lamport; a body edit of it (its lamport line intact and
+/// issued, held by every peer) then resumes the clock one below it, and the
+/// node's next write re-issues that `(author, lamport)` pair (M-18): B holds
+/// `(A, l3)` twice. Before T83 the clock resumed above the file's lamport.
+/// Fails at HEAD.
+#[test]
+#[ignore = "A6-1: after an adoption between the node's last two writes, the L-87 clock release resumes one below the edited record's issued lamport and the next write re-issues an (author, lamport) pair every peer holds (M-18)"]
+fn l87_the_clock_release_does_not_reissue_a_pair_a_peer_holds_after_a_body_edit() {
+    let (clock, l3, l4, duplicates) = edited_own_record_scenario(9254, |text, _, _| {
+        text.replace("\"r3\"", "\"r3 (typo fixed)\"")
+    });
+    eprintln!("A6-1: clock {clock}, r3 issued {l3}, r4 stamped {l4}, duplicates {duplicates:?}");
+    assert!(
+        l4 > l3,
+        "A's next write re-issued lamport {l4}; r3 was issued at {l3}"
+    );
+    assert!(
+        duplicates.is_empty(),
+        "B holds duplicate (author, lamport) pairs: {duplicates:?}"
+    );
+}
