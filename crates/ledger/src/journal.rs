@@ -161,6 +161,23 @@ const JOURNAL_EXTENSION: &str = "journal";
 /// cannot be resolved, is returned unresolved, and the ledger's checked open
 /// refuses it exactly as before (T67). Resolved once: a link planted after
 /// boot is replaced by the next compaction, never followed (L-44).
+///
+/// T87 / M-60, decision (24): the owner check reads one inode and the follow
+/// walks the path again, so an account that can write the link's directory
+/// could rename its own link over this user's between the two. The link is
+/// therefore followed only when **its directory** is owned by this uid and is
+/// not writable by group or others — then no other account can replace it,
+/// and the check and the follow see the same link. And it is followed **one
+/// hop**: a link whose target is itself a link is refused, since that second
+/// link's owner was never checked (a directory link in either path is
+/// followed, by policy — the node stays consistent under it). A link that
+/// passes resolves to its target as before.
+///
+/// T87 / M-61, decision (25): a journal beside the LINK is refused. The node
+/// derives its journal from the target, so `<link>.journal` — left by an
+/// unclean stop before the ledger was moved behind a link — would never be
+/// read, folded or renamed, and its acknowledged records would be silently
+/// absent (H-15's precedent: refuse rather than lose them).
 pub fn resolve_ledger_path(configured: &Path) -> std::io::Result<PathBuf> {
     let Ok(metadata) = std::fs::symlink_metadata(configured) else {
         return Ok(configured.to_path_buf());
@@ -168,25 +185,97 @@ pub fn resolve_ledger_path(configured: &Path) -> std::io::Result<PathBuf> {
     if !metadata.file_type().is_symlink() {
         return Ok(configured.to_path_buf());
     }
+    let refuse =
+        |message: String| std::io::Error::new(std::io::ErrorKind::PermissionDenied, message);
+    let link_directory = match configured.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         let owner = metadata.uid();
         let this_uid = effective_uid();
         if owner != this_uid {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "ledger path {} is a symbolic link owned by uid {owner}, not by this \
-                     node's uid {this_uid}; a ledger link is followed only when this node's own \
-                     user created it — point ledgerPath at the real file, or recreate the link \
-                     as this user (L-84)",
-                    configured.display()
-                ),
-            ));
+            return Err(refuse(format!(
+                "ledger path {} is a symbolic link owned by uid {owner}, not by this \
+                 node's uid {this_uid}; a ledger link is followed only when this node's own \
+                 user created it — point ledgerPath at the real file, or recreate the link \
+                 as this user (L-84)",
+                configured.display()
+            )));
+        }
+        let directory = std::fs::metadata(&link_directory)?;
+        let mode = directory.mode() & 0o7777;
+        if directory.uid() != this_uid || mode & 0o022 != 0 {
+            return Err(refuse(format!(
+                "ledger path {} is a symbolic link in {}, a directory {}; another account \
+                 could replace the link between this node's check and its use, so it is not \
+                 followed — keep the link in a directory only this node's user (uid {this_uid}) \
+                 can write, or point ledgerPath at the real file (M-60)",
+                configured.display(),
+                link_directory.display(),
+                if directory.uid() != this_uid {
+                    format!("owned by uid {}", directory.uid())
+                } else {
+                    format!("with mode {mode:o}, writable by group or others")
+                }
+            )));
         }
     }
-    Ok(std::fs::canonicalize(configured).unwrap_or_else(|_| configured.to_path_buf()))
+    let Ok(resolved) = std::fs::canonicalize(configured) else {
+        return Ok(configured.to_path_buf());
+    };
+    // One hop: the link's own target, with only its directory resolved, must
+    // be where the whole chain ends.
+    let target = std::fs::read_link(configured)?;
+    let target = if target.is_absolute() {
+        target
+    } else {
+        link_directory.join(target)
+    };
+    let one_hop = match (target.parent(), target.file_name()) {
+        (Some(directory), Some(name)) => {
+            let directory = if directory.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                directory
+            };
+            std::fs::canonicalize(directory)
+                .ok()
+                .map(|directory| directory.join(name))
+        }
+        _ => None,
+    };
+    if one_hop.as_deref() != Some(resolved.as_path()) {
+        return Err(refuse(format!(
+            "ledger path {} is a symbolic link to {}, which is itself a symbolic link; only \
+             one link is followed, since the second one's owner was never checked — point \
+             the link (or ledgerPath) at the real file (M-60)",
+            configured.display(),
+            target.display()
+        )));
+    }
+    let stray_journal = journal_path_for(configured);
+    if resolved != configured && std::fs::symlink_metadata(&stray_journal).is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "a journal {} sits beside the ledger link {}, but this node journals at its \
+                 target {} and would never read it: it belongs to the ledger that was at the \
+                 link's path before it became a link, and may hold acknowledged records. Move \
+                 it beside the target as {} (if the target has no journal of its own), or put \
+                 the ledger back at {} and start the node once so it folds the journal in, then \
+                 make the link (M-61, H-15)",
+                stray_journal.display(),
+                configured.display(),
+                resolved.display(),
+                journal_path_for(&resolved).display(),
+                configured.display()
+            ),
+        ));
+    }
+    Ok(resolved)
 }
 
 /// The journal path for a ledger file.
@@ -718,11 +807,12 @@ pub enum FileTrust {
     /// TARGET must be a regular file: a link to a FIFO, device, socket or
     /// directory is refused exactly like one at the path, and a dangling link
     /// is refused rather than treated as "no ledger yet". The open never
-    /// blocks either way (`O_NONBLOCK`). Note what the node WRITES is a
-    /// different matter: every full rewrite is temp + `rename` in the link's
-    /// directory, so the first compaction replaces the link itself with a
-    /// regular `.bean` and leaves the target untouched (it always has). To keep
-    /// the ledger elsewhere, symlink the data directory instead.
+    /// blocks either way (`O_NONBLOCK`). Since T82 (L-84) the node resolves
+    /// the link once, at boot ([`resolve_ledger_path`]), and works at the
+    /// target from then on: journal, lock, temp files and every rewrite sit
+    /// beside the target, and the link is kept. Since T87 (M-60, M-61) the
+    /// link is followed only from a directory only this node's user can
+    /// write, one hop, and never with a journal left beside it.
     OperatorLedger,
     /// `gl-node`'s config file (`GL_NODE_CONFIG`) — **read only**, operator
     /// owned (T77 / L-73). The [`FileTrust::OperatorLedger`] policy: a symlink
@@ -1607,6 +1697,133 @@ mod tests {
             Err(other) => panic!("expected Corrupt, got {other}"),
         }
         std::fs::remove_file(path).ok();
+    }
+
+    /// A fresh private directory (mode 0700) for the T87 link tests.
+    #[cfg(unix)]
+    fn t87_directory(name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = std::env::temp_dir().join(format!(
+            "openledger-t87-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        directory
+    }
+
+    /// M-60 (T87, decision (24)): the uid check on the link and the follow are
+    /// two path walks, so an account that can write the link's directory can
+    /// swap its own link in between (X3 `k4a`). A link is followed only from a
+    /// directory this uid owns that group and others cannot write — then no
+    /// other account can replace it. The same link resolves once the
+    /// directory is private again.
+    ///
+    /// Bug-catch: drop the directory check and the link in the
+    /// group-writable directory resolves.
+    #[cfg(unix)]
+    #[test]
+    fn m60_a_link_in_a_directory_others_can_write_is_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = t87_directory("m60-dir");
+        let target = directory.join("real.bean");
+        std::fs::write(&target, "").unwrap();
+        let link = directory.join("ledger.bean");
+        std::os::unix::fs::symlink("real.bean", &link).unwrap();
+        for mode in [0o770, 0o707, 0o777] {
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(mode)).unwrap();
+            let error = resolve_ledger_path(&link).expect_err("a swappable link is refused");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "mode {mode:o}"
+            );
+            assert!(error.to_string().contains("(M-60)"), "{error}");
+        }
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            resolve_ledger_path(&link).unwrap(),
+            std::fs::canonicalize(&target).unwrap()
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// M-60 (T87, decision (24)): one hop. `ledger.bean -> middle -> real` is
+    /// refused — `middle`'s owner and directory were never checked (A5 `P5`,
+    /// X3 `k4b`: the chain resolved to the far end). A single link resolves,
+    /// with a relative or an absolute target, and so does one whose target
+    /// sits under a DIRECTORY link, by the documented policy.
+    ///
+    /// Bug-catch: drop the one-hop comparison and the chain resolves.
+    #[cfg(unix)]
+    #[test]
+    fn m60_a_chain_of_links_is_refused_and_a_directory_link_is_followed() {
+        let directory = t87_directory("m60-chain");
+        let real_directory = directory.join("volume");
+        std::fs::create_dir(&real_directory).unwrap();
+        let target = real_directory.join("real.bean");
+        std::fs::write(&target, "").unwrap();
+        let canonical = std::fs::canonicalize(&target).unwrap();
+
+        let middle = directory.join("middle.bean");
+        std::os::unix::fs::symlink(&target, &middle).unwrap();
+        let chained = directory.join("chained.bean");
+        std::os::unix::fs::symlink("middle.bean", &chained).unwrap();
+        let error = resolve_ledger_path(&chained).expect_err("a chain is refused");
+        assert!(
+            error.to_string().contains("itself a symbolic link"),
+            "{error}"
+        );
+
+        let relative = directory.join("relative.bean");
+        std::os::unix::fs::symlink("volume/real.bean", &relative).unwrap();
+        assert_eq!(resolve_ledger_path(&relative).unwrap(), canonical);
+        assert_eq!(
+            resolve_ledger_path(&middle).unwrap(),
+            canonical,
+            "absolute target"
+        );
+
+        let directory_link = directory.join("mounted");
+        std::os::unix::fs::symlink(&real_directory, &directory_link).unwrap();
+        let through = directory.join("through.bean");
+        std::os::unix::fs::symlink("mounted/real.bean", &through).unwrap();
+        assert_eq!(resolve_ledger_path(&through).unwrap(), canonical);
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// M-61 (T87, decision (25)): a journal beside the LINK belongs to the
+    /// ledger that was at the link's path before it became a link — an unclean
+    /// stop, then the README's move-behind-a-link. The node journals at the
+    /// target, so it would never read it and its acknowledged records would
+    /// be silently absent (X3 `k4f`). Refused, naming both remedies; nothing
+    /// is moved. The control: no stray journal, and it resolves.
+    ///
+    /// Bug-catch: drop the stray-journal check and the link resolves.
+    #[cfg(unix)]
+    #[test]
+    fn m61_a_journal_beside_the_link_is_refused() {
+        let directory = t87_directory("m61");
+        let target = directory.join("real.bean");
+        std::fs::write(&target, "").unwrap();
+        let link = directory.join("ledger.bean");
+        std::os::unix::fs::symlink("real.bean", &link).unwrap();
+        assert!(resolve_ledger_path(&link).is_ok(), "control");
+        let stray = journal_path_for(&link);
+        std::fs::write(&stray, ";;olj 0 e3b0\n").unwrap();
+        let error = resolve_ledger_path(&link).expect_err("refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(
+            error.to_string().contains("(M-61, H-15)")
+                && error.to_string().contains("real.bean.journal"),
+            "{error}"
+        );
+        assert!(stray.exists(), "nothing is moved or deleted");
+        std::fs::remove_dir_all(&directory).ok();
     }
 
     /// L-105 (T86): L-85's shape with the third record torn inside the first

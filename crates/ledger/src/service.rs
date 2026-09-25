@@ -3192,6 +3192,12 @@ impl LedgerService {
         if matches!(mode, BootMode::Fresh) {
             // L-57: once per process start, clear what crashed rewrites left.
             sweep_stale_temporaries(&file_path);
+            // T87: and what a build that still wrote beside the LINK left
+            // there (`<link>.tmp.*`); since T82 temp files sit beside the
+            // target, so nothing else ever cleans those up.
+            if file_path != configured {
+                sweep_stale_temporaries(&configured);
+            }
         }
         let content = match read_ledger_file(&file_path) {
             Ok(content) => content,
@@ -21807,6 +21813,71 @@ mod tests {
             .unwrap();
         let on_disk = LedgerService::boot(path.clone(), "checker".to_owned()).unwrap();
         assert!(on_disk.accounts().is_open("Assets:HandY"), "written back");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// M-61 (T87, decision (25)), through `boot`: the ledger was converted to
+    /// a link after an unclean stop, so its journal still sits beside the
+    /// link. Boot refuses, naming it, and touches nothing — the journal, the
+    /// link and the target are as they were (before T87 boot served the
+    /// target without the journal's acknowledged records, X3 `k4f`). Once the
+    /// journal is moved beside the target, boot reads it through the link;
+    /// and a stale temp named after the LINK (what an older build left) is
+    /// swept.
+    ///
+    /// Bug-catch: drop the stray-journal check in `resolve_ledger_path` and
+    /// the first boot succeeds without the journal's record.
+    #[cfg(unix)]
+    #[test]
+    fn m61_boot_through_a_link_with_a_journal_beside_it_refuses_and_changes_nothing() {
+        let directory = t67_directory("m61-boot");
+        let old = directory.join("ledger.bean");
+        std::fs::write(&old, large_ledger_content()).unwrap();
+        let mut svc = LedgerService::boot(old.clone(), "test-peer".to_owned()).unwrap();
+        svc.compact().unwrap();
+        svc.open_account_staged(
+            "Assets:InJournal".to_owned(),
+            make_date(2024, 1, 2),
+            vec![],
+            |_, _, _| None,
+        )
+        .unwrap();
+        let pending = svc.prepare_commit().unwrap().expect("a commit");
+        assert_eq!(pending.kind(), CommitKind::Append, "premise: an append");
+        let receipt = pending.commit().unwrap();
+        svc.finish_commit(receipt);
+        drop(svc); // an unclean stop: the journal is not folded
+
+        // The README's move behind a link.
+        let data = directory.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let target = data.join("real.bean");
+        std::fs::rename(&old, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &old).unwrap();
+        let stray = crate::journal::journal_path_for(&old);
+        let journal_bytes = std::fs::read(&stray).unwrap();
+        let stale_temp = directory.join("ledger.bean.tmp.4242.0123456789abcdef");
+        std::fs::write(&stale_temp, "x").unwrap();
+
+        let error = match LedgerService::boot(old.clone(), "test-peer".to_owned()) {
+            Err(error) => error,
+            Ok(_) => panic!("boot must refuse a journal beside the link"),
+        };
+        assert!(error.to_string().contains("(M-61, H-15)"), "{error}");
+        assert_eq!(std::fs::read(&stray).unwrap(), journal_bytes, "untouched");
+        assert!(std::fs::symlink_metadata(&old)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        // The remedy the error names.
+        std::fs::rename(&stray, crate::journal::journal_path_for(&target)).unwrap();
+        let svc = LedgerService::boot(old.clone(), "test-peer".to_owned()).unwrap();
+        assert!(
+            svc.accounts().is_open("Assets:InJournal"),
+            "the record is served"
+        );
+        assert!(!stale_temp.exists(), "the link's stale temp is swept");
         std::fs::remove_dir_all(&directory).ok();
     }
 

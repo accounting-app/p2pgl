@@ -1055,7 +1055,15 @@ cases where you might:
   so the journal, `.lock` and temporary files sit beside the target and the
   link is kept (a ledger on another volume works). A link owned by any other
   user refuses boot — otherwise whoever can write the ledger's directory could
-  point it at any file the node's user owns and have it overwritten.
+  point it at any file the node's user owns and have it overwritten. For the
+  same reason the link must sit in a directory owned by the node's user that
+  group and others cannot write (not `/tmp`, not a shared directory), and it is
+  followed **one link deep**: a link to another link refuses boot. A directory
+  in the path may itself be a link. If the ledger was converted to a link
+  after an unclean stop, its journal is still beside the link, where the node
+  no longer looks: boot refuses and names it. Move it beside the target (as
+  `<target>.journal`), or put the ledger back, start the node once so it folds
+  the journal in, stop it cleanly, and then make the link.
 - **A `.bean` missing beside a journal refuses boot** rather than starting an
   empty ledger with the journal's writes on top.
 - **A torn final record** — a crash mid-append — is dropped with a warning. On
