@@ -2973,44 +2973,99 @@ fn h19_a_peers_2_28_jump_is_diagnosed_everywhere_yet_a_fresh_node_still_joins_by
     assert!(mesh.replicas[g].svc.lamport_gap() >= LAMPORT_GAP_WARN);
 }
 
-/// A6-3 (0925): the boot warning names "the author of the directive at the
-/// top of the gap" (service.rs, boot's third branch). On a node that holds
-/// the history above a removed author's jump but not the jump itself — one
-/// that joined by anti-entropy after the remedy, or a copy from which the
-/// operator deleted the jumping directive as the H-12 remedy instructs — the
-/// directive at the top of the gap is the first HONEST record stamped above
-/// it, so every boot accuses an honest author of jumping the clock. The same
-/// expression as the boot branch, on F's DAG. Fails at HEAD: names A.
+/// A6-3 (0925), as decision (33) resolved it (T89 / L-111, L-113): the gap
+/// warning named "the author of the directive at the top of the gap" as the
+/// one that jumped the clock. On a node that holds the history above a
+/// removed author's jump but not the jump itself — one that joined by
+/// anti-entropy after the remedy, or a copy from which the operator deleted
+/// the jumping directive — that directive is the first HONEST record stamped
+/// above it, so every boot accused an honest author. The node cannot know
+/// which it is, so the warning now says so: it names the author at the top of
+/// the gap as the jumper OR the first honest record above a removed one; and
+/// a gap under 2^32 is "diagnosed, not uncrossable" — anti-entropy still
+/// crosses it — with no bootstrap join prescribed. The warning is F's own,
+/// from `verify_own_history` (T89 / L-100).
+///
+/// Failed at `45014e9`: the text named the jumper outright and prescribed the
+/// bootstrap join.
 #[test]
-#[ignore = "A6-3: on a node without the jumping directive (joined after the remedy, or the jump deleted per H-12), the gap warning names the first honest author above the gap as the one that jumped the clock"]
 fn h19_the_gap_warning_on_a_node_without_the_jump_names_the_removed_author() {
     let (mut mesh, _jump_id, attacker) = gap_warn_jump_mesh(9256);
     let f = mesh.add("F", 13);
     mesh.run_to_fixed_point(Order::Ascending);
-    let svc = &mesh.replicas[f].svc;
     let (gap, top) = largest_lamport_gap(
-        svc.dag()
+        mesh.replicas[f]
+            .svc
+            .dag()
             .directives()
             .into_iter()
             .filter_map(Directive::lamport_clock),
     );
-    let named = svc
+    let named = mesh.replicas[f]
+        .svc
         .dag()
         .directives()
         .into_iter()
         .find(|directive| directive.lamport_clock() == Some(top))
         .and_then(author_of);
-    eprintln!(
-        "A6-3: F's gap {gap} (top {top}); the warning would name {named:?}; X is {}; A is {}",
-        attacker.public_key_hex(),
-        mesh.replicas[0].author()
-    );
     assert!(gap >= LAMPORT_GAP_WARN);
-    assert_eq!(
+    assert_ne!(
         named.as_deref(),
         Some(attacker.public_key_hex().as_str()),
-        "the warning names an honest author as the jumper"
+        "premise: F does not hold the jump, so the top of its gap is an honest record"
     );
+    let (_, logged) = capture_warnings(|| mesh.replicas[f].svc.verify_own_history());
+    eprintln!("A6-3: F's gap {gap} (top {top}, author {named:?}); logged:\n{logged}");
+    assert!(
+        logged.contains("lamport gap")
+            && logged.contains("first honest record stamped above it")
+            && logged.contains("diagnosed, not uncrossable"),
+        "the warning must not call the author at the top the jumper outright, and must say a \
+         gap under 2^32 is crossed by anti-entropy: {logged}"
+    );
+    assert!(
+        !logged.contains("compacted .bean"),
+        "no bootstrap join is prescribed for a crossable gap: {logged}"
+    );
+}
+
+/// Every WARN (and ERROR) `body` logs on this thread, one line per event
+/// with its fields (T89; the boot fuzzer's minimal subscriber, so the test
+/// needs nothing beyond `tracing`).
+fn capture_warnings<T>(body: impl FnOnce() -> T) -> (T, String) {
+    use std::fmt::Write as _;
+    use std::sync::{Arc, Mutex};
+
+    struct Fields(String);
+    impl tracing::field::Visit for Fields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let _ = write!(self.0, "{}={:?} ", field.name(), value);
+        }
+    }
+    struct Capture(Arc<Mutex<String>>);
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            let mut logged = self.0.lock().unwrap();
+            logged.push_str(&fields.0);
+            logged.push('\n');
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+    let logged = Arc::new(Mutex::new(String::new()));
+    let value = tracing::subscriber::with_default(Capture(Arc::clone(&logged)), body);
+    let text = logged.lock().unwrap().clone();
+    (value, text)
 }
 
 /// A writes r1 and r2 (signed), B writes one record A adopts — the ordinary

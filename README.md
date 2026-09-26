@@ -55,7 +55,7 @@ The playground is **off** by default. Turn it on with `"graphiql": true` and vis
 
 ### Upgrading
 
-Read [`CHANGELOG.md`](CHANGELOG.md) before upgrading, starting with *Breaking*. Config files are parsed strictly, so an **older binary refuses a config that uses a key added in a newer one**: upgrade the binary before editing the config, and remove new keys before rolling back. A newer node holds what it **writes** to tighter limits than what it **takes as history**, so that history an older build wrote keeps replicating: an `open` may list up to 64 currencies and a transaction's postings up to 100 metadata keys when this node authors them, but a peer's record or an existing file is held only to 4,096 of each. One case still cannot replicate: an amount past 10^21 in a history written before T65 (a ledger kept in base units, such as wei). Boot keeps that record in the file, names it, and quarantines it together with every record that depends on it, so the node serves only what a fresh replica can hold; `verify` lists what is quarantined. Restating such an amount in a larger unit gives the record a new id, so its descendants (whose parents name the old id) stay quarantined: restate the chain, or join nodes by bootstrap (§Mesh identity). The CHANGELOG lists each case.
+Read [`CHANGELOG.md`](CHANGELOG.md) before upgrading, starting with *Breaking*. Config files are parsed strictly, so an **older binary refuses a config that uses a key added in a newer one**: upgrade the binary before editing the config, and remove new keys before rolling back. A newer node holds what it **writes** to tighter limits than what it **takes as history**, so that history an older build wrote keeps replicating: an `open` may list up to 64 currencies and a transaction's postings up to 100 metadata keys when this node authors them, but a peer's record or an existing file is held only to 4,096 of each. One case still cannot replicate: an amount past 10^21 in a history written before T65 (a ledger kept in base units, such as wei). Boot keeps that record in the file, names it, and quarantines it together with every record that depends on it, so the node serves only what a fresh replica can hold; `verify` lists what is quarantined. Restating such an amount in a larger unit gives the record a new id, so its descendants (whose parents name the old id) stay quarantined: restate the chain, or join nodes by bootstrap (§Mesh identity). The CHANGELOG lists each case. **Upgrade every node of a mesh, not some:** a node on a build from T75 to T80 refuses a history record over 64 currencies or 100 posting metadata keys that this build accepts, and then every record this node writes afterwards names a parent that node lacks — it buffers them all until it is upgraded, and nothing on this node says so. A hand-typed entry's metadata keys are counted as the record will be stored with a signature (96 on a transaction, 97 on anything else), also on a node with signing off, so enabling signing later never pushes a record over the cap.
 
 ---
 
@@ -745,11 +745,18 @@ node that refuses the parent buffers all of it as orphans forever
 
 The node **tells you** when it is in this state: at boot, and when an adoption
 opens one, it logs *"the ledger history carries a lamport gap no honest mesh
-makes"* (or *"an adopted directive opened a lamport gap"*), naming the author
-of the directive at the top of the gap. It is judged on the history itself —
-two consecutive lamport values at least 2^28 apart, which honest traffic never
-produces (each event moves the highest clock by one) — so honest meshes,
-however many nodes join them, never see it. A `LAMPORT_ADVANCE` refusal that
+makes"* (or *"an adopted directive opened a lamport gap"*). It is judged on the
+history the node serves — two consecutive lamport values at least 2^28 apart,
+which honest traffic never produces (each event moves the highest clock by one)
+— so honest meshes, however many nodes join them, never see it, and a record
+the same boot quarantines (an edited lamport line, say) does not trigger it.
+The line names the author at the top of the gap: the node that jumped the
+clock, or — on a node that no longer holds the jumping directive (its author
+removed, or the directive deleted) — the first honest record stamped above it;
+the node cannot tell which, and says so. A gap under 2^32 is only *diagnosed*:
+anti-entropy still crosses it, and nothing needs doing. A gap of 2^32 or more
+is the one later joiners cannot cross, and the line then gives the bootstrap
+join below. A `LAMPORT_ADVANCE` refusal that
 repeats tick after tick on a fresh node is the same state seen from the other
 side.
 
@@ -1033,8 +1040,13 @@ same trust boundary:
   limit, a mutation whose record would
   not fit is refused before anything changes (`RESOURCE_LIMIT_EXCEEDED`,
   "refused before staging"), and a peer's batch that would not fit is deferred
-  and that peer paused for `p2p.antiEntropySupplyBackoffSeconds`. Archive or
-  split the ledger to make room.
+  and that peer paused for `p2p.antiEntropySupplyBackoffSeconds`. What
+  shrinking can mean on a mesh is limited: records you delete from the file
+  come back from peers (they keep what they accepted), so only comments and
+  hand lines the node has not yet adopted really go away. The lasting remedy
+  is to start a new ledger — carry the closing balances forward as opening
+  entries in a fresh `.bean` under a new `meshId` for every node, and keep the
+  old file read-only as the archive of the years it covers.
 
 ### The commit journal (`<ledgerPath>.journal`)
 

@@ -1379,6 +1379,10 @@ pub const MAX_LAMPORT_ADVANCE: u64 = 1 << 32;
 /// ratchet-legal jump makes, so every such jump is diagnosed.
 pub const LAMPORT_GAP_WARN: u64 = 1 << 28;
 
+// A gap the warning names must be one the ratchet could have admitted in a
+// single step (0925 §5: this held only inside a unit test).
+const _: () = assert!(LAMPORT_GAP_WARN < MAX_LAMPORT_ADVANCE);
+
 /// The largest difference between consecutive distinct values of
 /// `lamports`, counting from 0, and the value at the top of it (T83 /
 /// L-94). `(0, 0)` for an empty history. The predicate behind the H-19
@@ -1417,6 +1421,34 @@ pub fn largest_lamport_gap(lamports: impl IntoIterator<Item = u64>) -> (u64, u64
 /// re-attributes such a record to this node when its signature verifies
 /// under this node's key (the signature does not cover the author).
 pub const PLACEHOLDER_AUTHOR: &str = "local";
+
+/// What a lamport-gap warning says about crossing the gap and about whom it
+/// names (T89 / L-111, L-113, decision (33)).
+///
+/// A gap of at least [`LAMPORT_GAP_WARN`] (2^28) is diagnosed; only one of at
+/// least [`MAX_LAMPORT_ADVANCE`] (2^32) is beyond what anti-entropy crosses in
+/// one step, and only then does a later joiner need the bootstrap join. The
+/// author named is the one at the top of the gap — the jumper, or, on a node
+/// that no longer holds the jumping directive, the first honest record above
+/// it — so the text never calls it the jumper outright.
+fn lamport_gap_verdict(gap: u64) -> String {
+    let named = "The author named is the one at the top of the gap: the node that jumped \
+                 the clock — or, on a node that no longer holds the jumping directive (its \
+                 author removed from the allowlist, or the directive deleted), the first \
+                 honest record stamped above it";
+    if gap >= MAX_LAMPORT_ADVANCE {
+        format!(
+            "{named}. At 2^32 or more the gap is uncrossable by anti-entropy once the author \
+             that made it is off the allowlist. {BOOTSTRAP_JOIN_REMEDY}"
+        )
+    } else {
+        format!(
+            "{named}. Under 2^32 the gap is diagnosed, not uncrossable: anti-entropy still \
+             crosses it (the adoption ratchet admits up to 2^32 a step), so no bootstrap join \
+             is needed for it; watch for it growing (H-19, L-111, L-113)"
+        )
+    }
+}
 
 pub const BOOTSTRAP_JOIN_REMEDY: &str =
     "A node that joins later, or is rebuilt from an empty disk, cannot cross a gap this \
@@ -1537,6 +1569,19 @@ fn check_lamport_advance(
     Ok(())
 }
 
+/// Whether `author` is this node's own when this node's id is `own_author`
+/// (T89 / L-96, decision (31)): its id, or the pre-T80 placeholder
+/// ([`PLACEHOLDER_AUTHOR`]) — only this node ever wrote `"local"` into its own
+/// file (a signing node before T80, or any signing-off node). T80
+/// re-attributed such records in the DAG, but everything outside it
+/// (quarantined, held as text) kept the placeholder and dropped out of every
+/// "own" lookup once the id was set: the L-87 release re-issued its lamport,
+/// the ceiling diagnostics named `"local"` with the mesh-wide remedy, and a
+/// boot and a reload of the same file resumed at different clocks.
+fn is_own_author(author: &str, own_author: &str) -> bool {
+    author == own_author || author == PLACEHOLDER_AUTHOR
+}
+
 /// The highest Lamport value boot's clock must resume above (M-18, T63 / H-12).
 ///
 /// # Which directives count
@@ -1603,7 +1648,7 @@ impl BootLamportHigh {
                 self.value = lamport;
                 self.author = author.map(str::to_owned);
             }
-            if author.is_some_and(|author| author != own_author)
+            if author.is_some_and(|author| !is_own_author(author, own_author))
                 && (lamport > self.foreign_value || self.foreign_author.is_none())
             {
                 self.foreign_value = lamport;
@@ -1620,7 +1665,7 @@ impl BootLamportHigh {
         {
             self.remember_outside_dag(author, lamport);
         }
-        if directive_author(directive) == Some(own_author) {
+        if directive_author(directive).is_some_and(|author| is_own_author(author, own_author)) {
             self.note(directive, own_author);
         }
     }
@@ -1630,7 +1675,7 @@ impl BootLamportHigh {
     fn note_text_if_own(&mut self, text: &str, own_author: &str) {
         for (author, lamport) in envelope_pairs_in_text(text) {
             self.remember_outside_dag(&author, lamport);
-            if author == own_author
+            if is_own_author(&author, own_author)
                 && (lamport > self.value || self.author.is_none() && lamport == self.value)
             {
                 self.value = lamport;
@@ -1837,6 +1882,47 @@ pub fn validate_body_envelope_keys(
         }
     }
     Ok(())
+}
+
+/// Drop every `openledger-*` key a node-written record may not carry — at
+/// directive level, one that is not one of the four [`ENVELOPE_KEYS`]; at
+/// posting level, every one — and return what was dropped, posting-level keys
+/// prefixed `posting:` (T83 / L-89; T89 / L-109, L-112, decision (34)).
+///
+/// None of them is hashed (`economic_canonical_serialize` omits every
+/// `openledger-*` key) or signed, and no peer ever receives one
+/// (`extract_envelope` keeps the closed set), so the record keeps its id, its
+/// signature and its place in every balance. Boot and the live reconcile both
+/// strip a complete envelope this way; operator input keeps H-06's refusal.
+fn strip_stray_envelope_keys(directive: &mut Directive) -> Vec<String> {
+    let mut stripped = Vec::new();
+    let metadata = directive_metadata_mut(directive);
+    let stray: Vec<String> = metadata
+        .keys()
+        .filter(|key| {
+            key.starts_with(ENVELOPE_KEY_PREFIX) && !ENVELOPE_KEYS.contains(&key.as_str())
+        })
+        .cloned()
+        .collect();
+    for key in stray {
+        metadata.remove(&key);
+        stripped.push(key);
+    }
+    if let Directive::Transaction(transaction) = directive {
+        for posting in &mut transaction.postings {
+            let stray: Vec<String> = posting
+                .metadata
+                .keys()
+                .filter(|key| key.starts_with(ENVELOPE_KEY_PREFIX))
+                .cloned()
+                .collect();
+            for key in stray {
+                posting.metadata.remove(&key);
+                stripped.push(format!("posting:{key}"));
+            }
+        }
+    }
+    stripped
 }
 
 /// Reject control characters in every string a directive carries (L-26).
@@ -2882,6 +2968,19 @@ pub struct LedgerService {
     /// and a caller that reports only the last one's return misses what the
     /// earlier ones quarantined.
     signature_quarantined_total: usize,
+    /// Signatures the pass has checked and accepted, across every pass (T89 /
+    /// L-98): the "every signature failed" judgement is made once, over all
+    /// passes, not per pass — the signer's pass sees only this node's own
+    /// records, so two edited own records made it fire while every foreign
+    /// record verified a moment later.
+    signature_verified_total: usize,
+    /// Refusals whose reason is "signature does not verify", across every
+    /// pass (T89 / L-98).
+    signature_failed_total: usize,
+    /// Edited records whose clock release is on hold because every signature
+    /// checked so far has failed (T89 / L-99, decision (32)) — see
+    /// [`Self::verify_history_pass`].
+    release_on_hold: BTreeSet<String>,
     /// History boot refused under a content rule every peer holds it to,
     /// and everything that descends from it (T81 / M-51, M-52) — see
     /// [`Self::quarantine_descendants_of_refused_history`]. Kept so the live
@@ -3419,25 +3518,15 @@ impl LedgerService {
         // a warning: the record keeps its id, its signature and its place in
         // every balance, and the next compaction writes it without the key.
         // (Operator input keeps its refusal on the file path.)
+        // T89 / L-112: posting-level keys too.
         let mut directives = directives;
         for directive in directives.iter_mut() {
             if Self::is_operator_input(directive) {
                 continue;
             }
-            let stray: Vec<String> = directive
-                .metadata()
-                .keys()
-                .filter(|key| {
-                    key.starts_with(ENVELOPE_KEY_PREFIX) && !ENVELOPE_KEYS.contains(&key.as_str())
-                })
-                .cloned()
-                .collect();
+            let stray = strip_stray_envelope_keys(directive);
             if stray.is_empty() {
                 continue;
-            }
-            let metadata = directive_metadata_mut(directive);
-            for key in &stray {
-                metadata.remove(key);
             }
             warn!(
                 id = %compute_content_id(directive),
@@ -3833,39 +3922,12 @@ impl LedgerService {
                  this node. Investigate the author named here (H-12). If that author is \
                  removed from the allowlist: {BOOTSTRAP_JOIN_REMEDY}"
             );
-        } else {
-            // T72 / H-19, judged on the content since T83 (L-94): a lamport
-            // gap in the history — legal under the ratchet, or pre-T63 — that
-            // no later joiner can cross by anti-entropy once its author is off
-            // the allowlist. Every existing node carries on and its own writes
-            // are accepted, so without this line the state is silent; the
-            // joiner that copied the file sees it too.
-            let (gap, top) = largest_lamport_gap(
-                dag.directives()
-                    .into_iter()
-                    .filter_map(Directive::lamport_clock),
-            );
-            if gap >= LAMPORT_GAP_WARN {
-                let jumper = dag
-                    .directives()
-                    .into_iter()
-                    .find(|directive| directive.lamport_clock() == Some(top))
-                    .and_then(directive_author)
-                    .unwrap_or("(unknown)")
-                    .to_owned();
-                warn!(
-                    gap,
-                    below = top - gap,
-                    top,
-                    threshold = LAMPORT_GAP_WARN,
-                    author = %jumper,
-                    file = %file_path.display(),
-                    "the ledger history carries a lamport gap no honest mesh makes — the \
-                     directive at the top of it, by the author named here, jumped the clock. \
-                     Existing nodes are unaffected. {BOOTSTRAP_JOIN_REMEDY}"
-                );
-            }
         }
+        // T72 / H-19, judged on the content since T83 (L-94): the lamport gap
+        // is no longer judged here, on the history as loaded, but by
+        // `verify_own_history`, over the history the node will serve — after
+        // the signature pass and the quarantines (T89 / L-100: it used to fire
+        // for a record the same boot then quarantined).
 
         // H-08: one line the operator can act on, after every per-directive
         // warning above. It states the contract the quarantine exists to make
@@ -3929,6 +3991,9 @@ impl LedgerService {
             verifier: None,
             unverified_history,
             signature_quarantined_total: 0,
+            signature_verified_total: 0,
+            signature_failed_total: 0,
+            release_on_hold: BTreeSet::new(),
             refused_history_closure: BTreeSet::new(),
             reconcile_batch_ids: HashSet::new(),
             unsigned_operator_input: Vec::new(),
@@ -4066,6 +4131,16 @@ impl LedgerService {
     /// Why operator input naming another node as its author is refused
     /// (M-54, T79) — one spelling for both file paths.
     fn foreign_operator_input_reason(other_author: &str) -> String {
+        // 0925 §5: "local" is not another node — it is the placeholder a
+        // pre-T80 build wrote; say so, with the same remedy.
+        if other_author == PLACEHOLDER_AUTHOR {
+            return "openledger-author names the placeholder \"local\" — what a build before \
+                    T80 wrote instead of this node's id — on an entry that is missing its \
+                    openledger-lamport or openledger-signature, so it cannot be told apart from \
+                    another node's. Remove the openledger-author line to adopt it as this node's \
+                    own (M-54)"
+                .to_owned();
+        }
         format!(
             "openledger-author names another node ({other_author}) on an entry that is missing \
              its openledger-lamport or openledger-signature: this node cannot sign for that \
@@ -4153,6 +4228,7 @@ impl LedgerService {
         if operator_input.is_empty() {
             return;
         }
+        let operator_input = hand_parented_last(operator_input);
         let mut tally = AdoptionTally::default();
         for directive in operator_input {
             let content_id = compute_content_id(&directive);
@@ -4438,6 +4514,21 @@ impl LedgerService {
     /// boot is never refused. Returns how many directives were quarantined.
     pub fn verify_own_history(&mut self) -> usize {
         let quarantined = self.verify_history_pass();
+        self.warn_if_the_served_history_has_a_lamport_gap();
+        // T80 / T89 (L-98, L-99): judged once, over every pass.
+        if self.every_checked_signature_failed() {
+            warn!(
+                failed = self.signature_failed_total,
+                file = %self.file_path.display(),
+                "EVERY signature this node checked failed. That is not one edited record: the \
+                 signature domain (p2p.meshId, or p2p.swarmTopic when meshId is unset) or the \
+                 node key differs from the one this history was signed under. Check both \
+                 before repairing anything — the records are quarantined, not lost, and load \
+                 again once the domain and key are right. Do not author until then: this \
+                 node's clock is left where the history put it, and records written under the \
+                 wrong domain are quarantined at the next correct boot (H-20, T80, L-99)"
+            );
+        }
         if !self.unverified_history.is_empty() {
             warn!(
                 unverified = self.unverified_history.len(),
@@ -4628,6 +4719,7 @@ impl LedgerService {
                  compaction writes the new author (T80, M-53)"
             );
         }
+        self.signature_verified_total += verified;
         if refused.is_empty() {
             info!(
                 verified,
@@ -4635,6 +4727,12 @@ impl LedgerService {
                 "ledger history verified: every checked signature is the one its author \
                  would have produced (H-20)"
             );
+            // T89 / L-99: a release put on hold while nothing verified runs
+            // once something does.
+            if !self.release_on_hold.is_empty() && !self.every_checked_signature_failed() {
+                let held = std::mem::take(&mut self.release_on_hold);
+                self.release_clock_carried_by_edited_records(&held);
+            }
             return 0;
         }
         for (content_id, reason) in &refused {
@@ -4651,48 +4749,51 @@ impl LedgerService {
                  (H-20, H-08)"
             );
         }
-        // T80 (0924 §5): every signature this pass checked failed — not
-        // missing, failed. One edited record does not look like that; a
-        // signature domain or key that differs from the one the history was
-        // signed under does, and the per-record reason cannot say so.
-        let every_checked_failed = verified == 0
-            && refused.len() >= 2
-            && refused
-                .values()
-                .all(|reason| reason.starts_with("signature does not verify"));
-        if every_checked_failed {
-            warn!(
-                failed = refused.len(),
-                file = %self.file_path.display(),
-                "EVERY signature this node checked failed. That is not one edited record: the \
-                 signature domain (p2p.meshId, or p2p.swarmTopic when meshId is unset) or the \
-                 node key differs from the one this history was signed under. Check both \
-                 before repairing anything — the records are quarantined, not lost, and load \
-                 again once the domain and key are right (H-20, T80)"
-            );
-        }
         let edited: BTreeSet<String> = refused
             .iter()
             .filter(|(_, reason)| reason.starts_with("signature does not verify"))
             .map(|(id, _)| id.clone())
             .collect();
         let ids: BTreeSet<String> = refused.into_keys().collect();
+        let any_edited = !edited.is_empty();
         self.signature_quarantined_total += ids.len();
+        self.signature_failed_total += edited.len();
         self.quarantine_out_of_dag(&ids);
-        self.release_clock_carried_by_edited_records(&edited);
+        // T89 / L-99, decision (32): while every signature checked so far has
+        // failed, the failures say "wrong mesh id or key", not "edited
+        // lamport lines", and releasing the clock past them would re-issue
+        // pairs this node signed under the right domain. The release waits:
+        // it runs once any pass verifies something, and never if nothing
+        // ever does (the WARN in `verify_own_history` says not to author).
+        if self.every_checked_signature_failed() {
+            self.release_on_hold.extend(edited);
+        } else {
+            let mut release = std::mem::take(&mut self.release_on_hold);
+            release.extend(edited);
+            self.release_clock_carried_by_edited_records(&release);
+        }
         // T84 / H-23: a signed record whose parent the pass just took out is a
         // record no peer lacking that parent can adopt; it goes too, with what
         // descends from it, and the operator input still pending is rebased
         // away from all of them.
         self.quarantine_unservable_history();
+        // T89 (0925 §5): the summary says what the refusals were. Records
+        // that carry an author and a lamport but NO signature were not edited
+        // — they are a history written before signing was enabled.
+        let summary = if !any_edited {
+            "they carry an author and a lamport but no openledger-signature: a history this \
+             node wrote before signing was enabled, or pasted unsigned. Delete their \
+             openledger-* lines to re-adopt them as this node's own, signed (H-20)"
+        } else {
+            "signature does not verify — was this record edited? History is append-only: a \
+             correction is a new reversing entry, never an edit of a signed line (H-20)"
+        };
         warn!(
             quarantined = ids.len(),
             verified,
             ids = %ids.iter().cloned().collect::<Vec<_>>().join(", "),
             file = %self.file_path.display(),
-            "ledger directives QUARANTINED at signature verification: signature does not \
-             verify — was this record edited? History is append-only: a correction is a new \
-             reversing entry, never an edit of a signed line (H-20)"
+            "ledger directives QUARANTINED at signature verification: {summary}"
         );
         ids.len()
     }
@@ -4703,6 +4804,48 @@ impl LedgerService {
     /// [`Self::verify_own_history`] call, whose return counts only its own.
     pub fn signature_quarantined_total(&self) -> usize {
         self.signature_quarantined_total
+    }
+
+    /// The H-19 diagnostic (T72; a content property since T83 / L-94), judged
+    /// on the history this node serves (T89 / L-100) and worded by
+    /// [`lamport_gap_verdict`] (L-111, L-113): a gap of at least
+    /// [`LAMPORT_GAP_WARN`] between two consecutive lamports, naming the
+    /// author at the top of it.
+    fn warn_if_the_served_history_has_a_lamport_gap(&self) {
+        let (gap, top) = self.lamport_gap_and_top();
+        if gap < LAMPORT_GAP_WARN {
+            return;
+        }
+        let named = self
+            .dag
+            .directives()
+            .into_iter()
+            .find(|directive| directive.lamport_clock() == Some(top))
+            .and_then(directive_author)
+            .unwrap_or("(unknown)")
+            .to_owned();
+        warn!(
+            gap,
+            below = top - gap,
+            top,
+            threshold = LAMPORT_GAP_WARN,
+            author = %named,
+            file = %self.file_path.display(),
+            "the ledger history carries a lamport gap no honest mesh makes. Existing nodes \
+             are unaffected. {}",
+            lamport_gap_verdict(gap)
+        );
+    }
+
+    /// Every signature checked so far, over every pass, has failed — at least
+    /// two, none accepted, and every refusal a failure (not a missing
+    /// signature) (T89 / L-98, L-99). One edited record does not look like
+    /// that; a signature domain or node key that differs from the one the
+    /// history was signed under does.
+    fn every_checked_signature_failed(&self) -> bool {
+        self.signature_verified_total == 0
+            && self.signature_failed_total >= 2
+            && self.signature_failed_total == self.signature_quarantined_total
     }
 
     /// Lower the clock to what boot would have resumed at without the edited
@@ -4746,10 +4889,18 @@ impl LedgerService {
                 self.quarantined
                     .iter()
                     .filter(|(id, _)| !edited.contains(*id))
-                    .filter(|(_, directive)| directive_author(directive) == Some(own.as_str()))
+                    .filter(|(_, directive)| {
+                        directive_author(directive)
+                            .is_some_and(|author| is_own_author(author, own.as_str()))
+                    })
                     .filter_map(|(_, directive)| directive.lamport_clock()),
             )
             .chain(self.boot_outside_dag_lamports.get(&own).copied())
+            .chain(
+                self.boot_outside_dag_lamports
+                    .get(PLACEHOLDER_AUTHOR)
+                    .copied(),
+            )
             .max()
             .unwrap_or(0);
         let plausible_edited = edited
@@ -5702,9 +5853,16 @@ impl LedgerService {
                     .iter()
                     .map(|(author, lamport)| (*lamport, author.as_str())),
             )
-            .map(|(lamport, author)| (author != self.author_id, lamport, author))
+            .map(|(lamport, author)| (!is_own_author(author, &self.author_id), lamport, author))
             .max_by_key(|(foreign, lamport, _)| (*foreign, *lamport))
-            .map(|(_, _, author)| author.to_owned())
+            // T89 / L-96: the placeholder is this node — name it by its id.
+            .map(|(foreign, _, author)| {
+                if foreign {
+                    author.to_owned()
+                } else {
+                    self.author_id.clone()
+                }
+            })
     }
 
     /// T72 / H-19 (T83 / L-94, L-83): warn when an adoption opens a lamport
@@ -5734,8 +5892,8 @@ impl LedgerService {
             threshold = LAMPORT_GAP_WARN,
             author = author.unwrap_or("(unknown)"),
             "an adopted directive opened a lamport gap in the history no honest mesh makes; \
-             its author, named here, jumped the clock. This node is unaffected. \
-             {BOOTSTRAP_JOIN_REMEDY}"
+             this node is unaffected. {}",
+            lamport_gap_verdict(gap)
         );
     }
 
@@ -7424,6 +7582,9 @@ impl LedgerService {
                 .cmp(&b.date())
                 .then_with(|| a.type_priority().cmp(&b.type_priority()))
         });
+        // T89 / L-108: and hand lines that spell their own parents after the
+        // rest, as boot adopts them.
+        let file_directives = hand_parented_last(file_directives);
 
         // M-38: the same Kahn pre-scan boot runs, over the file ∪ the live
         // quarantine. The DAG's own I8 check catches a planted cycle only on
@@ -7616,6 +7777,23 @@ impl LedgerService {
         // neither the Lamport clock nor a half-stamped envelope — the same
         // ordering rule H-04 states above and T27 states for the local
         // paths.
+        // T89 / L-109, decision (34): a complete envelope — a node's record,
+        // pasted or re-read — is stripped as boot strips it, not refused and
+        // then deleted from the file by the re-persist (the same bytes had two
+        // fates). Operator input keeps H-06's refusal below.
+        if !Self::is_operator_input(&directive) {
+            let stray = strip_stray_envelope_keys(&mut directive);
+            if !stray.is_empty() {
+                warn!(
+                    id = %content_id,
+                    keys = %stray.join(", "),
+                    file = %self.file_path.display(),
+                    "dropped openledger-* metadata keys that are not part of the envelope from a \
+                     node-written record the reconcile read; they are not hashed, not signed and \
+                     never sent to a peer (L-109, L-89, H-06)"
+                );
+            }
+        }
         if let Err(error) = validate_body_envelope_keys(&directive, ENVELOPE_KEYS)
             .and_then(|()| validate_body_strings(&directive))
             .and_then(|()| validate_parent_fan_in(&directive))
@@ -8191,10 +8369,13 @@ impl LedgerService {
                 // node is refused before this (live path) or at finalisation
                 // (boot), because adopted it was a parent of every later own
                 // write and the reasons below did not hold for it (it is not
-                // inert: it is a head). What still arrives here is a complete
-                // author + lamport envelope without a signature on a node
-                // with no verifier (signing off), where the history rule is
-                // "loaded as it is".
+                // inert: it is a head). And since T80 a signing-off gl-node
+                // installs no signer, so this function returns above; with
+                // signing on, a complete envelope is judged by the verifier
+                // before it gets here. What still reaches this arm is a
+                // library caller that installs a signer and no verifier, with
+                // a complete author + lamport envelope and no signature — the
+                // history rule, "loaded as it is" (0925 §5).
                 //
                 // T41 — WARN AND ADOPT is the deliberate choice here; refusing
                 // the entry was considered and rejected. Three reasons.
@@ -8393,33 +8574,50 @@ impl LedgerService {
     /// refuses loudly instead of re-issuing a pair.
     pub fn set_author_id(&mut self, author_id: String) {
         self.author_id = author_id;
-        let own_high = self
+        // T89 / L-96: the placeholder's records are this node's too.
+        let placeholder_high = self
             .boot_outside_dag_lamports
-            .get(&self.author_id)
+            .get(PLACEHOLDER_AUTHOR)
             .copied()
             .unwrap_or(0);
+        let own_high = self
+            .boot_outside_dag_lamports
+            .get(self.author_id.as_str())
+            .copied()
+            .unwrap_or(0)
+            .max(placeholder_high);
         // Boot's own rule: resume at `max + 1` when anything is non-zero.
         let resume = if own_high > 0 {
             own_high.saturating_add(1)
         } else {
             0
         };
-        if resume <= self.boot_clock_base {
+        // Boot counts the placeholder's records as its own on every path, so
+        // they never move the clock here. When they are what carries it, boot
+        // (under the placeholder, as the node always boots) named author
+        // `local` with the mesh-wide allowlist remedy; the L-91 WARN below is
+        // the correct one — a pre-signing record of this node's own file
+        // (T89 / L-96).
+        let carried_by_placeholder =
+            placeholder_high > 0 && placeholder_high.saturating_add(1) >= self.lamport_clock;
+        if resume <= self.boot_clock_base && !carried_by_placeholder {
             return;
         }
-        self.boot_clock_base = resume;
         // T84 / M-57, decision (16): operator input adopted at boot is stamped
         // by `finalize_operator_input` from this clock, so raising the clock is
         // all L-67 needs here — the re-stamp of its placeholder lamports that
         // lived here is gone with them.
         let before = self.lamport_clock;
-        self.lamport_clock = self.lamport_clock.max(resume);
+        if resume > self.boot_clock_base {
+            self.boot_clock_base = resume;
+            self.lamport_clock = self.lamport_clock.max(resume);
+        }
         // L-91 (T80): boot warns when the next stamp will refuse, but under
         // the placeholder author it could not count this node's own records
         // outside the DAG — they are folded only here. Same predicates as
         // boot; the source is this node's own file, so the remedy is to repair
         // it, never to remove an author from anyone's allowlist.
-        if self.lamport_clock != before {
+        if self.lamport_clock != before || carried_by_placeholder {
             if !lamport_value_is_legal(self.lamport_clock.saturating_add(1)) {
                 warn!(
                     author = %self.author_id,
@@ -8430,8 +8628,9 @@ impl LedgerService {
                     "this node's OWN records outside the ledger (quarantined, or held as \
                      unparsable text) carry an openledger-lamport at the Lamport ceiling, and the \
                      clock now resumes above them: this node will refuse to author. No other node \
-                     carried it here — find the block with this node's openledger-author and \
-                     that lamport in the .bean and delete or repair it, then restart (L-91, H-12)"
+                     carried it here — find the block with this node's openledger-author (or \
+                     \"local\", written before signing) and that lamport in the .bean and delete \
+                     or repair it, then restart (L-91, L-96, H-12)"
                 );
             } else if LAMPORT_CEILING - self.lamport_clock <= MAX_LAMPORT_ADVANCE {
                 warn!(
@@ -8443,7 +8642,8 @@ impl LedgerService {
                     "this node's OWN records outside the ledger carry an openledger-lamport \
                      within one adoption step (2^32) of the Lamport ceiling, and the clock now \
                      resumes above them; no honest history gets here. Find the block with this \
-                     node's openledger-author and that lamport in the .bean (L-91, H-12)"
+                     node's openledger-author (or \"local\", written before signing) and that \
+                     lamport in the .bean (L-91, L-96, H-12)"
                 );
             }
         }
@@ -8491,13 +8691,17 @@ impl LedgerService {
     /// the quantity the H-19 warning compares with [`LAMPORT_GAP_WARN`]. O(n
     /// log n); diagnostics and tests only.
     pub fn lamport_gap(&self) -> u64 {
+        self.lamport_gap_and_top().0
+    }
+
+    /// [`largest_lamport_gap`] over the DAG: the gap and the lamport at its top.
+    fn lamport_gap_and_top(&self) -> (u64, u64) {
         largest_lamport_gap(
             self.dag
                 .directives()
                 .into_iter()
                 .filter_map(Directive::lamport_clock),
         )
-        .0
     }
 
     /// Get the set of current DAG head txids (for anti-entropy exchange).
@@ -8955,6 +9159,47 @@ enum AdoptionPath {
     Boot,
     /// The live reconcile of a running node.
     Live,
+}
+
+/// `directives` with every hand-typed transaction that spells its own
+/// `openledger-parents` (operator input — no full envelope — with a parents
+/// line) moved after the rest, each group keeping its order (T89 / L-108).
+///
+/// Operator input is adopted in canonical (date, type) order, and a hand
+/// parent must already be served when the line naming it is adopted (L-75).
+/// Two hand lines of one edit, the child placed before its hand parent on the
+/// same date, used to refuse the child ("exists nowhere") at one boot and
+/// adopt it at the next — served set, balances and file bytes changing across
+/// a restart with nothing edited in between.
+fn hand_parented_last(directives: Vec<Directive>) -> Vec<Directive> {
+    let (rest, hand_parented): (Vec<Directive>, Vec<Directive>) =
+        directives.into_iter().partition(|directive| {
+            !(matches!(directive, Directive::Transaction(_))
+                && LedgerService::is_operator_input(directive)
+                && directive.metadata().contains_key(ENVELOPE_KEY_PARENTS))
+        });
+    // Within the group, a line whose hand parent is another line of the group
+    // comes after it (stable; a cycle keeps file order, and the L-75 check
+    // refuses it as before).
+    let mut pending: Vec<(String, Directive)> = hand_parented
+        .into_iter()
+        .map(|directive| (compute_content_id(&directive), directive))
+        .collect();
+    let mut ordered: Vec<Directive> = Vec::with_capacity(pending.len());
+    let mut waiting: HashSet<String> = pending.iter().map(|(id, _)| id.clone()).collect();
+    while !pending.is_empty() {
+        let ready = pending.iter().position(|(id, directive)| match directive {
+            Directive::Transaction(txn) => txn
+                .parent_ids()
+                .into_iter()
+                .all(|parent| parent == id.as_str() || !waiting.contains(parent)),
+            _ => true,
+        });
+        let (id, directive) = pending.remove(ready.unwrap_or(0));
+        waiting.remove(&id);
+        ordered.push(directive);
+    }
+    rest.into_iter().chain(ordered).collect()
 }
 
 /// The `openledger-parents` value a transaction stored under `content_id`
@@ -12734,12 +12979,18 @@ mod tests {
     fn test_h19_boot_warns_on_a_lamport_gap_in_the_history() {
         let path = test_file_path();
         std::fs::write(&path, history_file_at(5_000_000_000)).unwrap();
-        let (svc, logged) =
-            capture_warnings(|| LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap());
+        // T89 / L-100: judged by `verify_own_history` (which gl-node calls
+        // at every boot), over the history the node will serve.
+        let (svc, logged) = capture_warnings(|| {
+            let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+            svc.verify_own_history();
+            svc
+        });
         assert_eq!(svc.directive_count(), 3);
         assert_eq!(svc.lamport_clock(), 5_000_000_001);
         assert!(
-            logged.contains("lamport gap")
+            logged.contains("uncrossable")
+                && logged.contains("lamport gap")
                 && logged.contains("peer-history")
                 && logged.contains("H-19")
                 && logged.contains("compacted .bean"),
@@ -20846,24 +21097,362 @@ mod tests {
     fn t80_the_signature_quarantine_total_counts_every_pass_and_a_total_failure_names_the_domain() {
         let path = pre_t80_placeholder_signed_file();
         let mut svc = LedgerService::boot(path.clone(), "another-key".to_owned()).unwrap();
-        // A verifier for a different key/domain: nothing verifies.
-        let (_, logged) = capture_warnings(|| {
+        // A verifier for a different key/domain: nothing verifies. Since T89
+        // (L-98) the WARN is judged once, by `verify_own_history`, over every
+        // pass.
+        let (last, logged) = capture_warnings(|| {
             svc.set_verifier(std::sync::Arc::new(
                 |_: &str, _, _: &str, _: &str, _: &str, _: &str| false,
-            ))
+            ));
+            svc.verify_own_history()
         });
         assert_eq!(svc.quarantined_count(), 3);
-        assert_eq!(
-            svc.verify_own_history(),
-            0,
-            "the last call finds nothing left"
-        );
+        assert_eq!(last, 0, "the last call finds nothing left");
         assert_eq!(svc.signature_quarantined_total(), 3);
         assert!(
             logged.contains("EVERY signature this node checked failed")
                 && logged.contains("p2p.meshId"),
             "{logged}"
         );
+        remove_ledger_and_journal(&path);
+    }
+
+    /// A pre-T80 placeholder history (lamports 1–3) plus a fourth "local"
+    /// record at lamport 7 held as unparsable text (T89 / L-96 tests).
+    fn placeholder_history_with_a_text_held_record() -> PathBuf {
+        let path = pre_t80_placeholder_signed_file();
+        append_to_file(
+            &path,
+            "\n2024-01-26 * \"Junk\" \"held as text\"\n\
+             \x20 openledger-author: \"local\"\n\
+             \x20 openledger-lamport: \"7\"\n\
+             \x20 this line does not parse\n",
+        );
+        path
+    }
+
+    /// L-96 (T89, decision (31)): the placeholder's records are this node's in
+    /// every own lookup. A Fresh boot under the placeholder counted the
+    /// text-held "local" record at lamport 7 as own; a boot (or an L-13
+    /// reload) under the real author did not, and resumed below it — so the
+    /// next write re-issued a lamport this node's own file holds (X1 `c5a`,
+    /// A2 `s9`). Both now resume above it.
+    ///
+    /// Bug-catch: make `is_own_author` compare the id alone and the boot under
+    /// the real author resumes at 4.
+    #[test]
+    fn l96_a_boot_under_the_real_author_counts_the_placeholders_records_outside_the_dag() {
+        let path = placeholder_history_with_a_text_held_record();
+        let mut placeholder =
+            LedgerService::boot(path.clone(), PLACEHOLDER_AUTHOR.to_owned()).unwrap();
+        placeholder.set_author_id("test-peer".to_owned());
+        let under_the_key = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert_eq!(placeholder.lamport_clock(), 8);
+        assert_eq!(
+            under_the_key.lamport_clock(),
+            placeholder.lamport_clock(),
+            "a boot and a reload of one file resume at the same clock"
+        );
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-96 (T89, decision (31)): a placeholder record held as text at the
+    /// ceiling is this node's own, so `set_author_id` gives L-91's WARN (this
+    /// node's own file is the source) and the ceiling refusal names this node,
+    /// never "local" with the mesh-wide allowlist remedy (A2 `s5`).
+    ///
+    /// Bug-catch: drop the placeholder from `set_author_id`'s own high and the
+    /// WARN is silent.
+    #[test]
+    fn l96_a_placeholder_record_at_the_ceiling_is_this_nodes_own() {
+        let path = pre_t80_placeholder_signed_file();
+        append_to_file(
+            &path,
+            &format!(
+                "\n2024-01-26 * \"Junk\" \"held as text\"\n\
+                 \x20 openledger-author: \"local\"\n\
+                 \x20 openledger-lamport: \"{}\"\n\
+                 \x20 this line does not parse\n",
+                LAMPORT_CEILING - 3
+            ),
+        );
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        let error = svc
+            .open_account("Assets:After".to_owned(), make_date(2024, 2, 1), vec![])
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("author local"), "{error}");
+        assert!(error.contains("test-peer"), "names this node: {error}");
+        remove_ledger_and_journal(&path);
+    }
+
+    /// T89 / L-96: the node always boots under the placeholder, so boot
+    /// names author `local` with the mesh-wide allowlist remedy for a
+    /// pre-signing record at the ceiling. Once the key loads, the L-91 WARN
+    /// says what it is — this node's own file — although the clock does not
+    /// move (boot already counted the record).
+    ///
+    /// Bug-catch: look up only the real author id in `set_author_id` and no
+    /// L-91 WARN is logged.
+    #[test]
+    fn l96_set_author_id_names_a_placeholder_record_at_the_ceiling_as_this_nodes_own() {
+        let path = pre_t80_placeholder_signed_file();
+        append_to_file(
+            &path,
+            &format!(
+                "\n2024-01-26 * \"Junk\" \"held as text\"\n\
+                 \x20 openledger-author: \"local\"\n\
+                 \x20 openledger-lamport: \"{}\"\n\
+                 \x20 this line does not parse\n",
+                LAMPORT_CEILING - 3
+            ),
+        );
+        let mut svc = LedgerService::boot(path.clone(), PLACEHOLDER_AUTHOR.to_owned()).unwrap();
+        let clock = svc.lamport_clock;
+        let (_, logged) = capture_warnings(|| svc.set_author_id("test-peer".to_owned()));
+        assert_eq!(svc.lamport_clock, clock, "boot already counted the record");
+        assert!(
+            logged.contains("OWN records outside the ledger")
+                && logged.contains("(L-91, L-96")
+                && logged.contains("written before signing"),
+            "{logged}"
+        );
+        remove_ledger_and_journal(&path);
+    }
+
+    /// Two own transactions whose narrations were edited, beside three
+    /// foreign records (the accounts' `open`s and one transaction, by
+    /// `peer-b`) that verify (T89 / L-98, L-99 tests). Returns the path and
+    /// a verifier that accepts a marker signature from any author.
+    fn edited_own_records_beside_verifying_foreign_ones() -> (PathBuf, DirectiveVerifier) {
+        let path = test_file_path();
+        let foreign = |directive: Directive| {
+            let mut directive = directive;
+            directive_metadata_mut(&mut directive)
+                .insert(ENVELOPE_KEY_AUTHOR.to_owned(), "peer-b".to_owned());
+            marker_signed(directive)
+        };
+        let mut cash = open_directive("Assets:Cash", &["USD"]);
+        directive_metadata_mut(&mut cash).insert(ENVELOPE_KEY_LAMPORT.to_owned(), "1".to_owned());
+        let mut equity = open_directive("Equity:Opening", &[]);
+        directive_metadata_mut(&mut equity).insert(ENVELOPE_KEY_LAMPORT.to_owned(), "2".to_owned());
+        let other = signed_history_transaction("by peer b", 1, ("Assets:Cash", "USD"), "", 3);
+        let own_one = signed_history_transaction("own one", 2, ("Assets:Cash", "USD"), "", 4);
+        let own_two = signed_history_transaction("own two", 3, ("Assets:Cash", "USD"), "", 5);
+        let text = full_file_serialize(
+            &[
+                foreign(cash),
+                foreign(equity),
+                foreign(other),
+                own_one,
+                own_two,
+            ],
+            &[],
+        )
+        .replace("\"own one\"", "\"own one (edited)\"")
+        .replace("\"own two\"", "\"own two (edited)\"");
+        std::fs::write(&path, text).unwrap();
+        let any_author: DirectiveVerifier = std::sync::Arc::new(
+            |content_id: &str,
+             is_transaction: bool,
+             parents: &str,
+             lamport: &str,
+             _: &str,
+             signature: &str| {
+                signature == format!("sig({content_id}|{is_transaction}|{parents}|{lamport})")
+            },
+        );
+        (path, any_author)
+    }
+
+    /// L-98 (T89): the signer's pass sees only this node's own records; with
+    /// both of them edited it saw "every signature failed" and warned to check
+    /// the mesh id and the key, while every foreign record verified a moment
+    /// later in the verifier's pass (A2 `s3`). Judged once, over every pass,
+    /// there is no such WARN — and the release put on hold by the first pass
+    /// runs once the second verifies something.
+    ///
+    /// Bug-catch: judge the WARN per pass again and it fires.
+    #[test]
+    fn l98_the_every_signature_failed_warning_is_judged_over_every_pass() {
+        let (path, any_author) = edited_own_records_beside_verifying_foreign_ones();
+        let (_, logged) = capture_warnings(|| {
+            let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+            svc.set_signer(marker_signer());
+            svc.set_verifier(any_author);
+            svc.verify_own_history();
+            assert_eq!(svc.quarantined_count(), 2, "the two edited own records");
+            assert!(svc.release_on_hold.is_empty(), "the held release ran");
+        });
+        assert!(!logged.contains("EVERY signature"), "{logged}");
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-99 (T89, decision (32)): a verifier for the wrong domain or key fails
+    /// every signature. The failures say nothing about edited lamport lines,
+    /// so the clock is not released past them — it stays where the history
+    /// put it — and the WARN, judged once, says not to author until the
+    /// domain and key are right (A2 `s1(e)`: the clock walked to 0).
+    ///
+    /// Bug-catch: release regardless and one record's implausible lamport
+    /// (edited to 4·10^9 here) takes the clock down to 3.
+    #[test]
+    fn l99_on_a_domain_mismatch_the_clock_is_kept_and_the_node_is_told_not_to_author() {
+        let path = pre_t80_placeholder_signed_file();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let edited = content.replacen(
+            "openledger-lamport: \"3\"",
+            "openledger-lamport: \"4000000000\"",
+            1,
+        );
+        assert_ne!(content, edited, "premise");
+        std::fs::write(&path, edited).unwrap();
+        let mut svc = LedgerService::boot(path.clone(), "another-key".to_owned()).unwrap();
+        let clock = svc.lamport_clock();
+        let (_, logged) = capture_warnings(|| {
+            svc.set_verifier(std::sync::Arc::new(
+                |_: &str, _, _: &str, _: &str, _: &str, _: &str| false,
+            ));
+            svc.verify_own_history();
+        });
+        assert_eq!(svc.quarantined_count(), 3);
+        assert_eq!(svc.lamport_clock(), clock, "the clock is kept");
+        assert!(
+            logged.contains("EVERY signature") && logged.contains("Do not author"),
+            "{logged}"
+        );
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-100 (T89): the gap warning is judged on the history this node
+    /// serves. An own record whose lamport line was edited to 10^9 — inside
+    /// one adoption step, so boot's ratchet keeps it — opens a gap in the
+    /// history AS LOADED; the signature pass quarantines it, and
+    /// the served history has no gap — so no warning, where boot used to warn
+    /// (naming this node) for a record the same boot then quarantined (D1 on
+    /// the real binary).
+    ///
+    /// Bug-catch: judge the gap at boot again and the warning fires.
+    #[test]
+    fn l100_the_gap_warning_ignores_a_record_the_same_boot_quarantines() {
+        let (path, _first, _second) = two_signed_transactions_file();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let top = content.matches("openledger-lamport: \"").count();
+        let edited = content.replacen(
+            &format!("openledger-lamport: \"{top}\""),
+            "openledger-lamport: \"1000000000\"",
+            1,
+        );
+        assert_ne!(content, edited, "premise");
+        std::fs::write(&path, edited).unwrap();
+        let (svc, logged) = capture_warnings(|| {
+            let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+            svc.set_signer(marker_signer());
+            svc.verify_own_history();
+            svc
+        });
+        assert_eq!(svc.quarantined_count(), 1, "premise: the edited record");
+        assert!(!logged.contains("lamport gap"), "{logged}");
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-108 (T89): two hand lines of one edit, the child — spelling the
+    /// parent's id in `openledger-parents` — placed BEFORE its parent on the
+    /// same date. Both are adopted in one boot (hand-parented lines go last),
+    /// where the child used to be refused ("exists nowhere") at the first
+    /// boot and adopted at the second (X1 `c7 order`).
+    ///
+    /// Bug-catch: adopt in plain canonical order and the child is refused.
+    #[test]
+    fn l108_a_hand_child_before_its_hand_parent_is_adopted_in_the_same_boot() {
+        let (svc, path) = setup_with_signed_accounts();
+        drop(svc);
+        let parent_text = "2024-01-20 * \"Hand\" \"the parent\"\n\
+                           \x20 Assets:Cash                                         5.00 USD\n\
+                           \x20 Equity:Opening                                     -5.00 USD\n";
+        let parent_id = compute_content_id(&parse_file(parent_text).unwrap().remove(0));
+        append_to_file(
+            &path,
+            &format!(
+                "\n2024-01-20 * \"Hand\" \"the child\"\n\
+                 \x20 openledger-parents: \"{parent_id}\"\n\
+                 \x20 Assets:Cash                                         2.00 USD\n\
+                 \x20 Equity:Opening                                     -2.00 USD\n\n{parent_text}"
+            ),
+        );
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.set_signer(marker_signer());
+        svc.finalize_operator_input();
+        assert_eq!(svc.quarantined_count(), 0);
+        assert_eq!(parents_of_named(&svc, "the child"), vec![parent_id]);
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-109 (T89, decision (34)): a peer's signed block pasted under a
+    /// running node carries a stray directive-level `openledger-note`. Boot
+    /// strips the key and serves the record; the live reconcile used to refuse
+    /// it (H-06) and the re-persist then deleted the block from the file (X1
+    /// `c8a`). It is now stripped there too: adopted, served, and written back
+    /// without the key.
+    ///
+    /// Bug-catch: drop the strip on the live path and the block is refused
+    /// and gone from the file.
+    #[test]
+    fn l109_a_pasted_signed_block_with_a_stray_key_is_stripped_on_the_live_path_too() {
+        let (mut svc, path) = setup_with_signed_accounts();
+        svc.set_verifier(marker_verifier());
+        svc.compact().unwrap();
+        let mut pasted =
+            signed_history_transaction("pasted peer record", 5, ("Assets:Cash", "USD"), "", 40);
+        directive_metadata_mut(&mut pasted)
+            .insert("openledger-note".to_owned(), "hand annotation".to_owned());
+        append_to_file(&path, &format!("\n{}", full_file_serialize(&[pasted], &[])));
+        let result = svc.reconcile_file().unwrap();
+        assert_eq!(result.new_directives, 1, "{result:?}");
+        let served = transaction_named(&svc, "pasted peer record").expect("served");
+        assert!(!served.metadata().contains_key("openledger-note"));
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("pasted peer record") && !on_disk.contains("openledger-note"));
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-112 (T89, decision (34)): a posting-level `openledger-*` key on a
+    /// signed history record is stripped at boot like a directive-level one
+    /// — before T89 it was served and written back by every compaction. The
+    /// record keeps its id and its signature (neither covers the key).
+    ///
+    /// Bug-catch: strip directive-level keys only and the posting keeps it.
+    #[test]
+    fn l112_a_posting_level_stray_key_is_stripped_at_boot() {
+        let (svc, path) = setup_with_signed_accounts();
+        drop(svc);
+        let mut record =
+            signed_history_transaction("posting annotated", 5, ("Assets:Cash", "USD"), "", 40);
+        let id = compute_content_id(&record);
+        if let Directive::Transaction(txn) = &mut record {
+            txn.postings[0]
+                .metadata
+                .insert("openledger-foo".to_owned(), "x".to_owned());
+        }
+        assert_eq!(compute_content_id(&record), id, "premise: not hashed");
+        append_to_file(&path, &format!("\n{}", full_file_serialize(&[record], &[])));
+        let (mut svc, logged) = capture_warnings(|| {
+            let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+            svc.set_signer(marker_signer());
+            svc
+        });
+        assert!(logged.contains("posting:openledger-foo"), "{logged}");
+        let Some(Directive::Transaction(served)) = svc.get_directive(&id).cloned() else {
+            panic!("served under its id");
+        };
+        assert!(served
+            .postings
+            .iter()
+            .all(|posting| posting.metadata.is_empty()));
+        svc.compact().unwrap();
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("openledger-foo"));
         remove_ledger_and_journal(&path);
     }
 
