@@ -55,7 +55,7 @@ The playground is **off** by default. Turn it on with `"graphiql": true` and vis
 
 ### Upgrading
 
-Read [`CHANGELOG.md`](CHANGELOG.md) before upgrading, starting with *Breaking*. Config files are parsed strictly, so an **older binary refuses a config that uses a key added in a newer one**: upgrade the binary before editing the config, and remove new keys before rolling back. A newer node holds what it **writes** to tighter limits than what it **takes as history**, so that history an older build wrote keeps replicating: an `open` may list up to 64 currencies and a transaction's postings up to 100 metadata keys when this node authors them, but a peer's record or an existing file is held only to 4,096 of each. One case still cannot replicate: an amount past 10^21 in a history written before T65 (a ledger kept in base units, such as wei). Boot keeps that record in the file, names it, and quarantines it together with every record that depends on it, so the node serves only what a fresh replica can hold; `verify` lists what is quarantined. Restating such an amount in a larger unit gives the record a new id, so its descendants (whose parents name the old id) stay quarantined: restate the chain, or join nodes by bootstrap (§Mesh identity). The CHANGELOG lists each case. **Upgrade every node of a mesh, not some:** a node on a build from T75 to T80 refuses a history record over 64 currencies or 100 posting metadata keys that this build accepts, and then every record this node writes afterwards names a parent that node lacks — it buffers them all until it is upgraded, and nothing on this node says so. A hand-typed entry's metadata keys are counted as the record will be stored with a signature (96 on a transaction, 97 on anything else), also on a node with signing off, so enabling signing later never pushes a record over the cap.
+Read [`CHANGELOG.md`](CHANGELOG.md) before upgrading, starting with *Breaking*. Config files are parsed strictly, so an **older binary refuses a config that uses a key added in a newer one**: upgrade the binary before editing the config, and remove new keys before rolling back. A newer node holds what it **writes** to tighter limits than what it **takes as history**, so that history an older build wrote keeps replicating: an `open` may list up to 64 currencies and a transaction's postings up to 100 metadata keys when this node authors them, but a peer's record or an existing file is held only to 4,096 of each. One case still cannot replicate: an amount past 10^21 in a history written before T65 (a ledger kept in base units, such as wei). Boot keeps that record in the file, names it, and quarantines it together with every record that depends on it, so the node serves only what a fresh replica can hold; `verify` lists what is quarantined. Restating such an amount in a larger unit gives the record a new id, so its descendants (whose parents name the old id) stay quarantined: restate the chain (delete the `openledger-*` lines of each descendant, so it is re-adopted under its own id with parents this node serves; peers that hold the old copies adopt the restated ones), or join nodes by bootstrap (§Mesh identity). The CHANGELOG lists each case. **Upgrade every node of a mesh, not some:** a node on a build from T75 to T80 refuses a history record over 64 currencies or 100 posting metadata keys that this build accepts, and then every record this node writes afterwards names a parent that node lacks — it buffers them all until it is upgraded, and nothing on this node says so. A hand-typed entry's metadata keys are counted as the record will be stored with a signature (96 on a transaction, 97 on anything else), also on a node with signing off, so enabling signing later never pushes a record over the cap.
 
 ---
 
@@ -866,7 +866,10 @@ transaction on the account and listing its currencies, and restart — boot judg
 the history after it has adopted what you typed, so an `open` that admits the
 transactions frees them in that same boot. Restating a record in a different form
 (a larger unit, a corrected body) gives it a new id, so what named the old id
-stays held; restate the chain, or join nodes by bootstrap (§Mesh identity).
+stays held; restate the chain — delete the `openledger-*` lines of each record
+that descends from it, so each is re-adopted under its own id with parents this
+node serves (a peer that holds the old copies adopts the restated ones) — or join
+nodes by bootstrap (§Mesh identity).
 
 Three edits an editor makes by accident are caught the same way: a stray
 dedent, a byte-order mark glued to a posting, or a stray word inside a
@@ -1008,7 +1011,11 @@ same trust boundary:
   the reason, before the canonical rewrite removes them from the file — and that
   rewrite runs even when *every* entry in the edit was refused, so a refused
   line does not linger on disk to be loaded raw at the next boot. (At boot the
-  same refusal quarantines instead of dropping; see above.)
+  same refusal quarantines instead of dropping; see above.) An entry with a
+  full envelope is history, not a typed line, and is kept when boot would keep
+  it: one over a limit peers hold history to or over the 1 MiB body cap, one the
+  accounts do not admit, and one whose parent this node does not serve are held
+  in the quarantine and written back, as at boot.
 - A file that no longer **parses** blocks writes until a human fixes it, rather
   than being canonicalized on top of a half-saved edit. The refusal records
   nothing about the broken file — not its hash, not its size — so every later

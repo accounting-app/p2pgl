@@ -1193,10 +1193,13 @@ fn a_pasted_complete_envelope_is_counted_as_it_arrives_and_an_unsigned_own_one_i
     own.push_str("  Equity:Opening                                     -5 USD\n");
     append(&own);
     let result = node.reconcile_file().expect("reconcile");
+    // T90 / L-126: B's 97-key record is held in the quarantine and kept in the
+    // file, as boot keeps it, so this reconcile reads and refuses it again
+    // (before T90 the first re-persist deleted it).
     assert_eq!(
         (result.new_directives, result.rejected),
-        (0, 1),
-        "refused by the signature check (H-20), never signed to 101"
+        (0, 2),
+        "refused by the signature check (H-20), never signed to 101; B's 97 still held"
     );
     for directive in node.dag().directives() {
         assert!(
@@ -1379,7 +1382,6 @@ fn a2_served_transaction(node: &LedgerService, id: &str) -> Directive {
 /// forever. Before T85 B adopted A's copies and the quarantine healed
 /// (`live_quarantine`'s "a peer serving the same economic body").
 #[test]
-#[ignore = "A2-1: the wire refuses a closure member's content id whatever its parents, so a restated chain never reaches a node that held the old one"]
 fn a2_a_restated_chain_reaches_every_node_that_held_the_old_one() {
     let author = std::sync::Arc::new(key());
     let over = Decimal::from_str_exact("50000000000000000000000").expect("5 × 10^22");
@@ -1819,7 +1821,6 @@ fn a2_a_pasted_child_of_a_later_pasted_parent_the_accounts_refuse_is_held_live_a
 /// the quarantine. T85's hold covers the missing-parent arm only; T89
 /// (L-109) closed this class for stray envelope keys.
 #[test]
-#[ignore = "A2-3: the live reconcile deletes from the file a pasted complete envelope the accounts refuse, which boot keeps quarantined"]
 fn a2_the_live_reconcile_keeps_in_the_file_what_boot_keeps() {
     let a = std::sync::Arc::new(key());
     let b = PeerKeySignatureProvider::from_bytes(&[0x51; 32], MESH_ID.to_owned());
@@ -1863,7 +1864,6 @@ fn a2_the_live_reconcile_keeps_in_the_file_what_boot_keeps() {
 /// the node's OWN copies of `C` and `Y` from every peer that adopted them,
 /// for good, and with them everything the mesh writes on top.
 #[test]
-#[ignore = "A2-1: after a crash the closure takes an API re-entry of a held record by id, and the wire refuses the node's own acknowledged records back for good"]
 fn a2_a_record_reentered_through_the_api_returns_from_a_peer_after_a_crash() {
     use ledger::service::{PostingInput, TransactionInput};
     let author = std::sync::Arc::new(key());
@@ -1965,6 +1965,133 @@ fn a2_a_record_reentered_through_the_api_returns_from_a_peer_after_a_crash() {
         "A2-1: after the crash the node serves neither its C nor its Y, held {:?}, and \
          refuses a peer's copies: {back:?}",
         node.quarantined_ids()
+    );
+    drop(node);
+    let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+}
+
+/// T90 / H-24 (b), decision (36): the same crash, and no peer at all. The
+/// canonical file holds `C` as the closure held it (parent `X`, a record past
+/// the amount cap), the journal holds `C` as the API re-entered it (parents
+/// this node serves) and `Y` on top. Boot meets two copies of one body and,
+/// since T90, serves the one whose parents it holds — before the closure is
+/// walked — so the node's own acknowledged `C` and `Y` are served straight
+/// after the restart, with P2P off.
+///
+/// Bug-catch: drop `prefer_copies_whose_parents_are_served` and boot keeps
+/// the file's copy: the closure takes `C` by its parent and `Y` as its child.
+#[test]
+fn h24_after_a_crash_the_node_serves_its_re_entered_record_and_what_it_wrote_on_top() {
+    use ledger::service::{PostingInput, TransactionInput};
+    let author = std::sync::Arc::new(key());
+    let over = Decimal::from_str_exact("50000000000000000000000").expect("5 × 10^22");
+    let x = signed_transfer(&author, 2, "X pre-upgrade", over, "", 3);
+    let c = signed_transfer(
+        &author,
+        3,
+        "C child",
+        Decimal::from(5),
+        &compute_content_id(&x),
+        4,
+    );
+    let c_id = compute_content_id(&c);
+    // Past `COMPACTION_MIN_CANONICAL_BYTES`, so a write appends to the journal.
+    let Directive::Transaction(mut padding) =
+        signed_transfer(&author, 1, "padding", Decimal::from(1), "", 5)
+    else {
+        unreachable!()
+    };
+    for index in 0..100 {
+        padding.postings[0]
+            .metadata
+            .insert(format!("k{index:03}"), "v".repeat(800));
+    }
+    let padding = a2_resigned(&author, padding, "", 5);
+    let path = scratch_ledger("a2-1-api");
+    std::fs::write(
+        &path,
+        ledger::serialize::full_file_serialize(
+            &[
+                a2_open(&author, "Equity:Opening", 1),
+                a2_open(&author, "Assets:Cash", 2),
+                padding,
+                x,
+                c,
+            ],
+            &[],
+        ),
+    )
+    .expect("write");
+    let mut node = a2_restart(&path, &author);
+    node.compact().expect("the startup compaction");
+    assert!(node.quarantined_ids().contains(&c_id.as_str()), "premise");
+
+    let signing = std::sync::Arc::clone(&author);
+    let sign = move |content_id: &str, parents: &str, lamport: &str| {
+        signing.sign(&SignableMessage {
+            content_id,
+            is_transaction: true,
+            parents,
+            lamport,
+        })
+    };
+    let input = |day: u32, narration: &str, amount: i64| TransactionInput {
+        date: date(day),
+        flag: Flag::Complete,
+        payee: None,
+        narration: Some(narration.to_owned()),
+        tags: vec![],
+        links: vec![],
+        postings: ["Assets:Cash", "Equity:Opening"]
+            .into_iter()
+            .zip([amount, -amount])
+            .map(|(account, number)| PostingInput {
+                account: account.to_owned(),
+                amount: Some(usd(Decimal::from(number))),
+                cost: None,
+                price: None,
+            })
+            .collect(),
+    };
+    node.append_transaction_signing(input(5, "warm-up", 1), sign.clone())
+        .expect("the first write compacts");
+    let reentered = node
+        .append_transaction_signing(input(3, "C child", 5), sign.clone())
+        .expect("re-entered");
+    assert_eq!(reentered.txid, c_id, "the same body, the same id");
+    let y = node
+        .append_transaction_signing(input(6, "Y after", 7), sign)
+        .expect("Y");
+    assert!(
+        node.journal_bytes() > 0,
+        "premise: both are journal records"
+    );
+    drop(node); // no stop compaction
+
+    let mut node = a2_restart(&path, &author);
+    assert!(
+        node.contains_directive(&c_id) && node.contains_directive(&y.txid),
+        "H-24 (b): after the crash C served {}, Y served {}, held {:?}",
+        node.contains_directive(&c_id),
+        node.contains_directive(&y.txid),
+        node.quarantined_ids()
+    );
+    let Some(Directive::Transaction(c_served)) = node.get_directive(&c_id).cloned() else {
+        panic!("C is served as a transaction");
+    };
+    assert!(
+        c_served
+            .parent_ids()
+            .into_iter()
+            .all(|parent| node.contains_directive(parent)),
+        "the served copy of C names only parents this node serves"
+    );
+    node.compact().expect("compaction");
+    drop(node);
+    let node = a2_restart(&path, &author);
+    assert!(
+        node.contains_directive(&c_id) && node.contains_directive(&y.txid),
+        "a fixed point across the next restart"
     );
     drop(node);
     let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
