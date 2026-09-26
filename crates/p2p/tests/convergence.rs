@@ -3421,25 +3421,22 @@ fn l99_a_wrong_mesh_id_keeps_the_clock_and_warns_once_on_boot_and_reload() {
     mesh.assert_converged_among("A6 / L-99 right meshId again", &[a, b], &[]);
 }
 
-/// A6-2 (0926): `every_checked_signature_failed` counts what this node signs
+/// A6-2 (0926): `every_checked_signature_failed` counted what this node signs
 /// itself as a verified signature. The README's stop → edit → start with a
 /// hand `open` appended, restarted under the wrong `meshId`: every history
 /// signature fails in the setters' passes (the release is held), then
 /// `finalize_operator_input` signs the hand line under the wrong domain and
-/// its own `verify_history_pass` accepts it — `signature_verified_total` = 1,
-/// the verdict flips and `verify_own_history` stays silent. The operator gets
+/// its own `verify_history_pass` accepted it — `signature_verified_total` = 1,
+/// the verdict flipped and `verify_own_history` stayed silent. The operator got
 /// one "signature does not verify — was this record edited?" WARN per record
-/// of the history instead of "check meshId / do not author" (L-99's remedy),
-/// and the hand line is signed under a domain every peer refuses. Before T89
-/// the WARN was judged per pass and fired here. The same flip follows one
-/// write the node makes under the wrong domain (L-99's "do not author" is
-/// advisory): at the next boot that write verifies, and every history record
-/// is reported as "edited". (The held release that runs then lowers nothing:
-/// what verified sits above the whole history.)
+/// of the history instead of "check meshId / do not author" (L-99's remedy).
+/// Before T89 the WARN was judged per pass and fired here. Since T92 (L-114,
+/// decision (41)) finalize's own fresh signatures are not counted as verified
+/// history, so it fires again. (The same flip after one WRITE the node makes
+/// under the wrong domain is decision (41)'s residual — see
+/// `l114_one_write_under_the_wrong_domain_hides_the_verdict_at_the_next_boot`.)
 #[test]
-#[ignore = "A6-2: this node's own fresh signatures count as verified ones, so a hand line in the same boot, or one write before the next boot, hides the wrong-meshId WARN"]
 fn a6_2_a_hand_line_in_the_same_boot_does_not_hide_a_wrong_mesh_id() {
-    // (a) The hand line in the same boot.
     let (mut mesh, path) = jumped_history_then_stop_a(9263);
     let a = 0;
     // A hand `open` of a new account: it validates without any of the
@@ -3452,27 +3449,34 @@ fn a6_2_a_hand_line_in_the_same_boot_does_not_hide_a_wrong_mesh_id() {
         1,
         "premise: every history record quarantined, the hand line served"
     );
-    let with_hand_line = logged.contains("EVERY signature");
-    // (b) No hand line; the node authors once despite the WARN, and restarts
-    // under the same config.
+    assert!(
+        logged.contains("EVERY signature"),
+        "every history signature failed under the wrong meshId, yet the WARN that says so (and \
+         says not to author) is missing with a hand line in the boot; logged:\n{logged}"
+    );
+}
+
+/// L-114 (T92), the residual decision (41) accepts: with no hand line, a node
+/// restarted under the wrong `meshId` WARNs that every signature failed and
+/// not to author — the advice is advisory (decision (32)) — and authors once
+/// anyway. At the next boot, under the same config, that write is history
+/// signed under the domain now in use: it verifies, so not EVERY signature
+/// failed, and the history is reported record by record as "edited". Closing
+/// it needs the node to refuse to author while the verdict holds, decision
+/// (41)'s option (b), which was not chosen.
+#[test]
+#[ignore = "documented residual (T92, decision (41)): a write authored under the wrong meshId verifies at the next boot and hides the every-signature-failed WARN; refusing to author was not chosen"]
+fn l114_one_write_under_the_wrong_domain_hides_the_verdict_at_the_next_boot() {
+    let a = 0;
     let (mut mesh, path) = jumped_history_then_stop_a(9270);
     let first = restart_under_mesh_id(&mut mesh, a, path, "another-mesh");
     assert!(first.contains("EVERY signature"), "premise: {first}");
     mesh.replicas[a].open("Assets:Written");
     let path = mesh.stop(a);
     let after_write = restart_under_mesh_id(&mut mesh, a, path, "another-mesh");
-    let after_write_warned = after_write.contains("EVERY signature");
-    eprintln!(
-        "A6-2: EVERY WARN with a hand line in the boot: {with_hand_line}; at the boot after \
-         one write: {after_write_warned}\n(a) logged:\n{logged}\n(b) logged:\n{after_write}"
-    );
     assert!(
-        with_hand_line && after_write_warned,
-        "every history signature failed under the wrong meshId, yet the WARN that says so (and \
-         says not to author) is missing: with a hand line in the boot {}, at the boot after one \
-         write {}",
-        !with_hand_line,
-        !after_write_warned
+        after_write.contains("EVERY signature"),
+        "at the boot after one write the WARN is missing; logged:\n{after_write}"
     );
 }
 
@@ -3663,7 +3667,6 @@ fn l108_hand_lines_child_first_are_served_in_one_boot_and_replicate() {
 /// restart with nothing edited — and, pasted under the running node, refused
 /// by the live reconcile and deleted from the file by the re-persist.
 #[test]
-#[ignore = "A6-3: hand_parented_last keys the sort on the file-spelled id, so a child of an elided-posting hand parent is refused at boot 1 (adopted at boot 2) and deleted on the live path"]
 fn a6_3_a_hand_child_of_an_elided_posting_hand_parent_is_served_in_one_boot() {
     let mut mesh = seeded_mesh(9267, 2);
     let a = 0;

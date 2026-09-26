@@ -63,6 +63,25 @@ const GRAPHQL_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// `iroh::protocol=error` in it (README, "Log volume on a public bind").
 const DEFAULT_LOG_FILTER: &str = "info,iroh::protocol=error";
 
+/// The boot banner for records the signature check quarantined (H-20).
+///
+/// T92 / M-69, decision (40): it defers to the per-record WARNs above it and
+/// names only remedies that work. Before T92 it ended "or delete the edited
+/// block and append a reversing entry instead" — the remedy T84 withdrew from
+/// the ledger's own WARN and the README: deleting the block leaves what
+/// descends from it held (H-23), and the reversing entry then counts twice once
+/// the record returns; after enabling signing over an unsigned history,
+/// following it emptied the served ledger.
+const SIGNATURE_QUARANTINE_BANNER: &str =
+    "ledger records QUARANTINED at boot by the signature check: they stay in the .bean (every \
+     compaction writes them back) but are NOT served and NOT in any balance. The per-record \
+     warnings above give each one's reason. Restore an edited record from a peer's or a \
+     backup's copy; if only a record's openledger-* lines were edited, or it was written before \
+     signing was enabled, delete those lines so it is re-adopted under the same id. Do not \
+     delete the block itself — what descends from it stays held (H-23) — and do not append a \
+     reversing entry for a record that is only held: it would count twice once the record \
+     returns (H-20)";
+
 enum CliAction {
     Serve,
     Version,
@@ -563,11 +582,7 @@ async fn main() {
                 quarantined = quarantined_by_signature,
                 quarantined_total = service.quarantined_count(),
                 directives = service.directive_count(),
-                "ledger records QUARANTINED at boot because their signature does not verify \
-                 — was a record edited by hand? They stay in the .bean (every compaction \
-                 writes them back) but are NOT served and NOT in any balance. History is \
-                 append-only: restore the original line from a peer's copy of the ledger, \
-                 or delete the edited block and append a reversing entry instead (H-20)"
+                "{SIGNATURE_QUARANTINE_BANNER}"
             );
         }
     }
@@ -1060,6 +1075,31 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M-69 (T92, decision (40)): the H-20 boot banner names only remedies
+    /// that work — the per-record reasons, a restored copy, deleting the
+    /// `openledger-*` lines — and warns off the two that do not.
+    ///
+    /// Bug-catch: restore "or delete the edited block and append a reversing
+    /// entry instead" and this fails.
+    #[test]
+    fn m69_the_signature_quarantine_banner_names_only_remedies_that_work() {
+        let banner = SIGNATURE_QUARANTINE_BANNER;
+        assert!(!banner.contains("delete the edited block"), "{banner}");
+        assert!(
+            !banner.contains("append a reversing entry instead"),
+            "{banner}"
+        );
+        for needle in [
+            "per-record",
+            "openledger-* lines",
+            "re-adopted under the same id",
+            "Do not delete the block",
+            "count twice",
+        ] {
+            assert!(banner.contains(needle), "missing {needle:?}: {banner}");
+        }
+    }
 
     /// L-31: booting on a path that does not exist yet must leave the ledger
     /// file at 0600.

@@ -2977,6 +2977,16 @@ pub struct LedgerService {
     /// Refusals whose reason is "signature does not verify", across every
     /// pass (T89 / L-98).
     signature_failed_total: usize,
+    /// Operator input `finalize_operator_input` has just signed, awaiting the
+    /// pass that checks it (T92 / L-114, decision (41)). The pass still checks
+    /// each (a signer and a verifier bound to different mesh ids is what it
+    /// catches), but a signature this node made moments ago says nothing about
+    /// whether the HISTORY verifies, so it does not count towards
+    /// `signature_verified_total`: before T92 one hand line in the same boot —
+    /// or one write before the next — hid the "every signature failed / do not
+    /// author" verdict on a `meshId` or key mismatch, and released the clock
+    /// the verdict had put on hold.
+    signed_by_finalize: HashSet<String>,
     /// Edited records whose clock release is on hold because every signature
     /// checked so far has failed (T89 / L-99, decision (32)) — see
     /// [`Self::verify_history_pass`].
@@ -3999,6 +4009,7 @@ impl LedgerService {
             unverified_history,
             signature_quarantined_total: 0,
             signature_verified_total: 0,
+            signed_by_finalize: HashSet::new(),
             signature_failed_total: 0,
             release_on_hold: BTreeSet::new(),
             refused_history_closure: BTreeSet::new(),
@@ -4184,6 +4195,33 @@ impl LedgerService {
                     slot.insert(directive);
                 }
             }
+        }
+    }
+
+    /// The content id `directive` will be stored under once I2 has resolved
+    /// an elided posting — which is what a hand line naming it as a parent
+    /// spells (T92 / L-128). The file's own id when the body does not resolve
+    /// (the adoption refuses it anyway) or is not a transaction.
+    fn stored_content_id(directive: &Directive) -> String {
+        let Directive::Transaction(txn) = directive else {
+            return compute_content_id(directive);
+        };
+        let mut permissive = AccountState::new();
+        for posting in &txn.postings {
+            let open = Open {
+                date: txn.date,
+                account: posting.account.clone(),
+                currencies: Vec::new(),
+                metadata: BTreeMap::new(),
+            };
+            permissive.record_open(&open, &posting.account);
+        }
+        match validate_transaction(txn, &permissive) {
+            Ok(validated) => compute_content_id(&Directive::Transaction(Transaction {
+                postings: validated.postings,
+                ..txn.clone()
+            })),
+            Err(_) => compute_content_id(directive),
         }
     }
 
@@ -4383,6 +4421,47 @@ impl LedgerService {
             // T84 / H-23: history on an account only a refused entry opened.
             self.quarantine_unservable_history();
         }
+        // T92 / L-121 (decision (42), revised 2026-09-26): L-77 for a hand
+        // `open` adopted at boot, judged here, after the signature pass has
+        // settled which `open`s are served. At boot the node's own edited
+        // `open` — the one the H-23 WARN tells the operator to replace with
+        // "the missing open" — was still in the DAG, so boot's L-77 refused
+        // the remedy as "already open" while the account was open nowhere
+        // anyone could see. Refused now only when a served `open` other than
+        // pending operator input still opens the account, in adoption order
+        // (of two hand `open`s of one new account the second is refused).
+        let mut pending_opens: HashSet<String> = self
+            .unsigned_operator_input
+            .iter()
+            .filter(|id| matches!(self.dag.get(id.as_str()), Some(Directive::Open(_))))
+            .cloned()
+            .collect();
+        let mut already_open: BTreeSet<String> = BTreeSet::new();
+        for content_id in self.unsigned_operator_input.clone() {
+            let Some(Directive::Open(open)) = self.dag.get(&content_id) else {
+                continue;
+            };
+            if self
+                .accounts
+                .is_open_excluding(&open.account, &pending_opens)
+            {
+                warn!(
+                    id = %content_id,
+                    file = %self.file_path.display(),
+                    "quarantining a ledger-file entry, kept in the file as written: {} (L-77)",
+                    ServiceError::AccountAlreadyOpen {
+                        account: open.account.clone(),
+                    }
+                );
+                already_open.insert(content_id);
+            } else {
+                pending_opens.remove(&content_id);
+            }
+        }
+        if !already_open.is_empty() {
+            self.quarantine_out_of_dag(&already_open);
+            self.quarantine_unservable_history();
+        }
         // T84 / M-57, decision (16): the lamport, stamped here for the first
         // time — boot's was a placeholder that never moved the clock — from
         // the clock the signature pass and the L-87 release have settled, in
@@ -4420,6 +4499,10 @@ impl LedgerService {
         }
         if !unstampable.is_empty() {
             self.quarantine_out_of_dag(&unstampable);
+            // T92 / M-64: as the M-54 arm above does — history that relied on
+            // the input just held (an account only its hand `open` opened, a
+            // hand parent) is no longer servable.
+            self.quarantine_unservable_history();
         }
         let ids = std::mem::take(&mut self.unsigned_operator_input);
         // Every file-spelled author left names this node (the rest were
@@ -4462,6 +4545,8 @@ impl LedgerService {
             // else — a signer and a verifier bound to different mesh ids
             // would otherwise sign records every peer refuses.
             self.unverified_history.insert(content_id.clone());
+            // T92 / L-114: but it is not evidence that the history verifies.
+            self.signed_by_finalize.insert(content_id.clone());
         }
         for directive in &reindex {
             self.read_model.reindex_directive(directive);
@@ -4665,11 +4750,19 @@ impl LedgerService {
              missing record from a backup; or, for this node's own record whose envelope \
              lines were edited, delete that block's openledger-* lines so it is re-adopted \
              under the same id; or add the missing open, dated no later than the first \
-             transaction on the account; then restart. Otherwise rebuild this node by the \
-             bootstrap join (H-23)"
+             transaction on the account (where the account's own open is served but dated \
+             after it, correct that open's date instead); then restart. Otherwise rebuild \
+             this node by the bootstrap join (H-23)"
         );
         self.quarantine_out_of_dag(&ids);
-        ids.len()
+        // T92 / M-64, decision (39): to a fixpoint. The rebuild above can
+        // itself refuse pending operator input — a hand-parented line whose
+        // hand parent this rule just held — and that line was exempt from the
+        // walk, so its history descendants were not judged: one of them was
+        // then served over a parent held in the quarantine, silently, and
+        // every later write named it. Each round takes at least one record out
+        // of the DAG, so this ends.
+        ids.len() + self.quarantine_unservable_history()
     }
 
     /// The pass behind [`Self::verify_own_history`], without the
@@ -4685,7 +4778,25 @@ impl LedgerService {
         let mut remaining: BTreeSet<String> = BTreeSet::new();
         let mut verified = 0usize;
         let mut reattributed: Vec<Directive> = Vec::new();
+        // T92 / L-131: an id the file spells twice — a node-written copy boot
+        // loaded as history (and, here, held: its parent is refused, or its
+        // envelope edited) and a hand-typed copy of the same body the operator
+        // added beside it — is in the DAG as the hand copy, pending operator
+        // input. That copy is not history and carries no signature yet; judged
+        // as history it was quarantined ("no openledger-signature") and the
+        // startup compaction dropped the typed block, silently.
+        // `finalize_operator_input` signs it and checks it then.
+        let pending: HashSet<&str> = self
+            .unsigned_operator_input
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut retyped: Vec<String> = Vec::new();
         for content_id in ids {
+            if pending.contains(content_id.as_str()) {
+                retyped.push(content_id);
+                continue;
+            }
             let Some(directive) = self.dag.get(&content_id) else {
                 continue;
             };
@@ -4704,7 +4815,13 @@ impl LedgerService {
                 continue;
             };
             match self.verify_history_directive(&content_id, directive) {
-                HistoryVerdict::Verified => verified += 1,
+                // T92 / L-114: this node's own signature of a moment ago is not
+                // counted as verified history.
+                HistoryVerdict::Verified => {
+                    if !self.signed_by_finalize.remove(&content_id) {
+                        verified += 1;
+                    }
+                }
                 HistoryVerdict::Unverifiable => {
                     remaining.insert(content_id);
                 }
@@ -4714,6 +4831,15 @@ impl LedgerService {
             }
         }
         self.unverified_history = remaining;
+        if !retyped.is_empty() {
+            info!(
+                ids = %retyped.join(", "),
+                file = %self.file_path.display(),
+                "the ledger file spells these records twice — as loaded history and as a line \
+                 typed by hand without an envelope; the typed line is adopted as this node's \
+                 own and signed, and replaces the other copy at the next compaction (L-131)"
+            );
+        }
         if !reattributed.is_empty() {
             for directive in &reattributed {
                 self.read_model.reindex_directive(directive);
@@ -8320,7 +8446,18 @@ impl LedgerService {
             // refused exactly as `open_account` refuses it. Operator input
             // only: a full-envelope `open` is a peer's data (M-09) and joins
             // the lifecycle set at its own position, as it does on the wire.
-            if needs_stamp {
+            //
+            // T92 / L-121: on the live path only. At boot the node's own
+            // `open` of the account may be one the signature pass is about to
+            // hold (edited), which is exactly when the operator adds the hand
+            // `open` the H-23 WARN prescribes; `finalize_operator_input`
+            // judges L-77 once the pass has run. And no longer while a
+            // node-written `open` of the account is held (T85 / L-110,
+            // decision (20), retired 2026-09-26): with I9 the union over every
+            // `open` (T91), a second `open` the mesh may re-supply changes no
+            // verdict, and the refusal made the WARN's own remedy fail — boot
+            // and live alike (L-121, L-125).
+            if needs_stamp && path == AdoptionPath::Live {
                 if let Directive::Open(open) = &directive {
                     if self.accounts.is_open(&open.account) {
                         tally.refuse(
@@ -8330,36 +8467,6 @@ impl LedgerService {
                             }
                             .to_string(),
                         );
-                        return FileAdoption::Refused;
-                    }
-                    // T85 / L-110, decision (20): nor while this node holds a
-                    // node-written `open` of the account in its quarantine
-                    // (edited, or its signature otherwise refused). The mesh
-                    // may still hold that record and re-supply it, and then the
-                    // account would carry two `open`s mesh-wide. At boot the
-                    // same record is still in the DAG when operator input is
-                    // adopted, so the check above refuses it there; this is the
-                    // live reconcile's copy of that verdict. An `open` refused
-                    // under a content rule (the M-51 flood, in
-                    // `refused_history_closure`) does not count: no peer holds
-                    // it, and a hand `open` is the remedy decision (18) names.
-                    if let Some((held_id, _)) = self.live_quarantine().find(|(id, held)| {
-                        matches!(held, Directive::Open(held_open)
-                            if held_open.account == open.account)
-                            && !Self::is_operator_input(held)
-                            && !self.refused_history_closure.contains(*id)
-                    }) {
-                        let reason = format!(
-                            "{}: this node holds a node-written open of it in its quarantine \
-                             ({held_id}), which the mesh may still hold — restore that record \
-                             (from a peer's copy, or by deleting its openledger-* lines if only \
-                             its envelope was edited) instead of opening the account again, or \
-                             the account would carry two opens (L-110)",
-                            ServiceError::AccountAlreadyOpen {
-                                account: open.account.clone(),
-                            }
-                        );
-                        tally.refuse(content_id, reason);
                         return FileAdoption::Refused;
                     }
                 }
@@ -9348,24 +9455,60 @@ fn hand_parented_last(directives: Vec<Directive>) -> Vec<Directive> {
     // Within the group, a line whose hand parent is another line of the group
     // comes after it (stable; a cycle keeps file order, and the L-75 check
     // refuses it as before).
-    let mut pending: Vec<(String, Directive)> = hand_parented
-        .into_iter()
-        .map(|directive| (compute_content_id(&directive), directive))
+    //
+    // T92 / L-128: lines are matched by the id each will be STORED under — a
+    // child names its hand parent by that id, which differs from the file's
+    // when I2 resolves an elided posting — and L-129: Kahn's algorithm, ready
+    // lines taken in file order, instead of a rescan of the group per line
+    // (quadratic: 20,000 lines in a reversed chain took 58 s to boot).
+    let ids: Vec<String> = hand_parented
+        .iter()
+        .map(LedgerService::stored_content_id)
         .collect();
-    let mut ordered: Vec<Directive> = Vec::with_capacity(pending.len());
-    let mut waiting: HashSet<String> = pending.iter().map(|(id, _)| id.clone()).collect();
-    while !pending.is_empty() {
-        let ready = pending.iter().position(|(id, directive)| match directive {
-            Directive::Transaction(txn) => txn
-                .parent_ids()
-                .into_iter()
-                .all(|parent| parent == id.as_str() || !waiting.contains(parent)),
-            _ => true,
-        });
-        let (id, directive) = pending.remove(ready.unwrap_or(0));
-        waiting.remove(&id);
-        ordered.push(directive);
+    let mut position: HashMap<&str, usize> = HashMap::new();
+    for (index, id) in ids.iter().enumerate() {
+        position.entry(id.as_str()).or_insert(index);
     }
+    let mut waiting_on = vec![0usize; hand_parented.len()];
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); hand_parented.len()];
+    for (index, directive) in hand_parented.iter().enumerate() {
+        let Directive::Transaction(txn) = directive else {
+            continue;
+        };
+        let parents: HashSet<&str> = txn.parent_ids().into_iter().collect();
+        for parent in parents {
+            if let Some(&parent_index) = position.get(parent) {
+                if parent_index != index {
+                    waiting_on[index] += 1;
+                    children[parent_index].push(index);
+                }
+            }
+        }
+    }
+    let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<usize>> = waiting_on
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count == 0)
+        .map(|(index, _)| std::cmp::Reverse(index))
+        .collect();
+    let mut order: Vec<usize> = Vec::with_capacity(hand_parented.len());
+    while let Some(std::cmp::Reverse(index)) = ready.pop() {
+        order.push(index);
+        for &child in &children[index] {
+            waiting_on[child] -= 1;
+            if waiting_on[child] == 0 {
+                ready.push(std::cmp::Reverse(child));
+            }
+        }
+    }
+    // What a cycle kept waiting follows, in file order.
+    let placed: HashSet<usize> = order.iter().copied().collect();
+    order.extend((0..hand_parented.len()).filter(|index| !placed.contains(index)));
+    let mut slots: Vec<Option<Directive>> = hand_parented.into_iter().map(Some).collect();
+    let ordered: Vec<Directive> = order
+        .into_iter()
+        .filter_map(|index| slots[index].take())
+        .collect();
     rest.into_iter().chain(ordered).collect()
 }
 
@@ -20683,10 +20826,14 @@ mod tests {
 
     /// L-77: a hand-typed `open` of an account that is already open is
     /// refused on both file paths exactly as `open_account` refuses it, so
-    /// the account's currency constraint cannot be rewritten from the file.
+    /// the account's currency constraint cannot be widened from the file.
+    /// Since T92 (L-121) the file path judges it at boot in
+    /// `finalize_operator_input`, once the signature pass has settled which
+    /// `open`s are served — so the boot half runs gl-node's order.
     ///
-    /// Bug-catch: remove the `is_open` arm in `adopt_file_directive` and the
-    /// re-open is adopted and `currencies("Assets:Cash")` becomes `EUR`.
+    /// Bug-catch: remove the `is_open` arm in `adopt_file_directive` (live) or
+    /// the re-judge in `finalize_operator_input` (boot) and the re-open is
+    /// adopted and `currencies("Assets:Cash")` gains `EUR`.
     #[test]
     fn l77_a_hand_open_of_an_already_open_account_is_refused_on_both_file_paths() {
         const REOPEN: &str = "\n2024-01-01 open Assets:Cash EUR\n";
@@ -20694,9 +20841,12 @@ mod tests {
 
         let (path, _) = signed_node_written_file();
         append_to_file(&path, REOPEN);
-        let (booted, logged) =
-            capture_warnings(|| LedgerService::boot(path.clone(), "test-peer".to_owned()));
-        let mut svc = booted.unwrap();
+        let (mut svc, logged) = capture_warnings(|| {
+            let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+            svc.set_signer(marker_signer());
+            svc.finalize_operator_input();
+            svc
+        });
         assert_eq!(svc.quarantined_count(), 1);
         assert_eq!(svc.unsigned_operator_input_count(), 0);
         assert!(logged.contains("already open"), "{logged}");
@@ -21005,6 +21155,126 @@ mod tests {
             hand.metadata().get(ENVELOPE_KEY_SIGNATURE),
             Some(&marker_signature(hand))
         );
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-131 (T92), the audit's X2 `c1b`: a record the closure holds (its
+    /// parent is over a legacy ceiling) and, beside it in the file, the
+    /// operator's hand-typed copy of the same body — no envelope — to restate
+    /// it. Same body, same id: the hand copy is the DAG's, pending operator
+    /// input. Before T92 the signature pass judged it as history, held it for
+    /// "no openledger-signature", and the startup compaction dropped the typed
+    /// block. Now it is adopted as this node's own, signed at finalisation,
+    /// served, and written by the compaction.
+    ///
+    /// Bug-catch: drop the pending-input skip in `verify_history_pass` and the
+    /// hand copy is held and gone from the file.
+    #[test]
+    fn l131_a_hand_copy_typed_beside_a_held_record_is_adopted_not_dropped() {
+        let (svc, path) = setup_with_signed_accounts();
+        drop(svc);
+        let Directive::Transaction(mut flood) = signed_history_transaction(
+            "over the legacy ceiling",
+            1,
+            ("Assets:Cash", "USD"),
+            "",
+            11,
+        ) else {
+            unreachable!()
+        };
+        flood.postings[0].metadata = (0
+            ..=crate::limits::MAX_POSTING_METADATA_KEYS_PER_TRANSACTION_LEGACY)
+            .map(|index| (format!("k{index}"), "v".to_owned()))
+            .collect();
+        let flood = marker_signed(Directive::Transaction(flood));
+        let held = signed_history_transaction(
+            "child of the flood",
+            2,
+            ("Assets:Cash", "USD"),
+            &compute_content_id(&flood),
+            12,
+        );
+        let id = compute_content_id(&held);
+        let mut typed = held.clone();
+        directive_metadata_mut(&mut typed).retain(|key, _| !key.starts_with("openledger-"));
+        assert_eq!(compute_content_id(&typed), id, "premise: same body");
+        append_to_file(
+            &path,
+            &format!("\n{}", full_file_serialize(&[flood, held, typed], &[])),
+        );
+        let mut svc = t85_boot(&path);
+        assert!(svc.contains_directive(&id), "the typed copy is served");
+        let served = svc.get_directive(&id).unwrap();
+        assert_eq!(
+            served
+                .metadata()
+                .get(ENVELOPE_KEY_AUTHOR)
+                .map(String::as_str),
+            Some("test-peer")
+        );
+        assert!(served.metadata().contains_key(ENVELOPE_KEY_SIGNATURE));
+        assert_eq!(
+            served
+                .metadata()
+                .get(ENVELOPE_KEY_PARENTS)
+                .map(String::as_str),
+            Some(""),
+            "parents this node serves, not the refused flood"
+        );
+        svc.compact().unwrap();
+        drop(svc);
+        let svc = t85_boot(&path);
+        assert!(svc.contains_directive(&id), "and after a restart");
+        remove_ledger_and_journal(&path);
+    }
+
+    /// M-64 (T92, decision (39)), the audit's X1 `n1a`: an own signed chain
+    /// T1 ← R ← T ← P ← C. The operator deleted R's block and P's
+    /// `openledger-lamport` and `openledger-signature` lines (a half envelope:
+    /// operator input with a hand-spelled parent, M-47). The rule holds T (its
+    /// parent exists nowhere); P was exempt from that walk as pending input,
+    /// and the rebuild then refuses it (its hand parent is held). Before T92
+    /// nothing re-ran the rule, so C — signed history naming P — was served
+    /// over a parent held in the quarantine, and every later write named it.
+    ///
+    /// Bug-catch: drop the fixpoint (`ids.len()` alone at the end of
+    /// `quarantine_unservable_history`) and C is served.
+    #[test]
+    fn m64_a_record_whose_hand_parent_the_rebuild_refuses_is_held_too() {
+        let (svc, path) = setup_with_signed_accounts();
+        drop(svc);
+        let cash = ("Assets:Cash", "USD");
+        let t1 = signed_history_transaction("T1", 1, cash, "", 20);
+        let r = signed_history_transaction("R", 2, cash, &compute_content_id(&t1), 21);
+        let t = signed_history_transaction("T", 3, cash, &compute_content_id(&r), 22);
+        let mut p = signed_history_transaction("P", 4, cash, &compute_content_id(&t), 23);
+        let c = signed_history_transaction("C", 5, cash, &compute_content_id(&p), 24);
+        let c_id = compute_content_id(&c);
+        let metadata = directive_metadata_mut(&mut p);
+        metadata.remove(ENVELOPE_KEY_LAMPORT);
+        metadata.remove(ENVELOPE_KEY_SIGNATURE);
+        assert!(
+            LedgerService::is_operator_input(&p),
+            "premise: a half envelope"
+        );
+        append_to_file(
+            &path,
+            &format!("\n{}", full_file_serialize(&[t1, t, p, c], &[])),
+        );
+        let svc = t85_boot(&path);
+        assert!(!svc.contains_directive(&c_id), "C is not served over P");
+        assert!(svc.quarantined_ids().contains(&c_id.as_str()));
+        for directive in svc.dag().directives() {
+            if let Directive::Transaction(txn) = directive {
+                for parent in txn.parent_ids() {
+                    assert!(
+                        svc.contains_directive(parent),
+                        "{} names {parent}, which this node does not serve",
+                        compute_content_id(directive)
+                    );
+                }
+            }
+        }
         remove_ledger_and_journal(&path);
     }
 
@@ -22288,51 +22558,66 @@ mod tests {
         remove_ledger_and_journal(&path);
     }
 
-    /// L-110 (T85, decision (20)): while this node holds a node-written `open`
-    /// of an account in its quarantine (here its date edited, so its
-    /// signature fails), a hand `open` of the same account is refused on the
-    /// live path as boot refuses it (L-77 there): the mesh may still re-supply
-    /// the original, and the account would carry two `open`s. The flood
-    /// `open` refused under a content rule does not block the M-51 remedy.
+    /// L-121 / L-125 (T92, decision (42) as revised 2026-09-26, which retires
+    /// decision (20)): this node's own `open` of an account is held (its date
+    /// edited, so its signature fails). The hand `open` the H-23 WARN
+    /// prescribes — "add the missing open" — is adopted on the live path and at
+    /// boot. Before T92 the live path refused it while the node-written `open`
+    /// was held (T85 / L-110: the mesh may re-supply the original and the
+    /// account carry two `open`s — harmless since T91, I9 being the union over
+    /// every `open`), and boot refused it as "already open" because the edited
+    /// `open` was still in the DAG when operator input was adopted.
     ///
-    /// Bug-catch: drop the quarantine clause in the L-77 check and the live
-    /// reconcile adopts the second `open`.
+    /// Bug-catch: restore boot's L-77 check at adoption and the boot half is
+    /// refused; restore the L-110 clause and the live half is.
     #[test]
-    fn l110_a_hand_open_is_refused_while_a_node_written_open_of_the_account_is_quarantined() {
-        let (mut svc, path) = setup_with_signed_accounts();
-        svc.compact().unwrap();
-        drop(svc);
-        let content = std::fs::read_to_string(&path).unwrap();
-        let edited = content.replacen(
-            "2024-01-01 open Expenses:Food",
-            "2024-01-03 open Expenses:Food",
-            1,
-        );
-        assert_ne!(content, edited, "premise: the open line was found");
-        std::fs::write(&path, edited).unwrap();
+    fn l121_a_hand_open_is_adopted_while_the_nodes_own_edited_open_is_held() {
+        let edited_file = || {
+            let (mut svc, path) = setup_with_signed_accounts();
+            svc.compact().unwrap();
+            drop(svc);
+            let content = std::fs::read_to_string(&path).unwrap();
+            let edited = content.replacen(
+                "2024-01-01 open Expenses:Food",
+                "2024-01-03 open Expenses:Food",
+                1,
+            );
+            assert_ne!(content, edited, "premise: the open line was found");
+            std::fs::write(&path, edited).unwrap();
+            path
+        };
+
+        // Live: the edited open is held, the hand open is typed under a
+        // running node.
+        let path = edited_file();
         let mut svc = t85_boot(&path);
         assert_eq!(svc.quarantined_count(), 1, "the edited open");
         assert!(!svc.accounts().is_open("Expenses:Food"));
-
-        append_to_file(&path, "\n2024-01-04 open Expenses:Food USD\n");
+        append_to_file(&path, "\n2024-01-01 open Expenses:Food USD\n");
         let result = svc.reconcile_file().unwrap();
-        assert_eq!(result.new_directives, 0);
-        assert!(!svc.accounts().is_open("Expenses:Food"), "no second open");
-
-        // The control: a content-refused open never blocks the hand remedy.
-        append_to_file(
-            &path,
-            &format!(
-                "\n{}\n2024-01-05 open Assets:Flood C0001\n",
-                full_file_serialize(&[t85_flood_open()], &[])
-            ),
-        );
+        assert_eq!(result.new_directives, 1, "{result:?}");
+        assert!(svc.accounts().is_open("Expenses:Food"), "adopted live");
+        svc.compact().unwrap();
         drop(svc);
         let svc = t85_boot(&path);
         assert!(
-            svc.accounts().is_open("Assets:Flood"),
-            "the M-51 remedy is adopted"
+            svc.accounts().is_open("Expenses:Food"),
+            "and after a restart"
         );
+        drop(svc);
+        remove_ledger_and_journal(&path);
+
+        // Boot: the hand open is in the file beside the edited one when the
+        // node starts — the stop → edit → start the WARN describes.
+        let path = edited_file();
+        append_to_file(&path, "\n2024-01-01 open Expenses:Food USD\n");
+        let svc = t85_boot(&path);
+        assert!(
+            svc.accounts().is_open("Expenses:Food"),
+            "adopted at boot once the signature pass has held the edited open"
+        );
+        assert_eq!(svc.quarantined_count(), 1, "only the edited open is held");
+        drop(svc);
         remove_ledger_and_journal(&path);
     }
 

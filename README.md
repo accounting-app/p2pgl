@@ -910,11 +910,13 @@ peer's copy. A hand-typed `openledger-parents` line must name records this node
 quarantine (a quarantined record is never served), is refused, because a signed
 record with a parent nobody can resolve orphans everything written after it. A
 hand-typed `open` of an account that is already open is refused exactly as the
-API refuses it — and so is one of an account whose node-written `open` this node
-holds in its quarantine (edited, say): the mesh may still re-supply that `open`,
-and the account would then carry two. Restore the quarantined one instead. An
-`open` refused because no peer accepts it (over the 4,096-currency ceiling) does
-not count; opening the account by hand is the remedy there.
+API refuses it. "Already open" is judged against what this node serves: when
+its own `open` of the account is held (you edited it, say, so its signature no
+longer verifies), a hand-typed `open` is adopted — at boot as well as under a
+running node — and is the remedy the quarantine warning names. If a peer later
+re-supplies the original `open`, the account carries both, which changes
+nothing: a transaction may use any currency listed by any `open` dated on or
+before it.
 
 Fixing a node-written record **and** appending new lines in the same edit is
 safe. Boot stamps your new lines' parents before it has checked the signatures

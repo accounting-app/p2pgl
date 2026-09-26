@@ -454,6 +454,26 @@ impl AccountState {
         )
     }
 
+    /// Whether the account is currently open counting only the lifecycle
+    /// events whose content id is not in `exclude` (T92 / L-121): "is it open
+    /// without these pending hand-typed `open`s", the question L-77 asks of
+    /// operator input once the signature pass has settled what is served.
+    pub fn is_open_excluding(
+        &self,
+        account: &str,
+        exclude: &std::collections::HashSet<String>,
+    ) -> bool {
+        self.events.get(account).is_some_and(|events| {
+            matches!(
+                events
+                    .iter()
+                    .rev()
+                    .find(|(key, _)| !exclude.contains(&key.content_id)),
+                Some((_, LifecycleEvent::Open { .. }))
+            )
+        })
+    }
+
     /// Returns true if the account is open for a transaction dated `date`.
     pub fn is_open_at(&self, account: &str, date: NaiveDate) -> bool {
         self.check_account_open(account, date).is_ok()

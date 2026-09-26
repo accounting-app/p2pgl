@@ -2110,7 +2110,6 @@ fn h24_after_a_crash_the_node_serves_its_re_entered_record_and_what_it_wrote_on_
 /// account stays unopened until the operator repeats the edit with the node
 /// stopped.
 #[test]
-#[ignore = "A2-2: the L-110 clause refuses the remedy its own WARN names (strip the envelope) and the compaction reverts it"]
 fn a2_the_l110_remedy_followed_under_a_running_node_opens_the_account() {
     let a = std::sync::Arc::new(key());
     let (mut node, path) = a2_node_with_accounts("a2-2", &a);
@@ -2150,19 +2149,10 @@ fn a2_the_l110_remedy_followed_under_a_running_node_opens_the_account() {
     node.compact().expect("the startup compaction");
     assert!(!node.accounts().is_open("Expenses:Food"), "premise: held");
 
-    let mut text = std::fs::read_to_string(&path).expect("read");
-    text.push_str("\n2024-01-02 open Expenses:Food USD\n");
-    std::fs::write(&path, text).expect("write");
-    node.reconcile_file().expect("reconcile");
-    assert!(!node.accounts().is_open("Expenses:Food"), "premise: L-110");
-
-    // The WARN's remedy, as written: drop the hand open, strip the envelope.
-    let text = std::fs::read_to_string(&path).expect("read");
-    std::fs::write(
-        &path,
-        text.replace("\n2024-01-02 open Expenses:Food USD\n", "\n"),
-    )
-    .expect("write");
+    // The remedy for an envelope-only edit, as the WARN words it: strip the
+    // envelope. (T92, decision (42) as revised 2026-09-26: the hand `open`
+    // this test first typed — refused live by L-110 before T92 — is now
+    // adopted, see `l121_…`; the strip is exercised on its own here.)
     edit_food_block(&|line| (!line.contains("openledger-")).then(|| line.to_owned()));
     node.reconcile_file().expect("reconcile");
     let live = node.accounts().is_open("Expenses:Food");

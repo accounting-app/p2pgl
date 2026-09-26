@@ -2546,34 +2546,42 @@ fn a1_a_hand_line_spelling_the_placeholder_author_is_refused_on_a_signing_node()
 }
 
 /// The T79 residual's shape at boot (A1 hunt (2)): the history `open` of an
-/// account is edited, so the signature pass quarantines it; a hand re-`open`
-/// of the account was refused at adoption as already open (the edited copy
-/// was still in the DAG), and a hand transaction on it — valid at adoption —
-/// no longer validates once the pass has run, so the rebase refuses it with
-/// it. Everything is held in the file; nothing half-stamped is served; the
-/// reboot is a fixed point. (Conservative: every peer holds the original
-/// `open`, so the transaction would replicate; the live reconcile adopts both
-/// hand lines at the next hand edit — see the A1 report.)
+/// account is edited, so the signature pass quarantines it; the operator
+/// appends a hand re-`open` of the account and a hand transaction on it.
+/// Before T92 the hand `open` was refused at adoption as already open (the
+/// edited copy was still in the DAG) and the transaction went with it — the
+/// H-23 WARN's own remedy, "add the missing open", refused. Since T92 (L-121,
+/// decision (42) as revised 2026-09-26) L-77 is judged after the signature
+/// pass: the hand `open` (the original `open`'s body, so the original id) and
+/// the hand transaction are adopted, the account's history (which only the
+/// edited `open` opened) is served again, and only the edited `open` is held. `assert_holds` checks that a fresh peer adopts
+/// everything served and that the reboot is a fixed point.
 ///
-/// Revert-proof: drop the `validate_transaction` call in
-/// `rebase_operator_input` (0924 R7) and the hand transaction is served.
+/// Bug-catch: judge L-77 at boot adoption again and nothing hand-typed is
+/// adopted.
 #[test]
-fn a1_an_edited_open_with_a_hand_reopen_and_transaction_is_held_whole() {
+fn a1_an_edited_open_with_a_hand_reopen_and_transaction_is_served_through_the_reopen() {
     let report = assert_holds(
         Operator::EditOpenPlusHandReopenAndTransaction,
         55,
         0,
         Checks::ALL,
     );
-    assert!(report.adopted.is_empty(), "nothing hand-typed is served");
-    // The edited open, the hand re-open and the hand transaction — with, since
-    // T84, the history on the account only the edited open opened here (a
-    // peer holding the original open re-supplies it, and them).
-    assert_refused_with_descendants(
-        &report.first.expect("ran"),
-        &generate_fixture(55),
-        3,
-        "edited open",
+    // The hand `open` spells the ORIGINAL `open`'s body, so it is the truth's
+    // id, served again (and signed as this node's own); the one id the truth
+    // did not hold is the hand transaction.
+    assert_eq!(
+        report.adopted.len(),
+        1,
+        "the hand transaction is adopted: {:?}",
+        report.adopted.keys().collect::<Vec<_>>()
+    );
+    let first = report.first.expect("ran");
+    assert_eq!(
+        first.quarantined_ids.len(),
+        1,
+        "only the edited open is held: {:?}",
+        first.quarantined_ids
     );
 }
 
@@ -3146,7 +3154,6 @@ fn a1_0926_1_a_restart_with_nothing_edited_serves_what_the_running_node_served()
 /// Fails at HEAD: check 6 names the child, and the reboot changes the
 /// served set.
 #[test]
-#[ignore = "A1-2: finalize's ceiling refusal quarantines operator input without re-running the served-set rule; a record naming it stays served"]
 fn a1_0926_2_a_ceiling_refused_hand_line_leaves_nothing_served_over_it() {
     let truth = generate_fixture(62);
     let mut blocks = split_blocks(&truth.text);
@@ -3204,7 +3211,6 @@ fn a1_0926_2_a_ceiling_refused_hand_line_leaves_nothing_served_over_it() {
 ///
 /// Fails at HEAD: after the remedy the account's transactions are still held.
 #[test]
-#[ignore = "A1-3: the H-23 remedy 'add the missing open' is refused (L-77) for an open dated after its transactions"]
 fn a1_0926_3_the_add_the_missing_open_remedy_frees_what_a_late_open_held() {
     let truth = generate_fixture(63);
     let mutation = mutate(&truth, Operator::EditOpenDateAfterItsTransactions, 0).unwrap();
