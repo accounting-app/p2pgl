@@ -186,8 +186,13 @@ pub struct VerifyResult {
     pub balance_assertions: BalanceAssertionReport,
     /// Content ids of the records this node holds in its quarantine — in the
     /// file, NOT in the DAG, NOT in any balance and NOT served (T81 / M-51,
-    /// M-52). Sorted. The boot log names why each is there.
+    /// M-52). Sorted. The boot log names why each is there. At most 1,000
+    /// (`MAX_LISTED_QUARANTINED`; T88 / L-103) — `quarantinedTotal` is the
+    /// full count.
     pub quarantined: Vec<String>,
+    /// How many records the quarantine holds in all, listed or not (T88 /
+    /// L-103). Saturates at `i32::MAX`.
+    pub quarantined_total: i32,
     /// Blocks held as unparsable text, which have no content id (L-45).
     pub unparsable_blocks: i32,
 }

@@ -259,7 +259,19 @@ pub struct OrphanBuffer {
     /// so the chain arrives parent before child and stages without buffering.
     /// A hint only — it orders what is asked for, never what is accepted —
     /// bounded by [`MAX_PARENT_HINT_IDS`] ids and aged out with the orphans.
-    parent_hints: HashMap<String, (Vec<String>, Instant)>,
+    ///
+    /// T88 / L-107, decision (28): each hint also names the peer whose
+    /// delivery left it, and no peer may hold more than
+    /// [`MAX_PARENT_HINT_IDS_PER_PEER`] of the table — before T88 one peer
+    /// serving ~33k orphans that name absent parents filled it for everyone,
+    /// and an honest chain join crawled at the pre-T83 speed.
+    parent_hints: HashMap<String, (Vec<String>, Instant, Option<String>)>,
+    /// Ids held in `parent_hints` per delivering peer (T88).
+    parent_hint_ids_per_peer: HashMap<String, usize>,
+    /// A lower bound on every hint's time, so `evict_expired` sweeps the
+    /// hints only when one may have aged out (T88: before, only a full table
+    /// ever dropped an expired hint). `None` when there are none.
+    oldest_hint_at: Option<Instant>,
     /// Ids held in `parent_hints`, keys and parents together.
     parent_hint_ids: usize,
 }
@@ -269,6 +281,12 @@ pub struct OrphanBuffer {
 /// a hint is not recorded (after expired ones are dropped); a hint only
 /// orders the next Want, so a full table costs speed, never correctness.
 pub const MAX_PARENT_HINT_IDS: usize = 65_536;
+
+/// The most of [`MAX_PARENT_HINT_IDS`] one delivering peer's refused orphans
+/// may hold (T88 / L-107, decision (28)): a quarter, 16,384 ids — the links of
+/// an ~8,000-directive chain past the per-peer orphan cap — so at least three
+/// other peers' hints always fit beside a hostile one's.
+pub const MAX_PARENT_HINT_IDS_PER_PEER: usize = MAX_PARENT_HINT_IDS / 4;
 
 impl OrphanBuffer {
     pub fn new() -> Self {
@@ -286,6 +304,8 @@ impl OrphanBuffer {
             sweeps: 0,
             refusals: RefusalCache::new(),
             parent_hints: HashMap::new(),
+            parent_hint_ids_per_peer: HashMap::new(),
+            oldest_hint_at: None,
             parent_hint_ids: 0,
         }
     }
@@ -299,39 +319,153 @@ impl OrphanBuffer {
         }
         self.parent_hints
             .get(id)
-            .map(|(parents, _)| parents.clone())
+            .map(|(parents, _, _)| parents.clone())
             .unwrap_or_default()
     }
 
+    /// Drop from `want` every id that can only wait on something `peer`
+    /// already served a copy of that was refused for good — a buffered or
+    /// hinted orphan whose missing parents are all refused-for-good for that
+    /// peer, or are themselves dropped here (transitively) — and return how
+    /// many were dropped (T88 / L-106, decision (27)).
+    ///
+    /// The refusal cache (L-34) stops the Want of the refused record itself,
+    /// but its descendants are MISSING a parent, which is retried, never
+    /// refused, so before T88 a peer serving the subtree under a record every
+    /// node refuses made this node re-fetch, re-parse and re-verify all of it
+    /// every round, forever. Dropped per peer and for the refusal cache's
+    /// TTL, like the parent: a copy from another peer, or after the TTL, is
+    /// asked for as before. An orphan also waiting on an account is kept (an
+    /// `open` can still arrive).
+    pub fn retain_not_doomed(&self, peer: &str, want: &mut Vec<String>, now: Instant) -> usize {
+        let mut doomed: HashSet<String> = HashSet::new();
+        loop {
+            let before = doomed.len();
+            for id in want.iter() {
+                if doomed.contains(id) {
+                    continue;
+                }
+                let (parents, accounts_pending) = match self.entries.get(id) {
+                    Some(entry) => (
+                        entry.missing_parents.as_slice(),
+                        !entry.missing_accounts.is_empty(),
+                    ),
+                    None => match self.parent_hints.get(id) {
+                        Some((parents, _, _)) => (parents.as_slice(), false),
+                        None => continue,
+                    },
+                };
+                if accounts_pending || parents.is_empty() {
+                    continue;
+                }
+                if parents.iter().all(|parent| {
+                    doomed.contains(parent) || self.refusals.is_refused(peer, parent, now)
+                }) {
+                    doomed.insert(id.clone());
+                }
+            }
+            if doomed.len() == before {
+                break;
+            }
+        }
+        if doomed.is_empty() {
+            return 0;
+        }
+        let before = want.len();
+        want.retain(|id| !doomed.contains(id));
+        before - want.len()
+    }
+
     /// Remember that `id` was refused for lack of room while missing
-    /// `parents` (T83 / L-95) — see [`Self::parent_hints`].
-    fn remember_parent_hint(&mut self, id: &str, parents: &[String], now: Instant) {
+    /// `parents` (T83 / L-95) — see [`Self::parent_hints`] — charged to
+    /// `from_peer`'s share (T88 / L-107).
+    fn remember_parent_hint(
+        &mut self,
+        id: &str,
+        parents: &[String],
+        now: Instant,
+        from_peer: Option<&str>,
+    ) {
         if parents.is_empty() || self.parent_hints.contains_key(id) {
             return;
         }
         let cost = 1 + parents.len();
-        if self.parent_hint_ids + cost > MAX_PARENT_HINT_IDS {
-            // Expired hints first; the counter is recomputed below.
-            self.parent_hints
-                .retain(|_, (_, seen)| now.saturating_duration_since(*seen) < MAX_ORPHAN_AGE);
-            self.parent_hint_ids = self
-                .parent_hints
-                .values()
-                .map(|(parents, _)| 1 + parents.len())
-                .sum();
-            if self.parent_hint_ids + cost > MAX_PARENT_HINT_IDS {
+        let peer_held = |this: &Self| {
+            from_peer
+                .and_then(|peer| this.parent_hint_ids_per_peer.get(peer))
+                .copied()
+                .unwrap_or(0)
+        };
+        if self.parent_hint_ids + cost > MAX_PARENT_HINT_IDS
+            || peer_held(self) + cost > MAX_PARENT_HINT_IDS_PER_PEER
+        {
+            // Expired hints first — only when one may have aged out, so a
+            // peer at its share cannot make every refusal a full pass.
+            self.sweep_expired_hints(now);
+            if self.parent_hint_ids + cost > MAX_PARENT_HINT_IDS
+                || peer_held(self) + cost > MAX_PARENT_HINT_IDS_PER_PEER
+            {
                 return;
             }
         }
         self.parent_hint_ids += cost;
+        if let Some(peer) = from_peer {
+            *self
+                .parent_hint_ids_per_peer
+                .entry(peer.to_owned())
+                .or_insert(0) += cost;
+        }
+        self.oldest_hint_at = Some(self.oldest_hint_at.map_or(now, |oldest| oldest.min(now)));
+        self.parent_hints.insert(
+            id.to_owned(),
+            (parents.to_vec(), now, from_peer.map(str::to_owned)),
+        );
+    }
+
+    /// Drop hints older than [`MAX_ORPHAN_AGE`] and recompute the counters —
+    /// only when one may have expired (T88): a full table, or a peer at its
+    /// share, must not make every refused orphan a pass over the table.
+    fn sweep_expired_hints(&mut self, now: Instant) {
+        let Some(oldest) = self.oldest_hint_at else {
+            return;
+        };
+        if now.saturating_duration_since(oldest) <= MAX_ORPHAN_AGE {
+            return;
+        }
         self.parent_hints
-            .insert(id.to_owned(), (parents.to_vec(), now));
+            .retain(|_, (_, seen, _)| now.saturating_duration_since(*seen) < MAX_ORPHAN_AGE);
+        self.parent_hint_ids = 0;
+        self.parent_hint_ids_per_peer.clear();
+        self.oldest_hint_at = None;
+        for (parents, seen, peer) in self.parent_hints.values() {
+            let cost = 1 + parents.len();
+            self.parent_hint_ids += cost;
+            if let Some(peer) = peer {
+                *self
+                    .parent_hint_ids_per_peer
+                    .entry(peer.clone())
+                    .or_insert(0) += cost;
+            }
+            self.oldest_hint_at = Some(
+                self.oldest_hint_at
+                    .map_or(*seen, |oldest| oldest.min(*seen)),
+            );
+        }
     }
 
     /// Forget the hint for `id` (it was buffered, or it arrived).
     fn forget_parent_hint(&mut self, id: &str) {
-        if let Some((parents, _)) = self.parent_hints.remove(id) {
-            self.parent_hint_ids = self.parent_hint_ids.saturating_sub(1 + parents.len());
+        if let Some((parents, _, peer)) = self.parent_hints.remove(id) {
+            let cost = 1 + parents.len();
+            self.parent_hint_ids = self.parent_hint_ids.saturating_sub(cost);
+            if let Some(peer) = peer {
+                if let Some(held) = self.parent_hint_ids_per_peer.get_mut(&peer) {
+                    *held = held.saturating_sub(cost);
+                    if *held == 0 {
+                        self.parent_hint_ids_per_peer.remove(&peer);
+                    }
+                }
+            }
         }
     }
 
@@ -410,7 +544,7 @@ impl OrphanBuffer {
         }
 
         if self.entries.len() >= MAX_ORPHANS {
-            self.remember_parent_hint(&id, &missing_parents, now);
+            self.remember_parent_hint(&id, &missing_parents, now, from_peer.as_deref());
             return OrphanInsert::BudgetExhausted;
         }
 
@@ -419,19 +553,19 @@ impl OrphanBuffer {
         // is the entry's full cost, not its body alone (L-20).
         let cost_bytes = entry_cost_bytes(&id, &directive, &missing_parents, &missing_accounts);
         if self.total_bytes.saturating_add(cost_bytes) > self.max_bytes {
-            self.remember_parent_hint(&id, &missing_parents, now);
+            self.remember_parent_hint(&id, &missing_parents, now, from_peer.as_deref());
             return OrphanInsert::BudgetExhausted;
         }
 
         if let Some(ref peer_id) = from_peer {
             let count = self.peer_counts.get(peer_id).copied().unwrap_or(0);
             if count >= MAX_ORPHANS_PER_PEER {
-                self.remember_parent_hint(&id, &missing_parents, now);
+                self.remember_parent_hint(&id, &missing_parents, now, from_peer.as_deref());
                 return OrphanInsert::BudgetExhausted;
             }
             let bytes = self.peer_bytes.get(peer_id).copied().unwrap_or(0);
             if bytes.saturating_add(cost_bytes) > self.max_bytes_per_peer {
-                self.remember_parent_hint(&id, &missing_parents, now);
+                self.remember_parent_hint(&id, &missing_parents, now, from_peer.as_deref());
                 return OrphanInsert::BudgetExhausted;
             }
         }
@@ -606,6 +740,7 @@ impl OrphanBuffer {
     /// costs only what it evicts.
     pub fn evict_expired(&mut self, now: Instant) -> Vec<String> {
         self.refusals.evict_expired(now);
+        self.sweep_expired_hints(now);
         let Some(oldest) = self.oldest_buffered_at else {
             return Vec::new();
         };
@@ -807,12 +942,112 @@ mod tests {
         let mut bounded = OrphanBuffer::new();
         let now = Instant::now();
         for index in 0..MAX_PARENT_HINT_IDS / 2 {
-            bounded.remember_parent_hint(&format!("h{index}"), &[format!("p{index}")], now);
+            bounded.remember_parent_hint(&format!("h{index}"), &[format!("p{index}")], now, None);
         }
         assert_eq!(bounded.parent_hint_ids, MAX_PARENT_HINT_IDS);
-        bounded.remember_parent_hint("one-more", &["p".to_owned()], now);
+        bounded.remember_parent_hint("one-more", &["p".to_owned()], now, None);
         assert!(bounded.known_missing_parents("one-more").is_empty());
         assert_eq!(bounded.parent_hints.len(), MAX_PARENT_HINT_IDS / 2);
+    }
+
+    /// L-107 (T88, decision (28)): one delivering peer's refused orphans may
+    /// hold at most `MAX_PARENT_HINT_IDS_PER_PEER` of the hint table, so
+    /// another peer's hints still fit (A6-2 / X2-2: one peer filled the whole
+    /// table and every honest chain join crawled).
+    ///
+    /// Bug-catch: drop the per-peer check in `remember_parent_hint` and the
+    /// hostile peer takes the table and the honest hint is not recorded.
+    #[test]
+    fn l107_one_peer_cannot_take_more_than_its_share_of_the_hint_table() {
+        let mut buffer = OrphanBuffer::new();
+        let now = Instant::now();
+        for index in 0..MAX_PARENT_HINT_IDS / 2 {
+            buffer.remember_parent_hint(
+                &format!("hostile{index}"),
+                &[format!("absent{index}")],
+                now,
+                Some("hostile"),
+            );
+        }
+        assert_eq!(
+            buffer.parent_hint_ids_per_peer.get("hostile").copied(),
+            Some(MAX_PARENT_HINT_IDS_PER_PEER),
+            "the hostile peer stops at its share"
+        );
+        assert_eq!(buffer.parent_hint_ids, MAX_PARENT_HINT_IDS_PER_PEER);
+        buffer.remember_parent_hint(
+            "honest-link",
+            &["honest-parent".to_owned()],
+            now,
+            Some("honest"),
+        );
+        assert_eq!(
+            buffer.known_missing_parents("honest-link"),
+            vec!["honest-parent".to_owned()],
+            "another peer's hint still fits"
+        );
+        buffer.forget_parent_hint("honest-link");
+        assert!(!buffer.parent_hint_ids_per_peer.contains_key("honest"));
+    }
+
+    /// L-107 (T88): hints age out with the orphans' sweep, not only when the
+    /// table is full.
+    ///
+    /// Bug-catch: drop the hint sweep from `evict_expired` and the hint stays.
+    #[test]
+    fn l107_expired_hints_are_swept_with_the_orphans() {
+        let mut buffer = OrphanBuffer::new();
+        let then = Instant::now();
+        buffer.remember_parent_hint("old", &["p".to_owned()], then, Some("peer"));
+        buffer.evict_expired(then + MAX_ORPHAN_AGE + Duration::from_secs(1));
+        assert!(buffer.known_missing_parents("old").is_empty());
+        assert_eq!(buffer.parent_hint_ids, 0);
+        assert!(buffer.parent_hint_ids_per_peer.is_empty());
+    }
+
+    /// L-106 (T88, decision (27)): a peer served X, this node refused X for
+    /// good, and the same peer's children C (and grandchild G, waiting on C)
+    /// are buffered. The Want for that peer drops C and G — they can only
+    /// wait on X — and keeps an orphan waiting on something else, one also
+    /// waiting on an account, and everything for any other peer (X2 `r3`: 50
+    /// re-verifications a round, forever).
+    ///
+    /// Bug-catch: make `retain_not_doomed` a no-op and C and G stay wanted.
+    #[test]
+    fn l106_what_can_only_wait_on_a_record_this_peer_had_refused_is_not_wanted() {
+        let mut buffer = OrphanBuffer::new();
+        let now = Instant::now();
+        let x = "a".repeat(64);
+        assert!(buffer.refusals_mut().record("peer", &x, now));
+        let child = |name: &str| (name.to_owned(), make_directive(name));
+        let (c, d) = child("c");
+        buffer.insert(c.clone(), d, vec![x.clone()], Some("peer".to_owned()));
+        let (g, d) = child("g");
+        buffer.insert(g.clone(), d, vec![c.clone()], Some("peer".to_owned()));
+        let (other, d) = child("other");
+        buffer.insert(
+            other.clone(),
+            d,
+            vec!["b".repeat(64)],
+            Some("peer".to_owned()),
+        );
+        let (on_account, d) = child("on-account");
+        buffer.insert_waiting(
+            on_account.clone(),
+            d,
+            vec![x.clone()],
+            vec!["Assets:Later".to_owned()],
+            Some("peer".to_owned()),
+        );
+        let wanted = vec![g.clone(), c.clone(), other.clone(), on_account.clone()];
+
+        let mut want = wanted.clone();
+        assert_eq!(buffer.retain_not_doomed("peer", &mut want, now), 2);
+        assert_eq!(want, vec![other.clone(), on_account.clone()]);
+
+        let mut want = wanted.clone();
+        assert_eq!(buffer.retain_not_doomed("another-peer", &mut want, now), 0);
+        assert_eq!(want, wanted, "per peer");
     }
 
     #[test]

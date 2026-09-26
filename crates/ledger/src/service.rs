@@ -6290,6 +6290,21 @@ impl LedgerService {
         self.live_quarantine().map(|(id, _)| id).collect()
     }
 
+    /// The first `limit` of [`Self::quarantined_ids`], in id order, and how
+    /// many there are in all — one pass, no list longer than `limit` built
+    /// (T88 / L-103: the GraphQL `verify` field, which returned every id).
+    pub fn quarantined_ids_capped(&self, limit: usize) -> (Vec<String>, usize) {
+        let mut listed = Vec::new();
+        let mut total = 0usize;
+        for (id, _) in self.live_quarantine() {
+            if listed.len() < limit {
+                listed.push(id.to_owned());
+            }
+            total += 1;
+        }
+        (listed, total)
+    }
+
     /// Canonical text of the directives staged since the last commit.
     ///
     /// `O(staged)`, not `O(ledger)` — this is the whole of T44's goal (a). The

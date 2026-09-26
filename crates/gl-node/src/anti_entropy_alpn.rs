@@ -1282,6 +1282,18 @@ async fn run_head_exchange(
     if suppressed > 0 {
         debug!(peer = %remote, suppressed, "not re-wanting directives this peer served that were refused for good");
     }
+    // T88 / L-106: nor what can only wait on such a record — the buffered
+    // descendants of a directive this peer served and this node refused for
+    // good. Their missing parent is retried, never refused, so without this
+    // the whole subtree was re-sent, re-parsed and re-verified every round.
+    let doomed = handler.orphan_buffer.read().await.retain_not_doomed(
+        &remote.to_string(),
+        &mut want,
+        std::time::Instant::now(),
+    );
+    if doomed > 0 {
+        debug!(peer = %remote, doomed, "not re-wanting directives that can only wait on one this peer served and was refused for good");
+    }
     // T72 / L-69: likewise for ids the adoption ratchet refused, while the
     // clock read above has not reached the point where that verdict can
     // change. Read under the same guard as the diff, so the two agree.
@@ -1684,6 +1696,29 @@ pub(crate) struct SupplyOutcome {
 /// [`apply_supply_entries_from`]).
 const PHASE_ONE_WEIGHT_BUDGET: usize = p2p::protocol::MAX_MESSAGE_SIZE as usize;
 
+/// The most parsed weight phase 1 holds on one connection beyond what the
+/// connection limiter's byte budget covers (T88 / M-62, decision (26)): 1 MiB.
+///
+/// T83 (L-90) stopped a failed byte charge from flushing a one-directive
+/// chunk, so a peer whose budget was spent no longer cost a commit and fsync
+/// per directive — but what the budget could not cover was then held
+/// uncharged up to [`PHASE_ONE_WEIGHT_BUDGET`] (16 MiB) per connection:
+/// ~460–512 MiB per peer over its 32 connections, 4 GiB across the global
+/// connection cap, against documented budgets of 32 MiB and 256 MiB. Past
+/// this residue the chunk is staged, as before T83 but per ~1 MiB of weight,
+/// not per directive; a peer's uncharged hold is then at most its connection
+/// count in MiB — about its own byte budget again — and one directive of
+/// weight above that (the pre-T83 residual).
+const UNCHARGED_RESIDUE_CAP: usize = 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// The most parsed weight phase 1 held uncharged on this thread since the
+    /// last reset (T88 tests; the unit tests drive phase 1 on a current-thread
+    /// runtime, so a thread-local is exact and isolated from other tests).
+    static PHASE_ONE_MAX_UNCHARGED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// What phase 1 holds for phase 2: validated directives in arrival order, each
 /// with its serialized length, plus the exact record they would become and
 /// their resident weight (T77).
@@ -1888,9 +1923,9 @@ async fn apply_supply_entries_from(
         // budget was exhausted every directive failed its charge, so each
         // 256-entry frame became 256 commits and fsyncs under the write
         // permit. Now the charge below is best effort: what it cannot cover
-        // is held uncharged, never more than `PHASE_ONE_WEIGHT_BUDGET` per
-        // connection — and only connections whose frame body WAS charged
-        // get here, so the uncharged hold is bounded by the charged bodies.
+        // is held uncharged — since T88 at most `UNCHARGED_RESIDUE_CAP` per
+        // connection (M-62) — and only connections whose frame body WAS
+        // charged get here.
         let fits = chunk.weight.saturating_add(resident) <= PHASE_ONE_WEIGHT_BUDGET;
         if !fits && !chunk.is_empty() {
             let verdict = stage_and_commit_batch(
@@ -1914,11 +1949,45 @@ async fn apply_supply_entries_from(
             }
         }
         // Charge what the chunk now holds, as far as the budget allows (see
-        // above).
-        let _ = weight.grow_to(base + chunk.weight.saturating_add(resident));
+        // above). T88 / M-62: and never hold more than
+        // `UNCHARGED_RESIDUE_CAP` beyond what the budget covered — stage the
+        // chunk first when adding this directive would.
+        let target = base + chunk.weight.saturating_add(resident);
+        if !weight.grow_to(target)
+            && target.saturating_sub(weight.held()) > UNCHARGED_RESIDUE_CAP
+            && !chunk.is_empty()
+        {
+            let verdict = stage_and_commit_batch(
+                handler,
+                std::mem::take(&mut chunk),
+                remote,
+                &mut outcome,
+                &mut stage_refused,
+                &mut ratcheted,
+            )
+            .await;
+            weight.shrink_to(base);
+            if verdict != ChunkVerdict::Durable
+                && handler
+                    .supply_backoff
+                    .is_active(remote, std::time::Instant::now())
+            {
+                deferring = true;
+                outcome.deferred += 1;
+                continue;
+            }
+            let _ = weight.grow_to(base + resident);
+        }
         // Preserve arrival order so an open/parent earlier in the batch is
         // visible to a later child's checks in phase 2.
         chunk.push(directive, bytes, resident);
+        #[cfg(test)]
+        PHASE_ONE_MAX_UNCHARGED.with(|max| {
+            max.set(
+                max.get()
+                    .max((base + chunk.weight).saturating_sub(weight.held())),
+            );
+        });
     }
 
     // ── Phase 2: one ledger write lock per chunk (M-15) ─────────────────
@@ -7552,6 +7621,109 @@ pub(crate) mod tests {
         assert!(svc.get_directive(&fixture.poison.id).is_none());
     }
 
+    /// L-106 (T88, decision (27)) KEY TEST, end to end over QUIC. A peer
+    /// serves X — a transaction with an amount past the cap, refused for good
+    /// at intake — and X's child C and grandchild G. L-34 stops the Want of X
+    /// after the first exchange; before T88, C and G (buffered, MISSING a
+    /// parent, which is retried) were asked for, re-sent, re-parsed and
+    /// re-verified on every exchange, forever (X2 `r3`: 50 a round). They can
+    /// only wait on X, so they are asked for once. Nothing is staged.
+    ///
+    /// Bug-catch: drop the `retain_not_doomed` call in the Want session and C
+    /// and G are wanted three times.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn l106_the_subtree_under_a_record_refused_for_good_is_wanted_once() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        let endpoint_source = bind_direct_endpoint().await;
+        let endpoint_sink = bind_direct_endpoint().await;
+        let author = iroh::SecretKey::generate().public();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let fixture = refusal_fixture(
+            temp_dir.path(),
+            &author.to_string(),
+            &[endpoint_source.id().to_string()],
+        );
+        let handler_sink = refusal_sink(temp_dir.path(), &fixture).await;
+
+        let hand_entry = |body: String, lamport: u64, parents: &str, identify: bool| {
+            let limits = if identify {
+                ledger::parse::ParseLimits::IDENTIFY
+            } else {
+                ledger::parse::ParseLimits::UNLIMITED
+            };
+            let parsed = ledger::parse::parse_file_bounded(&body, 0, limits)
+                .expect("parses")
+                .remove(0);
+            p2p::protocol::SupplyEntry {
+                id: ledger::hash::compute_content_id(&parsed),
+                kind: p2p::protocol::DirectiveKind::Transaction,
+                economic_bean: body,
+                envelope: std::collections::BTreeMap::from([
+                    ("openledger-author".to_owned(), author.to_string()),
+                    ("openledger-lamport".to_owned(), lamport.to_string()),
+                    ("openledger-parents".to_owned(), parents.to_owned()),
+                ]),
+            }
+        };
+        let x = hand_entry(
+            "2024-01-20 * \"X past the cap\"\n  Assets:Cash 50000000000000000000000 USD\n  \
+             Equity:Opening -50000000000000000000000 USD\n"
+                .to_owned(),
+            50,
+            "",
+            true,
+        );
+        let c = hand_entry(
+            "2024-01-21 * \"C child of X\"\n  Assets:Cash 1 USD\n  Equity:Opening -1 USD\n"
+                .to_owned(),
+            51,
+            &x.id,
+            false,
+        );
+        let g = hand_entry(
+            "2024-01-22 * \"G grandchild\"\n  Assets:Cash 2 USD\n  Equity:Opening -2 USD\n"
+                .to_owned(),
+            52,
+            &c.id,
+            false,
+        );
+        let source = RecordingSource {
+            entries: Arc::new(std::sync::Mutex::new(vec![x.clone(), c.clone(), g.clone()])),
+            wanted: Arc::new(std::sync::Mutex::new(Vec::new())),
+            unsolicited: Vec::new(),
+        };
+        let router_source = Router::builder(endpoint_source.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, source.clone())
+            .spawn();
+        wait_until_dialable(&endpoint_source).await;
+        wait_until_dialable(&endpoint_sink).await;
+        let times_wanted = |id: &str| {
+            source
+                .wanted
+                .lock()
+                .expect("wanted")
+                .iter()
+                .filter(|wanted| wanted.as_str() == id)
+                .count()
+        };
+
+        for _ in 0..3 {
+            exchange_with_peer(&endpoint_sink, endpoint_source.addr(), &handler_sink).await;
+        }
+        let _ = router_source.shutdown().await;
+        assert_eq!(times_wanted(&x.id), 1, "L-34: the refused record itself");
+        assert_eq!(
+            (times_wanted(&c.id), times_wanted(&g.id)),
+            (1, 1),
+            "the subtree that can only wait on it is wanted once, not once per exchange"
+        );
+        let svc = handler_sink.ledger.read().await;
+        for id in [&x.id, &c.id, &g.id] {
+            assert!(svc.get_directive(id).is_none());
+        }
+    }
+
     /// T66 / L-60 KEY TEST (end to end). A peer that pads every `Supply` reply
     /// with entries this node never Wanted — 200 garbage bodies under fresh,
     /// well-formed ids (with the four honest ones, under the 256-entry frame
@@ -8475,10 +8647,13 @@ pub(crate) mod tests {
     /// frame. Before T83 every directive then failed its weight charge, and a
     /// failed charge flushed the chunk, so the frame took one commit (journal
     /// record and fsync) per directive — 256 against 4 for the same frame with
-    /// the budget free. Phase 1 now flushes on the weight budget only, so the
-    /// frame takes no more commits than the control. Both ledgers are
-    /// 44 MiB-canonical so every commit is an append and journal records
-    /// count commits exactly.
+    /// the budget free. T83 flushed on the weight budget only, so the frame
+    /// took no more commits than the control — and held its whole weight
+    /// uncharged (M-62). Since T88 (decision (26)) at most
+    /// `UNCHARGED_RESIDUE_CAP` is held uncharged, so the frame is staged per
+    /// ~1 MiB of weight: several directives a commit (64 here), never one
+    /// each. Both ledgers are 44 MiB-canonical so every commit is an append
+    /// and journal records count commits exactly.
     #[test]
     fn l90_an_exhausted_byte_budget_does_not_split_a_frame_into_one_commit_per_directive() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -8512,6 +8687,11 @@ pub(crate) mod tests {
                 }
             })
             .collect();
+        let entries_weight_max = entries
+            .iter()
+            .map(|entry| p2p::anti_entropy::resident_weight(&validate_supply_entry(entry).unwrap()))
+            .max()
+            .unwrap_or(0);
         let records = |path: &std::path::Path| -> usize {
             std::fs::read_to_string(ledger::journal::journal_path_for(path))
                 .map(|text| {
@@ -8567,6 +8747,7 @@ pub(crate) mod tests {
         let mut reservation = handler.limiter.frame_reservation(remote);
         let ok = reservation.grow_to(4 * 1024 * 1024);
         let before = records(&bean);
+        PHASE_ONE_MAX_UNCHARGED.with(|max| max.set(0));
         let started = std::time::Instant::now();
         let outcome = runtime.block_on(apply_supply_entries_from(
             &handler,
@@ -8577,14 +8758,28 @@ pub(crate) mod tests {
         ));
         let took = started.elapsed();
         let attack_records = records(&bean) - before;
+        let max_uncharged = PHASE_ONE_MAX_UNCHARGED.with(std::cell::Cell::get);
         eprintln!(
             "l90: body grow_to ok={ok}; control frame → {control_records} journal records in {control_took:?}; \
-             budget-exhausted frame → {attack_records} journal records in {took:?}; {outcome:?}"
+             budget-exhausted frame → {attack_records} journal records in {took:?}; max uncharged \
+             {max_uncharged} B; {outcome:?}"
         );
         assert_eq!(outcome.merged, MAX_SUPPLY_ENTRIES, "{outcome:?}");
+        // T88 / M-62, decision (26): the exhausted budget now bounds what is
+        // held uncharged (`UNCHARGED_RESIDUE_CAP`), so the frame is staged
+        // per ~1 MiB of weight — several directives a commit, never one each
+        // (L-90's property) — where T83 held it all uncharged and committed it
+        // as the control does.
         assert!(
-            attack_records <= control_records,
-            "an exhausted budget must not split the frame: {attack_records} commits vs {control_records}"
+            attack_records * 4 <= MAX_SUPPLY_ENTRIES,
+            "an exhausted budget must not split the frame one directive per commit: \
+             {attack_records} commits for {MAX_SUPPLY_ENTRIES} directives (control {control_records})"
+        );
+        let largest = entries_weight_max;
+        assert!(
+            max_uncharged <= UNCHARGED_RESIDUE_CAP + largest,
+            "M-62: {max_uncharged} B held uncharged, over the {UNCHARGED_RESIDUE_CAP} B cap plus \
+             one directive ({largest} B)"
         );
     }
 

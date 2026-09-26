@@ -20,6 +20,11 @@ use super::{GRAPHQL_MAX_COMPLEXITY, HEAVY_RESOLVER_COMPLEXITY};
 /// is rationed directly rather than sharing the flat heavy-resolver weight.
 pub(crate) const MAX_VERIFY_PER_REQUEST: usize = 2;
 
+/// The most quarantined ids one `verify` lists (T88 / L-103); the field
+/// `quarantinedTotal` carries the full count. The list is set by the file,
+/// not by the caller, and a 20,000-record quarantine was 1.3 MB per `verify`.
+pub(crate) const MAX_LISTED_QUARANTINED: usize = 1_000;
+
 /// Complexity weight for `verify` (M-23).
 ///
 /// # Why this is not `HEAVY_RESOLVER_COMPLEXITY`
@@ -285,17 +290,17 @@ impl QueryRoot {
             // for this task and left for the pass that owns that file.
             let svc = ledger.read().await;
             let report = ledger::verify::verify_dag(svc.dag(), svc.read_model());
+            // T88 / L-103: capped like `errors`, with the full count beside it.
+            let (quarantined, quarantined_total) =
+                svc.quarantined_ids_capped(MAX_LISTED_QUARANTINED);
             VerifyResult {
                 ok: report.ok,
                 nodes_checked: report.nodes_checked as i32,
                 errors: report.errors.iter().map(|e| e.to_string()).collect(),
                 truncated: i32::try_from(report.truncated).unwrap_or(i32::MAX),
                 balance_assertions: assertion_report(&report.assertions),
-                quarantined: svc
-                    .quarantined_ids()
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect(),
+                quarantined,
+                quarantined_total: i32::try_from(quarantined_total).unwrap_or(i32::MAX),
                 unparsable_blocks: i32::try_from(svc.unparsable_block_count()).unwrap_or(i32::MAX),
             }
         } else {
@@ -306,6 +311,7 @@ impl QueryRoot {
                 truncated: 0,
                 balance_assertions: assertion_report(&Default::default()),
                 quarantined: Vec::new(),
+                quarantined_total: 0,
                 unparsable_blocks: 0,
             }
         }

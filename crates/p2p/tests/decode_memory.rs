@@ -714,8 +714,12 @@ fn postings_with_metadata_body(narration: &str) -> String {
 /// Measured before T75 (release, same allocator): 61,678 postings 19.94×;
 /// 41,941 postings + meta 41.72×; 349,518 tags 30.63×; 349,515 currencies
 /// 24.00×; 74,896 posting-metadata keys 10.21×; 262,144 junk body lines 9.00×.
-/// After: every one ≤ 0.08× — the parse stops at the first item past a cap,
-/// and the lazy scanner no longer materialises the rest of a flooded header.
+/// After T75: every one ≤ 0.08× — the parse stops at the first item past a
+/// cap, and the lazy scanner no longer materialises the rest of a flooded
+/// header. T81 raised the wire's body-line cap to 5,196 (the legacy posting-
+/// metadata ceiling), so the line floods now read up to that many lines
+/// before stopping: measured ≤ 0.28× (0925 A3), still well inside the 4×
+/// bar.
 ///
 /// Reverting the parse-time limits (`ParseLimits::UNLIMITED` in
 /// `validate_supply_entry`) fails this test on the peak for all four audited
@@ -818,10 +822,51 @@ fn parsed_flood_bodies_are_refused_within_the_entry_budget() {
 /// phase 2, and a parsed directive is larger than its body — a 1000-posting
 /// transaction's `Vec<Posting>` alone is 184 B a posting against ~36 B of text.
 /// The audit measured 6.1× for 256 honest 1000-posting transactions; T75
-/// cannot and does not change that (nothing honest is refused). 8× is that
-/// measurement plus headroom for allocator-growth jitter. The hostile bound
-/// below stays at 4×.
-const HONEST_FRAME_PEAK_MULTIPLE: usize = 8;
+/// cannot and does not change that (nothing honest is refused). The hostile
+/// bound below stays at 4×.
+///
+/// T88 / L-102, decision (29): 8× was calibrated on that one shape. The
+/// densest frame the wire ADMITS — 256 transactions of 1,000 shortest-line
+/// postings, 96 directive and 4,096 posting metadata keys (T81's legacy
+/// ceiling) — parses at 14.4× (0925 A3, release) and is now the second control
+/// below; 16× is that measurement plus the same headroom for allocator-growth
+/// jitter. Decision (29) keeps the 4,096 ceiling and states the multiple.
+const HONEST_FRAME_PEAK_MULTIPLE: usize = 16;
+
+/// The densest transaction the wire admits (T88 / L-102): `postings`
+/// shortest-line postings, `dir_meta` directive metadata keys and
+/// `posting_meta` posting metadata keys spread across the postings (0925 A3's
+/// generator).
+fn densest_admitted_transaction(
+    postings: usize,
+    dir_meta: usize,
+    posting_meta: usize,
+    tag: usize,
+) -> String {
+    let mut body = format!("2024-01-01 * \"{tag}\"\n");
+    for key in 0..dir_meta {
+        body.push_str(&format!("  m{key}: \"\"\n"));
+    }
+    let per_posting = posting_meta / postings;
+    let mut extra = posting_meta - per_posting * postings;
+    for index in 0..postings {
+        let number = if index == 0 {
+            (postings as i64 - 1).to_string()
+        } else {
+            "-1".to_owned()
+        };
+        body.push_str(&format!("  Assets:A {number} US\n"));
+        let mut here = per_posting;
+        if extra > 0 {
+            here += 1;
+            extra -= 1;
+        }
+        for key in 0..here {
+            body.push_str(&format!("  p{key}: \"\"\n"));
+        }
+    }
+    body
+}
 
 /// Run phase 1 of `apply_supply_entries` over `entries` — validate each and
 /// keep what passes — and report `(staged, peak)`. The entries stay live
@@ -912,5 +957,38 @@ fn a_frame_of_flood_bodies_is_refused_within_the_frame_budget() {
         "an honest {}-byte frame peaked at {honest_peak} bytes, over the \
          {HONEST_FRAME_PEAK_MULTIPLE}× budget of {honest_budget}",
         honest_frame.len(),
+    );
+    drop(honest);
+
+    // ── The densest frame the wire admits (T88 / L-102) ────────────────────
+    let densest: Vec<SupplyEntry> = (0..MAX_SUPPLY_ENTRIES)
+        .map(|index| {
+            entry_with_true_id(densest_admitted_transaction(
+                ledger::service::MAX_POSTINGS_PER_TRANSACTION,
+                96,
+                ledger::limits::MAX_POSTING_METADATA_KEYS_PER_TRANSACTION_LEGACY,
+                index,
+            ))
+        })
+        .collect();
+    let densest_frame = WireMessage::supply(densest.clone()).to_cbor().unwrap();
+    assert!(densest_frame.len() <= MAX_MESSAGE_SIZE as usize);
+    let densest_budget = densest_frame.len() * HONEST_FRAME_PEAK_MULTIPLE;
+    let (densest_staged, densest_peak) = phase_one(&densest);
+    println!(
+        "256 x densest admitted (1000 postings, 96 + 4096 metadata keys): {} bytes, phase-1 \
+         peak {densest_peak} bytes ({:.2}× frame, budget {densest_budget}), staged {densest_staged}",
+        densest_frame.len(),
+        densest_peak as f64 / densest_frame.len() as f64,
+    );
+    assert_eq!(
+        densest_staged, MAX_SUPPLY_ENTRIES,
+        "every admitted entry is staged"
+    );
+    assert!(
+        densest_peak <= densest_budget,
+        "the densest admitted {}-byte frame peaked at {densest_peak} bytes, over the \
+         {HONEST_FRAME_PEAK_MULTIPLE}× budget of {densest_budget}",
+        densest_frame.len(),
     );
 }

@@ -2793,10 +2793,11 @@ fn l95_ancestors_first_join_converges_under_a_hostile_peers_parent_hints() {
 /// nothing, so an honest chain longer than the buffer joins at the pre-T83
 /// speed (the L-95 crawl) for as long as the hostile hints are renewed. The
 /// Done note's residual says "one extra round per lost hint"; it is the whole
-/// join. Fails at HEAD: the chain that joins in 3 ticks with a free table
-/// does not join in 30 with a full one.
+/// join. Failed at `45014e9`: the chain that joins in 3 ticks with a free
+/// table did not join in 30 with a full one. Since T88 (decision (28)) the
+/// hostile peer's hints stop at its share of the table; the premise below
+/// changed with that decision.
 #[test]
-#[ignore = "A6-2: one allowlisted peer fills the global parent-hint table (MAX_PARENT_HINT_IDS is not per peer) with orphans refused at its per-peer cap, and every later honest chain join crawls at the pre-T83 speed until the hints age out"]
 fn l95_a_peer_that_fills_the_parent_hint_table_restores_the_crawl_for_honest_joins() {
     let n = MAX_ORPHANS_PER_PEER + 300;
     let mut mesh = seeded_mesh(9251, 1);
@@ -2839,12 +2840,15 @@ fn l95_a_peer_that_fills_the_parent_hint_table_restores_the_crawl_for_honest_joi
     }
     assert_eq!(buffered, MAX_ORPHANS_PER_PEER);
     assert_eq!(refused, MAX_PARENT_HINT_IDS / 2);
+    // T88 / L-107 (decision (28)): the hostile peer's hints stop at its share
+    // of the table; before T88 the last one fitted exactly and the table was
+    // full for everyone.
     assert!(
-        !mesh.replicas[f]
+        mesh.replicas[f]
             .orphans
             .known_missing_parents(&last)
             .is_empty(),
-        "the last hostile hint fits exactly"
+        "the hostile peer's hints stop at its share"
     );
     let ticks = mesh.join_like_gl_node(0, f, None, 30);
     let joiner = &mesh.replicas[f];

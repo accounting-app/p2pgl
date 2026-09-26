@@ -739,6 +739,41 @@ mod tests {
         );
     }
 
+    /// L-103 (T88, decision (30)): `verify` lists at most
+    /// `MAX_LISTED_QUARANTINED` quarantined ids, like `errors`, and
+    /// `quarantinedTotal` counts them all. 1,005 transactions naming a parent
+    /// that exists nowhere are all held (H-23); the list stops at 1,000.
+    ///
+    /// Bug-catch: return every id again and the list is 1,005 long.
+    #[tokio::test]
+    async fn l103_verify_lists_at_most_a_thousand_quarantined_ids_and_counts_them_all() {
+        let absent = "a".repeat(64);
+        let mut text =
+            "2024-01-01 open Assets:Cash USD\n\n2024-01-01 open Equity:Opening\n\n".to_owned();
+        for index in 0..1_005u32 {
+            text.push_str(&format!(
+                "2024-01-16 * \"held {index}\"\n  \
+                   openledger-author: \"test\"\n  \
+                   openledger-lamport: \"{}\"\n  \
+                   openledger-parents: \"{absent}\"\n  \
+                   Assets:Cash                                      1.00 USD\n  \
+                   Equity:Opening                                  -1.00 USD\n\n",
+                index + 3
+            ));
+        }
+        let (_dir, schema) = schema_over_ledger(&text);
+        let result = schema
+            .execute("{ verify { quarantined quarantinedTotal } }")
+            .await;
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let data = result.data.into_json().unwrap();
+        assert_eq!(data["verify"]["quarantinedTotal"], 1_005);
+        assert_eq!(
+            data["verify"]["quarantined"].as_array().map(Vec::len),
+            Some(crate::graphql::query::MAX_LISTED_QUARANTINED)
+        );
+    }
+
     #[tokio::test]
     async fn test_verify_surfaces_failing_balance_assertion() {
         // M-08 regression: `balance` directives reach the file through the
