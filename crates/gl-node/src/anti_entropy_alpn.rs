@@ -6507,6 +6507,27 @@ pub(crate) mod tests {
         converged_state(&sink, &path).await
     }
 
+    /// Apply several Supplies in sequence through the real remote path — a
+    /// replica that already holds a prefix of the set, then receives the rest
+    /// — and snapshot it.
+    async fn apply_batches(
+        dir: &std::path::Path,
+        label: &str,
+        allow: &PeerAllowlist,
+        batches: Vec<Vec<p2p::protocol::SupplyEntry>>,
+    ) -> ConvergedState {
+        let path = dir.join(format!("sink-{label}.bean"));
+        let sink: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(path.clone(), "sink".to_owned()).expect("boot sink"),
+        ));
+        let handler = make_handler(sink.clone(), allow.clone());
+        let remote = iroh::SecretKey::generate().public();
+        for entries in batches {
+            apply_supply_entries(&handler, entries, remote).await;
+        }
+        converged_state(&sink, &path).await
+    }
+
     /// Deterministic xorshift64* — a seeded shuffle with no extra dependency,
     /// so a failing permutation is reproducible from the seed alone.
     struct Xorshift(u64);
@@ -6573,6 +6594,104 @@ pub(crate) mod tests {
 
         for (label, entries) in orders {
             let state = apply_order(temp_dir.path(), &label, &allow, entries).await;
+            assert_eq!(
+                state.directive_ids, reference.directive_ids,
+                "order {label}: accepted directive set diverged"
+            );
+            assert_eq!(
+                state.lifecycle, reference.lifecycle,
+                "order {label}: account lifecycle state diverged"
+            );
+            assert_eq!(
+                state.balances, reference.balances,
+                "order {label}: balances diverged"
+            );
+            assert_eq!(
+                state.file_bytes, reference.file_bytes,
+                "order {label}: persisted .bean file is not byte-identical"
+            );
+        }
+    }
+
+    /// T91 (M-09 remainder, decision (38)) — X1's `n3e` shape through the real
+    /// remote path. The sink already holds the prefix (the three `open`s and
+    /// the 01-15 Cash transaction); the rest of T29's fixture plus a Cash
+    /// posting between the re-open (03-01) and the re-close (04-01) then
+    /// arrives in one Supply, in many orders. Where the 03-15 posting and its
+    /// DAG parent (the source's 06-01 Bank transaction) land before the 02-01
+    /// `close`, the posting is held (Cash is open on 03-15 on the sink) when
+    /// the `close` is judged; the pre-T91 guard refused the `close` for good
+    /// there, and that replica then admitted postings to Cash between 02-01
+    /// and 03-01 that every other replica refuses. Judged under the
+    /// lifecycle fold, the `close` closes nothing the 03-15 posting needs (the
+    /// re-open does), so every order accepts the whole set.
+    ///
+    /// Bug-catch: judge an ingested `close` against the account's latest
+    /// posting again and the orders that hold the 03-15 posting first (seed 8
+    /// among them) refuse the `close`: their accepted set diverges.
+    #[tokio::test]
+    async fn lifecycle_converges_when_the_account_is_posted_to_after_a_reopen() {
+        let author = iroh::SecretKey::generate().public();
+        let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+
+        let (mut source, mut ids) = seed_lifecycle_source(temp_dir.path(), &author.to_string());
+        // The source's own guard admits it: Cash is open on 03-15 (re-opened
+        // 03-01, re-closed 04-01).
+        let after_reopen = source
+            .append_transaction(lifecycle_txn("Assets:Cash", day(3, 15), dec!(40)))
+            .expect("a posting after the re-open")
+            .txid;
+        ids.push(after_reopen.clone());
+        let entries: Vec<p2p::protocol::SupplyEntry> =
+            ids.iter().map(|id| entry_for(&source, id)).collect();
+        assert_eq!(
+            entries.len(),
+            10,
+            "the fixture shape is what the test claims"
+        );
+        // Creation order: three opens, the 01-15 Cash transaction, then the rest.
+        let (prefix, rest) = entries.split_at(4);
+
+        let reference = apply_batches(
+            temp_dir.path(),
+            "sorted-reopen",
+            &allow,
+            vec![prefix.to_vec(), rest.to_vec()],
+        )
+        .await;
+        assert_eq!(
+            reference.directive_ids.len(),
+            10,
+            "the reference order must accept the whole set"
+        );
+
+        let mut orders: Vec<(String, Vec<p2p::protocol::SupplyEntry>)> = Vec::new();
+        // Heads first, as `compute_want` asks: the 03-15 transaction leads.
+        let mut heads_first = rest.to_vec();
+        let position = heads_first
+            .iter()
+            .position(|entry| entry.id == after_reopen)
+            .expect("present");
+        let head = heads_first.remove(position);
+        heads_first.insert(0, head);
+        orders.push(("heads-first".to_owned(), heads_first));
+        let mut reversed = rest.to_vec();
+        reversed.reverse();
+        orders.push(("reversed-reopen".to_owned(), reversed));
+        for seed in 1..=32u64 {
+            let mut shuffled = rest.to_vec();
+            Xorshift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1).shuffle(&mut shuffled);
+            orders.push((format!("reopen-seed-{seed}"), shuffled));
+        }
+        for (label, entries) in orders {
+            let state = apply_batches(
+                temp_dir.path(),
+                &label,
+                &allow,
+                vec![prefix.to_vec(), entries],
+            )
+            .await;
             assert_eq!(
                 state.directive_ids, reference.directive_ids,
                 "order {label}: accepted directive set diverged"
@@ -6672,7 +6791,7 @@ pub(crate) mod tests {
         );
 
         // The attacker: a node holding no transactions can legitimately close
-        // Assets:Cash at 1970-01-01 through its own local API — that is what
+        // Assets:Cash at 2024-01-10 through its own local API — that is what
         // makes this reachable with one allowlisted peer and no forgery.
         let mut attacker =
             LedgerService::boot(temp_dir.path().join("attacker.bean"), author.to_string())
@@ -6687,7 +6806,10 @@ pub(crate) mod tests {
         let poison = attacker
             .close_account(
                 "Assets:Cash".to_owned(),
-                NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid date"),
+                // T91 / decision (38): inside the interval `txn1` (01-15)
+                // needs; a close dated before the `open` closes nothing under
+                // the lifecycle fold and is accepted as data.
+                NaiveDate::from_ymd_opt(2024, 1, 10).expect("valid date"),
             )
             .expect("attacker's own close is legal on its own ledger");
 
@@ -7011,7 +7133,7 @@ pub(crate) mod tests {
     /// A seeded source, a sink holding its opens for Cash/Equity plus `txn1`,
     /// and the three shapes L-34 must tell apart:
     ///
-    /// * `poison` — a close of Assets:Cash dated 1970, before `txn1`: the M-09
+    /// * `poison` — a close of Assets:Cash dated 2024-01-10, before `txn1`: the M-09
     ///   backdated close, refused FOR GOOD;
     /// * `txn2` — posts to Expenses:Food, whose `open` the sink lacks: an
     ///   ACCOUNT WAIT, acceptable the moment that open arrives;
@@ -7042,7 +7164,10 @@ pub(crate) mod tests {
         let poison_id = attacker
             .close_account(
                 "Assets:Cash".to_owned(),
-                NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid date"),
+                // T91 / decision (38): inside the interval `txn1` (01-15)
+                // needs; a close dated before the `open` closes nothing under
+                // the lifecycle fold and is accepted as data.
+                NaiveDate::from_ymd_opt(2024, 1, 10).expect("valid date"),
             )
             .expect("attacker's own close is legal on its own ledger");
         let mut allowed = vec![author.to_owned()];

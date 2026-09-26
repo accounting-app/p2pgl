@@ -8578,32 +8578,48 @@ impl LedgerService {
     /// close is held to the same rule, with the same error code, and is not
     /// inserted into the DAG when it fails.
     ///
-    /// ## Residual — honest statement of what this does NOT prove
+    /// ## Judged under the fold (T91 / M-09 remainder, decision (38))
     ///
-    /// This is a DoS mitigation, not a convergence proof. The rule is evaluated
-    /// against the transactions this node holds AT INGEST TIME, and two nodes
-    /// can hold different transaction sets at that moment. Concretely: a close
-    /// dated 2024-03-01 that arrives at node A before any 2024-06-01
-    /// transaction on that account is accepted there, while node B — which
-    /// already had that transaction — rejects the same close. The two nodes
-    /// then hold DIFFERENT DIRECTIVE SETS, and nothing here closes that gap.
+    /// The close is refused only when, with it added to the account's
+    /// lifecycle fold, a transaction this node holds would stop being
+    /// admitted: one dated after the close and before the next `open` of the
+    /// account (or up to the next `close`) — [`AccountState::
+    /// dates_a_close_would_close`]. Before T91 it was refused whenever ANY held
+    /// transaction was dated after it, including one after a later re-open
+    /// that the fold admits either way. Anti-entropy Wants remote heads first,
+    /// and the latest transaction is a head, so a replica coming back online
+    /// met `open`, `close`, re-`open`, transaction in the order transaction,
+    /// re-`open`, `close`: it refused the honest `close` for good, and from
+    /// then on disagreed with every other replica about the account between
+    /// the close and the re-open — a receipt it wrote there, and everything
+    /// after it, was refused by all of them (state divergence for one
+    /// directive set, which the pre-T91 residual said could not happen). Now
+    /// the verdict on the `close` does not depend on whether the re-`open` and
+    /// the transactions after it arrived first.
     ///
-    /// What the M-09 event model does guarantee is the other half: for a GIVEN
-    /// directive set, every node derives the same account state regardless of
-    /// arrival order. Directive-set divergence is possible; state divergence for
-    /// a fixed set is not. (Note also that a transaction rejected under I3 is
-    /// never in the DAG, so it does not feed back into this rule — only
-    /// ACCEPTED transactions can refuse a close.)
+    /// ## Residual
+    ///
+    /// Still evaluated against the transactions this node holds at ingest: a
+    /// transaction dated INSIDE the interval, written on one node while the
+    /// `close` was on its way to it, refuses the `close` there and is itself
+    /// refused (I3) on every node that took the `close` first. That is a
+    /// genuine conflict between two concurrent writes, not an ordering
+    /// artefact, and it stays the M-09 residual.
     ///
     /// Boot does not apply this rule: see the comment at the boot loop.
     fn reject_backdated_close(&self, close: &Close) -> Result<(), ServiceError> {
-        if let Some(latest) = self.latest_posting_date(&close.account) {
-            if latest > close.date {
-                return Err(ServiceError::AccountHasLaterTransactions {
-                    account: close.account.clone(),
-                    latest_date: latest,
-                });
-            }
+        let content_id = compute_content_id(&Directive::Close(close.clone()));
+        let Some(interval) = self.accounts.dates_a_close_would_close(close, &content_id) else {
+            return Ok(());
+        };
+        if let Some(latest) = self
+            .read_model
+            .latest_posting_date_in(&close.account, interval)
+        {
+            return Err(ServiceError::AccountHasLaterTransactions {
+                account: close.account.clone(),
+                latest_date: latest,
+            });
         }
         Ok(())
     }
@@ -13387,7 +13403,7 @@ mod tests {
         let before = svc.lamport_clock();
 
         let error = svc
-            .stage_remote_directive(remote_close("Assets:Cash", make_date(1970, 1, 1), 9))
+            .stage_remote_directive(remote_close("Assets:Cash", make_date(2024, 1, 10), 9))
             .unwrap_err();
         assert_eq!(error.error_code(), "ACCOUNT_HAS_LATER_TRANSACTIONS");
         assert_eq!(
@@ -13431,6 +13447,67 @@ mod tests {
         })
     }
 
+    /// T91 (M-09 remainder, decision (38)): an ingested `close` is judged
+    /// under the lifecycle fold. One dated before the account's `open` closes
+    /// nothing and is accepted as data — the account stays open and local
+    /// writes go on (the write-DoS stays closed). One dated before a later
+    /// re-open is accepted although a transaction after the re-open is held,
+    /// in the order anti-entropy delivers them (the transaction and the
+    /// re-open first); before T91 that transaction refused it for good.
+    ///
+    /// Bug-catch: judge the `close` against the latest posting on the account
+    /// again and both are refused.
+    #[test]
+    fn m09_a_close_that_closes_nothing_a_held_transaction_needs_is_accepted() {
+        let (mut svc, path) = setup_with_accounts();
+        svc.append_transaction(balanced_input()).unwrap(); // 2024-01-15
+
+        let before_the_open = remote_close("Assets:Cash", make_date(1970, 1, 1), 9);
+        assert!(
+            svc.stage_remote_directive(before_the_open)
+                .unwrap()
+                .is_some(),
+            "a close before the open closes nothing"
+        );
+        assert!(svc.accounts().is_open("Assets:Cash"));
+        assert!(svc
+            .accounts()
+            .is_open_at("Assets:Cash", make_date(2024, 1, 15)));
+        let mut later = balanced_input();
+        later.date = make_date(2024, 1, 20);
+        later.narration = Some("after the accepted close".to_owned());
+        svc.append_transaction(later).expect("local writes go on");
+
+        // Re-opened 03-01 and posted to on 04-01, then the 02-01 close arrives.
+        assert!(svc
+            .stage_remote_directive(remote_open("Assets:Cash", make_date(2024, 3, 1), 10))
+            .unwrap()
+            .is_some());
+        let mut after_reopen = balanced_input();
+        after_reopen.date = make_date(2024, 4, 1);
+        after_reopen.narration = Some("after the re-open".to_owned());
+        svc.append_transaction(after_reopen).unwrap();
+        let close = remote_close("Assets:Cash", make_date(2024, 2, 1), 11);
+        assert!(
+            svc.stage_remote_directive(close).unwrap().is_some(),
+            "the transaction after the re-open does not refuse the close"
+        );
+        assert!(!svc
+            .accounts()
+            .is_open_at("Assets:Cash", make_date(2024, 2, 15)));
+        assert!(svc
+            .accounts()
+            .is_open_at("Assets:Cash", make_date(2024, 4, 1)));
+
+        // A close inside the interval a held transaction needs is still refused.
+        let inside = remote_close("Assets:Cash", make_date(2024, 1, 18), 12);
+        assert_eq!(
+            svc.stage_remote_directive(inside).unwrap_err().error_code(),
+            "ACCOUNT_HAS_LATER_TRANSACTIONS"
+        );
+        std::fs::remove_file(path).ok();
+    }
+
     /// M-09 write-DoS: one allowlisted peer's backdated `close` used to be
     /// applied unconditionally (`let _ =`), shutting the account on every
     /// replica and failing every later local append to it.
@@ -13439,7 +13516,11 @@ mod tests {
         let (mut svc, path) = setup_with_accounts();
         svc.append_transaction(balanced_input()).unwrap(); // 2024-01-15
 
-        let poison = remote_close("Assets:Cash", make_date(1970, 1, 1), 9);
+        // T91 / decision (38): dated inside the open interval, before the held
+        // transaction — a `close` dated before the account's `open` closes
+        // nothing under the fold and is accepted (see
+        // `m09_a_close_that_closes_nothing_a_held_transaction_needs_is_accepted`).
+        let poison = remote_close("Assets:Cash", make_date(2024, 1, 10), 9);
         let poison_id = LedgerService::content_id(&poison);
         let error = svc.stage_remote_directive(poison).unwrap_err();
         assert_eq!(error.error_code(), "ACCOUNT_HAS_LATER_TRANSACTIONS");
@@ -13705,7 +13786,8 @@ mod tests {
         svc.append_transaction(balanced_input()).unwrap(); // 2024-01-15
 
         let mut content = std::fs::read_to_string(&path).unwrap();
-        content.push_str("\n1970-01-01 close Assets:Cash\n");
+        // T91 / decision (38): inside the interval the held transaction needs.
+        content.push_str("\n2024-01-10 close Assets:Cash\n");
         std::fs::write(&path, &content).unwrap();
 
         let result = svc.reconcile_file().unwrap();
@@ -20618,10 +20700,7 @@ mod tests {
         assert_eq!(svc.quarantined_count(), 1);
         assert_eq!(svc.unsigned_operator_input_count(), 0);
         assert!(logged.contains("already open"), "{logged}");
-        assert_eq!(
-            svc.accounts().currencies("Assets:Cash"),
-            Some(usd.as_slice())
-        );
+        assert_eq!(svc.accounts().currencies("Assets:Cash"), Some(usd.clone()));
         let api = svc
             .open_account(
                 "Assets:Cash".to_owned(),
@@ -20645,10 +20724,7 @@ mod tests {
         assert_eq!(result.rejected, 1);
         assert_eq!(result.new_directives, 0);
         assert!(logged.contains("already open"), "{logged}");
-        assert_eq!(
-            svc.accounts().currencies("Assets:Cash"),
-            Some(usd.as_slice())
-        );
+        assert_eq!(svc.accounts().currencies("Assets:Cash"), Some(usd.clone()));
         remove_ledger_and_journal(&path);
     }
 

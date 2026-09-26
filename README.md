@@ -133,6 +133,8 @@ curl -s -X POST http://127.0.0.1:4000/graphql \
 | `date` | When the account is opened. Format: `YYYY-MM-DD` | `"2025-01-01"` |
 | `currencies` | Optional list of allowed currencies. Omit to allow any. | `["USD", "EUR"]`, or remove entirely |
 
+An account can end up with more than one `open` on a mesh — another node opened it too, or it was closed and opened again. A transaction on such an account may use any currency listed by **any** `open` dated on or before it, and any currency at all once one of those `open`s lists none, so an `open` that arrives later never makes a transaction every node already accepted unacceptable. Whether the account is open on the transaction's date is decided by the latest `open` or `close` dated before it. A peer's `close` is refused only when it would close the account on the date of a transaction this node holds; a `close` followed by a later re-open does not count the transactions after the re-open against it.
+
 **More examples:**
 
 ```bash

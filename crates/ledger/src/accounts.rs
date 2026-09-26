@@ -305,7 +305,11 @@ impl AccountState {
         currency: &str,
         date: NaiveDate,
     ) -> Result<(), ValidationError> {
-        Self::enforce_currencies(account, currency, self.currencies_at(account, date))
+        Self::enforce_currencies(
+            account,
+            currency,
+            self.currencies_at(account, date).as_deref(),
+        )
     }
 
     fn enforce_currencies(
@@ -344,25 +348,101 @@ impl AccountState {
         })
     }
 
-    /// The currency constraint list from the account's latest `open`
-    /// (empty = any currency).
-    pub fn currencies(&self, account: &str) -> Option<&[String]> {
+    /// The currency constraint a transaction dated after every `open` of the
+    /// account faces: the union over all of them (empty = any currency). See
+    /// [`Self::currencies_at`]. `None` when the account was never opened.
+    pub fn currencies(&self, account: &str) -> Option<Vec<String>> {
         let events = self.events.get(account)?;
-        events.values().rev().find_map(|event| match event {
-            LifecycleEvent::Open { currencies } => Some(currencies.as_slice()),
-            LifecycleEvent::Close => None,
-        })
+        if !events
+            .values()
+            .any(|event| matches!(event, LifecycleEvent::Open { .. }))
+        {
+            return None;
+        }
+        Some(Self::union_of_open_currencies(events.values()))
     }
 
-    /// The currency constraint list in force on `date` (empty = any currency).
+    /// The currency constraint in force on `date` (empty = any currency): the
+    /// UNION of the lists of every `open` of the account dated no later than
+    /// the transaction, and no constraint at all once one of them lists none
+    /// (T91 / M-63, decision (37)).
+    ///
+    /// Before T91 it was the list of the latest such `open` alone. An `open` is
+    /// data on the wire (M-09), so a peer's second `open` of an account —
+    /// back-dated, another currency list, or two partitioned nodes opening
+    /// the same account differently — replaced the constraint for every date
+    /// after it, and history every replica had admitted under the first list
+    /// stopped being admissible: the served-set rule (H-23) then un-served it,
+    /// and everything written on top of it, at each node's next restart. With
+    /// the union, an `open` can only ever admit more, so a verdict once given
+    /// is never retracted by a later arrival and every replica reaches the
+    /// same one in every order. A `close` never narrows the list; I3 decides
+    /// whether the account is open at all.
     ///
     /// `None` when no `open` is in force then — I3 rejects such a transaction
     /// before I9 is ever consulted.
-    pub fn currencies_at(&self, account: &str, date: NaiveDate) -> Option<&[String]> {
+    pub fn currencies_at(&self, account: &str, date: NaiveDate) -> Option<Vec<String>> {
+        let bound = LifecycleKey::transaction_bound(date);
         match self.deciding_for_transaction(account, date) {
-            Some((_, LifecycleEvent::Open { currencies })) => Some(currencies.as_slice()),
-            _ => None,
+            Some((_, LifecycleEvent::Open { .. })) => {}
+            _ => return None,
         }
+        let events = self.events.get(account)?;
+        Some(Self::union_of_open_currencies(
+            events.range(..bound).map(|(_, event)| event),
+        ))
+    }
+
+    fn union_of_open_currencies<'a>(
+        events: impl Iterator<Item = &'a LifecycleEvent>,
+    ) -> Vec<String> {
+        let mut union: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for event in events {
+            if let LifecycleEvent::Open { currencies } = event {
+                if currencies.is_empty() {
+                    return Vec::new();
+                }
+                union.extend(currencies.iter().cloned());
+            }
+        }
+        union.into_iter().collect()
+    }
+
+    /// The transaction dates an ingested `close` would close (T91 / M-09
+    /// remainder, decision (38)): the interval after the close's own date in
+    /// which, with the close added to the fold, the close would be the
+    /// deciding event — up to (excluding) the next `open` after it, or up to
+    /// and including the date of the next `close`, or unbounded. `None` for
+    /// an account with no lifecycle event. Where the account is already closed
+    /// at the close's position the interval holds no transaction the DAG
+    /// holds (I3 refused them), so no separate test is needed for that.
+    ///
+    /// A transaction held on the account and dated inside the interval is
+    /// admitted today and would not be with the close; one dated after a later
+    /// re-open is admitted either way, which is what the pre-T91 rule — "any
+    /// held transaction dated after the close" — got wrong.
+    pub fn dates_a_close_would_close(
+        &self,
+        close: &Close,
+        content_id: &str,
+    ) -> Option<(std::ops::Bound<NaiveDate>, std::ops::Bound<NaiveDate>)> {
+        use std::ops::Bound;
+        let key = LifecycleKey {
+            date: close.date,
+            priority: Directive::Close(close.clone()).type_priority(),
+            lamport: envelope_lamport(&close.metadata),
+            content_id: content_id.to_owned(),
+        };
+        let events = self.events.get(&close.account)?;
+        let until = match events
+            .range((Bound::Excluded(key), Bound::Unbounded))
+            .next()
+        {
+            Some((next, LifecycleEvent::Open { .. })) => Bound::Excluded(next.date),
+            Some((next, LifecycleEvent::Close)) => Bound::Included(next.date),
+            None => Bound::Unbounded,
+        };
+        Some((Bound::Excluded(close.date), until))
     }
 
     /// Returns true if the account is currently open (its last lifecycle event
@@ -615,11 +695,13 @@ mod tests {
 
         assert_eq!(
             state.currencies_at("Assets:Cash", date(2024, 3, 1)),
-            Some(["USD".to_owned()].as_slice())
+            Some(vec!["USD".to_owned()])
         );
+        // T91 / M-63, decision (37): from the second `open` on, the union —
+        // a later `open` admits more, it never takes USD away.
         assert_eq!(
             state.currencies_at("Assets:Cash", date(2024, 9, 1)),
-            Some(["EUR".to_owned()].as_slice())
+            Some(vec!["EUR".to_owned(), "USD".to_owned()])
         );
         assert!(state
             .check_currency_constraint_at("Assets:Cash", "USD", date(2024, 3, 1))
@@ -627,10 +709,13 @@ mod tests {
         assert!(state
             .check_currency_constraint_at("Assets:Cash", "EUR", date(2024, 3, 1))
             .is_err());
-        // The date-free form answers for the latest open.
+        assert!(state
+            .check_currency_constraint_at("Assets:Cash", "USD", date(2024, 9, 1))
+            .is_ok());
+        // The date-free form answers for a transaction after every open.
         assert_eq!(
             state.currencies("Assets:Cash"),
-            Some(["EUR".to_owned()].as_slice())
+            Some(vec!["EUR".to_owned(), "USD".to_owned()])
         );
     }
 
@@ -716,7 +801,7 @@ mod tests {
         );
         assert_eq!(
             state.currencies("Assets:Cash"),
-            Some(["USD".to_owned()].as_slice()),
+            Some(vec!["USD".to_owned()]),
             "the rejected open recorded nothing"
         );
         state

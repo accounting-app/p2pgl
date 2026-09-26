@@ -3090,7 +3090,6 @@ fn a1_0926_op_ak_a_stripped_envelope_is_re_adopted_under_the_same_id() {
 /// Fails at HEAD: the restart with nothing edited serves less than the
 /// running node served.
 #[test]
-#[ignore = "A1-1: a peer's `open` narrowing an account's currencies makes the next restart quarantine history every replica holds, with every descendant"]
 fn a1_0926_1_a_restart_with_nothing_edited_serves_what_the_running_node_served() {
     let truth = generate_fixture(61);
     let dir = fresh_dir("a1-0926-1");

@@ -2192,7 +2192,6 @@ fn a2_the_l110_remedy_followed_under_a_running_node_opens_the_account() {
 /// fresh hand line included: one peer directive un-serves history every
 /// replica already holds, on every replica, and every write after it.
 #[test]
-#[ignore = "A2-4: a peer's back-dated second open makes the served-set rule quarantine history every replica holds, with all its descendants"]
 fn a2_a_peer_open_never_unserves_history_this_node_already_serves() {
     let a = std::sync::Arc::new(key());
     let b = PeerKeySignatureProvider::from_bytes(&[0x51; 32], MESH_ID.to_owned());

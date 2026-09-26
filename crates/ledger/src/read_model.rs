@@ -25,7 +25,7 @@
 
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::hash::compute_content_id;
 use crate::model::*;
@@ -525,16 +525,20 @@ pub struct ReadModel {
     txid_index: HashMap<String, usize>,
     /// Postings index: `account → [txid]`.
     account_postings: HashMap<String, Vec<String>>,
-    /// Latest transaction date per account: `account → max(txn.date)`.
+    /// Transaction dates per account: `account → {txn.date}`.
     ///
     /// Maintained incrementally so the FR-3 AC2 close rule ("no transactions
-    /// after the close date") is an O(1) lookup instead of a full-DAG scan on
-    /// every local and ingested `close`. A monotone max over the same set
+    /// after the close date") is a lookup instead of a full-DAG scan on every
+    /// local and ingested `close`. A set union over the same set
     /// `account_postings` indexes, so it is order-insensitive and needs no
     /// rebuild: every path that puts a transaction into the DAG also calls
     /// [`Self::index_directive`], and the DAG is grow-only (nothing is ever
-    /// removed), so the index cannot go stale in either direction.
-    latest_posting_dates: HashMap<String, NaiveDate>,
+    /// removed), so the index cannot go stale in either direction. A set of
+    /// dates rather than their max since T91 (M-09): an ingested `close` is
+    /// judged against the transactions dated inside the interval it would
+    /// actually close, not against the latest one, which a later re-open
+    /// admits ([`Self::latest_posting_date_in`]).
+    posting_dates: HashMap<String, BTreeSet<NaiveDate>>,
     /// Indexed postings whose amount is outside the amount cap
     /// ([`crate::limits::MAX_AMOUNT_MAGNITUDE`]); informational — see
     /// [`Self::over_cap_posting_count`].
@@ -549,7 +553,7 @@ impl ReadModel {
             transactions: Vec::new(),
             txid_index: HashMap::new(),
             account_postings: HashMap::new(),
-            latest_posting_dates: HashMap::new(),
+            posting_dates: HashMap::new(),
             over_cap_postings: 0,
         };
 
@@ -615,17 +619,17 @@ impl ReadModel {
                 }
             }
 
-            // Index by account, and carry the per-account latest transaction
-            // date forward with it (see `latest_posting_dates`).
+            // Index by account, and record the transaction's date against it
+            // (see `posting_dates`).
             for posting in &txn.postings {
                 self.account_postings
                     .entry(posting.account.clone())
                     .or_default()
                     .push(txid.clone());
-                self.latest_posting_dates
+                self.posting_dates
                     .entry(posting.account.clone())
-                    .and_modify(|latest| *latest = (*latest).max(txn.date))
-                    .or_insert(txn.date);
+                    .or_default()
+                    .insert(txn.date);
             }
 
             // Store the transaction.
@@ -1093,10 +1097,24 @@ impl ReadModel {
     /// The latest date of any transaction with a posting on `account`.
     ///
     /// `None` when the account has never been posted to. Backed by the
-    /// [`latest_posting_dates`](Self::latest_posting_dates) index, so this is a
-    /// hash lookup rather than a scan of every transaction.
+    /// [`posting_dates`](Self::posting_dates) index, so this is a lookup
+    /// rather than a scan of every transaction.
     pub fn latest_posting_date(&self, account: &str) -> Option<NaiveDate> {
-        self.latest_posting_dates.get(account).copied()
+        self.posting_dates.get(account)?.last().copied()
+    }
+
+    /// The latest transaction date on `account` inside `range`, or `None`
+    /// (T91 / M-09: the interval an ingested `close` would close).
+    pub fn latest_posting_date_in(
+        &self,
+        account: &str,
+        range: (std::ops::Bound<NaiveDate>, std::ops::Bound<NaiveDate>),
+    ) -> Option<NaiveDate> {
+        self.posting_dates
+            .get(account)?
+            .range(range)
+            .next_back()
+            .copied()
     }
 
     /// Indexed postings whose amount is outside the amount cap
