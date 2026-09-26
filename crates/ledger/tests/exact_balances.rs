@@ -2875,3 +2875,508 @@ fn a4_3_a_text_held_block_without_an_id_must_not_leave_its_descendants_served() 
         USD,
     );
 }
+
+// ─── A3 (0926): balances across T86's recovery reload, refusals and restarts ─
+//
+// T86 (M-58, M-59, L-104, L-105) changed what a failed commit's recovery
+// keeps, when a refused compaction reloads, and which journal tails are torn.
+// The observable here is the one a user reads: the `Assets:Cash` balance the
+// running node reports, the one it reports after a restart, and the one a
+// fresh replica holds after syncing what the node serves. Each test drives the
+// public API only and induces a commit failure through the filesystem (a
+// read-only ledger directory, so `persist_atomically` cannot create its
+// temporary file).
+
+/// Run `body` and return what it logged at WARN and above.
+fn capture_warnings<T>(body: impl FnOnce() -> T) -> (T, String) {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Buffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+        type Writer = Buffer;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let buffer = Buffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buffer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let value = tracing::subscriber::with_default(subscriber, body);
+    let logged = String::from_utf8_lossy(&buffer.0.lock().expect("log buffer")).into_owned();
+    (value, logged)
+}
+
+/// Run `body` with `directory` read-only, so every commit in it fails.
+#[cfg(unix)]
+fn with_read_only_directory<T>(directory: &Path, body: impl FnOnce() -> T) -> T {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+    let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    value.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// An API write of `amount` USD into `Assets:Cash` from `Equity:Opening`.
+fn cash_input(narration: &str, amount: i64, day: u32) -> TransactionInput {
+    TransactionInput {
+        date: date(2024, 2, day),
+        flag: Flag::Complete,
+        payee: None,
+        narration: Some(narration.to_owned()),
+        tags: Vec::new(),
+        links: Vec::new(),
+        postings: vec![
+            PostingInput {
+                account: CASH.to_owned(),
+                amount: Some(Amount {
+                    number: Decimal::from(amount),
+                    currency: USD.to_owned(),
+                }),
+                cost: None,
+                price: None,
+            },
+            PostingInput {
+                account: OPENING.to_owned(),
+                amount: None,
+                cost: None,
+                price: None,
+            },
+        ],
+    }
+}
+
+/// A hand-typed transaction, as an operator appends it to the `.bean`.
+fn hand_line(narration: &str, amount: i64) -> String {
+    format!(
+        "\n2024-01-26 * \"Hand\" \"{narration}\"\n  Assets:Cash  {amount} USD\n  \
+         Equity:Opening  -{amount} USD\n"
+    )
+}
+
+fn append_to(path: &Path, text: &str) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("open for append");
+    file.write_all(text.as_bytes()).expect("append");
+}
+
+/// A node `nodeA` holding the two `open`s and an acknowledged 100 USD,
+/// compacted, in its own directory.
+fn node_with_100(label: &str) -> (LedgerService, PathBuf) {
+    let path = scratch_ledger(label);
+    let mut service = LedgerService::boot(&path, "nodeA".to_owned()).expect("boot");
+    for account in [CASH, OPENING] {
+        service
+            .open_account(account.to_owned(), date(2024, 1, 1), vec![])
+            .expect("open");
+    }
+    service
+        .append_transaction(cash_input("acked", 100, 1))
+        .expect("acked");
+    service.compact().expect("compact");
+    (service, path)
+}
+
+/// Every transaction's parents are in the same DAG.
+fn parents_resolve(service: &LedgerService) -> bool {
+    service
+        .dag()
+        .directives()
+        .into_iter()
+        .all(|directive| match directive {
+            Directive::Transaction(txn) => txn
+                .parent_ids()
+                .into_iter()
+                .all(|parent| service.dag().get(parent).is_some()),
+            _ => true,
+        })
+}
+
+/// What a fresh replica holds after syncing everything `served` serves:
+/// its `Assets:Cash` balance and what it refused.
+fn fresh_replica_cash(served: &LedgerService, label: &str) -> (Option<String>, Vec<String>) {
+    let mut directives: Vec<Directive> = served.dag().directives().into_iter().cloned().collect();
+    directives.sort_by_key(|directive| {
+        let lamport = directive
+            .metadata()
+            .get("openledger-lamport")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        (!matches!(directive, Directive::Open(_)), lamport)
+    });
+    let path = scratch_ledger(label);
+    let mut fresh = LedgerService::boot(&path, "fresh".to_owned()).expect("boot fresh");
+    let refused = sync_from_served(&mut fresh, directives);
+    let cash = read_now(fresh.read_model(), CASH);
+    remove_scratch(&path);
+    (cash, refused)
+}
+
+/// M-59 (T86 (b), decision (22)) at the balance level. A plain failed write
+/// first (the control: the reload installs and the balance is untouched);
+/// then the operator appends a hand line to the running node's file and the
+/// next API write fails — the pre-persist reconcile adopted the hand line
+/// with that staged write as its parent, so the rebuild is refused. After
+/// one more write, the running node, the node restarted from its file, and a
+/// fresh replica synced from what it serves report the same balance, and
+/// every parent on disk resolves.
+///
+/// The shape matters because before T86 the rebuild installed: the staged
+/// write was discarded, the hand line kept an envelope naming it, and the
+/// next restart's served-set rule (H-23) quarantined the hand line and every
+/// later write — the running node reported 106, the restarted one 100.
+///
+/// Bug-catch: drop the parent check in `keep_committed_envelopes_in` and the
+/// three balances disagree.
+#[cfg(unix)]
+#[test]
+fn a3_m59_a_failed_write_that_a_hand_line_names_leaves_one_balance_running_restarted_and_replicated(
+) {
+    let (mut service, path) = node_with_100("a3-m59");
+    let directory = path.parent().expect("directory").to_path_buf();
+
+    let (outcome, logged) = capture_warnings(|| {
+        with_read_only_directory(&directory, || {
+            service.append_transaction(cash_input("control", 3, 2))
+        })
+    });
+    assert!(outcome.is_err(), "premise: the commit fails");
+    assert!(logged.contains("L-13 reload installed"), "{logged}");
+    assert_eq!(read_now(service.read_model(), CASH).as_deref(), Some("100"));
+
+    append_to(&path, &hand_line("typed while running", 5));
+    let (outcome, logged) = capture_warnings(|| {
+        with_read_only_directory(&directory, || {
+            service.append_transaction(cash_input("staged in the failed commit", 7, 3))
+        })
+    });
+    assert!(outcome.is_err(), "premise: the commit fails");
+    let m59_logged = logged;
+
+    service
+        .append_transaction(cash_input("later", 1, 4))
+        .expect("the next write");
+    let running = read_now(service.read_model(), CASH);
+    let (replicated, refused) = fresh_replica_cash(&service, "a3-m59-fresh");
+    drop(service);
+    let restarted = LedgerService::boot(&path, "nodeA".to_owned()).expect("restart");
+    assert!(
+        running == read_now(restarted.read_model(), CASH) && running == replicated,
+        "running {running:?}, restarted {:?}, fresh replica {replicated:?}",
+        read_now(restarted.read_model(), CASH)
+    );
+    assert!(parents_resolve(&restarted), "every parent on disk resolves");
+    assert_eq!(restarted.quarantined_count(), 0);
+    assert!(refused.is_empty(), "the replica refused {refused:?}");
+    assert!(
+        m59_logged.contains("REFUSING") && m59_logged.contains("M-59"),
+        "premise: the M-59 shape: {m59_logged}"
+    );
+    remove_scratch(&path);
+}
+
+/// L-104 (T86 (c), decision (23)) at the balance level, on a signing-off
+/// node. A hand line is finalised at boot and served — a replica syncs it —
+/// but the compaction that would canonicalise it fails. The operator then
+/// restores a backup taken before the line was typed, and the next commit
+/// (a compaction, nothing staged) fails too. The rebuild lacks the stamped line, so it is refused; the next
+/// write puts the line back, and the node reports the replica's balance
+/// before and after a restart.
+///
+/// Under T82's key (exempt while unsigned) a signing-off node never left the
+/// exemption: the rebuild installed without the line and the node's balance
+/// fell below the replica's, for good on a node with no peer.
+///
+/// Bug-catch: key the exemption in `committed_ids_missing_from` on the
+/// signature again and the node reports 100 against the replica's 105.
+#[cfg(unix)]
+#[test]
+fn a3_l104_a_signing_off_nodes_served_hand_line_survives_a_backup_a_failed_commit_and_a_restart() {
+    let (service, path) = node_with_100("a3-l104");
+    let directory = path.parent().expect("directory").to_path_buf();
+    drop(service);
+    let backup = std::fs::read_to_string(&path).expect("backup");
+    append_to(&path, &hand_line("typed while stopped", 5));
+
+    let mut service = LedgerService::boot(&path, "nodeA".to_owned()).expect("boot");
+    assert_eq!(service.finalize_operator_input(), 1);
+    assert!(with_read_only_directory(&directory, || service.compact()).is_err());
+    let (replicated, refused) = fresh_replica_cash(&service, "a3-l104-fresh");
+    assert!(refused.is_empty(), "the replica refused {refused:?}");
+    assert_eq!(replicated.as_deref(), Some("105"), "premise: served");
+
+    std::fs::write(&path, &backup).expect("restore the backup");
+    let (outcome, logged) =
+        capture_warnings(|| with_read_only_directory(&directory, || service.compact()));
+    assert!(outcome.is_err(), "premise: the commit fails");
+    service
+        .open_account("Assets:After".to_owned(), date(2024, 2, 3), vec![])
+        .expect("the next write");
+
+    let running = read_now(service.read_model(), CASH);
+    drop(service);
+    let restarted = LedgerService::boot(&path, "nodeA".to_owned()).expect("restart");
+    assert!(
+        running == replicated && read_now(restarted.read_model(), CASH) == replicated,
+        "running {running:?}, restarted {:?}, the replica that synced the line {replicated:?}",
+        read_now(restarted.read_model(), CASH)
+    );
+    assert!(
+        logged.contains("REFUSING"),
+        "premise: the floor refused: {logged}"
+    );
+    remove_scratch(&path);
+}
+
+/// The `(start, header end)` of every record in a journal: each `;;olj ` at
+/// a line start, and the offset just past its header line.
+fn journal_records(bytes: &[u8]) -> Vec<(usize, usize)> {
+    (0..bytes.len())
+        .filter(|&at| bytes[at..].starts_with(b";;olj ") && (at == 0 || bytes[at - 1] == b'\n'))
+        .map(|at| {
+            let newline = bytes[at..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .expect("a header line");
+            (at, at + newline + 1)
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn write_owner_only(path: &Path, bytes: &[u8]) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, bytes).expect("write");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+}
+
+/// L-105 (T86 (d)) at the balance level, through boot. Three acknowledged
+/// writes go to the journal (10, 20, then 30 USD); a later append is torn
+/// inside the first `cut` bytes of its `;;olj ` tag (1–5), and the length of
+/// the acknowledged record before it is damaged to run to the end of the
+/// file. Boot must either refuse (`Corrupt`) or report every acknowledged
+/// amount — never drop the 20 as a torn tail. The control, the same tear with
+/// the length intact, is an ordinary torn tail: the node boots and reports
+/// exactly the acknowledged 30.
+///
+/// Why balances: the pre-T86 answer was not an error but a quiet `Ok` whose
+/// Cash balance lacked an acknowledged record, which the startup compaction
+/// then made permanent.
+///
+/// Bug-catch: drop the no-candidate branch in `has_later_intact_record` and
+/// the node boots reporting 10.
+#[cfg(unix)]
+#[test]
+fn a3_l105_an_acknowledged_record_over_an_append_torn_in_its_tag_is_never_a_quiet_balance_loss() {
+    let path = scratch_ledger("a3-l105");
+    // Over `COMPACTION_MIN_CANONICAL_BYTES`, so the writes are journal appends.
+    std::fs::write(&path, format!("; {}\n", "x".repeat(70_000))).expect("write");
+    let mut service = LedgerService::boot(&path, "nodeA".to_owned()).expect("boot");
+    for account in [CASH, OPENING] {
+        service
+            .open_account(account.to_owned(), date(2024, 1, 1), vec![])
+            .expect("open");
+    }
+    for (day, amount) in [(1, 10), (2, 20), (3, 30)] {
+        service
+            .append_transaction(cash_input(&format!("acked {amount}"), amount, day))
+            .expect("acked");
+    }
+    let journal = service.journal_path().to_path_buf();
+    drop(service);
+    let bytes = std::fs::read(&journal).expect("a journal");
+    let bean = std::fs::read(&path).expect("the ledger");
+    let records = journal_records(&bytes);
+    assert!(records.len() >= 3, "premise: appends, {records:?}");
+    let (second, second_header_end) = records[records.len() - 2];
+    let (last, _) = records[records.len() - 1];
+
+    for cut in 1..=5usize {
+        let torn = &bytes[..last + cut];
+        let header = std::str::from_utf8(&bytes[second..second_header_end]).expect("utf-8");
+        let hash = header.trim_end().rsplit(' ').next().expect("hash");
+        let damaged_header = format!(";;olj {} {hash}\n", torn.len() - second_header_end);
+        let mut damaged = torn[..second].to_vec();
+        damaged.extend_from_slice(damaged_header.as_bytes());
+        damaged.extend_from_slice(&torn[second_header_end..]);
+
+        std::fs::write(&path, &bean).expect("restore the ledger");
+        write_owner_only(&journal, &damaged);
+        match LedgerService::boot(&path, "nodeA".to_owned()) {
+            Err(_) => {}
+            Ok(booted) => assert_eq!(
+                read_now(booted.read_model(), CASH).as_deref(),
+                Some("30"),
+                "cut {cut}: an acknowledged record behind a damaged length was dropped as torn"
+            ),
+        }
+
+        std::fs::write(&path, &bean).expect("restore the ledger");
+        write_owner_only(&journal, torn);
+        let booted = LedgerService::boot(&path, "nodeA".to_owned()).expect("a torn tail boots");
+        assert_eq!(
+            read_now(booted.read_model(), CASH).as_deref(),
+            Some("30"),
+            "control, cut {cut}: 10 + 20 acknowledged, the torn 30 never was"
+        );
+    }
+    remove_scratch(&path);
+}
+
+/// A ledger whose file is `margin` bytes under the cap, all of it canonical
+/// comments, with `nodeA`'s two `open`s and an acknowledged 100 USD compacted
+/// in; then as many hand lines appended as the margin holds raw. Their
+/// envelopes push the canonical form past the cap (the L-64 shape the README
+/// names), while the file on disk stays under it.
+fn node_near_the_cap_with_hand_lines_appended(label: &str) -> (LedgerService, PathBuf, usize) {
+    let path = scratch_ledger(label);
+    let cap = MAX_LEDGER_FILE_BYTES as usize;
+    let line = format!("; {}\n", "x".repeat((1 << 20) - 3));
+    let rest = cap - 4096 - line.len() * 63;
+    let last = format!("; {}\n", "x".repeat(rest - 3));
+    std::fs::write(&path, format!("{}{last}", line.repeat(63))).expect("write");
+    let mut service = LedgerService::boot(&path, "nodeA".to_owned()).expect("boot");
+    for account in [CASH, OPENING] {
+        service
+            .open_account(account.to_owned(), date(2024, 1, 1), vec![])
+            .expect("open");
+    }
+    service
+        .append_transaction(cash_input("acked", 100, 1))
+        .expect("acked");
+    service.compact().expect("compact");
+    let margin = cap - std::fs::metadata(&path).expect("stat").len() as usize;
+    let count = margin / hand_line("typed while running 00", 5).len();
+    let hand: String = (0..count)
+        .map(|index| hand_line(&format!("typed while running {index:02}"), 5))
+        .collect();
+    append_to(&path, &hand);
+    assert!(std::fs::metadata(&path).expect("stat").len() <= MAX_LEDGER_FILE_BYTES);
+    (service, path, count)
+}
+
+/// M-58 (T86 (a)) at the balance level, in the file watcher's order: the
+/// operator appends hand lines to a near-cap ledger under a running node, the
+/// watcher's reconcile adopts them (nothing staged) and their envelopes push
+/// the canonical form over the cap, and the compaction that follows is
+/// refused for the cap without a reload. What the refused prepare's
+/// adopt-before-persist took in came from the file, so the running node, the
+/// node restarted from that file, and a fresh replica report one balance —
+/// and the node is closed to writes before staging (headroom 0).
+///
+/// Bug-catch: take the L-80 arm out of `prepare_refusal_needs_no_reload` and
+/// the refused compaction reloads.
+#[test]
+fn a3_m58_hand_lines_adopted_over_the_cap_by_a_refused_compaction_keep_one_balance_without_a_reload(
+) {
+    let (mut service, path, count) = node_near_the_cap_with_hand_lines_appended("a3-m58-watcher");
+    let adopted = service
+        .reconcile_file_staged()
+        .expect("the watcher's reconcile");
+    assert_eq!(adopted.new_directives, count, "premise: adopted");
+    assert_eq!(service.append_headroom(), 0, "premise: over the cap");
+
+    let (outcome, logged) = capture_warnings(|| service.compact());
+    assert!(
+        matches!(outcome, Err(ServiceError::ResourceLimitExceeded { .. })),
+        "{outcome:?}"
+    );
+    assert!(
+        !logged.contains("reload") && !logged.contains("REFUSING"),
+        "the refused compaction must not rebuild: {logged}"
+    );
+    assert_eq!(service.append_headroom(), 0, "the fact holds");
+
+    let expected = (100 + 5 * count).to_string();
+    let running = read_now(service.read_model(), CASH);
+    let (replicated, refused) = fresh_replica_cash(&service, "a3-m58-fresh");
+    drop(service);
+    let restarted = LedgerService::boot(&path, "nodeA".to_owned()).expect("restart");
+    assert!(refused.is_empty(), "the replica refused {refused:?}");
+    assert_eq!(running.as_deref(), Some(expected.as_str()));
+    assert_eq!(read_now(restarted.read_model(), CASH), running);
+    assert_eq!(replicated, running);
+    remove_scratch(&path);
+}
+
+/// A3-1 (0926), the fast shape. T86's M-59 refusal keeps memory whenever a
+/// hand line adopted by a write's own pre-persist reconcile names that write
+/// as its parent and the commit fails — which is the normal way a running
+/// node adopts a hand edit with `watchLedgerFile` off (the default). Memory
+/// then holds the failed call's write: in the balance at once, served, and
+/// written by the next unrelated commit, although the call returned an
+/// error. The balance after an error must be what the file gave the node —
+/// 100 acknowledged plus the adopted 5 — not that plus the refused 7.
+#[cfg(unix)]
+#[test]
+#[ignore = "A3-1: a write whose call failed stays in the balance after T86's M-59 refusal"]
+fn a3_1_a_write_whose_commit_failed_is_not_in_the_balance_after_the_m59_refusal() {
+    let (mut service, path) = node_with_100("a3-1-io");
+    let directory = path.parent().expect("directory").to_path_buf();
+    append_to(&path, &hand_line("typed while running", 5));
+    let outcome = with_read_only_directory(&directory, || {
+        service.append_transaction(cash_input("the failed call", 7, 2))
+    });
+    assert!(outcome.is_err(), "premise: the call returned an error");
+    assert_eq!(
+        read_now(service.read_model(), CASH).as_deref(),
+        Some("105"),
+        "the failed call's 7 is in the balance ({} staged write kept)",
+        service.uncommitted_count()
+    );
+    remove_scratch(&path);
+}
+
+/// A3-1 (0926), the cap shape. The same ordering on a near-cap ledger: the
+/// hand lines the write's pre-persist reconcile adopts push the canonical
+/// form over the cap, so `prepare` refuses with the cap's error ("every write
+/// fails until the file is made smaller"). The write is staged, so the L-13
+/// reload runs, and M-59 refuses it: the refused write is kept in memory,
+/// counted in the balance and served — but can never be written, so a
+/// restart drops it (307 running, 300 restarted). The kept write also keeps
+/// `uncommitted_count() > 0`, which is the condition under which gl-node's
+/// pre-stage refusal steps aside (`refuse_if_local_write_cannot_fit`), and
+/// makes every later compaction reload again — the cost M-58 removed.
+#[test]
+#[ignore = "A3-1: on the cap path the refused write is in the running balance and gone after a restart"]
+fn a3_1_a_write_refused_for_the_cap_is_neither_counted_nor_reloaded_for() {
+    let (mut service, path, _) = node_near_the_cap_with_hand_lines_appended("a3-1-cap");
+    let outcome = service.append_transaction(cash_input("refused for the cap", 7, 2));
+    assert!(
+        matches!(outcome, Err(ServiceError::ResourceLimitExceeded { .. })),
+        "premise: the cap's refusal, {outcome:?}"
+    );
+    let running = read_now(service.read_model(), CASH);
+    let (compacted, logged) = capture_warnings(|| service.compact());
+    drop(service);
+    let restarted = LedgerService::boot(&path, "nodeA".to_owned()).expect("restart");
+    let after_restart = read_now(restarted.read_model(), CASH);
+    remove_scratch(&path);
+    assert_eq!(
+        running, after_restart,
+        "the balance the running node reports after the refusal is not the one it reports \
+         after a restart"
+    );
+    assert!(
+        !logged.contains("REFUSING") && !logged.contains("reload"),
+        "the shutdown compaction ({compacted:?}) rebuilt the ledger: {logged}"
+    );
+}

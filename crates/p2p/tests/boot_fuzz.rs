@@ -58,6 +58,28 @@
 //! lamport keeps that lamport through the rebase) and A1-2 (the per-record
 //! remedy silences (d) while the child stays unadoptable).
 //! `boot_fuzz_a1_operators` sweeps the green A1 operators.
+//!
+//! ## A1 (0926 re-audit of T84)
+//!
+//! Check 6 asks only whether a served record's parents are served, and the
+//! wire check (1) never asks I3/I9, so neither sees the half of T84's rule
+//! that judges a transaction against the accounts (a revert of that half
+//! left every case here green), and `assert_refused_with_descendants` bounds
+//! the quarantine by a count (holding every node-written transaction passes
+//! it). Check 7 asks a real fresh replica — an empty signing
+//! `LedgerService` behind the real intake, staging the served set in lamport
+//! order with orphans retried — both questions: everything served is
+//! adopted, and nothing node-written is held that it would adopt in the form
+//! the mesh holds. It is off in [`Checks::ALL`] (no existing case changes)
+//! and on in [`Checks::EXACT`], which `a1_0926_every_operator_…` sweeps over
+//! every operator. Operators `(ai)`–`(ak)` are the shapes T84 names (an
+//! `open` dated after its transactions, a deleted `open` restored by hand,
+//! the strip-the-envelope remedy). Three cases are `#[ignore]`d with their
+//! finding: A1-1 (a peer's `open` that narrows an account makes the next
+//! restart quarantine history every replica holds), A1-2 (finalize's ceiling
+//! refusal leaves a record served over the line it refused), A1-3 (the
+//! "add the missing open" remedy is refused for an `open` dated after its
+//! transactions).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -72,6 +94,7 @@ use ledger::parse::parse_file;
 use ledger::read_model::CurrencyBalances;
 use ledger::service::{
     DirectiveSigner, DirectiveVerifier, LedgerService, PostingInput, TransactionInput,
+    LAMPORT_CEILING,
 };
 use p2p::allowlist::PeerAllowlist;
 use p2p::gossip::make_supply_entry;
@@ -539,12 +562,26 @@ struct Checks {
     /// so it could not see a node that serves a record whose parent no
     /// replica it talks to may hold (X1 `c3j`, A1 `strand`).
     served_set_self_contained: bool,
+    /// A1 (0926): check 7 — a fresh replica, asked on the real intake and
+    /// its own `stage_remote_directive`, adopts every served record and none
+    /// of the node-written records the node holds back (the edit's own
+    /// targets aside). Off in [`Checks::ALL`], so every case written before
+    /// it runs as it did; on in [`Checks::EXACT`].
+    fresh_peer_adopts_exactly: bool,
 }
 
 impl Checks {
     const ALL: Checks = Checks {
         read_model_parity: true,
         served_set_self_contained: true,
+        fresh_peer_adopts_exactly: false,
+    };
+
+    /// [`Checks::ALL`] plus check 7 (A1, 0926).
+    const EXACT: Checks = Checks {
+        read_model_parity: true,
+        served_set_self_contained: true,
+        fresh_peer_adopts_exactly: true,
     };
 }
 
@@ -778,6 +815,11 @@ fn audit_with(
         }
     }
 
+    // 7. A1 (0926): what a fresh replica would hold, asked of one.
+    if checks.fresh_peer_adopts_exactly {
+        failures.extend(fresh_peer_audit(snapshot, truth, effect, &allowlist));
+    }
+
     // 5. L-74: the read model and the DAG agree on every served transaction.
     if checks.read_model_parity {
         for (id, directive) in &snapshot.served {
@@ -810,6 +852,119 @@ fn audit_with(
         }
     }
 
+    failures
+}
+
+/// Offer one served record to `peer` as the wire delivers it (A1, 0926): the
+/// intake (`validate_supply_entry`), the signature and the allowlist, the
+/// DAG's parent rule — a record whose parent has not arrived waits, as the
+/// orphan buffer holds it — and the peer's own `stage_remote_directive`
+/// (I1–I3, I9, the lamport rules, the backdated-`close` rule).
+fn offer_to(
+    peer: &mut LedgerService,
+    directive: &Directive,
+    allowlist: &PeerAllowlist,
+) -> Result<(), String> {
+    let entry = make_supply_entry(directive);
+    let parsed =
+        validate_supply_entry(&entry).map_err(|error| format!("validate_supply_entry: {error}"))?;
+    verify_remote_signature(&parsed, true, MESH_ID)
+        .map_err(|error| format!("verify_remote_signature: {error}"))?;
+    verify_author_allowlisted(&parsed, allowlist)
+        .map_err(|error| format!("verify_author_allowlisted: {error}"))?;
+    if let Directive::Transaction(txn) = &parsed {
+        if let Some(parent) = txn
+            .parent_ids()
+            .into_iter()
+            .find(|parent| peer.get_directive(parent).is_none())
+        {
+            return Err(format!("its parent {} never arrives", short(parent)));
+        }
+    }
+    peer.stage_remote_directive(parsed)
+        .map(|_| ())
+        .map_err(|error| format!("stage_remote_directive: {error}"))
+}
+
+/// Offer `pending` to `peer` in rounds until a round adopts nothing — a
+/// record refused for a parent or an `open` that arrives later gets its
+/// retry, as the orphan buffer's drain gives it. Returns what was never
+/// adopted, with the last reason.
+fn stage_in_rounds(
+    peer: &mut LedgerService,
+    mut pending: Vec<(String, Directive)>,
+    allowlist: &PeerAllowlist,
+) -> BTreeMap<String, String> {
+    loop {
+        let before = pending.len();
+        let mut refused = BTreeMap::new();
+        pending.retain(
+            |(id, directive)| match offer_to(peer, directive, allowlist) {
+                Ok(()) => false,
+                Err(reason) => {
+                    refused.insert(id.clone(), reason);
+                    true
+                }
+            },
+        );
+        if pending.is_empty() || pending.len() == before {
+            return refused;
+        }
+    }
+}
+
+/// Check 7 (A1, 0926): a fresh signing replica — empty ledger, the same
+/// allowlist — stages the served set in lamport order (the order its author
+/// issued it in, so the adoption ratchet never bites) and must adopt all of
+/// it; then it is offered, in the form the mesh holds (the truth), every
+/// node-written record the node holds back that the edit did not target, and
+/// must refuse each. The first half is the served set's I3/I9 half of H-23
+/// that check 6 cannot see; the second is the minimality
+/// `assert_refused_with_descendants` only bounds by a count.
+fn fresh_peer_audit(
+    snapshot: &Snapshot,
+    truth: &Truth,
+    effect: &Effect,
+    allowlist: &PeerAllowlist,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let dir = fresh_dir("fresh-peer");
+    let own = PeerKeySignatureProvider::from_bytes(&[0x77; 32], MESH_ID.to_owned());
+    let mut peer = LedgerService::boot(dir.join("ledger.bean"), own.public_key_hex())
+        .expect("an empty ledger boots");
+    let mut served: Vec<(String, Directive)> = snapshot
+        .served
+        .iter()
+        .map(|(id, directive)| (id.clone(), directive.clone()))
+        .collect();
+    served.sort_by_key(|(id, directive)| (directive.lamport_clock().unwrap_or(0), id.clone()));
+    for (id, reason) in stage_in_rounds(&mut peer, served, allowlist) {
+        failures.push(format!(
+            "served {} is never adopted by a fresh peer: {reason}",
+            short(&id)
+        ));
+    }
+    let held: Vec<(String, Directive)> = snapshot
+        .quarantined_ids
+        .iter()
+        .filter(|id| !effect.touched.contains(*id) && !effect.deleted.contains(*id))
+        .filter_map(|id| {
+            let directive = validate_supply_entry(truth.entries.get(id)?).ok()?;
+            Some((id.clone(), directive))
+        })
+        .collect();
+    let refused = stage_in_rounds(&mut peer, held.clone(), allowlist);
+    for (id, _) in &held {
+        if !refused.contains_key(id) {
+            failures.push(format!(
+                "held {}, which a fresh peer holding the served set adopts in the form the mesh \
+                 holds it (an over-quarantine)",
+                short(id)
+            ));
+        }
+    }
+    drop(peer);
+    std::fs::remove_dir_all(dir).ok();
     failures
 }
 
@@ -1052,6 +1207,23 @@ enum Operator {
     /// adoption ratchet (5,000,000,000) AND a hand line appended in the same
     /// edit.
     EditLamportLinePastRatchetPlusAppendHand,
+    // ── A1 (0926 re-audit of T84) ──
+    /// (ai) The `open` of `Expenses:Food` moved to a date after the first
+    /// transaction on it — T84's "an account whose `open` … is dated after
+    /// it". On a signing node the signature pass holds the moved `open`, so
+    /// every transaction on the account goes with it (I3), and what descends
+    /// from them.
+    EditOpenDateAfterItsTransactions,
+    /// (aj) The signed `open` of `Expenses:Food` deleted and typed back by
+    /// hand, dated no later than the first transaction on it — the remedy
+    /// the H-23 WARN names for a removed `open`. Its body is the original's,
+    /// so it is re-adopted under the original id and frees what it admits.
+    DeleteOpenPlusHandOpen,
+    /// (ak) The `openledger-*` lines of a signed transaction deleted — the
+    /// remedy the H-20 and H-23 WARNs name for an envelope-only edit: the
+    /// record is re-adopted under the same id as operator input, and what
+    /// names it resolves.
+    StripEnvelopeOfSignedRecord,
 }
 
 /// Every operator that is green: [`OPERATORS_ENABLED`] plus the A2 operators
@@ -1192,6 +1364,10 @@ const HAND_TRANSACTION: &str = "2024-01-29 * \"Hand\" \"appended while the node 
 /// A second hand line, dated after every other operator's (A1): no
 /// envelope, so boot chooses its parents from the heads it holds.
 const A1_LATER_HAND_TRANSACTION: &str = "2024-01-31 * \"Hand\" \"stamped on top of the other edits\"\n  Expenses:Rent                                      3.25 USD\n  Assets:Cash                                       -3.25 USD";
+
+/// The date (ai) moves `open Expenses:Food` to: after the fixture's first
+/// transaction, which always posts to `Expenses:Food` on day 3–5 (A1, 0926).
+const A1_0926_LATE_FOOD_OPEN: &str = "2024-01-06 open Expenses:Food";
 
 /// A lamport past the adoption ratchet from any fixture clock: more than
 /// [`ledger::service::MAX_LAMPORT_ADVANCE`] above it (A1-1).
@@ -1483,6 +1659,31 @@ fn mutate(truth: &Truth, operator: Operator, position: usize) -> Option<Mutation
                 }
             });
             blocks.push(HAND_TRANSACTION.to_owned());
+        }
+        // ── A1 (0926) ──
+        Operator::EditOpenDateAfterItsTransactions => {
+            let index = blocks
+                .iter()
+                .position(|block| block.starts_with("2024-01-01 open Expenses:Food"))?;
+            touch(&mut effect, &blocks[index]);
+            blocks[index] = set_lines(&blocks[index], |lines| {
+                lines[0] = A1_0926_LATE_FOOD_OPEN.to_owned();
+            });
+        }
+        Operator::DeleteOpenPlusHandOpen => {
+            let index = blocks
+                .iter()
+                .position(|block| block.starts_with("2024-01-01 open Expenses:Food"))?;
+            effect
+                .deleted
+                .push(truth_id_of(truth, &blocks[index]).expect("signed open"));
+            blocks.remove(index);
+            blocks.push("2024-01-01 open Expenses:Food".to_owned());
+        }
+        Operator::StripEnvelopeOfSignedRecord => {
+            let index = pick(&signed_txns);
+            touch(&mut effect, &blocks[index]);
+            blocks[index] = strip_envelope(&blocks[index]);
         }
     }
     Some(Mutation {
@@ -2626,4 +2827,495 @@ proptest! {
             report.failures.join("\n  ")
         );
     }
+}
+
+// ─── A1 (0926 re-audit of T84) ───────────────────────────────────────────────
+
+/// The operators added by the 0926 re-audit (A1): the shapes T84's rule and
+/// its remedies name.
+const OPERATORS_A1_0926: [Operator; 3] = [
+    Operator::EditOpenDateAfterItsTransactions,
+    Operator::DeleteOpenPlusHandOpen,
+    Operator::StripEnvelopeOfSignedRecord,
+];
+
+/// Every operator in this file that is expected green.
+fn every_green_operator() -> Vec<Operator> {
+    OPERATORS_ALL
+        .iter()
+        .chain(OPERATORS_A1.iter())
+        .chain(OPERATORS_A1_0926.iter())
+        .copied()
+        .chain([
+            Operator::EditLamportLineHuge,
+            Operator::EditLamportLinePastRatchetPlusAppendHand,
+        ])
+        .collect()
+}
+
+/// A signed `open` block authored by `provider` at `lamport`, as another
+/// allowlisted peer of the mesh serves it (A1, 0926). An `open` names no
+/// parents.
+fn a1_0926_signed_open_block(
+    provider: &PeerKeySignatureProvider,
+    body: &str,
+    lamport: u64,
+) -> String {
+    let directive = parse_file(&format!("{body}\n"))
+        .expect("open parses")
+        .remove(0);
+    let id = compute_content_id(&directive);
+    let lamport = lamport.to_string();
+    let signature = provider
+        .sign(&SignableMessage {
+            content_id: &id,
+            is_transaction: false,
+            parents: "",
+            lamport: &lamport,
+        })
+        .expect("signing enabled");
+    format!(
+        "{body}\n  {KEY_AUTHOR}: \"{}\"\n  {KEY_LAMPORT}: \"{lamport}\"\n  {KEY_SIGNATURE}: \"{signature}\"",
+        provider.public_key_hex()
+    )
+}
+
+/// Every operator, every check including check 7 (A1, 0926): after boot
+/// (and the reboot), what the node serves is exactly what a fresh replica
+/// adopts — all of it, and none of the node-written records it holds back
+/// beyond the ones the edit made unacceptable. Deterministic: two seeds, two
+/// positions per operator.
+///
+/// Revert-proofs (in a copy of HEAD): (M2) drop the `validate_transaction`
+/// arm of `unservable_history` — T84's I3/I9 half — and the deleted-`open`
+/// and moved-`open` cases serve transactions no fresh peer adopts (every
+/// other case in this file stays green under M2); (M1) make
+/// `unservable_history` hold every history transaction once anything is
+/// unservable, and the held-but-adoptable records are named (ten of the
+/// eleven cases T84 moved to `assert_refused_with_descendants` stay green
+/// under M1).
+#[test]
+fn a1_0926_every_operator_serves_exactly_what_a_fresh_peer_adopts() {
+    let mut failures = Vec::new();
+    let mut applied = 0usize;
+    for seed in [71u64, 72] {
+        let truth = generate_fixture(seed);
+        for operator in every_green_operator() {
+            for position in [0usize, 1] {
+                let report = run_case(&truth, operator, position, Checks::EXACT);
+                if !report.applied {
+                    continue;
+                }
+                applied += 1;
+                failures.extend(report.failures.into_iter().map(|failure| {
+                    format!("{operator:?} seed {seed} position {position}: {failure}")
+                }));
+            }
+        }
+    }
+    assert!(applied > 100, "only {applied} cases applied");
+    assert!(
+        failures.is_empty(),
+        "{} failure(s):\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
+}
+
+/// Check 7 sees a served transaction on an account no served `open` opens —
+/// the I3 half of H-23 that checks 1 and 6 do not ask (A1, 0926).
+#[test]
+fn a1_0926_oracle_7_detects_a_served_record_no_fresh_peer_adopts() {
+    let truth = generate_fixture(24);
+    let mut snapshot = {
+        let dir = fresh_dir("oracle7");
+        let path = dir.join("ledger.bean");
+        std::fs::write(&path, &truth.text).unwrap();
+        let svc = LedgerService::boot(path, truth.author.clone()).unwrap();
+        let snapshot = snapshot_of(&svc);
+        drop(svc);
+        std::fs::remove_dir_all(dir).ok();
+        snapshot
+    };
+    assert!(audit(&snapshot, &truth, &Effect::default(), Checks::EXACT).is_empty());
+    let open = snapshot
+        .served
+        .iter()
+        .find(|(_, d)| matches!(d, Directive::Open(open) if open.account == "Expenses:Food"))
+        .map(|(id, _)| id.clone())
+        .unwrap();
+    snapshot.served.remove(&open);
+    snapshot.quarantined_ids.insert(open.clone());
+    let effect = Effect {
+        touched: vec![],
+        deleted: vec![open],
+    };
+    let failures = audit(&snapshot, &truth, &effect, Checks::ALL);
+    assert!(
+        failures.is_empty(),
+        "checks 1–6 are blind to it: {failures:#?}"
+    );
+    let failures = audit(&snapshot, &truth, &effect, Checks::EXACT);
+    assert!(
+        !failures.is_empty()
+            && failures.iter().all(|failure| {
+                failure.contains("never adopted by a fresh peer")
+                    && (failure.contains("Expenses:Food not open")
+                        || failure.contains("never arrives"))
+            }),
+        "{failures:#?}"
+    );
+}
+
+/// Check 7 sees a node-written record held back that a fresh replica holding
+/// the served set would adopt — the over-quarantine a count bound admits
+/// (A1, 0926).
+#[test]
+fn a1_0926_oracle_7_detects_an_over_quarantine() {
+    let truth = generate_fixture(25);
+    let mut snapshot = {
+        let dir = fresh_dir("oracle7");
+        let path = dir.join("ledger.bean");
+        std::fs::write(&path, &truth.text).unwrap();
+        let svc = LedgerService::boot(path, truth.author.clone()).unwrap();
+        let snapshot = snapshot_of(&svc);
+        drop(svc);
+        std::fs::remove_dir_all(dir).ok();
+        snapshot
+    };
+    // A transaction nothing names: holding it strands nothing else.
+    let named: BTreeSet<String> = snapshot.served.values().flat_map(parents_of).collect();
+    let victim = snapshot
+        .served
+        .iter()
+        .find(|(id, d)| matches!(d, Directive::Transaction(_)) && !named.contains(*id))
+        .map(|(id, _)| id.clone())
+        .unwrap();
+    snapshot.served.remove(&victim);
+    snapshot.journal.remove(&victim);
+    snapshot.quarantined_ids.insert(victim.clone());
+    snapshot.quarantined_count += 1;
+    // The T84 helper's bound admits it (0 refused + 1 node-written transaction).
+    assert_refused_with_descendants(&snapshot, &truth, 0, "over-quarantine");
+    let failures = audit(&snapshot, &truth, &Effect::default(), Checks::EXACT);
+    assert_eq!(
+        failures,
+        vec![format!(
+            "held {}, which a fresh peer holding the served set adopts in the form the mesh \
+             holds it (an over-quarantine)",
+            short(&victim)
+        )]
+    );
+}
+
+/// (ai) An `open` moved after its transactions (A1, 0926): everything on the
+/// account, and what descends from it, is held — and nothing else (check 7).
+#[test]
+fn a1_0926_op_ai_an_open_dated_after_its_transactions_holds_exactly_what_it_does_not_admit() {
+    let report = assert_holds(
+        Operator::EditOpenDateAfterItsTransactions,
+        73,
+        0,
+        Checks::EXACT,
+    );
+    let first = report.first.expect("ran");
+    assert!(
+        !first.quarantined_ids.is_empty(),
+        "the moved open is held, with what it no longer admits"
+    );
+    assert!(
+        first
+            .served
+            .values()
+            .all(|d| !matches!(d, Directive::Open(open) if open.account == "Expenses:Food")),
+        "the moved open is not served"
+    );
+}
+
+/// (aj) The remedy for a removed `open` (A1, 0926): typed back by hand,
+/// dated no later than the first transaction, it frees every transaction it
+/// admits in the same boot, and the node serves the whole history again.
+#[test]
+fn a1_0926_op_aj_a_deleted_open_typed_back_by_hand_frees_its_transactions() {
+    let truth = generate_fixture(74);
+    let report = assert_holds(Operator::DeleteOpenPlusHandOpen, 74, 0, Checks::EXACT);
+    let first = report.first.expect("ran");
+    assert_eq!(first.quarantined_count, 0, "nothing is held");
+    for (id, entry) in &truth.entries {
+        if entry.kind == DirectiveKind::Transaction {
+            assert!(first.served.contains_key(id), "{} is served", short(id));
+        }
+    }
+}
+
+/// (ak) The strip-the-envelope remedy on a record with descendants (A1,
+/// 0926): re-adopted under the same id, it and everything naming it are
+/// served, a fresh replica adopts all of it, and the reboot is a fixed point.
+#[test]
+fn a1_0926_op_ak_a_stripped_envelope_is_re_adopted_under_the_same_id() {
+    let truth = generate_fixture(75);
+    for position in 0..3 {
+        let report = assert_holds(
+            Operator::StripEnvelopeOfSignedRecord,
+            75,
+            position,
+            Checks::EXACT,
+        );
+        let first = report.first.expect("ran");
+        assert_eq!(
+            first.quarantined_count, 0,
+            "position {position}: nothing is held"
+        );
+        assert_eq!(
+            first.served.len(),
+            truth.entries.len(),
+            "position {position}: the same ids are served"
+        );
+    }
+}
+
+/// A1-1 (0926): another allowlisted peer serves an `open` of an account that
+/// is already open, dated inside the history, with a currency list that
+/// excludes what the account has always held — an `open` is data on the
+/// wire (M-09), so every node adopts it. Nothing on any node is edited. At
+/// its next restart each node's T84 rule judges the history against the
+/// accounts as they now stand (I9), and quarantines every transaction on the
+/// account after that date and — through parenthood — everything written
+/// after them on every account, this node's acknowledged writes included;
+/// the live reconcile's post-loop rule does the same at the next hand edit.
+/// A fresh replica that received the history before the `open` holds all of
+/// it, so "no fresh replica could hold" is not what the rule measures. The
+/// WARN's "add the missing open" is refused (L-77: already open).
+///
+/// Fails at HEAD: the restart with nothing edited serves less than the
+/// running node served.
+#[test]
+#[ignore = "A1-1: a peer's `open` narrowing an account's currencies makes the next restart quarantine history every replica holds, with every descendant"]
+fn a1_0926_1_a_restart_with_nothing_edited_serves_what_the_running_node_served() {
+    let truth = generate_fixture(61);
+    let dir = fresh_dir("a1-0926-1");
+    let path = dir.join("ledger.bean");
+    std::fs::write(&path, &truth.text).unwrap();
+    let mut svc = run_pipeline(&path, &truth.provider).unwrap();
+    let mut dates: Vec<NaiveDate> = snapshot_of(&svc)
+        .served
+        .values()
+        .filter_map(|d| match d {
+            Directive::Transaction(txn) => Some(txn.date),
+            _ => None,
+        })
+        .collect();
+    dates.sort();
+    // After the first transaction: it stays admitted, the rest do not.
+    let date = dates[1];
+    let peer = foreign_provider(&truth);
+    let block = a1_0926_signed_open_block(
+        &peer,
+        &format!("{date} open Assets:Cash EUR"),
+        svc.lamport_clock() + 1,
+    );
+    let open = parse_file(&format!("{block}\n")).unwrap().remove(0);
+    let allowlist = PeerAllowlist::parse(&[truth.author.clone(), peer.public_key_hex()]).unwrap();
+    offer_to(&mut svc, &open, &allowlist).expect("an open is data on the wire (M-09)");
+    svc.persist_or_reload().unwrap();
+    let running = snapshot_of(&svc);
+    drop(svc);
+    let (restarted, logged) = capture_warnings(|| run_pipeline(&path, &truth.provider).unwrap());
+    let restarted = snapshot_of(&restarted);
+    std::fs::remove_dir_all(dir).ok();
+    let failures = fixed_point(&running, &restarted);
+    assert!(
+        failures.is_empty(),
+        "a restart with nothing edited changed what the node serves ({} records named \
+         \"no fresh replica could hold\", I9: {}):\n  {}",
+        logged.matches("no fresh replica could hold").count(),
+        logged.contains("does not accept USD"),
+        failures.join("\n  ")
+    );
+}
+
+/// A1-2 (0926): `finalize_operator_input` quarantines operator input it
+/// cannot stamp below the Lamport ceiling, but — unlike its M-54 refusal,
+/// the signature pass and boot — does not run `quarantine_unservable_history`
+/// after it. The operator follows the H-20/H-23 remedy and strips a signed
+/// record's `openledger-*` lines; its child still names it. A peer's record
+/// near the ceiling leaves room for one stamp, which an earlier hand line
+/// takes. The stripped record is refused at finalisation and its child is
+/// served naming a record this node does not serve (check 6); the next boot
+/// holds it (not a fixed point).
+///
+/// Fails at HEAD: check 6 names the child, and the reboot changes the
+/// served set.
+#[test]
+#[ignore = "A1-2: finalize's ceiling refusal quarantines operator input without re-running the served-set rule; a record naming it stays served"]
+fn a1_0926_2_a_ceiling_refused_hand_line_leaves_nothing_served_over_it() {
+    let truth = generate_fixture(62);
+    let mut blocks = split_blocks(&truth.text);
+    let signed: Vec<usize> = (0..blocks.len())
+        .filter(|index| is_transaction_block(&blocks[*index]) && is_signed_block(&blocks[*index]))
+        .collect();
+    let parent = signed
+        .iter()
+        .copied()
+        .find(|parent| {
+            let parent_id = truth_id_of(&truth, &blocks[*parent]).unwrap();
+            signed.iter().any(|child| {
+                envelope_value(&blocks[*child], KEY_PARENTS)
+                    .is_some_and(|parents| parents.contains(&parent_id))
+            })
+        })
+        .expect("the fixture is a chain");
+    let parent_id = truth_id_of(&truth, &blocks[parent]).unwrap();
+    blocks[parent] = strip_envelope(&blocks[parent]);
+    let peer = foreign_provider(&truth);
+    blocks.push(a1_0926_signed_open_block(
+        &peer,
+        "2024-01-01 open Assets:Other",
+        LAMPORT_CEILING - 4,
+    ));
+    blocks.push("2023-12-31 open Assets:Earlier".to_owned());
+    let dir = fresh_dir("a1-0926-2");
+    let path = dir.join("ledger.bean");
+    std::fs::write(&path, join_blocks(&blocks)).unwrap();
+    let effect = Effect {
+        touched: vec![parent_id],
+        deleted: vec![],
+    };
+    let extra = vec![peer.public_key_hex()];
+    let mut failures = Vec::new();
+    let first = snapshot_of(&run_pipeline(&path, &truth.provider).unwrap());
+    failures.extend(
+        audit_with(&first, &truth, &effect, Checks::ALL, &extra)
+            .into_iter()
+            .map(|failure| format!("first boot: {failure}")),
+    );
+    let second = snapshot_of(&run_pipeline(&path, &truth.provider).unwrap());
+    failures.extend(fixed_point(&first, &second));
+    std::fs::remove_dir_all(dir).ok();
+    assert!(failures.is_empty(), "{}", failures.join("\n  "));
+}
+
+/// A1-3 (0926): an `open` moved after its transactions (operator (ai)). The
+/// H-23 WARN — and README §Editing, for "the `open` it relies on … is dated
+/// after it" — prescribes "add the missing open, dated no later than the
+/// first transaction on the account". The operator does, and the hand `open`
+/// is refused as already open (L-77): at adoption the moved `open` is still
+/// in the DAG (the signature pass that holds it runs later; on a node without
+/// signing it is served), so everything stays held, at every boot.
+///
+/// Fails at HEAD: after the remedy the account's transactions are still held.
+#[test]
+#[ignore = "A1-3: the H-23 remedy 'add the missing open' is refused (L-77) for an open dated after its transactions"]
+fn a1_0926_3_the_add_the_missing_open_remedy_frees_what_a_late_open_held() {
+    let truth = generate_fixture(63);
+    let mutation = mutate(&truth, Operator::EditOpenDateAfterItsTransactions, 0).unwrap();
+    let dir = fresh_dir("a1-0926-3");
+    let path = dir.join("ledger.bean");
+    std::fs::write(&path, &mutation.text).unwrap();
+    let (svc, logged) = capture_warnings(|| run_pipeline(&path, &truth.provider).unwrap());
+    let held_before = svc.quarantined_count();
+    drop(svc);
+    assert!(
+        held_before > 1 && logged.contains("add the missing open"),
+        "premise: the moved open holds transactions, and the WARN names the remedy"
+    );
+    // "add the missing open, dated no later than the first transaction on
+    // the account" — the fixture's first transaction is on day 3–5.
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str("\n2024-01-01 open Expenses:Food\n");
+    std::fs::write(&path, text).unwrap();
+    let (svc, logged) = capture_warnings(|| run_pipeline(&path, &truth.provider).unwrap());
+    let after = snapshot_of(&svc);
+    drop(svc);
+    std::fs::remove_dir_all(dir).ok();
+    let still_held: Vec<&str> = truth
+        .entries
+        .iter()
+        .filter(|(id, entry)| {
+            entry.kind == DirectiveKind::Transaction && !after.served.contains_key(*id)
+        })
+        .map(|(id, _)| short(id))
+        .collect();
+    assert!(
+        still_held.is_empty(),
+        "after the prescribed remedy {} transaction(s) are still held ({still_held:?}); the \
+         hand open was refused: {}",
+        still_held.len(),
+        logged.contains("is already open")
+    );
+}
+
+/// "If a peer holds the missing parent, it re-supplies it and these records
+/// return by themselves" — the H-23 WARN's promise, end to end (A1, 0926):
+/// the lamport line of a signed record with a child is edited, so the record
+/// is held under its own id and its descendants with it; a peer that holds
+/// the mesh's copy offers every record the node does not serve, on the real
+/// intake and `stage_remote_directive`. All of them are adopted, the node
+/// holds nothing, its clock stays above everything it holds, its next write
+/// is adopted by the peer, and a restart serves the same set.
+///
+/// Revert-proof: drop the DAG filter in `live_quarantine` and the stale
+/// copies are still counted (and written) after the parent returned.
+#[test]
+fn a1_0926_a_held_child_returns_when_a_peer_re_supplies_its_parent() {
+    let truth = generate_fixture(76);
+    let (dir, path, child) = a1_envelope_edited_parent_with_a_child(&truth);
+    let mut svc = run_pipeline(&path, &truth.provider).unwrap();
+    assert!(
+        svc.quarantined_ids().contains(&child.as_str()),
+        "premise: held"
+    );
+    let allowlist = PeerAllowlist::parse(std::slice::from_ref(&truth.author)).unwrap();
+    let missing: Vec<(String, Directive)> = truth
+        .entries
+        .iter()
+        .filter(|(id, _)| svc.get_directive(id).is_none())
+        .map(|(id, entry)| (id.clone(), validate_supply_entry(entry).unwrap()))
+        .collect();
+    let refused = stage_in_rounds(&mut svc, missing, &allowlist);
+    assert!(
+        refused.is_empty(),
+        "the node refuses the mesh's copies: {refused:?}"
+    );
+    svc.persist_or_reload().unwrap();
+    assert_eq!(
+        svc.quarantined_count(),
+        0,
+        "nothing is held once the parent is back"
+    );
+    let highest = svc
+        .all_directive_ids()
+        .iter()
+        .filter_map(|id| svc.get_directive(id).and_then(Directive::lamport_clock))
+        .max()
+        .unwrap();
+    assert!(
+        svc.lamport_clock() > highest,
+        "the clock is above everything held"
+    );
+    let write = svc
+        .append_transaction_signing(
+            random_transaction(&mut Rng::new(76), ymd(2024, 2, 2), 99),
+            sign_kind(&truth.provider, true),
+        )
+        .unwrap();
+    let running = snapshot_of(&svc);
+    drop(svc);
+    let restarted = snapshot_of(&run_pipeline(&path, &truth.provider).unwrap());
+    std::fs::remove_dir_all(dir).ok();
+    assert_eq!(fixed_point(&running, &restarted), Vec::<String>::new());
+    assert!(restarted.served.contains_key(&write.txid));
+    let peer_dir = fresh_dir("a1-0926-resupply-peer");
+    let peer_path = peer_dir.join("ledger.bean");
+    std::fs::write(&peer_path, &truth.text).unwrap();
+    let mut peer =
+        LedgerService::boot(peer_path, foreign_provider(&truth).public_key_hex()).unwrap();
+    let staged = offer_to(&mut peer, &restarted.served[&write.txid], &allowlist);
+    drop(peer);
+    std::fs::remove_dir_all(peer_dir).ok();
+    assert_eq!(
+        staged,
+        Ok(()),
+        "the node's next write is adopted by the peer"
+    );
 }

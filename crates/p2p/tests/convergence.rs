@@ -3191,3 +3191,667 @@ fn l87_the_clock_release_does_not_reissue_a_pair_a_peer_holds_after_a_body_edit(
         "B holds duplicate (author, lamport) pairs: {duplicates:?}"
     );
 }
+
+// ─── A6 (0926): T89 across replicas ─────────────────────────────────────────
+//
+// The placeholder in every own lookup (L-96), the "every signature failed"
+// judgement and its held release (L-98, L-99), the gap verdict (L-111, L-113),
+// hand-parented lines (L-108) and the stray-key strip on both paths (L-109,
+// L-112), each judged on what the other replicas end up holding.
+
+use ledger::serialize::full_file_serialize;
+
+/// Replica `index`'s `.bean` with `text` appended (the operator's editor).
+fn append_to_bean(path: &Path, text: &str) {
+    let mut content = std::fs::read_to_string(path).expect("read the .bean");
+    content.push_str(text);
+    std::fs::write(path, content).expect("write the .bean");
+}
+
+/// A hand line: `body` as the file spells it, with no envelope except the
+/// `openledger-parents` the operator typed, if any.
+fn hand_line(body: &Transaction, parents: Option<&str>) -> String {
+    let mut body = body.clone();
+    if let Some(parents) = parents {
+        body.metadata
+            .insert("openledger-parents".to_owned(), parents.to_owned());
+    }
+    format!(
+        "\n{}",
+        full_file_serialize(&[Directive::Transaction(body)], &[])
+    )
+}
+
+/// An L-13 reload of replica `index` exactly as `gl-node` drives one after a
+/// failed commit: `begin_recovery` → `RecoveryReload::load` →
+/// `finish_recovery` (which re-runs `verify_own_history` and finalises what
+/// the rebuild read as operator input). Returns every WARN it logged.
+fn l13_reload(mesh: &mut Mesh, index: usize) -> String {
+    let svc = &mut mesh.replicas[index].svc;
+    let reload = svc.begin_recovery();
+    let loaded = reload.load();
+    let ((), logged) = capture_warnings(|| svc.finish_recovery(reload, loaded));
+    logged
+}
+
+/// Every `(author, lamport)` pair replica `index` holds more than once.
+fn duplicate_pairs(mesh: &Mesh, index: usize) -> Vec<(String, u64)> {
+    let mut counts: BTreeMap<(String, u64), usize> = BTreeMap::new();
+    for directive in mesh.replicas[index].svc.dag().directives() {
+        if let (Some(author), Some(lamport)) = (author_of(directive), directive.lamport_clock()) {
+            *counts.entry((author, lamport)).or_insert(0) += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(pair, _)| pair)
+        .collect()
+}
+
+/// L-96 (T89, decision (31)) across a boot and an L-13 reload: A's file holds
+/// a pre-T80 history A signed under the placeholder `"local"` plus one more
+/// `"local"` record at lamport 7 held as unparsable text (the H-20 salvage
+/// shape). The gl-node boot runs under the placeholder, so it counted that
+/// record as A's own; the L-13 reload boots under A's real id and, before
+/// T89, did not — the same file resumed at two clocks (X1 `c5a`: 9 vs 6), and
+/// the reloaded node's next write could land at or below a lamport its own
+/// file already spells. Now both resume above it, A's next write is stamped
+/// above 7, and B, joining by anti-entropy, converges with no duplicate pair.
+///
+/// Bug-catch: make `is_own_author` compare the id alone and the reload
+/// resumes at 4.
+#[test]
+fn l96_a_placeholder_history_resumes_at_one_clock_on_a_boot_and_an_l13_reload() {
+    let key_a = key(1);
+    let path = temp_bean("A-placeholder");
+    {
+        let mut svc = LedgerService::boot(path.clone(), "local".to_owned()).expect("boot");
+        svc.set_signer(signer(&key_a));
+        let mut a = Replica {
+            name: "pre-T80 A".to_owned(),
+            key: Arc::clone(&key_a),
+            path: path.clone(),
+            svc,
+            orphans: OrphanBuffer::new(),
+            permanent: BTreeMap::new(),
+            retryable: BTreeMap::new(),
+            keep_files: true,
+        };
+        a.open("Assets:Cash");
+        a.open("Equity:Opening");
+        a.append("pre-signing", 3, "Assets:Cash");
+        a.svc.compact().expect("compact");
+    }
+    let written = std::fs::read_to_string(&path).expect("read");
+    assert_eq!(
+        written.matches("openledger-author: \"local\"").count(),
+        3,
+        "premise: every record carries the placeholder"
+    );
+    append_to_bean(
+        &path,
+        "\n2024-01-26 * \"Junk\" \"held as text\"\n  openledger-author: \"local\"\n  \
+         openledger-lamport: \"7\"\n  this line does not parse\n",
+    );
+    let mut mesh = Mesh::new(9261);
+    let (a, report) = mesh.add_like_gl_node("A", Arc::clone(&key_a), path, MESH_ID);
+    let fresh = mesh.replicas[a].svc.lamport_clock();
+    for directive in mesh.replicas[a]
+        .svc
+        .dag()
+        .directives()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        mesh.record(&directive);
+    }
+    let logged = l13_reload(&mut mesh, a);
+    let reloaded = mesh.replicas[a].svc.lamport_clock();
+    eprintln!(
+        "A6 / L-96: {report:?}; clock after the gl-node boot {fresh}, after the L-13 reload \
+         {reloaded}; reload logged:\n{logged}"
+    );
+    assert!(fresh > 7, "the boot resumes above the text-held record");
+    assert_eq!(
+        reloaded, fresh,
+        "a boot and an L-13 reload of one file resume at one clock"
+    );
+    let written = mesh.append(a, "after-reload", 4, "Assets:Cash");
+    let stamped = mesh.replicas[a]
+        .svc
+        .get_directive(&written)
+        .and_then(Directive::lamport_clock)
+        .expect("stamped");
+    assert!(
+        stamped > 7,
+        "A's next write is stamped {stamped}, not above 7"
+    );
+    let b = mesh.add("B", 2);
+    mesh.run_to_fixed_point(Order::Ascending);
+    assert!(duplicate_pairs(&mesh, b).is_empty());
+    mesh.assert_converged("A6 / L-96 placeholder history");
+}
+
+/// A and B with history, then X (allowlisted) serves a 2^30 jump — a peer's
+/// ratchet-legal step every node adopts — and A authors on top of it, so
+/// every record from then on is 2^28 or more above the history before it.
+/// Returns the mesh and A's canonical `.bean` (A stopped).
+fn jumped_history_then_stop_a(seed: u64) -> (Mesh, PathBuf) {
+    let mut mesh = seeded_mesh(seed, 2);
+    let (a, b) = (0, 1);
+    let x = key(206);
+    mesh.allow_also(&x.public_key_hex());
+    mesh.append(a, "pre-1", 10, "Assets:Cash");
+    mesh.run_to_fixed_point(Order::Ascending);
+    let clock = mesh.replicas[a]
+        .svc
+        .lamport_clock()
+        .max(mesh.replicas[b].svc.lamport_clock());
+    let jump = mesh.record(&hand_open(&x, "Assets:Jump", clock + (1 << 30)));
+    for replica in [a, b] {
+        mesh.deliver(replica, vec![jump.clone()], Order::Causal);
+    }
+    mesh.append(a, "post-1", 5, "Assets:Cash");
+    mesh.append(a, "post-2", 6, "Assets:Cash");
+    mesh.run_to_fixed_point(Order::Ascending);
+    assert!(mesh.divergence_among(&[a, b], &[]).is_none());
+    let path = mesh.stop(a);
+    (mesh, path)
+}
+
+/// Restart slot `index` on `path` in gl-node order under `mesh_id` — key and
+/// verifier both for that domain, as `main.rs` builds them from one config —
+/// and return the WARNs the boot logged.
+fn restart_under_mesh_id(mesh: &mut Mesh, index: usize, path: PathBuf, mesh_id: &str) -> String {
+    let name = mesh.replicas[index].name.clone();
+    let seed = u8::try_from(index + 1).expect("seeded_mesh keys");
+    let ((replica, report), logged) = capture_warnings(|| {
+        Replica::boot_like_gl_node(&name, key_for_mesh(seed, mesh_id), path, mesh_id)
+    });
+    eprintln!("A6 / {name} restarted under {mesh_id:?}: {report:?}");
+    mesh.replicas[index] = replica;
+    logged
+}
+
+/// L-98 + L-99 (T89, decision (32)) through gl-node's boot order: A restarts
+/// under the wrong `meshId` — key and verifier both for another domain. Every
+/// signature in its file fails, across the signer's and the verifier's
+/// passes; the "EVERY signature" WARN is logged exactly once, says not to
+/// author, and the clock stays where the history put it — above the 2^30
+/// jump the history carries, which the L-87 release would otherwise walk it
+/// back past (every record is quarantined, so nothing "remains"). An L-13
+/// reload under the same config re-derives the same verdict and the same
+/// clock. Restarted under the right `meshId`, A quarantines nothing and the
+/// mesh converges.
+///
+/// Bug-catch: release regardless of the verdict and the clock falls below
+/// the jump.
+#[test]
+fn l99_a_wrong_mesh_id_keeps_the_clock_and_warns_once_on_boot_and_reload() {
+    let (mut mesh, path) = jumped_history_then_stop_a(9262);
+    let (a, b) = (0, 1);
+    let history_top = mesh.replicas[b]
+        .svc
+        .dag()
+        .directives()
+        .into_iter()
+        .filter_map(Directive::lamport_clock)
+        .max()
+        .expect("history");
+    let logged = restart_under_mesh_id(&mut mesh, a, path.clone(), "another-mesh");
+    let clock = mesh.replicas[a].svc.lamport_clock();
+    eprintln!("A6 / L-99: history top {history_top}, A's clock {clock}\n{logged}");
+    assert_eq!(mesh.replicas[a].svc.directive_count(), 0, "all quarantined");
+    assert_eq!(logged.matches("EVERY signature").count(), 1, "{logged}");
+    assert!(logged.contains("Do not author"), "{logged}");
+    assert!(
+        clock >= history_top,
+        "the clock ({clock}) was released below the history ({history_top})"
+    );
+    let reload = l13_reload(&mut mesh, a);
+    assert_eq!(mesh.replicas[a].svc.lamport_clock(), clock, "{reload}");
+    assert_eq!(reload.matches("EVERY signature").count(), 1, "{reload}");
+    let path = mesh.stop(a);
+    let logged = restart_under_mesh_id(&mut mesh, a, path, MESH_ID);
+    assert!(!logged.contains("EVERY signature"), "{logged}");
+    assert_eq!(mesh.replicas[a].svc.quarantined_count(), 0);
+    mesh.run_to_fixed_point(Order::Ascending);
+    mesh.assert_converged_among("A6 / L-99 right meshId again", &[a, b], &[]);
+}
+
+/// A6-2 (0926): `every_checked_signature_failed` counts what this node signs
+/// itself as a verified signature. The README's stop → edit → start with a
+/// hand `open` appended, restarted under the wrong `meshId`: every history
+/// signature fails in the setters' passes (the release is held), then
+/// `finalize_operator_input` signs the hand line under the wrong domain and
+/// its own `verify_history_pass` accepts it — `signature_verified_total` = 1,
+/// the verdict flips and `verify_own_history` stays silent. The operator gets
+/// one "signature does not verify — was this record edited?" WARN per record
+/// of the history instead of "check meshId / do not author" (L-99's remedy),
+/// and the hand line is signed under a domain every peer refuses. Before T89
+/// the WARN was judged per pass and fired here. The same flip follows one
+/// write the node makes under the wrong domain (L-99's "do not author" is
+/// advisory): at the next boot that write verifies, and every history record
+/// is reported as "edited". (The held release that runs then lowers nothing:
+/// what verified sits above the whole history.)
+#[test]
+#[ignore = "A6-2: this node's own fresh signatures count as verified ones, so a hand line in the same boot, or one write before the next boot, hides the wrong-meshId WARN"]
+fn a6_2_a_hand_line_in_the_same_boot_does_not_hide_a_wrong_mesh_id() {
+    // (a) The hand line in the same boot.
+    let (mut mesh, path) = jumped_history_then_stop_a(9263);
+    let a = 0;
+    // A hand `open` of a new account: it validates without any of the
+    // history, so the rebase keeps it (a hand transaction on a history
+    // account would be refused with its `open` and change nothing here).
+    append_to_bean(&path, "\n2024-01-02 open Assets:Hand\n");
+    let logged = restart_under_mesh_id(&mut mesh, a, path, "another-mesh");
+    assert_eq!(
+        mesh.replicas[a].svc.directive_count(),
+        1,
+        "premise: every history record quarantined, the hand line served"
+    );
+    let with_hand_line = logged.contains("EVERY signature");
+    // (b) No hand line; the node authors once despite the WARN, and restarts
+    // under the same config.
+    let (mut mesh, path) = jumped_history_then_stop_a(9270);
+    let first = restart_under_mesh_id(&mut mesh, a, path, "another-mesh");
+    assert!(first.contains("EVERY signature"), "premise: {first}");
+    mesh.replicas[a].open("Assets:Written");
+    let path = mesh.stop(a);
+    let after_write = restart_under_mesh_id(&mut mesh, a, path, "another-mesh");
+    let after_write_warned = after_write.contains("EVERY signature");
+    eprintln!(
+        "A6-2: EVERY WARN with a hand line in the boot: {with_hand_line}; at the boot after \
+         one write: {after_write_warned}\n(a) logged:\n{logged}\n(b) logged:\n{after_write}"
+    );
+    assert!(
+        with_hand_line && after_write_warned,
+        "every history signature failed under the wrong meshId, yet the WARN that says so (and \
+         says not to author) is missing: with a hand line in the boot {}, at the boot after one \
+         write {}",
+        !with_hand_line,
+        !after_write_warned
+    );
+}
+
+/// A and B with history; X (allowlisted) serves two `open`s in a row, each
+/// one ratchet-legal step of 2^31 + 2^30 — under 2^32 — above the clock
+/// before it, with no honest record between them; honest authoring on top;
+/// A↔B synced; X removed from the allowlist (the remedy the gap WARN points
+/// at). Returns the mesh and X's two ids.
+fn two_step_jump_mesh(seed: u64) -> (Mesh, Vec<String>) {
+    let mut mesh = seeded_mesh(seed, 2);
+    let (a, b) = (0, 1);
+    let x = key(207);
+    mesh.allow_also(&x.public_key_hex());
+    mesh.append(a, "pre-1", 10, "Assets:Cash");
+    mesh.run_to_fixed_point(Order::Ascending);
+    let step = (1u64 << 31) + (1 << 30);
+    let mut jumps = Vec::new();
+    for account in ["Assets:JumpOne", "Assets:JumpTwo"] {
+        let clock = mesh.replicas[a]
+            .svc
+            .lamport_clock()
+            .max(mesh.replicas[b].svc.lamport_clock());
+        let id = mesh.record(&hand_open(&x, account, clock + step));
+        for replica in [a, b] {
+            mesh.deliver(replica, vec![id.clone()], Order::Causal);
+            assert!(
+                mesh.replicas[replica].svc.contains_directive(&id),
+                "a step under 2^32 is adopted"
+            );
+        }
+        jumps.push(id);
+    }
+    mesh.append(a, "post-a", 5, "Assets:Cash");
+    mesh.open(b, "Assets:Bank");
+    mesh.append(b, "post-b", 7, "Assets:Bank");
+    mesh.run_to_fixed_point(Order::Ascending);
+    assert!(mesh.divergence_among(&[a, b], &[]).is_none());
+    let honest = [mesh.replicas[a].author(), mesh.replicas[b].author()];
+    mesh.allow_exactly(&honest);
+    (mesh, jumps)
+}
+
+/// L-113's verdict (T89, decision (33)) held to the join it predicts, single
+/// step: a peer's one 2^31 + 2^30 jump, the jumper removed. A's and B's
+/// served-history WARN says "diagnosed, not uncrossable" and prescribes no
+/// bootstrap join — and a fresh F does join by anti-entropy alone, the honest
+/// records above the gap one ratchet step from its clock. Passes at HEAD.
+#[test]
+fn l113_a_single_sub_2_32_jump_is_called_crossable_and_a_fresh_node_crosses_it() {
+    let mut mesh = seeded_mesh(9264, 2);
+    let (a, b) = (0, 1);
+    let x = key(208);
+    mesh.allow_also(&x.public_key_hex());
+    mesh.append(a, "pre-1", 10, "Assets:Cash");
+    mesh.run_to_fixed_point(Order::Ascending);
+    let clock = mesh.replicas[a].svc.lamport_clock();
+    let jump = mesh.record(&hand_open(&x, "Assets:Jump", clock + (1 << 31) + (1 << 30)));
+    for replica in [a, b] {
+        mesh.deliver(replica, vec![jump.clone()], Order::Causal);
+    }
+    mesh.append(a, "post-a", 5, "Assets:Cash");
+    mesh.append(b, "post-b", 7, "Assets:Cash");
+    mesh.run_to_fixed_point(Order::Ascending);
+    let honest = [mesh.replicas[a].author(), mesh.replicas[b].author()];
+    mesh.allow_exactly(&honest);
+    for replica in [a, b] {
+        let (_, logged) = capture_warnings(|| mesh.replicas[replica].svc.verify_own_history());
+        assert!(
+            logged.contains("diagnosed, not uncrossable") && !logged.contains("compacted .bean"),
+            "{logged}"
+        );
+    }
+    let f = mesh.add("F", 13);
+    mesh.run_to_fixed_point(Order::Ascending);
+    mesh.assert_converged_among("A6 / L-113 single step", &[a, b, f], &[jump]);
+}
+
+/// A6-1 (0926): the verdict is judged over the history this node serves,
+/// which still holds the removed author's records; a joiner refuses them
+/// (not allowlisted), so the gap IT must cross is the sum of that author's
+/// consecutive steps. Two steps of 2^31 + 2^30 by X with nothing honest in
+/// between: every node's largest gap is under 2^32 and its WARN says
+/// "diagnosed, not uncrossable … no bootstrap join is needed" — yet once X is
+/// removed a fresh F cannot adopt any honest record above the second step
+/// (2^32 + 2^31 above its clock, `LamportAdvance`, deferred forever). Before
+/// T89 the WARN prescribed the bootstrap join for every gap ≥ 2^28, which was
+/// right here. (Steps under 2^28 each, 17 or more of them, are the same
+/// shape with no WARN at all — the metric's blind spot since T83.)
+#[test]
+#[ignore = "A6-1: the gap verdict calls a removed author's two sub-2^32 steps crossable, but a fresh node cannot cross them by anti-entropy"]
+fn a6_1_a_removed_authors_two_sub_2_32_steps_are_called_crossable_yet_block_a_join() {
+    let (mut mesh, jumps) = two_step_jump_mesh(9265);
+    let (a, b) = (0, 1);
+    let (_, logged) = capture_warnings(|| mesh.replicas[a].svc.verify_own_history());
+    assert!(
+        logged.contains("lamport gap"),
+        "premise: diagnosed: {logged}"
+    );
+    let says_crossable =
+        logged.contains("diagnosed, not uncrossable") && !logged.contains("compacted .bean");
+    let f = mesh.add("F", 13);
+    let rounds = mesh.run_to_fixed_point(Order::Ascending);
+    let report = mesh.divergence_among(&[a, b, f], &jumps);
+    eprintln!(
+        "A6-1: A's WARN says crossable: {says_crossable}; F after {rounds} rounds holds {} of \
+         {}, clock {}\n{logged}",
+        mesh.replicas[f].svc.directive_count(),
+        mesh.replicas[a].svc.directive_count(),
+        mesh.replicas[f].svc.lamport_clock()
+    );
+    assert!(
+        !(says_crossable && report.is_some()),
+        "A's WARN says no bootstrap join is needed for its gap, yet a fresh node joining by \
+         anti-entropy after X's removal is stuck:\n{}",
+        report.unwrap_or_default()
+    );
+}
+
+/// L-108 (T89) across replicas and restarts: the operator appends two hand
+/// lines to A's stopped file, the child — its `openledger-parents` spelling
+/// the parent's id — placed before its hand parent on the same date, the
+/// parent itself spelling its parent (A's r1), so the two sort among
+/// themselves (a hand parent without a parents line goes first anyway). A's
+/// gl-node boot adopts both (hand-parented lines go last), B adopts both from
+/// A, the mesh converges with the oracle, and a second stop → start of A is a
+/// fixed point (same served set, nothing quarantined). Before T89 the child
+/// was refused at the first boot and adopted at the second.
+///
+/// Bug-catch: adopt in plain canonical order and the first boot quarantines
+/// the child.
+#[test]
+fn l108_hand_lines_child_first_are_served_in_one_boot_and_replicate() {
+    let mut mesh = seeded_mesh(9266, 2);
+    let a = 0;
+    let r1 = mesh.append(a, "r1", 1, "Assets:Cash");
+    mesh.run_to_fixed_point(Order::Ascending);
+    let path = mesh.stop(a);
+    let parent = transaction_body("hand parent", 4, "Assets:Cash");
+    let child = transaction_body("hand child", 2, "Assets:Cash");
+    let parent_id = compute_content_id(&Directive::Transaction(parent.clone()));
+    let child_id = compute_content_id(&Directive::Transaction(child.clone()));
+    append_to_bean(
+        &path,
+        &format!(
+            "{}{}",
+            hand_line(&child, Some(&parent_id)),
+            hand_line(&parent, Some(&r1))
+        ),
+    );
+    let report = mesh.restart_like_gl_node(a, path, MESH_ID);
+    let quarantined = mesh.replicas[a].svc.quarantined_count();
+    eprintln!("A6 / L-108: {report:?}, quarantined {quarantined}");
+    assert_eq!(quarantined, 0, "nothing refused at the first boot");
+    assert_eq!(report.finalized, 2);
+    assert_eq!(
+        mesh.replicas[a].parents_of(&child_id),
+        vec![parent_id.clone()]
+    );
+    for id in [&parent_id, &child_id] {
+        let directive = mesh.replicas[a]
+            .svc
+            .get_directive(id)
+            .expect("served")
+            .clone();
+        mesh.record(&directive);
+    }
+    mesh.run_to_fixed_point(Order::Ascending);
+    mesh.assert_converged("A6 / L-108 hand lines");
+    let held = mesh.replicas[a].svc.all_directive_ids();
+    let path = mesh.stop(a);
+    mesh.restart_like_gl_node(a, path, MESH_ID);
+    assert_eq!(
+        mesh.replicas[a].svc.all_directive_ids(),
+        held,
+        "fixed point"
+    );
+    assert_eq!(mesh.replicas[a].svc.quarantined_count(), 0);
+}
+
+/// A6-3 (0926): `hand_parented_last` orders the hand-parented group by the
+/// id each line has AS THE FILE SPELLS IT, but a child names its parent by
+/// the id the parent is STORED under, which differs when the parent elides a
+/// posting (I2 resolves it; L-11). With an elided-posting hand parent that
+/// spells its own parents (so both lines are in the hand-parented group) the
+/// dependency is invisible to the sort, the child keeps file order, and
+/// L-108's shape is back: refused at the first boot ("exists nowhere"),
+/// adopted at the second — served set and file bytes change across a
+/// restart with nothing edited — and, pasted under the running node, refused
+/// by the live reconcile and deleted from the file by the re-persist.
+#[test]
+#[ignore = "A6-3: hand_parented_last keys the sort on the file-spelled id, so a child of an elided-posting hand parent is refused at boot 1 (adopted at boot 2) and deleted on the live path"]
+fn a6_3_a_hand_child_of_an_elided_posting_hand_parent_is_served_in_one_boot() {
+    let mut mesh = seeded_mesh(9267, 2);
+    let a = 0;
+    let r1 = mesh.append(a, "r1", 1, "Assets:Cash");
+    mesh.run_to_fixed_point(Order::Ascending);
+    let path = mesh.stop(a);
+    let resolved = transaction_body("elided hand parent", 4, "Assets:Cash");
+    let stored_id = compute_content_id(&Directive::Transaction(resolved.clone()));
+    let mut elided = resolved;
+    elided.postings[1].amount = None;
+    let child = transaction_body("hand child of elided", 2, "Assets:Cash");
+    let child_id = compute_content_id(&Directive::Transaction(child.clone()));
+    append_to_bean(
+        &path,
+        &format!(
+            "{}{}",
+            hand_line(&child, Some(&stored_id)),
+            hand_line(&elided, Some(&r1))
+        ),
+    );
+    mesh.restart_like_gl_node(a, path, MESH_ID);
+    let parent_served = mesh.replicas[a].svc.contains_directive(&stored_id);
+    let first = mesh.replicas[a].svc.contains_directive(&child_id);
+    let path = mesh.stop(a);
+    mesh.restart_like_gl_node(a, path.clone(), MESH_ID);
+    let second = mesh.replicas[a].svc.contains_directive(&child_id);
+    // The live path: the same shape pasted under the running node. What the
+    // reconcile refuses there is deleted from the file by the re-persist.
+    let resolved = transaction_body("elided hand parent, live", 3, "Assets:Cash");
+    let live_parent_id = compute_content_id(&Directive::Transaction(resolved.clone()));
+    let mut elided = resolved;
+    elided.postings[1].amount = None;
+    let child = transaction_body("hand child of elided, live", 1, "Assets:Cash");
+    let live_child_id = compute_content_id(&Directive::Transaction(child.clone()));
+    append_to_bean(
+        &path,
+        &format!(
+            "{}{}",
+            hand_line(&child, Some(&live_parent_id)),
+            hand_line(&elided, Some(&r1))
+        ),
+    );
+    let result = mesh.replicas[a].svc.reconcile_file().expect("reconcile");
+    let live = mesh.replicas[a].svc.contains_directive(&live_child_id);
+    mesh.replicas[a].svc.compact().expect("compact");
+    let kept = std::fs::read_to_string(&path)
+        .expect("read")
+        .contains("hand child of elided, live");
+    eprintln!(
+        "A6-3: parent stored under {stored_id} served {parent_served}; child served at boot 1 \
+         {first}, at boot 2 {second}; live reconcile {result:?}: child served {live}, still in \
+         the file {kept}"
+    );
+    assert!(
+        parent_served,
+        "premise: the parent is stored under the resolved id"
+    );
+    assert!(
+        first && live,
+        "the child of an elided-posting hand parent is refused: at the first boot {} (served \
+         at the second: {second}); on the live path {} (still in the file: {kept})",
+        !first,
+        !live
+    );
+}
+
+/// L-109 + L-112 (T89, decision (34)) across the wire: a record B signed,
+/// carrying a stray `openledger-*` key at directive level AND at posting
+/// level, reaches A's `.bean` twice — pasted under the running node (the
+/// live reconcile) and, a second record, typed in while A is stopped (boot).
+/// A serves both, stripped, under their ids; a fresh C that hears of them
+/// ONLY from A adopts both through the real intake (B's signature still
+/// verifies — neither key is hashed or signed); the mesh converges with the
+/// oracle and no file keeps a stray key. Before T89 the live reconcile
+/// refused the pasted block (H-06) and the re-persist deleted it.
+///
+/// Bug-catch: drop the live strip and the pasted record is refused.
+#[test]
+fn l109_stray_keyed_records_are_stripped_on_both_paths_and_cross_the_wire_intact() {
+    let mut mesh = seeded_mesh(9268, 2);
+    let (a, b) = (0, 1);
+    mesh.append(a, "r1", 1, "Assets:Cash");
+    mesh.run_to_fixed_point(Order::Ascending);
+    let annotate = |directive: &Directive| {
+        let mut annotated = directive.clone();
+        if let Directive::Transaction(txn) = &mut annotated {
+            txn.metadata
+                .insert("openledger-note".to_owned(), "hand annotation".to_owned());
+            txn.postings[0]
+                .metadata
+                .insert("openledger-memo".to_owned(), "posting note".to_owned());
+        }
+        format!("\n{}", full_file_serialize(&[annotated], &[]))
+    };
+    // Boot path: A stopped, B's record typed in with both keys.
+    let at_boot = mesh.replicas[b].append("from b, read at boot", 6, "Assets:Cash");
+    let at_boot_id = mesh.record(&at_boot);
+    let path = mesh.stop(a);
+    append_to_bean(&path, &annotate(&at_boot));
+    mesh.restart_like_gl_node(a, path.clone(), MESH_ID);
+    assert!(mesh.replicas[a].svc.contains_directive(&at_boot_id));
+    // Live path: B's next record pasted under the running A.
+    let live = mesh.replicas[b].append("from b, pasted live", 7, "Assets:Cash");
+    let live_id = mesh.record(&live);
+    append_to_bean(&path, &annotate(&live));
+    let result = mesh.replicas[a].svc.reconcile_file().expect("reconcile");
+    eprintln!("A6 / L-109: live reconcile {result:?}");
+    assert_eq!(result.new_directives, 1, "{result:?}");
+    for id in [&at_boot_id, &live_id] {
+        let served = mesh.replicas[a].svc.get_directive(id).expect("served");
+        let Directive::Transaction(txn) = served else {
+            panic!("a transaction");
+        };
+        assert!(!txn.metadata.contains_key("openledger-note"));
+        assert!(txn
+            .postings
+            .iter()
+            .all(|posting| posting.metadata.is_empty()));
+    }
+    let c = mesh.add("C", 12);
+    mesh.serve(a, c, Order::Causal);
+    for id in [&at_boot_id, &live_id] {
+        assert!(
+            mesh.replicas[c].svc.contains_directive(id),
+            "C adopts {id} from A alone: {:?}",
+            mesh.replicas[c].permanent.get(id.as_str())
+        );
+    }
+    mesh.run_to_fixed_point(Order::Ascending);
+    mesh.assert_converged("A6 / L-109 stray keys");
+    mesh.replicas[a].svc.compact().expect("compact");
+    let on_disk = std::fs::read_to_string(&path).expect("read A's .bean");
+    assert!(
+        !on_disk.contains("openledger-note") && !on_disk.contains("openledger-memo"),
+        "{on_disk}"
+    );
+}
+
+/// A6-4 (0926, Info): the verdict's boundary is one off. Adoption sets the
+/// clock to `max(local, remote) + 1` and the ratchet refuses only when
+/// `remote − clock ≥ 2^32`, so a joiner that has adopted the record at the
+/// bottom of a gap crosses one of exactly 2^32. Built on the L-111 shape: X
+/// (allowlisted) serves one `open` at `m + 2^32 − 2` (m = the top of the
+/// history), A authors on top of it, X is removed; a fresh F joins by
+/// anti-entropy — it lacks X's record, so its largest gap is exactly 2^32,
+/// topped by A's honest record — and F converges. F's own WARN then calls
+/// the gap F just crossed "uncrossable by anti-entropy" and prescribes the
+/// bootstrap join.
+#[test]
+#[ignore = "A6-4: lamport_gap_verdict calls a gap of exactly 2^32 uncrossable, but a joiner at max + 1 crosses it"]
+fn a6_4_a_gap_of_exactly_2_32_is_called_uncrossable_by_a_node_that_just_crossed_it() {
+    let mut mesh = seeded_mesh(9269, 2);
+    let (a, b) = (0, 1);
+    let x = key(209);
+    mesh.allow_also(&x.public_key_hex());
+    mesh.append(a, "pre-1", 10, "Assets:Cash");
+    mesh.run_to_fixed_point(Order::Ascending);
+    let top = mesh.replicas[a]
+        .svc
+        .dag()
+        .directives()
+        .into_iter()
+        .filter_map(Directive::lamport_clock)
+        .max()
+        .expect("history");
+    let jump = mesh.record(&hand_open(&x, "Assets:Jump", top + MAX_LAMPORT_ADVANCE - 2));
+    for replica in [a, b] {
+        mesh.deliver(replica, vec![jump.clone()], Order::Causal);
+        assert!(mesh.replicas[replica].svc.contains_directive(&jump));
+    }
+    mesh.append(a, "post-a", 5, "Assets:Cash");
+    mesh.run_to_fixed_point(Order::Ascending);
+    let honest = [mesh.replicas[a].author(), mesh.replicas[b].author()];
+    mesh.allow_exactly(&honest);
+    let f = mesh.add("F", 13);
+    mesh.run_to_fixed_point(Order::Ascending);
+    let crossed = mesh
+        .divergence_among(&[a, b, f], std::slice::from_ref(&jump))
+        .is_none();
+    let (_, logged) = capture_warnings(|| mesh.replicas[f].svc.verify_own_history());
+    eprintln!(
+        "A6-4: F's gap {} (MAX_LAMPORT_ADVANCE {MAX_LAMPORT_ADVANCE}); F crossed it: \
+         {crossed}\n{logged}",
+        mesh.replicas[f].svc.lamport_gap()
+    );
+    assert_eq!(mesh.replicas[f].svc.lamport_gap(), MAX_LAMPORT_ADVANCE);
+    assert!(
+        !(crossed && logged.contains("uncrossable by anti-entropy")),
+        "F crossed the gap by anti-entropy, and its own WARN calls it uncrossable:\n{logged}"
+    );
+}

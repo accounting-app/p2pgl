@@ -1316,3 +1316,940 @@ fn history_over_the_wire_body_cap_is_never_served_or_always_crosses() {
     let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
     let _ = std::fs::remove_dir_all(fresh_path.parent().expect("dir"));
 }
+
+// ─── A2 (0926 re-audit of T85): the closure on the wire, with real keys ─────
+
+/// A signed `open` of `account` on day 1, by `key` at `lamport`.
+fn a2_open(key: &PeerKeySignatureProvider, account: &str, lamport: u64) -> Directive {
+    sign_directive(
+        key,
+        Directive::Open(Open {
+            date: date(1),
+            account: account.to_owned(),
+            currencies: vec![],
+            metadata: BTreeMap::new(),
+        }),
+        lamport,
+    )
+}
+
+/// `directive` with every `openledger-*` key removed — the operator's
+/// "strip the envelope lines" edit, which keeps the content id.
+fn a2_stripped(directive: &Directive) -> Directive {
+    let mut directive = directive.clone();
+    let metadata = match &mut directive {
+        Directive::Transaction(txn) => &mut txn.metadata,
+        Directive::Open(open) => &mut open.metadata,
+        _ => panic!("a transaction or an open"),
+    };
+    metadata.retain(|name, _| !name.starts_with("openledger-"));
+    directive
+}
+
+/// What `stage_remote_directive` made of `directive` after the real wire
+/// validators: `"OK"`, `"WIRE_REFUSED"` or the staging error code.
+fn a2_offer(node: &mut LedgerService, directive: &Directive) -> &'static str {
+    match through_the_wire(directive) {
+        Ok(admitted) => match node.stage_remote_directive(admitted) {
+            Ok(_) => "OK",
+            Err(error) => error.error_code(),
+        },
+        Err(_) => "WIRE_REFUSED",
+    }
+}
+
+fn a2_served_transaction(node: &LedgerService, id: &str) -> Directive {
+    node.get_directive(id)
+        .unwrap_or_else(|| panic!("{id} is served"))
+        .clone()
+}
+
+/// A2-1 (0926), T85 (b) × the README's own remedy: a pre-T65 mesh replicated
+/// `X` (5 × 10^22, past the amount cap), its child `C` and grandchild `G` to
+/// every node, so after the upgrade every node's closure holds `C` and `G`.
+/// On node A the operator follows §Upgrading — restates `X` in a larger unit
+/// (a new id) and "restates the chain" by stripping `C`'s and `G`'s
+/// `openledger-*` lines — so A re-adopts both under their SAME content ids
+/// (the id covers the body only) with parents it serves, signs them, and a
+/// fresh replica stages all three. Node B holds the old copies in its
+/// closure and T85's wire check refuses by content id, permanently
+/// (`INVALID_INPUT`, cached per `(peer, id)` in gl-node), whatever the
+/// offered copy's parents: B keeps `X2` and never `C`/`G`, across restarts —
+/// two honest replicas with the same available set, different ledgers,
+/// forever. Before T85 B adopted A's copies and the quarantine healed
+/// (`live_quarantine`'s "a peer serving the same economic body").
+#[test]
+#[ignore = "A2-1: the wire refuses a closure member's content id whatever its parents, so a restated chain never reaches a node that held the old one"]
+fn a2_a_restated_chain_reaches_every_node_that_held_the_old_one() {
+    let author = std::sync::Arc::new(key());
+    let over = Decimal::from_str_exact("50000000000000000000000").expect("5 × 10^22");
+    let opening = a2_open(&author, "Equity:Opening", 1);
+    let cash = a2_open(&author, "Assets:Cash", 2);
+    let x = signed_transfer(&author, 2, "X pre-upgrade", over, "", 3);
+    let x_id = compute_content_id(&x);
+    let c = signed_transfer(&author, 3, "C child", Decimal::from(5), &x_id, 4);
+    let c_id = compute_content_id(&c);
+    let g = signed_transfer(&author, 4, "G grandchild", Decimal::from(9), &c_id, 5);
+    let g_id = compute_content_id(&g);
+    let history = ledger::serialize::full_file_serialize(
+        &[
+            opening.clone(),
+            cash.clone(),
+            x.clone(),
+            c.clone(),
+            g.clone(),
+        ],
+        &[],
+    );
+
+    // Node B: the upgraded copy of that history, untouched.
+    let b_key = std::sync::Arc::new(PeerKeySignatureProvider::from_bytes(
+        &[0x52; 32],
+        MESH_ID.to_owned(),
+    ));
+    let b_path = scratch_ledger("a2-1-b");
+    std::fs::write(&b_path, &history).expect("write");
+    let mut b = signing_node(&b_path, &b_key);
+    b.verify_own_history();
+    b.finalize_operator_input();
+    let held: Vec<&str> = b.quarantined_ids();
+    assert!(
+        held.contains(&c_id.as_str()) && held.contains(&g_id.as_str()),
+        "premise: B's closure holds C and G ({held:?})"
+    );
+
+    // Node A: the operator's §Upgrading remedy, stop → edit → start.
+    let x2 = {
+        let Directive::Transaction(mut txn) = a2_stripped(&x) else {
+            unreachable!()
+        };
+        for posting in &mut txn.postings {
+            let amount = posting.amount.as_mut().expect("explicit");
+            amount.number /= Decimal::from_str_exact("1000000000000000000000").expect("10^21");
+        }
+        Directive::Transaction(txn)
+    };
+    let x2_id = compute_content_id(&x2);
+    let a_path = scratch_ledger("a2-1-a");
+    std::fs::write(
+        &a_path,
+        ledger::serialize::full_file_serialize(
+            &[
+                opening.clone(),
+                cash.clone(),
+                x2,
+                a2_stripped(&c),
+                a2_stripped(&g),
+            ],
+            &[],
+        ),
+    )
+    .expect("write");
+    let mut a = signing_node(&a_path, &author);
+    a.verify_own_history();
+    assert_eq!(a.finalize_operator_input(), 3, "X2, C and G re-adopted");
+    let served: Vec<Directive> = [&x2_id, &c_id, &g_id]
+        .into_iter()
+        .map(|id| a2_served_transaction(&a, id))
+        .collect();
+
+    // A fresh replica takes A's whole restated chain …
+    let (mut fresh, fresh_path) = fresh_with_accounts("a2-1-fresh");
+    let fresh_codes: Vec<&str> = served
+        .iter()
+        .map(|directive| a2_offer(&mut fresh, directive))
+        .collect();
+    assert_eq!(
+        fresh_codes,
+        vec!["OK", "OK", "OK"],
+        "premise: a fresh replica"
+    );
+
+    // … and so must B, which holds the same available set.
+    let b_codes: Vec<&str> = served
+        .iter()
+        .map(|directive| a2_offer(&mut b, directive))
+        .collect();
+    b.compact().expect("compact");
+    drop(b);
+    let mut b = signing_node(&b_path, &b_key);
+    b.verify_own_history();
+    b.finalize_operator_input();
+    let after_restart: Vec<&str> = served
+        .iter()
+        .map(|directive| a2_offer(&mut b, directive))
+        .collect();
+    assert!(
+        b.contains_directive(&c_id) && b.contains_directive(&g_id),
+        "A2-1: B staged {b_codes:?}, after a restart {after_restart:?}; A and a fresh \
+         replica serve C and G, B never will"
+    );
+    drop((a, b, fresh));
+    for path in [&a_path, &b_path, &fresh_path] {
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+}
+
+/// `txn`'s body re-signed by `key` at `lamport` naming `parents` (a body
+/// edit changes the content id, so the old signature is void).
+fn a2_resigned(
+    key: &PeerKeySignatureProvider,
+    txn: Transaction,
+    parents: &str,
+    lamport: u64,
+) -> Directive {
+    let Directive::Transaction(mut txn) = a2_stripped(&Directive::Transaction(txn)) else {
+        unreachable!()
+    };
+    let content_id = compute_content_id(&Directive::Transaction(txn.clone()));
+    let lamport = lamport.to_string();
+    let signature = key
+        .sign(&SignableMessage {
+            content_id: &content_id,
+            is_transaction: true,
+            parents,
+            lamport: &lamport,
+        })
+        .expect("signs");
+    for (name, value) in [
+        ("openledger-author", key.public_key_hex()),
+        ("openledger-lamport", lamport),
+        ("openledger-parents", parents.to_owned()),
+        ("openledger-signature", signature),
+    ] {
+        txn.metadata.insert(name.to_owned(), value);
+    }
+    Directive::Transaction(txn)
+}
+
+fn a2_sign_open_with(
+    key: std::sync::Arc<PeerKeySignatureProvider>,
+) -> impl Fn(&str, &str, &str) -> Option<String> {
+    move |content_id: &str, parents: &str, lamport: &str| {
+        key.sign(&SignableMessage {
+            content_id,
+            is_transaction: false,
+            parents,
+            lamport,
+        })
+    }
+}
+
+/// A signing node under `key` with `Assets:Cash` and `Equity:Opening` opened
+/// through its own API, compacted, so the next reconcile reads only what a
+/// test appends.
+fn a2_node_with_accounts(
+    label: &str,
+    key: &std::sync::Arc<PeerKeySignatureProvider>,
+) -> (LedgerService, PathBuf) {
+    let path = scratch_ledger(label);
+    let mut node = signing_node(&path, key);
+    for account in ["Assets:Cash", "Equity:Opening"] {
+        node.open_account_signing(
+            account.to_owned(),
+            date(1),
+            vec![],
+            a2_sign_open_with(std::sync::Arc::clone(key)),
+        )
+        .expect("open");
+    }
+    node.compact().expect("compact");
+    (node, path)
+}
+
+fn a2_append(path: &PathBuf, directives: &[Directive]) {
+    let mut content = std::fs::read_to_string(path).expect("read");
+    content.push('\n');
+    content.push_str(&ledger::serialize::full_file_serialize(directives, &[]));
+    std::fs::write(path, content).expect("write");
+}
+
+/// gl-node's boot order over `path`: boot, signer, verifier, finalise.
+fn a2_restart(path: &PathBuf, key: &std::sync::Arc<PeerKeySignatureProvider>) -> LedgerService {
+    let mut node = signing_node(path, key);
+    node.verify_own_history();
+    node.finalize_operator_input();
+    node
+}
+
+/// A2 (0926), T85 (b)+(c) through the real wire validators with real keys:
+/// a history record over the 1 MiB body cap (`S`, inside every count), its
+/// child `C` and grandchild `G`. The node that holds them boots with all
+/// three quarantined (L-101's seed and the closure); `S` is refused on the
+/// wire for good (`ResourceLimitExceeded`), `C` and `G` cross
+/// `validate_supply_entry` + `verify_remote_signature` and are refused at
+/// staging as `INVALID_INPUT` — permanent in gl-node's
+/// `stage_refusal_is_permanent` — before and after a restart; a fresh
+/// replica, which never has `S`, holds neither (`MISSING_PARENT`, retried
+/// for ever). So the permanent verdict agrees with every replica that lacks
+/// the seed; an unrelated record by the same author stages on both.
+#[test]
+fn a2_the_closure_is_refused_on_the_wire_where_no_fresh_replica_could_hold_it_either() {
+    let author = std::sync::Arc::new(key());
+    let Directive::Transaction(mut big) =
+        signed_transfer(&author, 2, "big", Decimal::from(5), "", 3)
+    else {
+        unreachable!()
+    };
+    for index in 0..4_000 {
+        big.postings[0]
+            .metadata
+            .insert(format!("k{index:04}"), "v".repeat(300));
+    }
+    let s = a2_resigned(&author, big, "", 3);
+    let s_id = compute_content_id(&s);
+    assert!(enforce_resource_limits_for(&s, ResourceRule::History).is_ok());
+    let c = signed_transfer(&author, 3, "C child", Decimal::from(1), &s_id, 4);
+    let c_id = compute_content_id(&c);
+    let g = signed_transfer(&author, 4, "G grandchild", Decimal::from(2), &c_id, 5);
+    let unrelated = signed_transfer(&author, 5, "unrelated", Decimal::from(3), "", 6);
+
+    let error = through_the_wire(&s).expect_err("over the body cap");
+    assert!(
+        matches!(error, MergeError::ResourceLimitExceeded(_)),
+        "{error:?}"
+    );
+    assert!(intake_refusal_is_permanent(&error));
+
+    let path = scratch_ledger("a2-closure-wire");
+    std::fs::write(
+        &path,
+        ledger::serialize::full_file_serialize(
+            &[
+                a2_open(&author, "Equity:Opening", 1),
+                a2_open(&author, "Assets:Cash", 2),
+                s.clone(),
+                c.clone(),
+                g.clone(),
+            ],
+            &[],
+        ),
+    )
+    .expect("write");
+    let mut holder = a2_restart(&path, &author);
+    for id in [&s_id, &c_id, &compute_content_id(&g)] {
+        assert!(!holder.contains_directive(id), "{id} is not served");
+        assert!(holder.quarantined_ids().contains(&id.as_str()), "{id} held");
+    }
+    let (mut fresh, fresh_path) = fresh_with_accounts("a2-closure-wire-fresh");
+    for round in ["first boot", "after a restart"] {
+        let codes: Vec<&str> = [&c, &g, &unrelated]
+            .into_iter()
+            .map(|directive| a2_offer(&mut holder, directive))
+            .collect();
+        assert_eq!(
+            codes,
+            vec!["INVALID_INPUT", "INVALID_INPUT", "OK"],
+            "{round}: the closure refused permanently, the unrelated record staged"
+        );
+        holder.compact().expect("compact");
+        drop(holder);
+        holder = a2_restart(&path, &author);
+    }
+    let codes: Vec<&str> = [&c, &g, &unrelated]
+        .into_iter()
+        .map(|directive| a2_offer(&mut fresh, directive))
+        .collect();
+    assert_eq!(
+        codes,
+        vec!["MISSING_PARENT", "MISSING_PARENT", "OK"],
+        "a fresh replica never holds C or G either"
+    );
+    drop((holder, fresh));
+    let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    let _ = std::fs::remove_dir_all(fresh_path.parent().expect("dir"));
+}
+
+/// A2 (0926), T85's live hold with real keys: `D`, another node's
+/// correctly signed record naming `Q`, pasted under a running node that
+/// lacks `Q`. The live reconcile holds `D` (not served, kept in the file by
+/// the re-persist) exactly as a boot over the same bytes does; `Q` then
+/// arrives on the wire and `D` stays held until a peer's copy of it arrives
+/// too, which stages and leaves the quarantine; a restart serves both, with
+/// nothing held. Nothing served ever names a parent this node lacks.
+#[test]
+fn a2_a_pasted_record_whose_parent_is_absent_is_held_live_as_at_boot_and_returns_from_a_peer() {
+    let a = std::sync::Arc::new(key());
+    let b = PeerKeySignatureProvider::from_bytes(&[0x51; 32], MESH_ID.to_owned());
+    let q = signed_transfer(&b, 6, "Q parent", Decimal::from(4), "", 50);
+    let q_id = compute_content_id(&q);
+    let d = signed_transfer(&b, 7, "D names Q", Decimal::from(1), &q_id, 51);
+    let d_id = compute_content_id(&d);
+
+    let (mut live, live_path) = a2_node_with_accounts("a2-hold-live", &a);
+    let (booted, boot_path) = a2_node_with_accounts("a2-hold-boot", &a);
+    drop(booted);
+    a2_append(&live_path, std::slice::from_ref(&d));
+    a2_append(&boot_path, std::slice::from_ref(&d));
+    let result = live.reconcile_file().expect("reconcile");
+    assert_eq!((result.new_directives, result.rejected), (0, 1));
+    let booted = a2_restart(&boot_path, &a);
+    for (label, node) in [("live", &live), ("boot", &booted)] {
+        assert!(!node.contains_directive(&d_id), "{label}: D is not served");
+        assert_eq!(node.quarantined_ids(), vec![d_id.as_str()], "{label}");
+    }
+    live.compact().expect("compact");
+    assert!(
+        std::fs::read_to_string(&live_path)
+            .expect("read")
+            .contains("D names Q"),
+        "the re-persist keeps the held record in the file"
+    );
+
+    assert_eq!(a2_offer(&mut live, &q), "OK");
+    assert!(
+        !live.contains_directive(&d_id),
+        "held until a peer's copy arrives (the stated residual)"
+    );
+    assert_eq!(a2_offer(&mut live, &d), "OK");
+    assert!(live.contains_directive(&d_id) && live.quarantined_ids().is_empty());
+    live.compact().expect("compact");
+    drop((live, booted));
+    let restarted = a2_restart(&live_path, &a);
+    assert!(restarted.contains_directive(&q_id) && restarted.contains_directive(&d_id));
+    assert!(restarted.quarantined_ids().is_empty());
+    drop(restarted);
+    for path in [&live_path, &boot_path] {
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+}
+
+/// A2 (0926), T85's `reconcile_batch_ids` with real keys: `C` is dated
+/// before its parent `P` and both are pasted together, so the canonical
+/// (date) order adopts `C` first while `P` is still absent. A parent later
+/// in the same file counts as present, so both are adopted and served; a
+/// fresh replica stages both (parent first), and a restart serves the same
+/// set with nothing held.
+#[test]
+fn a2_a_pasted_child_dated_before_its_pasted_parent_is_adopted_with_it() {
+    let a = std::sync::Arc::new(key());
+    let b = PeerKeySignatureProvider::from_bytes(&[0x51; 32], MESH_ID.to_owned());
+    let p = signed_transfer(&b, 9, "P later-dated parent", Decimal::from(4), "", 60);
+    let p_id = compute_content_id(&p);
+    let c = signed_transfer(&b, 8, "C earlier-dated child", Decimal::from(1), &p_id, 61);
+    let c_id = compute_content_id(&c);
+    let (mut node, path) = a2_node_with_accounts("a2-batch-forward", &a);
+    a2_append(&path, &[c.clone(), p.clone()]);
+    let result = node.reconcile_file().expect("reconcile");
+    assert_eq!((result.new_directives, result.rejected), (2, 0));
+    assert!(node.contains_directive(&p_id) && node.contains_directive(&c_id));
+    let (mut fresh, fresh_path) = fresh_with_accounts("a2-batch-forward-fresh");
+    assert_eq!(
+        [&p, &c].map(|directive| a2_offer(&mut fresh, directive)),
+        ["OK", "OK"]
+    );
+    node.compact().expect("compact");
+    drop(node);
+    let restarted = a2_restart(&path, &a);
+    assert!(restarted.contains_directive(&p_id) && restarted.contains_directive(&c_id));
+    assert!(restarted.quarantined_ids().is_empty());
+    drop((restarted, fresh));
+    let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    let _ = std::fs::remove_dir_all(fresh_path.parent().expect("dir"));
+}
+
+/// Another node's correctly signed transaction on `Assets:Nowhere` (an
+/// account no node opened), dated day 5 — every peer refuses it
+/// (`ACCOUNT_NOT_OPEN`) — and its child dated day 4, as pasted together.
+fn a2_unadmitted_parent_and_child(b: &PeerKeySignatureProvider) -> (Directive, Directive) {
+    let Directive::Transaction(mut txn) =
+        signed_transfer(b, 5, "P on nowhere", Decimal::from(3), "", 40)
+    else {
+        unreachable!()
+    };
+    txn.postings[0].account = "Assets:Nowhere".to_owned();
+    let p = a2_resigned(b, txn, "", 40);
+    let child = signed_transfer(
+        b,
+        4,
+        "C names P",
+        Decimal::from(2),
+        &compute_content_id(&p),
+        41,
+    );
+    (p, child)
+}
+
+/// A2 (0926), T85's post-loop rule with real keys: the pasted `C` is
+/// adopted on the strength of its parent `P` being later in the same file,
+/// and `P` is then refused (`ACCOUNT_NOT_OPEN`). `C` must not stay served
+/// naming a parent no one holds: the rule after the loop holds it, and a
+/// boot over the same bytes serves the same set (neither).
+#[test]
+fn a2_a_pasted_child_of_a_later_pasted_parent_the_accounts_refuse_is_held_live_as_at_boot() {
+    let a = std::sync::Arc::new(key());
+    let b = PeerKeySignatureProvider::from_bytes(&[0x51; 32], MESH_ID.to_owned());
+    let (p, c) = a2_unadmitted_parent_and_child(&b);
+    let (p_id, c_id) = (compute_content_id(&p), compute_content_id(&c));
+    let (mut live, live_path) = a2_node_with_accounts("a2-post-loop-live", &a);
+    let (booted, boot_path) = a2_node_with_accounts("a2-post-loop-boot", &a);
+    drop(booted);
+    a2_append(&live_path, &[p.clone(), c.clone()]);
+    a2_append(&boot_path, &[p.clone(), c.clone()]);
+    live.reconcile_file().expect("reconcile");
+    let booted = a2_restart(&boot_path, &a);
+    for (label, node) in [("live", &live), ("boot", &booted)] {
+        assert!(
+            !node.contains_directive(&p_id) && !node.contains_directive(&c_id),
+            "{label}: neither is served"
+        );
+        for directive in node.dag().directives() {
+            if let Directive::Transaction(txn) = directive {
+                for parent in txn.parent_ids() {
+                    assert!(
+                        node.contains_directive(parent),
+                        "{label}: dangling {parent}"
+                    );
+                }
+            }
+        }
+    }
+    drop((live, booted));
+    for path in [&live_path, &boot_path] {
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+}
+
+/// A2-3 (0926): the same pasted bytes, two fates in the FILE. Boot loads
+/// `P` (a peer's record the accounts do not admit) and T84's rule holds it —
+/// quarantined, kept in the file. The live reconcile refuses it inside
+/// `adopt_file_directive` (`validate_transaction`), outside the quarantine,
+/// so the canonical re-persist deletes it ("NOT adopted and the canonical
+/// re-persist will drop them"), while it keeps `C`, which T85's hold put in
+/// the quarantine. T85's hold covers the missing-parent arm only; T89
+/// (L-109) closed this class for stray envelope keys.
+#[test]
+#[ignore = "A2-3: the live reconcile deletes from the file a pasted complete envelope the accounts refuse, which boot keeps quarantined"]
+fn a2_the_live_reconcile_keeps_in_the_file_what_boot_keeps() {
+    let a = std::sync::Arc::new(key());
+    let b = PeerKeySignatureProvider::from_bytes(&[0x51; 32], MESH_ID.to_owned());
+    let (p, c) = a2_unadmitted_parent_and_child(&b);
+    let mut kept = Vec::new();
+    for label in ["live", "boot"] {
+        let (mut node, path) = a2_node_with_accounts(&format!("a2-3-{label}"), &a);
+        if label == "boot" {
+            drop(node);
+            a2_append(&path, &[p.clone(), c.clone()]);
+            node = a2_restart(&path, &a);
+        } else {
+            a2_append(&path, &[p.clone(), c.clone()]);
+            node.reconcile_file().expect("reconcile");
+        }
+        node.compact().expect("compact");
+        let text = std::fs::read_to_string(&path).expect("read");
+        kept.push((
+            label,
+            text.contains("P on nowhere"),
+            text.contains("C names P"),
+        ));
+        drop(node);
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+    assert_eq!(
+        kept,
+        vec![("live", true, true), ("boot", true, true)],
+        "A2-3: (path, file keeps P, file keeps C)"
+    );
+}
+
+/// A2-1 (0926), the single-node shape of the same fault: the operator
+/// re-enters a transaction the closure holds (`C`, child of the pre-T65
+/// `X`) through the API — same body, so the same content id — and writes
+/// `Y` on top. Both are signed, served and acknowledged; both go to the
+/// journal. The node then stops without its stop compaction (a crash), and
+/// boot reads the canonical file's quarantined `C` (parent `X`) before the
+/// journal's `C` (parents it serves): the closure takes `C` by id and `Y`
+/// as its child, so neither is served — and T85's wire check then refuses
+/// the node's OWN copies of `C` and `Y` from every peer that adopted them,
+/// for good, and with them everything the mesh writes on top.
+#[test]
+#[ignore = "A2-1: after a crash the closure takes an API re-entry of a held record by id, and the wire refuses the node's own acknowledged records back for good"]
+fn a2_a_record_reentered_through_the_api_returns_from_a_peer_after_a_crash() {
+    use ledger::service::{PostingInput, TransactionInput};
+    let author = std::sync::Arc::new(key());
+    let over = Decimal::from_str_exact("50000000000000000000000").expect("5 × 10^22");
+    let x = signed_transfer(&author, 2, "X pre-upgrade", over, "", 3);
+    let c = signed_transfer(
+        &author,
+        3,
+        "C child",
+        Decimal::from(5),
+        &compute_content_id(&x),
+        4,
+    );
+    let c_id = compute_content_id(&c);
+    // Past `COMPACTION_MIN_CANONICAL_BYTES`, so a write appends to the journal.
+    let Directive::Transaction(mut padding) =
+        signed_transfer(&author, 1, "padding", Decimal::from(1), "", 5)
+    else {
+        unreachable!()
+    };
+    for index in 0..100 {
+        padding.postings[0]
+            .metadata
+            .insert(format!("k{index:03}"), "v".repeat(800));
+    }
+    let padding = a2_resigned(&author, padding, "", 5);
+    let path = scratch_ledger("a2-1-api");
+    std::fs::write(
+        &path,
+        ledger::serialize::full_file_serialize(
+            &[
+                a2_open(&author, "Equity:Opening", 1),
+                a2_open(&author, "Assets:Cash", 2),
+                padding,
+                x,
+                c,
+            ],
+            &[],
+        ),
+    )
+    .expect("write");
+    let mut node = a2_restart(&path, &author);
+    node.compact().expect("the startup compaction");
+    assert!(node.quarantined_ids().contains(&c_id.as_str()), "premise");
+
+    let signing = std::sync::Arc::clone(&author);
+    let sign = move |content_id: &str, parents: &str, lamport: &str| {
+        signing.sign(&SignableMessage {
+            content_id,
+            is_transaction: true,
+            parents,
+            lamport,
+        })
+    };
+    let input = |day: u32, narration: &str, amount: i64| TransactionInput {
+        date: date(day),
+        flag: Flag::Complete,
+        payee: None,
+        narration: Some(narration.to_owned()),
+        tags: vec![],
+        links: vec![],
+        postings: ["Assets:Cash", "Equity:Opening"]
+            .into_iter()
+            .zip([amount, -amount])
+            .map(|(account, number)| PostingInput {
+                account: account.to_owned(),
+                amount: Some(usd(Decimal::from(number))),
+                cost: None,
+                price: None,
+            })
+            .collect(),
+    };
+    node.append_transaction_signing(input(5, "warm-up", 1), sign.clone())
+        .expect("the first write compacts");
+    let reentered = node
+        .append_transaction_signing(input(3, "C child", 5), sign.clone())
+        .expect("re-entered");
+    assert_eq!(reentered.txid, c_id, "the same body, the same id");
+    let y = node
+        .append_transaction_signing(input(6, "Y after", 7), sign)
+        .expect("Y");
+    assert!(
+        node.journal_bytes() > 0,
+        "premise: both are journal records"
+    );
+    let served: Vec<Directive> = [&c_id, &y.txid]
+        .into_iter()
+        .map(|id| a2_served_transaction(&node, id))
+        .collect();
+    drop(node); // no stop compaction
+
+    let mut node = a2_restart(&path, &author);
+    let back: Vec<&str> = served
+        .iter()
+        .map(|directive| a2_offer(&mut node, directive))
+        .collect();
+    assert!(
+        node.contains_directive(&c_id) && node.contains_directive(&y.txid),
+        "A2-1: after the crash the node serves neither its C nor its Y, held {:?}, and \
+         refuses a peer's copies: {back:?}",
+        node.quarantined_ids()
+    );
+    drop(node);
+    let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+}
+
+/// A2-2 (0926), T85 (d) / L-110 followed as its own WARN says, under the
+/// running node that printed it: this node's `open Expenses:Food` had only
+/// its `openledger-lamport` edited, so boot holds it (H-20). A hand `open`
+/// is refused live with "restore that record … by deleting its
+/// openledger-* lines if only its envelope was edited". Doing exactly that
+/// gives an operator-input `open` with the held record's content id; the
+/// clause finds the held copy — the same record — and refuses it again, and
+/// since the id is in the quarantine the reconcile logs that it "writes
+/// them back unchanged": the compaction writes back the EDITED envelope
+/// over the operator's repair, and the next boot holds it again. The
+/// account stays unopened until the operator repeats the edit with the node
+/// stopped.
+#[test]
+#[ignore = "A2-2: the L-110 clause refuses the remedy its own WARN names (strip the envelope) and the compaction reverts it"]
+fn a2_the_l110_remedy_followed_under_a_running_node_opens_the_account() {
+    let a = std::sync::Arc::new(key());
+    let (mut node, path) = a2_node_with_accounts("a2-2", &a);
+    node.open_account_signing(
+        "Expenses:Food".to_owned(),
+        date(1),
+        vec![],
+        a2_sign_open_with(std::sync::Arc::clone(&a)),
+    )
+    .expect("open");
+    node.compact().expect("compact");
+    drop(node);
+    let edit_food_block = |edit: &dyn Fn(&str) -> Option<String>| {
+        let text = std::fs::read_to_string(&path).expect("read");
+        let mut in_food = false;
+        let mut out = Vec::new();
+        for line in text.lines() {
+            if !line.starts_with(' ') {
+                in_food = line == "2024-01-01 open Expenses:Food";
+            }
+            match (in_food, edit(line)) {
+                (true, Some(replacement)) => out.push(replacement),
+                (true, None) => {}
+                (false, _) => out.push(line.to_owned()),
+            }
+        }
+        std::fs::write(&path, out.join("\n") + "\n").expect("write");
+    };
+    edit_food_block(&|line| {
+        Some(if line.contains("openledger-lamport") {
+            "  openledger-lamport: \"99\"".to_owned()
+        } else {
+            line.to_owned()
+        })
+    });
+    let mut node = a2_restart(&path, &a);
+    node.compact().expect("the startup compaction");
+    assert!(!node.accounts().is_open("Expenses:Food"), "premise: held");
+
+    let mut text = std::fs::read_to_string(&path).expect("read");
+    text.push_str("\n2024-01-02 open Expenses:Food USD\n");
+    std::fs::write(&path, text).expect("write");
+    node.reconcile_file().expect("reconcile");
+    assert!(!node.accounts().is_open("Expenses:Food"), "premise: L-110");
+
+    // The WARN's remedy, as written: drop the hand open, strip the envelope.
+    let text = std::fs::read_to_string(&path).expect("read");
+    std::fs::write(
+        &path,
+        text.replace("\n2024-01-02 open Expenses:Food USD\n", "\n"),
+    )
+    .expect("write");
+    edit_food_block(&|line| (!line.contains("openledger-")).then(|| line.to_owned()));
+    node.reconcile_file().expect("reconcile");
+    let live = node.accounts().is_open("Expenses:Food");
+    node.compact().expect("compact");
+    let reverted = std::fs::read_to_string(&path)
+        .expect("read")
+        .contains("openledger-lamport: \"99\"");
+    drop(node);
+    let restarted = a2_restart(&path, &a);
+    assert!(
+        live && restarted.accounts().is_open("Expenses:Food"),
+        "A2-2: open live {live}, the compaction wrote the edited envelope back {reverted}, \
+         open after a restart {}",
+        restarted.accounts().is_open("Expenses:Food")
+    );
+    drop(restarted);
+    let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+}
+
+/// A2-4 (0926), T84's rule × T85's post-loop call × the wire: every node
+/// serves `T1` (USD on `Assets:Cash`, day 5). An allowlisted peer then
+/// serves a second, correctly signed `open Assets:Cash EUR` dated day 3;
+/// the wire accepts it (a peer's `open` joins the lifecycle at its own
+/// date, M-09). From then on the accounts this node serves no longer admit
+/// `T1` — so the next live reconcile (any hand edit) and every later boot
+/// quarantine `T1` and everything that descends from it, the operator's
+/// fresh hand line included: one peer directive un-serves history every
+/// replica already holds, on every replica, and every write after it.
+#[test]
+#[ignore = "A2-4: a peer's back-dated second open makes the served-set rule quarantine history every replica holds, with all its descendants"]
+fn a2_a_peer_open_never_unserves_history_this_node_already_serves() {
+    let a = std::sync::Arc::new(key());
+    let b = PeerKeySignatureProvider::from_bytes(&[0x51; 32], MESH_ID.to_owned());
+    let (mut node, path) = a2_node_with_accounts("a2-4", &a);
+    let t1 = signed_transfer(&b, 5, "T1 USD", Decimal::from(5), "", 10);
+    let t1_id = compute_content_id(&t1);
+    assert_eq!(a2_offer(&mut node, &t1), "OK");
+    let second_open = sign_directive(
+        &b,
+        Directive::Open(Open {
+            date: date(3),
+            account: "Assets:Cash".to_owned(),
+            currencies: vec!["EUR".to_owned()],
+            metadata: BTreeMap::new(),
+        }),
+        11,
+    );
+    assert_eq!(a2_offer(&mut node, &second_open), "OK", "premise: accepted");
+    node.compact().expect("compact");
+    let mut text = std::fs::read_to_string(&path).expect("read");
+    text.push_str("\n2024-01-20 * \"hand\"\n  Assets:Cash  1 EUR\n  Equity:Opening  -1 EUR\n");
+    std::fs::write(&path, text).expect("write");
+    node.reconcile_file().expect("reconcile");
+    let served_live = node.contains_directive(&t1_id);
+    let held_live = node.quarantined_ids().len();
+    node.compact().expect("compact");
+    drop(node);
+    let restarted = a2_restart(&path, &a);
+    assert!(
+        served_live && restarted.contains_directive(&t1_id),
+        "A2-4: T1 served after the live reconcile {served_live} ({held_live} held), after a \
+         restart {} (held {:?})",
+        restarted.contains_directive(&t1_id),
+        restarted.quarantined_ids()
+    );
+    drop(restarted);
+    let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+}
+
+/// A2 (0926), T85's stated residual re-checked: "`close_account`'s own
+/// body-size check is now unreachable through any public path". It is
+/// reachable: account names have no length cap, and a `close` body spells
+/// `close` where the `open` spells `open` — one byte longer. An `open` with
+/// no currencies whose body is exactly `MAX_ECONOMIC_BEAN_LENGTH` is
+/// authored, crosses the wire signed and stages on a peer; its `close` is
+/// one byte over, so `close_account` refuses it on that size check without
+/// moving the clock, and the wire refuses a peer's copy for good — the
+/// account can never be closed anywhere.
+#[test]
+fn a2_close_accounts_size_check_is_reachable_through_an_open_at_the_cap() {
+    use ledger::model::Close;
+    use ledger::serialize::economic_canonical_serialize;
+    use ledger::service::MAX_ECONOMIC_BEAN_LENGTH;
+    let open_of = |account: &str| {
+        Directive::Open(Open {
+            date: date(1),
+            account: account.to_owned(),
+            currencies: vec![],
+            metadata: BTreeMap::new(),
+        })
+    };
+    let probe = economic_canonical_serialize(&open_of("Assets:A")).len();
+    let account = format!("Assets:A{}", "a".repeat(MAX_ECONOMIC_BEAN_LENGTH - probe));
+    assert_eq!(
+        economic_canonical_serialize(&open_of(&account)).len(),
+        MAX_ECONOMIC_BEAN_LENGTH,
+        "premise: the open is exactly at the cap"
+    );
+    let close = Directive::Close(Close {
+        date: date(2),
+        account: account.clone(),
+        metadata: BTreeMap::new(),
+    });
+    assert_eq!(
+        economic_canonical_serialize(&close).len(),
+        MAX_ECONOMIC_BEAN_LENGTH + 1
+    );
+
+    let author = std::sync::Arc::new(key());
+    let path = scratch_ledger("a2-close-cap");
+    let mut node = signing_node(&path, &author);
+    node.open_account_signing(
+        account.clone(),
+        date(1),
+        vec![],
+        a2_sign_open_with(std::sync::Arc::clone(&author)),
+    )
+    .expect("an open at the cap is authored");
+    let served_open = node
+        .dag()
+        .directives()
+        .into_iter()
+        .find(|directive| matches!(directive, Directive::Open(_)))
+        .expect("served")
+        .clone();
+    let (mut fresh, fresh_path) = fresh_with_accounts("a2-close-cap-fresh");
+    assert_eq!(a2_offer(&mut fresh, &served_open), "OK", "and replicates");
+
+    let clock = node.lamport_clock();
+    let error = node
+        .close_account(account.clone(), date(2))
+        .expect_err("one byte over");
+    assert_eq!(error.error_code(), "RESOURCE_LIMIT_EXCEEDED", "{error}");
+    assert_eq!(node.lamport_clock(), clock, "refused before the stamp");
+    // The body cap is checked before the envelope is looked at.
+    let error = validate_supply_entry(&make_supply_entry(&close)).expect_err("over the cap");
+    assert!(
+        matches!(error, MergeError::ResourceLimitExceeded(_)),
+        "{error:?}"
+    );
+    drop((node, fresh));
+    let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    let _ = std::fs::remove_dir_all(fresh_path.parent().expect("dir"));
+}
+
+/// A2 (0926), T85 (d) / L-110's remedy on the supported path (stop → edit
+/// → start), with no peer holding the original: this node's `open
+/// Expenses:Food` has its envelope edited (lamport) or its body edited
+/// (date), so boot holds it (H-20). Deleting its `openledger-*` lines with
+/// the node stopped turns it into operator input; the next boot adopts it,
+/// signs it, and a fresh replica stages it — the operator is never stuck on
+/// this path, whichever edit was made. (A2-2 pins the same remedy under a
+/// running node.)
+#[test]
+fn a2_the_l110_remedy_works_with_the_node_stopped_for_either_edit() {
+    let a = std::sync::Arc::new(key());
+    for (label, from, to) in [
+        (
+            "envelope",
+            "openledger-lamport: \"3\"",
+            "openledger-lamport: \"99\"",
+        ),
+        (
+            "body",
+            "2024-01-01 open Expenses:Food",
+            "2024-01-02 open Expenses:Food",
+        ),
+    ] {
+        let (mut node, path) = a2_node_with_accounts(&format!("a2-l110-stopped-{label}"), &a);
+        node.open_account_signing(
+            "Expenses:Food".to_owned(),
+            date(1),
+            vec![],
+            a2_sign_open_with(std::sync::Arc::clone(&a)),
+        )
+        .expect("open");
+        node.compact().expect("compact");
+        drop(node);
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains(from), "{label}: premise");
+        std::fs::write(&path, text.replacen(from, to, 1)).expect("write");
+        let mut node = a2_restart(&path, &a);
+        node.compact().expect("the startup compaction");
+        assert!(!node.accounts().is_open("Expenses:Food"), "{label}: held");
+        drop(node);
+
+        let text = std::fs::read_to_string(&path).expect("read");
+        let mut in_food = false;
+        let stripped: Vec<&str> = text
+            .lines()
+            .filter(|line| {
+                if !line.starts_with(' ') {
+                    in_food = line.contains(" open Expenses:Food");
+                }
+                !(in_food && line.contains("openledger-"))
+            })
+            .collect();
+        std::fs::write(&path, stripped.join("\n") + "\n").expect("write");
+        let node = a2_restart(&path, &a);
+        assert!(node.accounts().is_open("Expenses:Food"), "{label}: opened");
+        assert!(node.quarantined_ids().is_empty(), "{label}");
+        let food = node
+            .dag()
+            .directives()
+            .into_iter()
+            .find(|directive| {
+                matches!(directive, Directive::Open(open) if open.account == "Expenses:Food")
+            })
+            .expect("served")
+            .clone();
+        let (mut fresh, fresh_path) = fresh_with_accounts(&format!("a2-l110-fresh-{label}"));
+        assert_eq!(a2_offer(&mut fresh, &food), "OK", "{label}");
+        drop((node, fresh));
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+        let _ = std::fs::remove_dir_all(fresh_path.parent().expect("dir"));
+    }
+}
