@@ -1019,7 +1019,10 @@ same trust boundary:
   full envelope is history, not a typed line, and is kept when boot would keep
   it: one over a limit peers hold history to or over the 1 MiB body cap, one the
   accounts do not admit, and one whose parent this node does not serve are held
-  in the quarantine and written back, as at boot.
+  in the quarantine and written back, as at boot. A line this node adopts
+  from the file is not offered to peers until the rewrite that spells it
+  canonically has succeeded, so a failed rewrite followed by a restart (which
+  stamps the line again) never leaves the mesh holding two envelopes for it.
 - A file that no longer **parses** blocks writes until a human fixes it, rather
   than being canonicalized on top of a half-saved edit. The refusal records
   nothing about the broken file — not its hash, not its size — so every later
@@ -1086,7 +1089,10 @@ cases where you might:
   after an unclean stop, its journal is still beside the link, where the node
   no longer looks: boot refuses and names it. Move it beside the target (as
   `<target>.journal`), or put the ledger back, start the node once so it folds
-  the journal in, stop it cleanly, and then make the link.
+  the journal in, stop it cleanly, and then make the link. The link is resolved
+  once, when the node starts: turning the path into a link while it runs is
+  not followed (a recovery after a failed write refuses it) — stop the node
+  first.
 - **A `.bean` missing beside a journal refuses boot** rather than starting an
   empty ledger with the journal's writes on top.
 - **A torn final record** — a crash mid-append — is dropped with a warning. On

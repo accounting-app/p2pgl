@@ -1555,7 +1555,9 @@ async fn fetch_want_chunk(
 async fn local_have_heads_pages(ledger: &SharedLedger) -> p2p::anti_entropy::HaveHeadsPages {
     let (heads, directive_ids) = {
         let svc = ledger.read().await;
-        (svc.head_txids(), svc.sorted_directive_ids())
+        // T93 / L-116: what this node serves — not a line adopted from the
+        // `.bean` whose rewrite has not succeeded yet.
+        (svc.served_head_txids(), svc.served_sorted_directive_ids())
     };
     let mut heads: Vec<String> = heads.into_iter().collect();
     heads.sort_unstable();
@@ -1593,7 +1595,8 @@ fn supply_for_want<F>(
 where
     F: FnMut(&ledger::model::Directive) -> p2p::protocol::SupplyEntry,
 {
-    p2p::anti_entropy::build_supply(ids, |id| svc.get_directive(id).map(&mut serialize))
+    // T93 / L-116: `served_directive`, not `get_directive`.
+    p2p::anti_entropy::build_supply(ids, |id| svc.served_directive(id).map(&mut serialize))
 }
 
 /// Tally of what `apply_supply_entries` did with one `Supply` batch (M-14).
@@ -3435,7 +3438,11 @@ pub(crate) mod tests {
     /// Built as text so the source node can boot a large ledger in one shot;
     /// `openledger-author` is required on the receive path (H-14), and is not
     /// part of the economic body, so every directive still hashes distinctly by
-    /// its account name alone.
+    /// its account name alone. Each carries an `openledger-lamport` too, so boot
+    /// loads it as history: without one it is operator input, and since T93
+    /// (L-116) a line adopted from the file is not served until the canonical
+    /// rewrite — which gl-node runs at startup, before P2P, and these fixtures
+    /// skip.
     pub(crate) fn write_open_directive_ledger(path: &std::path::Path, count: usize, author: &str) {
         use std::fmt::Write as _;
 
@@ -3443,6 +3450,7 @@ pub(crate) mod tests {
         for index in 0..count {
             writeln!(content, "2024-01-01 open Assets:Acct{index:05}").expect("write to String");
             writeln!(content, "  openledger-author: \"{author}\"").expect("write to String");
+            writeln!(content, "  openledger-lamport: \"{}\"", index + 1).expect("write to String");
             content.push('\n');
         }
         std::fs::write(path, content).expect("write source ledger");
@@ -6613,6 +6621,96 @@ pub(crate) mod tests {
         }
     }
 
+    /// L-116 (T93, decision (45)): a line the watcher adopts from the `.bean`
+    /// under a running node is stamped and signed in memory only until the
+    /// compaction that spells it canonically succeeds. It is neither
+    /// advertised nor supplied until then — before T93 it was, and a failed
+    /// compaction plus a restart re-stamped it, so the mesh held two envelopes
+    /// for one id. The head it would have replaced is advertised meanwhile,
+    /// and after the rewrite the line is served like any other record.
+    ///
+    /// Bug-catch: serve through `get_directive` / `head_txids` /
+    /// `sorted_directive_ids` again and the line is advertised and supplied
+    /// before its rewrite.
+    #[tokio::test]
+    async fn l116_a_line_adopted_from_the_file_is_served_only_after_its_rewrite() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("ledger.bean");
+        let mut svc = LedgerService::boot(path.clone(), "node".to_owned()).expect("boot");
+        for account in ["Assets:Cash", "Equity:Opening"] {
+            svc.open_account(account.to_owned(), day(1, 1), Vec::new())
+                .expect("open");
+        }
+        let written = svc
+            .append_transaction(balanced_funding_input())
+            .expect("write")
+            .txid;
+        svc.compact().expect("compact");
+        let mut text = std::fs::read_to_string(&path).expect("read");
+        text.push_str(
+            "\n2024-01-20 * \"Hand\" \"typed while running\"\n  Assets:Cash  3 USD\n  \
+             Equity:Opening  -3 USD\n",
+        );
+        std::fs::write(&path, text).expect("write");
+        let result = svc.reconcile_file_staged().expect("reconcile");
+        assert_eq!(result.new_directives, 1, "{result:?}");
+        let hand = svc
+            .all_directive_ids()
+            .into_iter()
+            .find(|id| {
+                matches!(svc.get_directive(id), Some(ledger::model::Directive::Transaction(txn))
+                    if txn.narration.as_deref() == Some("typed while running"))
+            })
+            .expect("adopted");
+        assert!(svc.is_head(&hand), "premise: the hand line is the head");
+        let ledger: SharedLedger = Arc::new(RwLock::new(svc));
+        let advertised = |ledger: SharedLedger| async move {
+            let mut heads = Vec::new();
+            let mut ids = Vec::new();
+            for page in local_have_heads_pages(&ledger).await {
+                if let WireMessage::HaveHeads {
+                    head_txids,
+                    directive_ids,
+                    ..
+                } = page
+                {
+                    heads.extend(head_txids);
+                    ids.extend(directive_ids);
+                }
+            }
+            (heads, ids)
+        };
+        let supplied = |ledger: SharedLedger, id: String| async move {
+            match collect_supply(&ledger, std::slice::from_ref(&id)).await {
+                WireMessage::Supply { entries, .. } => entries.len(),
+                other => panic!("not a supply: {other:?}"),
+            }
+        };
+
+        let (heads, ids) = advertised(Arc::clone(&ledger)).await;
+        assert!(
+            !ids.contains(&hand) && !heads.contains(&hand),
+            "not advertised"
+        );
+        assert!(
+            heads.contains(&written),
+            "the head it replaced is advertised"
+        );
+        assert_eq!(
+            supplied(Arc::clone(&ledger), hand.clone()).await,
+            0,
+            "not supplied"
+        );
+
+        ledger.write().await.compact().expect("the rewrite");
+        let (heads, ids) = advertised(Arc::clone(&ledger)).await;
+        assert!(
+            ids.contains(&hand) && heads.contains(&hand),
+            "advertised after it"
+        );
+        assert_eq!(supplied(Arc::clone(&ledger), hand).await, 1, "and supplied");
+    }
+
     /// T91 (M-09 remainder, decision (38)) — X1's `n3e` shape through the real
     /// remote path. The sink already holds the prefix (the three `open`s and
     /// the 01-15 Cash transaction); the rest of T29's fixture plus a Cash
@@ -6943,6 +7041,9 @@ pub(crate) mod tests {
             writeln!(content, "2024-01-01 open Assets:Big{index:03}").expect("write to String");
             writeln!(content, "  memo: \"{memo}\"").expect("write to String");
             writeln!(content, "  openledger-author: \"{author}\"").expect("write to String");
+            // T93 / L-116: history, not operator input — see
+            // `write_open_directive_ledger`.
+            writeln!(content, "  openledger-lamport: \"{}\"", index + 1).expect("write to String");
             content.push('\n');
         }
         std::fs::write(path, content).expect("write source ledger");

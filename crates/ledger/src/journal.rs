@@ -481,7 +481,16 @@ pub fn read_journal(path: &Path, budget: u64) -> Result<JournalScan, JournalErro
             // payload. Either one means records follow the damaged header:
             // fail closed, name the offset, and let the operator decide.
             let over_budget = payload_length as u64 > budget;
-            if over_budget || has_later_record_header(&bytes[cursor..]) {
+            // T93 / L-122: and a later append torn inside the first five bytes
+            // of its `;;olj ` tag, before a whole tag exists to find — the gap
+            // T86 closed in the exact-length arm below (L-105), with the same
+            // discriminator: the bytes before the fragment are exactly this
+            // record's payload and verify against its own hash, which a torn
+            // final record's bytes never do.
+            if over_budget
+                || has_later_record_header(&bytes[cursor..])
+                || has_later_intact_record(&bytes[cursor..], expected_hash)
+            {
                 return Err(JournalError::Corrupt {
                     offset: record_start as u64,
                     reason: format!(
@@ -1873,6 +1882,65 @@ mod tests {
             assert_eq!(scan.torn_tail_bytes, cut as u64, "control, cut {cut}");
             std::fs::remove_file(&path).ok();
         }
+    }
+
+    /// L-122 (T93): L-105's shape in the OTHER arm — the second record's length
+    /// damaged to claim MORE bytes than the file holds, over a third append
+    /// torn inside the first five bytes of its tag. The over-claim arm failed
+    /// closed only on a complete `;;olj ` line, so the acknowledged second
+    /// record was dropped as a torn tail (D1 `case_l105b`: cuts 1, 3, 5), where
+    /// CHANGELOG says a damaged length over a torn append fails closed. The
+    /// control — the same over-claim with no later append — is still a torn
+    /// final record (M-43's accepted policy).
+    ///
+    /// Bug-catch: drop the `has_later_intact_record` term in the over-claim
+    /// arm and every cut reads `Ok` with one intact record.
+    #[test]
+    fn l122_an_over_long_length_over_an_append_torn_inside_its_tag_is_corrupt() {
+        for cut in 1..=5usize {
+            let path = temp_journal(&format!("l122-cut-{cut}"));
+            let (bytes, second) = three_records(&path);
+            let third = second
+                + bytes[second..]
+                    .windows(6)
+                    .skip(1)
+                    .position(|window| window == b";;olj ")
+                    .unwrap()
+                + 1;
+            let torn = bytes[..third + cut].to_vec();
+            let header_end = second + torn[second..].iter().position(|b| *b == b'\n').unwrap() + 1;
+            let over = (torn.len() - header_end + 64).to_string();
+            write_private(&path, with_length(&torn, second, &over));
+            match read_journal(&path, 64 * 1024 * 1024) {
+                Err(JournalError::Corrupt { offset, .. }) => {
+                    assert_eq!(offset, second as u64, "cut {cut}")
+                }
+                Ok(scan) => panic!(
+                    "cut {cut}: an acknowledged record behind an over-long length was dropped as \
+                     torn ({} payloads, {} torn bytes)",
+                    scan.payloads.len(),
+                    scan.torn_tail_bytes
+                ),
+                Err(other) => panic!("cut {cut}: expected Corrupt, got {other}"),
+            }
+            std::fs::remove_file(&path).ok();
+        }
+        let path = temp_journal("l122-control");
+        let (bytes, second) = three_records(&path);
+        let third = second
+            + bytes[second..]
+                .windows(6)
+                .skip(1)
+                .position(|window| window == b";;olj ")
+                .unwrap()
+            + 1;
+        let two = bytes[..third].to_vec();
+        let header_end = second + two[second..].iter().position(|b| *b == b'\n').unwrap() + 1;
+        let over = (two.len() - header_end + 64).to_string();
+        write_private(&path, with_length(&two, second, &over));
+        let scan = read_journal(&path, 64 * 1024 * 1024).expect("a torn final record");
+        assert_eq!(scan.payloads.len(), 1, "control");
+        std::fs::remove_file(&path).ok();
     }
 
     /// L-85 (T82): the second of three records has its length damaged to run

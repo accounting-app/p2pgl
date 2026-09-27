@@ -3043,9 +3043,15 @@ fn fresh_replica_cash(served: &LedgerService, label: &str) -> (Option<String>, V
 /// write was discarded, the hand line kept an envelope naming it, and the
 /// next restart's served-set rule (H-23) quarantined the hand line and every
 /// later write — the running node reported 106, the restarted one 100.
+/// T86 refused that install instead (M-59), which kept the failed write in
+/// memory — counted and served (A3-1 / M-65). Since T93 (decision (43)) the
+/// hand line takes its parents from committed records only, so it never
+/// names the staged write: the reload installs, the failed write is rolled
+/// back, and the three balances agree without the refusal.
 ///
-/// Bug-catch: drop the parent check in `keep_committed_envelopes_in` and the
-/// three balances disagree.
+/// Bug-catch: let the hand line's parents include the staged write again
+/// (`choose_parents` instead of `choose_committed_parents`) and the install
+/// is refused and the failed write kept.
 #[cfg(unix)]
 #[test]
 fn a3_m59_a_failed_write_that_a_hand_line_names_leaves_one_balance_running_restarted_and_replicated(
@@ -3087,8 +3093,8 @@ fn a3_m59_a_failed_write_that_a_hand_line_names_leaves_one_balance_running_resta
     assert_eq!(restarted.quarantined_count(), 0);
     assert!(refused.is_empty(), "the replica refused {refused:?}");
     assert!(
-        m59_logged.contains("REFUSING") && m59_logged.contains("M-59"),
-        "premise: the M-59 shape: {m59_logged}"
+        m59_logged.contains("L-13 reload installed") && !m59_logged.contains("REFUSING"),
+        "the reload installs and rolls the failed write back (M-65): {m59_logged}"
     );
     remove_scratch(&path);
 }
@@ -3327,7 +3333,6 @@ fn a3_m58_hand_lines_adopted_over_the_cap_by_a_refused_compaction_keep_one_balan
 /// 100 acknowledged plus the adopted 5 — not that plus the refused 7.
 #[cfg(unix)]
 #[test]
-#[ignore = "A3-1: a write whose call failed stays in the balance after T86's M-59 refusal"]
 fn a3_1_a_write_whose_commit_failed_is_not_in_the_balance_after_the_m59_refusal() {
     let (mut service, path) = node_with_100("a3-1-io");
     let directory = path.parent().expect("directory").to_path_buf();
@@ -3356,7 +3361,6 @@ fn a3_1_a_write_whose_commit_failed_is_not_in_the_balance_after_the_m59_refusal(
 /// pre-stage refusal steps aside (`refuse_if_local_write_cannot_fit`), and
 /// makes every later compaction reload again — the cost M-58 removed.
 #[test]
-#[ignore = "A3-1: on the cap path the refused write is in the running balance and gone after a restart"]
 fn a3_1_a_write_refused_for_the_cap_is_neither_counted_nor_reloaded_for() {
     let (mut service, path, _) = node_near_the_cap_with_hand_lines_appended("a3-1-cap");
     let outcome = service.append_transaction(cash_input("refused for the cap", 7, 2));

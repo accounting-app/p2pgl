@@ -558,6 +558,18 @@ pub(crate) fn refuse_if_local_write_cannot_fit(
     signer: Option<&dyn SignatureProvider>,
 ) -> Result<(), ServiceError> {
     let headroom = service.append_headroom();
+    // T93 / M-65, decision (43): at (or over) the cap nothing fits, whatever
+    // is already staged. The "something else is staged" exemption below let
+    // every mutation through once one write was stuck staged — each then
+    // rebuilt the ledger under the permit and was refused for the cap anyway.
+    if headroom == 0 {
+        return Err(ServiceError::ResourceLimitExceeded {
+            message: format!(
+                "the ledger is at its size cap (max {MAX_LEDGER_FILE_BYTES}); refused before \
+                 staging, nothing changed. Archive or split the ledger to make room"
+            ),
+        });
+    }
     if headroom >= LOCAL_WRITE_FAST_PATH_HEADROOM || service.uncommitted_count() > 0 {
         return Ok(());
     }
@@ -1576,6 +1588,37 @@ mod tests {
             raw.text()
         );
         assert_eq!(ledger.read().await.directive_count(), 3, "nothing staged");
+
+        // T93 / M-65, decision (43): with a write already staged (a library
+        // caller's, or one a refused install kept), the pre-stage refusal used
+        // to step aside — every mutation then staged, rebuilt the ledger under
+        // the permit and was refused for the cap anyway. Over the cap nothing
+        // fits, so it refuses whatever is staged.
+        ledger
+            .write()
+            .await
+            .open_account_staged(
+                "Assets:Staged".to_owned(),
+                chrono::NaiveDate::from_ymd_opt(2024, 1, 5).unwrap(),
+                vec![],
+                |_, _, _| None,
+            )
+            .expect("a library stage");
+        assert_eq!(ledger.read().await.uncommitted_count(), 1, "premise");
+        let response = schema
+            .execute(r#"mutation { openAccount(name: "Assets:AfterStage", date: "2024-01-05") }"#)
+            .await;
+        assert_eq!(
+            error_codes(&response),
+            vec!["\"RESOURCE_LIMIT_EXCEEDED\"".to_owned()],
+            "{:?}",
+            response.errors
+        );
+        assert_eq!(
+            ledger.read().await.uncommitted_count(),
+            1,
+            "refused before staging"
+        );
     }
 
     #[tokio::test]

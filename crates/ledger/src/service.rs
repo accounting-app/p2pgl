@@ -3270,7 +3270,34 @@ impl LedgerService {
         let configured: PathBuf = file_path.into();
         // T82 / L-84: a symlinked `.bean` this node's user created is worked
         // at its target — journal, temp files and compactions included.
-        let file_path = crate::journal::resolve_ledger_path(&configured)?;
+        //
+        // T93 / L-117: resolved once, by the process start. A reload is handed
+        // the path the running service works at — the one gl-node locked and
+        // its watcher polls — and uses it as it is: resolving it again followed
+        // a link the operator had put there since, and the rebuilt service
+        // then read, journalled and compacted a file the lock did not cover.
+        // A path that has become a link is refused instead (the reload's
+        // REFUSING arm keeps memory).
+        let file_path = if matches!(mode, BootMode::Reload) {
+            let is_link = std::fs::symlink_metadata(&configured)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false);
+            if is_link {
+                return Err(ServiceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "ledger path {} became a symbolic link while the node was running; a \
+                         reload does not follow it, since this node's lock and watcher are on the \
+                         path it started with — stop the node, then start it on the new layout \
+                         (L-117, L-44)",
+                        configured.display()
+                    ),
+                )));
+            }
+            configured.clone()
+        } else {
+            crate::journal::resolve_ledger_path(&configured)?
+        };
         if file_path != configured {
             info!(
                 link = %configured.display(),
@@ -6049,6 +6076,58 @@ impl LedgerService {
         choose_parents_in(&self.dag, content_id)
     }
 
+    /// [`Self::choose_parents`] for a line adopted from the FILE: the heads
+    /// among records a commit has already written, never a write staged and
+    /// not yet committed (T93 / M-65, decision (43)).
+    ///
+    /// A hand edit is adopted inside the `prepare` of whatever write comes
+    /// next. Its parents used to be every head, the write staged in that same
+    /// call included; if that commit then failed, the recovery reload found a
+    /// kept hand-line envelope naming a record the rebuild lacked and refused
+    /// to install (M-59) — so memory, with the write whose call had just
+    /// returned an error, was kept, counted and served, and on an over-cap
+    /// ledger every later write staged, failed and was kept too. A staged
+    /// head is replaced by its own parents, walked back to what is committed,
+    /// and a candidate that a committed record already names is dropped, so
+    /// the choice is exactly the heads of the committed DAG.
+    fn choose_committed_parents(&self, content_id: &str) -> String {
+        if self.pending_ids.is_empty() {
+            return self.choose_parents(content_id);
+        }
+        let pending: HashSet<&str> = self.pending_ids.iter().map(String::as_str).collect();
+        let mut committed: BTreeSet<&str> = BTreeSet::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut frontier: Vec<&str> = self.dag.heads_admissible_as_parents_of(content_id);
+        while let Some(head) = frontier.pop() {
+            if !seen.insert(head) {
+                continue;
+            }
+            if !pending.contains(head) {
+                committed.insert(head);
+                continue;
+            }
+            if let Some(Directive::Transaction(txn)) = self.dag.get(head) {
+                frontier.extend(
+                    txn.parent_ids()
+                        .into_iter()
+                        .filter(|parent| self.dag.get(parent).is_some() && *parent != content_id),
+                );
+            }
+        }
+        committed.retain(|id| {
+            self.dag.children_of(id).is_none_or(|children| {
+                children
+                    .iter()
+                    .all(|child| pending.contains(child.as_str()) || child == content_id)
+            })
+        });
+        let mut candidates: Vec<(&str, Option<&str>)> = committed
+            .into_iter()
+            .map(|head| (head, self.dag.get(head).and_then(directive_author)))
+            .collect();
+        select_parents(&mut candidates).join(",")
+    }
+
     /// The value this node stamps next, checked against the one Lamport rule
     /// (H-07, H-12) — see [`checked_lamport`].
     ///
@@ -6881,10 +6960,12 @@ impl LedgerService {
     ///   arrivals) since the last commit. The failed commit was its only way
     ///   onto disk.
     /// * **`adopted_from_file`** — what boot or a reconcile adopted from the
-    ///   `.bean` since the last compaction. On disk only in the operator's raw
-    ///   spelling; an operator who removes their own hand lines again before
-    ///   the rewrite that would have canonicalised them is obeyed (T62's
-    ///   `floor (a)`), exactly as before.
+    ///   `.bean` since the last compaction, on disk only in the operator's raw
+    ///   spelling. Counted out of the count floor only: since T86 (L-104) a
+    ///   stamped line is this node's record, and since T84 every adopted line
+    ///   is stamped at adoption, so the id check below holds it like any other
+    ///   (T93 / L-124). T62's `floor (a)` — an operator removing their own hand
+    ///   lines before the rewrite is obeyed — no longer applies.
     ///
     /// Every OTHER id memory holds was on disk in this node's spelling at the
     /// last commit, and the rebuild is **refused** — memory kept, the refusal
@@ -6982,8 +7063,7 @@ impl LedgerService {
                             .join(","),
                         file = %self.file_path.display(),
                         "REFUSING to install an L-13 rebuild that lacks directives memory holds \
-                         and no failed commit can explain — neither staged since the last commit \
-                         nor adopted from the file, still unstamped, since the last compaction: \
+                         and no failed commit can explain — not staged since the last commit: \
                          the files lost records memory still holds. Memory is kept, ahead of disk; the next \
                          commit is a full rewrite that puts every in-memory directive back on \
                          disk (H-15, M-46)"
@@ -7046,6 +7126,26 @@ impl LedgerService {
                          commit writes it back (L-81)"
                     );
                 }
+                // T93 / L-115, decision (44): the clock never falls below a
+                // lamport this node issued (M-18). The rebuild resumes at the
+                // file's `max + 1`, and the staged writes the failed commit
+                // discards are on no disk — but they were served while staged
+                // (L-86), so a peer may hold them: the next write reusing one
+                // of their lamports re-issued an (author, lamport) pair.
+                let own = self.author_id.clone();
+                let discarded_own_high = self
+                    .pending_ids
+                    .iter()
+                    .filter(|id| reloaded.dag.get(id).is_none())
+                    .filter_map(|id| self.dag.get(id))
+                    .filter(|directive| {
+                        directive_author(directive)
+                            .is_some_and(|author| is_own_author(author, &own))
+                    })
+                    .filter_map(Directive::lamport_clock)
+                    .max()
+                    .unwrap_or(0);
+                reloaded.lamport_clock = reloaded.lamport_clock.max(discarded_own_high);
                 self.adopt_reloaded(reloaded);
                 // H-20: the reload re-derived the history from the file; the
                 // carried signer and verifier were installed by assignment,
@@ -7055,6 +7155,9 @@ impl LedgerService {
                 // quarantined after the signing would stay a parent of a
                 // signed record no peer can resolve.
                 self.verify_own_history();
+                // T93 / L-115: and the pass's L-87 release may not lower it
+                // below them either, before finalisation stamps from it.
+                self.lamport_clock = self.lamport_clock.max(discarded_own_high);
                 self.finalize_operator_input();
                 // T86 / M-58, decision (21): the fact decides whether writes
                 // are refused before staging, and a rebuild whose operator
@@ -7082,39 +7185,26 @@ impl LedgerService {
     }
 
     /// The ids memory holds that `rebuilt` lacks and that no failed commit can
-    /// explain (M-46): every id in neither `pending_ids` (staged, never on
-    /// disk) nor `adopted_from_file` (on disk only as the operator's raw
-    /// line). Each of those was on disk in this node's own spelling as of the
-    /// last commit, so a rebuild of the same files holds it under the same
-    /// id. One set lookup per directive, no content hashing.
+    /// explain (M-46): every id not in `pending_ids` (staged, never on disk).
+    /// Everything else was on disk as of the last commit — in this node's
+    /// spelling, or as a line the operator typed and this node adopted and
+    /// stamped — so a rebuild of the same files holds it under the same id.
+    /// One set lookup per directive, no content hashing.
     ///
-    /// T82 / L-93, T86 / L-104: a file-adopted id is exempt only while
-    /// memory's copy is still operator input — not yet stamped with this
-    /// node's author and lamport. Once finalised at boot, or stamped by a live
-    /// reconcile, it is this node's record and may already have been served,
-    /// even though the compaction that would clear `adopted_from_file` has not
-    /// happened yet (it failed). A rebuild that lacks it is refused like one
-    /// that lacks any other committed record, so the next commit writes it
-    /// back — what the success path (the L-30 union) does anyway. T82 keyed
-    /// this on the signature, which a signing-off node never adds.
+    /// T86 / L-104, decision (23): a file-adopted id is not exempt once it is
+    /// stamped with this node's author and lamport — and since T84 every
+    /// adopted line is, at boot (provisionally) and on the live path alike, so
+    /// T93 / L-124 removed the "still unstamped" exemption that T86 left, which
+    /// could no longer apply. A rebuild that lacks such a line is refused like
+    /// one that lacks any other committed record, so the next commit writes it
+    /// back — what the success path (the L-30 union) does anyway. Deleting a
+    /// line this node has stamped is not a retraction (T62's floor (a) is
+    /// gone); a reversing entry is.
     fn committed_ids_missing_from<'a>(&'a self, rebuilt: &LedgerDag) -> Vec<&'a str> {
         let staged: HashSet<&str> = self.pending_ids.iter().map(String::as_str).collect();
         self.dag
             .ids()
             .filter(|id| !staged.contains(id))
-            .filter(|id| {
-                // T86 / L-104, decision (23): exempt only while memory's copy
-                // is still operator input (not yet finalised). T82 keyed this
-                // on the signature, so on a signing-off node — which never
-                // signs — a hand line finalised, served and written back was
-                // droppable forever; `keep_committed_envelopes_in` already
-                // treats a finalised copy as committed.
-                !self.adopted_from_file.contains(*id)
-                    || self
-                        .dag
-                        .get(id)
-                        .is_some_and(|directive| !Self::is_operator_input(directive))
-            })
             .filter(|id| rebuilt.get(id).is_none())
             .collect()
     }
@@ -8252,7 +8342,7 @@ impl LedgerService {
                 stamped_parents = true;
                 txn.metadata.insert(
                     "openledger-parents".to_owned(),
-                    self.choose_parents(&content_id),
+                    self.choose_committed_parents(&content_id),
                 );
             }
         }
@@ -8303,7 +8393,7 @@ impl LedgerService {
                     // honest ledger. Parents the FILE spelled are the
                     // operator's own and are left alone.
                     if stamped_parents {
-                        let parents = self.choose_parents(&stored_id);
+                        let parents = self.choose_committed_parents(&stored_id);
                         directive_metadata_mut(&mut final_directive)
                             .insert("openledger-parents".to_owned(), parents);
                     }
@@ -8800,6 +8890,75 @@ impl LedgerService {
     /// Get a directive by content ID.
     pub fn get_directive(&self, content_id: &str) -> Option<&Directive> {
         self.dag.get(content_id)
+    }
+
+    /// The directive a peer may be SERVED under `content_id` (T93 / L-116,
+    /// decision (45)): what [`Self::get_directive`] returns, except a line
+    /// adopted from the `.bean` whose canonical rewrite has not succeeded yet.
+    ///
+    /// Such a line is stamped and signed in memory only. Served before its
+    /// compaction, a failed compaction plus a restart re-stamped it — boot
+    /// reads the raw line again and gives it a new lamport and signature — and
+    /// the mesh then held two envelopes for one id. Held back until the
+    /// rewrite puts its envelope on disk, the only envelope any peer ever sees
+    /// is the one the file keeps. The id is the body's, so a record naming it
+    /// (a local write on top) stays valid either way.
+    pub fn served_directive(&self, content_id: &str) -> Option<&Directive> {
+        if self.adopted_from_file.contains(content_id) {
+            return None;
+        }
+        self.dag.get(content_id)
+    }
+
+    /// [`Self::head_txids`] over what this node serves (T93 / L-116): a head
+    /// held back by [`Self::served_directive`] is replaced by those of its
+    /// parents that no served record names.
+    pub fn served_head_txids(&self) -> std::collections::HashSet<String> {
+        if self.adopted_from_file.is_empty() {
+            return self.head_txids();
+        }
+        let unserved = |id: &str| self.adopted_from_file.contains(id);
+        let mut served_heads: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut frontier: Vec<String> = self.dag.heads().iter().cloned().collect();
+        while let Some(id) = frontier.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if !unserved(&id) {
+                let named_by_served = self
+                    .dag
+                    .children_of(&id)
+                    .is_some_and(|children| children.iter().any(|child| !unserved(child)));
+                if !named_by_served {
+                    served_heads.insert(id);
+                }
+                continue;
+            }
+            if let Some(Directive::Transaction(txn)) = self.dag.get(&id) {
+                frontier.extend(
+                    txn.parent_ids()
+                        .into_iter()
+                        .filter(|parent| self.dag.get(parent).is_some())
+                        .map(str::to_owned),
+                );
+            }
+        }
+        served_heads
+    }
+
+    /// [`Self::sorted_directive_ids`] over what this node serves (T93 /
+    /// L-116).
+    pub fn served_sorted_directive_ids(&self) -> std::sync::Arc<[String]> {
+        let all = self.sorted_directive_ids();
+        if self.adopted_from_file.is_empty() {
+            return all;
+        }
+        all.iter()
+            .filter(|id| !self.adopted_from_file.contains(id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+            .into()
     }
 
     /// Compute the content ID for a directive (for lookups).
@@ -22901,17 +23060,125 @@ mod tests {
         remove_ledger_and_journal(&path);
     }
 
-    /// M-59 (T86, decision (22)): the pre-persist reconcile adopts a hand line
-    /// under a running node with parents that include a local write staged in
-    /// the same commit; the commit fails. Memory's kept envelope names that
-    /// staged write, which the rebuild lacks — before T86 the install went
-    /// ahead, the staged write was discarded, and the hand line was served,
-    /// written and named by every later write with a parent that existed
-    /// nowhere (A5 `a5_p2`). Now the install is refused, memory is kept, and
-    /// the next commit writes both, so every parent on disk resolves.
+    /// L-117 (T93), the audit's X3 `k12`: while the node runs, the operator
+    /// moves the `.bean` elsewhere and leaves a link at its path; then a commit
+    /// fails. The recovery reload used to resolve the path again, follow the
+    /// link, and install a service working at the moved file — journal and
+    /// compactions included — while gl-node's lock and watcher stayed on the
+    /// path it started with. The reload now uses the path as it is and refuses
+    /// a path that has become a link; memory is kept, still at that path.
     ///
-    /// Bug-catch: drop the parent check in `keep_committed_envelopes_in` and
-    /// the hand line is on disk naming a parent that is not.
+    /// Bug-catch: resolve the path on a reload again and the service's path is
+    /// the moved file after the failed commit.
+    #[cfg(unix)]
+    #[test]
+    fn l117_a_reload_does_not_follow_a_link_put_at_the_path_after_the_start() {
+        let directory = t67_directory("l117-relink");
+        let path = directory.join("ledger.bean");
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        for account in ["Assets:Cash", "Equity:Opening"] {
+            svc.open_account(account.to_owned(), make_date(2024, 1, 1), vec![])
+                .unwrap();
+        }
+        svc.compact().unwrap();
+        let elsewhere = directory.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let moved = elsewhere.join("moved.bean");
+        std::fs::rename(&path, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &path).unwrap();
+        let (outcome, logged) = capture_warnings(|| {
+            with_read_only_directory(&directory, || svc.append_transaction(balanced_input()))
+        });
+        assert!(outcome.is_err(), "premise: the commit fails");
+        assert!(logged.contains("L-117"), "{logged}");
+        assert_eq!(
+            svc.file_path(),
+            path.as_path(),
+            "still the path it started on"
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// L-115 (T93, decision (44)), the audit's X3 shape: after a restart the
+    /// clock resumes at the file's `max + 1`, so the first write is stamped
+    /// `max + 2`. Its commit fails; the recovery reload rebuilds from the file
+    /// — `max + 1` again — and before T93 the next write re-issued the failed
+    /// write's `(author, lamport)` pair, which a peer may already hold (a staged
+    /// write is served, L-86). The install now keeps the clock at least at the
+    /// highest own lamport among the writes it discards.
+    ///
+    /// Bug-catch: drop the `discarded_own_high` floor and the next write
+    /// reuses the failed write's lamport.
+    #[cfg(unix)]
+    #[test]
+    fn l115_a_write_after_a_failed_commit_never_reuses_its_lamport() {
+        let directory = t67_directory("l115-reissue");
+        let path = directory.join("ledger.bean");
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.set_signer(marker_signer());
+        for account in ["Assets:Cash", "Equity:Opening"] {
+            svc.open_account_signing(
+                account.to_owned(),
+                make_date(2024, 1, 1),
+                vec![],
+                marker_sign(false),
+            )
+            .unwrap();
+        }
+        svc.compact().unwrap();
+        drop(svc);
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.set_signer(marker_signer());
+        let failed = svc
+            .append_transaction_staged(balanced_input(), marker_sign(true))
+            .unwrap()
+            .txid;
+        let failed_lamport = svc.get_directive(&failed).unwrap().lamport_clock().unwrap();
+        let outcome = with_read_only_directory(&directory, || svc.persist_or_reload());
+        assert!(outcome.is_err(), "premise: the commit fails");
+        assert!(
+            svc.get_directive(&failed).is_none(),
+            "premise: the reload rolled the failed write back"
+        );
+        let next = svc
+            .append_transaction_signing(
+                TransactionInput {
+                    narration: Some("the next write".to_owned()),
+                    ..balanced_input()
+                },
+                marker_sign(true),
+            )
+            .unwrap()
+            .txid;
+        let next_lamport = svc.get_directive(&next).unwrap().lamport_clock().unwrap();
+        assert!(
+            next_lamport > failed_lamport,
+            "the next write is stamped {next_lamport}, the failed one was {failed_lamport}"
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// M-59 (T86, decision (22)), kept as the backstop decision (43) names: the
+    /// pre-persist reconcile adopts a hand line under a running node whose
+    /// parents include a local write staged in the same commit; the commit
+    /// fails. Memory's kept envelope names that staged write, which the rebuild
+    /// lacks — before T86 the install went ahead, the staged write was
+    /// discarded, and the hand line was served, written and named by every
+    /// later write with a parent that existed nowhere (A5 `a5_p2`). Now the
+    /// install is refused, memory is kept, and the next commit writes both, so
+    /// every parent on disk resolves.
+    ///
+    /// Since T93 (M-65) a hand line whose parents THIS NODE chooses never names
+    /// a staged write (`choose_committed_parents`), so the shape needs the
+    /// operator to spell the staged write's id in an `openledger-parents` line
+    /// — and then the rebuild's own boot refuses that line (L-75: its parent
+    /// exists nowhere on disk), so the committed-id floor refuses the install
+    /// before the M-59 parent check is reached. Either refusal keeps memory;
+    /// what this pins is the outcome: memory self-consistent, the next commit
+    /// writing both, every parent on disk resolving.
+    ///
+    /// Bug-catch: drop both refusals and the hand line is on disk naming a
+    /// parent that is not.
     #[cfg(unix)]
     #[test]
     fn m59_a_kept_envelope_whose_parent_the_rebuild_lacks_refuses_the_install() {
@@ -22929,17 +23196,18 @@ mod tests {
             .unwrap();
         }
         svc.compact().unwrap();
-        append_to_file(&path, &h22_hand_line("hand while running", None));
-        let (outcome, logged) = capture_warnings(|| {
-            with_read_only_directory(&directory, || {
-                svc.append_transaction_signing(balanced_input(), marker_sign(true))
-            })
-        });
-        assert!(outcome.is_err(), "premise: the commit fails");
-        assert!(
-            logged.contains("REFUSING") && logged.contains("M-59"),
-            "{logged}"
+        let staged = svc
+            .append_transaction_staged(balanced_input(), marker_sign(true))
+            .unwrap()
+            .txid;
+        append_to_file(
+            &path,
+            &h22_hand_line("hand while running", Some(staged.as_str())),
         );
+        let (outcome, logged) =
+            capture_warnings(|| with_read_only_directory(&directory, || svc.persist_or_reload()));
+        assert!(outcome.is_err(), "premise: the commit fails");
+        assert!(logged.contains("REFUSING"), "{logged}");
         assert!(!logged.contains("reload installed"), "{logged}");
         let parents_resolve = |svc: &LedgerService| {
             svc.dag()
