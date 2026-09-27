@@ -117,6 +117,72 @@ fn envelope_lamport(metadata: &Metadata) -> u64 {
 pub struct AccountState {
     /// `account → (deterministic key → event)`.
     events: HashMap<String, BTreeMap<LifecycleKey, LifecycleEvent>>,
+    /// `account → where each currency first becomes admissible` (T97 / M-70).
+    /// Present exactly for the accounts that carry an `open`.
+    currency_index: HashMap<String, CurrencyIndex>,
+}
+
+/// I9's union (T91 / M-63) as a lookup rather than a fold (T97 / M-70).
+///
+/// The union over every `open` dated no later than a transaction admits
+/// currency `c` exactly when the EARLIEST `open` listing `c` sorts below the
+/// transaction's bound, and admits every currency once the earliest `open`
+/// listing none does. Events are only ever added, so both minima only move
+/// down, and the answer is order-insensitive like the fold it replaces.
+///
+/// The fold walked every lifecycle event of the account dated before the
+/// transaction, for every posting validated — at boot, on the served-set rule
+/// and on every peer transaction — so an allowlisted peer's run of
+/// `close`/`open` pairs on a busy account cost every replica (postings ×
+/// pairs): 1,000 pairs took a 150,000-transaction boot from 3.6 s to 16.6 s.
+#[derive(Debug, Clone, Default)]
+struct CurrencyIndex {
+    /// The earliest `open` that lists no currency (any currency from there on).
+    any_from: Option<LifecycleKey>,
+    /// Currency → the earliest `open` that lists it.
+    first_listed: BTreeMap<String, LifecycleKey>,
+}
+
+impl CurrencyIndex {
+    fn record(&mut self, key: &LifecycleKey, currencies: &[String]) {
+        fn lower(slot: &mut Option<LifecycleKey>, key: &LifecycleKey) {
+            if slot.as_ref().is_none_or(|held| key < held) {
+                *slot = Some(key.clone());
+            }
+        }
+        if currencies.is_empty() {
+            lower(&mut self.any_from, key);
+        }
+        for currency in currencies {
+            let slot = self
+                .first_listed
+                .entry(currency.clone())
+                .or_insert_with(|| key.clone());
+            if key < slot {
+                *slot = key.clone();
+            }
+        }
+    }
+
+    /// The union in force below `bound` (empty = any currency).
+    fn union_below(&self, bound: &LifecycleKey) -> Vec<String> {
+        if self.any_from.as_ref().is_some_and(|key| key < bound) {
+            return Vec::new();
+        }
+        self.first_listed
+            .iter()
+            .filter(|(_, key)| *key < bound)
+            .map(|(currency, _)| currency.clone())
+            .collect()
+    }
+
+    fn admits_below(&self, currency: &str, bound: &LifecycleKey) -> bool {
+        self.any_from.as_ref().is_some_and(|key| key < bound)
+            || self
+                .first_listed
+                .get(currency)
+                .is_some_and(|key| key < bound)
+    }
 }
 
 impl AccountState {
@@ -178,6 +244,12 @@ impl AccountState {
     }
 
     fn insert_event(&mut self, account: &str, key: LifecycleKey, event: LifecycleEvent) {
+        if let LifecycleEvent::Open { currencies } = &event {
+            self.currency_index
+                .entry(account.to_owned())
+                .or_default()
+                .record(&key, currencies);
+        }
         self.events
             .entry(account.to_owned())
             .or_default()
@@ -305,6 +377,22 @@ impl AccountState {
         currency: &str,
         date: NaiveDate,
     ) -> Result<(), ValidationError> {
+        // T97 / M-70: the admitting case is two lookups; the union is built
+        // only for the refusal's message.
+        if !matches!(
+            self.deciding_for_transaction(account, date),
+            Some((_, LifecycleEvent::Open { .. }))
+        ) {
+            return Ok(());
+        }
+        let bound = LifecycleKey::transaction_bound(date);
+        if self
+            .currency_index
+            .get(account)
+            .is_some_and(|index| index.admits_below(currency, &bound))
+        {
+            return Ok(());
+        }
         Self::enforce_currencies(
             account,
             currency,
@@ -341,25 +429,18 @@ impl AccountState {
     /// satisfies. This is the question the orphan drain asks: "could an `open`
     /// for this account now admit a transaction that was waiting on it?"
     pub fn has_open(&self, account: &str) -> bool {
-        self.events.get(account).is_some_and(|events| {
-            events
-                .values()
-                .any(|event| matches!(event, LifecycleEvent::Open { .. }))
-        })
+        self.currency_index.contains_key(account)
     }
 
     /// The currency constraint a transaction dated after every `open` of the
     /// account faces: the union over all of them (empty = any currency). See
     /// [`Self::currencies_at`]. `None` when the account was never opened.
     pub fn currencies(&self, account: &str) -> Option<Vec<String>> {
-        let events = self.events.get(account)?;
-        if !events
-            .values()
-            .any(|event| matches!(event, LifecycleEvent::Open { .. }))
-        {
-            return None;
+        let index = self.currency_index.get(account)?;
+        if index.any_from.is_some() {
+            return Some(Vec::new());
         }
-        Some(Self::union_of_open_currencies(events.values()))
+        Some(index.first_listed.keys().cloned().collect())
     }
 
     /// The currency constraint in force on `date` (empty = any currency): the
@@ -381,31 +462,16 @@ impl AccountState {
     ///
     /// `None` when no `open` is in force then — I3 rejects such a transaction
     /// before I9 is ever consulted.
+    ///
+    /// Read off [`CurrencyIndex`] (T97 / M-70): the cost is the account's
+    /// distinct currencies, not its lifecycle history.
     pub fn currencies_at(&self, account: &str, date: NaiveDate) -> Option<Vec<String>> {
-        let bound = LifecycleKey::transaction_bound(date);
         match self.deciding_for_transaction(account, date) {
             Some((_, LifecycleEvent::Open { .. })) => {}
             _ => return None,
         }
-        let events = self.events.get(account)?;
-        Some(Self::union_of_open_currencies(
-            events.range(..bound).map(|(_, event)| event),
-        ))
-    }
-
-    fn union_of_open_currencies<'a>(
-        events: impl Iterator<Item = &'a LifecycleEvent>,
-    ) -> Vec<String> {
-        let mut union: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for event in events {
-            if let LifecycleEvent::Open { currencies } = event {
-                if currencies.is_empty() {
-                    return Vec::new();
-                }
-                union.extend(currencies.iter().cloned());
-            }
-        }
-        union.into_iter().collect()
+        let index = self.currency_index.get(account)?;
+        Some(index.union_below(&LifecycleKey::transaction_bound(date)))
     }
 
     /// The transaction dates an ingested `close` would close (T91 / M-09
@@ -828,5 +894,162 @@ mod tests {
             .close_account("Assets:Cash", date(2024, 12, 31))
             .expect("close");
         assert!(!state.is_open("Assets:Cash"));
+    }
+
+    /// The pre-T97 I9 fold, kept as the oracle for [`CurrencyIndex`]: the
+    /// union of every `open` below the bound, empty once one lists none.
+    fn union_by_fold(state: &AccountState, account: &str, date: NaiveDate) -> Option<Vec<String>> {
+        match state.deciding_for_transaction(account, date) {
+            Some((_, LifecycleEvent::Open { .. })) => {}
+            _ => return None,
+        }
+        let mut union = std::collections::BTreeSet::new();
+        for (_, event) in state
+            .events
+            .get(account)?
+            .range(..LifecycleKey::transaction_bound(date))
+        {
+            if let LifecycleEvent::Open { currencies } = event {
+                if currencies.is_empty() {
+                    return Some(Vec::new());
+                }
+                union.extend(currencies.iter().cloned());
+            }
+        }
+        Some(union.into_iter().collect())
+    }
+
+    fn lifecycle_directive(open: bool, day: u32, lamport: u64, currencies: &[&str]) -> Directive {
+        let on = date(2024, 1, 1) + chrono::Days::new(u64::from(day));
+        match open_directive("Assets:Cash", on, lamport) {
+            Directive::Open(mut directive) if open => {
+                directive.currencies = currencies.iter().map(|c| (*c).to_owned()).collect();
+                Directive::Open(directive)
+            }
+            _ => close_directive("Assets:Cash", on, lamport),
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// T97 / M-70: the index answers exactly what the fold answered — the
+        /// admitting verdict, the union a refusal names, the all-time union and
+        /// `has_open` — for every history, inserted in any order.
+        #[test]
+        fn m70_the_currency_index_answers_what_the_fold_answered(
+            events in proptest::collection::vec(
+                (
+                    proptest::bool::weighted(0.6),
+                    0u32..12,
+                    0u64..4,
+                    proptest::sample::subsequence(vec!["USD", "EUR", "GBP"], 0..=2),
+                ),
+                0..10,
+            ),
+            order_seed in proptest::prelude::any::<u64>(),
+        ) {
+            let directives: Vec<Directive> = events
+                .iter()
+                .map(|(open, day, lamport, currencies)| {
+                    lifecycle_directive(*open, *day, *lamport, currencies)
+                })
+                .collect();
+            let mut shuffled = directives.clone();
+            let mut seed = order_seed;
+            for i in (1..shuffled.len()).rev() {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                shuffled.swap(i, (seed >> 33) as usize % (i + 1));
+            }
+            for ordered in [&directives, &shuffled] {
+                let mut state = AccountState::new();
+                apply(&mut state, ordered);
+                let fold_ever = state.events.get("Assets:Cash").and_then(|events| {
+                    events.values().any(|e| matches!(e, LifecycleEvent::Open { .. })).then(|| {
+                        let last = date(2030, 1, 1);
+                        union_by_fold(&state, "Assets:Cash", last).unwrap_or_else(|| {
+                            // Closed at the end: the all-time union is still
+                            // every open's list.
+                            let mut union = std::collections::BTreeSet::new();
+                            for event in events.values() {
+                                if let LifecycleEvent::Open { currencies } = event {
+                                    if currencies.is_empty() {
+                                        return Vec::new();
+                                    }
+                                    union.extend(currencies.iter().cloned());
+                                }
+                            }
+                            union.into_iter().collect()
+                        })
+                    })
+                });
+                proptest::prop_assert_eq!(state.currencies("Assets:Cash"), fold_ever.clone());
+                proptest::prop_assert_eq!(state.has_open("Assets:Cash"), fold_ever.is_some());
+                for day in 0..14u64 {
+                    let at = date(2024, 1, 1) + chrono::Days::new(day);
+                    let fold = union_by_fold(&state, "Assets:Cash", at);
+                    proptest::prop_assert_eq!(state.currencies_at("Assets:Cash", at), fold.clone());
+                    for currency in ["USD", "EUR", "GBP"] {
+                        let admitted = fold
+                            .as_ref()
+                            .is_none_or(|u| u.is_empty() || u.iter().any(|c| c == currency));
+                        proptest::prop_assert_eq!(
+                            state.check_currency_constraint_at("Assets:Cash", currency, at).is_ok(),
+                            admitted,
+                            "{} on {}", currency, at
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// T97 / M-70, the performance measurement's shape: an account with a long
+    /// run of `close`/`open` pairs — a peer's to publish — and one posting
+    /// checked per pair. Each check used to walk every event before it, so
+    /// this was (pairs²) ≈ 10⁸ event visits; it is now two lookups each.
+    ///
+    /// Bug-catch: validate with the fold again (`union_by_fold`'s body in
+    /// `check_currency_constraint_at`) and this takes tens of seconds.
+    #[test]
+    fn m70_a_long_reopen_history_is_checked_without_walking_it() {
+        let pairs = 10_000u64;
+        let mut state = AccountState::new();
+        let first = date(2000, 1, 1);
+        let mut record = |directive: Directive, id: u64| {
+            state.record_lifecycle(&directive, &format!("{id:064x}"));
+        };
+        let mut open = open_directive("Assets:Cash", first, 0);
+        if let Directive::Open(o) = &mut open {
+            o.currencies = vec!["USD".to_owned()];
+        }
+        record(open, 0);
+        for pair in 0..pairs {
+            let day = first + chrono::Days::new(2 * pair + 1);
+            record(close_directive("Assets:Cash", day, 0), 2 * pair + 1);
+            let mut open = open_directive("Assets:Cash", day + chrono::Days::new(1), 0);
+            if let Directive::Open(o) = &mut open {
+                o.currencies = vec!["EUR".to_owned()];
+            }
+            record(open, 2 * pair + 2);
+        }
+        let last = first + chrono::Days::new(2 * pairs + 1);
+        let started = std::time::Instant::now();
+        for _ in 0..pairs {
+            state
+                .check_currency_constraint_at("Assets:Cash", "USD", last)
+                .expect("the first open's currency stays admitted");
+        }
+        assert!(
+            state
+                .check_currency_constraint_at("Assets:Cash", "GBP", last)
+                .is_err(),
+            "a currency no open lists is refused"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "{pairs} checks over {pairs} reopens took {elapsed:?}"
+        );
     }
 }
