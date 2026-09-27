@@ -1286,13 +1286,25 @@ async fn run_head_exchange(
     // descendants of a directive this peer served and this node refused for
     // good. Their missing parent is retried, never refused, so without this
     // the whole subtree was re-sent, re-parsed and re-verified every round.
-    let doomed = handler.orphan_buffer.read().await.retain_not_doomed(
-        &remote.to_string(),
-        &mut want,
-        std::time::Instant::now(),
-    );
+    // T95 / M-66, M-67, L-133: judged only on this peer's own copies, in one
+    // linear pass, and never on a parent the ledger now holds. The ledger's
+    // read lock is taken before the buffer's, the order phase 2 takes them in.
+    let (doomed, already_buffered) = {
+        let svc = handler.ledger.read().await;
+        let buffer = handler.orphan_buffer.read().await;
+        let peer = remote.to_string();
+        let doomed = buffer.retain_not_doomed(&peer, &mut want, std::time::Instant::now(), |id| {
+            svc.contains_directive(id)
+        });
+        // T95 / L-130: nor what this peer already served and this node holds
+        // buffered — asking again re-verified the same copy every round.
+        (doomed, buffer.retain_not_buffered_from(&peer, &mut want))
+    };
     if doomed > 0 {
         debug!(peer = %remote, doomed, "not re-wanting directives that can only wait on one this peer served and was refused for good");
+    }
+    if already_buffered > 0 {
+        debug!(peer = %remote, already_buffered, "not re-wanting directives this peer already served that are buffered on a missing parent");
     }
     // T72 / L-69: likewise for ids the adoption ratchet refused, while the
     // clock read above has not reached the point where that verdict can

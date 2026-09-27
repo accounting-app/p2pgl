@@ -3029,10 +3029,47 @@ fn h19_the_gap_warning_on_a_node_without_the_jump_names_the_removed_author() {
     );
 }
 
+/// A process-wide default subscriber that records nothing but is interested in
+/// every callsite (T96 / L-135). Tracing caches each callsite's interest; a
+/// callsite first hit by a test with no subscriber of its own was cached as
+/// "never", and a concurrent capture's rebuild could miss a registration still
+/// in flight — the capturing test then lost that one line (the log checks that
+/// failed in two gates, and `m51_…` beside the T85 tests, deterministically).
+/// With this installed, no callsite is ever "never"; each thread's scoped
+/// subscriber decides.
+fn ensure_every_callsite_is_interesting() {
+    struct Interested;
+    impl tracing::Subscriber for Interested {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(Interested);
+        tracing::callsite::rebuild_interest_cache();
+    });
+}
+
 /// Every WARN (and ERROR) `body` logs on this thread, one line per event
 /// with its fields (T89; the boot fuzzer's minimal subscriber, so the test
 /// needs nothing beyond `tracing`).
 fn capture_warnings<T>(body: impl FnOnce() -> T) -> (T, String) {
+    ensure_every_callsite_is_interesting();
     use std::fmt::Write as _;
     use std::sync::{Arc, Mutex};
 
@@ -3109,6 +3146,35 @@ fn edited_own_record_scenario(
     assert!(
         quarantined >= 1,
         "the edited record is quarantined (H-20): {report:?}"
+    );
+    // T96 / L-135, decision (52): and nothing else. Every held id is the
+    // edited copy (the only one B cannot hold) or r2 / a record descending
+    // from it in B's DAG — the edited record's original and what names it.
+    let mut descendants: BTreeSet<String> = BTreeSet::from([r2.clone()]);
+    let mut frontier = vec![r2.clone()];
+    while let Some(id) = frontier.pop() {
+        for child in mesh.replicas[b]
+            .svc
+            .dag()
+            .children_of(&id)
+            .unwrap_or_default()
+        {
+            if descendants.insert(child.clone()) {
+                frontier.push(child.clone());
+            }
+        }
+    }
+    let held = mesh.replicas[a].svc.quarantined_ids();
+    let unknown_to_b = held
+        .iter()
+        .filter(|id| !mesh.replicas[b].svc.contains_directive(id))
+        .count();
+    assert!(
+        unknown_to_b <= 1
+            && held.iter().all(|id| {
+                !mesh.replicas[b].svc.contains_directive(id) || descendants.contains(*id)
+            }),
+        "held beyond the edited record and what descends from it: {held:?}"
     );
     let clock = mesh.replicas[a].svc.lamport_clock();
     let r4 = mesh.append(a, "r4", 4, "Assets:Cash");
@@ -3566,7 +3632,6 @@ fn l113_a_single_sub_2_32_jump_is_called_crossable_and_a_fresh_node_crosses_it()
 /// right here. (Steps under 2^28 each, 17 or more of them, are the same
 /// shape with no WARN at all — the metric's blind spot since T83.)
 #[test]
-#[ignore = "A6-1: the gap verdict calls a removed author's two sub-2^32 steps crossable, but a fresh node cannot cross them by anti-entropy"]
 fn a6_1_a_removed_authors_two_sub_2_32_steps_are_called_crossable_yet_block_a_join() {
     let (mut mesh, jumps) = two_step_jump_mesh(9265);
     let (a, b) = (0, 1);
@@ -3816,7 +3881,6 @@ fn l109_stray_keyed_records_are_stripped_on_both_paths_and_cross_the_wire_intact
 /// the gap F just crossed "uncrossable by anti-entropy" and prescribes the
 /// bootstrap join.
 #[test]
-#[ignore = "A6-4: lamport_gap_verdict calls a gap of exactly 2^32 uncrossable, but a joiner at max + 1 crosses it"]
 fn a6_4_a_gap_of_exactly_2_32_is_called_uncrossable_by_a_node_that_just_crossed_it() {
     let mut mesh = seeded_mesh(9269, 2);
     let (a, b) = (0, 1);

@@ -185,77 +185,19 @@ pub fn resolve_ledger_path(configured: &Path) -> std::io::Result<PathBuf> {
     if !metadata.file_type().is_symlink() {
         return Ok(configured.to_path_buf());
     }
-    let refuse =
-        |message: String| std::io::Error::new(std::io::ErrorKind::PermissionDenied, message);
     let link_directory = match configured.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
     };
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let owner = metadata.uid();
-        let this_uid = effective_uid();
-        if owner != this_uid {
-            return Err(refuse(format!(
-                "ledger path {} is a symbolic link owned by uid {owner}, not by this \
-                 node's uid {this_uid}; a ledger link is followed only when this node's own \
-                 user created it — point ledgerPath at the real file, or recreate the link \
-                 as this user (L-84)",
-                configured.display()
-            )));
-        }
-        let directory = std::fs::metadata(&link_directory)?;
-        let mode = directory.mode() & 0o7777;
-        if directory.uid() != this_uid || mode & 0o022 != 0 {
-            return Err(refuse(format!(
-                "ledger path {} is a symbolic link in {}, a directory {}; another account \
-                 could replace the link between this node's check and its use, so it is not \
-                 followed — keep the link in a directory only this node's user (uid {this_uid}) \
-                 can write, or point ledgerPath at the real file (M-60)",
-                configured.display(),
-                link_directory.display(),
-                if directory.uid() != this_uid {
-                    format!("owned by uid {}", directory.uid())
-                } else {
-                    format!("with mode {mode:o}, writable by group or others")
-                }
-            )));
-        }
-    }
+    let resolved = match resolve_link_in_its_directory(configured, &link_directory)? {
+        Some(resolved) => resolved,
+        None => return Ok(configured.to_path_buf()),
+    };
+    #[cfg(not(unix))]
     let Ok(resolved) = std::fs::canonicalize(configured) else {
         return Ok(configured.to_path_buf());
     };
-    // One hop: the link's own target, with only its directory resolved, must
-    // be where the whole chain ends.
-    let target = std::fs::read_link(configured)?;
-    let target = if target.is_absolute() {
-        target
-    } else {
-        link_directory.join(target)
-    };
-    let one_hop = match (target.parent(), target.file_name()) {
-        (Some(directory), Some(name)) => {
-            let directory = if directory.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                directory
-            };
-            std::fs::canonicalize(directory)
-                .ok()
-                .map(|directory| directory.join(name))
-        }
-        _ => None,
-    };
-    if one_hop.as_deref() != Some(resolved.as_path()) {
-        return Err(refuse(format!(
-            "ledger path {} is a symbolic link to {}, which is itself a symbolic link; only \
-             one link is followed, since the second one's owner was never checked — point \
-             the link (or ledgerPath) at the real file (M-60)",
-            configured.display(),
-            target.display()
-        )));
-    }
     let stray_journal = journal_path_for(configured);
     if resolved != configured && std::fs::symlink_metadata(&stray_journal).is_ok() {
         return Err(std::io::Error::new(
@@ -276,6 +218,233 @@ pub fn resolve_ledger_path(configured: &Path) -> std::io::Result<PathBuf> {
         ));
     }
     Ok(resolved)
+}
+
+/// The checks of [`resolve_ledger_path`] on a link, every one of them bound to
+/// ONE open handle on the link's directory (T94 / M-68, decision (46)).
+///
+/// T87 read the directory's owner and mode by path, then followed the link by
+/// path again: an account able to write any ANCESTOR of that directory could
+/// swap the whole directory — `renameat2(RENAME_EXCHANGE)` / `renamex_np(
+/// RENAME_SWAP)` — between the two, so the rule approved the operator's
+/// directory and the follow used the attacker's link (A4: ~250 hits in 5 s;
+/// the next compaction then rewrote any file the node's uid owns). Here the
+/// directory is opened once and the link's owner (`fstatat`, not following),
+/// its target (`readlinkat`) and the target itself (`openat` with
+/// `O_NOFOLLOW`, which also enforces the one hop: a target that is itself a
+/// link fails with `ELOOP`) are all read relative to that handle, whatever
+/// the path names by then. The path the node will use is `canonicalize` of
+/// the configured one, accepted only when it is the SAME file — `(dev, ino)`
+/// — as the one opened through the handle: a swap in between makes them
+/// differ and refuses, and a target whose spelling differs from its on-disk
+/// name only in case or Unicode normalisation (T87's string compare refused
+/// it, L-119) is the same file and resolves.
+///
+/// `Ok(None)`: the link cannot be followed to anything (dangling, or its
+/// target cannot be opened) — the caller returns the configured path and the
+/// ledger's checked open refuses it (T67).
+#[cfg(unix)]
+fn resolve_link_in_its_directory(
+    configured: &Path,
+    link_directory: &Path,
+) -> std::io::Result<Option<PathBuf>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let refuse =
+        |message: String| std::io::Error::new(std::io::ErrorKind::PermissionDenied, message);
+    let Some(name) = configured.file_name() else {
+        return Ok(None);
+    };
+    let name = CString::new(name.as_bytes())?;
+    let this_uid = effective_uid();
+
+    let directory = std::fs::File::open(link_directory)?;
+    let directory_metadata = directory.metadata()?;
+    let mode = directory_metadata.mode() & 0o7777;
+    if directory_metadata.uid() != this_uid || mode & 0o022 != 0 {
+        return Err(refuse(format!(
+            "ledger path {} is a symbolic link in {}, a directory {}; another account \
+             could replace the link between this node's check and its use, so it is not \
+             followed — keep the link in a directory only this node's user (uid {this_uid}) \
+             can write, or point ledgerPath at the real file (M-60)",
+            configured.display(),
+            link_directory.display(),
+            if directory_metadata.uid() != this_uid {
+                format!("owned by uid {}", directory_metadata.uid())
+            } else {
+                format!("with mode {mode:o}, writable by group or others")
+            }
+        )));
+    }
+    // T94 / L-120, decision (47): on macOS an ACL can let other accounts add
+    // and remove entries in a directory whose mode bits say they cannot (on
+    // Linux a POSIX ACL shows in the group bits the check above reads).
+    #[cfg(target_os = "macos")]
+    if directory_has_extended_acl(&directory) {
+        return Err(refuse(format!(
+            "ledger path {} is a symbolic link in {}, a directory carrying an access control \
+             list (ls -le shows it); an ACL can let other accounts replace the link, so it is \
+             not followed — remove the ACL (chmod -N), keep the link in a directory only this \
+             node's user can write, or point ledgerPath at the real file (M-60, L-120)",
+            configured.display(),
+            link_directory.display()
+        )));
+    }
+
+    let link = stat_at(&directory, &name, libc::AT_SYMLINK_NOFOLLOW)?;
+    if link.st_mode & libc::S_IFMT != libc::S_IFLNK {
+        return Err(refuse(format!(
+            "ledger path {} changed while it was being checked (it is no longer the link that \
+             was resolved); refusing to follow it (M-68)",
+            configured.display()
+        )));
+    }
+    if link.st_uid != this_uid {
+        return Err(refuse(format!(
+            "ledger path {} is a symbolic link owned by uid {}, not by this node's uid \
+             {this_uid}; a ledger link is followed only when this node's own user created it — \
+             point ledgerPath at the real file, or recreate the link as this user (L-84)",
+            configured.display(),
+            link.st_uid
+        )));
+    }
+    let target = read_link_at(&directory, &name)?;
+    let target_file = match open_at_no_follow(&directory, &target) {
+        Ok(file) => file,
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(refuse(format!(
+                "ledger path {} is a symbolic link to {}, which is itself a symbolic link; only \
+                 one link is followed, since the second one's owner was never checked — point \
+                 the link (or ledgerPath) at the real file (M-60)",
+                configured.display(),
+                String::from_utf8_lossy(target.as_bytes())
+            )));
+        }
+        Err(_) => return Ok(None),
+    };
+    let opened = target_file.metadata()?;
+    let Ok(resolved) = std::fs::canonicalize(configured) else {
+        return Ok(None);
+    };
+    let at_path = std::fs::metadata(&resolved)?;
+    if (at_path.dev(), at_path.ino()) != (opened.dev(), opened.ino()) {
+        return Err(refuse(format!(
+            "ledger path {} does not lead to the file its link names when followed through the \
+             link's own directory (it resolves to {}): the link or a directory above it changed \
+             while it was being checked; refusing to follow it (M-68)",
+            configured.display(),
+            resolved.display()
+        )));
+    }
+    Ok(Some(resolved))
+}
+
+/// `fstatat(directory, name, flags)` (T94 / M-68).
+#[cfg(unix)]
+fn stat_at(
+    directory: &std::fs::File,
+    name: &std::ffi::CStr,
+    flags: libc::c_int,
+) -> std::io::Result<libc::stat> {
+    use std::os::unix::io::AsRawFd;
+    let mut buffer = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `directory` is an open descriptor for the duration of the call,
+    // `name` is a NUL-terminated string, and `buffer` is a properly aligned
+    // `stat` the kernel fills in full on success; it is read only then.
+    unsafe {
+        if libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            buffer.as_mut_ptr(),
+            flags,
+        ) != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(buffer.assume_init())
+    }
+}
+
+/// `readlinkat(directory, name)` (T94 / M-68).
+#[cfg(unix)]
+fn read_link_at(
+    directory: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::io::AsRawFd;
+    let mut buffer = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: `directory` is open, `name` is NUL-terminated, and the kernel
+    // writes at most `buffer.len()` bytes into `buffer`, returning how many.
+    let length = unsafe {
+        libc::readlinkat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            buffer.as_mut_ptr().cast::<libc::c_char>(),
+            buffer.len(),
+        )
+    };
+    if length < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    buffer.truncate(length as usize);
+    Ok(std::ffi::CString::new(buffer)?)
+}
+
+/// `openat(directory, path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)`,
+/// as an owned file (T94 / M-68). Relative paths resolve from `directory`;
+/// a final component that is a symbolic link fails with `ELOOP`.
+#[cfg(unix)]
+fn open_at_no_follow(
+    directory: &std::fs::File,
+    path: &std::ffi::CStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    // SAFETY: `directory` is open and `path` is NUL-terminated; on success the
+    // returned descriptor is new and owned by nobody else, so the `File` takes
+    // sole ownership of it and closes it on drop.
+    unsafe {
+        let descriptor = libc::openat(
+            directory.as_raw_fd(),
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        );
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(std::fs::File::from_raw_fd(descriptor))
+    }
+}
+
+/// Whether the directory carries an extended (NFSv4-style) ACL with at least
+/// one entry (T94 / L-120; macOS only — see [`resolve_link_in_its_directory`]).
+#[cfg(target_os = "macos")]
+fn directory_has_extended_acl(directory: &std::fs::File) -> bool {
+    use std::os::unix::io::AsRawFd;
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+    extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> *mut libc::c_void;
+        fn acl_get_entry(
+            acl: *mut libc::c_void,
+            entry_id: libc::c_int,
+            entry: *mut *mut libc::c_void,
+        ) -> libc::c_int;
+        fn acl_free(object: *mut libc::c_void) -> libc::c_int;
+    }
+    // SAFETY: libSystem's documented ACL calls on an open descriptor; the ACL
+    // returned (non-null) is owned here, only read, and freed exactly once.
+    unsafe {
+        let acl = acl_get_fd_np(directory.as_raw_fd(), ACL_TYPE_EXTENDED);
+        if acl.is_null() {
+            return false;
+        }
+        let mut entry: *mut libc::c_void = std::ptr::null_mut();
+        let has_entry = acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) == 0;
+        acl_free(acl);
+        has_entry
+    }
 }
 
 /// The journal path for a ledger file.
@@ -1757,6 +1926,172 @@ mod tests {
         assert_eq!(
             resolve_ledger_path(&link).unwrap(),
             std::fs::canonicalize(&target).unwrap()
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// Swap two directories atomically (the attacker's move in M-68).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn swap_directories(a: &std::ffi::CStr, b: &std::ffi::CStr) {
+        // SAFETY: two NUL-terminated paths; the call only renames.
+        #[cfg(target_os = "macos")]
+        unsafe {
+            libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP);
+        }
+        // SAFETY: as above, through the raw syscall (glibc may lack the wrapper).
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                a.as_ptr(),
+                libc::AT_FDCWD,
+                b.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            );
+        }
+    }
+
+    /// M-68 (T94, decision (46)), the audit's A4 `raceswap`: an account able to
+    /// write the directory ABOVE the link's directory keeps swapping, with an
+    /// atomic exchange, the operator's link directory (`node/`, 0755, holding
+    /// `ledger.bean -> ../store/real.bean`) and its own (`evil/`, 0777 — the
+    /// rule refuses it whenever it is inspected — holding `ledger.bean ->
+    /// ../victim/secret.bean`). T87 checked the directory by path and followed
+    /// the link by path again, so the rule approved `node/` and the follow used
+    /// `evil/`'s link: the victim file came back ~50 times a second. Bound to
+    /// one directory handle, every check and the follow see the same directory,
+    /// and a path that no longer leads to the file opened through it is
+    /// refused: the victim never comes back.
+    ///
+    /// Bug-catch: check the directory by path again (`std::fs::metadata` of the
+    /// link's directory, then `canonicalize`) and the victim is returned.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn m68_a_directory_swapped_under_the_link_is_never_followed() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        let root = t87_directory("m68-race");
+        let shared = root.join("shared");
+        let store = root.join("store");
+        let victim = root.join("victim");
+        for directory in [&shared, &store, &victim] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        std::fs::write(store.join("real.bean"), "").unwrap();
+        std::fs::write(victim.join("secret.bean"), "").unwrap();
+        let node = shared.join("node");
+        let evil = shared.join("evil");
+        std::fs::create_dir(&node).unwrap();
+        std::fs::create_dir(&evil).unwrap();
+        std::os::unix::fs::symlink("../../store/real.bean", node.join("ledger.bean")).unwrap();
+        std::os::unix::fs::symlink("../../victim/secret.bean", evil.join("ledger.bean")).unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let configured = node.join("ledger.bean");
+        let real = std::fs::canonicalize(store.join("real.bean")).unwrap();
+        let secret = std::fs::canonicalize(victim.join("secret.bean")).unwrap();
+        assert_eq!(resolve_ledger_path(&configured).unwrap(), real, "premise");
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swapper = {
+            let stop = std::sync::Arc::clone(&stop);
+            let a = std::ffi::CString::new(node.as_os_str().as_bytes()).unwrap();
+            let b = std::ffi::CString::new(evil.as_os_str().as_bytes()).unwrap();
+            std::thread::spawn(move || {
+                let mut swaps = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    swap_directories(&a, &b);
+                    swaps += 1;
+                }
+                // Leave the operator's directory where it started.
+                if swaps % 2 == 1 {
+                    swap_directories(&a, &b);
+                }
+                swaps
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let (mut calls, mut victim_hits) = (0u64, 0u64);
+        while std::time::Instant::now() < deadline {
+            calls += 1;
+            if resolve_ledger_path(&configured).ok().as_deref() == Some(secret.as_path()) {
+                victim_hits += 1;
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let swaps = swapper.join().unwrap();
+        std::fs::remove_dir_all(&root).ok();
+        assert!(swaps > 0 && calls > 0, "premise: the race ran");
+        assert_eq!(
+            victim_hits, 0,
+            "{victim_hits} of {calls} resolutions returned the victim file ({swaps} swaps)"
+        );
+    }
+
+    /// L-119 (T94): a link whose target is spelled differently from the file's
+    /// on-disk name only in letter case — the same file on a case-insensitive
+    /// file system (macOS's default) — resolves. T87 compared the link's
+    /// spelling with `canonicalize`'s as strings and refused it as "itself a
+    /// symbolic link", which it is not; the file identity is what is compared
+    /// now. Skipped where the file system is case-sensitive.
+    ///
+    /// Bug-catch: compare the path strings again and it is refused.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn l119_a_link_spelling_its_target_in_another_case_resolves() {
+        let directory = t87_directory("l119-case");
+        let store = directory.join("store");
+        std::fs::create_dir(&store).unwrap();
+        std::fs::write(store.join("mixed.bean"), "").unwrap();
+        let link = directory.join("ledger.bean");
+        std::os::unix::fs::symlink("store/MIXED.bean", &link).unwrap();
+        if std::fs::metadata(&link).is_err() {
+            std::fs::remove_dir_all(&directory).ok();
+            return; // case-sensitive: the link is dangling here
+        }
+        let resolved = resolve_ledger_path(&link).expect("the same file resolves");
+        assert_eq!(
+            std::fs::metadata(&resolved).unwrap().len(),
+            0,
+            "resolved to the target"
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// L-120 (T94, decision (47)): on macOS an access control list can let
+    /// every account add and remove entries in a directory whose mode is 0700;
+    /// T87 read the mode bits only, so a link there was followed. A directory
+    /// carrying an ACL entry is refused; with the ACL removed it resolves.
+    ///
+    /// Bug-catch: drop the ACL check and the link is followed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn l120_a_link_in_a_directory_with_an_acl_is_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = t87_directory("l120-acl");
+        std::fs::write(directory.join("real.bean"), "").unwrap();
+        let link = directory.join("ledger.bean");
+        std::os::unix::fs::symlink("real.bean", &link).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let chmod = |arguments: &[&str]| {
+            let status = std::process::Command::new("chmod")
+                .args(arguments)
+                .arg(&directory)
+                .status()
+                .unwrap();
+            assert!(status.success(), "chmod {arguments:?}");
+        };
+        chmod(&[
+            "+a",
+            "everyone allow add_file,add_subdirectory,delete_child",
+        ]);
+        let error = resolve_ledger_path(&link).expect_err("refused");
+        assert!(error.to_string().contains("L-120"), "{error}");
+        chmod(&["-N"]);
+        assert!(
+            resolve_ledger_path(&link).is_ok(),
+            "resolves once the ACL is gone"
         );
         std::fs::remove_dir_all(&directory).ok();
     }

@@ -831,6 +831,9 @@ fn parsed_flood_bodies_are_refused_within_the_entry_budget() {
 /// ceiling) — parses at 14.4× (0925 A3, release) and is now the second control
 /// below; 16× is that measurement plus the same headroom for allocator-growth
 /// jitter. Decision (29) keeps the 4,096 ceiling and states the multiple.
+/// (T95 / L-132: "densest" held for that shape only — other admitted shapes
+/// reach 28×; what bounds every one is the absolute
+/// [`ADMITTED_FRAME_PEAK_BYTES`].)
 const HONEST_FRAME_PEAK_MULTIPLE: usize = 16;
 
 /// The densest transaction the wire admits (T88 / L-102): `postings`
@@ -991,4 +994,91 @@ fn a_frame_of_flood_bodies_is_refused_within_the_frame_budget() {
          {HONEST_FRAME_PEAK_MULTIPLE}× budget of {densest_budget}",
         densest_frame.len(),
     );
+}
+
+/// Every admitted frame shape's phase-1 peak, as an absolute figure (T95 /
+/// L-132, decision (49)): 224 MiB.
+///
+/// The ratio above holds for the shapes it measures, not for every frame the
+/// caps admit: 0926 A5 found 1,000 postings with ONE metadata key each parsing
+/// at 28.25× a 6.9 MB frame, and the 4,096-key shape with one-byte values at
+/// 211 MB (13.95× of 15.2 MB) — the largest absolute peak. A host is sized
+/// against what one frame in flight can hold, so that is what is pinned: the
+/// worst ratio and the worst absolute shape, each under this bound.
+const ADMITTED_FRAME_PEAK_BYTES: usize = 224 << 20;
+
+/// A transaction of `postings` shortest-line postings carrying `keys[i]`
+/// posting metadata keys each, valued `value`, plus `dir_meta` directive keys
+/// (0926 A5's generator).
+fn admitted_variant(
+    postings: usize,
+    keys: &[usize],
+    value: &str,
+    dir_meta: usize,
+    tag: usize,
+) -> String {
+    let mut body = format!("2024-01-01 * \"{tag}\"\n");
+    for key in 0..dir_meta {
+        body.push_str(&format!("  m{key}: \"{value}\"\n"));
+    }
+    for (index, count) in keys.iter().enumerate().take(postings) {
+        let number = if index == 0 {
+            (postings as i64 - 1).to_string()
+        } else {
+            "-1".to_owned()
+        };
+        body.push_str(&format!("  Assets:A {number} US\n"));
+        for key in 0..*count {
+            body.push_str(&format!("  p{key}: \"{value}\"\n"));
+        }
+    }
+    body
+}
+
+/// L-132 (T95, decision (49)): the two shapes A5 measured past the ratio
+/// control — the worst ratio (one posting key each) and the worst absolute
+/// peak (4,096 one-byte-valued keys) — each fits a frame, stages whole, and
+/// peaks under [`ADMITTED_FRAME_PEAK_BYTES`].
+///
+/// A pin on a measured bound rather than on one mechanism, so it has no
+/// single revert: a change that makes an admitted frame parse heavier — a
+/// higher posting-metadata ceiling, a second copy of each key in the parser —
+/// fails it.
+#[test]
+fn every_admitted_frame_shape_peaks_under_an_absolute_bound() {
+    let _measuring = measurement_lock();
+    let postings = ledger::service::MAX_POSTINGS_PER_TRANSACTION;
+    let spread = |total: usize| -> Vec<usize> {
+        (0..postings)
+            .map(|index| total / postings + usize::from(index < total % postings))
+            .collect()
+    };
+    let legacy = ledger::limits::MAX_POSTING_METADATA_KEYS_PER_TRANSACTION_LEGACY;
+    for (name, keys, value) in [
+        ("one key per posting", spread(postings), ""),
+        ("4,096 keys, one-byte values", spread(legacy), "x"),
+    ] {
+        let entries: Vec<SupplyEntry> = (0..MAX_SUPPLY_ENTRIES)
+            .map(|index| entry_with_true_id(admitted_variant(postings, &keys, value, 96, index)))
+            .collect();
+        let frame = WireMessage::supply(entries.clone()).to_cbor().unwrap();
+        assert!(
+            frame.len() <= MAX_MESSAGE_SIZE as usize,
+            "{name}: fits a frame"
+        );
+        let (staged, peak) = phase_one(&entries);
+        println!(
+            "{name}: {} bytes, phase-1 peak {peak} bytes ({:.2}× frame), staged {staged}",
+            frame.len(),
+            peak as f64 / frame.len() as f64,
+        );
+        assert_eq!(
+            staged, MAX_SUPPLY_ENTRIES,
+            "{name}: every admitted entry is staged"
+        );
+        assert!(
+            peak <= ADMITTED_FRAME_PEAK_BYTES,
+            "{name}: peaked at {peak} bytes, over the {ADMITTED_FRAME_PEAK_BYTES}-byte bound"
+        );
+    }
 }

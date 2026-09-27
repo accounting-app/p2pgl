@@ -268,10 +268,11 @@ pub struct OrphanBuffer {
     parent_hints: HashMap<String, (Vec<String>, Instant, Option<String>)>,
     /// Ids held in `parent_hints` per delivering peer (T88).
     parent_hint_ids_per_peer: HashMap<String, usize>,
-    /// A lower bound on every hint's time, so `evict_expired` sweeps the
-    /// hints only when one may have aged out (T88: before, only a full table
-    /// ever dropped an expired hint). `None` when there are none.
-    oldest_hint_at: Option<Instant>,
+    /// Every hint recorded, oldest first, with its time (T95 / L-134). Expiry
+    /// pops the aged front only — T88 kept a lower bound and swept the whole
+    /// table each time it moved, one full pass per distinct expiring time. An
+    /// entry whose hint has since been forgotten or replaced is skipped.
+    hint_order: std::collections::VecDeque<(Instant, String)>,
     /// Ids held in `parent_hints`, keys and parents together.
     parent_hint_ids: usize,
 }
@@ -305,7 +306,7 @@ impl OrphanBuffer {
             refusals: RefusalCache::new(),
             parent_hints: HashMap::new(),
             parent_hint_ids_per_peer: HashMap::new(),
-            oldest_hint_at: None,
+            hint_order: std::collections::VecDeque::new(),
             parent_hint_ids: 0,
         }
     }
@@ -337,42 +338,191 @@ impl OrphanBuffer {
     /// TTL, like the parent: a copy from another peer, or after the TTL, is
     /// asked for as before. An orphan also waiting on an account is kept (an
     /// `open` can still arrive).
-    pub fn retain_not_doomed(&self, peer: &str, want: &mut Vec<String>, now: Instant) -> usize {
-        let mut doomed: HashSet<String> = HashSet::new();
-        loop {
-            let before = doomed.len();
-            for id in want.iter() {
-                if doomed.contains(id) {
-                    continue;
+    ///
+    /// T95 / M-66, decision (48): an id is judged only by a copy (or hint)
+    /// that `peer` itself delivered. A content id covers the body alone, and
+    /// the signature covers the parents, so an author can sign a second
+    /// envelope of its own record naming a parent this node refused from
+    /// another peer; judged by whichever copy was buffered, that kept the
+    /// honest peer's copy — and everything written on top of it — out of the
+    /// Want. And a parent `holds` says this node already has never makes an
+    /// id doomed (L-133: a hint outlives its parent's arrival). M-67: one
+    /// memoised pass over the Want, linear in it and its parent links — T88's
+    /// fixpoint re-walked the whole Want per newly doomed id (9,192 ids
+    /// advertised child-first cost ~10–15 s, under this buffer's lock).
+    pub fn retain_not_doomed(
+        &self,
+        peer: &str,
+        want: &mut Vec<String>,
+        now: Instant,
+        holds: impl Fn(&str) -> bool,
+    ) -> usize {
+        // What `peer`'s own copy of `id` says it waits on — `None` when the
+        // copy this node knows is not `peer`'s, or also waits on an account.
+        let judged = |id: &str| -> Option<&[String]> {
+            if let Some(entry) = self.entries.get(id) {
+                let own = entry.from_peer.as_deref() == Some(peer);
+                return (own && entry.missing_accounts.is_empty())
+                    .then_some(entry.missing_parents.as_slice());
+            }
+            self.parent_hints
+                .get(id)
+                .filter(|(_, _, from)| from.as_deref() == Some(peer))
+                .map(|(parents, _, _)| parents.as_slice())
+        };
+        let wanted: HashSet<&str> = want.iter().map(String::as_str).collect();
+        // `Some(true)` doomed, `Some(false)` not, absent while on the stack.
+        let mut verdict: HashMap<&str, bool> = HashMap::new();
+        let mut on_stack: HashSet<&str> = HashSet::new();
+        for root in want.iter().map(String::as_str) {
+            if verdict.contains_key(root) {
+                continue;
+            }
+            // (id, its parents, next parent to look at, doomed so far)
+            let mut stack: Vec<(&str, &[String], usize, bool)> = Vec::new();
+            match judged(root) {
+                Some(parents) if !parents.is_empty() => {
+                    on_stack.insert(root);
+                    stack.push((root, parents, 0, true));
                 }
-                let (parents, accounts_pending) = match self.entries.get(id) {
-                    Some(entry) => (
-                        entry.missing_parents.as_slice(),
-                        !entry.missing_accounts.is_empty(),
-                    ),
-                    None => match self.parent_hints.get(id) {
-                        Some((parents, _, _)) => (parents.as_slice(), false),
-                        None => continue,
-                    },
-                };
-                if accounts_pending || parents.is_empty() {
+                _ => {
+                    verdict.insert(root, false);
                     continue;
-                }
-                if parents.iter().all(|parent| {
-                    doomed.contains(parent) || self.refusals.is_refused(peer, parent, now)
-                }) {
-                    doomed.insert(id.clone());
                 }
             }
-            if doomed.len() == before {
-                break;
+            while let Some(frame) = stack.last_mut() {
+                let (id, parents, next, doomed) = *frame;
+                if !doomed || next == parents.len() {
+                    stack.pop();
+                    on_stack.remove(id);
+                    verdict.insert(id, doomed);
+                    if let Some(caller) = stack.last_mut() {
+                        caller.3 &= doomed;
+                    }
+                    continue;
+                }
+                frame.2 += 1;
+                let parent = parents[next].as_str();
+                if holds(parent) {
+                    frame.3 = false;
+                    continue;
+                }
+                if self.refusals.is_refused(peer, parent, now) {
+                    continue;
+                }
+                if !wanted.contains(parent) || on_stack.contains(parent) {
+                    frame.3 = false;
+                    continue;
+                }
+                match verdict.get(parent) {
+                    Some(&parent_doomed) => frame.3 &= parent_doomed,
+                    None => match judged(parent) {
+                        Some(grandparents) if !grandparents.is_empty() => {
+                            on_stack.insert(parent);
+                            stack.push((parent, grandparents, 0, true));
+                        }
+                        _ => {
+                            verdict.insert(parent, false);
+                            frame.3 = false;
+                        }
+                    },
+                }
             }
         }
+        let doomed: HashSet<String> = verdict
+            .into_iter()
+            .filter(|(_, doomed)| *doomed)
+            .map(|(id, _)| id.to_owned())
+            .collect();
         if doomed.is_empty() {
             return 0;
         }
         let before = want.len();
         want.retain(|id| !doomed.contains(id));
+        before - want.len()
+    }
+
+    /// Drop from `want` every id already buffered from `peer` itself that
+    /// nothing in this Want can release, and return how many (T95 / L-130).
+    ///
+    /// Such an id's fate turns on its missing parents, and `peer` just served
+    /// this very copy: asking again re-fetched, re-parsed and re-verified it
+    /// every round — the per-tick cost L-106's filter misses when the refused
+    /// root was never served (the peer does not advertise it). It stays in the
+    /// Want when a missing parent is in it (and not itself dropped here): then
+    /// the parent arrives in the same exchange, and asking for the child again
+    /// is what lets a chain longer than the orphan budget stage in order as it
+    /// lands (L-95 — without it, one gap of the chain closed per round). A copy
+    /// buffered from ANOTHER peer is always asked for (M-66: `peer`'s own copy
+    /// may name other parents). One memoised pass, like `retain_not_doomed`.
+    pub fn retain_not_buffered_from(&self, peer: &str, want: &mut Vec<String>) -> usize {
+        // `peer`'s own buffered copy, waiting on parents only — one also
+        // waiting on an account is kept, as in `retain_not_doomed` (the `open`
+        // may be in this Want).
+        let own = |id: &str| -> Option<&[String]> {
+            self.entries
+                .get(id)
+                .filter(|entry| {
+                    entry.from_peer.as_deref() == Some(peer) && entry.missing_accounts.is_empty()
+                })
+                .map(|entry| entry.missing_parents.as_slice())
+        };
+        let wanted: HashSet<&str> = want.iter().map(String::as_str).collect();
+        // `true`: keep in the Want (not buffered from `peer`, or releasable).
+        let mut keep: HashMap<&str, bool> = HashMap::new();
+        let mut on_stack: HashSet<&str> = HashSet::new();
+        for root in want.iter().map(String::as_str) {
+            if keep.contains_key(root) {
+                continue;
+            }
+            let Some(parents) = own(root) else {
+                keep.insert(root, true);
+                continue;
+            };
+            // (id, its parents, next parent to look at, releasable so far)
+            let mut stack: Vec<(&str, &[String], usize, bool)> = vec![(root, parents, 0, false)];
+            on_stack.insert(root);
+            while let Some(frame) = stack.last_mut() {
+                let (id, parents, next, releasable) = *frame;
+                if releasable || next == parents.len() {
+                    stack.pop();
+                    on_stack.remove(id);
+                    keep.insert(id, releasable);
+                    if let Some(caller) = stack.last_mut() {
+                        caller.3 |= releasable;
+                    }
+                    continue;
+                }
+                frame.2 += 1;
+                let parent = parents[next].as_str();
+                if !wanted.contains(parent) || on_stack.contains(parent) {
+                    continue;
+                }
+                match keep.get(parent) {
+                    Some(&kept) => frame.3 |= kept,
+                    None => match own(parent) {
+                        None => {
+                            keep.insert(parent, true);
+                            frame.3 = true;
+                        }
+                        Some(grandparents) => {
+                            on_stack.insert(parent);
+                            stack.push((parent, grandparents, 0, false));
+                        }
+                    },
+                }
+            }
+        }
+        let dropped: HashSet<String> = keep
+            .into_iter()
+            .filter(|(_, kept)| !*kept)
+            .map(|(id, _)| id.to_owned())
+            .collect();
+        if dropped.is_empty() {
+            return 0;
+        }
+        let before = want.len();
+        want.retain(|id| !dropped.contains(id));
         before - want.len()
     }
 
@@ -415,41 +565,41 @@ impl OrphanBuffer {
                 .entry(peer.to_owned())
                 .or_insert(0) += cost;
         }
-        self.oldest_hint_at = Some(self.oldest_hint_at.map_or(now, |oldest| oldest.min(now)));
+        self.hint_order.push_back((now, id.to_owned()));
+        // Forgotten hints leave their entry behind until it ages out; a peer
+        // churning hints must not grow the queue past twice the table's bound.
+        if self.hint_order.len() > 2 * MAX_PARENT_HINT_IDS {
+            let hints = &self.parent_hints;
+            self.hint_order.retain(|(seen, id)| {
+                hints
+                    .get(id)
+                    .is_some_and(|(_, recorded, _)| recorded == seen)
+            });
+        }
         self.parent_hints.insert(
             id.to_owned(),
             (parents.to_vec(), now, from_peer.map(str::to_owned)),
         );
     }
 
-    /// Drop hints older than [`MAX_ORPHAN_AGE`] and recompute the counters —
-    /// only when one may have expired (T88): a full table, or a peer at its
-    /// share, must not make every refused orphan a pass over the table.
+    /// Drop hints older than [`MAX_ORPHAN_AGE`] (T95 / L-134): pop the aged
+    /// front of `hint_order`, forgetting each hint still recorded at that
+    /// time — the work is the number of expired hints, never the table.
     fn sweep_expired_hints(&mut self, now: Instant) {
-        let Some(oldest) = self.oldest_hint_at else {
-            return;
-        };
-        if now.saturating_duration_since(oldest) <= MAX_ORPHAN_AGE {
-            return;
-        }
-        self.parent_hints
-            .retain(|_, (_, seen, _)| now.saturating_duration_since(*seen) < MAX_ORPHAN_AGE);
-        self.parent_hint_ids = 0;
-        self.parent_hint_ids_per_peer.clear();
-        self.oldest_hint_at = None;
-        for (parents, seen, peer) in self.parent_hints.values() {
-            let cost = 1 + parents.len();
-            self.parent_hint_ids += cost;
-            if let Some(peer) = peer {
-                *self
-                    .parent_hint_ids_per_peer
-                    .entry(peer.clone())
-                    .or_insert(0) += cost;
+        while let Some((seen, _)) = self.hint_order.front() {
+            if now.saturating_duration_since(*seen) < MAX_ORPHAN_AGE {
+                break;
             }
-            self.oldest_hint_at = Some(
-                self.oldest_hint_at
-                    .map_or(*seen, |oldest| oldest.min(*seen)),
-            );
+            let Some((seen, id)) = self.hint_order.pop_front() else {
+                break;
+            };
+            if self
+                .parent_hints
+                .get(&id)
+                .is_some_and(|(_, recorded, _)| *recorded == seen)
+            {
+                self.forget_parent_hint(&id);
+            }
         }
     }
 
@@ -1042,12 +1192,181 @@ mod tests {
         let wanted = vec![g.clone(), c.clone(), other.clone(), on_account.clone()];
 
         let mut want = wanted.clone();
-        assert_eq!(buffer.retain_not_doomed("peer", &mut want, now), 2);
+        assert_eq!(
+            buffer.retain_not_doomed("peer", &mut want, now, |_| false),
+            2
+        );
         assert_eq!(want, vec![other.clone(), on_account.clone()]);
 
         let mut want = wanted.clone();
-        assert_eq!(buffer.retain_not_doomed("another-peer", &mut want, now), 0);
+        assert_eq!(
+            buffer.retain_not_doomed("another-peer", &mut want, now, |_| false),
+            0
+        );
         assert_eq!(want, wanted, "per peer");
+    }
+
+    /// M-66 (T95, decision (48)), A5-1's shape: an author's second envelope of
+    /// its own record C, naming a parent K this node refused from the HONEST
+    /// peer, is buffered first (from `mallory`). Before T95 the Want for the
+    /// honest peer judged C by that buffered copy and dropped it — so the
+    /// honest copy, and everything on top of it, was never asked for. Only a
+    /// copy the asked peer delivered decides now.
+    ///
+    /// Bug-catch: judge by any buffered copy again and C is dropped for
+    /// `honest`.
+    #[test]
+    fn m66_another_peers_copy_does_not_decide_what_this_peer_is_asked_for() {
+        let mut buffer = OrphanBuffer::new();
+        let now = Instant::now();
+        let k = "b".repeat(64);
+        assert!(buffer.refusals_mut().record("honest", &k, now));
+        assert!(buffer.refusals_mut().record("mallory", &k, now));
+        buffer.insert(
+            "c".to_owned(),
+            make_directive("c"),
+            vec![k.clone()],
+            Some("mallory".to_owned()),
+        );
+        let mut want = vec!["c".to_owned()];
+        assert_eq!(
+            buffer.retain_not_doomed("honest", &mut want, now, |_| false),
+            0
+        );
+        assert_eq!(want, vec!["c".to_owned()], "asked of the honest peer");
+        assert_eq!(
+            buffer.retain_not_doomed("mallory", &mut want, now, |_| false),
+            1
+        );
+    }
+
+    /// L-133 (T95): a hint C → [X] outlives X's arrival (`parent_arrived`
+    /// forgets only the hint keyed X). X refused for good from `peer`, then
+    /// adopted from another peer: C must be asked for again, since what it
+    /// waited on is here. A parent the caller holds never dooms.
+    ///
+    /// Bug-catch: ignore `holds` and C stays dropped until the TTL.
+    #[test]
+    fn l133_a_parent_this_node_now_holds_never_dooms_its_child() {
+        let mut buffer = OrphanBuffer::new();
+        let now = Instant::now();
+        let x = "c".repeat(64);
+        assert!(buffer.refusals_mut().record("peer", &x, now));
+        buffer.remember_parent_hint("c", std::slice::from_ref(&x), now, Some("peer"));
+        let mut want = vec!["c".to_owned()];
+        assert_eq!(
+            buffer.retain_not_doomed("peer", &mut want, now, |id| id == x),
+            0
+        );
+        assert_eq!(
+            buffer.retain_not_doomed("peer", &mut want, now, |_| false),
+            1
+        );
+    }
+
+    /// M-67 (T95), A5 `a5_7`: 1,000 buffered and 8,000 hinted links of one
+    /// chain whose root this peer served and this node refused, advertised
+    /// child-first. T88's fixpoint re-walked the whole Want per doomed id —
+    /// ~10–15 s in release, under this buffer's lock, every exchange. One
+    /// memoised pass drops all of them at once.
+    ///
+    /// Bug-catch: restore the fixpoint loop and this takes minutes in debug.
+    #[test]
+    fn m67_a_child_first_chain_is_judged_in_one_pass() {
+        let mut buffer = OrphanBuffer::new();
+        let now = Instant::now();
+        let root = "d".repeat(64);
+        assert!(buffer.refusals_mut().record("peer", &root, now));
+        let id = |index: usize| format!("{index:064}");
+        for index in 0..9_000usize {
+            let parent = if index == 0 {
+                root.clone()
+            } else {
+                id(index - 1)
+            };
+            if index < 1_000 {
+                buffer.insert(
+                    id(index),
+                    make_directive(&id(index)),
+                    vec![parent],
+                    Some("peer".to_owned()),
+                );
+            } else {
+                buffer.remember_parent_hint(&id(index), &[parent], now, Some("peer"));
+            }
+        }
+        let mut want: Vec<String> = (0..9_000usize).rev().map(id).collect();
+        let started = Instant::now();
+        let dropped = buffer.retain_not_doomed("peer", &mut want, now, |_| false);
+        let took = started.elapsed();
+        assert!(
+            dropped >= 1_000,
+            "the buffered links are dropped: {dropped}"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "one pass, not a fixpoint: {took:?}"
+        );
+    }
+
+    /// L-130 (T95): an id this peer served and this node holds buffered on a
+    /// parent the peer does not offer is not asked of that peer again; the same
+    /// id buffered from ANOTHER peer still is (M-66), and so is one whose
+    /// missing parent is in the same Want (L-95's chain).
+    ///
+    /// Bug-catch: make `retain_not_buffered_from` a no-op and the peer's own
+    /// buffered copy is re-wanted every round.
+    #[test]
+    fn l130_what_this_peer_already_served_and_is_buffered_is_not_wanted_again() {
+        let mut buffer = OrphanBuffer::new();
+        let missing = vec!["m".repeat(64)];
+        buffer.insert(
+            "mine".to_owned(),
+            make_directive("mine"),
+            missing.clone(),
+            Some("peer".to_owned()),
+        );
+        buffer.insert(
+            "theirs".to_owned(),
+            make_directive("theirs"),
+            missing,
+            Some("other".to_owned()),
+        );
+        let mut want = vec!["mine".to_owned(), "theirs".to_owned(), "new".to_owned()];
+        assert_eq!(buffer.retain_not_buffered_from("peer", &mut want), 1);
+        assert_eq!(want, vec!["theirs".to_owned(), "new".to_owned()]);
+        // Its missing parent offered in the same Want: kept, so the chain
+        // stages in order as it lands (L-95).
+        let mut want = vec!["mine".to_owned(), "m".repeat(64)];
+        assert_eq!(buffer.retain_not_buffered_from("peer", &mut want), 0);
+    }
+
+    /// L-134 (T95): hints expire from the front of their insertion order —
+    /// the aged ones go, the rest stay, and a hint forgotten and recorded again
+    /// is aged from its NEW time (its old queue entry is skipped).
+    ///
+    /// Bug-catch: pop without comparing the recorded time and the re-recorded
+    /// hint is dropped early.
+    #[test]
+    fn l134_hints_expire_in_order_and_a_rerecorded_hint_keeps_its_new_age() {
+        let mut buffer = OrphanBuffer::new();
+        let start = Instant::now();
+        let step = std::time::Duration::from_secs(60);
+        let parent = vec!["p".repeat(64)];
+        buffer.remember_parent_hint("a", &parent, start, Some("peer"));
+        buffer.remember_parent_hint("b", &parent, start + step, Some("peer"));
+        buffer.forget_parent_hint("a");
+        buffer.remember_parent_hint("a", &parent, start + step * 2, Some("peer"));
+        buffer.sweep_expired_hints(start + MAX_ORPHAN_AGE + step);
+        assert!(!buffer.parent_hints.contains_key("b"), "b aged out");
+        assert!(
+            buffer.parent_hints.contains_key("a"),
+            "a is aged from its new time"
+        );
+        buffer.sweep_expired_hints(start + MAX_ORPHAN_AGE + step * 2);
+        assert!(buffer.parent_hints.is_empty());
+        assert_eq!(buffer.parent_hint_ids, 0);
+        assert!(buffer.parent_hint_ids_per_peer.is_empty());
     }
 
     #[test]

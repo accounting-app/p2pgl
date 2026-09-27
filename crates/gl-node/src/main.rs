@@ -29,7 +29,7 @@ use axum::routing::{get, post};
 use axum::{middleware, Router};
 use p2p::node::PeerRegistry;
 use p2p::orphan_buffer::OrphanBuffer;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -62,6 +62,21 @@ const GRAPHQL_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// whole string, so an operator who sets one on a public bind should keep
 /// `iroh::protocol=error` in it (README, "Log volume on a public bind").
 const DEFAULT_LOG_FILTER: &str = "info,iroh::protocol=error";
+
+/// Resolve the configured ledger path (a symlinked `.bean` is worked at its
+/// target, T82 / L-84), lock the result (M-17), and — under that lock, where
+/// no sibling process can be mid-rewrite — sweep the stale temporaries an
+/// older build left beside the link (T94 / L-118: `boot` is handed the target,
+/// so its own sweep never saw the link's directory). The path returned is the
+/// one the node locks, boots, watches and reloads.
+fn claim_ledger_path(configured: &Path) -> Result<(PathBuf, ledger_lock::LedgerLock), String> {
+    let resolved =
+        ledger::journal::resolve_ledger_path(configured).map_err(|error| error.to_string())?;
+    let guard = ledger_lock::acquire(&resolved)
+        .map_err(|error| format!("failed to lock ledger file: {error}"))?;
+    ledger::service::sweep_temporaries_beside_the_link(configured, &resolved);
+    Ok((resolved, guard))
+}
 
 /// The boot banner for records the signature check quarantined (H-20).
 ///
@@ -232,20 +247,13 @@ async fn main() {
     // T82 / L-84: a symlinked `.bean` is worked at its target, so the lock
     // sits beside the target too — two nodes pointed at one ledger through
     // different links exclude each other.
-    let ledger_path = match ledger::journal::resolve_ledger_path(&ledger_path) {
-        Ok(resolved) => resolved,
+    let (ledger_path, _ledger_lock) = match claim_ledger_path(&ledger_path) {
+        Ok((resolved, guard)) => {
+            info!(lock = %guard.path().display(), "ledger lock acquired");
+            (resolved, guard)
+        }
         Err(error) => {
             error!(%error, "cannot use the configured ledger path — aborting");
-            std::process::exit(1);
-        }
-    };
-    let _ledger_lock = match ledger_lock::acquire(&ledger_path) {
-        Ok(guard) => {
-            info!(lock = %guard.path().display(), "ledger lock acquired");
-            guard
-        }
-        Err(error) => {
-            error!(%error, "failed to lock ledger file — aborting");
             std::process::exit(1);
         }
     };
@@ -1075,6 +1083,44 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L-118 (T94): gl-node resolves a symlinked `.bean` before `boot`, so the
+    /// boot is handed the target and T87's sweep beside the LINK never ran on
+    /// the node — a stale `<link>.tmp.*` an older build left (a whole-ledger
+    /// copy, possibly) stayed for good (A4 `case_sweep_and_remedy.py`).
+    /// `claim_ledger_path` sweeps it once the lock is held, and the lock sits
+    /// beside the target.
+    ///
+    /// Bug-catch: drop the `sweep_temporaries_beside_the_link` call and the
+    /// stale temp beside the link survives.
+    #[cfg(unix)]
+    #[test]
+    fn l118_claiming_a_linked_ledger_sweeps_the_temporaries_beside_the_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = directory.path().join("store");
+        std::fs::create_dir(&store).unwrap();
+        let target = store.join("target.bean");
+        std::fs::write(&target, "").unwrap();
+        let link = directory.path().join("ledger.bean");
+        std::os::unix::fs::symlink("store/target.bean", &link).unwrap();
+        let stale = directory
+            .path()
+            .join("ledger.bean.tmp.4242.0123456789abcdef");
+        std::fs::write(&stale, "a crashed rewrite").unwrap();
+
+        let (resolved, guard) = claim_ledger_path(&link).expect("claimed");
+        assert_eq!(resolved, std::fs::canonicalize(&target).unwrap());
+        assert!(!stale.exists(), "the stale temp beside the link is swept");
+        assert!(
+            guard
+                .path()
+                .starts_with(std::fs::canonicalize(&store).unwrap()),
+            "the lock sits beside the target: {}",
+            guard.path().display()
+        );
+    }
 
     /// M-69 (T92, decision (40)): the H-20 boot banner names only remedies
     /// that work — the per-record reasons, a restored copy, deleting the

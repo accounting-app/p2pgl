@@ -27,7 +27,11 @@ jobs:
       # action code stays frozen at this commit (stable branch tip at pin time).
       # T89 (0925 §5): re-pinned — `stable` is force-moved, and the previous pin
       # (4360b52) was left unreachable from every ref, one GC away from failing CI.
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2026-09-03
+      # T96 (L-123): pinned on `master` instead. `stable` and the other generated
+      # branches are regenerated together, which orphans their old tips (6bed076,
+      # T89's pin, was reachable from `stable` alone); `master` is not rewritten.
+      # `master`'s action requires the `toolchain` input, which is given below.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-11
         with:
           toolchain: stable
           components: rustfmt, clippy

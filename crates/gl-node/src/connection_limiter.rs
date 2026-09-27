@@ -94,12 +94,17 @@ pub struct AntiEntropyLimits {
     /// each chunk. So this budget now bounds bodies AND the parsed directives
     /// waiting on them; what stays uncharged is the decode transient above
     /// (≤ ~4× a body, before phase 1) and, when the budget is exhausted, at
-    /// most 1 MiB of parsed weight plus one directive per connection
-    /// (`UNCHARGED_RESIDUE_CAP`, T88 / M-62) — so about a peer's connection
-    /// count in MiB, its own budget again. T83 (L-90) had let that residue grow
-    /// to the 16 MiB weight budget per connection: ~460–512 MiB per peer and
-    /// 4 GiB across the connection cap. The densest frame the wire admits
-    /// (T81's 4,096-key ceiling) parses at ~14.4× its size. Outbound (`Want`ed) frames are bounded by the
+    /// most `max(1 MiB, one directive)` of parsed weight per connection
+    /// (`UNCHARGED_RESIDUE_CAP`, T88 / M-62). One directive the wire admits
+    /// weighs up to ~1.97 MB resident, so that is ~2 MiB per connection: ~60 MiB
+    /// for one peer's 32 connections and ~480 MiB across the 256-connection cap
+    /// (T95 / L-132 — T88 said "about its own budget", ~1.9× short). T83 (L-90)
+    /// had let that residue grow to the 16 MiB weight budget per connection:
+    /// ~460–512 MiB per peer and 4 GiB across the connection cap. A frame the
+    /// wire admits parses at up to ~28× its size (one metadata key on each of
+    /// 1,000 postings) and at most ~211 MB in absolute terms (the 4,096-key
+    /// ceiling with one-byte values) — `decode_memory` pins 224 MiB; size a host
+    /// against that figure per frame in flight. Outbound (`Want`ed) frames are bounded by the
     /// same 16 MiB per exchange and by the node's own loops. Before T77 the
     /// staged directives were bounded per frame only by `MAX_SUPPLY_ENTRIES` ×
     /// the §3.12 caps, so the ceiling under the 256 MiB default was ≈ 3.5 GiB

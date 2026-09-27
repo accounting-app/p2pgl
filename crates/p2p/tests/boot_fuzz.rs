@@ -565,8 +565,9 @@ struct Checks {
     /// A1 (0926): check 7 — a fresh replica, asked on the real intake and
     /// its own `stage_remote_directive`, adopts every served record and none
     /// of the node-written records the node holds back (the edit's own
-    /// targets aside). Off in [`Checks::ALL`], so every case written before
-    /// it runs as it did; on in [`Checks::EXACT`].
+    /// targets aside). On in [`Checks::ALL`] since T96 (L-135, decision (52)):
+    /// before, the existing sweeps were blind to T84's I3/I9 arm (disabled,
+    /// the fuzzer stayed green) and bounded the held set by a count only.
     fresh_peer_adopts_exactly: bool,
 }
 
@@ -574,10 +575,19 @@ impl Checks {
     const ALL: Checks = Checks {
         read_model_parity: true,
         served_set_self_contained: true,
+        fresh_peer_adopts_exactly: true,
+    };
+
+    /// Checks 1–6 without check 7: what [`Checks::ALL`] was before T96, for
+    /// the cases that show what check 7 adds, and for a fixture no fresh peer
+    /// can join by design (a history near the lamport ceiling, decision (1)).
+    const WITHOUT_FRESH_PEER: Checks = Checks {
+        read_model_parity: true,
+        served_set_self_contained: true,
         fresh_peer_adopts_exactly: false,
     };
 
-    /// [`Checks::ALL`] plus check 7 (A1, 0926).
+    /// Every check, check 7 included (A1, 0926) — [`Checks::ALL`] since T96.
     const EXACT: Checks = Checks {
         read_model_parity: true,
         served_set_self_contained: true,
@@ -2385,11 +2395,48 @@ const OPERATORS_A1: [Operator; 4] = [
     Operator::EditOpenPlusHandReopenAndTransaction,
 ];
 
+/// A process-wide default subscriber that records nothing but is interested in
+/// every callsite (T96 / L-135). Tracing caches each callsite's interest; a
+/// callsite first hit by a test with no subscriber of its own was cached as
+/// "never", and a concurrent capture's rebuild could miss a registration still
+/// in flight — the capturing test then lost that one line (the log checks that
+/// failed in two gates, and `m51_…` beside the T85 tests, deterministically).
+/// With this installed, no callsite is ever "never"; each thread's scoped
+/// subscriber decides.
+fn ensure_every_callsite_is_interesting() {
+    struct Interested;
+    impl tracing::Subscriber for Interested {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(Interested);
+        tracing::callsite::rebuild_interest_cache();
+    });
+}
+
 /// Every WARN (and ERROR) `body` logs on this thread, one line per event with
 /// its fields — the diagnostics are part of the contract where a deviation
 /// replaced a mechanism by a warning (T79 (d)). A minimal subscriber, so the
 /// test needs nothing beyond `tracing`.
 fn capture_warnings<T>(body: impl FnOnce() -> T) -> (T, String) {
+    ensure_every_callsite_is_interesting();
     use std::fmt::Write as _;
     use std::sync::Mutex;
 
@@ -2958,7 +3005,7 @@ fn a1_0926_oracle_7_detects_a_served_record_no_fresh_peer_adopts() {
         touched: vec![],
         deleted: vec![open],
     };
-    let failures = audit(&snapshot, &truth, &effect, Checks::ALL);
+    let failures = audit(&snapshot, &truth, &effect, Checks::WITHOUT_FRESH_PEER);
     assert!(
         failures.is_empty(),
         "checks 1–6 are blind to it: {failures:#?}"
@@ -3191,7 +3238,10 @@ fn a1_0926_2_a_ceiling_refused_hand_line_leaves_nothing_served_over_it() {
     let mut failures = Vec::new();
     let first = snapshot_of(&run_pipeline(&path, &truth.provider).unwrap());
     failures.extend(
-        audit_with(&first, &truth, &effect, Checks::ALL, &extra)
+        // The fixture's peer record sits near the lamport ceiling, which no
+        // fresh peer crosses by anti-entropy (decision (1)); check 7 would
+        // name that limitation, not this case's fault (T96).
+        audit_with(&first, &truth, &effect, Checks::WITHOUT_FRESH_PEER, &extra)
             .into_iter()
             .map(|failure| format!("first boot: {failure}")),
     );

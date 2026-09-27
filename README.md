@@ -55,7 +55,7 @@ The playground is **off** by default. Turn it on with `"graphiql": true` and vis
 
 ### Upgrading
 
-Read [`CHANGELOG.md`](CHANGELOG.md) before upgrading, starting with *Breaking*. Config files are parsed strictly, so an **older binary refuses a config that uses a key added in a newer one**: upgrade the binary before editing the config, and remove new keys before rolling back. A newer node holds what it **writes** to tighter limits than what it **takes as history**, so that history an older build wrote keeps replicating: an `open` may list up to 64 currencies and a transaction's postings up to 100 metadata keys when this node authors them, but a peer's record or an existing file is held only to 4,096 of each. One case still cannot replicate: an amount past 10^21 in a history written before T65 (a ledger kept in base units, such as wei). Boot keeps that record in the file, names it, and quarantines it together with every record that depends on it, so the node serves only what a fresh replica can hold; `verify` lists what is quarantined. Restating such an amount in a larger unit gives the record a new id, so its descendants (whose parents name the old id) stay quarantined: restate the chain (delete the `openledger-*` lines of each descendant, so it is re-adopted under its own id with parents this node serves; peers that hold the old copies adopt the restated ones), or join nodes by bootstrap (§Mesh identity). The CHANGELOG lists each case. **Upgrade every node of a mesh, not some:** a node on a build from T75 to T80 refuses a history record over 64 currencies or 100 posting metadata keys that this build accepts, and then every record this node writes afterwards names a parent that node lacks — it buffers them all until it is upgraded, and nothing on this node says so. A hand-typed entry's metadata keys are counted as the record will be stored with a signature (96 on a transaction, 97 on anything else), also on a node with signing off, so enabling signing later never pushes a record over the cap.
+Read [`CHANGELOG.md`](CHANGELOG.md) before upgrading, starting with *Breaking*. Config files are parsed strictly, so an **older binary refuses a config that uses a key added in a newer one**: upgrade the binary before editing the config, and remove new keys before rolling back. A newer node holds what it **writes** to tighter limits than what it **takes as history**, so that history an older build wrote keeps replicating: an `open` may list up to 64 currencies and a transaction's postings up to 100 metadata keys when this node authors them, but a peer's record or an existing file is held only to 4,096 of each. One case still cannot replicate: an amount past 10^21 in a history written before T65 (a ledger kept in base units, such as wei). Boot keeps that record in the file, names it, and quarantines it together with every record that depends on it, so the node serves only what a fresh replica can hold; `verify` lists what is quarantined. Restating such an amount in a larger unit gives the record a new id, so its descendants (whose parents name the old id) stay quarantined: restate the chain (delete the `openledger-*` lines of each descendant, so it is re-adopted under its own id with parents this node serves; peers that hold the old copies adopt the restated ones), or join nodes by bootstrap (§Mesh identity). If the account's `open` accepts only the smaller unit (an `open … WEI`, say), the restated amount is refused there too: add the larger unit to that `open` in the same edit (delete its `openledger-*` lines so it is re-adopted as your own). The CHANGELOG lists each case. **Upgrade every node of a mesh, not some:** a node on a build from T75 to T80 refuses a history record over 64 currencies or 100 posting metadata keys that this build accepts, and then every record this node writes afterwards names a parent that node lacks — it buffers them all until it is upgraded, and nothing on this node says so. A hand-typed entry's metadata keys are counted as the record will be stored with a signature (96 on a transaction, 97 on anything else), also on a node with signing off, so enabling signing later never pushes a record over the cap.
 
 ---
 
@@ -395,7 +395,11 @@ curl -s -X POST http://127.0.0.1:4000/graphql \
 
 `errors` lists at most the first 1,000 problems, one per offending node;
 `truncated` is how many more were found and not listed (`0` means `errors` is
-complete).
+complete). Three more fields describe what the node holds back: `quarantined`
+lists the ids of records kept in the file but not served (at most 1,000),
+`quarantinedTotal` counts all of them, and `unparsableBlocks` counts blocks of
+the file held as text because they do not parse — request them as
+`{ verify { ok quarantined quarantinedTotal unparsableBlocks } }`.
 
 ---
 
@@ -860,8 +864,10 @@ test — its parent was edited, deleted, restated or held as unparsable text; th
 replica that lacks it, and so would everything this node writes afterwards. Boot
 quarantines such records together with what descends from them, names each one
 and why in the log (*"quarantining a ledger record no fresh replica could hold"*,
-H-23), and keeps them in the file. On a mesh they come back by themselves: a peer
-that holds the missing parent re-supplies it, and then them. On a node no peer
+H-23), and keeps them in the file. On a mesh they come back when a peer holds
+them: it re-supplies the missing parent and then them; a held record no peer
+holds (written while offline, say) stays held until the node restarts or the
+record is restored another way. On a node no peer
 can help, restore the missing record from a backup, strip the `openledger-*`
 lines as above, or add the missing `open` dated no later than the first
 transaction on the account and listing its currencies, and restart — boot judges
@@ -1083,8 +1089,13 @@ cases where you might:
   user refuses boot — otherwise whoever can write the ledger's directory could
   point it at any file the node's user owns and have it overwritten. For the
   same reason the link must sit in a directory owned by the node's user that
-  group and others cannot write (not `/tmp`, not a shared directory), and it is
-  followed **one link deep**: a link to another link refuses boot. A directory
+  group and others cannot write (not `/tmp`, not a shared directory, and on
+  macOS not one carrying an access control list — `ls -le` shows it, `chmod -N`
+  removes it), and it is followed **one link deep**: a link to another link
+  refuses boot. A data directory created under a group-writable umask (002,
+  mode 0775) is refused with its mode named; `chmod g-w,o-w <directory>` fixes
+  it. The checks and the follow are made through one open handle on the link's
+  directory, so swapping that directory from above cannot redirect the node. A directory
   in the path may itself be a link. If the ledger was converted to a link
   after an unclean stop, its journal is still beside the link, where the node
   no longer looks: boot refuses and names it. Move it beside the target (as

@@ -2887,8 +2887,45 @@ fn a4_3_a_text_held_block_without_an_id_must_not_leave_its_descendants_served() 
 // read-only ledger directory, so `persist_atomically` cannot create its
 // temporary file).
 
+/// A process-wide default subscriber that records nothing but is interested in
+/// every callsite (T96 / L-135). Tracing caches each callsite's interest; a
+/// callsite first hit by a test with no subscriber of its own was cached as
+/// "never", and a concurrent capture's rebuild could miss a registration still
+/// in flight — the capturing test then lost that one line (the log checks that
+/// failed in two gates, and `m51_…` beside the T85 tests, deterministically).
+/// With this installed, no callsite is ever "never"; each thread's scoped
+/// subscriber decides.
+fn ensure_every_callsite_is_interesting() {
+    struct Interested;
+    impl tracing::Subscriber for Interested {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(Interested);
+        tracing::callsite::rebuild_interest_cache();
+    });
+}
+
 /// Run `body` and return what it logged at WARN and above.
 fn capture_warnings<T>(body: impl FnOnce() -> T) -> (T, String) {
+    ensure_every_callsite_is_interesting();
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]

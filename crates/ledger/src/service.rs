@@ -204,6 +204,25 @@ fn is_reserved_temporary_name(name: &str, ledger_name: &str) -> bool {
 /// because writes never reuse a name. Best effort: a failure here never fails
 /// the boot. (Library users that run several writers on one ledger without
 /// that lock keep the pre-T30 exposure, as `persist_atomically` documents.)
+/// `(DAG size, held-back file-adopted lines, the served ids)` — see
+/// `LedgerService::served_id_snapshot`.
+type ServedIdSnapshot = (usize, usize, std::sync::Arc<[String]>);
+
+/// Clear what an older build's crashed rewrites left beside a ledger LINK
+/// (`<link>.tmp.*`) — before T82 temporary files sat beside the link, and since
+/// then nothing else ever removes them (T94 / L-118). A no-op unless
+/// `configured` is a link that resolved elsewhere.
+///
+/// `boot_with` does this for a caller that hands it the link's path, but
+/// `gl-node` resolves the link first and boots the TARGET, so inside the boot
+/// the two paths are equal and T87's sweep never ran on the node. `gl-node`
+/// calls this after taking the ledger lock, as the boot's own sweep runs.
+pub fn sweep_temporaries_beside_the_link(configured: &Path, resolved: &Path) {
+    if configured != resolved {
+        sweep_stale_temporaries(configured);
+    }
+}
+
 fn sweep_stale_temporaries(path: &Path) {
     let Some(file_name) = path.file_name() else {
         return;
@@ -1431,21 +1450,33 @@ pub const PLACEHOLDER_AUTHOR: &str = "local";
 /// author named is the one at the top of the gap — the jumper, or, on a node
 /// that no longer holds the jumping directive, the first honest record above
 /// it — so the text never calls it the jumper outright.
-fn lamport_gap_verdict(gap: u64) -> String {
+///
+/// T96 / L-127, decision (50): `without_named` is the largest gap the history
+/// shows once the named author's records are left out — what a joiner must
+/// cross once that author is off the allowlist, since it then refuses them. Two
+/// consecutive sub-2^32 steps by one author are each crossable, but together
+/// they are not: judged on the single step, the WARN said "no bootstrap join is
+/// needed" while a fresh node stayed partitioned. And a gap of exactly 2^32 is
+/// crossable — a joiner adopts the record below it at `below + 1`, and the
+/// ratchet refuses only a step of 2^32 or more from there — so "uncrossable"
+/// is strictly more than 2^32 (T89 said "at least", one off).
+fn lamport_gap_verdict(gap: u64, without_named: u64) -> String {
     let named = "The author named is the one at the top of the gap: the node that jumped \
                  the clock — or, on a node that no longer holds the jumping directive (its \
                  author removed from the allowlist, or the directive deleted), the first \
                  honest record stamped above it";
-    if gap >= MAX_LAMPORT_ADVANCE {
+    if gap > MAX_LAMPORT_ADVANCE || without_named > MAX_LAMPORT_ADVANCE {
         format!(
-            "{named}. At 2^32 or more the gap is uncrossable by anti-entropy once the author \
-             that made it is off the allowlist. {BOOTSTRAP_JOIN_REMEDY}"
+            "{named}. Past 2^32 — as one step, or as the steps of the named author taken \
+             together — the gap is uncrossable by anti-entropy once that author is off the \
+             allowlist. {BOOTSTRAP_JOIN_REMEDY}"
         )
     } else {
         format!(
-            "{named}. Under 2^32 the gap is diagnosed, not uncrossable: anti-entropy still \
-             crosses it (the adoption ratchet admits up to 2^32 a step), so no bootstrap join \
-             is needed for it; watch for it growing (H-19, L-111, L-113)"
+            "{named}. Up to 2^32 the gap is diagnosed, not uncrossable: anti-entropy crosses it \
+             (the adoption ratchet admits up to 2^32 a step) while every author inside it stays \
+             allowlisted, so no bootstrap join is needed for it; watch for it growing (H-19, \
+             L-111, L-113, L-127)"
         )
     }
 }
@@ -3206,6 +3237,13 @@ pub struct LedgerService {
     /// invalidation key. Behind a `Mutex` because the snapshot is taken under
     /// the ledger's READ lock, by any number of concurrent readers.
     directive_id_snapshot: std::sync::Mutex<Option<(usize, std::sync::Arc<[String]>)>>,
+    /// The last [`Self::served_sorted_directive_ids`] snapshot, keyed by the
+    /// DAG size and the number of held-back file-adopted lines it was taken at
+    /// (T95, the L-116 advert cost): without it, a node whose compaction kept
+    /// failing cloned every id on every anti-entropy advert. The held-back set
+    /// only grows (adoption) or empties (a successful rewrite) between
+    /// rebuilds, and `rebuild_dag` resets this with the other snapshot.
+    served_id_snapshot: std::sync::Mutex<Option<ServedIdSnapshot>>,
 }
 
 impl LedgerService {
@@ -4075,6 +4113,7 @@ impl LedgerService {
             commit_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             commit_observer: None,
             directive_id_snapshot: std::sync::Mutex::new(None),
+            served_id_snapshot: std::sync::Mutex::new(None),
         };
 
         // T81 / M-51, M-52: what descends from a record refused under a
@@ -4773,7 +4812,8 @@ impl LedgerService {
              does not serve, or a transaction the accounts it serves do not admit, and what \
              descends from them. Serving them would make everything this node writes \
              afterwards unadoptable by every peer. If a peer holds the missing parent, it \
-             re-supplies it and these records return by themselves. If none does: restore the \
+             re-supplies it — and these records too — they return: re-supplying the parent \
+             alone brings back only the records a peer also holds. If none does: restore the \
              missing record from a backup; or, for this node's own record whose envelope \
              lines were edited, delete that block's openledger-* lines so it is re-adopted \
              under the same id; or add the missing open, dated no later than the first \
@@ -4988,8 +5028,17 @@ impl LedgerService {
             .and_then(directive_author)
             .unwrap_or("(unknown)")
             .to_owned();
+        // T96 / L-127: the gap a joiner faces once that author is removed.
+        let (without_named, _) = largest_lamport_gap(
+            self.dag
+                .directives()
+                .into_iter()
+                .filter(|directive| directive_author(directive) != Some(named.as_str()))
+                .filter_map(Directive::lamport_clock),
+        );
         warn!(
             gap,
+            without_named,
             below = top - gap,
             top,
             threshold = LAMPORT_GAP_WARN,
@@ -4997,7 +5046,7 @@ impl LedgerService {
             file = %self.file_path.display(),
             "the ledger history carries a lamport gap no honest mesh makes. Existing nodes \
              are unaffected. {}",
-            lamport_gap_verdict(gap)
+            lamport_gap_verdict(gap, without_named)
         );
     }
 
@@ -5362,6 +5411,10 @@ impl LedgerService {
         // and can grow back to the same number over a different set.
         *self
             .directive_id_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .served_id_snapshot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         if rebased > 0 {
@@ -6211,7 +6264,7 @@ impl LedgerService {
             author = author.unwrap_or("(unknown)"),
             "an adopted directive opened a lamport gap in the history no honest mesh makes; \
              this node is unaffected. {}",
-            lamport_gap_verdict(gap)
+            lamport_gap_verdict(gap, gap)
         );
     }
 
@@ -7120,10 +7173,10 @@ impl LedgerService {
                     warn!(
                         kept,
                         file = %self.file_path.display(),
-                        "the rebuilt ledger read records this node had already signed as raw hand \
-                         input — a backup taken before they were canonicalised was restored over \
-                         the file; they keep the envelope this node committed, and the next \
-                         commit writes it back (L-81)"
+                        "the rebuilt ledger read records this node had already stamped as raw hand \
+                         input — still raw in the file because a rewrite failed, or a backup taken \
+                         before they were canonicalised was restored over it; they keep the \
+                         envelope this node committed, and the next commit writes it back (L-81)"
                     );
                 }
                 // T93 / L-115, decision (44): the clock never falls below a
@@ -8954,11 +9007,24 @@ impl LedgerService {
         if self.adopted_from_file.is_empty() {
             return all;
         }
-        all.iter()
+        let key = (self.dag.len(), self.adopted_from_file.len());
+        let mut snapshot = self
+            .served_id_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((size, held, ids)) = snapshot.as_ref() {
+            if (*size, *held) == key {
+                return std::sync::Arc::clone(ids);
+            }
+        }
+        let served: std::sync::Arc<[String]> = all
+            .iter()
             .filter(|id| !self.adopted_from_file.contains(id.as_str()))
             .cloned()
             .collect::<Vec<_>>()
-            .into()
+            .into();
+        *snapshot = Some((key.0, key.1, std::sync::Arc::clone(&served)));
+        served
     }
 
     /// Compute the content ID for a directive (for lookups).
@@ -9747,12 +9813,49 @@ mod tests {
         NaiveDate::from_ymd_opt(year, month, day).unwrap()
     }
 
+    /// A process-wide default subscriber that records nothing but is interested in
+    /// every callsite (T96 / L-135). Tracing caches each callsite's interest; a
+    /// callsite first hit by a test with no subscriber of its own was cached as
+    /// "never", and a concurrent capture's rebuild could miss a registration still
+    /// in flight — the capturing test then lost that one line (the log checks that
+    /// failed in two gates, and `m51_…` beside the T85 tests, deterministically).
+    /// With this installed, no callsite is ever "never"; each thread's scoped
+    /// subscriber decides.
+    fn ensure_every_callsite_is_interesting() {
+        struct Interested;
+        impl tracing::Subscriber for Interested {
+            fn register_callsite(
+                &self,
+                _: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::sometimes()
+            }
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                false
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        INSTALLED.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(Interested);
+            tracing::callsite::rebuild_interest_cache();
+        });
+    }
+
     /// Run `body` with every `WARN`/`ERROR` it logs captured as text.
     ///
     /// `tracing::subscriber::with_default` installs a *thread-local* subscriber,
     /// so this stays correct under `cargo test`'s thread-per-test parallelism —
     /// a concurrent test's logs never land in this buffer.
     fn capture_warnings<T>(body: impl FnOnce() -> T) -> (T, String) {
+        ensure_every_callsite_is_interesting();
         use std::sync::{Arc, Mutex};
 
         #[derive(Clone, Default)]
@@ -10677,8 +10780,11 @@ mod tests {
         // ledger written before L-02 could hold an account name no `close`
         // could ever be shipped for. Since T85 (L-101, decision (19)) boot
         // holds such an `open` as a record every peer refuses, so the account
-        // is never open here and `close_account`'s own size check is defence
-        // in depth; the close is refused before it, and nothing moves.
+        // is never open here and the close is refused before the size check,
+        // and nothing moves. (T96 / L-136: the check itself is still reachable
+        // — an `open` of exactly 1,048,576 bytes is admitted and its `close`,
+        // one byte longer, is not: `m50_wire`'s
+        // `a2_close_accounts_size_check_is_reachable_…` pins that.)
         let path = test_file_path();
         let huge = long_account("Assets", MAX_ECONOMIC_BEAN_LENGTH + 1_024);
         let persisted = full_file_serialize(
@@ -22044,6 +22150,42 @@ mod tests {
         remove_ledger_and_journal(&path);
     }
 
+    /// L-108 / L-135 (T96): a chain of three hand lines that ALL spell a
+    /// parents line — the parent a root (`""`), the child naming it, the
+    /// grandchild naming the child — written grandchild first. Moving
+    /// hand-parented lines last is not enough here (all three are in that
+    /// group); only the topological order within it adopts them in one boot.
+    /// T89's own test passed with that order removed (A6 R5b).
+    ///
+    /// Bug-catch: keep the hand-parented group in file order and the
+    /// grandchild and child are refused.
+    #[test]
+    fn l108_a_hand_chain_written_backwards_is_adopted_in_the_same_boot() {
+        let (svc, path) = setup_with_signed_accounts();
+        drop(svc);
+        let line = |narration: &str, parents: &str, amount: &str| {
+            format!(
+                "2024-01-20 * \"Hand\" \"{narration}\"\n\
+                 \x20 openledger-parents: \"{parents}\"\n\
+                 \x20 Assets:Cash                                         {amount} USD\n\
+                 \x20 Equity:Opening                                     -{amount} USD\n"
+            )
+        };
+        let parent = line("the parent", "", "5.00");
+        let parent_id = compute_content_id(&parse_file(&parent).unwrap().remove(0));
+        let child = line("the child", &parent_id, "2.00");
+        let child_id = compute_content_id(&parse_file(&child).unwrap().remove(0));
+        let grandchild = line("the grandchild", &child_id, "1.00");
+        append_to_file(&path, &format!("\n{grandchild}\n{child}\n{parent}"));
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.set_signer(marker_signer());
+        svc.finalize_operator_input();
+        assert_eq!(svc.quarantined_count(), 0);
+        assert_eq!(parents_of_named(&svc, "the child"), vec![parent_id]);
+        assert_eq!(parents_of_named(&svc, "the grandchild"), vec![child_id]);
+        remove_ledger_and_journal(&path);
+    }
+
     /// L-109 (T89, decision (34)): a peer's signed block pasted under a
     /// running node carries a stray directive-level `openledger-note`. Boot
     /// strips the key and serves the record; the live reconcile used to refuse
@@ -23057,6 +23199,40 @@ mod tests {
         );
         assert_eq!(svc.append_headroom(), 0, "the reload measured the rebuild");
         assert!(!svc.accounts().is_open("Assets:Late"));
+        remove_ledger_and_journal(&path);
+    }
+
+    /// L-116's advert cost (T95): while a line adopted from the file waits for
+    /// its rewrite, the served id list is built once and shared by every
+    /// advert until the ledger changes — before T95 each advert cloned every id
+    /// (a node whose compaction kept failing paid that on every exchange).
+    ///
+    /// Bug-catch: drop the `served_id_snapshot` cache and two adverts return
+    /// separate lists.
+    #[test]
+    fn l116_the_served_id_list_is_shared_while_a_line_waits_for_its_rewrite() {
+        let (mut svc, path) = setup_with_accounts();
+        svc.compact().unwrap();
+        append_to_file(
+            &path,
+            "\n2024-01-20 * \"Hand\" \"typed while running\"\n  Assets:Cash  3 USD\n  \
+             Equity:Opening  -3 USD\n",
+        );
+        assert_eq!(svc.reconcile_file_staged().unwrap().new_directives, 1);
+        let first = svc.served_sorted_directive_ids();
+        let second = svc.served_sorted_directive_ids();
+        assert!(std::sync::Arc::ptr_eq(&first, &second), "one shared list");
+        assert_eq!(
+            first.len() + 1,
+            svc.sorted_directive_ids().len(),
+            "the line is held back"
+        );
+        svc.compact().unwrap();
+        assert_eq!(
+            svc.served_sorted_directive_ids().len(),
+            svc.sorted_directive_ids().len(),
+            "served after its rewrite"
+        );
         remove_ledger_and_journal(&path);
     }
 
