@@ -214,7 +214,7 @@ impl AccountState {
     ///
     /// Recording is pure data entry: it never rejects. Whether a directive is
     /// ALLOWED into the ledger is the caller's decision (the local write guards
-    /// in `service.rs`; since T98 no ingested `close` is refused); once it is in
+    /// in `service`; since T98 no ingested `close` is refused); once it is in
     /// the DAG, its lifecycle event belongs in this set, because the state must
     /// be a pure function of the stored directive set — a node that boots from
     /// the file and a node that ingested the same directives one by one have to

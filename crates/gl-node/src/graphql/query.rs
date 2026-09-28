@@ -286,7 +286,7 @@ impl QueryRoot {
             // the lock, so writers are no better off, and it panics outright on
             // a current-thread runtime. The real fix is `LedgerService` holding
             // its DAG and read model behind `Arc` so a reader can clone the
-            // handle and drop the guard — a `service.rs` change, out of scope
+            // handle and drop the guard — a `ledger::service` change, out of scope
             // for this task and left for the pass that owns that file.
             let svc = ledger.read().await;
             let report = ledger::verify::verify_dag(svc.dag(), svc.read_model());

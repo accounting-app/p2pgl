@@ -1301,7 +1301,20 @@ openledger-v2/
 │   │   ├── src/serialize.rs  # Canonical serializer (I7 round-trip)
 │   │   ├── src/dag.rs        # Content-addressed DAG (G-Set CRDT)
 │   │   ├── src/validate.rs   # I1–I3, I9 validation + account state
-│   │   ├── src/service.rs    # LedgerService (mutations, reconcile)
+│   │   ├── src/service/      # LedgerService, one module per concern:
+│   │   │   ├── mod.rs        #   the struct and its re-exports
+│   │   │   ├── boot.rs       #   boot and operator input
+│   │   │   ├── verify.rs     #   signature pass, served-set rule
+│   │   │   ├── quarantine.rs #   held records, closure, copy chooser
+│   │   │   ├── authoring.rs  #   this node's writes, envelope stamping
+│   │   │   ├── commit.rs     #   two-phase commit, compaction
+│   │   │   ├── recovery.rs   #   failed-commit recovery, reload
+│   │   │   ├── reconcile.rs  #   live hand-edit reconcile
+│   │   │   ├── remote.rs     #   directives from peers
+│   │   │   ├── access.rs     #   accessors, served views
+│   │   │   ├── lamport.rs, envelope.rs, resource_limits.rs,
+│   │   │   │   blocks.rs, file_io.rs, error.rs  # shared rules and I/O
+│   │   │   └── tests.rs      #   unit tests
 │   │   ├── src/hash.rs       # SHA-256 content hashing (I5)
 │   │   ├── src/verify.rs     # DAG integrity verification
 │   │   ├── src/read_model.rs # Reports (trial balance, balance sheet, etc.)

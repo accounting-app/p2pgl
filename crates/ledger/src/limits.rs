@@ -6,7 +6,7 @@
 //! `MAX_METADATA_KEYS_PER_DIRECTIVE` — stay where they have always been, in
 //! [`crate::service`], and are referenced from there by
 //! [`crate::parse::ParseLimits`]. The two below are new with T75 and live here
-//! so the parser can see them without the numbers moving into `service.rs`;
+//! so the parser can see them without the numbers moving into `service`;
 //! [`crate::service::enforce_resource_limits`] refers to the same constants,
 //! so the wire's parse-time refusal and the write paths' refusal are one rule.
 
