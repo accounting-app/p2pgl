@@ -87,11 +87,13 @@
 //! chain of signed records and half envelopes), revised decision (42) to the
 //! end (a hand `open`, then the original returning from a peer), and L-131's
 //! retyped copy against the other holds and a refusal at finalisation. Four
-//! are `#[ignore]`d with their finding: A3-1 (a copy retyped beside a record
-//! the rule or the signature pass holds is still dropped), A3-2 (a retyped
-//! closure member frees its descendants only at the next boot), A3-3 (a
-//! retyped copy refused at finalisation is WARNed as kept and dropped) and
-//! A3-4 (one full rebuild and one recursion level per round of the rule).
+//! were `#[ignore]`d with their finding and run since T99: A3-1 (a copy
+//! retyped beside a record the rule or the signature pass holds was dropped),
+//! A3-2 (a retyped closure member freed its descendants only at the next
+//! boot), A3-3 (a retyped copy refused at finalisation was WARNed as kept and
+//! dropped) and A3-4 (one full rebuild and one recursion level per round of
+//! the rule); so does X1-1 (the missing `open` retyped with the held `open`'s
+//! own id).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -3627,10 +3629,10 @@ fn a3_0927_retyped_closure_member(truth: &Truth, top: &str) -> (Vec<String>, Str
 /// naming it. The in-place remedy (delete the block's `openledger-*` lines,
 /// operator (ak)) serves the same record in both shapes.
 ///
-/// Fails at HEAD: the retyped record is not served in either shape, and the
-/// typed block is gone from the file.
+/// Failed at `a5313a1`: the retyped record was not served in either shape, and
+/// the typed block was gone from the file. T99 parks the typed line and adopts
+/// it the moment the history copy is held (decision (59)).
 #[test]
-#[ignore = "A3-1: a block retyped beside a record the served-set rule or the signature pass holds is dropped, not adopted (L-131 fixed for the closure only)"]
 fn a3_0927_1_a_block_retyped_beside_a_record_the_rule_or_the_pass_holds_is_adopted() {
     let mut failures = Vec::new();
     for held_by in ["the served-set rule", "the signature pass"] {
@@ -3688,9 +3690,10 @@ fn a3_0927_1_a_block_retyped_beside_a_record_the_rule_or_the_pass_holds_is_adopt
 /// reaches C, and C is served: a restart with nothing edited changes the
 /// served set and the balances (the boot invariant's fixed point).
 ///
-/// Fails at HEAD: C is served after the reboot but not after the first boot.
+/// Failed at `a5313a1`: C was served after the reboot but not after the first
+/// boot. T99 re-admits closure members whose parents are served once the
+/// operator input is in (L-144).
 #[test]
-#[ignore = "A3-2: a retyped closure member frees its held descendants only at the next boot (not a fixed point)"]
 fn a3_0927_2_a_retyped_closure_member_serves_the_same_set_at_the_next_boot() {
     let (truth, chain) = a3_0927_chain_fixture(94, 1);
     let (blocks, held, grandchild) = a3_0927_retyped_closure_member(&truth, &chain[0]);
@@ -3772,9 +3775,10 @@ fn a3_0927_a_retyped_copy_refused_at_finalisation_leaves_the_record_held_and_on_
 /// is gone. Nothing is lost (the same body stays in the file); the WARN names
 /// a block the file no longer has.
 ///
-/// Fails at HEAD: the typed block is not in the file after the compaction.
+/// Failed at `a5313a1`: the typed block was not in the file after the
+/// compaction. T99 holds the typed spelling beside the enveloped copy
+/// (L-145, decision (59)).
 #[test]
-#[ignore = "A3-3: a retyped copy refused at finalisation is WARNed as kept in the file as written, and dropped by the compaction"]
 fn a3_0927_3_a_retyped_copy_refused_at_finalisation_is_kept_as_written() {
     let (truth, chain) = a3_0927_chain_fixture(95, 1);
     let (mut blocks, _, _) = a3_0927_retyped_closure_member(&truth, &chain[0]);
@@ -3799,10 +3803,12 @@ fn a3_0927_3_a_retyped_copy_refused_at_finalisation_is_kept_as_written() {
             .any(|line| line.contains("kept in the file as written") && line.contains(&held)),
         "premise: the WARN names the typed copy"
     );
+    // The compaction writes every entry in canonical form (amounts aligned),
+    // so the typed block is found by content: no envelope, the held body.
     assert!(
         split_blocks(&after)
             .iter()
-            .any(|block| block == A3_0927_HELD_BODY),
+            .any(|block| !block.contains("openledger-") && a3_0927_id_of(block) == held),
         "the typed block the WARN says is kept in the file is gone"
     );
 }
@@ -3939,9 +3945,9 @@ fn a3_0927_a_hand_open_then_the_original_returning_changes_no_verdict() {
 /// hand parent it holds (the rebuild refuses exactly those), so one walk and
 /// one rebuild reach the same set.
 ///
-/// Fails at HEAD: 20 rounds for a 41-record chain.
+/// Failed at `a5313a1`: 20 rounds for a 41-record chain. T99 walks through
+/// the pending lines the rebuild would refuse, iteratively (decision (60)).
 #[test]
-#[ignore = "A3-4: the served-set rule's fixpoint costs one full rebuild and one recursion level per record pair of an alternating hand-parented chain"]
 fn a3_0927_4_the_rule_reaches_its_fixpoint_without_a_round_per_record() {
     let (truth, chain) = a3_0927_chain_fixture(97, 41);
     let mut blocks = split_blocks(&truth.text);
@@ -3990,7 +3996,6 @@ fn a3_0927_4_the_rule_reaches_its_fixpoint_without_a_round_per_record() {
 /// path give the same bytes two fates, and the printed remedy never works
 /// with the node stopped.
 #[test]
-#[ignore = "X1-1: a hand open with the id of the node's own signature-held open is dropped at boot as a duplicate, while the live path adopts it"]
 fn x1_0927_the_missing_open_retyped_beside_its_edited_envelope_opens_the_account_at_boot() {
     let truth = generate_fixture(0x0927_0001);
     let dir = fresh_dir("x1-0927-1");

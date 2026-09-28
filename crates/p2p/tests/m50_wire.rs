@@ -2611,7 +2611,6 @@ fn a1_0927_after_a_crash_a_chain_re_entered_parent_first_is_served() {
 /// copies back, so the journal's copies are gone from disk. A fresh replica
 /// given what the node served before the crash holds all three.
 #[test]
-#[ignore = "A1-1: the duplicate-copy preference judges 'resolves' against the pre-closure DAG, so a re-entered chain whose order reverses the file's parenthood is held after a crash"]
 fn a1_0927_after_a_crash_a_re_entered_chain_is_served_whatever_order_it_was_re_entered_in() {
     let author = std::sync::Arc::new(key());
     let (path, [c_id, d_id, y_id], served) =
@@ -2669,7 +2668,6 @@ fn a1_0927_after_a_crash_a_re_entered_chain_is_served_whatever_order_it_was_re_e
 /// the H-24 crash T90 fixed, reached through a hold T90's preference does not
 /// look at.
 #[test]
-#[ignore = "A1-2: the duplicate-copy preference keeps the file's copy whenever its parents resolve, so an API re-entry of a signature-held record is held again after a crash"]
 fn a1_0927_after_a_crash_a_re_entered_signature_held_record_is_served() {
     use ledger::service::{PostingInput, TransactionInput};
     let author = std::sync::Arc::new(key());
@@ -3223,7 +3221,6 @@ fn a1_0927_a_pasted_child_of_a_held_record_stays_in_the_file_as_boot_keeps_it() 
 /// peer supplies them again, and the startup compaction deletes the adopted
 /// copies from B's disk.
 #[test]
-#[ignore = "A1-1: after a crash, a node that adopted a restated chain whose order reverses the file's parenthood holds it again until a peer re-supplies it"]
 fn a1_0927_after_a_crash_a_restated_chain_adopted_from_a_peer_is_still_served() {
     let author = std::sync::Arc::new(key());
     let over = Decimal::from_str_exact("50000000000000000000000").expect("5 × 10^22");

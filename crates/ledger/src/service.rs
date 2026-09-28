@@ -3035,6 +3035,29 @@ pub struct LedgerService {
     /// the two T75 ceilings, the amount cap and (T85, L-101) the body cap.
     /// Re-derived by every boot and reload.
     refused_history_closure: BTreeSet<String>,
+    /// The other enveloped copies of a record boot met in the file (T99 /
+    /// M-72, decision (58)): a content id hashes the body alone, so the
+    /// canonical file and the journal can spell one record under two
+    /// envelopes — the file's copy held by the closure or the signature pass,
+    /// and the journal's copy re-entered through the API or adopted from a
+    /// peer. Kept until the node has judged which copy it serves: every step
+    /// that is about to hold a record first tries these
+    /// ([`Self::choose_servable_copies`]). A copy displaced by another joins
+    /// the list. Re-derived by every boot and reload.
+    alternative_copies: BTreeMap<String, Vec<Directive>>,
+    /// Envelope-less copies of a record the DAG held as history when boot met
+    /// them, keyed by the stored id (T99 / L-143, decision (59)): an operator
+    /// retyping a held record beside it. Adopted as operator input the moment
+    /// the history copy is held — by the served-set rule or the signature
+    /// pass ([`Self::adopt_typed_copies_of_held_records`]) — as the in-place
+    /// strip remedy would be; dropped by `finalize_operator_input` otherwise
+    /// (the history copy is served, and the typed one is a duplicate).
+    typed_copies: BTreeMap<String, Directive>,
+    /// A typed spelling of a record held beside an enveloped copy of the same
+    /// id (T99 / L-145, decision (59)): the quarantine keeps the enveloped copy
+    /// (L-76), and this keeps the operator's block too, so the compaction
+    /// writes both back and "kept in the file as written" is true.
+    quarantined_typed: BTreeMap<String, Directive>,
     /// The content ids of the entries the live reconcile in progress is
     /// adopting (T85): a complete-envelope record whose parent is not yet in
     /// the DAG may name one that comes later in canonical (date) order in the
@@ -3942,9 +3965,7 @@ impl LedgerService {
                 // pair (T63; see `BootLamportHigh`).
                 InsertResult::Duplicate { content_id } => {
                     lamport_high.note_if_own(directive, &author_id);
-                    if matches!(directive, Directive::Transaction(_)) {
-                        duplicate_copies.push((content_id, (*directive).clone()));
-                    }
+                    duplicate_copies.push((content_id, (*directive).clone()));
                 }
             }
         }
@@ -4082,6 +4103,9 @@ impl LedgerService {
             signature_failed_total: 0,
             release_on_hold: BTreeSet::new(),
             refused_history_closure: BTreeSet::new(),
+            alternative_copies: BTreeMap::new(),
+            typed_copies: BTreeMap::new(),
+            quarantined_typed: BTreeMap::new(),
             reconcile_batch_ids: HashSet::new(),
             unsigned_operator_input: Vec::new(),
             operator_input_with_file_author: BTreeSet::new(),
@@ -4124,15 +4148,34 @@ impl LedgerService {
         // content rule goes with it — before the operator input, so its
         // parents are chosen from what stays.
         content_rule_refused.extend(amount_cap_refused);
-        // T90 / H-24: before the closure is walked, so a record whose file copy
-        // descends from a refused record but whose other copy does not is
-        // judged on the copy every peer can adopt.
-        service.prefer_copies_whose_parents_are_served(duplicate_copies);
-        service.quarantine_descendants_of_refused_history(&content_rule_refused);
+        // T99 / M-72, decision (58): every other copy of a record the file
+        // spells twice is kept, and each step about to hold a record — the
+        // closure below, the served-set rule, the signature pass — first
+        // tries them (`choose_servable_copies`). T90 chose here, once, before
+        // any of those steps had spoken, and judged "its parents resolve"
+        // against a DAG that still held what the closure was about to take.
+        for (content_id, copy) in duplicate_copies {
+            if service.dag.get(&content_id) != Some(&copy) {
+                service
+                    .alternative_copies
+                    .entry(content_id)
+                    .or_default()
+                    .push(copy);
+            }
+        }
+        let closure_held = service.quarantine_descendants_of_refused_history(&content_rule_refused);
 
         // H-13: adopt the operator input, now that the whole history is in
         // place. Same path as a live hand edit, same order boot itself used.
         service.adopt_operator_input_at_boot(operator_input);
+
+        // T99 / L-144: a record the closure held because its parent was a
+        // closure member is servable again once the operator input put a copy
+        // of that parent back (a block retyped beside it, T92 / L-131). The
+        // closure was walked before that copy existed; before T99 the record
+        // came back only at the next boot, after the compaction had rewritten
+        // the parent.
+        service.readmit_closure_members_now_servable(&closure_held);
 
         // T84 / H-23: and what no fresh replica could hold for any other
         // reason — a parent served nowhere, an account that does not admit it.
@@ -4351,41 +4394,28 @@ impl LedgerService {
         let mut tally = AdoptionTally::default();
         for directive in operator_input {
             let content_id = compute_content_id(&directive);
-            if self.dag.get(&content_id).is_some() {
+            // T99 / L-143, decision (59): a line typed beside a record the
+            // DAG holds as history is parked, not dropped — the history copy
+            // may yet be held (the served-set rule, the signature pass), and
+            // then this copy is adopted in its place, as the in-place strip
+            // remedy would be.
+            let stored_id = Self::stored_content_id(&directive);
+            let held_as = [&content_id, &stored_id]
+                .into_iter()
+                .find(|id| self.dag.get(id.as_str()).is_some())
+                .cloned();
+            if let Some(existing) = held_as {
+                if self
+                    .dag
+                    .get(&existing)
+                    .is_some_and(|held| !Self::is_operator_input(held))
+                {
+                    self.typed_copies.entry(existing).or_insert(directive);
+                }
                 tally.duplicates += 1;
                 continue;
             }
-            // Kept as the file spelled it, for the quarantine on refusal.
-            let as_written = directive.clone();
-            // M-47: an author the FILE spelled is the operator's word, and
-            // `finalize_operator_input` must not write this node's id over
-            // it — see `operator_input_with_file_author`.
-            let file_author = directive_author(&directive).map(str::to_owned);
-            match self.adopt_file_directive(
-                directive,
-                content_id.clone(),
-                &mut tally,
-                AdoptionPath::Boot,
-            ) {
-                FileAdoption::Inserted(stored_id) => {
-                    if file_author.is_some() {
-                        self.operator_input_with_file_author
-                            .insert(stored_id.clone());
-                    }
-                    // T79 / H-22: a later step may still refuse this entry.
-                    self.operator_input_as_written
-                        .insert(stored_id.clone(), (content_id, as_written));
-                    self.unsigned_operator_input.push(stored_id);
-                }
-                FileAdoption::Duplicate => {}
-                FileAdoption::Refused => {
-                    Self::quarantine_keeping_envelope(
-                        &mut self.quarantined,
-                        content_id,
-                        as_written,
-                    );
-                }
-            }
+            self.adopt_one_operator_input(directive, content_id, &mut tally);
         }
         if !self.unsigned_operator_input.is_empty() {
             // The file holds these raw; the rewrite is what canonicalises them.
@@ -4414,6 +4444,102 @@ impl LedgerService {
                  QUARANTINED — kept in the file as written, kept out of the DAG, NOT served — \
                  stop the node, repair them, and restart (H-13, H-08)"
             );
+        }
+    }
+
+    /// One entry of [`Self::adopt_operator_input_at_boot`]: adopted as pending
+    /// operator input, or held as the file spelled it.
+    fn adopt_one_operator_input(
+        &mut self,
+        directive: Directive,
+        content_id: String,
+        tally: &mut AdoptionTally,
+    ) -> bool {
+        // Kept as the file spelled it, for the quarantine on refusal.
+        let as_written = directive.clone();
+        // M-47: an author the FILE spelled is the operator's word, and
+        // `finalize_operator_input` must not write this node's id over
+        // it — see `operator_input_with_file_author`.
+        let file_author = directive_author(&directive).map(str::to_owned);
+        match self.adopt_file_directive(directive, content_id.clone(), tally, AdoptionPath::Boot) {
+            FileAdoption::Inserted(stored_id) => {
+                if file_author.is_some() {
+                    self.operator_input_with_file_author
+                        .insert(stored_id.clone());
+                }
+                // T79 / H-22: a later step may still refuse this entry.
+                self.operator_input_as_written
+                    .insert(stored_id.clone(), (content_id, as_written));
+                self.unsigned_operator_input.push(stored_id);
+                true
+            }
+            FileAdoption::Duplicate => false,
+            FileAdoption::Refused => {
+                self.hold_operator_input_as_written(content_id, as_written);
+                false
+            }
+        }
+    }
+
+    /// Adopt the parked typed copy of each record in `held` the DAG no longer
+    /// holds (T99 / L-143, decision (59)): the operator retyped the record
+    /// beside its history copy, and a step has just held that copy — the
+    /// served-set rule (its parent is gone) or the signature pass (its
+    /// envelope was edited). Before T99 the typed copy had been counted a
+    /// duplicate at adoption and the startup compaction dropped it, silently;
+    /// T92's L-131 fix reached only a record the closure held, which leaves
+    /// the DAG before the operator input is adopted. Returns how many were
+    /// adopted.
+    fn adopt_typed_copies_of_held_records(&mut self, held: &BTreeSet<String>) -> usize {
+        let mut tally = AdoptionTally::default();
+        let mut adopted: Vec<String> = Vec::new();
+        for content_id in held {
+            if self.dag.get(content_id).is_some() {
+                continue;
+            }
+            let Some(typed) = self.typed_copies.remove(content_id) else {
+                continue;
+            };
+            let file_id = compute_content_id(&typed);
+            if self.adopt_one_operator_input(typed, file_id, &mut tally) {
+                adopted.push(content_id.clone());
+            }
+        }
+        if !adopted.is_empty() {
+            self.force_compaction = true;
+            info!(
+                ids = %adopted.join(", "),
+                file = %self.file_path.display(),
+                "the ledger file spells these held records twice — as history and as a line                  typed by hand without an envelope; the typed line is adopted as this node's                  own and signed, and replaces the held copy at the next compaction (L-131,                  L-143)"
+            );
+        }
+        if !tally.rejections.is_empty() {
+            warn!(
+                refused = tally.rejections.len(),
+                entries = %tally
+                    .rejections
+                    .iter()
+                    .map(|(id, reason)| format!("{id}: {reason}"))
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+                file = %self.file_path.display(),
+                "ledger file holds a line typed beside a held record that this node refuses to                  adopt; QUARANTINED — kept in the file as written (L-143, H-08)"
+            );
+        }
+        adopted.len()
+    }
+
+    /// Hold operator input as the file spelled it (T79; T99 / L-145): beside
+    /// an enveloped copy of the same record already held, the typed spelling
+    /// is kept too, so the compaction writes both and "kept in the file as
+    /// written" is true. Before T99 [`Self::quarantine_keeping_envelope`] kept
+    /// only the enveloped copy (L-76) and the operator's block was dropped.
+    fn hold_operator_input_as_written(&mut self, file_id: String, written: Directive) {
+        match self.quarantined.get(&file_id) {
+            Some(held) if !Self::is_operator_input(held) => {
+                self.quarantined_typed.insert(file_id, written);
+            }
+            _ => Self::quarantine_keeping_envelope(&mut self.quarantined, file_id, written),
         }
     }
 
@@ -4532,6 +4658,10 @@ impl LedgerService {
             self.quarantine_out_of_dag(&already_open);
             self.quarantine_unservable_history();
         }
+        // T99 / L-143: a line typed beside a record still served is a
+        // duplicate of it; nothing adopts it from here on, and the compaction
+        // keeps the node-written copy.
+        self.typed_copies.clear();
         // T84 / M-57, decision (16): the lamport, stamped here for the first
         // time — boot's was a placeholder that never moved the clock — from
         // the clock the signature pass and the L-87 release have settled, in
@@ -4575,6 +4705,12 @@ impl LedgerService {
             self.quarantine_unservable_history();
         }
         let ids = std::mem::take(&mut self.unsigned_operator_input);
+        // T99 / L-145: a typed copy of a closure member leaves the closure
+        // once it is finalised — not at adoption, when a refusal above could
+        // still hold it and leave the id out of the closure until a restart.
+        for content_id in &ids {
+            self.refused_history_closure.remove(content_id);
+        }
         // Every file-spelled author left names this node (the rest were
         // refused above), so the stamp below writes the id it already has.
         self.operator_input_with_file_author.clear();
@@ -4772,7 +4908,26 @@ impl LedgerService {
                 .map(<[String]>::to_vec)
                 .unwrap_or_default();
             for child in children {
-                if exempt.contains(&child) || unservable.contains_key(&child) {
+                if unservable.contains_key(&child) {
+                    continue;
+                }
+                if exempt.contains(&child) {
+                    // T99 / L-146, decision (60): pending input whose hand-
+                    // spelled parent this walk holds would be refused by the
+                    // rebuild that follows (`rebase_operator_input`, L-75), so
+                    // it is held with the rest, and what descends from it is
+                    // walked now, in this round. T92 left it to another round —
+                    // one full rebuild and one recursion level per link of an
+                    // alternating chain.
+                    if self.is_hand_parented_input(&child) {
+                        unservable.insert(
+                            child.clone(),
+                            format!(
+                                "its openledger-parents names {id}, which is not served (L-75)"
+                            ),
+                        );
+                        frontier.push(child);
+                    }
                     continue;
                 }
                 unservable.insert(child.clone(), format!("it descends from {id}"));
@@ -4780,6 +4935,18 @@ impl LedgerService {
             }
         }
         unservable
+    }
+
+    /// Whether `content_id` is pending operator input the file spelled with
+    /// an `openledger-parents` line (M-47) — the input the rebuild refuses
+    /// when a hand parent leaves the DAG.
+    fn is_hand_parented_input(&self, content_id: &str) -> bool {
+        self.operator_input_as_written
+            .get(content_id)
+            .is_some_and(|(_, written)| {
+                matches!(written, Directive::Transaction(_))
+                    && written.metadata().contains_key(ENVELOPE_KEY_PARENTS)
+            })
     }
 
     /// Quarantine what [`Self::unservable_history`] finds, naming every record
@@ -4793,12 +4960,56 @@ impl LedgerService {
     /// node no peer can help, the remedy is in the file. Returns how many were
     /// quarantined.
     fn quarantine_unservable_history(&mut self) -> usize {
+        // T92 / M-64, decision (39): to a fixpoint, since a rebuild can itself
+        // refuse pending input. T99 / L-146, decision (60): iterated, not
+        // recursive — T92 recursed once per round, so a crafted chain of
+        // hand-parented lines cost one full rebuild per link and aborted the
+        // recovery reload's 2 MiB thread with a stack overflow — and the walk
+        // goes through the input a rebuild would refuse, so a file needs one
+        // round. Each round that changes nothing ends it; one that holds
+        // shrinks the DAG, so the bound is never reached.
+        let mut quarantined = 0usize;
+        for _ in 0..=self.dag.len() {
+            match self.quarantine_unservable_round() {
+                Some(held) => quarantined += held,
+                None => break,
+            }
+        }
+        quarantined
+    }
+
+    /// One round of [`Self::quarantine_unservable_history`]: `None` when
+    /// nothing is unservable, else how many records it held.
+    fn quarantine_unservable_round(&mut self) -> Option<usize> {
         let exempt: HashSet<String> = self.unsigned_operator_input.iter().cloned().collect();
         let unservable = self.unservable_history(&exempt);
         if unservable.is_empty() {
-            return 0;
+            return None;
         }
-        for (content_id, reason) in &unservable {
+        // T99 / M-72, decision (58): another copy whose parents are served,
+        // before the record is held.
+        let doomed: BTreeSet<String> = unservable.keys().cloned().collect();
+        let (doomed, replacements) = self.served_instead(doomed, true);
+        // T99 / L-143, decision (59): a record retyped beside it is held
+        // alone and the typed line adopted in its place; the next round judges
+        // what descends from it against that copy.
+        let retyped: BTreeSet<String> = doomed
+            .iter()
+            .filter(|id| self.typed_copies.contains_key(*id))
+            .cloned()
+            .collect();
+        if !retyped.is_empty() {
+            self.unverified_history.retain(|id| !retyped.contains(id));
+            self.rebuild_dag(&retyped, &replacements);
+            let adopted = self.adopt_typed_copies_of_held_records(&retyped);
+            return Some(retyped.len() - adopted);
+        }
+        if doomed.is_empty() {
+            self.rebuild_dag(&BTreeSet::new(), &replacements);
+            return (!replacements.is_empty()).then_some(0);
+        }
+        for content_id in &doomed {
+            let reason = &unservable[content_id];
             warn!(
                 id = %content_id,
                 reason = %reason,
@@ -4807,7 +5018,7 @@ impl LedgerService {
                  as loaded, kept out of the DAG and every balance, NOT served (H-23, H-08)"
             );
         }
-        let ids: BTreeSet<String> = unservable.into_keys().collect();
+        let ids = doomed;
         self.unverified_history.retain(|id| !ids.contains(id));
         warn!(
             quarantined = ids.len(),
@@ -4826,15 +5037,9 @@ impl LedgerService {
              after it, correct that open's date instead); then restart. Otherwise rebuild \
              this node by the bootstrap join (H-23)"
         );
-        self.quarantine_out_of_dag(&ids);
-        // T92 / M-64, decision (39): to a fixpoint. The rebuild above can
-        // itself refuse pending operator input — a hand-parented line whose
-        // hand parent this rule just held — and that line was exempt from the
-        // walk, so its history descendants were not judged: one of them was
-        // then served over a parent held in the quarantine, silently, and
-        // every later write named it. Each round takes at least one record out
-        // of the DAG, so this ends.
-        ids.len() + self.quarantine_unservable_history()
+        let held = ids.len();
+        self.rebuild_dag(&ids, &replacements);
+        Some(held)
     }
 
     /// The pass behind [`Self::verify_own_history`], without the
@@ -4851,13 +5056,15 @@ impl LedgerService {
         let mut verified = 0usize;
         let mut reattributed: Vec<Directive> = Vec::new();
         // T92 / L-131: an id the file spells twice — a node-written copy boot
-        // loaded as history (and, here, held: its parent is refused, or its
-        // envelope edited) and a hand-typed copy of the same body the operator
-        // added beside it — is in the DAG as the hand copy, pending operator
-        // input. That copy is not history and carries no signature yet; judged
-        // as history it was quarantined ("no openledger-signature") and the
-        // startup compaction dropped the typed block, silently.
-        // `finalize_operator_input` signs it and checks it then.
+        // loaded as history (and held before the operator input was adopted:
+        // the closure took it) and a hand-typed copy of the same body the
+        // operator added beside it — is in the DAG as the hand copy, pending
+        // operator input. That copy is not history and carries no signature
+        // yet; judged as history it was quarantined ("no openledger-signature")
+        // and the startup compaction dropped the typed block, silently.
+        // `finalize_operator_input` signs it and checks it then. (A copy typed
+        // beside a record this pass or the served-set rule holds is parked at
+        // adoption and adopted when that happens — T99 / L-143.)
         let pending: HashSet<&str> = self
             .unsigned_operator_input
             .iter()
@@ -4944,6 +5151,18 @@ impl LedgerService {
             }
             return 0;
         }
+        // T99 / M-72, decision (58): a refused record the file spells twice is
+        // served on its other copy when that one verifies and names served
+        // parents — an API re-entry of a record whose file copy was edited
+        // (A1-2). Before T99 the first copy loaded was the one judged, and the
+        // startup compaction deleted the copy that verified.
+        let edited: BTreeSet<String> = refused
+            .iter()
+            .filter(|(_, reason)| reason.starts_with("signature does not verify"))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let (held, replacements) = self.served_instead(refused.keys().cloned().collect(), false);
+        refused.retain(|content_id, _| held.contains(content_id));
         for (content_id, reason) in &refused {
             warn!(
                 id = %content_id,
@@ -4958,16 +5177,13 @@ impl LedgerService {
                  (H-20, H-08)"
             );
         }
-        let edited: BTreeSet<String> = refused
-            .iter()
-            .filter(|(_, reason)| reason.starts_with("signature does not verify"))
-            .map(|(id, _)| id.clone())
-            .collect();
         let ids: BTreeSet<String> = refused.into_keys().collect();
         let any_edited = !edited.is_empty();
         self.signature_quarantined_total += ids.len();
         self.signature_failed_total += edited.len();
-        self.quarantine_out_of_dag(&ids);
+        self.rebuild_dag(&ids, &replacements);
+        // T99 / L-143, decision (59): a line typed beside a record just held.
+        self.adopt_typed_copies_of_held_records(&ids);
         // T89 / L-99, decision (32): while every signature checked so far has
         // failed, the failures say "wrong mesh id or key", not "edited
         // lamport lines", and releasing the clock past them would re-issue
@@ -4986,6 +5202,9 @@ impl LedgerService {
         // descends from it, and the operator input still pending is rebased
         // away from all of them.
         self.quarantine_unservable_history();
+        if ids.is_empty() {
+            return 0;
+        }
         // T89 (0925 §5): the summary says what the refusals were. Records
         // that carry an author and a lamport but NO signature were not edited
         // — they are a history written before signing was enabled.
@@ -5442,93 +5661,6 @@ impl LedgerService {
         }
     }
 
-    /// Quarantine every record that descends from `refused` — history boot
-    /// refused under a content rule every peer holds it to (T81 / M-51,
-    /// M-52; decision (6)).
-    ///
-    /// No peer accepts a refused record, so nothing whose parents reach it can
-    /// replicate: each would be buffered on its missing parent on every peer,
-    /// forever, while this node served it and counted it. Quarantining the
-    /// closure makes what this node serves the set a fresh replica can hold —
-    /// loudly, every id named, every record kept in the file (H-08) — rather
-    /// than a history no one can sync past. Walks both the children a record
-    /// in the DAG has and the children still waiting on one that is absent.
-    ///
-    /// A refused `open` has dependants without being anyone's parent: the
-    /// transactions on its account. T81 took every transaction on an account
-    /// "no surviving `open` opens" here, before the operator input — by name,
-    /// blind to dates and currencies, and to a hand `open` adopted a moment
-    /// later (M-56). Since T85 (decision (18)) those are judged by
-    /// [`Self::quarantine_unservable_history`] instead, after the operator
-    /// input, with the check a peer applies (`validate_transaction` against the
-    /// accounts this node serves), so a hand `open` that admits them frees them
-    /// in the same boot and one that does not leaves them held. What remains
-    /// here is parenthood, which no later step can repair.
-    /// Of two copies of one transaction body in the loaded file, serve the one
-    /// whose parents this node holds (T90 / H-24, decision (36)).
-    ///
-    /// A content id hashes the body alone, so the canonical file and the
-    /// journal can each spell the same record under a different envelope: the
-    /// file's copy of a record the closure held (its parent a refused record),
-    /// and the journal's copy of the same body re-entered through the API with
-    /// parents this node served. Boot's loop keeps whichever copy it meets
-    /// first, which is canonical order, not merit; when that copy names a
-    /// parent the DAG does not hold and the other does not, the closure took
-    /// the node's own acknowledged record — and every later write on top of
-    /// it — and the wire refused a peer's copy of both. Only an alternative
-    /// whose every parent is in the DAG, and none of them a descendant of the
-    /// record itself, replaces it; everything else stays as loaded. The
-    /// signature pass then judges the copy served.
-    fn prefer_copies_whose_parents_are_served(&mut self, alternatives: Vec<(String, Directive)>) {
-        let mut replacements: BTreeMap<String, Directive> = BTreeMap::new();
-        for (content_id, alternative) in alternatives {
-            if replacements.contains_key(&content_id) {
-                continue;
-            }
-            let (Some(Directive::Transaction(loaded)), Directive::Transaction(other)) =
-                (self.dag.get(&content_id), &alternative)
-            else {
-                continue;
-            };
-            let resolves = |txn: &Transaction| {
-                txn.parent_ids()
-                    .into_iter()
-                    .all(|parent| self.dag.get(parent).is_some())
-            };
-            if resolves(loaded) || !resolves(other) {
-                continue;
-            }
-            // Parents that descend from the record would close a cycle.
-            let mut descendants: HashSet<String> = HashSet::new();
-            let mut frontier = vec![content_id.clone()];
-            while let Some(id) = frontier.pop() {
-                for child in self.dag.children_of(&id).unwrap_or_default() {
-                    if descendants.insert(child.clone()) {
-                        frontier.push(child.clone());
-                    }
-                }
-            }
-            if other
-                .parent_ids()
-                .into_iter()
-                .any(|parent| descendants.contains(parent))
-            {
-                continue;
-            }
-            replacements.insert(content_id, alternative);
-        }
-        if replacements.is_empty() {
-            return;
-        }
-        info!(
-            ids = %replacements.keys().cloned().collect::<Vec<_>>().join(", "),
-            file = %self.file_path.display(),
-            "the ledger file holds two copies of these records; serving the copy whose parents \
-             this node holds, since the other names a parent it does not (H-24)"
-        );
-        self.rebuild_dag(&BTreeSet::new(), &replacements);
-    }
-
     /// Whether `parent` is a record the closure holds back AND this node holds
     /// no copy of (T90 / H-24, decision (36)).
     ///
@@ -5563,9 +5695,40 @@ impl LedgerService {
         );
     }
 
-    fn quarantine_descendants_of_refused_history(&mut self, refused: &BTreeSet<String>) {
+    /// Quarantine every record that descends from `refused` — history boot
+    /// refused under a content rule every peer holds it to (T81 / M-51,
+    /// M-52; decision (6)).
+    ///
+    /// No peer accepts a refused record, so nothing whose parents reach it can
+    /// replicate: each would be buffered on its missing parent on every peer,
+    /// forever, while this node served it and counted it. Quarantining the
+    /// closure makes what this node serves the set a fresh replica can hold —
+    /// loudly, every id named, every record kept in the file (H-08) — rather
+    /// than a history no one can sync past. Walks both the children a record
+    /// in the DAG has and the children still waiting on one that is absent.
+    ///
+    /// A refused `open` has dependants without being anyone's parent: the
+    /// transactions on its account. T81 took every transaction on an account
+    /// "no surviving `open` opens" here, before the operator input — by name,
+    /// blind to dates and currencies, and to a hand `open` adopted a moment
+    /// later (M-56). Since T85 (decision (18)) those are judged by
+    /// [`Self::quarantine_unservable_history`] instead, after the operator
+    /// input, with the check a peer applies (`validate_transaction` against the
+    /// accounts this node serves), so a hand `open` that admits them frees them
+    /// in the same boot and one that does not leaves them held. What remains
+    /// here is parenthood, which no later step can repair.
+    ///
+    /// Since T99 (M-72, decision (58)) a member with another copy whose
+    /// parents are served — the journal's copy of a record re-entered through
+    /// the API or adopted from a peer — is served on that copy instead of
+    /// being held ([`Self::choose_servable_copies`]). Returns the members it
+    /// held, for [`Self::readmit_closure_members_now_servable`].
+    fn quarantine_descendants_of_refused_history(
+        &mut self,
+        refused: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
         if refused.is_empty() {
-            return;
+            return BTreeSet::new();
         }
         let mut closure: BTreeSet<String> = BTreeSet::new();
         let mut frontier: Vec<String> = refused.iter().cloned().collect();
@@ -5580,10 +5743,12 @@ impl LedgerService {
                 }
             }
         }
+        let (closure, replacements) = self.served_instead(closure, true);
         self.refused_history_closure
             .extend(refused.iter().cloned().chain(closure.iter().cloned()));
         if closure.is_empty() {
-            return;
+            self.rebuild_dag(&BTreeSet::new(), &replacements);
+            return closure;
         }
         warn!(
             quarantined = closure.len(),
@@ -5600,7 +5765,206 @@ impl LedgerService {
              under its own id with parents this node serves; peers that hold the old copies \
              adopt the restated ones — or join nodes by bootstrap (M-51, M-52, H-08, H-24)"
         );
-        self.quarantine_out_of_dag(&closure);
+        self.rebuild_dag(&closure, &replacements);
+        closure
+    }
+
+    /// Of `doomed` — records in the DAG a step is about to hold — the ones
+    /// another copy saves, as `(still doomed, replacements)` (T99 / M-72,
+    /// decision (58)). A replacement is served in place of the DAG's copy; the
+    /// displaced copy joins [`Self::alternative_copies`], and each chosen
+    /// alternative leaves it. `dag_copy_acceptable` is false for the
+    /// signature pass, whose doomed copies are the ones it refused.
+    fn served_instead(
+        &mut self,
+        doomed: BTreeSet<String>,
+        dag_copy_acceptable: bool,
+    ) -> (BTreeSet<String>, BTreeMap<String, Directive>) {
+        if doomed.is_empty() {
+            return (doomed, BTreeMap::new());
+        }
+        let chosen = self.choose_servable_copies(&doomed, dag_copy_acceptable, false);
+        let mut doomed = doomed;
+        let mut replacements: BTreeMap<String, Directive> = BTreeMap::new();
+        for (content_id, copy) in chosen {
+            doomed.remove(&content_id);
+            if self.dag.get(&content_id) == Some(&copy) {
+                continue;
+            }
+            if let Some(displaced) = self.dag.get(&content_id).cloned() {
+                let others = self
+                    .alternative_copies
+                    .entry(content_id.clone())
+                    .or_default();
+                others.retain(|other| other != &copy);
+                others.push(displaced);
+            }
+            replacements.insert(content_id, copy);
+        }
+        if !replacements.is_empty() {
+            info!(
+                ids = %replacements.keys().cloned().collect::<Vec<_>>().join(", "),
+                file = %self.file_path.display(),
+                "the ledger file holds two copies of these records; serving the copy every                  peer can adopt — its parents served, its signature verified — instead of                  holding the record (H-24, M-72)"
+            );
+        }
+        (doomed, replacements)
+    }
+
+    /// Which copy of each record in `doomed` a fresh replica could adopt, in
+    /// the order they become adoptable (T99 / M-72, decision (58); L-142).
+    ///
+    /// The candidates for an id are the DAG's copy (when
+    /// `dag_copy_acceptable`), its held copy in the quarantine (when
+    /// `from_quarantine`), and every copy in [`Self::alternative_copies`]. A
+    /// candidate is admissible on its own when its body validates as data
+    /// against the accounts this node serves and — for a copy other than the
+    /// DAG's, once the node has the means — its signature verifies. It is
+    /// chosen once every parent it names is served: a record outside `doomed`
+    /// in the DAG, or a record already chosen. That is a least fixpoint
+    /// computed in one pass over a parent → waiting-candidates index, so the
+    /// cost is linear in the candidates and their parents, and every chosen
+    /// copy's parents were served before it — the choice can never close a
+    /// cycle (A1's D-first re-entry: the file's `D` names `C`, the journal's
+    /// `C` names `D`; only the journal's `D`, naming a served record, starts
+    /// the chain, and T90's per-record descendant walk, quadratic on a
+    /// crafted file, is gone).
+    fn choose_servable_copies(
+        &self,
+        doomed: &BTreeSet<String>,
+        dag_copy_acceptable: bool,
+        from_quarantine: bool,
+    ) -> Vec<(String, Directive)> {
+        let judge_signature = self.verifier.is_some() || self.signer.is_some();
+        let mut served: HashSet<String> = self
+            .dag
+            .ids()
+            .filter(|id| !doomed.contains(*id))
+            .map(str::to_owned)
+            .collect();
+        let mut candidates: Vec<(String, Directive)> = Vec::new();
+        let mut unmet: Vec<usize> = Vec::new();
+        let mut waiting: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut ready: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        for content_id in doomed {
+            let own = self.dag.get(content_id);
+            let mut copies: Vec<&Directive> = Vec::new();
+            if dag_copy_acceptable {
+                copies.extend(own);
+            }
+            if from_quarantine {
+                copies.extend(
+                    self.quarantined
+                        .get(content_id)
+                        .filter(|held| !Self::is_operator_input(held)),
+                );
+            }
+            copies.extend(
+                self.alternative_copies
+                    .get(content_id)
+                    .into_iter()
+                    .flatten(),
+            );
+            for copy in copies {
+                if let Directive::Transaction(txn) = copy {
+                    if validate_transaction_as_data(txn, &self.accounts).is_err() {
+                        continue;
+                    }
+                }
+                if judge_signature
+                    && Some(copy) != own
+                    && matches!(
+                        self.verify_history_directive(content_id, copy),
+                        HistoryVerdict::Refused(_)
+                    )
+                {
+                    continue;
+                }
+                let parents: BTreeSet<String> = match copy {
+                    Directive::Transaction(txn) => txn
+                        .parent_ids()
+                        .into_iter()
+                        .filter(|parent| !served.contains(*parent))
+                        .map(str::to_owned)
+                        .collect(),
+                    _ => BTreeSet::new(),
+                };
+                let index = candidates.len();
+                candidates.push((content_id.clone(), copy.clone()));
+                unmet.push(parents.len());
+                if parents.is_empty() {
+                    ready.push_back(index);
+                }
+                for parent in parents {
+                    waiting.entry(parent).or_default().push(index);
+                }
+            }
+        }
+        let mut chosen: Vec<(String, Directive)> = Vec::new();
+        while let Some(index) = ready.pop_front() {
+            let content_id = candidates[index].0.clone();
+            if !served.insert(content_id.clone()) {
+                continue;
+            }
+            chosen.push(candidates[index].clone());
+            for waiter in waiting.remove(&content_id).unwrap_or_default() {
+                unmet[waiter] -= 1;
+                if unmet[waiter] == 0 {
+                    ready.push_back(waiter);
+                }
+            }
+        }
+        chosen
+    }
+
+    /// Put back closure members whose held copy — or another copy — names only
+    /// records the DAG now holds (T99 / L-144): after the operator input,
+    /// whose retyped copy of a closure member (T92 / L-131) is such a record.
+    /// Each re-admitted record re-enters the DAG, the accounts and the read
+    /// model, leaves the quarantine and the closure, and is judged by the
+    /// signature pass like all history.
+    fn readmit_closure_members_now_servable(&mut self, members: &BTreeSet<String>) {
+        let held: BTreeSet<String> = members
+            .iter()
+            .filter(|id| self.dag.get(id.as_str()).is_none())
+            .cloned()
+            .collect();
+        if held.is_empty() {
+            return;
+        }
+        let chosen = self.choose_servable_copies(&held, false, true);
+        if chosen.is_empty() {
+            return;
+        }
+        let mut readmitted: Vec<String> = Vec::new();
+        for (content_id, copy) in chosen {
+            match self.dag.insert(copy.clone(), false) {
+                Ok(InsertResult::Inserted { .. }) => {
+                    self.accounts.record_lifecycle(&copy, &content_id);
+                    self.read_model.index_directive(&copy);
+                    self.quarantined.remove(&content_id);
+                    self.refused_history_closure.remove(&content_id);
+                    self.unverified_history.insert(content_id.clone());
+                    readmitted.push(content_id);
+                }
+                Ok(InsertResult::Duplicate { .. }) | Err(_) => {}
+            }
+        }
+        *self
+            .directive_id_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .served_id_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        if !readmitted.is_empty() {
+            info!(
+                ids = %readmitted.join(", "),
+                file = %self.file_path.display(),
+                "records the closure held are served again: every parent they name is a                  record this node now serves — a copy of it retyped in the file (L-144, L-131)"
+            );
+        }
     }
 
     /// Hold a directive the rebuild refused in [`Self::quarantined`] (T79):
@@ -5610,7 +5974,7 @@ impl LedgerService {
     fn hold_refused_in_quarantine(&mut self, content_id: &str, directive: Directive) {
         match self.operator_input_as_written.get(content_id).cloned() {
             Some((file_id, written)) => {
-                Self::quarantine_keeping_envelope(&mut self.quarantined, file_id, written);
+                self.hold_operator_input_as_written(file_id, written);
             }
             None => {
                 self.quarantined
@@ -6708,6 +7072,7 @@ impl LedgerService {
             .directives()
             .into_iter()
             .chain(self.live_quarantine().map(|(_, directive)| directive))
+            .chain(self.live_typed_quarantine())
         {
             total += full_file_serialize(std::slice::from_ref(directive), &[]).len() as u64;
             directives += 1;
@@ -6739,14 +7104,24 @@ impl LedgerService {
 
     fn compaction_directives(&self) -> Vec<Directive> {
         let mut directives: Vec<Directive> = self.dag.directives().into_iter().cloned().collect();
-        if self.quarantined.is_empty() {
+        if self.quarantined.is_empty() && self.quarantined_typed.is_empty() {
             return directives;
         }
         directives.extend(
             self.live_quarantine()
                 .map(|(_, directive)| directive.clone()),
         );
+        directives.extend(self.live_typed_quarantine().cloned());
         directives
+    }
+
+    /// The typed spellings held beside an enveloped copy (T99 / L-145), while
+    /// the DAG holds neither.
+    fn live_typed_quarantine(&self) -> impl Iterator<Item = &Directive> + '_ {
+        self.quarantined_typed
+            .iter()
+            .filter(|(content_id, _)| self.dag.get(content_id.as_str()).is_none())
+            .map(|(_, directive)| directive)
     }
 
     /// The quarantined entries that are still the file's only copy of their
@@ -7869,6 +8244,9 @@ impl LedgerService {
         &mut self,
         content: &str,
     ) -> Result<crate::file_watcher::ReconcileResult, ServiceError> {
+        // T99 / L-143: typed copies boot parked belong to the boot pipeline;
+        // the live path adopts what the file holds now, by its own rules.
+        self.typed_copies.clear();
         let content_hash = file_content_hash(content);
         // M-29: is this text the one this service itself last wrote (or read)?
         let is_own_bytes = content_hash == self.last_file_hash;
@@ -8553,8 +8931,11 @@ impl LedgerService {
                             // spells it canonically (see `prepare`).
                             self.adopted_from_file.insert(stored_id.clone());
                             // T90 / H-24: a copy of a closure member with
-                            // parents this node serves; no longer held back.
-                            self.refused_history_closure.remove(&stored_id);
+                            // parents this node serves; no longer held back —
+                            // at boot once finalised (T99 / L-145).
+                            if path == AdoptionPath::Live {
+                                self.refused_history_closure.remove(&stored_id);
+                            }
                             tally.new_directives += 1;
                             FileAdoption::Inserted(stored_id)
                         }
@@ -8651,7 +9032,9 @@ impl LedgerService {
                     self.read_model.index_directive(&directive);
                     // M-46: see the transaction arm above.
                     self.adopted_from_file.insert(content_id.clone());
-                    self.refused_history_closure.remove(&content_id);
+                    if path == AdoptionPath::Live {
+                        self.refused_history_closure.remove(&content_id);
+                    }
                     tally.new_directives += 1;
                     FileAdoption::Inserted(content_id)
                 }
@@ -21585,6 +21968,138 @@ mod tests {
         drop(svc);
         let svc = t85_boot(&path);
         assert!(svc.contains_directive(&id), "and after a restart");
+        remove_ledger_and_journal(&path);
+    }
+
+    /// T99 / M-72 at the served-set rule (decision (58)): the file spells one
+    /// record twice, and the copy boot meets first names a parent that exists
+    /// nowhere (its parents line edited, or a copy restated elsewhere) while
+    /// the other names the parents this node serves. The rule, about to hold
+    /// the record and its child, serves it on the other copy instead: both are
+    /// served, nothing is held, and the compaction keeps that copy.
+    ///
+    /// Bug-catch: drop the rescue from the rule's round and the record and
+    /// its child are held.
+    #[test]
+    fn m72_a_record_first_loaded_over_a_missing_parent_is_served_on_its_other_copy() {
+        let (mut svc, path) = setup_with_accounts();
+        let record = svc.append_transaction(balanced_input()).unwrap().txid;
+        let mut later = balanced_input();
+        later.date = make_date(2024, 1, 20);
+        later.narration = Some("the child".to_owned());
+        let child = svc.append_transaction(later).unwrap().txid;
+        svc.compact().unwrap();
+        drop(svc);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let block = text
+            .split("\n\n")
+            .find(|block| block.contains("\"Funding\""))
+            .expect("the record's block")
+            .to_owned();
+        let dangling = block
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with("openledger-parents:") {
+                    format!("  openledger-parents: \"{}\"", "f".repeat(64))
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_ne!(dangling, block, "premise: the copy names another parent");
+        std::fs::write(
+            &path,
+            text.replacen(&block, &format!("{dangling}\n\n{block}"), 1),
+        )
+        .unwrap();
+        let svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert!(svc.contains_directive(&record) && svc.contains_directive(&child));
+        assert_eq!(svc.quarantined_count(), 0, "{:?}", svc.quarantined_ids());
+        let parents = match svc.get_directive(&record) {
+            Some(Directive::Transaction(txn)) => txn
+                .parent_ids()
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            _ => panic!("the record is a transaction"),
+        };
+        assert!(
+            !parents.contains(&"f".repeat(64)),
+            "served on the other copy"
+        );
+        remove_ledger_and_journal(&path);
+    }
+
+    /// T99 / L-145 (X1-3, decision (59)): the L-131 shape, except the typed
+    /// copy spells another node as its author, so `finalize_operator_input`
+    /// refuses it (M-54). Adoption no longer takes the record out of the
+    /// closure — finalisation does, for what it finalises — so a peer's child
+    /// of the held record is still refused as naming a held-back parent
+    /// (before T99 it was buffered on a missing parent until a restart), and
+    /// the typed spelling stays in the file beside the node-written copy.
+    ///
+    /// Bug-catch: prune the closure at boot adoption again and the peer's
+    /// child is a missing parent; keep only the enveloped spelling and the
+    /// typed block is gone after the compaction.
+    #[test]
+    fn l145_a_typed_copy_refused_at_finalisation_stays_held_back_and_in_the_file() {
+        let (svc, path) = setup_with_signed_accounts();
+        drop(svc);
+        let Directive::Transaction(mut flood) = signed_history_transaction(
+            "over the legacy ceiling",
+            1,
+            ("Assets:Cash", "USD"),
+            "",
+            11,
+        ) else {
+            unreachable!()
+        };
+        flood.postings[0].metadata = (0
+            ..=crate::limits::MAX_POSTING_METADATA_KEYS_PER_TRANSACTION_LEGACY)
+            .map(|index| (format!("k{index}"), "v".to_owned()))
+            .collect();
+        let flood = marker_signed(Directive::Transaction(flood));
+        let held = signed_history_transaction(
+            "child of the flood",
+            2,
+            ("Assets:Cash", "USD"),
+            &compute_content_id(&flood),
+            12,
+        );
+        let id = compute_content_id(&held);
+        let mut typed = held.clone();
+        directive_metadata_mut(&mut typed).retain(|key, _| !key.starts_with("openledger-"));
+        directive_metadata_mut(&mut typed)
+            .insert(ENVELOPE_KEY_AUTHOR.to_owned(), "someone-else".to_owned());
+        append_to_file(
+            &path,
+            &format!("\n{}", full_file_serialize(&[flood, held, typed], &[])),
+        );
+        let mut svc = t85_boot(&path);
+        assert!(
+            !svc.contains_directive(&id),
+            "premise: the typed copy is refused (M-54)"
+        );
+        let mut child = remote_transaction("a peer's child of the held record", false);
+        child
+            .metadata
+            .insert(ENVELOPE_KEY_PARENTS.to_owned(), id.clone());
+        let refused = svc
+            .stage_remote_directive(Directive::Transaction(child))
+            .unwrap_err();
+        assert_eq!(
+            refused.error_code(),
+            "INVALID_INPUT",
+            "the held record is still held back: {refused}"
+        );
+        svc.compact().unwrap();
+        drop(svc);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("openledger-author: \"someone-else\""),
+            "the typed spelling is in the file:\n{text}"
+        );
         remove_ledger_and_journal(&path);
     }
 
