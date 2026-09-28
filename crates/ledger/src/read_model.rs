@@ -529,7 +529,9 @@ pub struct ReadModel {
     ///
     /// Maintained incrementally so the FR-3 AC2 close rule ("no transactions
     /// after the close date") is a lookup instead of a full-DAG scan on every
-    /// local `close`. A set union over the same set `account_postings`
+    /// local `close`, and so is T98's authoring exception
+    /// ([`Self::holds_posting_in`]: a `close` whose interval already holds a
+    /// posting does not bind this node's writes). A set union over the same set `account_postings`
     /// indexes, so it is order-insensitive: every path that puts a
     /// transaction into the DAG also calls [`Self::index_directive`], and
     /// every path that takes one out rebuilds the read model wholesale

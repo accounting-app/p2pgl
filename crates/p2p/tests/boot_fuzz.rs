@@ -70,9 +70,9 @@
 //! `LedgerService` behind the real intake, staging the served set in lamport
 //! order with orphans retried — both questions: everything served is
 //! adopted, and nothing node-written is held that it would adopt in the form
-//! the mesh holds. It is off in [`Checks::ALL`] (no existing case changes)
-//! and on in [`Checks::EXACT`], which `a1_0926_every_operator_…` sweeps over
-//! every operator. Operators `(ai)`–`(ak)` are the shapes T84 names (an
+//! the mesh holds. Since T96 (L-135, decision (52)) it is on in
+//! [`Checks::ALL`], so every sweep runs it; [`Checks::WITHOUT_FRESH_PEER`] is
+//! what `ALL` was before, for the cases that show what check 7 adds. Operators `(ai)`–`(ak)` are the shapes T84 names (an
 //! `open` dated after its transactions, a deleted `open` restored by hand,
 //! the strip-the-envelope remedy). Three cases are `#[ignore]`d with their
 //! finding: A1-1 (a peer's `open` that narrows an account makes the next

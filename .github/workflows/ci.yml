@@ -24,7 +24,7 @@ jobs:
           persist-credentials: false
       # Pinned by SHA, so the toolchain can no longer be inferred from the ref;
       # `toolchain: stable` keeps installing current stable at run time while the
-      # action code stays frozen at this commit (stable branch tip at pin time).
+      # action code stays frozen at this commit (a `master` commit — see T96 below).
       # T89 (0925 §5): re-pinned — `stable` is force-moved, and the previous pin
       # (4360b52) was left unreachable from every ref, one GC away from failing CI.
       # T96 (L-123): pinned on `master` instead. `stable` and the other generated

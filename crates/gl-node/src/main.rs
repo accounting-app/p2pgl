@@ -321,7 +321,9 @@ async fn main() {
     // the one H-08 started with. T47 and T51 widened the quarantine to charset,
     // fan-in and unparsable-block cases, and a banner that says "repair their
     // openledger-parents" sends the operator of a charset or parse failure to
-    // look at a field that is fine.
+    // look at a field that is fine. T103 (0927 §5, M-73): the EVERY-signature
+    // shape — a wrong meshId or key — is not repaired record by record, and a
+    // restatement is made on one node, not on each that prints this.
     if quarantined_count > 0 {
         warn!(
             quarantined = quarantined_count,
@@ -333,10 +335,14 @@ async fn main() {
              balance and NOT replicated. The per-record boot warnings above give each one's \
              reason — its openledger-parents metadata, a disallowed character, excess fan-in, \
              a signature that does not verify, a parent no peer could resolve, or a block that \
-             does not parse at all (named by line number; it has no id). Stop the node, repair \
-             those records in the file, and restart. A repair that changes a record's body \
-             gives it a new id, and what descends from it stays held: restore the original \
-             from a peer or a backup where you can (H-23) (H-08, L-45)"
+             does not parse at all (named by line number; it has no id). If the boot warnings \
+             above include \"EVERY signature this node checked failed\", fix p2p.meshId or the \
+             node key first and repair nothing: the records load again once both are right. \
+             Otherwise stop the node, repair those records in the file, and restart. A repair \
+             that changes a record's body gives it a new id, and what descends from it stays \
+             held: restore the original from a peer or a backup where you can (H-23); where \
+             you cannot, restate the chain on ONE node only, as its warning says — every other \
+             node adopts the restatement and must not restate (H-08, L-45, M-73)"
         );
     }
 

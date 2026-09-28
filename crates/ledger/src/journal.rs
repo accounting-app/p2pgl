@@ -752,8 +752,9 @@ pub fn read_journal(path: &Path, budget: u64) -> Result<JournalScan, JournalErro
             // discriminator: the bytes before the fragment are exactly this
             // record's payload and verify against its own hash, which a torn
             // final record's bytes never do.
+            let later_header = !over_budget && has_later_record_header(&bytes[cursor..]);
             if over_budget
-                || has_later_record_header(&bytes[cursor..])
+                || later_header
                 || has_later_intact_record(&bytes[cursor..], expected_hash)
             {
                 return Err(JournalError::Corrupt {
@@ -769,8 +770,16 @@ pub fn read_journal(path: &Path, budget: u64) -> Result<JournalScan, JournalErro
                         },
                         if over_budget {
                             format!("the claim exceeds the journal budget of {budget} bytes")
-                        } else {
+                        } else if later_header {
                             "a later record header follows it".to_owned()
+                        } else {
+                            // T103 / L-155: `has_later_intact_record` — a
+                            // later append torn anywhere, as little as the
+                            // first byte of its tag (L-105, L-122): no
+                            // header follows, so do not say one does.
+                            "a later append, torn, follows it — the bytes before it verify as \
+                             this record's payload"
+                                .to_owned()
                         }
                     ),
                 });
@@ -2494,7 +2503,9 @@ mod tests {
     /// final record (M-43's accepted policy).
     ///
     /// Bug-catch: drop the `has_later_intact_record` term in the over-claim
-    /// arm and every cut reads `Ok` with one intact record.
+    /// arm and every cut reads `Ok` with one intact record. Since T103
+    /// (L-155) the reason is checked too: it named a later record header,
+    /// which a fragment of a tag is not.
     #[test]
     fn l122_an_over_long_length_over_an_append_torn_inside_its_tag_is_corrupt() {
         for cut in 1..=5usize {
@@ -2512,8 +2523,14 @@ mod tests {
             let over = (torn.len() - header_end + 64).to_string();
             write_private(&path, with_length(&torn, second, &over));
             match read_journal(&path, 64 * 1024 * 1024) {
-                Err(JournalError::Corrupt { offset, .. }) => {
-                    assert_eq!(offset, second as u64, "cut {cut}")
+                Err(JournalError::Corrupt { offset, reason }) => {
+                    assert_eq!(offset, second as u64, "cut {cut}");
+                    // T103 / L-155: no header follows a 1–5-byte fragment.
+                    assert!(
+                        reason.contains("a later append, torn, follows it")
+                            && !reason.contains("record header follows"),
+                        "cut {cut}: {reason}"
+                    );
                 }
                 Ok(scan) => panic!(
                     "cut {cut}: an acknowledged record behind an over-long length was dropped as \

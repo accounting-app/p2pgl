@@ -3593,6 +3593,9 @@ impl LedgerService {
         // T81 / M-52: content ids of text-held blocks refused only for an
         // amount past the cap — see `amount_cap_refused_block_ids`.
         let mut amount_cap_refused: BTreeSet<String> = BTreeSet::new();
+        // T103 / M-73: each such block's line and ids, named once boot knows
+        // whether anything it holds still descends from it.
+        let mut amount_cap_blocks: Vec<(usize, Vec<String>)> = Vec::new();
         // H-20 door (b): set when the per-block salvage produced the
         // directives, which is the one path that can yield a fragment of a
         // record — the I1 arm below runs only then.
@@ -3620,24 +3623,12 @@ impl LedgerService {
                         // the cap parses once the cap is lifted. Held as text
                         // all the same (nothing is admitted); what the lifted
                         // parse buys is its content id, so the records that
-                        // name it as a parent can be found below.
+                        // name it as a parent can be found below. Its WARN
+                        // waits for them (T103 / M-73,
+                        // `warn_amount_cap_block`).
                         if let Some(ids) = amount_cap_refused_block_ids(&block.text) {
-                            warn!(
-                                line = block.line,
-                                ids = %ids.join(", "),
-                                max = %crate::limits::MAX_AMOUNT_MAGNITUDE,
-                                file = %file_path.display(),
-                                "quarantining a ledger-file block with an amount past the cap \
-                                 (|amount| ≤ 10^21) — kept in the file byte-for-byte, kept out of \
-                                 the DAG, NOT in any balance, and with it every record that \
-                                 descends from it (named below): no peer accepts the block, so \
-                                 nothing built on it can replicate. A history written before T65 \
-                                 with base-unit amounts looks like this. Restating the amount in \
-                                 a larger unit gives the record a new id, so what descends from it \
-                                 (whose parents name the old id) stays held (H-23): restate the \
-                                 chain, or join nodes by bootstrap (M-52, M-50, H-08)"
-                            );
-                            amount_cap_refused.extend(ids);
+                            amount_cap_refused.extend(ids.iter().cloned());
+                            amount_cap_blocks.push((block.line, ids));
                             continue;
                         }
                         warn!(
@@ -4232,6 +4223,13 @@ impl LedgerService {
         // against; the rebuild re-chooses the parents of any operator input
         // that named what it takes out, so no hand line is signed over it.
         service.quarantine_unservable_history();
+
+        // T103 / M-73, decision (68a): each block refused for its amount is
+        // named with what this node still holds because of it — and, once
+        // nothing is, as a copy to delete when its restatement is served.
+        for (line, ids) in &amount_cap_blocks {
+            service.warn_amount_cap_block(*line, ids);
+        }
 
         // L-64 (T78): a process start says so when the canonical form will not
         // fit. With operator input pending the check waits for
@@ -5075,9 +5073,9 @@ impl LedgerService {
             "ledger records QUARANTINED because no peer could adopt them: a parent this node \
              does not serve, or a transaction the accounts it serves do not admit, and what \
              descends from them. Serving them would make everything this node writes \
-             afterwards unadoptable by every peer. If a peer holds the missing parent, it \
-             re-supplies it — and these records too — they return: re-supplying the parent \
-             alone brings back only the records a peer also holds. If none does: restore the \
+             afterwards unadoptable by every peer. They return when a peer that holds them \
+             re-supplies the missing parent and then them; a record no peer holds stays held \
+             even after its parent arrives. If no peer holds them: restore the \
              missing record from a backup; or, for this node's own record whose envelope \
              lines were edited, delete that block's openledger-* lines so it is re-adopted \
              under the same id; or add the missing open, dated no later than the first \
@@ -5744,11 +5742,89 @@ impl LedgerService {
         if Self::is_operator_input(directive) {
             return;
         }
+        self.fold_held_own_lamport(directive);
         Self::quarantine_keeping_envelope(
             &mut self.quarantined,
             content_id.to_owned(),
             directive.clone(),
         );
+    }
+
+    /// A record of this node's own that a live reconcile holds in the file
+    /// moves the clock to at least its lamport, as boot counts it
+    /// (`BootLamportHigh::note_if_own`) — T103 / L-141, decision (70a). Before,
+    /// the clock stayed where it was (L-55 governs what is refused and
+    /// dropped, not what is kept), and the node's next writes stamped the held
+    /// record's `(author, lamport)` pair again; once the record was admitted
+    /// (its account opened by hand) both were served.
+    fn fold_held_own_lamport(&mut self, directive: &Directive) {
+        if let (Some(author), Some(lamport)) =
+            (directive_author(directive), directive.lamport_clock())
+        {
+            if is_own_author(author, &self.author_id) {
+                self.lamport_clock = self.lamport_clock.max(lamport);
+            }
+        }
+    }
+
+    /// The boot WARN for a block refused only for an amount past the cap (T81
+    /// / M-52), once the closure, the operator input and the served-set rule
+    /// have spoken (T103 / M-73, decision (68a)). While a record this node
+    /// holds back still names one of the block's ids, the remedy is the
+    /// restatement — on ONE node: two operators following it restate one
+    /// deposit twice, two ids every replica serves. Once nothing does, the
+    /// block is what is left of a record whose restatement this node may
+    /// already serve (adopted from the node that restated it), and the WARN
+    /// says to delete it — or, if no node has restated it, to restate it on
+    /// one.
+    fn warn_amount_cap_block(&self, line: usize, ids: &[String]) {
+        let held: Vec<&str> = self
+            .quarantined
+            .iter()
+            .filter(|(_, directive)| match directive {
+                Directive::Transaction(txn) => txn
+                    .parent_ids()
+                    .into_iter()
+                    .any(|parent| ids.iter().any(|id| id == parent)),
+                _ => false,
+            })
+            .map(|(id, _)| id.as_str())
+            .collect();
+        if held.is_empty() {
+            warn!(
+                line,
+                ids = %ids.join(", "),
+                max = %crate::limits::MAX_AMOUNT_MAGNITUDE,
+                file = %self.file_path.display(),
+                "a ledger-file block with an amount past the cap (|amount| ≤ 10^21) is kept in \
+                 the file byte-for-byte, out of the DAG and every balance, and nothing this node \
+                 holds descends from it. If its restatement is served here — typed on this node, \
+                 or adopted from the one node that restated it — delete this block: it is a \
+                 stale copy of a record the mesh already carries. If no node has restated it, \
+                 restate it on ONE node only, in a larger unit and without its openledger-* \
+                 lines; every other node adopts it from there and must NOT restate (M-52, M-73)"
+            );
+        } else {
+            warn!(
+                line,
+                ids = %ids.join(", "),
+                held = %held.join(", "),
+                max = %crate::limits::MAX_AMOUNT_MAGNITUDE,
+                file = %self.file_path.display(),
+                "quarantining a ledger-file block with an amount past the cap \
+                 (|amount| ≤ 10^21) — kept in the file byte-for-byte, kept out of the DAG, NOT \
+                 in any balance, and with it every record that descends from it (held names \
+                 its children): no peer accepts the block, so nothing built on it can \
+                 replicate. A history written before T65 with base-unit amounts looks like \
+                 this. Restating the amount in a larger unit gives the record a new id, so what \
+                 descends from it (whose parents name the old id) stays held (H-23): restate \
+                 the chain on ONE node only — the record in a larger unit and without its own \
+                 openledger-* lines, and each record that descends from it without its \
+                 openledger-* lines; every other node adopts the restated records from that one \
+                 and must NOT restate (a second restatement is a second deposit every replica \
+                 counts). Or join nodes by bootstrap (M-52, M-50, H-08)"
+            );
+        }
     }
 
     /// Quarantine every record that descends from `refused` — history boot
@@ -5816,10 +5892,12 @@ impl LedgerService {
              refused record can replicate, so serving it would leave this node and every \
              fresh replica with different ledgers. A repair that changes the refused record's \
              body gives it a new id, and what descends from it (whose parents name the old id) \
-             stays held (H-23): repair the chain — restate the refused record, and delete the \
-             openledger-* lines of each record that descends from it, so each is re-adopted \
-             under its own id with parents this node serves; peers that hold the old copies \
-             adopt the restated ones — or join nodes by bootstrap (M-51, M-52, H-08, H-24)"
+             stays held (H-23): repair the chain on ONE node only — restate the refused record \
+             without its own openledger-* lines, and delete the openledger-* lines of each \
+             record that descends from it, so each is re-adopted under its own id with parents \
+             that node serves. Every other node adopts the restated records from it and must \
+             NOT restate: a second restatement is a second record, served and counted by every \
+             replica. Or join nodes by bootstrap (M-51, M-52, H-08, H-24, M-73)"
         );
         self.rebuild_dag(&closure, &replacements);
         closure
@@ -8931,6 +9009,24 @@ impl LedgerService {
         };
         let next_lamport = match next_lamport {
             Ok(value) => value,
+            // T103 / L-140, decision (69a): the ratchet on a complete
+            // envelope is the running node's alone. Boot loads the same bytes
+            // as history, above any ratchet (a bootstrap join relies on it),
+            // so the refusal says how to keep the record rather than holding
+            // it — held live, it would be served only after a restart.
+            Err(error @ ServiceError::LamportAdvance { .. })
+                if !needs_stamp && matches!(path, AdoptionPath::Live) =>
+            {
+                tally.refuse(
+                    content_id,
+                    format!(
+                        "{error} Refused by the running node only (L-140): boot adopts the \
+                         same bytes as history, and this rewrite drops them — to keep the \
+                         record, stop the node, put it back in the file and start it"
+                    ),
+                );
+                return FileAdoption::Refused;
+            }
             Err(error) => {
                 tally.refuse(content_id, error.to_string());
                 return FileAdoption::Refused;
@@ -9067,6 +9163,8 @@ impl LedgerService {
                             _ => None,
                         };
                         if let Some(parent) = missing_parent {
+                            // T103 / L-141: counted, as boot counts it.
+                            self.fold_held_own_lamport(&final_directive);
                             self.quarantined
                                 .entry(stored_id.clone())
                                 .or_insert_with(|| final_directive.clone());
@@ -15999,6 +16097,122 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    /// L-157 (T103; A1 R4d): the T90 hold on the resolved-body cap. A
+    /// complete envelope pasted into the file under a running node, whose body
+    /// is under the cap as the file spells it and one byte over once I2
+    /// resolves its elided posting, is history — not a typed line — so the
+    /// live reconcile holds it in the quarantine and the rewrite keeps it
+    /// (T90 (c) / L-126: the file keeps what boot would keep). The typed line
+    /// of the same shape is refused and dropped (the test below).
+    ///
+    /// Bug-catch: drop `hold_refused_file_entry` from the resolved-body arm of
+    /// `adopt_file_directive` and the rewrite deletes the record.
+    #[test]
+    fn l157_a_full_envelope_over_the_cap_once_resolved_is_held_in_the_file() {
+        let path = test_file_path();
+        std::fs::write(&path, "").unwrap();
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+
+        let measure = |asset: &str, equity: &str, elide: bool| -> usize {
+            let directive = Directive::Transaction(Transaction {
+                date: make_date(2024, 3, 1),
+                flag: Flag::Complete,
+                payee: Some("Hand".to_owned()),
+                narration: Some("Straddle".to_owned()),
+                tags: vec![],
+                links: vec![],
+                postings: vec![
+                    Posting {
+                        account: asset.to_owned(),
+                        amount: Some(Amount {
+                            number: dec!(1),
+                            currency: "USD".to_owned(),
+                        }),
+                        cost: None,
+                        price: None,
+                        metadata: BTreeMap::new(),
+                    },
+                    Posting {
+                        account: equity.to_owned(),
+                        amount: if elide {
+                            None
+                        } else {
+                            Some(Amount {
+                                number: dec!(-1),
+                                currency: "USD".to_owned(),
+                            })
+                        },
+                        cost: None,
+                        price: None,
+                        metadata: BTreeMap::new(),
+                    },
+                ],
+                metadata: BTreeMap::new(),
+            });
+            crate::serialize::economic_canonical_serialize(&directive).len()
+        };
+
+        // Start from a base pair, then grow the equity name until the RESOLVED
+        // body is exactly one byte over the cap.
+        let asset = long_account("Assets", MAX_ECONOMIC_BEAN_LENGTH / 2 - 256);
+        let base = long_account("Equity", MAX_ECONOMIC_BEAN_LENGTH / 2 - 256);
+        let short = measure(&asset, &base, false);
+        assert!(
+            short <= MAX_ECONOMIC_BEAN_LENGTH,
+            "the base pair must leave room to grow, got {short}"
+        );
+        // Growing the account name by one character grows the body by exactly
+        // one, so the pad is exact rather than searched for.
+        let equity = format!("{base}{}", "a".repeat(MAX_ECONOMIC_BEAN_LENGTH + 1 - short));
+        assert_eq!(
+            measure(&asset, &equity, false),
+            MAX_ECONOMIC_BEAN_LENGTH + 1,
+            "premise: the resolved body is one byte over the cap"
+        );
+        assert!(
+            measure(&asset, &equity, true) <= MAX_ECONOMIC_BEAN_LENGTH,
+            "premise: the ELIDED body — the one the file spells — is under it, \
+             so only the post-resolution check can catch this"
+        );
+
+        svc.open_account(asset.clone(), make_date(2024, 1, 1), vec![])
+            .unwrap();
+        svc.open_account(equity.clone(), make_date(2024, 1, 1), vec![])
+            .unwrap();
+        svc.compact().unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{content}\n\
+                 2024-03-01 * \"Hand\" \"Straddle\"\n\
+                 \x20 openledger-author: \"peer-x\"\n\
+                 \x20 openledger-lamport: \"5\"\n\
+                 \x20 openledger-parents: \"\"\n\
+                 \x20 openledger-signature: \"{}\"\n\
+                 \x20 {asset}                              1.00 USD\n\
+                 \x20 {equity}\n",
+                "ab".repeat(64)
+            ),
+        )
+        .unwrap();
+
+        let result = svc.reconcile_file().unwrap();
+        assert_eq!(
+            (result.rejected, result.new_directives),
+            (1, 0),
+            "premise: the post-I2 body is over the cap and is refused"
+        );
+        assert!(transaction_named(&svc, "Straddle").is_none(), "not served");
+        assert_eq!(svc.quarantined_ids().len(), 1, "held in the quarantine");
+        svc.compact().unwrap();
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("Straddle"),
+            "the rewrite keeps a held full envelope in the file"
+        );
+        remove_ledger_and_journal(&path);
+    }
+
     #[test]
     fn test_reconcile_rejects_a_body_that_only_crosses_the_cap_once_i2_resolves() {
         // The sharp edge of L-02 on this path, and the reason the cap is
@@ -19347,9 +19561,16 @@ mod tests {
         remove_ledger_and_journal(&path);
     }
 
-    /// L-55: a reconcile entry that is rejected after the stamp point leaves
-    /// the Lamport clock exactly where it was, and the next authored envelope
-    /// continues from there.
+    /// L-55: a reconcile entry that is rejected after the stamp point, and
+    /// dropped by the rewrite, leaves the Lamport clock exactly where it was,
+    /// and the next authored envelope continues from there.
+    ///
+    /// Since T103 (L-141, decision (70a)) the entry is a half envelope — a
+    /// hand-typed lamport, no author — which the reconcile refuses and the
+    /// rewrite drops. Until then it carried this node's author too: history
+    /// that T90 holds in the file, and whose lamport boot counts
+    /// (`BootLamportHigh`), so the running node now counts it as well
+    /// (`a1_0927_a_held_own_record_s_lamport_is_never_re_issued`, `l141_…`).
     ///
     /// Bug-catch: move `self.lamport_clock = next_lamport` back above the
     /// validation in `adopt_file_directive` and the clock jumps to 5000.
@@ -19362,14 +19583,16 @@ mod tests {
         append_to_file(
             &path,
             "\n2024-02-01 * \"Hand\" \"unbalanced\"\n  \
-             openledger-author: \"test-peer\"\n  \
              openledger-lamport: \"5000\"\n  \
-             openledger-parents: \"\"\n  \
              Assets:Cash                                        250.00 USD\n  \
              Equity:Opening                                     -10.00 USD\n",
         );
         let (result, _) = capture_warnings(|| svc.reconcile_file());
         assert_eq!(result.unwrap().rejected, 1);
+        assert!(
+            svc.quarantined_ids().is_empty(),
+            "premise: operator input the reconcile refuses is dropped, not held"
+        );
         assert_eq!(
             svc.lamport_clock(),
             before,

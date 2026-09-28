@@ -2776,16 +2776,20 @@ fn a1_0927_after_a_crash_a_re_entered_signature_held_record_is_served() {
     let _ = std::fs::remove_dir_all(fresh_path.parent().expect("dir"));
 }
 
-/// A1-3 (0927), T90 (c) / L-126's list: a peer's complete envelope pasted
-/// into the file whose lamport is 2^32 + 10 above this node's clock. The live
-/// reconcile refuses it under the adoption ratchet (`LAMPORT_ADVANCE`, H-12)
-/// and the canonical re-persist deletes it from the file; boot of the same
-/// bytes — the node stopped, the same paste — loads it as history and serves
-/// it (the trusted-bootstrap join relies on exactly that). README's live
-/// bullet says a full envelope "is kept when boot would keep it".
+/// A1-3 (0927), T90 (c) / L-126's list; L-140 (T103, decision (69a)): a
+/// peer's complete envelope pasted into the file whose lamport is 2^32 + 10
+/// above this node's clock. The live reconcile refuses it under the adoption
+/// ratchet (`LAMPORT_ADVANCE`, H-12) and the canonical re-persist drops it;
+/// boot of the same bytes — the node stopped, the same paste — loads it as
+/// history and serves it (the trusted-bootstrap join relies on exactly
+/// that). The refusal is the running node's alone, and says so: its reason
+/// names L-140 and how to keep the record (stop, put it back, start), which
+/// README's live bullet documents.
+///
+/// Bug-catch: drop the live-only clause from the refusal and the logged
+/// reason no longer tells the operator how to keep the record.
 #[test]
-#[ignore = "A1-3: the live reconcile deletes from the file a pasted complete envelope over the lamport ratchet, which boot of the same bytes serves"]
-fn a1_0927_a_pasted_record_over_the_lamport_ratchet_is_kept_in_the_file_as_boot_keeps_it() {
+fn a1_0927_a_pasted_record_over_the_lamport_ratchet_is_refused_live_only_and_says_how_to_keep_it() {
     let a = std::sync::Arc::new(key());
     let b = PeerKeySignatureProvider::from_bytes(&[0x51; 32], MESH_ID.to_owned());
     let jumped = signed_transfer(
@@ -2798,6 +2802,7 @@ fn a1_0927_a_pasted_record_over_the_lamport_ratchet_is_kept_in_the_file_as_boot_
     );
     let jumped_id = compute_content_id(&jumped);
     let mut kept = Vec::new();
+    let mut live_log = String::new();
     for label in ["live", "boot"] {
         let (mut node, path) = a2_node_with_accounts(&format!("a1-3-{label}"), &a);
         if label == "boot" {
@@ -2806,7 +2811,9 @@ fn a1_0927_a_pasted_record_over_the_lamport_ratchet_is_kept_in_the_file_as_boot_
             node = a2_restart(&path, &a);
         } else {
             a2_append(&path, std::slice::from_ref(&jumped));
-            node.reconcile_file().expect("reconcile");
+            let (result, logged) = capture_warnings(|| node.reconcile_file());
+            result.expect("reconcile");
+            live_log = logged;
         }
         let served = node.contains_directive(&jumped_id);
         node.compact().expect("compact");
@@ -2817,25 +2824,37 @@ fn a1_0927_a_pasted_record_over_the_lamport_ratchet_is_kept_in_the_file_as_boot_
         drop(node);
         let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
     }
+    assert_eq!(
+        kept,
+        vec![("live", false, false), ("boot", true, true)],
+        "(path, served, file keeps it)"
+    );
     assert!(
-        kept.iter().all(|(_, _, in_file)| *in_file),
-        "A1-3: (path, served, file keeps it) = {kept:?}"
+        live_log.contains(&jumped_id)
+            && live_log.contains("H-12 adoption ratchet")
+            && live_log.contains("Refused by the running node only (L-140)")
+            && live_log.contains("stop the node, put it back in the file and start it"),
+        "the live refusal says it is live-only and how to keep the record: {live_log}"
     );
 }
 
-/// A1-4 (0927), T90 (d): the reworded closure WARN, followed literally on
-/// every node that prints it. A pre-T65 mesh replicated `X` (5 × 10^22), its
-/// child `C` and grandchild `G`; after the upgrade EVERY node's closure holds
-/// `C` and `G` and every node logs "repair the chain — restate the refused
-/// record, and delete the openledger-* lines of each record that descends from
-/// it … peers that hold the old copies adopt the restated ones". The operators
-/// of A and B each do so, the same unit, B's narration marked "(restated)" —
-/// two restatements of one deposit, two ids. Since T90 each node adopts the
-/// other's restated `X` (a new root) and dedups `C`/`G` by id, so the mesh
-/// converges — on BOTH deposits: `Assets:Cash` counts the refused amount once
-/// per operator who followed the text.
+/// A1-4 (0927), T90 (d); M-73 (T103, decision (68a)): the restate remedy,
+/// followed as the WARNs now give it. A pre-T65 mesh replicated `X` (5 ×
+/// 10^22), its child `C` and grandchild `G`; after the upgrade every node's
+/// closure holds `C` and `G`. Before T103 every node's WARN told its operator
+/// to restate `X`, and operators of A and B who each did so restated one
+/// deposit twice — two ids, both served, `Assets:Cash` counting the refused
+/// amount once per operator. The WARN now says to restate on ONE node and
+/// that the others adopt it and must NOT restate: A's operator restates
+/// (`X` in a larger unit without its envelope, `C` and `G` without theirs),
+/// B's does nothing. B adopts A's `X` and A's copies of `C` and `G`, and its
+/// next boot's WARN for the old block says to delete it.
+///
+/// Bug-catch: make `warn_amount_cap_block` give the held-descendants text
+/// whatever is held and B's restart never says "delete this block"; restore
+/// the closure WARN's pre-T103 text and B's first boot does not say to repair
+/// on one node.
 #[test]
-#[ignore = "A1-4: the closure WARN tells every node's operator to restate the refused record; two restatements are two records every replica serves"]
 fn a1_0927_the_restate_remedy_followed_on_two_nodes_counts_the_deposit_once() {
     let author = std::sync::Arc::new(key());
     let over = Decimal::from_str_exact("50000000000000000000000").expect("5 × 10^22");
@@ -2858,45 +2877,59 @@ fn a1_0927_the_restate_remedy_followed_on_two_nodes_counts_the_deposit_once() {
         &compute_content_id(&c),
         5,
     );
-    let restated = |narration: &str| {
+    let restated = {
         let Directive::Transaction(mut txn) = a2_stripped(&x) else {
             unreachable!()
         };
-        txn.narration = Some(narration.to_owned());
         for posting in &mut txn.postings {
             let amount = posting.amount.as_mut().expect("explicit");
             amount.number /= Decimal::from_str_exact("1000000000000000000000").expect("10^21");
         }
         Directive::Transaction(txn)
     };
+    let files = [
+        // A's operator followed the WARN: the one restatement.
+        vec![
+            opening.clone(),
+            cash.clone(),
+            restated,
+            a2_stripped(&c),
+            a2_stripped(&g),
+        ],
+        // B's operator did not restate: the pre-upgrade history, untouched.
+        vec![opening.clone(), cash.clone(), x, c.clone(), g.clone()],
+    ];
     let mut nodes = Vec::new();
-    for (label, seed, narration) in [
-        ("a", 0x50u8, "X pre-upgrade"),
-        ("b", 0x52, "X pre-upgrade (restated)"),
-    ] {
+    let mut first_boot_b = String::new();
+    for ((label, seed), file) in [("a", 0x50u8), ("b", 0x52)].into_iter().zip(files) {
         let key = std::sync::Arc::new(PeerKeySignatureProvider::from_bytes(
             &[seed; 32],
             MESH_ID.to_owned(),
         ));
         let path = scratch_ledger(&format!("a1-4-{label}"));
-        std::fs::write(
-            &path,
-            ledger::serialize::full_file_serialize(
-                &[
-                    opening.clone(),
-                    cash.clone(),
-                    restated(narration),
-                    a2_stripped(&c),
-                    a2_stripped(&g),
-                ],
-                &[],
-            ),
-        )
-        .expect("write");
-        let node = a2_restart(&path, &key);
-        assert!(node.quarantined_ids().is_empty(), "{label}: premise");
-        nodes.push((node, path));
+        std::fs::write(&path, ledger::serialize::full_file_serialize(&file, &[])).expect("write");
+        let (node, logged) = capture_warnings(|| a2_restart(&path, &key));
+        if label == "b" {
+            first_boot_b = logged;
+            let held = node.quarantined_ids();
+            assert!(
+                held.contains(&compute_content_id(&c).as_str())
+                    && held.contains(&compute_content_id(&g).as_str()),
+                "premise: B's closure holds C and G ({held:?})"
+            );
+        } else {
+            assert!(node.quarantined_ids().is_empty(), "{label}: premise");
+        }
+        nodes.push((node, path, key));
     }
+    assert!(
+        first_boot_b.contains("held names its children")
+            && first_boot_b.contains("repair the chain on ONE node only")
+            && first_boot_b.contains("on ONE node only")
+            && first_boot_b.contains("must NOT restate")
+            && !first_boot_b.contains("delete this block"),
+        "M-73: B's WARNs say to restate on one node and not on the others: {first_boot_b}"
+    );
     // Anti-entropy both ways, until nothing more stages.
     for _ in 0..3 {
         for (from, to) in [(0usize, 1usize), (1, 0)] {
@@ -2919,27 +2952,41 @@ fn a1_0927_the_restate_remedy_followed_on_two_nodes_counts_the_deposit_once() {
             .balances["USD"]
             .to_string()
     };
-    let balances: Vec<String> = nodes.iter().map(|(node, _)| cash_on(node)).collect();
-    let deposits: Vec<usize> = nodes
-        .iter()
-        .map(|(node, _)| {
-            node.dag()
-                .directives()
-                .into_iter()
-                .filter(|directive| {
-                    matches!(directive, Directive::Transaction(txn)
-                        if txn.narration.as_deref().is_some_and(|n| n.starts_with("X pre-upgrade")))
-                })
-                .count()
-        })
-        .collect();
+    let deposits = |node: &LedgerService| {
+        node.dag()
+            .directives()
+            .into_iter()
+            .filter(|directive| {
+                matches!(directive, Directive::Transaction(txn)
+                    if txn.narration.as_deref().is_some_and(|n| n.starts_with("X pre-upgrade")))
+            })
+            .count()
+    };
+    let balances: Vec<String> = nodes.iter().map(|(node, _, _)| cash_on(node)).collect();
+    let counts: Vec<usize> = nodes.iter().map(|(node, _, _)| deposits(node)).collect();
     assert_eq!(
-        deposits,
-        vec![1, 1],
-        "A1-4: restated deposits served per node {deposits:?}, Assets:Cash {balances:?} (one \
-         restatement: 64 USD)"
+        (counts.clone(), balances.clone()),
+        (vec![1, 1], vec!["64".to_owned(), "64".to_owned()]),
+        "A1-4: restated deposits served per node {counts:?}, Assets:Cash {balances:?}"
     );
-    for (node, path) in nodes {
+    // B's next boot: the old block is all that is left of X, and nothing B
+    // holds descends from it any more.
+    let (mut b, b_path, b_key) = nodes.pop().expect("b");
+    b.compact().expect("compact");
+    drop(b);
+    let (b, logged) = capture_warnings(|| a2_restart(&b_path, &b_key));
+    assert!(
+        logged.contains("delete this block") && !logged.contains("held names its children"),
+        "M-73: B's restart names the old block as a copy to delete: {logged}"
+    );
+    assert_eq!(
+        (deposits(&b), cash_on(&b), b.quarantined_ids().len()),
+        (1, "64".to_owned(), 0),
+        "B after the restart"
+    );
+    drop(b);
+    let _ = std::fs::remove_dir_all(b_path.parent().expect("dir"));
+    for (node, path, _) in nodes {
         drop(node);
         let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
     }
@@ -2954,10 +3001,14 @@ fn a1_0927_the_restate_remedy_followed_on_two_nodes_counts_the_deposit_once() {
 /// bytes; now the bytes stay, held, and the node's next writes stamp the
 /// held record's `(author, lamport)` pair again. Boot counts a held own
 /// record (`BootLamportHigh`: "ignoring its value could re-issue its pair");
-/// the live hold does not. Once the account is opened by hand the held record
-/// is served beside the new one that carries its pair.
+/// the live hold did not. Once the account is opened by hand the held record
+/// was served beside the new one that carries its pair. Since T103 (L-141,
+/// decision (70a)) the live hold folds the held record's lamport into the
+/// clock, as boot does.
+///
+/// Bug-catch: drop the fold from `hold_refused_file_entry` and two served
+/// records carry the pair.
 #[test]
-#[ignore = "A1-5: a record the live reconcile now holds in the file is not folded into the clock, so the node re-issues its own (author, lamport) pair"]
 fn a1_0927_a_held_own_record_s_lamport_is_never_re_issued() {
     let a = std::sync::Arc::new(key());
     let (mut node, path) = a2_node_with_accounts("a1-5", &a);
@@ -3041,6 +3092,43 @@ fn a1_0927_a_held_own_record_s_lamport_is_never_re_issued() {
         "A1-5: clock {clock_after_hold} after holding a record at lamport {pasted_lamport}; \
          {on_disk} records on disk and {served_with_pair} served carry this node's pair \
          (author, {pasted_lamport})"
+    );
+    drop(node);
+    let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+}
+
+/// L-141 (T103, decision (70a)), the T85 arm: this node's own complete
+/// envelope pasted into the file naming a parent this node does not serve is
+/// held in the quarantine on its parent (M-56, H-23) — and its lamport now
+/// moves the clock, so the node's next write never stamps the held record's
+/// `(author, lamport)` pair. Boot of the same bytes counts it.
+///
+/// Bug-catch: drop the fold from the T85 missing-parent hold and the next
+/// write carries the held record's lamport.
+#[test]
+fn l141_a_held_own_record_on_a_missing_parent_moves_the_clock() {
+    let a = std::sync::Arc::new(key());
+    let (mut node, path) = a2_node_with_accounts("l141-parent", &a);
+    let pasted_lamport = node.lamport_clock() + 3;
+    let pasted = signed_transfer(
+        &a,
+        5,
+        "own, on a missing parent",
+        Decimal::from(3),
+        &"f".repeat(64),
+        pasted_lamport,
+    );
+    let pasted_id = compute_content_id(&pasted);
+    a2_append(&path, std::slice::from_ref(&pasted));
+    node.reconcile_file().expect("reconcile");
+    assert!(
+        node.quarantined_ids().contains(&pasted_id.as_str()),
+        "premise: held on its parent (T85)"
+    );
+    assert!(
+        node.lamport_clock() >= pasted_lamport,
+        "L-141: clock {} after holding this node's record at lamport {pasted_lamport}",
+        node.lamport_clock()
     );
     drop(node);
     let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
@@ -3338,4 +3426,80 @@ fn a1_0927_after_a_crash_a_restated_chain_adopted_from_a_peer_is_still_served() 
     for path in [&a_path, &b_path] {
         let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
     }
+}
+
+/// A process-wide default subscriber that records nothing but is interested in
+/// every callsite (T96 / L-135). Tracing caches each callsite's interest; a
+/// callsite first hit by a test with no subscriber of its own was cached as
+/// "never", and a concurrent capture's rebuild could miss a registration still
+/// in flight — the capturing test then lost that one line (the log checks that
+/// failed in two gates, and `m51_…` beside the T85 tests, deterministically).
+/// With this installed, no callsite is ever "never"; each thread's scoped
+/// subscriber decides.
+fn ensure_every_callsite_is_interesting() {
+    struct Interested;
+    impl tracing::Subscriber for Interested {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(Interested);
+        tracing::callsite::rebuild_interest_cache();
+    });
+}
+
+/// Every WARN (and ERROR) `body` logs on this thread, one line per event
+/// with its fields (T89; the boot fuzzer's minimal subscriber, so the test
+/// needs nothing beyond `tracing`).
+fn capture_warnings<T>(body: impl FnOnce() -> T) -> (T, String) {
+    ensure_every_callsite_is_interesting();
+    use std::fmt::Write as _;
+    use std::sync::{Arc, Mutex};
+
+    struct Fields(String);
+    impl tracing::field::Visit for Fields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let _ = write!(self.0, "{}={:?} ", field.name(), value);
+        }
+    }
+    struct Capture(Arc<Mutex<String>>);
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            let mut logged = self.0.lock().unwrap();
+            logged.push_str(&fields.0);
+            logged.push('\n');
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+    let logged = Arc::new(Mutex::new(String::new()));
+    let value = tracing::subscriber::with_default(Capture(Arc::clone(&logged)), body);
+    let text = logged.lock().unwrap().clone();
+    (value, text)
 }
