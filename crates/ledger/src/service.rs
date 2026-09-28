@@ -220,7 +220,10 @@ type StagedFrontier = (
 /// calls this after taking the ledger lock, as the boot's own sweep runs.
 pub fn sweep_temporaries_beside_the_link(configured: &Path, resolved: &Path) {
     if configured != resolved {
-        sweep_stale_temporaries(configured);
+        // T101 / L-139: never the link's own target — an operator may name
+        // the real file `<link>.tmp` beside the link, and the sweep deleted
+        // it, so boot started an empty ledger.
+        sweep_stale_temporaries(configured, Some(resolved));
     }
 }
 
@@ -238,10 +241,19 @@ pub fn sweep_temporaries_beside_the_link(configured: &Path, resolved: &Path) {
 /// because writes never reuse a name. Best effort: a failure here never fails
 /// the boot. (Library users that run several writers on one ledger without
 /// that lock keep the pre-T30 exposure, as `persist_atomically` documents.)
-fn sweep_stale_temporaries(path: &Path) {
+fn sweep_stale_temporaries(path: &Path, keep: Option<&Path>) {
     let Some(file_name) = path.file_name() else {
         return;
     };
+    #[cfg(unix)]
+    let kept = keep
+        .and_then(|keep| std::fs::metadata(keep).ok())
+        .map(|metadata| {
+            use std::os::unix::fs::MetadataExt;
+            (metadata.dev(), metadata.ino())
+        });
+    #[cfg(not(unix))]
+    let _ = keep;
     let ledger_name = file_name.to_string_lossy();
     let directory = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -260,6 +272,18 @@ fn sweep_stale_temporaries(path: &Path) {
         let Ok(metadata) = std::fs::symlink_metadata(&candidate) else {
             continue;
         };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if kept == Some((metadata.dev(), metadata.ino())) {
+                info!(
+                    path = %candidate.display(),
+                    "an entry named like a ledger temporary file is the ledger itself (the \
+                     target of the ledger link); leaving it alone (L-139)"
+                );
+                continue;
+            }
+        }
         let file_type = metadata.file_type();
         #[cfg(unix)]
         let ours = {
@@ -3413,12 +3437,12 @@ impl LedgerService {
         // "absent" and replaced by an empty ledger.
         if matches!(mode, BootMode::Fresh) {
             // L-57: once per process start, clear what crashed rewrites left.
-            sweep_stale_temporaries(&file_path);
+            sweep_stale_temporaries(&file_path, None);
             // T87: and what a build that still wrote beside the LINK left
             // there (`<link>.tmp.*`); since T82 temp files sit beside the
             // target, so nothing else ever cleans those up.
             if file_path != configured {
-                sweep_stale_temporaries(&configured);
+                sweep_stale_temporaries(&configured, Some(&file_path));
             }
         }
         let content = match read_ledger_file(&file_path) {

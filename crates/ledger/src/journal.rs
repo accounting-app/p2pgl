@@ -260,7 +260,17 @@ fn resolve_link_in_its_directory(
     let name = CString::new(name.as_bytes())?;
     let this_uid = effective_uid();
 
-    let directory = std::fs::File::open(link_directory)?;
+    // T101 / L-138: `O_DIRECTORY | O_NONBLOCK`, so whatever sits at the path
+    // by now — a FIFO an ancestor's writer swapped in — fails at once
+    // (`ENOTDIR`) instead of blocking boot before the lock, silently. T87 only
+    // `stat`ed the directory and could not hang.
+    let directory = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NONBLOCK)
+            .open(link_directory)?
+    };
     let directory_metadata = directory.metadata()?;
     let mode = directory_metadata.mode() & 0o7777;
     if directory_metadata.uid() != this_uid || mode & 0o022 != 0 {
@@ -281,13 +291,20 @@ fn resolve_link_in_its_directory(
     // T94 / L-120, decision (47): on macOS an ACL can let other accounts add
     // and remove entries in a directory whose mode bits say they cannot (on
     // Linux a POSIX ACL shows in the group bits the check above reads).
+    // T101 / L-137, decision (65): only an entry that does — an allow entry,
+    // in force on the directory itself, granting add-file, add-subdirectory,
+    // delete-child, write-security or change-owner. Any ACL at all was refused
+    // before, macOS's own `group:everyone deny delete` on `~`, `~/Documents`,
+    // `~/Desktop` and `~/Downloads` included, and the `chmod -N` remedy
+    // stripped that protection from the home folder.
     #[cfg(target_os = "macos")]
-    if directory_has_extended_acl(&directory) {
+    if directory_acl_lets_others_write(&directory) {
         return Err(refuse(format!(
-            "ledger path {} is a symbolic link in {}, a directory carrying an access control \
-             list (ls -le shows it); an ACL can let other accounts replace the link, so it is \
-             not followed — remove the ACL (chmod -N), keep the link in a directory only this \
-             node's user can write, or point ledgerPath at the real file (M-60, L-120)",
+            "ledger path {} is a symbolic link in {}, a directory whose access control list \
+             (ls -le shows it) lets an account add or remove entries in it; that account could \
+             replace the link, so it is not followed — remove that entry (chmod -a), keep the \
+             link in a directory only this node's user can write, or point ledgerPath at the \
+             real file (M-60, L-120, L-137)",
             configured.display(),
             link_directory.display()
         )));
@@ -334,6 +351,34 @@ fn resolve_link_in_its_directory(
             "ledger path {} does not lead to the file its link names when followed through the \
              link's own directory (it resolves to {}): the link or a directory above it changed \
              while it was being checked; refusing to follow it (M-68)",
+            configured.display(),
+            resolved.display()
+        )));
+    }
+    // T101 / M-71, decision (64): and it is that file IN the directory the link
+    // names. A hard link elsewhere has the same `(dev, ino)`: with the link's
+    // directory swapped for another between the handle and `canonicalize`, the
+    // second walk followed the other directory's link to a hard link of the
+    // target inside a directory no check had seen — one its owner writes —
+    // and the node then compacted, journalled and read there (A5-1). The
+    // target's directory, reached through the handle, must be the directory
+    // of the returned path.
+    let target_bytes = target.as_bytes();
+    let target_directory: &[u8] = match target_bytes.iter().rposition(|&byte| byte == b'/') {
+        Some(0) => b"/",
+        Some(index) => &target_bytes[..index],
+        None => b".",
+    };
+    let named = stat_at(&directory, &CString::new(target_directory)?, 0)?;
+    let Some(parent) = resolved.parent() else {
+        return Ok(None);
+    };
+    let at_parent = std::fs::metadata(parent)?;
+    if (at_parent.dev(), at_parent.ino()) != (named.st_dev as u64, named.st_ino as u64) {
+        return Err(refuse(format!(
+            "ledger path {} resolves to {}, which is not in the directory its link names: a \
+             directory above the link changed while it was being checked; refusing to follow it \
+             (M-68, M-71)",
             configured.display(),
             resolved.display()
         )));
@@ -392,7 +437,7 @@ fn read_link_at(
     Ok(std::ffi::CString::new(buffer)?)
 }
 
-/// `openat(directory, path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)`,
+/// `openat(directory, path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY | O_CLOEXEC)`,
 /// as an owned file (T94 / M-68). Relative paths resolve from `directory`;
 /// a final component that is a symbolic link fails with `ELOOP`.
 #[cfg(unix)]
@@ -408,7 +453,9 @@ fn open_at_no_follow(
         let descriptor = libc::openat(
             directory.as_raw_fd(),
             path.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            // T101: `O_NOCTTY` — a link the operator points at a terminal must
+            // not make it this process's controlling terminal.
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
         );
         if descriptor < 0 {
             return Err(std::io::Error::last_os_error());
@@ -417,13 +464,29 @@ fn open_at_no_follow(
     }
 }
 
-/// Whether the directory carries an extended (NFSv4-style) ACL with at least
-/// one entry (T94 / L-120; macOS only — see [`resolve_link_in_its_directory`]).
+/// Whether the directory's extended (NFSv4-style) ACL lets some account add
+/// or remove entries in it (T94 / L-120; T101 / L-137, decision (65); macOS
+/// only — see [`resolve_link_in_its_directory`]): an allow entry, not
+/// inherit-only, granting add-file, add-subdirectory, delete-child,
+/// write-security or change-owner. A deny entry, an entry that only children
+/// inherit, and an allow entry granting only reads are not refused — macOS's
+/// default `group:everyone deny delete` on the home folders among them.
 #[cfg(target_os = "macos")]
-fn directory_has_extended_acl(directory: &std::fs::File) -> bool {
+fn directory_acl_lets_others_write(directory: &std::fs::File) -> bool {
     use std::os::unix::io::AsRawFd;
+    // <sys/acl.h>.
     const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
     const ACL_FIRST_ENTRY: libc::c_int = 0;
+    const ACL_NEXT_ENTRY: libc::c_int = -1;
+    const ACL_EXTENDED_ALLOW: libc::c_int = 1;
+    const ACL_ENTRY_ONLY_INHERIT: libc::c_int = 1 << 8;
+    const LETS_ANOTHER_REPLACE_THE_LINK: [libc::c_int; 5] = [
+        1 << 2,  // ACL_ADD_FILE
+        1 << 5,  // ACL_ADD_SUBDIRECTORY
+        1 << 6,  // ACL_DELETE_CHILD
+        1 << 12, // ACL_WRITE_SECURITY
+        1 << 13, // ACL_CHANGE_OWNER
+    ];
     extern "C" {
         fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> *mut libc::c_void;
         fn acl_get_entry(
@@ -431,19 +494,52 @@ fn directory_has_extended_acl(directory: &std::fs::File) -> bool {
             entry_id: libc::c_int,
             entry: *mut *mut libc::c_void,
         ) -> libc::c_int;
+        fn acl_get_tag_type(entry: *mut libc::c_void, tag: *mut libc::c_int) -> libc::c_int;
+        fn acl_get_flagset_np(
+            entry: *mut libc::c_void,
+            flags: *mut *mut libc::c_void,
+        ) -> libc::c_int;
+        fn acl_get_flag_np(flags: *mut libc::c_void, flag: libc::c_int) -> libc::c_int;
+        fn acl_get_permset(entry: *mut libc::c_void, perms: *mut *mut libc::c_void) -> libc::c_int;
+        fn acl_get_perm_np(perms: *mut libc::c_void, perm: libc::c_int) -> libc::c_int;
         fn acl_free(object: *mut libc::c_void) -> libc::c_int;
     }
-    // SAFETY: libSystem's documented ACL calls on an open descriptor; the ACL
-    // returned (non-null) is owned here, only read, and freed exactly once.
+    // SAFETY: libSystem's documented ACL calls on an open descriptor. The ACL
+    // returned (non-null) is owned here and freed exactly once; the entries,
+    // flag sets and permission sets are views into it, read only while it is
+    // alive, and every out-pointer is a local written by the call before use.
     unsafe {
         let acl = acl_get_fd_np(directory.as_raw_fd(), ACL_TYPE_EXTENDED);
         if acl.is_null() {
             return false;
         }
+        let mut lets_write = false;
         let mut entry: *mut libc::c_void = std::ptr::null_mut();
-        let has_entry = acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) == 0;
+        let mut which = ACL_FIRST_ENTRY;
+        while !lets_write && acl_get_entry(acl, which, &mut entry) == 0 {
+            which = ACL_NEXT_ENTRY;
+            let mut tag: libc::c_int = 0;
+            if acl_get_tag_type(entry, &mut tag) != 0 || tag != ACL_EXTENDED_ALLOW {
+                continue;
+            }
+            let mut flags: *mut libc::c_void = std::ptr::null_mut();
+            if acl_get_flagset_np(entry, &mut flags) == 0
+                && acl_get_flag_np(flags, ACL_ENTRY_ONLY_INHERIT) == 1
+            {
+                continue;
+            }
+            let mut perms: *mut libc::c_void = std::ptr::null_mut();
+            if acl_get_permset(entry, &mut perms) != 0 {
+                // Unreadable: refuse, as T94 refused every entry.
+                lets_write = true;
+                continue;
+            }
+            lets_write = LETS_ANOTHER_REPLACE_THE_LINK
+                .iter()
+                .any(|perm| acl_get_perm_np(perms, *perm) == 1);
+        }
         acl_free(acl);
-        has_entry
+        lets_write
     }
 }
 
@@ -884,8 +980,8 @@ pub fn append_record(path: &Path, record: &str) -> Result<(u64, bool), std::io::
     // a regular file, and for regular files Linux, macOS and the BSDs ignore
     // the flag — a write never returns `EAGAIN` (the one historical exception,
     // Linux mandatory locking on a `mand` mount, was removed in 5.15). Clearing
-    // it would take an `fcntl(F_SETFL)`, an `unsafe` FFI call this crate
-    // avoids for no behavioural gain.
+    // it would take an `fcntl(F_SETFL)`, one more `unsafe` FFI call, for no
+    // behavioural gain.
     file.write_all(record.as_bytes())?;
     file.sync_all()?;
     let length = file.metadata()?.len();
@@ -1308,7 +1404,9 @@ pub fn read_to_end_capped(reader: impl Read, size_hint: u64, cap: u64) -> std::i
 /// the `libc` crate's binding — `libc` is a direct dependency now (it was
 /// already compiled in through tokio/mio). The binding is an `extern "C"` item,
 /// so calling it is still `unsafe` syntactically; there is no `std` route to the
-/// effective uid. This is the workspace's one production `unsafe` expression.
+/// effective uid. One of the workspace's production `unsafe` expressions; the
+/// others are the directory-handle calls of [`resolve_link_in_its_directory`]
+/// (T94: `fstatat`, `readlinkat`, `openat`, and on macOS the ACL calls).
 #[cfg(unix)]
 pub fn effective_uid() -> u32 {
     // SAFETY: `geteuid` takes no arguments, touches no memory, cannot fail
@@ -1955,9 +2053,9 @@ mod tests {
     /// M-68 (T94, decision (46)), the audit's A4 `raceswap`: an account able to
     /// write the directory ABOVE the link's directory keeps swapping, with an
     /// atomic exchange, the operator's link directory (`node/`, 0755, holding
-    /// `ledger.bean -> ../store/real.bean`) and its own (`evil/`, 0777 — the
+    /// `ledger.bean -> ../../store/real.bean`) and its own (`evil/`, 0777 — the
     /// rule refuses it whenever it is inspected — holding `ledger.bean ->
-    /// ../victim/secret.bean`). T87 checked the directory by path and followed
+    /// ../../victim/secret.bean`). T87 checked the directory by path and followed
     /// the link by path again, so the rule approved `node/` and the follow used
     /// `evil/`'s link: the victim file came back ~50 times a second. Bound to
     /// one directory handle, every check and the follow see the same directory,
@@ -2012,11 +2110,17 @@ mod tests {
             })
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let (mut calls, mut victim_hits) = (0u64, 0u64);
+        let (mut calls, mut victim_hits, mut elsewhere) = (0u64, 0u64, 0u64);
         while std::time::Instant::now() < deadline {
             calls += 1;
-            if resolve_ledger_path(&configured).ok().as_deref() == Some(secret.as_path()) {
-                victim_hits += 1;
+            match resolve_ledger_path(&configured).ok() {
+                Some(path) if path == secret => victim_hits += 1,
+                // T101 / L-157: any path but the target (or the link itself,
+                // when it cannot be followed) is a wrong answer too — A5-1's
+                // hard link in another directory passed a count of the victim
+                // alone.
+                Some(path) if path != real && path != configured => elsewhere += 1,
+                _ => {}
             }
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2024,9 +2128,170 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         assert!(swaps > 0 && calls > 0, "premise: the race ran");
         assert_eq!(
-            victim_hits, 0,
-            "{victim_hits} of {calls} resolutions returned the victim file ({swaps} swaps)"
+            (victim_hits, elsewhere),
+            (0, 0),
+            "of {calls} resolutions, {victim_hits} returned the victim file and {elsewhere} \
+             another path ({swaps} swaps)"
         );
+    }
+
+    /// M-71 (T101, decision (64); audit 0927 A5-1): the path returned is
+    /// `canonicalize` of the configured path — a second walk of it — and T94
+    /// accepted it on the target file's identity alone. The writer of
+    /// `shared/` (above the link's directory) swaps `node/` and its own
+    /// `evil/`, whose `ledger.bean` names a hard link of the operator's target
+    /// inside a directory it owns (`attacker/h`): whenever the handle saw
+    /// `node/` and the second walk `evil/`, the identities agreed and the node
+    /// was handed `attacker/h` — a path through a directory no check looked at
+    /// and the attacker writes, though the operator's target (`store/`) has no
+    /// ancestor it can write. The returned path's directory must be the one
+    /// the link names, reached through the handle.
+    ///
+    /// Bug-catch: drop the directory comparison and `attacker/h` comes back
+    /// (~430 times in 5 s at `a5313a1`).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn m71_a_hard_link_in_a_directory_the_checks_never_saw_is_never_returned() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        let root = t87_directory("m71-hardlink");
+        let shared = root.join("shared");
+        let store = root.join("store");
+        let attacker = root.join("attacker");
+        for directory in [&shared, &store, &attacker] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        std::fs::write(store.join("real.bean"), "").unwrap();
+        std::fs::hard_link(store.join("real.bean"), attacker.join("h")).unwrap();
+        let node = shared.join("node");
+        let evil = shared.join("evil");
+        std::fs::create_dir(&node).unwrap();
+        std::fs::create_dir(&evil).unwrap();
+        std::os::unix::fs::symlink("../../store/real.bean", node.join("ledger.bean")).unwrap();
+        std::os::unix::fs::symlink(attacker.join("h"), evil.join("ledger.bean")).unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let configured = node.join("ledger.bean");
+        let real = std::fs::canonicalize(store.join("real.bean")).unwrap();
+        assert_eq!(resolve_ledger_path(&configured).unwrap(), real, "premise");
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swapper = {
+            let stop = std::sync::Arc::clone(&stop);
+            let a = std::ffi::CString::new(node.as_os_str().as_bytes()).unwrap();
+            let b = std::ffi::CString::new(evil.as_os_str().as_bytes()).unwrap();
+            std::thread::spawn(move || {
+                let mut swaps = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    swap_directories(&a, &b);
+                    swaps += 1;
+                }
+                if swaps % 2 == 1 {
+                    swap_directories(&a, &b);
+                }
+                swaps
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let (mut calls, mut elsewhere) = (0u64, Vec::new());
+        while std::time::Instant::now() < deadline {
+            calls += 1;
+            if let Ok(path) = resolve_ledger_path(&configured) {
+                if path != real && path != configured {
+                    elsewhere.push(path);
+                }
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let swaps = swapper.join().unwrap();
+        std::fs::remove_dir_all(&root).ok();
+        assert!(swaps > 0 && calls > 0, "premise: the race ran");
+        assert!(
+            elsewhere.is_empty(),
+            "{} of {calls} resolutions returned another path ({swaps} swaps), e.g. {}",
+            elsewhere.len(),
+            elsewhere[0].display()
+        );
+    }
+
+    /// L-138 (T101): the link's directory is opened `O_DIRECTORY | O_NONBLOCK`.
+    /// An ancestor's writer can swap a FIFO in at the directory's path between
+    /// `symlink_metadata` and the open; a plain open blocked there for good,
+    /// before the lock, with no log line (A5-3). Driven here by handing the
+    /// resolution a FIFO as the link's directory: it must return at once.
+    ///
+    /// Bug-catch: open the directory with `File::open` again and the call
+    /// never returns (the test times out after 5 s).
+    #[cfg(unix)]
+    #[test]
+    fn l138_a_fifo_at_the_link_directorys_path_never_blocks_the_resolution() {
+        let root = t87_directory("l138-fifo");
+        let fifo = root.join("fifo");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path; `mkfifo` reads it only.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "premise");
+        let configured = fifo.join("ledger.bean");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let directory = fifo.clone();
+        std::thread::spawn(move || {
+            let outcome = resolve_link_in_its_directory(&configured, &directory);
+            sender.send(outcome.is_err()).ok();
+        });
+        let refused = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the resolution returned instead of blocking on the FIFO");
+        std::fs::remove_dir_all(&root).ok();
+        assert!(refused, "a FIFO is not a directory");
+    }
+
+    /// L-137 (T101, decision (65)): only an ACL entry that lets another account
+    /// add or remove entries in the link's directory refuses it. macOS gives
+    /// the home folders `group:everyone deny delete`; T94 refused any ACL, so
+    /// a link kept in `~` stopped booting, and its `chmod -N` remedy stripped
+    /// that protection. A deny entry, an inherit-only allow entry and a
+    /// read-only allow entry resolve; an allow entry granting `add_file` does
+    /// not.
+    ///
+    /// Bug-catch: refuse any entry again and the deny-only directory is
+    /// refused.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn l137_only_an_acl_entry_that_lets_others_write_refuses_the_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = t87_directory("l137-acl");
+        std::fs::write(directory.join("real.bean"), "").unwrap();
+        let link = directory.join("ledger.bean");
+        std::os::unix::fs::symlink("real.bean", &link).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let chmod = |arguments: &[&str]| {
+            let status = std::process::Command::new("chmod")
+                .args(arguments)
+                .arg(&directory)
+                .status()
+                .unwrap();
+            assert!(status.success(), "chmod {arguments:?}");
+        };
+        let mut verdicts = Vec::new();
+        for entry in [
+            "group:everyone deny delete",
+            "everyone allow add_file,only_inherit,file_inherit",
+            "everyone allow list,readattr",
+        ] {
+            chmod(&["-N"]);
+            chmod(&["+a", entry]);
+            verdicts.push((entry, resolve_ledger_path(&link).is_ok()));
+        }
+        chmod(&["-N"]);
+        chmod(&["+a", "everyone allow add_file"]);
+        let granting = resolve_ledger_path(&link);
+        chmod(&["-N"]);
+        std::fs::remove_dir_all(&directory).ok();
+        assert!(
+            verdicts.iter().all(|(_, resolves)| *resolves),
+            "{verdicts:?}"
+        );
+        let error = granting.expect_err("an entry granting add_file is refused");
+        assert!(error.to_string().contains("L-137"), "{error}");
     }
 
     /// L-119 (T94): a link whose target is spelled differently from the file's

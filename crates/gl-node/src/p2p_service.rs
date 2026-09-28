@@ -1086,7 +1086,8 @@ fn ensure_secret_key_owner(
 /// `geteuid(2)`: the uid file ownership is checked against (L-49).
 ///
 /// R-17: this was a hand-written `unsafe extern "C" { safe fn geteuid() }`
-/// declaration — the workspace's only production FFI declaration. It now
+/// declaration — at the time the workspace's only production FFI declaration
+/// (the ledger crate has others since T94, for the symlink guard). It now
 /// delegates to the ledger crate's [`ledger::journal::effective_uid`], which
 /// calls the `libc` crate's binding (a direct dependency since T67) and is the
 /// same uid every other node-owned file is checked against.

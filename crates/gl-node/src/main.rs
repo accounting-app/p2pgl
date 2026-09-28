@@ -72,6 +72,18 @@ const DEFAULT_LOG_FILTER: &str = "info,iroh::protocol=error";
 fn claim_ledger_path(configured: &Path) -> Result<(PathBuf, ledger_lock::LedgerLock), String> {
     let resolved =
         ledger::journal::resolve_ledger_path(configured).map_err(|error| error.to_string())?;
+    // T101 (A5-5): a link resolution gives up on — a target missing or not
+    // openable — returns the link itself. Locked as it stood, `boot` resolved
+    // it again, and a target that had appeared by then was worked at under the
+    // link's lock, with every recovery reload refusing the link (L-117).
+    if std::fs::symlink_metadata(&resolved).is_ok_and(|metadata| metadata.is_symlink()) {
+        return Err(format!(
+            "ledger path {} is a symbolic link this node could not follow — its target is \
+             missing or cannot be opened; create the target, or point ledgerPath at the real \
+             file (L-84)",
+            configured.display()
+        ));
+    }
     let guard = ledger_lock::acquire(&resolved)
         .map_err(|error| format!("failed to lock ledger file: {error}"))?;
     ledger::service::sweep_temporaries_beside_the_link(configured, &resolved);
@@ -1119,6 +1131,55 @@ mod tests {
                 .starts_with(std::fs::canonicalize(&store).unwrap()),
             "the lock sits beside the target: {}",
             guard.path().display()
+        );
+    }
+
+    /// L-139 (T101): the sweep beside the link never removes the link's own
+    /// target. An operator may name the real file like a crashed rewrite's
+    /// temporary (`ledger.bean.tmp`) beside `ledger.bean -> ledger.bean.tmp`;
+    /// T94's sweep deleted it and boot started an empty ledger (A5-4).
+    ///
+    /// Bug-catch: drop the identity comparison from the sweep and the target
+    /// is gone.
+    #[cfg(unix)]
+    #[test]
+    fn l139_claiming_a_link_never_sweeps_its_own_target() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = directory.path().join("ledger.bean.tmp");
+        std::fs::write(&target, "2024-01-01 open Assets:Kept\n").unwrap();
+        let link = directory.path().join("ledger.bean");
+        std::os::unix::fs::symlink("ledger.bean.tmp", &link).unwrap();
+        let (resolved, _guard) = claim_ledger_path(&link).expect("claimed");
+        assert_eq!(resolved, std::fs::canonicalize(&target).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "2024-01-01 open Assets:Kept\n",
+            "the ledger itself is not swept"
+        );
+    }
+
+    /// T101 (audit 0927 A5-5): a link resolution cannot follow — its target
+    /// missing — comes back as the link itself. Locked as it stood, `boot`
+    /// resolved it again, so a target that appeared in between was worked at
+    /// under the link's lock. `claim_ledger_path` refuses it, naming the link,
+    /// before any lock.
+    ///
+    /// Bug-catch: drop the refusal and the dangling link is claimed.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_that_cannot_be_followed_is_refused_before_the_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = directory.path().join("ledger.bean");
+        std::os::unix::fs::symlink("missing/target.bean", &link).unwrap();
+        let error = claim_ledger_path(&link).expect_err("refused");
+        assert!(error.contains("could not follow"), "{error}");
+        assert!(
+            !directory.path().join("ledger.bean.lock").exists(),
+            "no lock was taken"
         );
     }
 

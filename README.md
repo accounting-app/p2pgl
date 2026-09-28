@@ -1090,13 +1090,18 @@ cases where you might:
   point it at any file the node's user owns and have it overwritten. For the
   same reason the link must sit in a directory owned by the node's user that
   group and others cannot write (not `/tmp`, not a shared directory, and on
-  macOS not one carrying an access control list — `ls -le` shows it, `chmod -N`
-  removes it), and it is followed **one link deep**: a link to another link
-  refuses boot. A data directory created under a group-writable umask (002,
-  mode 0775) is refused with its mode named; `chmod g-w,o-w <directory>` fixes
-  it. The checks and the follow are made through one open handle on the link's
-  directory, so swapping that directory from above cannot redirect the node. A directory
-  in the path may itself be a link. If the ledger was converted to a link
+  macOS not one whose access control list lets another account add or remove
+  entries — `ls -le` shows it, `chmod -a` removes that entry; macOS's own
+  `deny delete` on the home folders is fine), and it is followed **one link
+  deep**: a link to another link refuses boot. A data directory created under a
+  group-writable umask (002, mode 0775) is refused with its mode named;
+  `chmod g-w,o-w <directory>` fixes it. The checks and the follow are made
+  through one open handle on the link's directory, and the path the node then
+  uses must be the file the link names in the directory it names, so swapping
+  a directory above the link cannot redirect the node while it starts. After
+  that the node works at the target by path: whoever can write a directory
+  above the TARGET controls the ledger, as for any `.bean`. A directory in the
+  path may itself be a link. If the ledger was converted to a link
   after an unclean stop, its journal is still beside the link, where the node
   no longer looks: boot refuses and names it. Move it beside the target (as
   `<target>.journal`), or put the ledger back, start the node once so it folds
