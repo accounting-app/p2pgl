@@ -3922,3 +3922,403 @@ fn a6_4_a_gap_of_exactly_2_32_is_called_uncrossable_by_a_node_that_just_crossed_
         "F crossed the gap by anti-entropy, and its own WARN calls it uncrossable:\n{logged}"
     );
 }
+
+// ─── A6 (0927): T93's served views and T95's Want filters, as gl-node runs them ───
+//
+// The harness's `serve` diffs `all_directive_ids` and supplies `get_directive`,
+// so it never saw T93's hidden lines (a line adopted from the `.bean` is served
+// only after its rewrite) nor T95's filters on the receiver's side of the
+// Want. `a6_0927_serve_like_gl_node` runs `run_head_exchange`'s pipeline to the
+// letter: the holder's `served_head_txids` / `served_sorted_directive_ids`
+// advert, `compute_want_by_membership`, the refusal filter, `retain_not_doomed`
+// (with the ledger's `contains_directive` as `holds`), `retain_not_buffered_from`,
+// `order_want_ancestors_first`, then `served_directive` for the Supply.
+
+use p2p::orphan_buffer::MAX_ORPHAN_AGE;
+
+/// The Want `receiver` sends `holder`, as gl-node's `run_head_exchange` builds
+/// it. `peer` is the name the receiver's orphan buffer knows the holder by
+/// (the harness's intake buffers everything from `"peer"`).
+fn a6_0927_gl_node_want(receiver: &Replica, holder: &Replica, peer: &str) -> Vec<String> {
+    let mut heads: Vec<String> = holder.svc.served_head_txids().into_iter().collect();
+    heads.sort_unstable();
+    let ids = holder.svc.served_sorted_directive_ids();
+    let mut want =
+        compute_want_by_membership(|id| receiver.svc.contains_directive(id), &heads, &ids);
+    want.retain(|id| !receiver.permanent.contains_key(id));
+    let now = std::time::Instant::now();
+    receiver
+        .orphans
+        .refusals()
+        .retain_wanted(peer, &mut want, now);
+    receiver
+        .orphans
+        .retain_not_doomed(peer, &mut want, now, |id| {
+            receiver.svc.contains_directive(id)
+        });
+    receiver.orphans.retain_not_buffered_from(peer, &mut want);
+    order_want_ancestors_first(&mut want, |id| receiver.orphans.known_missing_parents(id));
+    want
+}
+
+/// One gl-node exchange: `to` Wants from `from` (see
+/// [`a6_0927_gl_node_want`]) and ingests what `from` serves for it through
+/// `served_directive`. Returns what `to` staged.
+fn a6_0927_serve_like_gl_node(mesh: &mut Mesh, from: usize, to: usize) -> usize {
+    let want = a6_0927_gl_node_want(&mesh.replicas[to], &mesh.replicas[from], "peer");
+    let holder = &mesh.replicas[from].svc;
+    let entries = match build_supply(&want, |id| {
+        holder.served_directive(id).map(make_supply_entry)
+    }) {
+        WireMessage::Supply { entries, .. } => entries,
+        other => panic!("build_supply returned {other:?}"),
+    };
+    let allowlist = &mesh.allowlist;
+    mesh.replicas[to].intake(entries, allowlist)
+}
+
+/// What `svc` serves, derived without any cache: every DAG id
+/// `served_directive` answers for, sorted.
+fn a6_0927_served_ids_uncached(svc: &LedgerService) -> Vec<String> {
+    let mut ids: Vec<String> = svc
+        .all_directive_ids()
+        .into_iter()
+        .filter(|id| svc.served_directive(id).is_some())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// T95 (the L-116 advert cost) and T93 (L-116) at the mesh level: while a
+/// line typed into A's `.bean` waits for its rewrite, A's advert is the cached
+/// served-id list — and it must still track the ledger. A record staged from
+/// a peer before A's next commit is advertised at once (the list is keyed by
+/// the DAG's size and the held-back count, and both moved), the hand line is
+/// neither advertised nor supplied until the rewrite, and a fresh node that
+/// hears of everything only from A through gl-node's own pipeline holds
+/// exactly what A serves at each step.
+///
+/// Why the shape matters: gl-node's two-phase commit stages under the write
+/// lock and commits outside it, so adverts run between a stage and the
+/// compaction that clears the held-back set. A cache that outlived a change of
+/// the DAG there would advertise a stale set to every peer until the next
+/// change — the T95 unit test (`l116_the_served_id_list_is_shared…`) pins that
+/// the list is shared, not that it is invalidated.
+///
+/// Bug-catch: return the cached list whatever its key and the advert taken
+/// after B's record is staged omits it.
+#[test]
+fn a6_0927_1_the_cached_advert_tracks_a_record_staged_while_a_line_waits_for_its_rewrite() {
+    let mut mesh = seeded_mesh(9271, 2);
+    let (a, b) = (0, 1);
+    mesh.append(a, "r1", 1, "Assets:Cash");
+    mesh.run_to_fixed_point(Order::Ascending);
+    mesh.replicas[a].svc.compact().expect("compact");
+    let path = mesh.replicas[a].path.clone();
+    append_to_bean(
+        &path,
+        "\n2024-01-20 * \"Hand\" \"typed while A runs\"\n  Assets:Cash  3 USD\n  \
+         Equity:Opening  -3 USD\n",
+    );
+    let result = mesh.replicas[a]
+        .svc
+        .reconcile_file_staged()
+        .expect("the live reconcile");
+    assert_eq!(result.new_directives, 1, "{result:?}");
+    let hand: Vec<String> = mesh.replicas[a]
+        .svc
+        .all_directive_ids()
+        .into_iter()
+        .filter(|id| mesh.replicas[a].svc.served_directive(id).is_none())
+        .collect();
+    assert_eq!(hand.len(), 1, "premise: exactly the hand line is held back");
+    let advert = |mesh: &Mesh| mesh.replicas[a].svc.served_sorted_directive_ids().to_vec();
+    assert_eq!(
+        advert(&mesh),
+        a6_0927_served_ids_uncached(&mesh.replicas[a].svc)
+    );
+
+    // B writes; A stages B's record through the remote path, before any
+    // commit — the window gl-node's adverts run in.
+    let from_b = mesh.append(b, "from b", 5, "Assets:Cash");
+    let directive = mesh.replicas[b]
+        .svc
+        .get_directive(&from_b)
+        .expect("B's own record")
+        .clone();
+    assert!(matches!(
+        mesh.replicas[a].stage(&from_b, directive),
+        Staged::Inserted
+    ));
+    let staged_advert = advert(&mesh);
+    assert!(
+        staged_advert.contains(&from_b),
+        "A's advert omits the record it just staged"
+    );
+    assert!(
+        !staged_advert.contains(&hand[0]),
+        "the hand line is held back"
+    );
+    assert_eq!(
+        staged_advert,
+        a6_0927_served_ids_uncached(&mesh.replicas[a].svc)
+    );
+
+    // A fresh node that hears only from A, through gl-node's pipeline.
+    let c = mesh.add("C", 14);
+    for _ in 0..3 {
+        a6_0927_serve_like_gl_node(&mut mesh, a, c);
+    }
+    let mut at_c: Vec<String> = mesh.replicas[c]
+        .svc
+        .all_directive_ids()
+        .into_iter()
+        .collect();
+    at_c.sort_unstable();
+    assert_eq!(
+        at_c,
+        a6_0927_served_ids_uncached(&mesh.replicas[a].svc),
+        "C holds exactly what A serves while the line waits"
+    );
+
+    // The rewrite: A's next commit is the compaction that spells the hand
+    // line canonically; it is served from then on.
+    mesh.replicas[a].commit();
+    assert!(mesh.replicas[a].svc.served_directive(&hand[0]).is_some());
+    assert_eq!(
+        advert(&mesh),
+        a6_0927_served_ids_uncached(&mesh.replicas[a].svc)
+    );
+    for _ in 0..3 {
+        a6_0927_serve_like_gl_node(&mut mesh, a, c);
+    }
+    assert!(
+        mesh.replicas[c].svc.contains_directive(&hand[0]),
+        "C adopts the hand line after A's rewrite"
+    );
+    let hand_line = mesh.replicas[a]
+        .svc
+        .get_directive(&hand[0])
+        .expect("served")
+        .clone();
+    mesh.record(&hand_line);
+    mesh.run_to_fixed_point(Order::Ascending);
+    mesh.assert_converged("A6 (0927) / T95 cached advert");
+}
+
+/// A6-2 (0927): T95's `retain_not_buffered_from` (L-130) drops from the Want
+/// an id buffered from the asked peer whose missing parent is not in that
+/// Want — and a parent this node now HOLDS is never in it. So when the parent
+/// arrives by a path that does not drain the orphan buffer (the watcher's live
+/// reconcile of a `.bean` edit: a pasted record, a restored backup), the child
+/// is neither staged nor asked for again: it waits for the next batch that
+/// stages something (whose drain frees it) or for its orphan TTL
+/// (`MAX_ORPHAN_AGE`, an hour). `retain_not_doomed` asks `holds`; this filter
+/// has no such argument. Before T95 the child was re-Wanted each exchange and
+/// staged at once, its parent being present.
+///
+/// The shape: A writes x then c (c names x). V hears of c alone first (buffered
+/// on x, from A), then x reaches V through its `.bean`. A is V's only peer and
+/// writes nothing more; gl-node's exchanges run.
+#[test]
+#[ignore = "A6-2 (0927): a record buffered from the only peer that serves it is never re-Wanted once its parent arrives through the file; it waits for another batch's drain or the orphan TTL"]
+fn a6_0927_2_a_buffered_record_whose_parent_arrived_through_the_file_is_asked_for_again() {
+    let mut mesh = seeded_mesh(9272, 2);
+    let (a, v) = (0, 1);
+    let x = mesh.append(a, "x", 1, "Assets:Cash");
+    let c = mesh.append(a, "c", 2, "Assets:Cash");
+    mesh.deliver(v, vec![c.clone()], Order::Ascending);
+    assert!(
+        !mesh.replicas[v].svc.contains_directive(&c)
+            && mesh.replicas[v].orphans.known_missing_parents(&c) == vec![x.clone()],
+        "premise: c is buffered at V on x"
+    );
+    let x_directive = mesh.replicas[a]
+        .svc
+        .get_directive(&x)
+        .expect("A's record")
+        .clone();
+    let path = mesh.replicas[v].path.clone();
+    append_to_bean(
+        &path,
+        &format!("\n{}", full_file_serialize(&[x_directive], &[])),
+    );
+    let result = mesh.replicas[v].svc.reconcile_file().expect("reconcile");
+    assert_eq!(result.new_directives, 1, "premise: x adopted from the file");
+    assert!(mesh.replicas[v].svc.contains_directive(&x));
+    let mut wants = Vec::new();
+    for _ in 0..3 {
+        wants.push(a6_0927_gl_node_want(
+            &mesh.replicas[v],
+            &mesh.replicas[a],
+            "peer",
+        ));
+        a6_0927_serve_like_gl_node(&mut mesh, a, v);
+    }
+    assert!(
+        mesh.replicas[v].svc.contains_directive(&c),
+        "V holds c's parent, c is buffered from A, and A serves c — yet after 3 exchanges V \
+         lacks c: Wants {wants:?}, still buffered {}",
+        mesh.replicas[v].orphans.len()
+    );
+}
+
+/// A6-1 (0927): T95's hint queue (L-134) compacts itself once it passes twice
+/// the table's bound — AFTER pushing the new hint's entry and BEFORE inserting
+/// the hint, so the compaction's "still recorded at this time?" test drops the
+/// entry it just pushed. That hint then has no queue entry: expiry never
+/// reaches it and it outlives `MAX_ORPHAN_AGE` (until its id is buffered or
+/// arrives, which for an id that never does is forever), holding its share of
+/// the peer's and the table's hint budget.
+///
+/// The shape: one peer at its orphan quota whose refused-for-room records keep
+/// arriving (each hint recorded, then forgotten as the record lands) — the
+/// churn of a large catch-up — until the queue passes 2 × `MAX_PARENT_HINT_IDS`.
+#[test]
+#[ignore = "A6-1 (0927): the hint recorded as the L-134 queue is compacted loses its queue entry and never expires"]
+fn a6_0927_3_a_hint_recorded_as_the_hint_queue_is_compacted_still_ages_out() {
+    let mut buffer = OrphanBuffer::new();
+    let peer = Some("peer".to_owned());
+    let id = |tag: &str, index: usize| {
+        let tag: u64 = tag.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+        format!("{tag:016x}{index:048x}")
+    };
+    let body = hand_transaction(&key(40), "hinted", 1, &[], 1);
+    for index in 0..MAX_ORPHANS_PER_PEER {
+        let outcome = buffer.insert(
+            id("full", index),
+            body.clone(),
+            vec![id("away", index)],
+            peer.clone(),
+        );
+        assert_eq!(outcome, OrphanInsert::Buffered);
+    }
+    for index in 0..2 * MAX_PARENT_HINT_IDS {
+        let churn = id("churn", index);
+        let outcome = buffer.insert(
+            churn.clone(),
+            body.clone(),
+            vec![id("churn-parent", index)],
+            peer.clone(),
+        );
+        assert_eq!(outcome, OrphanInsert::BudgetExhausted);
+        // The record lands: its hint is forgotten, its queue entry stays.
+        let _ = buffer.parent_arrived(&churn);
+    }
+    let victim = id("victim", 0);
+    let outcome = buffer.insert(
+        victim.clone(),
+        body.clone(),
+        vec![id("victim-parent", 0)],
+        peer.clone(),
+    );
+    assert_eq!(outcome, OrphanInsert::BudgetExhausted);
+    assert_eq!(
+        buffer.known_missing_parents(&victim),
+        vec![id("victim-parent", 0)],
+        "premise: the victim is hinted"
+    );
+    let _ = buffer.evict_expired(std::time::Instant::now() + MAX_ORPHAN_AGE * 2);
+    assert!(
+        buffer.known_missing_parents(&victim).is_empty(),
+        "a hint twice MAX_ORPHAN_AGE old is still held"
+    );
+}
+
+/// X3-1 (0927): T93 / L-115 (decision (44)) floors the recovery reload's clock
+/// at the lamport of the staged write the failed commit discards — that write
+/// was served while staged (L-86: gl-node's advert and Supply read
+/// `served_sorted_directive_ids` / `served_directive`, which hide only lines
+/// awaiting their rewrite), so a peer may hold it. The floor lives in memory
+/// only: the operator who answers the failed write (disk full, a read-only
+/// mount) by fixing the disk and restarting gets a process start whose clock
+/// is the file's `max + 1`, and the first write after it is stamped with the
+/// discarded write's lamport — the same `(author, lamport)` pair under another
+/// id (M-18). Every shape of X3's 0927 differential re-issues it (52 of 52
+/// boot shapes, 12 of 12 live shapes). Fails at `a5313a1`.
+#[cfg(unix)]
+#[test]
+#[ignore = "X3-1: a restart after a failed commit re-issues the served staged write's (author, lamport) pair"]
+fn x3_0927_1_a_restart_after_a_failed_commit_never_reuses_the_served_writes_lamport() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_bean("x3-0927-1").with_extension("d");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let path = dir.join("ledger.bean");
+    let usd = |n: i64| Amount {
+        number: Decimal::from(n),
+        currency: "USD".to_owned(),
+    };
+    let write = |narration: &str, day: u32, n: i64| TransactionInput {
+        date: NaiveDate::from_ymd_opt(2024, 2, day).expect("date"),
+        flag: Flag::Complete,
+        payee: None,
+        narration: Some(narration.to_owned()),
+        tags: Vec::new(),
+        links: Vec::new(),
+        postings: vec![
+            PostingInput {
+                account: "Assets:Cash".to_owned(),
+                amount: Some(usd(n)),
+                cost: None,
+                price: None,
+            },
+            PostingInput {
+                account: "Equity:Opening".to_owned(),
+                amount: Some(usd(-n)),
+                cost: None,
+                price: None,
+            },
+        ],
+    };
+    let mut node = LedgerService::boot(&path, "nodeA".to_owned()).expect("boot");
+    for account in ["Assets:Cash", "Equity:Opening"] {
+        node.open_account(
+            account.to_owned(),
+            NaiveDate::from_ymd_opt(2024, 1, 1).expect("date"),
+            vec![],
+        )
+        .expect("open");
+    }
+    node.append_transaction(write("acked", 1, 100))
+        .expect("acked");
+    node.compact().expect("compact");
+    drop(node);
+    // A process start; the first write's commit fails (the disk is full).
+    let mut node = LedgerService::boot(&path, "nodeA".to_owned()).expect("start");
+    let staged = node
+        .append_transaction_staged(write("failed", 2, 7), |_, _, _| None)
+        .expect("stage");
+    let served_while_staged = node.served_sorted_directive_ids().contains(&staged.txid)
+        && node.served_directive(&staged.txid).is_some();
+    let discarded = node
+        .get_directive(&staged.txid)
+        .and_then(Directive::lamport_clock)
+        .expect("stamped");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+    let failed = node.persist_or_reload();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    assert!(failed.is_err(), "premise: the commit failed");
+    assert!(
+        !node.contains_directive(&staged.txid),
+        "premise: rolled back"
+    );
+    // The operator fixes the disk and restarts the node.
+    drop(node);
+    let mut node = LedgerService::boot(&path, "nodeA".to_owned()).expect("restart");
+    let next = node
+        .append_transaction_staged(write("after the restart", 3, 9), |_, _, _| None)
+        .expect("next write");
+    let stamped = node
+        .get_directive(&next.txid)
+        .and_then(Directive::lamport_clock)
+        .expect("stamped");
+    node.persist_or_reload().expect("commit");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !(served_while_staged && stamped == discarded),
+        "the first write after the restart re-issued (nodeA, {discarded}), the pair of the write \
+         the failed commit discarded after serving it"
+    );
+}

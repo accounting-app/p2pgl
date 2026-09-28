@@ -80,6 +80,18 @@
 //! refusal leaves a record served over the line it refused), A1-3 (the
 //! "add the missing open" remedy is refused for an `open` dated after its
 //! transactions).
+//!
+//! ## A3 (0927 re-audit of T92)
+//!
+//! The `a3_0927_*` cases take T92's fixpoint over many rounds (an alternating
+//! chain of signed records and half envelopes), revised decision (42) to the
+//! end (a hand `open`, then the original returning from a peer), and L-131's
+//! retyped copy against the other holds and a refusal at finalisation. Four
+//! are `#[ignore]`d with their finding: A3-1 (a copy retyped beside a record
+//! the rule or the signature pass holds is still dropped), A3-2 (a retyped
+//! closure member frees its descendants only at the next boot), A3-3 (a
+//! retyped copy refused at finalisation is WARNed as kept and dropped) and
+//! A3-4 (one full rebuild and one recursion level per round of the rule).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -3372,5 +3384,646 @@ fn a1_0926_a_held_child_returns_when_a_peer_re_supplies_its_parent() {
         staged,
         Ok(()),
         "the node's next write is adopted by the peer"
+    );
+}
+
+// ─── A3 (0927 re-audit of T92) ───────────────────────────────────────────────
+
+/// The truth of the node-written file at `path`, as [`generate_fixture`]
+/// derives it (A3, 0927).
+fn a3_0927_truth_of(path: &Path, provider: &Arc<PeerKeySignatureProvider>, dir: PathBuf) -> Truth {
+    let author = provider.public_key_hex();
+    let text = std::fs::read_to_string(path).unwrap();
+    let svc = LedgerService::boot(path.to_path_buf(), author.clone()).unwrap();
+    assert_eq!(
+        svc.unsigned_operator_input_count(),
+        0,
+        "fixture is canonical"
+    );
+    assert_eq!(svc.quarantined_count(), 0, "fixture is clean");
+    let mut entries = BTreeMap::new();
+    let mut ids_by_signature = BTreeMap::new();
+    for id in svc.all_directive_ids() {
+        let entry = make_supply_entry(svc.get_directive(&id).unwrap());
+        let signature = entry.envelope.get(KEY_SIGNATURE).unwrap().clone();
+        ids_by_signature.insert(signature, id.clone());
+        entries.insert(id, entry);
+    }
+    let balances = balances_of(&svc);
+    Truth {
+        text,
+        author,
+        provider: Arc::clone(provider),
+        entries,
+        ids_by_signature,
+        balances,
+        _dir: dir,
+    }
+}
+
+/// [`generate_fixture`] extended by `extra` transactions the node appends
+/// through its own API after a restart — a linear chain, each naming the one
+/// before it (A3, 0927). Returns the truth and the chain's ids in order.
+fn a3_0927_chain_fixture(seed: u64, extra: usize) -> (Truth, Vec<String>) {
+    let base = generate_fixture(seed);
+    let dir = fresh_dir("a3-0927-chain");
+    let path = dir.join("ledger.bean");
+    std::fs::write(&path, &base.text).unwrap();
+    let mut svc = run_pipeline(&path, &base.provider).unwrap();
+    let mut rng = Rng::new(seed ^ 0xa3a3);
+    let mut chain: Vec<String> = Vec::new();
+    for index in 0..extra {
+        let outcome = svc
+            .append_transaction_signing(
+                random_transaction(&mut rng, ymd(2024, 1, 29), 100 + index),
+                sign_kind(&base.provider, true),
+            )
+            .unwrap();
+        if let Some(previous) = chain.last() {
+            let Some(Directive::Transaction(txn)) = svc.get_directive(&outcome.txid) else {
+                unreachable!()
+            };
+            assert_eq!(
+                txn.parent_ids(),
+                vec![previous.as_str()],
+                "premise: a linear chain"
+            );
+        }
+        chain.push(outcome.txid);
+    }
+    svc.compact().unwrap();
+    drop(svc);
+    (a3_0927_truth_of(&path, &base.provider, dir), chain)
+}
+
+/// The index of the block of `truth` whose record is `id`.
+fn a3_0927_block_of(truth: &Truth, blocks: &[String], id: &str) -> usize {
+    blocks
+        .iter()
+        .position(|block| truth_id_of(truth, block).as_deref() == Some(id))
+        .unwrap_or_else(|| panic!("no block for {}", short(id)))
+}
+
+/// `block` without its `openledger-lamport` and `openledger-signature` lines:
+/// a half envelope, operator input whose author and parents stay (M-47).
+fn a3_0927_half_envelope(block: &str) -> String {
+    set_lines(block, |lines| {
+        lines.retain(|line| {
+            let line = line.trim_start();
+            !line.starts_with(KEY_LAMPORT) && !line.starts_with(KEY_SIGNATURE)
+        });
+    })
+}
+
+/// T92 / M-64 (decision (39)) over many rounds (A3, 0927). A node-written
+/// chain c0 ← c1 ← … ← c11; the operator deleted c0's block and cut the
+/// lamport and signature lines of every odd record (half envelopes: operator
+/// input naming a hand parent). Each round of the served-set rule holds one
+/// even record (its parent is not served); the rebuild that round triggers
+/// then refuses the next odd record (its hand parent was just held), which
+/// leaves the next even record over a parent the DAG no longer holds — found
+/// only by the next round. Five rounds at HEAD; `m64_…` (ledger) pins two. After
+/// boot and the reboot: nothing of the chain is served, every check holds
+/// (a fresh replica adopts exactly what is served), and it is a fixed point.
+///
+/// Revert-proof (archive copy): `quarantine_unservable_history` returning
+/// `ids.len()` without re-running itself → c4 is served over c3, which the
+/// first round's rebuild refused (check 6 and check 7 name it).
+#[test]
+fn a3_0927_the_rule_holds_an_alternating_chain_one_round_per_record() {
+    let (truth, chain) = a3_0927_chain_fixture(92, 12);
+    let mut blocks = split_blocks(&truth.text);
+    let indices: Vec<usize> = chain
+        .iter()
+        .map(|id| a3_0927_block_of(&truth, &blocks, id))
+        .collect();
+    for (position, index) in indices.iter().enumerate() {
+        if position % 2 == 1 {
+            blocks[*index] = a3_0927_half_envelope(&blocks[*index]);
+        }
+    }
+    blocks.remove(indices[0]);
+    let dir = fresh_dir("a3-0927-alternating");
+    let path = dir.join("ledger.bean");
+    std::fs::write(&path, join_blocks(&blocks)).unwrap();
+    let effect = Effect {
+        touched: chain.iter().skip(1).step_by(2).cloned().collect(),
+        deleted: vec![chain[0].clone()],
+    };
+    let (svc, logged) = capture_warnings(|| run_pipeline(&path, &truth.provider).unwrap());
+    let first = snapshot_of(&svc);
+    drop(svc);
+    let second = snapshot_of(&run_pipeline(&path, &truth.provider).unwrap());
+    std::fs::remove_dir_all(dir).ok();
+    let mut failures: Vec<String> = audit(&first, &truth, &effect, Checks::ALL);
+    failures.extend(fixed_point(&first, &second));
+    for id in &chain {
+        if first.served.contains_key(id) {
+            failures.push(format!("chain record {} is served", short(id)));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} (rule rounds: {})",
+        failures.join("\n  "),
+        logged
+            .matches("ledger records QUARANTINED because no peer could adopt them")
+            .count()
+    );
+}
+
+/// A node-written transaction block, signed by `provider` over `parents` and
+/// `lamport` (A3, 0927).
+fn a3_0927_signed_transaction_block(
+    provider: &PeerKeySignatureProvider,
+    body: &str,
+    parents: &str,
+    lamport: u64,
+) -> String {
+    let directive = parse_file(&format!("{body}\n"))
+        .expect("the body parses")
+        .remove(0);
+    let id = compute_content_id(&directive);
+    let lamport = lamport.to_string();
+    let signature = provider
+        .sign(&SignableMessage {
+            content_id: &id,
+            is_transaction: true,
+            parents,
+            lamport: &lamport,
+        })
+        .expect("signing enabled");
+    set_lines(body, |lines| {
+        lines.insert(
+            1,
+            format!("  {KEY_AUTHOR}: \"{}\"", provider.public_key_hex()),
+        );
+        lines.insert(2, format!("  {KEY_LAMPORT}: \"{lamport}\""));
+        lines.insert(3, format!("  {KEY_PARENTS}: \"{parents}\""));
+        lines.insert(4, format!("  {KEY_SIGNATURE}: \"{signature}\""));
+    })
+}
+
+const A3_0927_HELD_BODY: &str = "2024-01-30 * \"Held\" \"child of the flood\"\n  Expenses:Food  2.00 USD\n  Assets:Cash  -2.00 USD";
+const A3_0927_GRANDCHILD_BODY: &str = "2024-01-30 * \"Grandchild\" \"child of the held record\"\n  Expenses:Food  3.00 USD\n  Assets:Cash  -3.00 USD";
+
+fn a3_0927_id_of(body: &str) -> String {
+    compute_content_id(&parse_file(&format!("{body}\n")).unwrap().remove(0))
+}
+
+/// X2 `c1b`'s shape (L-131) on a node-written file: a record over the legacy
+/// posting-metadata ceiling (the "flood", refused under a content rule every
+/// peer holds history to), its signed child H and grandchild C, and — beside
+/// H — the operator's hand-typed copy of H's body, no envelope. Returns the
+/// blocks and the ids of H and C (A3, 0927).
+fn a3_0927_retyped_closure_member(truth: &Truth, top: &str) -> (Vec<String>, String, String) {
+    let mut blocks = split_blocks(&truth.text);
+    let lamport = truth
+        .entries
+        .values()
+        .filter_map(|entry| entry.envelope.get(KEY_LAMPORT)?.parse::<u64>().ok())
+        .max()
+        .unwrap();
+    let mut flood =
+        String::from("2024-01-30 * \"Flood\" \"a pre-limits record\"\n  Expenses:Food  1.00 USD\n");
+    for key in 0..=ledger::limits::MAX_POSTING_METADATA_KEYS_PER_TRANSACTION_LEGACY {
+        flood.push_str(&format!("    k{key}: \"v\"\n"));
+    }
+    flood.push_str("  Assets:Cash  -1.00 USD");
+    let flood_id = a3_0927_id_of(&flood);
+    let held = a3_0927_id_of(A3_0927_HELD_BODY);
+    let grandchild = a3_0927_id_of(A3_0927_GRANDCHILD_BODY);
+    blocks.push(a3_0927_signed_transaction_block(
+        &truth.provider,
+        &flood,
+        top,
+        lamport + 1,
+    ));
+    blocks.push(a3_0927_signed_transaction_block(
+        &truth.provider,
+        A3_0927_HELD_BODY,
+        &flood_id,
+        lamport + 2,
+    ));
+    blocks.push(a3_0927_signed_transaction_block(
+        &truth.provider,
+        A3_0927_GRANDCHILD_BODY,
+        &held,
+        lamport + 3,
+    ));
+    blocks.push(A3_0927_HELD_BODY.to_owned());
+    (blocks, held, grandchild)
+}
+
+/// A3-1 (0927): T92's L-131 fix — "a block retyped beside a held record of
+/// the same body is adopted as this node's own and replaces the held copy at
+/// the next compaction" (T92 Done note) — holds only when the record is held
+/// by the content-rule closure, which takes it out of the DAG before the
+/// operator input is adopted. Held by the served-set rule (its parent was
+/// deleted) or by the signature pass (its lamport line edited), the record is
+/// still in the DAG when the typed copy is adopted: the copy is counted a
+/// duplicate and skipped, the rule or the pass then holds the record, and the
+/// startup compaction drops the typed block from the file, with no line
+/// naming it. The in-place remedy (delete the block's `openledger-*` lines,
+/// operator (ak)) serves the same record in both shapes.
+///
+/// Fails at HEAD: the retyped record is not served in either shape, and the
+/// typed block is gone from the file.
+#[test]
+#[ignore = "A3-1: a block retyped beside a record the served-set rule or the signature pass holds is dropped, not adopted (L-131 fixed for the closure only)"]
+fn a3_0927_1_a_block_retyped_beside_a_record_the_rule_or_the_pass_holds_is_adopted() {
+    let mut failures = Vec::new();
+    for held_by in ["the served-set rule", "the signature pass"] {
+        let (truth, chain) = a3_0927_chain_fixture(93, 3);
+        let mut blocks = split_blocks(&truth.text);
+        let parent = a3_0927_block_of(&truth, &blocks, &chain[0]);
+        let record = a3_0927_block_of(&truth, &blocks, &chain[1]);
+        let typed = strip_envelope(&blocks[record]);
+        if held_by == "the served-set rule" {
+            blocks.remove(parent);
+        } else {
+            let lamport: u64 = envelope_value(&blocks[record], KEY_LAMPORT)
+                .unwrap()
+                .parse()
+                .unwrap();
+            blocks[record] = set_lines(&blocks[record], |lines| {
+                for line in lines.iter_mut() {
+                    if line.trim_start().starts_with(KEY_LAMPORT) {
+                        *line = format!("  {KEY_LAMPORT}: \"{}\"", lamport + 1);
+                    }
+                }
+            });
+        }
+        blocks.push(typed.clone());
+        let dir = fresh_dir("a3-0927-1");
+        let path = dir.join("ledger.bean");
+        std::fs::write(&path, join_blocks(&blocks)).unwrap();
+        let svc = run_pipeline(&path, &truth.provider).unwrap();
+        let served = svc.get_directive(&chain[1]).is_some();
+        drop(svc);
+        let after = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(dir).ok();
+        if !served {
+            failures.push(format!(
+                "held by {held_by}: the retyped record {} is not served; the typed block is {} \
+                 the file after the startup compaction",
+                short(&chain[1]),
+                if split_blocks(&after).contains(&typed) {
+                    "still in"
+                } else {
+                    "gone from"
+                }
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n  "));
+}
+
+/// A3-2 (0927): L-131's shape with a grandchild. The flood is refused, the
+/// closure holds its child H and H's child C by id; the operator's typed copy
+/// of H is adopted (T92) with parents this node serves. C still names H —
+/// now a served record — but stays held for this boot: the closure was walked
+/// before the typed copy existed. The startup compaction writes H's new
+/// envelope and drops the old copy, so the next boot's closure no longer
+/// reaches C, and C is served: a restart with nothing edited changes the
+/// served set and the balances (the boot invariant's fixed point).
+///
+/// Fails at HEAD: C is served after the reboot but not after the first boot.
+#[test]
+#[ignore = "A3-2: a retyped closure member frees its held descendants only at the next boot (not a fixed point)"]
+fn a3_0927_2_a_retyped_closure_member_serves_the_same_set_at_the_next_boot() {
+    let (truth, chain) = a3_0927_chain_fixture(94, 1);
+    let (blocks, held, grandchild) = a3_0927_retyped_closure_member(&truth, &chain[0]);
+    let dir = fresh_dir("a3-0927-2");
+    let path = dir.join("ledger.bean");
+    std::fs::write(&path, join_blocks(&blocks)).unwrap();
+    let first = snapshot_of(&run_pipeline(&path, &truth.provider).unwrap());
+    let second = snapshot_of(&run_pipeline(&path, &truth.provider).unwrap());
+    std::fs::remove_dir_all(dir).ok();
+    assert!(
+        first.served.contains_key(&held),
+        "premise: the typed copy of H is served (T92 / L-131)"
+    );
+    let failures = fixed_point(&first, &second);
+    assert!(
+        failures.is_empty(),
+        "C = {}:\n  {}",
+        short(&grandchild),
+        failures.join("\n  ")
+    );
+}
+
+/// L-131 × a refusal at finalisation (A3, 0927): the typed copy of the held
+/// record is pending operator input, which the signature pass skips (T92);
+/// `finalize_operator_input` then cannot stamp it — a peer's record near the
+/// Lamport ceiling leaves one stamp, which an earlier hand `open` takes — and
+/// holds it. Nothing is lost and nothing is served over it: the node-written
+/// copy of the record stays held and in the file, and so does its child.
+/// (What the WARN says about the typed block is A3-3.)
+#[test]
+fn a3_0927_a_retyped_copy_refused_at_finalisation_leaves_the_record_held_and_on_disk() {
+    let (truth, chain) = a3_0927_chain_fixture(95, 1);
+    let (mut blocks, held, grandchild) = a3_0927_retyped_closure_member(&truth, &chain[0]);
+    let peer = foreign_provider(&truth);
+    blocks.push(a1_0926_signed_open_block(
+        &peer,
+        "2024-01-01 open Assets:Other",
+        LAMPORT_CEILING - 4,
+    ));
+    blocks.push("2023-12-31 open Assets:Earlier".to_owned());
+    let dir = fresh_dir("a3-0927-l131-ceiling");
+    let path = dir.join("ledger.bean");
+    std::fs::write(&path, join_blocks(&blocks)).unwrap();
+    let (svc, logged) = capture_warnings(|| run_pipeline(&path, &truth.provider).unwrap());
+    let first = snapshot_of(&svc);
+    drop(svc);
+    let second = snapshot_of(&run_pipeline(&path, &truth.provider).unwrap());
+    let after = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_dir_all(dir).ok();
+    assert!(
+        logged.contains("cannot stamp it without passing the Lamport ceiling"),
+        "premise: the typed copy is refused at finalisation"
+    );
+    for id in [&held, &grandchild] {
+        assert!(!first.served.contains_key(id), "{} is served", short(id));
+        assert!(
+            first.quarantined_ids.contains(id),
+            "{} is not held",
+            short(id)
+        );
+    }
+    assert!(
+        split_blocks(&after)
+            .iter()
+            .any(|block| block.contains("\"Held\"") && is_signed_block(block)),
+        "the node-written copy of H is gone from the file"
+    );
+    assert_eq!(
+        fixed_point(&first, &second),
+        Vec::<String>::new(),
+        "a restart changes the served set"
+    );
+}
+
+/// A3-3 (0927): the refusal above WARNs "quarantining operator input, kept
+/// in the file as written" for the typed copy, but the quarantine is keyed by
+/// id and keeps the enveloped copy it already holds (L-76's preference), so
+/// the startup compaction writes the node-written copy and the typed block
+/// is gone. Nothing is lost (the same body stays in the file); the WARN names
+/// a block the file no longer has.
+///
+/// Fails at HEAD: the typed block is not in the file after the compaction.
+#[test]
+#[ignore = "A3-3: a retyped copy refused at finalisation is WARNed as kept in the file as written, and dropped by the compaction"]
+fn a3_0927_3_a_retyped_copy_refused_at_finalisation_is_kept_as_written() {
+    let (truth, chain) = a3_0927_chain_fixture(95, 1);
+    let (mut blocks, _, _) = a3_0927_retyped_closure_member(&truth, &chain[0]);
+    let peer = foreign_provider(&truth);
+    blocks.push(a1_0926_signed_open_block(
+        &peer,
+        "2024-01-01 open Assets:Other",
+        LAMPORT_CEILING - 4,
+    ));
+    blocks.push("2023-12-31 open Assets:Earlier".to_owned());
+    let dir = fresh_dir("a3-0927-3");
+    let path = dir.join("ledger.bean");
+    std::fs::write(&path, join_blocks(&blocks)).unwrap();
+    let (svc, logged) = capture_warnings(|| run_pipeline(&path, &truth.provider).unwrap());
+    drop(svc);
+    let after = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_dir_all(dir).ok();
+    let held = a3_0927_id_of(A3_0927_HELD_BODY);
+    assert!(
+        logged
+            .lines()
+            .any(|line| line.contains("kept in the file as written") && line.contains(&held)),
+        "premise: the WARN names the typed copy"
+    );
+    assert!(
+        split_blocks(&after)
+            .iter()
+            .any(|block| block == A3_0927_HELD_BODY),
+        "the typed block the WARN says is kept in the file is gone"
+    );
+}
+
+/// Decision (42) as revised (T92 / L-121), followed to the end (A3, 0927):
+/// the node's own `open` of an account has an edited lamport line, so the
+/// signature pass holds it and the served-set rule holds every transaction
+/// on the account (and what descends from them). The operator follows the
+/// H-23 WARN — "add the missing open, dated no later than the first
+/// transaction" — with another date, so another id; boot no longer judges
+/// L-77 at adoption (where the edited `open` was still in the DAG), and
+/// finalisation adopts it, since no served `open` other than pending input
+/// opens the account. Then a peer re-supplies the original `open`, the
+/// mesh's copy: the account has two `open`s, which since T91 changes no
+/// verdict. At every step the node serves what a fresh replica adopts, the
+/// restart after the re-supply is a fixed point, and the balances are the
+/// truth's. `Expenses:Food` stays open; `Expenses:Travel` also carries the
+/// fixture's history `close`, which the hand `open` precedes.
+///
+/// Revert-proof (archive copy): boot's L-77 at adoption again → the Food
+/// case fails (the hand `open` is refused as already open, the account's
+/// transactions stay held).
+fn a3_0927_hand_open_then_the_original_returns(account: &str) -> Vec<String> {
+    let truth = generate_fixture(96);
+    let mut blocks = split_blocks(&truth.text);
+    let index = blocks
+        .iter()
+        .position(|block| block.starts_with(&format!("2024-01-01 open {account}")))
+        .expect("the fixture opens the account");
+    let original = truth_id_of(&truth, &blocks[index]).unwrap();
+    let lamport: u64 = envelope_value(&blocks[index], KEY_LAMPORT)
+        .unwrap()
+        .parse()
+        .unwrap();
+    blocks[index] = set_lines(&blocks[index], |lines| {
+        for line in lines.iter_mut() {
+            if line.trim_start().starts_with(KEY_LAMPORT) {
+                *line = format!("  {KEY_LAMPORT}: \"{}\"", lamport + 1);
+            }
+        }
+    });
+    let dir = fresh_dir("a3-0927-42");
+    let path = dir.join("ledger.bean");
+    std::fs::write(&path, join_blocks(&blocks)).unwrap();
+    let effect = Effect {
+        touched: vec![original.clone()],
+        deleted: vec![],
+    };
+    let held = snapshot_of(&run_pipeline(&path, &truth.provider).unwrap());
+    assert!(
+        held.quarantined_ids.contains(&original) && held.quarantined_count > 1,
+        "premise: the edited open is held, and transactions with it"
+    );
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str(&format!("\n2024-01-02 open {account}\n"));
+    std::fs::write(&path, text).unwrap();
+    let mut svc = run_pipeline(&path, &truth.provider).unwrap();
+    let remedied = snapshot_of(&svc);
+    let mut failures: Vec<String> = audit(&remedied, &truth, &effect, Checks::ALL)
+        .into_iter()
+        .map(|failure| format!("after the remedy: {failure}"))
+        .collect();
+    let still_held: Vec<String> = remedied
+        .quarantined_ids
+        .iter()
+        .filter(|id| **id != original)
+        .map(|id| short(id).to_owned())
+        .collect();
+    if !still_held.is_empty() {
+        failures.push(format!("after the remedy still held: {still_held:?}"));
+    }
+    if remedied.balances != truth.balances {
+        failures.push("after the remedy the balances differ from the truth".to_owned());
+    }
+    let allowlist = PeerAllowlist::parse(std::slice::from_ref(&truth.author)).unwrap();
+    let returned = validate_supply_entry(&truth.entries[&original]).unwrap();
+    if let Err(error) = offer_to(&mut svc, &returned, &allowlist) {
+        failures.push(format!(
+            "the original open is refused on its return: {error}"
+        ));
+    }
+    svc.persist_or_reload().unwrap();
+    let running = snapshot_of(&svc);
+    drop(svc);
+    let restarted = snapshot_of(&run_pipeline(&path, &truth.provider).unwrap());
+    std::fs::remove_dir_all(dir).ok();
+    failures.extend(
+        audit(&restarted, &truth, &Effect::default(), Checks::ALL)
+            .into_iter()
+            .map(|failure| format!("after the return and a restart: {failure}")),
+    );
+    failures.extend(fixed_point(&running, &restarted));
+    if restarted.quarantined_count != 0 {
+        failures.push(format!(
+            "after the return {} record(s) are still held",
+            restarted.quarantined_count
+        ));
+    }
+    if restarted.balances != truth.balances {
+        failures.push("after the return the balances differ from the truth".to_owned());
+    }
+    // Check 4 replays what the node adopted through the local API of a
+    // replica of the truth, where the original `open` is served: the hand
+    // `open` beside it is the second `open` decision (42) accepts (the local
+    // API's "already open" is an authoring rule, not a wire one).
+    let accepted = format!("that the local API refuses: Account {account} is already open");
+    failures
+        .into_iter()
+        .filter(|failure| !failure.contains(&accepted))
+        .map(|failure| format!("{account}: {failure}"))
+        .collect()
+}
+
+#[test]
+fn a3_0927_a_hand_open_then_the_original_returning_changes_no_verdict() {
+    let mut failures = a3_0927_hand_open_then_the_original_returns("Expenses:Food");
+    failures.extend(a3_0927_hand_open_then_the_original_returns(
+        "Expenses:Travel",
+    ));
+    assert!(failures.is_empty(), "{}", failures.join("\n  "));
+}
+
+/// A3-4 (0927): the cost of T92's fixpoint (decision (39)). Each round of
+/// `quarantine_unservable_history` rebuilds the whole DAG, read model and
+/// account state, and recurses once more — and the alternating chain of
+/// [`a3_0927_the_rule_holds_an_alternating_chain_one_round_per_record`]
+/// forces one round per pair of records, so a boot costs O(pairs × records)
+/// and the recursion is as deep as the chain is long. Measured in release
+/// (A3 `fp`): 1,000 pairs (a 452 KB file) boot in minutes against under a
+/// second for the same records without the hand parents lines; 3,200 pairs
+/// abort a 2 MiB thread — the stack a tokio blocking thread, where the L-13
+/// reload's boot runs, gets — with a stack overflow. The rounds are
+/// avoidable: the walk can pass through a pending hand-parented line whose
+/// hand parent it holds (the rebuild refuses exactly those), so one walk and
+/// one rebuild reach the same set.
+///
+/// Fails at HEAD: 20 rounds for a 41-record chain.
+#[test]
+#[ignore = "A3-4: the served-set rule's fixpoint costs one full rebuild and one recursion level per record pair of an alternating hand-parented chain"]
+fn a3_0927_4_the_rule_reaches_its_fixpoint_without_a_round_per_record() {
+    let (truth, chain) = a3_0927_chain_fixture(97, 41);
+    let mut blocks = split_blocks(&truth.text);
+    let indices: Vec<usize> = chain
+        .iter()
+        .map(|id| a3_0927_block_of(&truth, &blocks, id))
+        .collect();
+    for (position, index) in indices.iter().enumerate() {
+        if position % 2 == 1 {
+            blocks[*index] = a3_0927_half_envelope(&blocks[*index]);
+        }
+    }
+    blocks.remove(indices[0]);
+    let dir = fresh_dir("a3-0927-4");
+    let path = dir.join("ledger.bean");
+    std::fs::write(&path, join_blocks(&blocks)).unwrap();
+    let (svc, logged) = capture_warnings(|| run_pipeline(&path, &truth.provider).unwrap());
+    let served_from_chain = chain
+        .iter()
+        .filter(|id| svc.get_directive(id).is_some())
+        .count();
+    drop(svc);
+    std::fs::remove_dir_all(dir).ok();
+    assert_eq!(served_from_chain, 0, "premise: the whole chain is held");
+    let rounds = logged
+        .matches("ledger records QUARANTINED because no peer could adopt them")
+        .count();
+    assert!(
+        rounds <= 2,
+        "{rounds} rounds of the served-set rule, each a full DAG rebuild and one recursion level, \
+         for a chain of {} records",
+        chain.len()
+    );
+}
+
+/// X1-1 (0927), decision (42) as revised × an envelope-only edit: the node's
+/// own `open Expenses:Food` had only its `openledger-lamport` line edited, so
+/// the signature pass holds it (its id — the body's — is unchanged) and the
+/// rule holds every Food transaction. The H-23 summary's remedy, "add the
+/// missing open, dated no later than the first transaction on the account",
+/// typed as the account's `open` line, has the held record's own id: boot's
+/// adoption meets the edited copy still in the DAG (the pass runs later),
+/// counts the typed line a duplicate and drops it, and the startup
+/// compaction deletes it from the file — silently. The live path adopts the
+/// same bytes (T92 retired L-110) and the account opens. Boot and the live
+/// path give the same bytes two fates, and the printed remedy never works
+/// with the node stopped.
+#[test]
+#[ignore = "X1-1: a hand open with the id of the node's own signature-held open is dropped at boot as a duplicate, while the live path adopts it"]
+fn x1_0927_the_missing_open_retyped_beside_its_edited_envelope_opens_the_account_at_boot() {
+    let truth = generate_fixture(0x0927_0001);
+    let dir = fresh_dir("x1-0927-1");
+    let path = dir.join("ledger.bean");
+    let mut blocks = split_blocks(&truth.text);
+    let food = blocks
+        .iter()
+        .position(|block| block.starts_with("2024-01-01 open Expenses:Food"))
+        .expect("the fixture opens Expenses:Food");
+    blocks[food] = set_lines(&blocks[food], |lines| {
+        for line in lines.iter_mut() {
+            if line.trim_start().starts_with("openledger-lamport:") {
+                *line = "  openledger-lamport: \"4242\"".to_owned();
+            }
+        }
+    });
+    blocks.push("2024-01-01 open Expenses:Food".to_owned());
+    std::fs::write(&path, join_blocks(&blocks)).unwrap();
+    let svc = run_pipeline(&path, &truth.provider).expect("boot");
+    assert!(
+        svc.accounts().is_open("Expenses:Food"),
+        "X1-1: the typed open is adopted at boot (held: {:?})",
+        svc.quarantined_ids()
+    );
+    let snapshot = snapshot_of(&svc);
+    drop(svc);
+    let svc = run_pipeline(&path, &truth.provider).expect("restart");
+    assert!(
+        svc.accounts().is_open("Expenses:Food"),
+        "and after a restart"
+    );
+    assert!(
+        fixed_point(&snapshot, &snapshot_of(&svc)).is_empty(),
+        "a fixed point"
     );
 }
