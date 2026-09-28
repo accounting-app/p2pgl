@@ -3966,10 +3966,10 @@ fn a2_0927_1_one_peers_close_and_posting_in_opposite_orders_leave_two_replicas_c
 /// and written by the next unrelated commit (whose compaction also replaces
 /// the link, L-44). The balance after an error must be what the node
 /// acknowledged — 100 — and the next write adds only itself, running and after
-/// a restart. Fails at `a5313a1` (107).
+/// a restart. Failed at `a5313a1` (107); since T100 (L-147, decision (62)) the
+/// reload-failed arm rolls the staged write back.
 #[cfg(unix)]
 #[test]
-#[ignore = "A4-2: the L-117 refusal keeps the failed call's write and the next commit writes it"]
 fn a4_0927_a_write_whose_reload_is_refused_for_a_link_is_not_in_the_balance() {
     let (mut service, path) = node_with_100("a4-0927-2-link");
     let directory = path.parent().expect("directory").to_path_buf();

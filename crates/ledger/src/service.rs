@@ -193,23 +193,21 @@ fn is_reserved_temporary_name(name: &str, ledger_name: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Remove the temporaries crashed rewrites left beside `path` (L-57).
-///
-/// Runs once, from a process-start boot — under `gl-node` that is after
-/// `ledger_lock::acquire`, so no sibling process can be mid-persist on this
-/// ledger and every match is a crashed leftover. Matches only the reserved
-/// names [`is_reserved_temporary_name`] defines — `<name>.tmp` (the pre-T67
-/// fixed name) and `<name>.tmp.<pid>.<16 hex>` — never any other
-/// `<name>.tmp.*` (T78). Removes only what a crashed persist
-/// could have left: a regular file or a symlink, owned by this uid. Anything
-/// else — a directory, a FIFO, a file another account owns — is logged and
-/// left alone: it is not ours to delete, and it no longer blocks a write,
-/// because writes never reuse a name. Best effort: a failure here never fails
-/// the boot. (Library users that run several writers on one ledger without
-/// that lock keep the pre-T30 exposure, as `persist_atomically` documents.)
-/// `(DAG size, held-back file-adopted lines, the served ids)` — see
-/// `LedgerService::served_id_snapshot`.
-type ServedIdSnapshot = (usize, usize, std::sync::Arc<[String]>);
+/// What decides which records this node withholds from peers (T100 / L-148,
+/// L-154): the DAG's size, how many file-adopted lines await their rewrite,
+/// and how many writes are staged with the last one's id. The DAG only grows
+/// between rebuilds, which reset every snapshot keyed by this.
+type WithheldKey = (usize, usize, usize, Option<String>);
+
+/// `(key, the served ids)` — see `LedgerService::served_id_snapshot`.
+type ServedIdSnapshot = (WithheldKey, std::sync::Arc<[String]>);
+
+/// `((staged count, last staged id), (the staged ids, the committed records
+/// they name))` — see `LedgerService::staged_frontier`.
+type StagedFrontier = (
+    (usize, Option<String>),
+    std::sync::Arc<(HashSet<String>, Vec<String>)>,
+);
 
 /// Clear what an older build's crashed rewrites left beside a ledger LINK
 /// (`<link>.tmp.*`) — before T82 temporary files sat beside the link, and since
@@ -226,6 +224,20 @@ pub fn sweep_temporaries_beside_the_link(configured: &Path, resolved: &Path) {
     }
 }
 
+/// Remove the temporaries crashed rewrites left beside `path` (L-57).
+///
+/// Runs once, from a process-start boot — under `gl-node` that is after
+/// `ledger_lock::acquire`, so no sibling process can be mid-persist on this
+/// ledger and every match is a crashed leftover. Matches only the reserved
+/// names [`is_reserved_temporary_name`] defines — `<name>.tmp` (the pre-T67
+/// fixed name) and `<name>.tmp.<pid>.<16 hex>` — never any other
+/// `<name>.tmp.*` (T78). Removes only what a crashed persist
+/// could have left: a regular file or a symlink, owned by this uid. Anything
+/// else — a directory, a FIFO, a file another account owns — is logged and
+/// left alone: it is not ours to delete, and it no longer blocks a write,
+/// because writes never reuse a name. Best effort: a failure here never fails
+/// the boot. (Library users that run several writers on one ledger without
+/// that lock keep the pre-T30 exposure, as `persist_atomically` documents.)
 fn sweep_stale_temporaries(path: &Path) {
     let Some(file_name) = path.file_name() else {
         return;
@@ -3270,6 +3282,13 @@ pub struct LedgerService {
     /// only grows (adoption) or empties (a successful rewrite) between
     /// rebuilds, and `rebuild_dag` resets this with the other snapshot.
     served_id_snapshot: std::sync::Mutex<Option<ServedIdSnapshot>>,
+    /// The ids this node withholds from peers, cached under their
+    /// [`WithheldKey`] (T100) — see [`Self::withheld_ids`].
+    withheld_snapshot: std::sync::Mutex<Option<(WithheldKey, std::sync::Arc<HashSet<String>>)>>,
+    /// The staged ids and the committed records they name, cached under the
+    /// staged count and last id (T100 / L-149) — see
+    /// [`Self::choose_committed_parents`].
+    staged_frontier: std::sync::Mutex<Option<StagedFrontier>>,
 }
 
 impl LedgerService {
@@ -3340,8 +3359,11 @@ impl LedgerService {
         // its watcher polls — and uses it as it is: resolving it again followed
         // a link the operator had put there since, and the rebuilt service
         // then read, journalled and compacted a file the lock did not cover.
-        // A path that has become a link is refused instead (the reload's
-        // REFUSING arm keeps memory).
+        // A path that has become a link is refused instead: the reload fails,
+        // and `finish_recovery`'s reload-failed arm keeps memory, less the
+        // writes the failed commit staged (T100 / L-147). Its next commit is a
+        // full rewrite that renames a regular file onto the path, replacing
+        // the link (L-44).
         let file_path = if matches!(mode, BootMode::Reload) {
             let is_link = std::fs::symlink_metadata(&configured)
                 .map(|metadata| metadata.file_type().is_symlink())
@@ -4142,6 +4164,8 @@ impl LedgerService {
             commit_observer: None,
             directive_id_snapshot: std::sync::Mutex::new(None),
             served_id_snapshot: std::sync::Mutex::new(None),
+            withheld_snapshot: std::sync::Mutex::new(None),
+            staged_frontier: std::sync::Mutex::new(None),
         };
 
         // T81 / M-51, M-52: what descends from a record refused under a
@@ -5641,6 +5665,14 @@ impl LedgerService {
             .served_id_snapshot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .withheld_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .staged_frontier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         if rebased > 0 {
             info!(
                 rebased,
@@ -6512,30 +6544,30 @@ impl LedgerService {
     /// head is replaced by its own parents, walked back to what is committed,
     /// and a candidate that a committed record already names is dropped, so
     /// the choice is exactly the heads of the committed DAG.
+    ///
+    /// T100 / L-149: the staged set and the committed records it names are
+    /// computed once per staged set ([`Self::staged_frontier`]), not per
+    /// adopted line — an adoption pass stages nothing — so a large hand edit
+    /// adopted beside a large staged batch costs the lines plus the batch, not
+    /// their product.
     fn choose_committed_parents(&self, content_id: &str) -> String {
         if self.pending_ids.is_empty() {
             return self.choose_parents(content_id);
         }
-        let pending: HashSet<&str> = self.pending_ids.iter().map(String::as_str).collect();
-        let mut committed: BTreeSet<&str> = BTreeSet::new();
-        let mut seen: HashSet<&str> = HashSet::new();
-        let mut frontier: Vec<&str> = self.dag.heads_admissible_as_parents_of(content_id);
-        while let Some(head) = frontier.pop() {
-            if !seen.insert(head) {
-                continue;
-            }
-            if !pending.contains(head) {
-                committed.insert(head);
-                continue;
-            }
-            if let Some(Directive::Transaction(txn)) = self.dag.get(head) {
-                frontier.extend(
-                    txn.parent_ids()
-                        .into_iter()
-                        .filter(|parent| self.dag.get(parent).is_some() && *parent != content_id),
-                );
-            }
-        }
+        let frontier = self.staged_frontier();
+        let (pending, named_by_staged) = (&frontier.0, &frontier.1);
+        let mut committed: BTreeSet<&str> = self
+            .dag
+            .heads_admissible_as_parents_of(content_id)
+            .into_iter()
+            .filter(|head| !pending.contains(*head))
+            .collect();
+        committed.extend(
+            named_by_staged
+                .iter()
+                .map(String::as_str)
+                .filter(|id| *id != content_id),
+        );
         committed.retain(|id| {
             self.dag.children_of(id).is_none_or(|children| {
                 children
@@ -6548,6 +6580,40 @@ impl LedgerService {
             .map(|head| (head, self.dag.get(head).and_then(directive_author)))
             .collect();
         select_parents(&mut candidates).join(",")
+    }
+
+    /// The staged ids and the committed records a staged transaction names as
+    /// a parent (T100 / L-149), cached under the staged count and last id —
+    /// `pending_ids` only grows by staging and is emptied by a commit, and a
+    /// rebuild that shrinks it resets the cache.
+    fn staged_frontier(&self) -> std::sync::Arc<(HashSet<String>, Vec<String>)> {
+        let key = (self.pending_ids.len(), self.pending_ids.last().cloned());
+        let mut cache = self
+            .staged_frontier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((cached, frontier)) = cache.as_ref() {
+            if *cached == key {
+                return std::sync::Arc::clone(frontier);
+            }
+        }
+        let pending: HashSet<String> = self.pending_ids.iter().cloned().collect();
+        let mut named: BTreeSet<String> = BTreeSet::new();
+        for id in &self.pending_ids {
+            if let Some(Directive::Transaction(txn)) = self.dag.get(id) {
+                named.extend(
+                    txn.parent_ids()
+                        .into_iter()
+                        .filter(|parent| {
+                            !pending.contains(*parent) && self.dag.get(parent).is_some()
+                        })
+                        .map(str::to_owned),
+                );
+            }
+        }
+        let frontier = std::sync::Arc::new((pending, named.into_iter().collect()));
+        *cache = Some((key, std::sync::Arc::clone(&frontier)));
+        frontier
     }
 
     /// The value this node stamps next, checked against the one Lamport rule
@@ -6766,6 +6832,29 @@ impl LedgerService {
             .saturating_sub(self.canonical_journal_bytes)
     }
 
+    /// The bytes a write can add before the next commit passes the file cap
+    /// (T100 / M-74, decision (61)): [`Self::append_headroom`], except while
+    /// the next commit will be a full rewrite — a line adopted from the file
+    /// awaiting its canonical spelling, a forced compaction, a file changed
+    /// under the node — when it is the cap minus the length of the rewrite
+    /// memory would write now (envelopes of the adopted lines and staged
+    /// writes included). `append_headroom` reads the file's size, which the
+    /// rewrite can exceed: `gl-node`'s pre-stage gate let such a write
+    /// through, the compaction's text was over the cap, and each mutation and
+    /// each peer batch paid a full reload for an `IO_ERROR`. O(1) unless a
+    /// rewrite is pending; then one pass over the ledger, which the rewrite
+    /// that follows pays anyway.
+    pub fn write_headroom(&self) -> u64 {
+        let append = self.append_headroom();
+        let rewrites = self.force_compaction
+            || !self.canonical_is_current
+            || !self.adopted_from_file.is_empty();
+        if append == 0 || !rewrites {
+            return append;
+        }
+        MAX_LEDGER_FILE_BYTES.saturating_sub(self.compaction_text_len())
+    }
+
     /// The commit journal's path (`<ledger>.bean.journal`).
     pub fn journal_path(&self) -> &Path {
         &self.journal_path
@@ -6932,28 +7021,30 @@ impl LedgerService {
             // `gl-node` used to advertise `externalFileEdits: "disabled"` as
             // that switch; the setting is gone (it never reached this line).
             self.adopt_external_edits()?;
-            // T82 / L-80: refuse before building a text the write would
-            // refuse anyway — as a resource limit, so `gl-node` backs the peer
-            // off and reports the cap, instead of an I/O error and a reload.
-            // Measured only when the fact is set (boot, finalisation and
-            // reconcile keep it current); a hand edit that shrank the file
-            // clears it here.
-            if self.canonical_over_cap {
-                if let Some(canonical) = self.measure_canonical_over_cap(false) {
-                    return Err(ServiceError::ResourceLimitExceeded {
-                        message: format!(
-                            "the canonical form of this ledger is {canonical} bytes, over the \
-                             file cap of {MAX_LEDGER_FILE_BYTES}: every write fails until the file \
-                             is made smaller (L-64, L-80)"
-                        ),
-                    });
-                }
-            }
             // H-08: DAG ∪ quarantine, not the DAG alone. This is the single
             // production write that replaces the whole `.bean`, so it is the
             // single place where "boot skipped it" could turn into "it is gone".
             // L-45 adds the third term — the blocks that never parsed.
-            (CommitKind::Compact, self.compaction_text(), String::new())
+            let text = self.compaction_text();
+            // T82 / L-80, T100 / M-74 (decision (61)): refuse a text the write
+            // would refuse anyway — as a resource limit, so `gl-node` backs
+            // the peer off and reports the cap, instead of an I/O error and a
+            // reload — and keep the fact current either way. Before T100 this
+            // was measured only while the fact was already set, and a rewrite
+            // whose adopted envelopes pushed it over the cap reached
+            // `persist_atomically`, which refused it as `InvalidData`.
+            let length = text.len() as u64;
+            self.canonical_over_cap = length > MAX_LEDGER_FILE_BYTES;
+            if self.canonical_over_cap {
+                return Err(ServiceError::ResourceLimitExceeded {
+                    message: format!(
+                        "the canonical form of this ledger is {length} bytes, over the file cap \
+                         of {MAX_LEDGER_FILE_BYTES}: every write fails until the file is made \
+                         smaller (L-64, L-80)"
+                    ),
+                });
+            }
+            (CommitKind::Compact, text, String::new())
         } else {
             // T27's "reject an over-cap write BEFORE any state changes" applies
             // to the append path too, and has to be re-derived here because the
@@ -7505,6 +7596,7 @@ impl LedgerService {
                     // The Info item beside M-49: the rebuild saw a torn
                     // journal, and the rewrite that follows must rename it.
                     self.journal_torn_at_boot |= reloaded.journal_torn_at_boot;
+                    self.discard_staged_writes();
                     return;
                 }
                 let mut reloaded = reloaded;
@@ -7528,6 +7620,7 @@ impl LedgerService {
                         );
                         self.force_compaction = true;
                         self.journal_torn_at_boot |= reloaded.journal_torn_at_boot;
+                        self.discard_staged_writes();
                         return;
                     }
                 };
@@ -7613,8 +7706,83 @@ impl LedgerService {
                      the failed commit may have torn, and it keeps the journal as a .torn-* \
                      sidecar instead of deleting it (L-13, M-49)"
                 );
+                self.discard_staged_writes();
             }
         }
+    }
+
+    /// Roll back what the failed commit staged, on the arms of
+    /// [`Self::finish_recovery`] that keep memory instead of installing the
+    /// rebuild (T100 / L-147, decision (62)): the committed-id floor, the M-59
+    /// check and a reload that failed (the L-117 link refusal among them).
+    /// Before T100 memory was kept as it stood, the write whose call had just
+    /// returned an error included: counted and served at once, written by the
+    /// next commit — "error, but durable". Since T93 a line adopted from the
+    /// file takes committed parents (decision (43)), so taking the staged
+    /// writes out strands nothing the node chose; a line that spells a staged
+    /// write's id as its parent itself (M-47) is held — as the operator typed
+    /// it, kept in the file — exactly as boot holds a hand-spelled parent that
+    /// is not served (L-75). The clock is not lowered (decision (44)). The
+    /// over-cap fact is measured again over what stays, since these arms return
+    /// before the success path's measurement (M-74).
+    fn discard_staged_writes(&mut self) {
+        if !self.pending_ids.is_empty() {
+            let staged: BTreeSet<String> = self.pending_ids.iter().cloned().collect();
+            let mut orphaned: BTreeSet<String> = BTreeSet::new();
+            let mut frontier: Vec<String> = staged.iter().cloned().collect();
+            while let Some(id) = frontier.pop() {
+                for child in self.dag.children_of(&id).unwrap_or_default() {
+                    if !staged.contains(child) && orphaned.insert(child.clone()) {
+                        frontier.push(child.clone());
+                    }
+                }
+            }
+            let already_held: BTreeSet<String> = self
+                .quarantined
+                .keys()
+                .filter(|id| staged.contains(*id))
+                .cloned()
+                .collect();
+            // A line the file spells raw is held as it spells it: this node's
+            // stamp is in memory only.
+            let as_typed: Vec<(String, Directive)> = orphaned
+                .iter()
+                .filter(|id| self.adopted_from_file.contains(*id))
+                .filter_map(|id| {
+                    let mut written = self.dag.get(id)?.clone();
+                    directive_metadata_mut(&mut written).retain(|key, _| {
+                        !matches!(
+                            key.as_str(),
+                            ENVELOPE_KEY_AUTHOR | ENVELOPE_KEY_LAMPORT | ENVELOPE_KEY_SIGNATURE
+                        )
+                    });
+                    Some((id.clone(), written))
+                })
+                .collect();
+            let refused: BTreeSet<String> = staged.union(&orphaned).cloned().collect();
+            self.rebuild_dag(&refused, &BTreeMap::new());
+            self.quarantined
+                .retain(|id, _| !staged.contains(id) || already_held.contains(id));
+            for (content_id, written) in as_typed {
+                self.adopted_from_file.remove(&content_id);
+                self.quarantined.insert(content_id, written);
+            }
+            for content_id in &orphaned {
+                warn!(
+                    id = %content_id,
+                    file = %self.file_path.display(),
+                    "quarantining a ledger record, kept in the file: its openledger-parents \
+                     names a write whose commit failed and which is rolled back (L-147, L-75)"
+                );
+            }
+            warn!(
+                discarded = staged.len(),
+                file = %self.file_path.display(),
+                "the writes staged in the failed commit are rolled back, as the calls that \
+                 staged them were told (L-147)"
+            );
+        }
+        self.measure_canonical_over_cap(false);
     }
 
     /// The ids memory holds that `rebuilt` lacks and that no failed commit can
@@ -9301,20 +9469,67 @@ impl LedgerService {
     /// is the one the file keeps. The id is the body's, so a record naming it
     /// (a local write on top) stays valid either way.
     pub fn served_directive(&self, content_id: &str) -> Option<&Directive> {
-        if self.adopted_from_file.contains(content_id) {
+        if self
+            .withheld_ids()
+            .is_some_and(|withheld| withheld.contains(content_id))
+        {
             return None;
         }
         self.dag.get(content_id)
     }
 
-    /// [`Self::head_txids`] over what this node serves (T93 / L-116): a head
-    /// held back by [`Self::served_directive`] is replaced by those of its
+    /// The records this node does not offer peers yet, or `None` when there
+    /// are none: lines adopted from the `.bean` whose canonical rewrite has
+    /// not succeeded (T93 / L-116) **and everything that descends from them**
+    /// (T100 / L-154) — a signed child of such a line, offered alone, is a
+    /// record no peer can adopt — plus every write staged and not yet
+    /// committed (T100 / L-148, decision (63)): offered in the window before
+    /// its commit, a write a failed commit then rolled back could be held by a
+    /// peer under the `(author, lamport)` pair this node reissues after a
+    /// restart. Cached under its [`WithheldKey`]; computed only while either
+    /// set is non-empty.
+    fn withheld_ids(&self) -> Option<std::sync::Arc<HashSet<String>>> {
+        if self.adopted_from_file.is_empty() && self.pending_ids.is_empty() {
+            return None;
+        }
+        let key: WithheldKey = (
+            self.dag.len(),
+            self.adopted_from_file.len(),
+            self.pending_ids.len(),
+            self.pending_ids.last().cloned(),
+        );
+        let mut snapshot = self
+            .withheld_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((cached, withheld)) = snapshot.as_ref() {
+            if *cached == key {
+                return Some(std::sync::Arc::clone(withheld));
+            }
+        }
+        let mut withheld: HashSet<String> = self.pending_ids.iter().cloned().collect();
+        let mut frontier: Vec<String> = self.adopted_from_file.iter().cloned().collect();
+        withheld.extend(frontier.iter().cloned());
+        while let Some(id) = frontier.pop() {
+            for child in self.dag.children_of(&id).unwrap_or_default() {
+                if withheld.insert(child.clone()) {
+                    frontier.push(child.clone());
+                }
+            }
+        }
+        let withheld = std::sync::Arc::new(withheld);
+        *snapshot = Some((key, std::sync::Arc::clone(&withheld)));
+        Some(withheld)
+    }
+
+    /// [`Self::head_txids`] over what this node serves (T93 / L-116; T100): a
+    /// head [`Self::served_directive`] withholds is replaced by those of its
     /// parents that no served record names.
     pub fn served_head_txids(&self) -> std::collections::HashSet<String> {
-        if self.adopted_from_file.is_empty() {
+        let Some(withheld) = self.withheld_ids() else {
             return self.head_txids();
-        }
-        let unserved = |id: &str| self.adopted_from_file.contains(id);
+        };
+        let unserved = |id: &str| withheld.contains(id);
         let mut served_heads: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut frontier: Vec<String> = self.dag.heads().iter().cloned().collect();
@@ -9345,29 +9560,34 @@ impl LedgerService {
     }
 
     /// [`Self::sorted_directive_ids`] over what this node serves (T93 /
-    /// L-116).
+    /// L-116; T100).
     pub fn served_sorted_directive_ids(&self) -> std::sync::Arc<[String]> {
         let all = self.sorted_directive_ids();
-        if self.adopted_from_file.is_empty() {
+        let Some(withheld) = self.withheld_ids() else {
             return all;
-        }
-        let key = (self.dag.len(), self.adopted_from_file.len());
+        };
+        let key: WithheldKey = (
+            self.dag.len(),
+            self.adopted_from_file.len(),
+            self.pending_ids.len(),
+            self.pending_ids.last().cloned(),
+        );
         let mut snapshot = self
             .served_id_snapshot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((size, held, ids)) = snapshot.as_ref() {
-            if (*size, *held) == key {
+        if let Some((cached, ids)) = snapshot.as_ref() {
+            if *cached == key {
                 return std::sync::Arc::clone(ids);
             }
         }
         let served: std::sync::Arc<[String]> = all
             .iter()
-            .filter(|id| !self.adopted_from_file.contains(id.as_str()))
+            .filter(|id| !withheld.contains(id.as_str()))
             .cloned()
             .collect::<Vec<_>>()
             .into();
-        *snapshot = Some((key.0, key.1, std::sync::Arc::clone(&served)));
+        *snapshot = Some((key, std::sync::Arc::clone(&served)));
         served
     }
 
@@ -19275,10 +19495,12 @@ mod tests {
             .unwrap();
         let before = svc.directive_count();
         let (_, logged) = capture_warnings(|| svc.recover_failed_commit());
+        // T100 / L-147, decision (62): memory is kept — less the write the
+        // failed commit staged, which is rolled back.
         assert_eq!(
             svc.directive_count(),
-            before,
-            "H-15: the emptier rebuild must not install"
+            before - 1,
+            "H-15: the emptier rebuild must not install; the staged open is rolled back"
         );
         assert!(logged.contains("REFUSING"), "{logged}");
         assert!(svc.compaction_pending());
@@ -20408,24 +20630,31 @@ mod tests {
         for name in acked.iter().chain(replacement.iter()) {
             assert!(svc.accounts().is_open(name), "{name} must stay in memory");
         }
+        // T100 / L-147, decision (62): the write whose call failed is rolled
+        // back; before T100 it was kept, counted and served.
         assert_eq!(
             svc.directive_count(),
-            7,
-            "three acked, three adopted, and the staged write kept ahead of disk"
+            6,
+            "three acked and three adopted; the staged write rolled back"
         );
+        assert!(!svc.accounts().is_open("Assets:Staged"));
         assert!(svc.compaction_pending(), "the refusal arms a full rewrite");
 
         svc.open_account("Assets:After".to_owned(), make_date(2024, 2, 2), vec![])
             .expect("the next write succeeds once the directory is writable");
         let on_disk = LedgerService::boot(path.clone(), "checker".to_owned()).unwrap();
-        assert_eq!(on_disk.directive_count(), 8, "the union is on disk");
+        assert_eq!(on_disk.directive_count(), 7, "the union is on disk");
         for name in acked
             .iter()
             .chain(replacement.iter())
-            .chain(["Assets:Staged", "Assets:After"].iter())
+            .chain(["Assets:After"].iter())
         {
             assert!(on_disk.accounts().is_open(name), "{name} on disk");
         }
+        assert!(
+            !on_disk.accounts().is_open("Assets:Staged"),
+            "the failed write"
+        );
         std::fs::remove_dir_all(&directory).ok();
     }
 
@@ -20681,9 +20910,12 @@ mod tests {
         let rebooted = LedgerService::boot(path.clone(), "test-peer".to_owned())
             .expect("M-49: the reboot must not find a corrupt journal");
         assert_eq!(rebooted.directive_count(), svc.directive_count());
-        for name in ["Assets:One", "Assets:Two", "Assets:Three"] {
+        for name in ["Assets:One", "Assets:Three"] {
             assert!(rebooted.accounts().is_open(name), "{name}");
         }
+        // T100 / L-147, decision (62): `Two` was staged in the commit that
+        // failed; the failed reload rolls it back instead of keeping it.
+        assert!(!rebooted.accounts().is_open("Assets:Two"));
         for sidecar in sidecars {
             std::fs::remove_file(sidecar).ok();
         }
@@ -21968,6 +22200,73 @@ mod tests {
         drop(svc);
         let svc = t85_boot(&path);
         assert!(svc.contains_directive(&id), "and after a restart");
+        remove_ledger_and_journal(&path);
+    }
+
+    /// T100 / L-154 (X1 `m9`), decision (63): the banner's remedy — delete an
+    /// envelope-only-edited record's `openledger-*` lines — re-adopts T2 from
+    /// the file, and until the rewrite that spells it canonically succeeds T2
+    /// is withheld from peers (T93 / L-116). Its signed child T3 is history
+    /// the file already held; offered alone it is a record no peer can adopt,
+    /// so it is withheld with T2 — in `served_directive`, the served heads and
+    /// the served ids — and both are offered once the rewrite succeeds.
+    ///
+    /// Bug-catch: withhold only the adopted lines, not what descends from them,
+    /// and T3 is served (and advertised as a head) before its parent.
+    #[test]
+    fn l154_a_child_of_a_line_awaiting_its_rewrite_is_withheld_with_it() {
+        let (mut svc, path) = setup_with_signed_accounts();
+        let t2 = svc
+            .append_transaction_signing(balanced_input(), marker_sign(true))
+            .unwrap()
+            .txid;
+        let t3 = svc
+            .append_transaction_signing(
+                TransactionInput {
+                    date: make_date(2024, 1, 20),
+                    narration: Some("T3 on top".to_owned()),
+                    ..balanced_input()
+                },
+                marker_sign(true),
+            )
+            .unwrap()
+            .txid;
+        svc.compact().unwrap();
+        drop(svc);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let stripped: Vec<String> = text
+            .split("\n\n")
+            .map(|block| {
+                if block.contains("\"Funding\"") {
+                    block
+                        .lines()
+                        .filter(|line| !line.trim_start().starts_with("openledger-"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    block.to_owned()
+                }
+            })
+            .collect();
+        std::fs::write(&path, stripped.join("\n\n")).unwrap();
+        let mut svc = t85_boot(&path);
+        assert!(
+            svc.contains_directive(&t2) && svc.contains_directive(&t3),
+            "premise"
+        );
+        assert!(
+            svc.served_directive(&t2).is_none(),
+            "premise: T2 awaits its rewrite"
+        );
+        assert!(
+            svc.served_directive(&t3).is_none(),
+            "T3 is withheld with its parent"
+        );
+        assert!(!svc.served_head_txids().contains(&t3));
+        assert!(!svc.served_sorted_directive_ids().contains(&t3));
+        svc.compact().unwrap();
+        assert!(svc.served_directive(&t2).is_some() && svc.served_directive(&t3).is_some());
+        assert!(svc.served_head_txids().contains(&t3));
         remove_ledger_and_journal(&path);
     }
 
@@ -23885,6 +24184,88 @@ mod tests {
         std::fs::remove_dir_all(&directory).ok();
     }
 
+    /// A4 (0927): decision (44)'s floor re-applied after `verify_own_history`.
+    /// A signing node whose file holds one of its own records with the lamport
+    /// line edited to 2^30 (quarantined, clock released, L-87) stages a write;
+    /// the commit fails. The rebuild resumes at 2^30 + 1, the reload's pass
+    /// releases it below the discarded write's lamport, and only the second
+    /// application keeps the next write from re-issuing it.
+    ///
+    /// Bug-catch: drop the `max(discarded_own_high)` after `verify_own_history`
+    /// in `finish_recovery` and the next write reuses the failed write's
+    /// lamport (`l115_…` does not notice).
+    #[cfg(unix)]
+    #[test]
+    fn l115_the_l87_release_after_a_failed_commit_does_not_reissue_its_lamport() {
+        let directory = t67_directory("a4-l115b");
+        let path = directory.join("ledger.bean");
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.set_signer(marker_signer());
+        for account in ["Assets:Cash", "Equity:Opening"] {
+            svc.open_account_signing(
+                account.to_owned(),
+                make_date(2024, 1, 1),
+                vec![],
+                marker_sign(false),
+            )
+            .unwrap();
+        }
+        svc.append_transaction_signing(balanced_input(), marker_sign(true))
+            .unwrap();
+        svc.compact().unwrap();
+        drop(svc);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("openledger-lamport: \"3\""), "{text}");
+        std::fs::write(
+            &path,
+            text.replace(
+                "openledger-lamport: \"3\"",
+                "openledger-lamport: \"1073741824\"",
+            ),
+        )
+        .unwrap();
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.set_signer(marker_signer());
+        svc.set_verifier(marker_verifier());
+        svc.finalize_operator_input();
+        svc.verify_own_history();
+        assert!(
+            svc.lamport_clock() < 1 << 28,
+            "premise: released, {}",
+            svc.lamport_clock()
+        );
+        let failed = svc
+            .append_transaction_staged(
+                TransactionInput {
+                    narration: Some("fails".to_owned()),
+                    ..balanced_input()
+                },
+                marker_sign(true),
+            )
+            .unwrap()
+            .txid;
+        let failed_lamport = svc.get_directive(&failed).unwrap().lamport_clock().unwrap();
+        let outcome = with_read_only_directory(&directory, || svc.persist_or_reload());
+        assert!(outcome.is_err(), "premise: the commit fails");
+        assert!(svc.get_directive(&failed).is_none(), "premise: rolled back");
+        let next = svc
+            .append_transaction_signing(
+                TransactionInput {
+                    narration: Some("the next write".to_owned()),
+                    ..balanced_input()
+                },
+                marker_sign(true),
+            )
+            .unwrap()
+            .txid;
+        let next_lamport = svc.get_directive(&next).unwrap().lamport_clock().unwrap();
+        assert!(
+            next_lamport > failed_lamport,
+            "the next write is stamped {next_lamport}, the failed one was {failed_lamport}"
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
     /// L-115 (T93, decision (44)), the audit's X3 shape: after a restart the
     /// clock resumes at the file's `max + 1`, so the first write is stamped
     /// `max + 2`. Its commit fails; the recovery reload rebuilds from the file
@@ -23959,12 +24340,16 @@ mod tests {
     /// operator to spell the staged write's id in an `openledger-parents` line
     /// — and then the rebuild's own boot refuses that line (L-75: its parent
     /// exists nowhere on disk), so the committed-id floor refuses the install
-    /// before the M-59 parent check is reached. Either refusal keeps memory;
-    /// what this pins is the outcome: memory self-consistent, the next commit
-    /// writing both, every parent on disk resolving.
+    /// before the M-59 parent check is reached. Either refusal keeps memory.
+    /// Since T100 (L-147, decision (62)) the refusing arm rolls the staged
+    /// write back — its call returned an error — and holds the hand line that
+    /// named it, as written (L-75): what this pins is the outcome, memory
+    /// self-consistent, the failed write on no disk, the hand line kept in the
+    /// file and held, every served parent on disk resolving.
     ///
     /// Bug-catch: drop both refusals and the hand line is on disk naming a
-    /// parent that is not.
+    /// parent that is not; hold nothing beside the rolled-back write and
+    /// memory serves the hand line over a parent it lacks.
     #[cfg(unix)]
     #[test]
     fn m59_a_kept_envelope_whose_parent_the_rebuild_lacks_refuses_the_install() {
@@ -24007,7 +24392,11 @@ mod tests {
                     _ => true,
                 })
         };
-        assert!(transaction_named(&svc, "hand while running").is_some());
+        assert!(
+            svc.get_directive(&staged).is_none(),
+            "the failed write is rolled back"
+        );
+        assert!(transaction_named(&svc, "hand while running").is_none());
         assert!(parents_resolve(&svc), "memory is self-consistent");
 
         svc.append_transaction_signing(
@@ -24018,10 +24407,20 @@ mod tests {
             marker_sign(true),
         )
         .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("hand while running"),
+            "the hand line is kept in the file"
+        );
         let on_disk = LedgerService::boot(path.clone(), "checker".to_owned()).unwrap();
-        assert!(transaction_named(&on_disk, "hand while running").is_some());
+        assert!(on_disk.get_directive(&staged).is_none());
+        assert!(transaction_named(&on_disk, "hand while running").is_none());
         assert!(parents_resolve(&on_disk), "every parent on disk resolves");
-        assert_eq!(on_disk.quarantined_count(), 0);
+        assert_eq!(
+            on_disk.quarantined_count(),
+            1,
+            "the hand line is held (L-75)"
+        );
         std::fs::remove_dir_all(&directory).ok();
     }
 

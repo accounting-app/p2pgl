@@ -3992,11 +3992,12 @@ fn a6_0927_served_ids_uncached(svc: &LedgerService) -> Vec<String> {
 /// T95 (the L-116 advert cost) and T93 (L-116) at the mesh level: while a
 /// line typed into A's `.bean` waits for its rewrite, A's advert is the cached
 /// served-id list — and it must still track the ledger. A record staged from
-/// a peer before A's next commit is advertised at once (the list is keyed by
-/// the DAG's size and the held-back count, and both moved), the hand line is
-/// neither advertised nor supplied until the rewrite, and a fresh node that
-/// hears of everything only from A through gl-node's own pipeline holds
-/// exactly what A serves at each step.
+/// a peer before A's next commit is not advertised until that commit succeeds
+/// (T100 / L-148, decision (63): a staged write is withheld, since a failed
+/// commit rolls it back), the hand line is neither advertised nor supplied
+/// until the rewrite, and a fresh node that hears of everything only from A
+/// through gl-node's own pipeline holds exactly what A serves at each step —
+/// the staged record once A has committed it.
 ///
 /// Why the shape matters: gl-node's two-phase commit stages under the write
 /// lock and commits outside it, so adverts run between a stage and the
@@ -4005,8 +4006,10 @@ fn a6_0927_served_ids_uncached(svc: &LedgerService) -> Vec<String> {
 /// change — the T95 unit test (`l116_the_served_id_list_is_shared…`) pins that
 /// the list is shared, not that it is invalidated.
 ///
-/// Bug-catch: return the cached list whatever its key and the advert taken
-/// after B's record is staged omits it.
+/// Bug-catch (T95, before T100): return the cached list whatever its key and
+/// the advert taken after B's record was staged omitted it. Since decision
+/// (63) the served set changes only at a commit, which empties the withheld
+/// set and bypasses the cache, so this case no longer catches that revert.
 #[test]
 fn a6_0927_1_the_cached_advert_tracks_a_record_staged_while_a_line_waits_for_its_rewrite() {
     let mut mesh = seeded_mesh(9271, 2);
@@ -4052,8 +4055,8 @@ fn a6_0927_1_the_cached_advert_tracks_a_record_staged_while_a_line_waits_for_its
     ));
     let staged_advert = advert(&mesh);
     assert!(
-        staged_advert.contains(&from_b),
-        "A's advert omits the record it just staged"
+        !staged_advert.contains(&from_b),
+        "A advertises a record it has only staged (T100 / L-148)"
     );
     assert!(
         !staged_advert.contains(&hand[0]),
@@ -4085,6 +4088,10 @@ fn a6_0927_1_the_cached_advert_tracks_a_record_staged_while_a_line_waits_for_its
     // line canonically; it is served from then on.
     mesh.replicas[a].commit();
     assert!(mesh.replicas[a].svc.served_directive(&hand[0]).is_some());
+    assert!(
+        advert(&mesh).contains(&from_b),
+        "the staged record is advertised once committed"
+    );
     assert_eq!(
         advert(&mesh),
         a6_0927_served_ids_uncached(&mesh.replicas[a].svc)
@@ -4237,10 +4244,11 @@ fn a6_0927_3_a_hint_recorded_as_the_hint_queue_is_compacted_still_ages_out() {
 /// is the file's `max + 1`, and the first write after it is stamped with the
 /// discarded write's lamport — the same `(author, lamport)` pair under another
 /// id (M-18). Every shape of X3's 0927 differential re-issues it (52 of 52
-/// boot shapes, 12 of 12 live shapes). Fails at `a5313a1`.
+/// boot shapes, 12 of 12 live shapes). Failed at `a5313a1`; since T100 (L-148,
+/// decision (63)) a staged write is withheld from peers until its commit
+/// succeeds, so nothing a peer holds carries the pair the restart reissues.
 #[cfg(unix)]
 #[test]
-#[ignore = "X3-1: a restart after a failed commit re-issues the served staged write's (author, lamport) pair"]
 fn x3_0927_1_a_restart_after_a_failed_commit_never_reuses_the_served_writes_lamport() {
     use std::os::unix::fs::PermissionsExt;
     let dir = temp_bean("x3-0927-1").with_extension("d");

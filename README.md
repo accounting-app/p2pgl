@@ -1102,8 +1102,11 @@ cases where you might:
   `<target>.journal`), or put the ledger back, start the node once so it folds
   the journal in, stop it cleanly, and then make the link. The link is resolved
   once, when the node starts: turning the path into a link while it runs is
-  not followed (a recovery after a failed write refuses it) — stop the node
-  first.
+  not followed (a recovery after a failed write refuses it, and rolls that
+  write back) — stop the node first. If you did not, the node's next write
+  rewrites the file at the path, replacing your link with a regular file, and
+  the file the link pointed to stops receiving writes: stop the node, move
+  the path's file where the link pointed, and make the link again.
 - **A `.bean` missing beside a journal refuses boot** rather than starting an
   empty ledger with the journal's writes on top.
 - **A torn final record** — a crash mid-append — is dropped with a warning. On

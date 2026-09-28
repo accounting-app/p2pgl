@@ -2110,7 +2110,9 @@ async fn stage_and_commit_batch(
     // KNOWN to fail the prepare's cap projection; staging it anyway is what
     // used to cost a full ledger reload per tick per peer. T77: the chunk's
     // exact record, not a per-entry wire estimate.
-    let headroom = svc.append_headroom();
+    // T100 / M-74: the headroom of the commit the chunk will take — a pending
+    // rewrite included (see `LedgerService::write_headroom`).
+    let headroom = svc.write_headroom();
     let estimated_bytes = chunk.record.record_bytes();
     if estimated_bytes > headroom {
         drop(svc);

@@ -546,8 +546,8 @@ const LOCAL_WRITE_FAST_PATH_HEADROOM: u64 = 2 * MAX_ECONOMIC_BEAN_LENGTH as u64;
 /// # When it does not decide
 ///
 /// It answers `Ok` — leaving the prepare's projection as the authority, as
-/// before — whenever it cannot predict the record exactly: something else is
-/// already staged (never, under the permit), the body is a duplicate (the
+/// before — whenever it cannot predict the record exactly: the body is a
+/// duplicate (the
 /// stage records nothing), the input is invalid (the stage's own error is the
 /// better answer), or the account is already open / not open. On a ledger
 /// more than [`LOCAL_WRITE_FAST_PATH_HEADROOM`] from the cap it builds
@@ -557,11 +557,13 @@ pub(crate) fn refuse_if_local_write_cannot_fit(
     write: LocalWrite<'_>,
     signer: Option<&dyn SignatureProvider>,
 ) -> Result<(), ServiceError> {
-    let headroom = service.append_headroom();
+    // T100 / M-74, decision (61): the headroom of the commit this write will
+    // take — while a rewrite is pending, the cap minus the rewrite memory would
+    // write now, not the file's size, which the rewrite (adopted lines'
+    // envelopes, staged writes) can exceed.
+    let headroom = service.write_headroom();
     // T93 / M-65, decision (43): at (or over) the cap nothing fits, whatever
-    // is already staged. The "something else is staged" exemption below let
-    // every mutation through once one write was stuck staged — each then
-    // rebuilt the ledger under the permit and was refused for the cap anyway.
+    // is already staged.
     if headroom == 0 {
         return Err(ServiceError::ResourceLimitExceeded {
             message: format!(
@@ -570,7 +572,12 @@ pub(crate) fn refuse_if_local_write_cannot_fit(
             ),
         });
     }
-    if headroom >= LOCAL_WRITE_FAST_PATH_HEADROOM || service.uncommitted_count() > 0 {
+    // T100 / M-74: no "something else is staged" exemption any more — it
+    // skipped the exact estimate whenever a write was stuck staged, so every
+    // mutation after it was staged, rebuilt the ledger under the permit and
+    // was refused for the cap anyway. The estimate is this write's own record,
+    // which is exactly what it adds.
+    if headroom >= LOCAL_WRITE_FAST_PATH_HEADROOM {
         return Ok(());
     }
     let Some(record) = local_write_record_bytes(service, write, signer) else {
@@ -1824,5 +1831,129 @@ mod tests {
             links: Vec::new(),
             postings: vec![posting("Assets:Cash", -5), posting("Expenses:Food", 5)],
         }
+    }
+
+    /// A ledger of `total` bytes of leading comments, with Cash and Food open
+    /// and compacted — A4's fixture for a canonical form near the cap.
+    fn m74_base(path: &std::path::Path, total: usize) -> LedgerService {
+        let line = format!("; {}\n", "x".repeat((1 << 20) - 3));
+        let last_len = total - line.len() * 63;
+        let last = format!("; {}\n", "x".repeat(last_len - 3));
+        std::fs::write(path, format!("{}{last}", line.repeat(63))).unwrap();
+        let mut service = LedgerService::boot(path, "m74".to_owned()).unwrap();
+        service.finalize_operator_input();
+        for account in ["Assets:Cash", "Expenses:Food"] {
+            service
+                .open_account(account.to_owned(), day(1), vec![])
+                .unwrap();
+        }
+        service.compact().unwrap();
+        service
+    }
+
+    /// `n` hand-typed transactions, as an operator appends them under a
+    /// running node.
+    fn m74_hand_lines(n: usize) -> String {
+        (0..n)
+            .map(|index| {
+                format!(
+                    "\n2024-01-26 * \"Hand\" \"typed while running {index:02}\"\n  \
+                     Assets:Cash  -5 USD\n  Expenses:Food  5 USD\n"
+                )
+            })
+            .collect()
+    }
+
+    /// T100 / M-74 (audit 0927, A4-1), decision (61): an operator's hand edit
+    /// under a running node leaves the ledger's canonical form — with the
+    /// envelopes this node gives the typed lines — just over the cap while
+    /// the file itself is under it. The first mutation adopts the edit inside
+    /// its `prepare` and is refused as a resource limit, with the one reload
+    /// that rolls its staged write back; every mutation after it is refused
+    /// before staging, in milliseconds, with no further reload, and the
+    /// running balance is the balance after a restart. At `a5313a1` the
+    /// compaction arm measured nothing unless the over-cap fact was already
+    /// set, `persist_atomically` refused the text as an I/O error, the fact was
+    /// never set, and every mutation paid a full reload for an `IO_ERROR`.
+    ///
+    /// Bug-catch: drop the compaction arm's length check and the mutations are
+    /// `IO_ERROR`s, each with a reload.
+    #[tokio::test]
+    async fn m74_a_rewrite_over_the_cap_refuses_every_mutation_before_staging() {
+        let (guard, raw, _filtered) = crate::anti_entropy_alpn::tests::capture_logs();
+        let dir = tempfile::tempdir().unwrap();
+        let cap = ledger::service::MAX_LEDGER_FILE_BYTES as usize;
+        let hand = 40;
+        let calibration = dir.path().join("calibration.bean");
+        let base = cap - 60_000;
+        let canonical = {
+            let mut svc = m74_base(&calibration, base);
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&calibration)
+                .unwrap();
+            std::io::Write::write_all(&mut file, m74_hand_lines(hand).as_bytes()).unwrap();
+            svc.reconcile_file().unwrap();
+            svc.canonical_bytes() as usize
+        };
+        let path = dir.path().join("m74.bean");
+        let service = m74_base(&path, base + (cap - 60 - canonical));
+        let ledger: SharedLedger = Arc::new(tokio::sync::RwLock::new(service));
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            std::io::Write::write_all(&mut file, m74_hand_lines(hand).as_bytes()).unwrap();
+        }
+        assert!(
+            std::fs::metadata(&path).unwrap().len() <= cap as u64,
+            "premise: the file is under the cap"
+        );
+        let schema = build_schema_with_service(
+            Arc::clone(&ledger),
+            TransactionBroadcast::new(),
+            p2p::node::PeerRegistry::new(),
+            Arc::new(security::signing::NoopSignatureProvider),
+            true,
+            None,
+        );
+        let cash = |svc: &LedgerService| {
+            svc.read_model()
+                .account_balance("Assets:Cash", None)
+                .and_then(|entry| entry.balances.get("USD").map(|d| d.to_string()))
+        };
+        let mut outcomes = Vec::new();
+        for attempt in 0..4u32 {
+            let response = schema.execute(lunch_mutation(10, 10 + attempt)).await;
+            outcomes.push((
+                error_codes(&response),
+                raw.text().matches("reload installed").count(),
+            ));
+        }
+        let running = cash(&*ledger.read().await);
+        drop(guard);
+        drop(schema);
+        let ledger = Arc::try_unwrap(ledger).ok().unwrap().into_inner();
+        drop(ledger);
+        let restarted = cash(&LedgerService::boot(&path, "m74".to_owned()).unwrap());
+        for (attempt, (codes, _)) in outcomes.iter().enumerate() {
+            assert_eq!(
+                codes,
+                &vec!["\"RESOURCE_LIMIT_EXCEEDED\"".to_owned()],
+                "mutation {attempt}: {outcomes:?}"
+            );
+        }
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, reloads)| *reloads == outcomes[0].1)
+                && outcomes[0].1 <= 1,
+            "at most the first mutation reloads: {outcomes:?}"
+        );
+        assert_eq!(
+            running, restarted,
+            "the running balance is the restarted one"
+        );
     }
 }
