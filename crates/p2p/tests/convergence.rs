@@ -3930,9 +3930,10 @@ fn a6_4_a_gap_of_exactly_2_32_is_called_uncrossable_by_a_node_that_just_crossed_
 // only after its rewrite) nor T95's filters on the receiver's side of the
 // Want. `a6_0927_serve_like_gl_node` runs `run_head_exchange`'s pipeline to the
 // letter: the holder's `served_head_txids` / `served_sorted_directive_ids`
-// advert, `compute_want_by_membership`, the refusal filter, `retain_not_doomed`
-// (with the ledger's `contains_directive` as `holds`), `retain_not_buffered_from`,
-// `order_want_ancestors_first`, then `served_directive` for the Supply.
+// advert, `compute_want_by_membership`, the refusal filter, `filter_want_for`
+// (both T95 filters, with the ledger's `contains_directive` as `holds`, T102),
+// `order_want_ancestors_first` by the peer's own copies (T102), then
+// `served_directive` for the Supply.
 
 use p2p::orphan_buffer::MAX_ORPHAN_AGE;
 
@@ -3951,13 +3952,17 @@ fn a6_0927_gl_node_want(receiver: &Replica, holder: &Replica, peer: &str) -> Vec
         .orphans
         .refusals()
         .retain_wanted(peer, &mut want, now);
+    // T102: both filters in one call, with the ledger as `holds` (L-151),
+    // then ordered by this peer's own copies and hints (M-76) — gl-node's
+    // `run_head_exchange` since T102.
     receiver
         .orphans
-        .retain_not_doomed(peer, &mut want, now, |id| {
+        .filter_want_for(peer, &mut want, now, |id| {
             receiver.svc.contains_directive(id)
         });
-    receiver.orphans.retain_not_buffered_from(peer, &mut want);
-    order_want_ancestors_first(&mut want, |id| receiver.orphans.known_missing_parents(id));
+    order_want_ancestors_first(&mut want, |id| {
+        receiver.orphans.known_missing_parents_from(peer, id)
+    });
     want
 }
 
@@ -4126,9 +4131,11 @@ fn a6_0927_1_the_cached_advert_tracks_a_record_staged_while_a_line_waits_for_its
 ///
 /// The shape: A writes x then c (c names x). V hears of c alone first (buffered
 /// on x, from A), then x reaches V through its `.bean`. A is V's only peer and
-/// writes nothing more; gl-node's exchanges run.
+/// writes nothing more; gl-node's exchanges run. Since T102 (L-151, decision
+/// (67)) the filter asks `holds` too, and the child is asked for again.
+///
+/// Bug-catch: give the filter no `holds` again and V never asks for c.
 #[test]
-#[ignore = "A6-2 (0927): a record buffered from the only peer that serves it is never re-Wanted once its parent arrives through the file; it waits for another batch's drain or the orphan TTL"]
 fn a6_0927_2_a_buffered_record_whose_parent_arrived_through_the_file_is_asked_for_again() {
     let mut mesh = seeded_mesh(9272, 2);
     let (a, v) = (0, 1);
@@ -4181,8 +4188,10 @@ fn a6_0927_2_a_buffered_record_whose_parent_arrived_through_the_file_is_asked_fo
 /// The shape: one peer at its orphan quota whose refused-for-room records keep
 /// arriving (each hint recorded, then forgotten as the record lands) — the
 /// churn of a large catch-up — until the queue passes 2 × `MAX_PARENT_HINT_IDS`.
+/// Since T102 (L-150) the hint is inserted before the queue is compacted.
+///
+/// Bug-catch: compact before inserting the hint again and it never expires.
 #[test]
-#[ignore = "A6-1 (0927): the hint recorded as the L-134 queue is compacted loses its queue entry and never expires"]
 fn a6_0927_3_a_hint_recorded_as_the_hint_queue_is_compacted_still_ages_out() {
     let mut buffer = OrphanBuffer::new();
     let peer = Some("peer".to_owned());

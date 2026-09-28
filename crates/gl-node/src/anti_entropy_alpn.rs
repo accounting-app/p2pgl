@@ -1287,19 +1287,30 @@ async fn run_head_exchange(
     // good. Their missing parent is retried, never refused, so without this
     // the whole subtree was re-sent, re-parsed and re-verified every round.
     // T95 / M-66, M-67, L-133: judged only on this peer's own copies, in one
-    // linear pass, and never on a parent the ledger now holds. The ledger's
-    // read lock is taken before the buffer's, the order phase 2 takes them in.
-    let (doomed, already_buffered) = {
+    // linear pass, and never on a parent the ledger now holds. T95 / L-130:
+    // nor what this peer already served and this node holds buffered — asking
+    // again re-verified the same copy every round (T102 / L-151: unless a
+    // parent it waits on is held now). T102 / L-152: the ledger is asked only
+    // about the parents this peer's copies name, under its own short read
+    // lock, and the filters walk this peer's ids, not the whole Want, under
+    // the buffer's lock alone — T95 held both locks for ~13 hashes per
+    // advertised id (8.3 s for a 1M-id Want against 1.6–2.2 s for T88's
+    // filter), and GraphQL writes and every peer's phase 2 queued behind it.
+    let peer = remote.to_string();
+    let named = handler.orphan_buffer.read().await.parents_named_by(&peer);
+    let held: std::collections::HashSet<String> = {
         let svc = handler.ledger.read().await;
-        let buffer = handler.orphan_buffer.read().await;
-        let peer = remote.to_string();
-        let doomed = buffer.retain_not_doomed(&peer, &mut want, std::time::Instant::now(), |id| {
-            svc.contains_directive(id)
-        });
-        // T95 / L-130: nor what this peer already served and this node holds
-        // buffered — asking again re-verified the same copy every round.
-        (doomed, buffer.retain_not_buffered_from(&peer, &mut want))
+        named
+            .into_iter()
+            .filter(|parent| svc.contains_directive(parent))
+            .collect()
     };
+    let (doomed, already_buffered) = handler.orphan_buffer.read().await.filter_want_for(
+        &peer,
+        &mut want,
+        std::time::Instant::now(),
+        |id| held.contains(id),
+    );
     if doomed > 0 {
         debug!(peer = %remote, doomed, "not re-wanting directives that can only wait on one this peer served and was refused for good");
     }
@@ -1318,18 +1329,27 @@ async fn run_head_exchange(
     // T83 / L-95: ask for known ancestors before their descendants, so a
     // chain longer than the orphan buffer arrives parent before child and
     // stages as it lands instead of crawling a few directives per round.
-    {
-        let buffer = handler.orphan_buffer.read().await;
-        p2p::anti_entropy::order_want_ancestors_first(&mut want, |id| {
-            buffer.known_missing_parents(id)
-        });
-    }
+    order_want_for_peer(
+        &*handler.orphan_buffer.read().await,
+        &remote.to_string(),
+        &mut want,
+    );
     for chunk in want.chunks(MAX_SUPPLY_ENTRIES) {
         fetch_want_chunk(send, recv, chunk, handler, remote, budget).await?;
     }
     // See `run_want_session`: the FIN is what releases the server's stream.
     let _ = send.finish();
     Ok(())
+}
+
+/// Order `peer`'s Want ancestors-first (T83 / L-95) by `peer`'s own buffered
+/// copies and hints (T102 / M-76, decision (66)): another peer's envelopes of
+/// the same records could name each record's child as its parent and turn this
+/// Want child-first.
+fn order_want_for_peer(buffer: &OrphanBuffer, peer: &str, want: &mut Vec<String>) {
+    p2p::anti_entropy::order_want_ancestors_first(want, |id| {
+        buffer.known_missing_parents_from(peer, id)
+    });
 }
 
 /// Append the ids of one advert page that have not been seen before (T41).
@@ -9160,6 +9180,166 @@ pub(crate) mod tests {
         assert!(
             !svc.accounts().is_open_at("Assets:Cash", day(2, 15)),
             "the sink agrees with the source that Cash is closed on 02-15"
+        );
+    }
+
+    /// M-76 (T102, decision (66)): H's Want is ordered by H's own copies, not
+    /// by M's envelopes of the same records naming each record's child as its
+    /// parent — with nothing of H's buffered, H's advert order stands.
+    ///
+    /// Bug-catch: order by any peer's copy (`known_missing_parents`) and H's
+    /// Want comes out child-first.
+    #[tokio::test]
+    async fn m76_a_peers_want_is_ordered_by_its_own_copies() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut svc =
+            LedgerService::boot(temp_dir.path().join("o.bean"), "o".to_owned()).expect("boot");
+        let open = svc
+            .open_account("Assets:Cash".to_owned(), day(1, 1), Vec::new())
+            .expect("open");
+        let directive = svc.get_directive(&open).expect("held").clone();
+        let ids: Vec<String> = ["a", "b", "c"].iter().map(|c| c.repeat(64)).collect();
+        let mut buffer = OrphanBuffer::new();
+        for (i, id) in ids.iter().enumerate() {
+            let parent = ids.get(i + 1).cloned().unwrap_or_else(|| "e".repeat(64));
+            buffer.insert(
+                id.clone(),
+                directive.clone(),
+                vec![parent],
+                Some("m".to_owned()),
+            );
+        }
+        let mut want = ids.clone();
+        order_want_for_peer(&buffer, "h", &mut want);
+        assert_eq!(want, ids, "H's Want keeps H's order");
+        let mut want_from_m = ids.clone();
+        order_want_for_peer(&buffer, "m", &mut want_from_m);
+        assert_eq!(
+            want_from_m,
+            ids.iter().rev().cloned().collect::<Vec<_>>(),
+            "M's own Want is ordered by M's own copies"
+        );
+    }
+
+    /// M-76 (T102, decision (66); audit 0927 X2-2): an allowlisted M signs its
+    /// own envelope of each of honest H's records — same content id, parents =
+    /// the NEXT record of H's chain — and pushes them to V before V catches up
+    /// from H. T95 judged a Want id only by the asked peer's copies, but the
+    /// orphan buffer kept the FIRST copy of an id whoever delivered it (H's
+    /// copy arriving later was a duplicate and dropped) and ordered H's Want by
+    /// that copy's parents: child-first, one record staged per exchange. Since
+    /// T102 a copy is buffered per delivering peer and a peer's Want is ordered
+    /// by its own copies, so V holds H's whole chain within a few exchanges.
+    ///
+    /// Bug-catch: key buffered copies by id alone again and V holds a few of
+    /// H's 40 records after three exchanges.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn m76_another_peers_copies_do_not_slow_an_honest_catch_up() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+        let n = 40usize;
+        let endpoint_client = bind_direct_endpoint().await;
+        let endpoint_source = bind_direct_endpoint().await;
+        let (id_client, id_source) = (endpoint_client.id(), endpoint_source.id());
+        let equivocator = iroh::SecretKey::generate().public();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let source: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("source.bean"), id_source.to_string())
+                .expect("boot source"),
+        ));
+        let mut chain = Vec::new();
+        let mut opens = Vec::new();
+        {
+            let mut svc = source.write().await;
+            for account in ["Equity:Opening", "Assets:Cash"] {
+                opens.push(
+                    svc.open_account(account.to_owned(), day(1, 1), Vec::new())
+                        .expect("open"),
+                );
+            }
+            for i in 0..n {
+                let txid = svc
+                    .append_transaction(lifecycle_txn(
+                        "Assets:Cash",
+                        day(2, 1 + (i % 28) as u32),
+                        rust_decimal::Decimal::from(1 + i as i64),
+                    ))
+                    .expect("chain")
+                    .txid;
+                chain.push(svc.get_directive(&txid).expect("held").clone());
+            }
+            svc.compact().expect("compact");
+        }
+        let ids: Vec<String> = chain.iter().map(ledger::hash::compute_content_id).collect();
+        let limits = AntiEntropyLimits {
+            max_total_connections: 8,
+            max_connections_per_peer: 4,
+            max_requests_per_connection: 100_000,
+            ..AntiEntropyLimits::default()
+        };
+        let client: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("client.bean"), id_client.to_string())
+                .expect("boot client"),
+        ));
+        let handler_source = make_handler_with_limits(
+            source.clone(),
+            PeerAllowlist::parse(&[id_client.to_string()]).expect("allowlist"),
+            limits,
+        );
+        let handler_client = make_handler_with_limits(
+            client.clone(),
+            PeerAllowlist::parse(&[id_source.to_string(), equivocator.to_string()])
+                .expect("allowlist"),
+            limits,
+        );
+        let router_source = Router::builder(endpoint_source.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler_source.clone())
+            .spawn();
+        wait_until_dialable(&endpoint_client).await;
+        wait_until_dialable(&endpoint_source).await;
+        {
+            let src = source.read().await;
+            let entries = opens.iter().map(|id| entry_for(&src, id)).collect();
+            apply_supply_entries(&handler_client, entries, id_source).await;
+        }
+        // M's envelope of each of H's bodies, naming the NEXT record as parent.
+        let copies = chain
+            .iter()
+            .enumerate()
+            .map(|(i, directive)| {
+                let mut copy = directive.clone();
+                if let ledger::model::Directive::Transaction(txn) = &mut copy {
+                    txn.metadata
+                        .insert("openledger-author".into(), equivocator.to_string());
+                    txn.metadata.insert(
+                        "openledger-parents".into(),
+                        ids.get(i + 1).cloned().unwrap_or_else(|| "e".repeat(64)),
+                    );
+                    txn.metadata
+                        .insert("openledger-lamport".into(), (10_000 + i).to_string());
+                }
+                make_supply_entry(&copy)
+            })
+            .collect();
+        apply_supply_entries_from(
+            &handler_client,
+            copies,
+            equivocator,
+            SupplyOrigin::Pushed,
+            &mut FrameReservation::unmetered(),
+        )
+        .await;
+        for _ in 0..3 {
+            exchange_with_peer(&endpoint_client, endpoint_source.addr(), &handler_client).await;
+        }
+        let held = {
+            let svc = client.read().await;
+            ids.iter().filter(|id| svc.contains_directive(id)).count()
+        };
+        let _ = router_source.shutdown().await;
+        assert_eq!(
+            held, n,
+            "X2-2: after three exchanges with H the client holds {held} of H's {n} records \
+             (without M's copies: all {n} in one exchange)"
         );
     }
 }

@@ -200,15 +200,34 @@ fn entry_cost_bytes(
         .saturating_add(index)
 }
 
+/// A buffered copy's key: its content id and the peer that delivered it.
+type OrphanKey = (String, Option<String>);
+
 /// The orphan buffer.
 #[derive(Debug)]
 pub struct OrphanBuffer {
-    /// Orphans keyed by their content ID.
-    entries: HashMap<String, OrphanEntry>,
-    /// Reverse index: parent_id → [orphan_id]. For fast lookup on parent arrival.
-    waiting_on: HashMap<String, HashSet<String>>,
-    /// Reverse index: account → [orphan_id], for lookup on `open` arrival (M-09).
-    waiting_on_account: HashMap<String, HashSet<String>>,
+    /// Orphans keyed by their content ID **and the peer that delivered the
+    /// copy** (T102 / M-76, decision (66)). A content id covers the body
+    /// alone and the signature covers the parents, so one allowlisted author
+    /// can sign its own envelopes of another peer's records, naming other
+    /// parents. Keyed by id alone, the first copy buffered held the slot: an
+    /// honest peer's copy arriving later was a duplicate and dropped, and the
+    /// entry waited on the parents the other copy named — a catch-up of an
+    /// honest chain crawled one record per exchange. Two copies with the same
+    /// wait list are one entry (a redelivery costs nothing).
+    entries: HashMap<OrphanKey, OrphanEntry>,
+    /// Content id → the peers whose copy of it is buffered (T102).
+    copies: HashMap<String, Vec<Option<String>>>,
+    /// Delivering peer → the ids buffered from it (T102 / L-152): what the Want
+    /// filters walk for that peer, instead of the whole Want.
+    by_peer: HashMap<String, HashSet<String>>,
+    /// Delivering peer → the ids it left a parent hint for (T102 / L-152).
+    hints_by_peer: HashMap<String, HashSet<String>>,
+    /// Reverse index: parent_id → the entries waiting on it. For fast lookup on
+    /// parent arrival.
+    waiting_on: HashMap<String, HashSet<OrphanKey>>,
+    /// Reverse index: account → the entries waiting on its `open` (M-09).
+    waiting_on_account: HashMap<String, HashSet<OrphanKey>>,
     /// Count of buffered orphans per delivering peer.
     peer_counts: HashMap<String, usize>,
     /// Buffered cost in bytes per delivering peer (0820-L8, 0902-L20).
@@ -237,6 +256,10 @@ pub struct OrphanBuffer {
     /// Full sweeps actually performed; the observable L-54's tests read.
     #[cfg(test)]
     sweeps: usize,
+    /// Steps the doomed-set walk took; the observable `m67_…` reads (T102,
+    /// decision (71): work, not wall-clock time).
+    #[cfg(test)]
+    filter_steps: std::sync::atomic::AtomicUsize,
     /// Directives the anti-entropy path refused for good, per peer (L-34).
     ///
     /// Lives here because this buffer is already the node's one shared,
@@ -293,6 +316,9 @@ impl OrphanBuffer {
     pub fn new() -> Self {
         OrphanBuffer {
             entries: HashMap::new(),
+            copies: HashMap::new(),
+            by_peer: HashMap::new(),
+            hints_by_peer: HashMap::new(),
             waiting_on: HashMap::new(),
             waiting_on_account: HashMap::new(),
             peer_counts: HashMap::new(),
@@ -303,6 +329,8 @@ impl OrphanBuffer {
             oldest_buffered_at: None,
             #[cfg(test)]
             sweeps: 0,
+            #[cfg(test)]
+            filter_steps: std::sync::atomic::AtomicUsize::new(0),
             refusals: RefusalCache::new(),
             parent_hints: HashMap::new(),
             parent_hint_ids_per_peer: HashMap::new(),
@@ -315,13 +343,95 @@ impl OrphanBuffer {
     /// from the hint left when it was refused for lack of room (T83 / L-95).
     /// Empty when nothing is known.
     pub fn known_missing_parents(&self, id: &str) -> Vec<String> {
-        if let Some(entry) = self.entries.get(id) {
+        if let Some(entry) = self
+            .copies
+            .get(id)
+            .and_then(|peers| peers.first())
+            .and_then(|peer| self.entries.get(&(id.to_owned(), peer.clone())))
+        {
             return entry.missing_parents.clone();
         }
         self.parent_hints
             .get(id)
             .map(|(parents, _, _)| parents.clone())
             .unwrap_or_default()
+    }
+
+    /// [`Self::known_missing_parents`] as `peer` itself delivered them: its
+    /// own buffered copy, or the hint its own refused copy left (T102 / M-76,
+    /// decision (66)). What orders `peer`'s Want ancestors-first — ordered by
+    /// another peer's copy, a peer that signed its own envelopes of an honest
+    /// chain naming each record's CHILD as its parent turned the honest peer's
+    /// Want child-first, one record per exchange.
+    pub fn known_missing_parents_from(&self, peer: &str, id: &str) -> Vec<String> {
+        if let Some(entry) = self.entries.get(&(id.to_owned(), Some(peer.to_owned()))) {
+            return entry.missing_parents.clone();
+        }
+        self.parent_hints
+            .get(id)
+            .filter(|(_, _, from)| from.as_deref() == Some(peer))
+            .map(|(parents, _, _)| parents.clone())
+            .unwrap_or_default()
+    }
+
+    /// `peer`'s own buffered copy of `id` (T102).
+    fn own_copy(&self, peer: &str, id: &str) -> Option<&OrphanEntry> {
+        self.entries.get(&(id.to_owned(), Some(peer.to_owned())))
+    }
+
+    /// The ids `peer` has a buffered copy or a hint of (T102 / L-152).
+    fn ids_from(&self, peer: &str) -> impl Iterator<Item = &str> + '_ {
+        self.by_peer
+            .get(peer)
+            .into_iter()
+            .flatten()
+            .chain(self.hints_by_peer.get(peer).into_iter().flatten())
+            .map(String::as_str)
+    }
+
+    /// Every parent `peer`'s own buffered copies and hints name (T102 /
+    /// L-152): the ids a caller asks the ledger about before
+    /// [`Self::filter_want_for`], so the ledger's lock is held for those
+    /// lookups only, not for the filters.
+    pub fn parents_named_by(&self, peer: &str) -> Vec<String> {
+        let mut parents: HashSet<&str> = HashSet::new();
+        for id in self.ids_from(peer) {
+            if let Some(entry) = self.own_copy(peer, id) {
+                parents.extend(entry.missing_parents.iter().map(String::as_str));
+            }
+            if let Some((hinted, _, from)) = self.parent_hints.get(id) {
+                if from.as_deref() == Some(peer) {
+                    parents.extend(hinted.iter().map(String::as_str));
+                }
+            }
+        }
+        parents.into_iter().map(str::to_owned).collect()
+    }
+
+    /// Both Want filters for `peer`, over one set of the Want's ids (T102 /
+    /// L-152): [`Self::retain_not_doomed`], then
+    /// [`Self::retain_not_buffered_from`]. Returns how many each dropped.
+    pub fn filter_want_for(
+        &self,
+        peer: &str,
+        want: &mut Vec<String>,
+        now: Instant,
+        holds: impl Fn(&str) -> bool,
+    ) -> (usize, usize) {
+        let before = want.len();
+        let (doomed, not_buffered) = {
+            let wanted: HashSet<&str> = want.iter().map(String::as_str).collect();
+            let doomed = self.doomed_for(peer, &wanted, now, &holds);
+            let not_buffered = self.buffered_from_and_stuck(peer, &wanted, &doomed, &holds);
+            (doomed, not_buffered)
+        };
+        if doomed.is_empty() && not_buffered.is_empty() {
+            return (0, 0);
+        }
+        want.retain(|id| !doomed.contains(id));
+        let after_doomed = want.len();
+        want.retain(|id| !not_buffered.contains(id));
+        (before - after_doomed, after_doomed - want.len())
     }
 
     /// Drop from `want` every id that can only wait on something `peer`
@@ -357,12 +467,36 @@ impl OrphanBuffer {
         now: Instant,
         holds: impl Fn(&str) -> bool,
     ) -> usize {
-        // What `peer`'s own copy of `id` says it waits on — `None` when the
-        // copy this node knows is not `peer`'s, or also waits on an account.
+        let doomed = {
+            let wanted: HashSet<&str> = want.iter().map(String::as_str).collect();
+            self.doomed_for(peer, &wanted, now, &holds)
+        };
+        if doomed.is_empty() {
+            return 0;
+        }
+        let before = want.len();
+        want.retain(|id| !doomed.contains(id));
+        before - want.len()
+    }
+
+    /// The ids [`Self::retain_not_doomed`] drops. T102 / L-152: the roots are
+    /// the ids `peer` itself has a copy or a hint of (a few thousand at most),
+    /// not the whole Want — an id with neither is never doomed.
+    fn doomed_for(
+        &self,
+        peer: &str,
+        wanted: &HashSet<&str>,
+        now: Instant,
+        holds: &dyn Fn(&str) -> bool,
+    ) -> HashSet<String> {
+        // What `peer`'s own copy of `id` says it waits on — `None` when this
+        // node has no copy of it from `peer`, or that copy also waits on an
+        // account.
         let judged = |id: &str| -> Option<&[String]> {
-            if let Some(entry) = self.entries.get(id) {
-                let own = entry.from_peer.as_deref() == Some(peer);
-                return (own && entry.missing_accounts.is_empty())
+            if let Some(entry) = self.own_copy(peer, id) {
+                return entry
+                    .missing_accounts
+                    .is_empty()
                     .then_some(entry.missing_parents.as_slice());
             }
             self.parent_hints
@@ -370,11 +504,17 @@ impl OrphanBuffer {
                 .filter(|(_, _, from)| from.as_deref() == Some(peer))
                 .map(|(parents, _, _)| parents.as_slice())
         };
-        let wanted: HashSet<&str> = want.iter().map(String::as_str).collect();
         // `Some(true)` doomed, `Some(false)` not, absent while on the stack.
         let mut verdict: HashMap<&str, bool> = HashMap::new();
         let mut on_stack: HashSet<&str> = HashSet::new();
-        for root in want.iter().map(String::as_str) {
+        let roots: Vec<&str> = self
+            .ids_from(peer)
+            .filter(|id| wanted.contains(id))
+            .collect();
+        for root in roots {
+            #[cfg(test)]
+            self.filter_steps
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if verdict.contains_key(root) {
                 continue;
             }
@@ -391,6 +531,9 @@ impl OrphanBuffer {
                 }
             }
             while let Some(frame) = stack.last_mut() {
+                #[cfg(test)]
+                self.filter_steps
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let (id, parents, next, doomed) = *frame;
                 if !doomed || next == parents.len() {
                     stack.pop();
@@ -429,17 +572,11 @@ impl OrphanBuffer {
                 }
             }
         }
-        let doomed: HashSet<String> = verdict
+        verdict
             .into_iter()
             .filter(|(_, doomed)| *doomed)
             .map(|(id, _)| id.to_owned())
-            .collect();
-        if doomed.is_empty() {
-            return 0;
-        }
-        let before = want.len();
-        want.retain(|id| !doomed.contains(id));
-        before - want.len()
+            .collect()
     }
 
     /// Drop from `want` every id already buffered from `peer` itself that
@@ -456,22 +593,56 @@ impl OrphanBuffer {
     /// buffered from ANOTHER peer is always asked for (M-66: `peer`'s own copy
     /// may name other parents). One memoised pass, like `retain_not_doomed`.
     pub fn retain_not_buffered_from(&self, peer: &str, want: &mut Vec<String>) -> usize {
+        let dropped = {
+            let wanted: HashSet<&str> = want.iter().map(String::as_str).collect();
+            self.buffered_from_and_stuck(peer, &wanted, &HashSet::new(), &|_| false)
+        };
+        if dropped.is_empty() {
+            return 0;
+        }
+        let before = want.len();
+        want.retain(|id| !dropped.contains(id));
+        before - want.len()
+    }
+
+    /// The ids [`Self::retain_not_buffered_from`] drops, the ids in
+    /// `already_dropped` counted as out of the Want. T102 / L-151, decision
+    /// (67): a copy with a recorded missing parent `holds` says this node now
+    /// has — one that arrived through the `.bean` or another path that drains
+    /// nothing — is kept in the Want: the exchange re-delivers it and it
+    /// stages at once. T95 dropped it for up to [`MAX_ORPHAN_AGE`]. T102 /
+    /// L-152: the roots are `peer`'s own buffered ids, not the whole Want.
+    fn buffered_from_and_stuck(
+        &self,
+        peer: &str,
+        wanted: &HashSet<&str>,
+        already_dropped: &HashSet<String>,
+        holds: &dyn Fn(&str) -> bool,
+    ) -> HashSet<String> {
         // `peer`'s own buffered copy, waiting on parents only — one also
         // waiting on an account is kept, as in `retain_not_doomed` (the `open`
-        // may be in this Want).
+        // may be in this Want) — and none of them held here already.
         let own = |id: &str| -> Option<&[String]> {
-            self.entries
-                .get(id)
+            self.own_copy(peer, id)
                 .filter(|entry| {
-                    entry.from_peer.as_deref() == Some(peer) && entry.missing_accounts.is_empty()
+                    entry.missing_accounts.is_empty()
+                        && !entry.missing_parents.iter().any(|parent| holds(parent))
                 })
                 .map(|entry| entry.missing_parents.as_slice())
         };
-        let wanted: HashSet<&str> = want.iter().map(String::as_str).collect();
+        let in_want = |id: &str| wanted.contains(id) && !already_dropped.contains(id);
         // `true`: keep in the Want (not buffered from `peer`, or releasable).
         let mut keep: HashMap<&str, bool> = HashMap::new();
         let mut on_stack: HashSet<&str> = HashSet::new();
-        for root in want.iter().map(String::as_str) {
+        let roots: Vec<&str> = self
+            .by_peer
+            .get(peer)
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .filter(|id| in_want(id))
+            .collect();
+        for root in roots {
             if keep.contains_key(root) {
                 continue;
             }
@@ -495,7 +666,7 @@ impl OrphanBuffer {
                 }
                 frame.2 += 1;
                 let parent = parents[next].as_str();
-                if !wanted.contains(parent) || on_stack.contains(parent) {
+                if !in_want(parent) || on_stack.contains(parent) {
                     continue;
                 }
                 match keep.get(parent) {
@@ -513,17 +684,10 @@ impl OrphanBuffer {
                 }
             }
         }
-        let dropped: HashSet<String> = keep
-            .into_iter()
+        keep.into_iter()
             .filter(|(_, kept)| !*kept)
             .map(|(id, _)| id.to_owned())
-            .collect();
-        if dropped.is_empty() {
-            return 0;
-        }
-        let before = want.len();
-        want.retain(|id| !dropped.contains(id));
-        before - want.len()
+            .collect()
     }
 
     /// Remember that `id` was refused for lack of room while missing
@@ -565,6 +729,20 @@ impl OrphanBuffer {
                 .entry(peer.to_owned())
                 .or_insert(0) += cost;
         }
+        // T102 / L-150: the hint goes into the table BEFORE the queue is
+        // compacted against it. T95 compacted first, so the entry just pushed
+        // was always dropped and that hint never expired — it held its share
+        // of the peer's and the table's budget until its id arrived.
+        self.parent_hints.insert(
+            id.to_owned(),
+            (parents.to_vec(), now, from_peer.map(str::to_owned)),
+        );
+        if let Some(peer) = from_peer {
+            self.hints_by_peer
+                .entry(peer.to_owned())
+                .or_default()
+                .insert(id.to_owned());
+        }
         self.hint_order.push_back((now, id.to_owned()));
         // Forgotten hints leave their entry behind until it ages out; a peer
         // churning hints must not grow the queue past twice the table's bound.
@@ -576,10 +754,6 @@ impl OrphanBuffer {
                     .is_some_and(|(_, recorded, _)| recorded == seen)
             });
         }
-        self.parent_hints.insert(
-            id.to_owned(),
-            (parents.to_vec(), now, from_peer.map(str::to_owned)),
-        );
     }
 
     /// Drop hints older than [`MAX_ORPHAN_AGE`] (T95 / L-134): pop the aged
@@ -613,6 +787,12 @@ impl OrphanBuffer {
                     *held = held.saturating_sub(cost);
                     if *held == 0 {
                         self.parent_hint_ids_per_peer.remove(&peer);
+                    }
+                }
+                if let Some(ids) = self.hints_by_peer.get_mut(&peer) {
+                    ids.remove(id);
+                    if ids.is_empty() {
+                        self.hints_by_peer.remove(&peer);
                     }
                 }
             }
@@ -689,7 +869,23 @@ impl OrphanBuffer {
         // full or per-peer quota exceeded" warning and a refusal metric —
         // pointing operators at capacity when the real event was ordinary
         // gossip redelivery.
-        if self.entries.contains_key(&id) {
+        // T102 / M-76: a copy is keyed by its id and the peer that delivered
+        // it; another peer's copy of the same record is buffered beside it,
+        // unless it waits on exactly the same parents and accounts (then it
+        // releases with it, and a redelivery costs nothing).
+        let key: OrphanKey = (id.clone(), from_peer.clone());
+        if self.entries.contains_key(&key)
+            || self.copies.get(&id).is_some_and(|peers| {
+                peers.iter().any(|peer| {
+                    self.entries
+                        .get(&(id.clone(), peer.clone()))
+                        .is_some_and(|entry| {
+                            entry.missing_parents == missing_parents
+                                && entry.missing_accounts == missing_accounts
+                        })
+                })
+            })
+        {
             return OrphanInsert::Duplicate;
         }
 
@@ -726,11 +922,21 @@ impl OrphanBuffer {
             self.waiting_on
                 .entry(parent.clone())
                 .or_default()
-                .insert(id.clone());
+                .insert(key.clone());
         }
         for account in &missing_accounts {
             self.waiting_on_account
                 .entry(account.clone())
+                .or_default()
+                .insert(key.clone());
+        }
+        self.copies
+            .entry(id.clone())
+            .or_default()
+            .push(from_peer.clone());
+        if let Some(ref peer_id) = from_peer {
+            self.by_peer
+                .entry(peer_id.clone())
                 .or_default()
                 .insert(id.clone());
         }
@@ -746,7 +952,7 @@ impl OrphanBuffer {
                 .map_or(now, |oldest| oldest.min(now)),
         );
         self.entries.insert(
-            id.clone(),
+            key,
             OrphanEntry {
                 id,
                 directive,
@@ -766,10 +972,14 @@ impl OrphanBuffer {
     pub fn parent_arrived(&mut self, parent_id: &str) -> Vec<OrphanEntry> {
         // T83 / L-95: it is here now; nothing needs to be asked for it.
         self.forget_parent_hint(parent_id);
-        let Some(orphan_ids) = self.waiting_on.remove(parent_id) else {
+        // T102 / M-76: and any other copy of it still buffered is stale.
+        for peer in self.copies.get(parent_id).cloned().unwrap_or_default() {
+            self.remove(&(parent_id.to_owned(), peer));
+        }
+        let Some(orphan_keys) = self.waiting_on.remove(parent_id) else {
             return Vec::new();
         };
-        self.release_resolved(orphan_ids, |entry| {
+        self.release_resolved(orphan_keys, |entry| {
             entry.missing_parents.retain(|p| p != parent_id)
         })
     }
@@ -777,10 +987,10 @@ impl OrphanBuffer {
     /// Notify the buffer that an `open` for `account` is now in the DAG (M-09).
     /// Returns any orphans that are now fully resolved.
     pub fn account_opened(&mut self, account: &str) -> Vec<OrphanEntry> {
-        let Some(orphan_ids) = self.waiting_on_account.remove(account) else {
+        let Some(orphan_keys) = self.waiting_on_account.remove(account) else {
             return Vec::new();
         };
-        self.release_resolved(orphan_ids, |entry| {
+        self.release_resolved(orphan_keys, |entry| {
             entry.missing_accounts.retain(|a| a != account)
         })
     }
@@ -790,20 +1000,21 @@ impl OrphanBuffer {
     /// clears.
     fn release_resolved(
         &mut self,
-        orphan_ids: HashSet<String>,
+        orphan_keys: HashSet<OrphanKey>,
         mut clear_reason: impl FnMut(&mut OrphanEntry),
     ) -> Vec<OrphanEntry> {
         let mut resolved = Vec::new();
-        for orphan_id in orphan_ids {
-            let Some(entry) = self.entries.get_mut(&orphan_id) else {
+        for key in orphan_keys {
+            let Some(entry) = self.entries.get_mut(&key) else {
                 continue;
             };
             clear_reason(entry);
             if !entry.is_ready() {
                 continue;
             }
-            if let Some(entry) = self.entries.remove(&orphan_id) {
+            if let Some(entry) = self.entries.remove(&key) {
                 self.release_entry_accounting(&entry);
+                self.unindex_copy(&key);
                 resolved.push(entry);
             }
         }
@@ -902,11 +1113,11 @@ impl OrphanBuffer {
             self.sweeps += 1;
         }
 
-        let mut expired: Vec<String> = Vec::new();
+        let mut expired: Vec<OrphanKey> = Vec::new();
         let mut survivors_oldest: Option<Instant> = None;
-        for (id, entry) in &self.entries {
+        for (key, entry) in &self.entries {
             if now.saturating_duration_since(entry.buffered_at) > MAX_ORPHAN_AGE {
-                expired.push(id.clone());
+                expired.push(key.clone());
             } else {
                 survivors_oldest = Some(
                     survivors_oldest.map_or(entry.buffered_at, |at| at.min(entry.buffered_at)),
@@ -914,11 +1125,14 @@ impl OrphanBuffer {
             }
         }
 
-        for id in &expired {
-            self.remove(id);
+        for key in &expired {
+            self.remove(key);
         }
         self.oldest_buffered_at = survivors_oldest;
-        expired
+        let mut ids: Vec<String> = expired.into_iter().map(|(id, _)| id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
     }
 
     /// Release count and cost accounting for a removed entry.
@@ -946,12 +1160,13 @@ impl OrphanBuffer {
     }
 
     /// Remove an orphan by ID and clean up both reverse indexes.
-    fn remove(&mut self, id: &str) {
-        if let Some(entry) = self.entries.remove(id) {
+    fn remove(&mut self, key: &OrphanKey) {
+        if let Some(entry) = self.entries.remove(key) {
             self.release_entry_accounting(&entry);
+            self.unindex_copy(key);
             for parent in &entry.missing_parents {
                 if let Some(set) = self.waiting_on.get_mut(parent) {
-                    set.remove(id);
+                    set.remove(key);
                     if set.is_empty() {
                         self.waiting_on.remove(parent);
                     }
@@ -959,7 +1174,7 @@ impl OrphanBuffer {
             }
             for account in &entry.missing_accounts {
                 if let Some(set) = self.waiting_on_account.get_mut(account) {
-                    set.remove(id);
+                    set.remove(key);
                     if set.is_empty() {
                         self.waiting_on_account.remove(account);
                     }
@@ -968,6 +1183,25 @@ impl OrphanBuffer {
         }
         self.forget_bound_if_empty();
         self.debug_assert_accounting_drained();
+    }
+
+    /// Drop a removed copy from the per-id and per-peer indexes (T102).
+    fn unindex_copy(&mut self, key: &OrphanKey) {
+        let (id, peer) = key;
+        if let Some(peers) = self.copies.get_mut(id) {
+            peers.retain(|held| held != peer);
+            if peers.is_empty() {
+                self.copies.remove(id);
+            }
+        }
+        if let Some(peer) = peer {
+            if let Some(ids) = self.by_peer.get_mut(peer) {
+                ids.remove(id);
+                if ids.is_empty() {
+                    self.by_peer.remove(peer);
+                }
+            }
+        }
     }
 
     /// An empty buffer has no oldest entry (L-54), so the next insert starts
@@ -1296,16 +1530,117 @@ mod tests {
             }
         }
         let mut want: Vec<String> = (0..9_000usize).rev().map(id).collect();
-        let started = Instant::now();
+        let links = want.len();
         let dropped = buffer.retain_not_doomed("peer", &mut want, now, |_| false);
-        let took = started.elapsed();
+        let steps = buffer
+            .filter_steps
+            .load(std::sync::atomic::Ordering::Relaxed);
         assert!(
             dropped >= 1_000,
             "the buffered links are dropped: {dropped}"
         );
+        // T102, decision (71): the work, not a 2 s wall-clock bound in debug
+        // (which the unmodified repo missed under load, 2.03 s): each id is
+        // entered once and each parent link looked at once.
         assert!(
-            took < std::time::Duration::from_secs(2),
-            "one pass, not a fixpoint: {took:?}"
+            steps <= 3 * (9_000 + links),
+            "one pass, not a fixpoint: {steps} steps for 9,000 ids and {links} links"
+        );
+    }
+
+    /// M-76 (T102, decision (66)): two peers' copies of one record, naming
+    /// different parents, are both buffered; each peer's Want order reads its
+    /// own copy, and the honest copy is released when ITS parent arrives while
+    /// the other still waits (and is dropped once the record is in).
+    ///
+    /// Bug-catch: key copies by id alone and the honest copy is a duplicate —
+    /// nothing is released when its parent arrives.
+    #[test]
+    fn m76_each_peers_copy_of_a_record_is_buffered_and_released_on_its_own_parents() {
+        let mut buffer = OrphanBuffer::new();
+        let record = "c".repeat(64);
+        let honest_parent = "a".repeat(64);
+        let forged_parent = "f".repeat(64);
+        assert_eq!(
+            buffer.insert(
+                record.clone(),
+                make_directive("forged"),
+                vec![forged_parent.clone()],
+                Some("m".to_owned()),
+            ),
+            OrphanInsert::Buffered
+        );
+        assert_eq!(
+            buffer.insert(
+                record.clone(),
+                make_directive("honest"),
+                vec![honest_parent.clone()],
+                Some("h".to_owned()),
+            ),
+            OrphanInsert::Buffered,
+            "another peer's copy with other parents is buffered beside it"
+        );
+        assert_eq!(
+            buffer.insert(
+                record.clone(),
+                make_directive("honest"),
+                vec![honest_parent.clone()],
+                Some("h2".to_owned()),
+            ),
+            OrphanInsert::Duplicate,
+            "a copy waiting on the same parents is one entry"
+        );
+        assert_eq!(
+            buffer.known_missing_parents_from("h", &record),
+            vec![honest_parent.clone()]
+        );
+        assert_eq!(
+            buffer.known_missing_parents_from("m", &record),
+            vec![forged_parent.clone()]
+        );
+        let released = buffer.parent_arrived(&honest_parent);
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].from_peer.as_deref(), Some("h"));
+        assert_eq!(buffer.len(), 1, "the forged copy still waits");
+        let _ = buffer.parent_arrived(&record);
+        assert!(
+            buffer.is_empty(),
+            "the stale copy goes once the record is in"
+        );
+        assert_eq!(buffer.total_cost_bytes(), 0);
+    }
+
+    /// L-152 (T102): the Want filters walk the ids the asked peer has a copy or
+    /// a hint of, not the whole Want — a peer advertising a million ids while
+    /// this node holds a handful of its orphans costs a handful of steps
+    /// (beyond building the Want's id set once).
+    ///
+    /// Bug-catch: take the roots from the Want again and the walk takes a step
+    /// per advertised id.
+    #[test]
+    fn l152_the_filters_walk_the_peers_own_ids_not_the_whole_want() {
+        let mut buffer = OrphanBuffer::new();
+        let now = Instant::now();
+        let root = "d".repeat(64);
+        assert!(buffer.refusals_mut().record("peer", &root, now));
+        let id = |index: usize| format!("{index:064}");
+        for index in 0..10usize {
+            buffer.insert(
+                id(index),
+                make_directive(&id(index)),
+                vec![root.clone()],
+                Some("peer".to_owned()),
+            );
+        }
+        let mut want: Vec<String> = (0..100_000usize).map(id).collect();
+        let (doomed, _) = buffer.filter_want_for("peer", &mut want, now, |_| false);
+        let steps = buffer
+            .filter_steps
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(doomed, 10);
+        assert!(
+            steps <= 3 * 20,
+            "{steps} steps for 10 own ids in a 100,000-id Want"
         );
     }
 
