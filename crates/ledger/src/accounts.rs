@@ -41,6 +41,15 @@
 //! last lifecycle event overall decides. That is the "currently open" question
 //! the local write guards ask, and it is what the old `close_date.is_none()`
 //! flag computed for every order the old code could actually build.
+//!
+//! ## Two rules: authoring and data (T98 / M-09, decision (54))
+//!
+//! The fold above is the AUTHORING rule — what this node's own API may write.
+//! Data a peer supplies or the `.bean` holds is judged by
+//! [`AccountState::check_account_opened_by`] and
+//! [`AccountState::check_currency_admitted_by`]: an `open` at or before the
+//! transaction admits it and a `close` never refuses it, so the admitted set
+//! is a function of the directive set alone, whatever the arrival order.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -137,6 +146,10 @@ pub struct AccountState {
 /// pairs): 1,000 pairs took a 150,000-transaction boot from 3.6 s to 16.6 s.
 #[derive(Debug, Clone, Default)]
 struct CurrencyIndex {
+    /// The earliest `open` of the account, whatever it lists (T98 / M-09,
+    /// decision (54)): I3 for directive-set data asks only whether one sorts
+    /// below the transaction ([`AccountState::check_account_opened_by`]).
+    first_open: Option<LifecycleKey>,
     /// The earliest `open` that lists no currency (any currency from there on).
     any_from: Option<LifecycleKey>,
     /// Currency → the earliest `open` that lists it.
@@ -150,6 +163,7 @@ impl CurrencyIndex {
                 *slot = Some(key.clone());
             }
         }
+        lower(&mut self.first_open, key);
         if currencies.is_empty() {
             lower(&mut self.any_from, key);
         }
@@ -200,7 +214,7 @@ impl AccountState {
     ///
     /// Recording is pure data entry: it never rejects. Whether a directive is
     /// ALLOWED into the ledger is the caller's decision (the local write guards
-    /// in `service.rs`, and M-09's backdated-remote-close guard); once it is in
+    /// in `service.rs`; since T98 no ingested `close` is refused); once it is in
     /// the DAG, its lifecycle event belongs in this set, because the state must
     /// be a pure function of the stored directive set — a node that boots from
     /// the file and a node that ingested the same directives one by one have to
@@ -418,6 +432,68 @@ impl AccountState {
         Ok(())
     }
 
+    /// I3 for DATA — a transaction a peer supplied, the `.bean` holds, or the
+    /// served-set rule re-judges (T98 / M-09 remainder, decision (54)): the
+    /// account is open for it when any `open` of the account sorts at or
+    /// before it. A `close` never refuses data.
+    ///
+    /// [`Self::check_account_open`] folds the `close`s in, and that fold is a
+    /// function of the order in which directives arrive whenever a `close` and
+    /// a posting inside the interval it closes meet: each replica admitted
+    /// whichever came first and refused the other for good (a posting after
+    /// the `close` fails I3; a `close` after the posting was refused as
+    /// back-dated). One allowlisted peer's two ordinary records, or two
+    /// operators on either side of a partition, left honest replicas with
+    /// different directive sets and balances forever; and since T91 the
+    /// `close`'s own verdict also depended on whether its re-`open` had
+    /// arrived yet (H-25). With data judged by this check, a `close` is inert
+    /// over any interval that holds a transaction — every replica holds the
+    /// same set whatever the order. It still binds this node's own API writes,
+    /// which [`Self::check_account_open`] judges: authoring is stricter than
+    /// acceptance.
+    pub fn check_account_opened_by(
+        &self,
+        account: &str,
+        date: NaiveDate,
+    ) -> Result<(), ValidationError> {
+        let bound = LifecycleKey::transaction_bound(date);
+        if self
+            .currency_index
+            .get(account)
+            .and_then(|index| index.first_open.as_ref())
+            .is_some_and(|key| *key < bound)
+        {
+            return Ok(());
+        }
+        Err(ValidationError::AccountNotOpen {
+            account: account.to_owned(),
+            date,
+        })
+    }
+
+    /// I9 for DATA (T98, decision (54)): the union of every `open` dated no
+    /// later than the transaction ([`Self::currencies_at`]'s rule), applied
+    /// whether or not a `close` sits in between — the data rule's I3
+    /// ([`Self::check_account_opened_by`]) ignores `close`s, so its I9 must
+    /// too. `Ok` when no `open` is in range: I3 refuses that transaction.
+    pub fn check_currency_admitted_by(
+        &self,
+        account: &str,
+        currency: &str,
+        date: NaiveDate,
+    ) -> Result<(), ValidationError> {
+        let bound = LifecycleKey::transaction_bound(date);
+        let Some(index) = self.currency_index.get(account) else {
+            return Ok(());
+        };
+        if !index.first_open.as_ref().is_some_and(|key| *key < bound)
+            || index.admits_below(currency, &bound)
+        {
+            return Ok(());
+        }
+        Self::enforce_currencies(account, currency, Some(&index.union_below(&bound)))
+    }
+
     /// Returns true if the account is known (carries any lifecycle event).
     pub fn is_known(&self, account: &str) -> bool {
         self.events.contains_key(account)
@@ -474,41 +550,40 @@ impl AccountState {
         Some(index.union_below(&LifecycleKey::transaction_bound(date)))
     }
 
-    /// The transaction dates an ingested `close` would close (T91 / M-09
-    /// remainder, decision (38)): the interval after the close's own date in
-    /// which, with the close added to the fold, the close would be the
-    /// deciding event — up to (excluding) the next `open` after it, or up to
-    /// and including the date of the next `close`, or unbounded. `None` for
-    /// an account with no lifecycle event. Where the account is already closed
-    /// at the close's position the interval holds no transaction the DAG
-    /// holds (I3 refused them), so no separate test is needed for that.
+    /// When the event deciding a transaction dated `date` is a `close`, the
+    /// dates that `close` closes: after its own date, up to (excluding) the
+    /// next `open` of the account, or up to and including the date of the next
+    /// `close`, or unbounded (T98 / M-09, decision (54)). `None` when an `open`
+    /// decides, or nothing does.
     ///
-    /// A transaction held on the account and dated inside the interval is
-    /// admitted today and would not be with the close; one dated after a later
-    /// re-open is admitted either way, which is what the pre-T91 rule — "any
-    /// held transaction dated after the close" — got wrong.
-    pub fn dates_a_close_would_close(
+    /// A `close` is inert over this interval once a transaction dated inside
+    /// it is held: the data rule admitted that transaction without the
+    /// `close`, and the authoring rule then lets this node's own write through
+    /// the same interval ([`crate::validate::validate_transaction_as_author`])
+    /// — one allowlisted peer's back-dated `close` must not shut an account
+    /// that every replica holds postings on (the M-09 write-DoS).
+    pub fn deciding_close_interval(
         &self,
-        close: &Close,
-        content_id: &str,
+        account: &str,
+        date: NaiveDate,
     ) -> Option<(std::ops::Bound<NaiveDate>, std::ops::Bound<NaiveDate>)> {
         use std::ops::Bound;
-        let key = LifecycleKey {
-            date: close.date,
-            priority: Directive::Close(close.clone()).type_priority(),
-            lamport: envelope_lamport(&close.metadata),
-            content_id: content_id.to_owned(),
-        };
-        let events = self.events.get(&close.account)?;
+        let events = self.events.get(account)?;
+        let (key, event) = events
+            .range(..LifecycleKey::transaction_bound(date))
+            .next_back()?;
+        if !matches!(event, LifecycleEvent::Close) {
+            return None;
+        }
         let until = match events
-            .range((Bound::Excluded(key), Bound::Unbounded))
+            .range((Bound::Excluded(key.clone()), Bound::Unbounded))
             .next()
         {
             Some((next, LifecycleEvent::Open { .. })) => Bound::Excluded(next.date),
             Some((next, LifecycleEvent::Close)) => Bound::Included(next.date),
             None => Bound::Unbounded,
         };
-        Some((Bound::Excluded(close.date), until))
+        Some((Bound::Excluded(key.date), until))
     }
 
     /// Returns true if the account is currently open (its last lifecycle event
@@ -928,6 +1003,78 @@ mod tests {
             }
             _ => close_directive("Assets:Cash", on, lamport),
         }
+    }
+
+    /// T98 / M-09 remainder, decision (54): the DATA rule admits a
+    /// transaction whenever an `open` of the account sorts at or before it —
+    /// no `close` refuses it — and its I9 is the union of those `open`s
+    /// whether or not a `close` sits between; the AUTHORING fold still closes.
+    /// `deciding_close_interval` names the dates the deciding `close` closes:
+    /// after its date, up to (excluding) the next `open`, or up to and
+    /// including the next `close`.
+    ///
+    /// Bug-catch: let the data rule's I3 fold the `close`s in and 02-15 is
+    /// refused; skip I9 after a `close` and GBP is admitted on 02-15; end the
+    /// interval at the next `open` inclusively and 03-01 counts as closed.
+    #[test]
+    fn t98_the_data_rule_ignores_closes_and_keeps_the_union() {
+        let mut state = AccountState::new();
+        apply(
+            &mut state,
+            &[
+                lifecycle_directive(true, 0, 1, &["USD"]), // 01-01 open USD
+                lifecycle_directive(false, 31, 2, &[]),    // 02-01 close
+                lifecycle_directive(true, 60, 3, &["EUR"]), // 03-01 re-open EUR
+                lifecycle_directive(false, 91, 4, &[]),    // 04-01 close
+                lifecycle_directive(false, 120, 5, &[]),   // 04-30 close
+            ],
+        );
+        let cash = "Assets:Cash";
+        let feb = date(2024, 2, 15);
+        assert!(
+            state.check_account_open(cash, feb).is_err(),
+            "authoring closes"
+        );
+        assert!(
+            state.check_account_opened_by(cash, feb).is_ok(),
+            "data does not"
+        );
+        assert!(state.check_currency_admitted_by(cash, "USD", feb).is_ok());
+        assert!(matches!(
+            state.check_currency_admitted_by(cash, "GBP", feb),
+            Err(ValidationError::AccountCurrencyMismatch { .. })
+        ));
+        assert!(state.check_currency_admitted_by(cash, "EUR", feb).is_err());
+        assert!(state
+            .check_currency_admitted_by(cash, "EUR", date(2024, 3, 1))
+            .is_ok());
+        assert!(matches!(
+            state.check_account_opened_by(cash, date(2023, 12, 31)),
+            Err(ValidationError::AccountNotOpen { .. })
+        ));
+        assert!(state.check_account_opened_by("Assets:Other", feb).is_err());
+
+        use std::ops::Bound;
+        assert_eq!(
+            state.deciding_close_interval(cash, feb),
+            Some((
+                Bound::Excluded(date(2024, 2, 1)),
+                Bound::Excluded(date(2024, 3, 1))
+            ))
+        );
+        assert_eq!(state.deciding_close_interval(cash, date(2024, 3, 1)), None);
+        assert_eq!(
+            state.deciding_close_interval(cash, date(2024, 4, 15)),
+            Some((
+                Bound::Excluded(date(2024, 4, 1)),
+                Bound::Included(date(2024, 4, 30))
+            ))
+        );
+        assert_eq!(
+            state.deciding_close_interval(cash, date(2024, 5, 15)),
+            Some((Bound::Excluded(date(2024, 4, 30)), Bound::Unbounded))
+        );
+        assert_eq!(state.deciding_close_interval(cash, date(2024, 1, 15)), None);
     }
 
     proptest::proptest! {

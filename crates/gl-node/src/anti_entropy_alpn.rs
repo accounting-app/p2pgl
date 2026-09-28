@@ -2481,10 +2481,13 @@ fn intake_refusal_is_permanent(error: &MergeError) -> bool {
 /// * `Io`, `Journal`, `CommitInFlight`, `Parse` — transient or not a verdict on
 ///   the directive at all.
 ///
-/// `AccountHasLaterTransactions` — the backdated close, the M-09 residual this
-/// cache exists for — reads ledger state but is monotone in it: the later
-/// posting that refutes the close is in a G-Set DAG and can never leave, so the
-/// close can never become acceptable.
+/// `AccountHasLaterTransactions` is this node's own API refusing a `close`
+/// (FR-3 AC2); no remote directive earns it since T98 (decision (54): a peer's
+/// `close` is data). Until then it was the backdated-close guard, classified
+/// here as monotone — "the later posting can never leave" — which T91 made
+/// false: a later re-`open` shrank the interval the `close` closed, so a
+/// `close` staged before its own re-`open` was cached refused although the
+/// set admitted it (H-25).
 fn stage_refusal_is_permanent(error: &ServiceError) -> bool {
     match error {
         ServiceError::Validation(validation) => match validation {
@@ -2525,13 +2528,13 @@ fn stage_refusal_is_permanent(error: &ServiceError) -> bool {
 ///
 /// * `AccountNotOpen` — no lifecycle event in force at the date yet;
 /// * `AccountClosed` — a `close` decides at the date, which a later-dated
-///   `open` can supersede;
+///   `open` can supersede (the authoring rule's verdict; since T98 remote data
+///   is judged without the `close`s and never earns it — kept for safety);
 /// * `AccountCurrencyMismatch` — the constraint list comes from the `open` in
 ///   force at the date, so a not-yet-seen `open` can be the one that allows it.
 ///
-/// Everything else (unbalanced, elided, malformed, resource limits, the
-/// backdated-close guard) is a verdict on the directive itself and stays a
-/// rejection.
+/// Everything else (unbalanced, elided, malformed, resource limits) is a
+/// verdict on the directive itself and stays a rejection.
 fn account_wait_target(error: &ServiceError) -> Option<String> {
     let ServiceError::Validation(validation) = error else {
         return None;
@@ -6739,6 +6742,12 @@ pub(crate) mod tests {
     /// Bug-catch: judge an ingested `close` against the account's latest
     /// posting again and the orders that hold the 03-15 posting first (seed 8
     /// among them) refuse the `close`: their accepted set diverges.
+    ///
+    /// T98 / H-25, decision (57): 400 seeds, not 32. T91's interval rule
+    /// refused the `close` whenever it was staged before its own re-`open`
+    /// with the 03-15 posting held — no order among the first 32 seeds did
+    /// that, seed 42 does. Since decision (54) a `close` is data and every
+    /// order accepts it.
     #[tokio::test]
     async fn lifecycle_converges_when_the_account_is_posted_to_after_a_reopen() {
         let author = iroh::SecretKey::generate().public();
@@ -6789,7 +6798,7 @@ pub(crate) mod tests {
         let mut reversed = rest.to_vec();
         reversed.reverse();
         orders.push(("reversed-reopen".to_owned(), reversed));
-        for seed in 1..=32u64 {
+        for seed in 1..=400u64 {
             let mut shuffled = rest.to_vec();
             Xorshift(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1).shuffle(&mut shuffled);
             orders.push((format!("reopen-seed-{seed}"), shuffled));
@@ -6867,14 +6876,15 @@ pub(crate) mod tests {
         );
     }
 
-    /// T29 (M-09) — the write-DoS. A remote `close` dated before transactions
-    /// already on that account is REJECTED, and local appends keep working.
-    ///
-    /// Before T29 the close was applied unconditionally with its error
-    /// swallowed (`let _ =`), which shut the account on every replica and made
-    /// every subsequent local append to it fail forever.
+    /// T29 (M-09) — the write-DoS. Before T29 a remote `close` was applied
+    /// unconditionally with its error swallowed (`let _ =`), which shut the
+    /// account on every replica and made every subsequent local append to it
+    /// fail forever; T29–T97 refused a `close` dated before transactions
+    /// already on the account. Since T98 (decision (54)) the `close` is data —
+    /// merged — and inert over the interval those transactions sit in, so
+    /// local appends keep working.
     #[tokio::test]
-    async fn backdated_remote_close_is_rejected_and_appends_keep_working() {
+    async fn backdated_remote_close_is_data_and_appends_keep_working() {
         let author = iroh::SecretKey::generate().public();
         let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -6916,29 +6926,31 @@ pub(crate) mod tests {
         let poison = attacker
             .close_account(
                 "Assets:Cash".to_owned(),
-                // T91 / decision (38): inside the interval `txn1` (01-15)
-                // needs; a close dated before the `open` closes nothing under
-                // the lifecycle fold and is accepted as data.
+                // Inside the interval `txn1` (01-15) sits in.
                 NaiveDate::from_ymd_opt(2024, 1, 10).expect("valid date"),
             )
             .expect("attacker's own close is legal on its own ledger");
 
+        // T98 / M-09 remainder, decision (54): a peer's `close` is data. It
+        // was refused (ACCOUNT_HAS_LATER_TRANSACTIONS) while `txn1` was held
+        // — which made the verdict depend on whether the `close` or the
+        // posting arrived first.
         let outcome =
             apply_supply_entries(&handler, vec![entry_for(&attacker, &poison)], remote).await;
-        assert_eq!(outcome.rejected, 1, "the backdated close is rejected");
-        assert_eq!(outcome.merged, 0);
-        assert_eq!(outcome.buffered, 0, "a bad close is not buffered for retry");
+        assert_eq!(
+            outcome.merged, 1,
+            "the backdated close is data: {outcome:?}"
+        );
+        assert_eq!(outcome.rejected, 0);
 
         let mut svc = sink.write().await;
+        assert!(svc.get_directive(&poison).is_some());
         assert!(
-            svc.get_directive(&poison).is_none(),
-            "the rejected close never reaches the DAG"
+            svc.get_directive(&seeded.txn1).is_some(),
+            "the posting after the close stays"
         );
-        assert!(
-            svc.accounts().is_open("Assets:Cash"),
-            "the account is still open"
-        );
-        // The M-09 consequence that mattered: local writes still work.
+        // The M-09 consequence that mattered: local writes still work — the
+        // close is inert over the interval `txn1` sits in.
         svc.append_transaction(lifecycle_txn(
             "Assets:Cash",
             NaiveDate::from_ymd_opt(2024, 2, 1).expect("valid date"),
@@ -7246,8 +7258,9 @@ pub(crate) mod tests {
     /// A seeded source, a sink holding its opens for Cash/Equity plus `txn1`,
     /// and the three shapes L-34 must tell apart:
     ///
-    /// * `poison` — a close of Assets:Cash dated 2024-01-10, before `txn1`: the M-09
-    ///   backdated close, refused FOR GOOD;
+    /// * `poison` — an unbalanced transaction naming `txn1` as its parent: an I1
+    ///   refusal, FOR GOOD (until T98 the M-09 backdated `close` played this
+    ///   part; since decision (54) a `close` is data and never refused);
     /// * `txn2` — posts to Expenses:Food, whose `open` the sink lacks: an
     ///   ACCOUNT WAIT, acceptable the moment that open arrives;
     /// * `txn3` — a child of `txn2`: an ORPHAN, acceptable once `txn2` lands.
@@ -7269,24 +7282,43 @@ pub(crate) mod tests {
             .append_transaction(lifecycle_txn("Assets:Cash", day(1, 25), dec!(5)))
             .expect("append txn3 (child of txn2)")
             .txid;
-        let mut attacker = LedgerService::boot(dir.join("attacker.bean"), author.to_owned())
-            .expect("boot attacker");
-        attacker
-            .open_account("Assets:Cash".to_owned(), day(1, 1), vec!["USD".to_owned()])
-            .expect("attacker opens cash");
-        let poison_id = attacker
-            .close_account(
-                "Assets:Cash".to_owned(),
-                // T91 / decision (38): inside the interval `txn1` (01-15)
-                // needs; a close dated before the `open` closes nothing under
-                // the lifecycle fold and is accepted as data.
-                NaiveDate::from_ymd_opt(2024, 1, 10).expect("valid date"),
-            )
-            .expect("attacker's own close is legal on its own ledger");
+        // An allowlisted peer's transaction that does not balance (I1): the
+        // wire intake parses it, the stage refuses it, and nothing that
+        // arrives later can change that verdict.
+        let usd = |number| {
+            Some(ledger::model::Amount {
+                number,
+                currency: "USD".to_owned(),
+            })
+        };
+        let posting = |account: &str, amount| ledger::model::Posting {
+            account: account.to_owned(),
+            amount,
+            cost: None,
+            price: None,
+            metadata: ledger::model::Metadata::new(),
+        };
+        let mut metadata = ledger::model::Metadata::new();
+        metadata.insert("openledger-author".to_owned(), author.to_owned());
+        metadata.insert("openledger-lamport".to_owned(), "50".to_owned());
+        metadata.insert("openledger-parents".to_owned(), seeded.txn1.clone());
+        let poison = ledger::model::Directive::Transaction(ledger::model::Transaction {
+            date: day(1, 20),
+            flag: Flag::Complete,
+            payee: None,
+            narration: Some("does not balance".to_owned()),
+            tags: Vec::new(),
+            links: Vec::new(),
+            postings: vec![
+                posting("Assets:Cash", usd(dec!(5))),
+                posting("Equity:Opening", usd(dec!(-4))),
+            ],
+            metadata,
+        });
         let mut allowed = vec![author.to_owned()];
         allowed.extend_from_slice(extra_allow);
         RefusalFixture {
-            poison: entry_for(&attacker, &poison_id),
+            poison: make_supply_entry(&poison),
             seeded,
             txn3,
             allow: PeerAllowlist::parse(&allowed).expect("allowlist"),
@@ -9055,5 +9087,77 @@ pub(crate) mod tests {
         assert_eq!(handler.limiter.frame_bytes_peak(), 1000 + weight);
         drop(reservation);
         assert_eq!(handler.limiter.frame_bytes_in_flight(), 0);
+    }
+
+    /// T98 / H-25 (audit 0927, X2-1), decision (54): a peer's `close` gets the
+    /// verdict the whole set gives it whether its re-open arrives before or
+    /// after it. An `open` or `close` names no parents, so a Want asks for a
+    /// `close` and its own re-open in content-id order; here the batch
+    /// delivers the posting after the re-open, then the `close`, then the
+    /// re-open. The sink already holds the prefix (the posting's parent), as a
+    /// replica that was offline does. At `a5313a1` T91's interval rule saw no
+    /// re-open yet, refused the `close` (`ACCOUNT_HAS_LATER_TRANSACTIONS`) and
+    /// gl-node cached the refusal as permanent; a receipt the replica then
+    /// wrote on 02-15 split it from the mesh for good.
+    ///
+    /// Bug-catch: refuse a remote `close` with a held posting in the interval
+    /// it closes again and the `close` is missing from the sink.
+    #[tokio::test]
+    async fn h25_a_close_arriving_before_its_reopen_is_admitted() {
+        let author = iroh::SecretKey::generate().public();
+        let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut source =
+            LedgerService::boot(temp_dir.path().join("x2-source.bean"), author.to_string())
+                .expect("boot source");
+        let mut prefix = Vec::new();
+        for account in ["Equity:Opening", "Assets:Cash"] {
+            prefix.push(
+                source
+                    .open_account(account.to_owned(), day(1, 1), Vec::new())
+                    .expect("open"),
+            );
+        }
+        prefix.push(
+            source
+                .append_transaction(lifecycle_txn("Assets:Cash", day(1, 15), dec!(100)))
+                .expect("prefix txn")
+                .txid,
+        );
+        let close = source
+            .close_account("Assets:Cash".to_owned(), day(2, 1))
+            .expect("close");
+        let reopen = source
+            .open_account("Assets:Cash".to_owned(), day(3, 1), Vec::new())
+            .expect("re-open");
+        let after = source
+            .append_transaction(lifecycle_txn("Assets:Cash", day(3, 15), dec!(40)))
+            .expect("posting after the re-open")
+            .txid;
+
+        let sink: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("x2-sink.bean"), "sink".to_owned())
+                .expect("boot sink"),
+        ));
+        let handler = make_handler(sink.clone(), allow);
+        let remote = iroh::SecretKey::generate().public();
+        let prefix_entries = prefix.iter().map(|id| entry_for(&source, id)).collect();
+        apply_supply_entries(&handler, prefix_entries, remote).await;
+        let batch = [&after, &close, &reopen]
+            .into_iter()
+            .map(|id| entry_for(&source, id))
+            .collect();
+        let outcome = apply_supply_entries(&handler, batch, remote).await;
+
+        let svc = sink.read().await;
+        assert!(
+            svc.get_directive(&close).is_some(),
+            "H-25: the close was refused because it was staged before its re-open \
+             ({outcome:?}); the whole set admits it"
+        );
+        assert!(
+            !svc.accounts().is_open_at("Assets:Cash", day(2, 15)),
+            "the sink agrees with the source that Cash is closed on 02-15"
+        );
     }
 }

@@ -20,7 +20,10 @@ use crate::parse::{
 };
 use crate::read_model::ReadModel;
 use crate::serialize::full_file_serialize;
-use crate::validate::{validate_transaction, AccountState, ValidationError};
+use crate::validate::{
+    validate_transaction, validate_transaction_as_author, validate_transaction_as_data,
+    AccountState, ValidationError,
+};
 
 // ─── Resource limits (§3.12) ─────────────────────────────────────────────────
 
@@ -3679,7 +3682,8 @@ impl LedgerService {
             // the DAG just assigned (M-09).
             //
             // Boot deliberately applies NO lifecycle policy: no already-open
-            // rejection, no backdated-close guard. The account state has to be a
+            // rejection (and, since T98, no ingest path refuses a `close`
+            // either). The account state has to be a
             // pure function of the persisted directive set, so that a node which
             // boots from the file and a node which ingested the same directives
             // one at a time agree exactly. A guard here would also reintroduce
@@ -4714,7 +4718,8 @@ impl LedgerService {
     ///
     /// A peer adopts a transaction only when every parent it names is already
     /// in its DAG (`require_parents`) and it validates against the account
-    /// state (`validate_transaction`: I1, I2, I3, I9) — the two checks
+    /// state (`validate_transaction_as_data`: I1, I2, I3, I9 — T98's data
+    /// rule, under which no `close` refuses it) — the two checks
     /// [`Self::stage_remote_directive`] applies. A record this node serves that
     /// fails either is refused by every replica that lacks it, and so is
     /// everything written after it: its descendants wait on a parent that
@@ -4752,7 +4757,7 @@ impl LedgerService {
                     content_id.to_owned(),
                     format!("its parent {parent} is not served, {whereabouts}"),
                 );
-            } else if let Err(error) = validate_transaction(txn, &self.accounts) {
+            } else if let Err(error) = validate_transaction_as_data(txn, &self.accounts) {
                 unservable.insert(
                     content_id.to_owned(),
                     format!("a peer refuses it against the accounts this node serves: {error}"),
@@ -5648,7 +5653,7 @@ impl LedgerService {
                 choose_parents_in(dag, content_id),
             );
         }
-        if let Err(error) = validate_transaction(txn, accounts) {
+        if let Err(error) = validate_transaction_as_data(txn, accounts) {
             return Err(format!(
                 "{error} — without the records this boot quarantined, the entry no longer \
                  validates (H-22)"
@@ -5803,7 +5808,7 @@ impl LedgerService {
         }
 
         // Validate (I1, I2, I3, I9). Returns resolved txn with elided posting filled.
-        let mut resolved = validate_transaction(txn, &self.accounts)?;
+        let mut resolved = self.validate_own_transaction(txn)?;
 
         // The content id hashes the economic body only — the envelope stamped
         // next is excluded — so it is known before stamping, and the stamp
@@ -8421,7 +8426,9 @@ impl LedgerService {
             return FileAdoption::Refused;
         }
         if let Directive::Transaction(txn) = &directive {
-            match validate_transaction(txn, &self.accounts) {
+            // T98 / M-09, decision (54): the file is data, judged by the rule
+            // every peer applies — a `close` never refuses it.
+            match validate_transaction_as_data(txn, &self.accounts) {
                 Ok(validated) => {
                     // Build the final transaction with the resolved postings.
                     let final_txn = Transaction {
@@ -8574,17 +8581,15 @@ impl LedgerService {
                 }
             }
         } else {
-            // M-09: a hand-added `close` goes through the same
-            // no-later-transactions rule as the local API and the peer
-            // ingest path, rather than being applied unconditionally with
-            // the error swallowed. It lands in the `rejected` tally like
-            // every other refused adoption.
-            if let Directive::Close(close) = &directive {
-                if let Err(error) = self.reject_backdated_close(close) {
-                    tally.refuse(content_id, error.to_string());
-                    return FileAdoption::Refused;
-                }
-            }
+            // T98 / M-09 remainder, decision (54): a `close` in the file is
+            // data, like a peer's — never refused for the transactions dated
+            // after it (it is inert over any interval that holds one; see
+            // `AccountState::check_account_opened_by`). Refusing it made the
+            // verdict depend on what this node held when it read the line: a
+            // hand `close` judged at boot before a later hand re-`open` was
+            // held at one boot and served at the next (L-153), and one judged
+            // while a record was held only here was accepted where every peer
+            // refused it (M-75).
             // L-77: a hand-typed `open` of an account that is already open is
             // refused exactly as `open_account` refuses it. Operator input
             // only: a full-envelope `open` is a peer's data (M-09) and joins
@@ -8816,71 +8821,27 @@ impl LedgerService {
 
     // ── Helpers ──────────────────────────────────────────────────────────
 
-    /// Apply the local "no later transactions" close rule to an INGESTED
-    /// `close` — from a peer or from a hand edit (M-09).
-    ///
-    /// Without this, one allowlisted peer's `close Assets:Cash` dated 1970 was
-    /// applied unconditionally (`let _ =`) on every replica, and from then on
-    /// every local append to that account failed I3 forever: a write-DoS on the
-    /// whole mesh, from a single directive, with no way to undo it. The local
-    /// close path has always refused to close an account out from under its own
-    /// transactions ([`ServiceError::AccountHasLaterTransactions`]); a remote
-    /// close is held to the same rule, with the same error code, and is not
-    /// inserted into the DAG when it fails.
-    ///
-    /// ## Judged under the fold (T91 / M-09 remainder, decision (38))
-    ///
-    /// The close is refused only when, with it added to the account's
-    /// lifecycle fold, a transaction this node holds would stop being
-    /// admitted: one dated after the close and before the next `open` of the
-    /// account (or up to the next `close`) — [`AccountState::
-    /// dates_a_close_would_close`]. Before T91 it was refused whenever ANY held
-    /// transaction was dated after it, including one after a later re-open
-    /// that the fold admits either way. Anti-entropy Wants remote heads first,
-    /// and the latest transaction is a head, so a replica coming back online
-    /// met `open`, `close`, re-`open`, transaction in the order transaction,
-    /// re-`open`, `close`: it refused the honest `close` for good, and from
-    /// then on disagreed with every other replica about the account between
-    /// the close and the re-open — a receipt it wrote there, and everything
-    /// after it, was refused by all of them (state divergence for one
-    /// directive set, which the pre-T91 residual said could not happen). Now
-    /// the verdict on the `close` does not depend on whether the re-`open` and
-    /// the transactions after it arrived first.
-    ///
-    /// ## Residual
-    ///
-    /// Still evaluated against the transactions this node holds at ingest: a
-    /// transaction dated INSIDE the interval, written on one node while the
-    /// `close` was on its way to it, refuses the `close` there and is itself
-    /// refused (I3) on every node that took the `close` first. That is a
-    /// genuine conflict between two concurrent writes, not an ordering
-    /// artefact, and it stays the M-09 residual.
-    ///
-    /// Boot does not apply this rule: see the comment at the boot loop.
-    fn reject_backdated_close(&self, close: &Close) -> Result<(), ServiceError> {
-        let content_id = compute_content_id(&Directive::Close(close.clone()));
-        let Some(interval) = self.accounts.dates_a_close_would_close(close, &content_id) else {
-            return Ok(());
-        };
-        if let Some(latest) = self
-            .read_model
-            .latest_posting_date_in(&close.account, interval)
-        {
-            return Err(ServiceError::AccountHasLaterTransactions {
-                account: close.account.clone(),
-                latest_date: latest,
-            });
-        }
-        Ok(())
+    /// I1, I2, I3 and I9 for a transaction this node authors (T98 / M-09,
+    /// decision (54)): the lifecycle fold with its `close`s, except a `close`
+    /// already inert over the transaction's date because a transaction dated
+    /// inside its interval is held — see
+    /// [`crate::validate::validate_transaction_as_author`]. The local API and
+    /// gl-node's pre-stage estimate both use it, so the estimate predicts the
+    /// stage.
+    pub fn validate_own_transaction(
+        &self,
+        txn: &Transaction,
+    ) -> Result<Transaction, ValidationError> {
+        validate_transaction_as_author(txn, &self.accounts, &|account, interval| {
+            self.read_model.holds_posting_in(account, interval)
+        })
     }
 
     /// Find the latest transaction date referencing a given account.
     ///
     /// Served from the read model's per-account index rather than by scanning
-    /// the DAG. This runs on every local close and on every ingested one
-    /// ([`Self::reject_backdated_close`]), and the scan it replaces was O(N) in
-    /// the whole ledger — so a peer streaming closes made each one cost a full
-    /// pass over every directive plus every posting on it. The index is
+    /// the DAG. This runs on every local close (FR-3 AC2), and the scan it
+    /// replaces was O(N) in the whole ledger. The index is
     /// maintained by `ReadModel::index_directive`, which every insert path
     /// already calls, and rebuilt wholesale by `ReadModel::build` at boot and
     /// after an L-13 reload, so the two views cannot drift.
@@ -9441,8 +9402,8 @@ impl LedgerService {
         //   the same reason `validate_body_names` and `validate_parent_fan_in`
         //   are repeated above.
         // * **Applied after validation, not before.** A directive that is
-        //   ultimately rejected — by `validate_transaction`, by the
-        //   backdated-close rule, by the DAG — must leave the clock exactly
+        //   ultimately rejected — by `validate_transaction_as_data`, by the
+        //   DAG — must leave the clock exactly
         //   where it was. Adoption used to run first, so a peer could ratchet a
         //   victim's clock with directives it knew would be thrown away, and
         //   every such bump was persisted into the next locally stamped
@@ -9488,8 +9449,11 @@ impl LedgerService {
         // Validate and insert based on directive type.
         let outcome = match &directive {
             Directive::Transaction(txn) => {
-                // Validate I1, I2, I3, I9 against local account state.
-                let validated = validate_transaction(txn, &self.accounts)?;
+                // Validate I1, I2, I3, I9 against local account state, by the
+                // data rule (T98 / M-09, decision (54)): no `close` refuses a
+                // peer's transaction, so the admitted set does not depend on
+                // whether the `close` or the posting arrived first.
+                let validated = validate_transaction_as_data(txn, &self.accounts)?;
                 let final_txn = Transaction {
                     postings: validated.postings,
                     ..txn.clone()
@@ -9522,12 +9486,17 @@ impl LedgerService {
                     InsertResult::Duplicate { .. } => None,
                 }
             }
-            Directive::Close(close) => {
-                // M-09: the one lifecycle directive that is NOT accepted as
-                // plain data — a close that predates transactions already on
-                // the account is the write-DoS, and is rejected here (and so
-                // never reaches the DAG or the event set).
-                self.reject_backdated_close(close)?;
+            Directive::Close(_) => {
+                // T98 / M-09 remainder, decision (54): a remote `close` is data
+                // too. It was refused when a held transaction fell in the
+                // interval it would close, which made the verdict depend on
+                // arrival order: a `close` and a posting inside its interval
+                // left replicas that took them in opposite orders apart for
+                // good, and since T91 a `close` staged before its own re-`open`
+                // was refused and cached permanent by gl-node (H-25). Data is
+                // admitted without the `close`s (`validate_transaction_as_data`),
+                // so the `close` is inert over any interval that holds a
+                // transaction and binds only this node's own API writes.
                 match self.dag.insert(directive.clone(), false)? {
                     InsertResult::Inserted { content_id } => {
                         self.accounts.record_lifecycle(&directive, &content_id);
@@ -13805,15 +13774,25 @@ mod tests {
         // the envelope of the next directive the node authored. One allowlisted
         // peer could therefore ratchet a victim's clock with traffic it knew
         // would be refused, which is the same poisoning as H-07's, paid for one
-        // step at a time.
+        // step at a time. (T98 / decision (54): no ingested `close` is refused
+        // any more, so the refused directive is a transaction on an account no
+        // `open` admits.)
         let (mut svc, path) = setup_with_accounts();
         svc.append_transaction(balanced_input()).unwrap(); // 2024-01-15
         let before = svc.lamport_clock();
 
+        let mut refused = remote_transaction("on an account never opened", false);
+        refused.postings[0].account = "Assets:Nowhere".to_owned();
         let error = svc
-            .stage_remote_directive(remote_close("Assets:Cash", make_date(2024, 1, 10), 9))
+            .stage_remote_directive(Directive::Transaction(refused))
             .unwrap_err();
-        assert_eq!(error.error_code(), "ACCOUNT_HAS_LATER_TRANSACTIONS");
+        assert!(
+            matches!(
+                error,
+                ServiceError::Validation(ValidationError::AccountNotOpen { .. })
+            ),
+            "{error}"
+        );
         assert_eq!(
             svc.lamport_clock(),
             before,
@@ -13855,20 +13834,30 @@ mod tests {
         })
     }
 
-    /// T91 (M-09 remainder, decision (38)): an ingested `close` is judged
-    /// under the lifecycle fold. One dated before the account's `open` closes
-    /// nothing and is accepted as data — the account stays open and local
-    /// writes go on (the write-DoS stays closed). One dated before a later
-    /// re-open is accepted although a transaction after the re-open is held,
-    /// in the order anti-entropy delivers them (the transaction and the
-    /// re-open first); before T91 that transaction refused it for good.
+    /// T98 (M-09 remainder, decision (54)): an ingested `close` is data — never
+    /// refused — and it binds only this node's own writes, and only over an
+    /// interval that holds no transaction. A `close` before the account's
+    /// `open` closes nothing; one inside the interval a held transaction sits
+    /// in is accepted and inert there, for a peer's posting and for this
+    /// node's; a forward `close` with nothing after it refuses a local write,
+    /// until a peer's posting dated after it makes it inert too. Before T98 the
+    /// middle `close` was refused (`ACCOUNT_HAS_LATER_TRANSACTIONS`), so which
+    /// of it and the posting a replica held depended on which arrived first.
     ///
-    /// Bug-catch: judge the `close` against the latest posting on the account
-    /// again and both are refused.
+    /// Bug-catch: judge peer data by the authoring fold again and the peer's
+    /// posting after the forward `close` is refused; drop the inert-`close`
+    /// test from the authoring rule and the local write beside a held
+    /// posting is refused.
     #[test]
-    fn m09_a_close_that_closes_nothing_a_held_transaction_needs_is_accepted() {
+    fn t98_an_ingested_close_is_data_and_binds_only_this_nodes_own_writes() {
         let (mut svc, path) = setup_with_accounts();
         svc.append_transaction(balanced_input()).unwrap(); // 2024-01-15
+        let local = |day: (u32, u32), narration: &str| {
+            let mut input = balanced_input();
+            input.date = make_date(2024, day.0, day.1);
+            input.narration = Some(narration.to_owned());
+            input
+        };
 
         let before_the_open = remote_close("Assets:Cash", make_date(1970, 1, 1), 9);
         assert!(
@@ -13877,66 +13866,60 @@ mod tests {
                 .is_some(),
             "a close before the open closes nothing"
         );
-        assert!(svc.accounts().is_open("Assets:Cash"));
-        assert!(svc
-            .accounts()
-            .is_open_at("Assets:Cash", make_date(2024, 1, 15)));
-        let mut later = balanced_input();
-        later.date = make_date(2024, 1, 20);
-        later.narration = Some("after the accepted close".to_owned());
-        svc.append_transaction(later).expect("local writes go on");
+        svc.append_transaction(local((1, 20), "after the inert close"))
+            .expect("local writes go on");
 
-        // Re-opened 03-01 and posted to on 04-01, then the 02-01 close arrives.
-        assert!(svc
-            .stage_remote_directive(remote_open("Assets:Cash", make_date(2024, 3, 1), 10))
-            .unwrap()
-            .is_some());
-        let mut after_reopen = balanced_input();
-        after_reopen.date = make_date(2024, 4, 1);
-        after_reopen.narration = Some("after the re-open".to_owned());
-        svc.append_transaction(after_reopen).unwrap();
-        let close = remote_close("Assets:Cash", make_date(2024, 2, 1), 11);
+        let inside = remote_close("Assets:Cash", make_date(2024, 1, 18), 10);
         assert!(
-            svc.stage_remote_directive(close).unwrap().is_some(),
-            "the transaction after the re-open does not refuse the close"
+            svc.stage_remote_directive(inside).unwrap().is_some(),
+            "a close inside a held transaction's interval is data, not refused"
         );
-        assert!(!svc
-            .accounts()
-            .is_open_at("Assets:Cash", make_date(2024, 2, 15)));
-        assert!(svc
-            .accounts()
-            .is_open_at("Assets:Cash", make_date(2024, 4, 1)));
+        svc.append_transaction(local((2, 10), "beside the held 01-20"))
+            .expect("the close is inert where a transaction is held");
 
-        // A close inside the interval a held transaction needs is still refused.
-        let inside = remote_close("Assets:Cash", make_date(2024, 1, 18), 12);
-        assert_eq!(
-            svc.stage_remote_directive(inside).unwrap_err().error_code(),
-            "ACCOUNT_HAS_LATER_TRANSACTIONS"
+        let forward = remote_close("Assets:Cash", make_date(2024, 6, 1), 11);
+        assert!(svc.stage_remote_directive(forward).unwrap().is_some());
+        let refused = svc
+            .append_transaction(local((6, 15), "after the forward close"))
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                ServiceError::Validation(ValidationError::AccountClosed { .. })
+            ),
+            "a close with nothing held after it binds this node's own write: {refused}"
         );
+
+        let mut peer = remote_transaction("a peer's posting after the close", false);
+        peer.date = make_date(2024, 6, 20);
+        peer.metadata
+            .insert("openledger-lamport".to_owned(), "12".to_owned());
+        assert!(
+            svc.stage_remote_directive(Directive::Transaction(peer))
+                .unwrap()
+                .is_some(),
+            "no close refuses a peer's transaction"
+        );
+        svc.append_transaction(local((6, 25), "after the peer's posting"))
+            .expect("a held posting makes the forward close inert too");
         std::fs::remove_file(path).ok();
     }
 
     /// M-09 write-DoS: one allowlisted peer's backdated `close` used to be
     /// applied unconditionally (`let _ =`), shutting the account on every
-    /// replica and failing every later local append to it.
+    /// replica and failing every later local append to it. Since T98
+    /// (decision (54)) the `close` is accepted as data — refusing it made the
+    /// replicas' verdicts depend on arrival order — and it is inert over the
+    /// interval the held transaction sits in, so local writes still go on.
     #[test]
-    fn test_remote_backdated_close_is_rejected() {
+    fn test_remote_backdated_close_is_data_and_local_writes_go_on() {
         let (mut svc, path) = setup_with_accounts();
         svc.append_transaction(balanced_input()).unwrap(); // 2024-01-15
 
-        // T91 / decision (38): dated inside the open interval, before the held
-        // transaction — a `close` dated before the account's `open` closes
-        // nothing under the fold and is accepted (see
-        // `m09_a_close_that_closes_nothing_a_held_transaction_needs_is_accepted`).
         let poison = remote_close("Assets:Cash", make_date(2024, 1, 10), 9);
         let poison_id = LedgerService::content_id(&poison);
-        let error = svc.stage_remote_directive(poison).unwrap_err();
-        assert_eq!(error.error_code(), "ACCOUNT_HAS_LATER_TRANSACTIONS");
-        assert!(
-            svc.get_directive(&poison_id).is_none(),
-            "a rejected close must not reach the DAG"
-        );
-        assert!(svc.accounts().is_open("Assets:Cash"));
+        assert!(svc.stage_remote_directive(poison).unwrap().is_some());
+        assert!(svc.get_directive(&poison_id).is_some(), "a close is data");
 
         // The consequence that mattered: local writes still work.
         let mut later = balanced_input();
@@ -14186,22 +14169,28 @@ mod tests {
         }
     }
 
-    /// A hand-edited file adding a backdated `close` is rejected by reconcile
-    /// for the same reason a peer's is — the finding named both paths.
+    /// A hand-edited file adding a backdated `close` is adopted by reconcile as
+    /// data, as a peer's is since T98 (decision (54)): it is inert over the
+    /// interval the held transaction sits in, which stays served, and local
+    /// writes go on.
     #[test]
-    fn test_reconcile_rejects_backdated_close() {
+    fn test_reconcile_adopts_a_backdated_close_as_data() {
         let (mut svc, path) = setup_with_accounts();
-        svc.append_transaction(balanced_input()).unwrap(); // 2024-01-15
+        let held = svc.append_transaction(balanced_input()).unwrap().txid; // 2024-01-15
 
         let mut content = std::fs::read_to_string(&path).unwrap();
-        // T91 / decision (38): inside the interval the held transaction needs.
         content.push_str("\n2024-01-10 close Assets:Cash\n");
         std::fs::write(&path, &content).unwrap();
 
         let result = svc.reconcile_file().unwrap();
-        assert_eq!(result.new_directives, 0);
-        assert_eq!(result.rejected, 1, "the backdated close is refused");
-        assert!(svc.accounts().is_open("Assets:Cash"));
+        assert_eq!(result.new_directives, 1);
+        assert_eq!(result.rejected, 0, "the backdated close is data");
+        assert!(svc.contains_directive(&held));
+        let mut later = balanced_input();
+        later.date = make_date(2024, 2, 1);
+        later.narration = Some("after the hand close".to_owned());
+        svc.append_transaction(later)
+            .expect("the close is inert beside the held transaction");
 
         std::fs::remove_file(path).ok();
     }
@@ -21140,6 +21129,112 @@ mod tests {
         assert_eq!(result.new_directives, 0);
         assert!(logged.contains("already open"), "{logged}");
         assert_eq!(svc.accounts().currencies("Assets:Cash"), Some(usd.clone()));
+        remove_ledger_and_journal(&path);
+    }
+
+    /// T98 / L-153 (X3's `k15`): a hand `close` is data at boot, as on the
+    /// wire. Node-written history holds a 03-15 posting on Cash; the operator
+    /// types `close Assets:Cash` 02-01 and a re-`open` 03-01. Adoption runs in
+    /// date order, so before T98 the `close` was judged before the re-`open`
+    /// with an unbounded interval, refused for the 03-15 posting and held — and
+    /// served at a later boot, once the compaction had written the re-`open`
+    /// as history. Now the `close` is served at the first boot, the posting
+    /// stays, and boot → compaction → boot is a fixed point.
+    ///
+    /// Bug-catch: restore the back-dated-`close` refusal on the file path and
+    /// the `close` is held at the first boot.
+    #[test]
+    fn l153_a_hand_close_is_served_at_the_first_boot() {
+        let (mut svc, path) = setup_with_accounts();
+        let mut input = balanced_input();
+        input.date = make_date(2024, 3, 15);
+        let posting = svc.append_transaction(input).unwrap().txid;
+        svc.compact().unwrap();
+        drop(svc);
+        append_to_file(
+            &path,
+            "\n2024-02-01 close Assets:Cash\n\n2024-03-01 open Assets:Cash USD\n",
+        );
+        let close = LedgerService::content_id(&Directive::Close(Close {
+            date: make_date(2024, 2, 1),
+            account: "Assets:Cash".to_owned(),
+            metadata: Metadata::new(),
+        }));
+        let mut first = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        first.finalize_operator_input();
+        assert!(first.contains_directive(&close), "the hand close is served");
+        assert!(first.contains_directive(&posting));
+        assert_eq!(first.quarantined_count(), 0);
+        let ids = first.all_directive_ids();
+        first.compact().unwrap();
+        drop(first);
+        let mut second = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        second.finalize_operator_input();
+        assert_eq!(second.all_directive_ids(), ids, "a fixed point");
+        assert_eq!(second.quarantined_count(), 0);
+        remove_ledger_and_journal(&path);
+    }
+
+    /// T98 / decision (54): a transaction the operator types into the file is
+    /// data like a peer's — admitted whenever an `open` precedes it, whatever
+    /// `close` sits in between — on both file paths and through boot's rebase
+    /// of pending input. The boot half carries a history record whose parent
+    /// exists nowhere, so the served-set rule quarantines it and the rebuild
+    /// rebases (re-validates) the pending hand transaction.
+    ///
+    /// Bug-catch: judge file adoption, or boot's rebase, by the authoring
+    /// fold again and the hand transaction after the `close` is refused.
+    #[test]
+    fn t98_a_hand_transaction_after_a_hand_close_is_data_at_boot_and_live() {
+        let (mut svc, path) = setup_with_accounts();
+        let mut input = balanced_input();
+        input.date = make_date(2024, 3, 15);
+        svc.append_transaction(input).unwrap();
+        svc.compact().unwrap();
+        drop(svc);
+        let dangling = "f".repeat(64);
+        append_to_file(
+            &path,
+            &format!(
+                "\n2024-02-01 close Assets:Cash\n\n\
+                 2024-02-10 * \"Acme\" \"typed after the close\"\n  \
+                 Assets:Cash  1 USD\n  Equity:Opening  -1 USD\n\n\
+                 2024-01-20 * \"Acme\" \"over a parent that exists nowhere\"\n  \
+                 openledger-author: \"test-peer\"\n  openledger-lamport: \"50\"\n  \
+                 openledger-parents: \"{dangling}\"\n  \
+                 Assets:Cash  2 USD\n  Equity:Opening  -2 USD\n"
+            ),
+        );
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.finalize_operator_input();
+        assert_eq!(
+            svc.quarantined_count(),
+            1,
+            "premise: the rule held a record"
+        );
+        let typed = svc.dag().directives().into_iter().any(|directive| {
+            matches!(directive, Directive::Transaction(txn)
+                if txn.narration.as_deref() == Some("typed after the close"))
+        });
+        assert!(typed, "the hand transaction after the hand close is served");
+
+        append_to_file(
+            &path,
+            "\n2024-02-20 * \"Acme\" \"typed live\"\n  Assets:Cash  3 USD\n  \
+             Equity:Opening  -3 USD\n",
+        );
+        // `rejected` re-counts the quarantined record, as every reconcile
+        // counts a boot-held one (T90); the typed line is the new directive.
+        let result = svc.reconcile_file().unwrap();
+        assert_eq!(result.new_directives, 1, "{result:?}");
+        let live = svc.dag().directives().into_iter().any(|directive| {
+            matches!(directive, Directive::Transaction(txn)
+                if txn.narration.as_deref() == Some("typed live"))
+        });
+        assert!(
+            live,
+            "the hand transaction typed under a running node is served"
+        );
         remove_ledger_and_journal(&path);
     }
 

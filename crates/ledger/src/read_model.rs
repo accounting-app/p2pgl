@@ -529,15 +529,11 @@ pub struct ReadModel {
     ///
     /// Maintained incrementally so the FR-3 AC2 close rule ("no transactions
     /// after the close date") is a lookup instead of a full-DAG scan on every
-    /// local and ingested `close`. A set union over the same set
-    /// `account_postings` indexes, so it is order-insensitive and needs no
-    /// rebuild: every path that puts a transaction into the DAG also calls
-    /// [`Self::index_directive`], and the DAG is grow-only (nothing is ever
-    /// removed), so the index cannot go stale in either direction. A set of
-    /// dates rather than their max since T91 (M-09): an ingested `close` is
-    /// judged against the transactions dated inside the interval it would
-    /// actually close, not against the latest one, which a later re-open
-    /// admits ([`Self::latest_posting_date_in`]).
+    /// local `close`. A set union over the same set `account_postings`
+    /// indexes, so it is order-insensitive: every path that puts a
+    /// transaction into the DAG also calls [`Self::index_directive`], and
+    /// every path that takes one out rebuilds the read model wholesale
+    /// ([`Self::build`]), so the index cannot go stale in either direction.
     posting_dates: HashMap<String, BTreeSet<NaiveDate>>,
     /// Indexed postings whose amount is outside the amount cap
     /// ([`crate::limits::MAX_AMOUNT_MAGNITUDE`]); informational — see
@@ -1103,18 +1099,17 @@ impl ReadModel {
         self.posting_dates.get(account)?.last().copied()
     }
 
-    /// The latest transaction date on `account` inside `range`, or `None`
-    /// (T91 / M-09: the interval an ingested `close` would close).
-    pub fn latest_posting_date_in(
+    /// Whether a transaction with a posting on `account` is dated inside
+    /// `range` (T98 / M-09, decision (54): the interval a `close` closes — see
+    /// [`crate::accounts::AccountState::deciding_close_interval`]).
+    pub fn holds_posting_in(
         &self,
         account: &str,
         range: (std::ops::Bound<NaiveDate>, std::ops::Bound<NaiveDate>),
-    ) -> Option<NaiveDate> {
+    ) -> bool {
         self.posting_dates
-            .get(account)?
-            .range(range)
-            .next_back()
-            .copied()
+            .get(account)
+            .is_some_and(|dates| dates.range(range).next().is_some())
     }
 
     /// Indexed postings whose amount is outside the amount cap

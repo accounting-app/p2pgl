@@ -533,7 +533,7 @@ const LOCAL_WRITE_FAST_PATH_HEADROOM: u64 = 2 * MAX_ECONOMIC_BEAN_LENGTH as u64;
 /// Called with the permit and the write lock held, immediately before the
 /// `*_staged` call, so nothing moves between the answer and the stage. It
 /// builds the directive the stage would store — the resolved transaction
-/// (`validate_transaction`), or the `open` / `close` — with the envelope the
+/// (`LedgerService::validate_own_transaction`), or the `open` / `close` — with the envelope the
 /// stamp would give it: this node's author, the next lamport, for a
 /// transaction EVERY head it may name as a parent (a superset of the at most
 /// `MAX_PARENTS` the stamp picks, so never shorter), and the signature the
@@ -624,8 +624,7 @@ fn local_write_record_bytes(
                     .collect(),
                 metadata: Metadata::new(),
             };
-            let resolved =
-                ledger::validate::validate_transaction(&body, service.accounts()).ok()?;
+            let resolved = service.validate_own_transaction(&body).ok()?;
             (Directive::Transaction(resolved), true)
         }
         LocalWrite::Open {

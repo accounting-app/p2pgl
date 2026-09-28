@@ -2,6 +2,8 @@
 //!
 //! These checks apply to both local writes and remote gossip inserts (§3.5).
 
+use std::ops::Bound;
+
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 
@@ -294,6 +296,67 @@ pub fn validate_transaction(
     txn: &Transaction,
     accounts: &AccountState,
 ) -> Result<Transaction, ValidationError> {
+    validate_transaction_under(txn, accounts, LifecycleRule::Authoring(None))
+}
+
+/// [`validate_transaction`] for DATA — a transaction a peer supplied, the
+/// `.bean` holds, or the served-set rule re-judges (T98 / M-09 remainder,
+/// decision (54)): I3 and I9 by [`AccountState::check_account_opened_by`] and
+/// [`AccountState::check_currency_admitted_by`], so a `close` never refuses it
+/// and every replica admits the same set in every arrival order. I1, I2 and
+/// the amount cap are the same as for a local write.
+pub fn validate_transaction_as_data(
+    txn: &Transaction,
+    accounts: &AccountState,
+) -> Result<Transaction, ValidationError> {
+    validate_transaction_under(txn, accounts, LifecycleRule::Data)
+}
+
+/// [`validate_transaction`] for THIS NODE'S OWN write (T98 / M-09 remainder,
+/// decision (54)): the lifecycle fold with its `close`s, except that a `close`
+/// is inert over an interval that already holds a transaction —
+/// `holds_posting_in(account, interval)` answers that for the interval
+/// [`AccountState::deciding_close_interval`] gives. Every replica admits such
+/// a transaction as data whatever the `close` says, so refusing this node's
+/// write beside it would let one peer's back-dated `close` shut the account
+/// for local writes alone (the M-09 write-DoS). A `close` with nothing held
+/// after it still binds: authoring stays stricter than acceptance.
+pub fn validate_transaction_as_author(
+    txn: &Transaction,
+    accounts: &AccountState,
+    holds_posting_in: HoldsPostingIn<'_>,
+) -> Result<Transaction, ValidationError> {
+    validate_transaction_under(
+        txn,
+        accounts,
+        LifecycleRule::Authoring(Some(holds_posting_in)),
+    )
+}
+
+/// A range of transaction dates, as `BTreeSet::range` takes it (T98).
+pub type DateInterval = (Bound<NaiveDate>, Bound<NaiveDate>);
+
+/// "Is a transaction with a posting on this account dated inside this
+/// interval held?" — the read model answers it for
+/// [`validate_transaction_as_author`] (T98).
+pub type HoldsPostingIn<'a> = &'a dyn Fn(&str, DateInterval) -> bool;
+
+/// Which lifecycle rule I3 and I9 apply (T98, decision (54)).
+#[derive(Clone, Copy)]
+enum LifecycleRule<'a> {
+    /// This node's own write: the fold with its `close`s, a `close` inert
+    /// where the given index holds a posting inside its interval (none given:
+    /// every `close` binds — [`validate_transaction`]).
+    Authoring(Option<HoldsPostingIn<'a>>),
+    /// Directive-set data: any `open` at or before the date admits it.
+    Data,
+}
+
+fn validate_transaction_under(
+    txn: &Transaction,
+    accounts: &AccountState,
+    rule: LifecycleRule<'_>,
+) -> Result<Transaction, ValidationError> {
     // ── H-17 / T76: the amount cap, before any arithmetic ───────────────
     //
     // First, so an over-cap amount is refused by name rather than surfacing
@@ -393,11 +456,48 @@ pub fn validate_transaction(
     // latest `open` instead would let a later re-open with a different currency
     // list retroactively invalidate transactions I3 had already admitted under
     // the earlier one.
+    //
+    // T98 / M-09 remainder, decision (54): data is judged without the
+    // `close`s (see `LifecycleRule`); only this node's own write is held to
+    // them.
     for posting in &txn.postings {
-        accounts.check_account_open(&posting.account, txn.date)?;
-
-        if let Some(ref amount) = posting.amount {
-            accounts.check_currency_constraint_at(&posting.account, &amount.currency, txn.date)?;
+        let inert_close = |holds: HoldsPostingIn<'_>| {
+            accounts
+                .deciding_close_interval(&posting.account, txn.date)
+                .is_some_and(|interval| holds(&posting.account, interval))
+        };
+        let rule = match rule {
+            LifecycleRule::Authoring(Some(holds))
+                if matches!(
+                    accounts.check_account_open(&posting.account, txn.date),
+                    Err(ValidationError::AccountClosed { .. })
+                ) && inert_close(holds) =>
+            {
+                LifecycleRule::Data
+            }
+            other => other,
+        };
+        match rule {
+            LifecycleRule::Authoring(_) => {
+                accounts.check_account_open(&posting.account, txn.date)?;
+                if let Some(ref amount) = posting.amount {
+                    accounts.check_currency_constraint_at(
+                        &posting.account,
+                        &amount.currency,
+                        txn.date,
+                    )?;
+                }
+            }
+            LifecycleRule::Data => {
+                accounts.check_account_opened_by(&posting.account, txn.date)?;
+                if let Some(ref amount) = posting.amount {
+                    accounts.check_currency_admitted_by(
+                        &posting.account,
+                        &amount.currency,
+                        txn.date,
+                    )?;
+                }
+            }
         }
     }
 

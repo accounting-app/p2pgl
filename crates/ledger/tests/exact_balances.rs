@@ -3533,6 +3533,17 @@ impl LifecycleOracle {
             .filter(move |event| event.0 < on || (event.0 == on && event.1 < 5))
     }
 
+    /// T98 / decision (54): I3 and I9 for DATA — any visible `open` admits,
+    /// whatever `close` follows it; I9 is the union as in [`Self::admits`].
+    fn admits_as_data(&self, on: NaiveDate, currency: &str) -> bool {
+        self.visible(on).any(|event| {
+            event
+                .4
+                .as_ref()
+                .is_some_and(|list| list.is_empty() || list.iter().any(|c| c == currency))
+        })
+    }
+
     /// I3: the last visible event is an `open`.
     fn open_at(&self, on: NaiveDate) -> bool {
         matches!(self.visible(on).last(), Some((_, _, _, _, Some(_))))
@@ -3686,25 +3697,26 @@ proptest! {
         }
     }
 
-    /// T91 / M-09 remainder, decision (38): once an account's lifecycle and
-    /// its transactions are held, an ingested `close` is refused
-    /// (`ACCOUNT_HAS_LATER_TRANSACTIONS`) exactly when adding it to the
-    /// oracle's lifecycle would close the date of a held transaction — not when
-    /// a held transaction merely lies after it (a re-open admits those) — and
-    /// an accepted `close` un-serves nothing across a restart: the running
-    /// node and the restarted one hold the same set and balances, and I3 at
-    /// every date is the oracle's.
+    /// T98 / M-09 remainder, decision (54) (replaces T91's "refused exactly
+    /// when it would close a held transaction", which the decision retired):
+    /// an ingested `close` is data. Whatever the lifecycle — `open`s and
+    /// `close`s in any mix, plus one more `close` — and whatever the order the
+    /// lifecycle and the transactions arrive in, every lifecycle directive is
+    /// held, the held transactions are exactly those an `open` dated at or
+    /// before them admits (with the union's I9) — no `close` refuses one —
+    /// the three orders hold one set and one balance, and a restart
+    /// un-serves nothing.
     ///
-    /// Bug-catch: judge the `close` against the latest posting on the account
-    /// again (pre-T91), or end its interval at the next `open` inclusively, or
-    /// at the next `close` exclusively, and the verdicts part from the
-    /// oracle's.
+    /// Bug-catch: judge peer data by the authoring fold again (a `close`
+    /// refuses the postings after it), or refuse a `close` a held posting
+    /// falls inside, and the held set depends on the order.
     #[test]
-    fn a2_0927_an_ingested_close_is_refused_exactly_when_it_would_close_a_held_transaction(
+    fn a2_0927_an_ingested_close_is_data_in_every_order_and_after_a_restart(
         events in lifecycle_events(),
         postings in lifecycle_postings(),
         close_offset in 0u32..45,
         close_lamport in 1u64..6,
+        seed in any::<u64>(),
     ) {
         let lifecycle: Vec<Directive> = std::iter::once(lifecycle_open(OPENING, date(2023, 12, 1), &[], envelope("peer", 1)))
             .chain(events.iter().map(|(is_open, offset, lamport, currencies)| {
@@ -3714,56 +3726,62 @@ proptest! {
                     lifecycle_close(CASH, day_2024(*offset), envelope("peer", 1 + lamport))
                 }
             }))
+            .chain(std::iter::once(lifecycle_close(CASH, day_2024(close_offset), envelope("peer", 1 + close_lamport))))
             .collect();
-        let path = scratch_ledger("a2-0927-close");
-        let mut service = LedgerService::boot(&path, "nodeA".to_owned()).expect("boot");
+        let transactions: Vec<Directive> = postings
+            .iter()
+            .enumerate()
+            .map(|(index, (offset, eur, units))| {
+                let currency = if *eur { EUR } else { USD };
+                posting_on(index, CASH, day_2024(*offset), Decimal::new(*units, 2), currency, envelope("peer", 20 + index as u64))
+            })
+            .collect();
         let mut oracle = LifecycleOracle::default();
         for directive in &lifecycle {
-            // No transaction is held yet, so no `close` closes one.
-            prop_assert!(service.stage_remote_directive(directive.clone()).is_ok());
             oracle.add(directive);
         }
-        let mut held: Vec<NaiveDate> = Vec::new();
-        for (index, (offset, eur, units)) in postings.iter().enumerate() {
-            let currency = if *eur { EUR } else { USD };
-            let on = day_2024(*offset);
-            let directive = posting_on(index, CASH, on, Decimal::new(*units, 2), currency, envelope("peer", 20 + index as u64));
-            let admitted = service.stage_remote_directive(directive).is_ok();
-            prop_assert_eq!(admitted, oracle.admits(on, currency), "I3/I9 on {} in {}", on, currency);
-            if admitted {
-                held.push(on);
+        let mut expected: BTreeSet<String> = lifecycle.iter().map(compute_content_id).collect();
+        for directive in &transactions {
+            let Directive::Transaction(txn) = directive else { unreachable!() };
+            let currency = &txn.postings[0].amount.as_ref().expect("amount").currency;
+            if oracle.admits_as_data(txn.date, currency) {
+                expected.insert(compute_content_id(directive));
             }
         }
-        let close = lifecycle_close(CASH, day_2024(close_offset), envelope("peer", 1 + close_lamport));
-        let already = service.contains_directive(&compute_content_id(&close));
-        let mut with_close = oracle.clone();
-        with_close.add(&close);
-        let closes_a_held_date = held.iter().any(|on| !with_close.open_at(*on));
-        let verdict = service.stage_remote_directive(close.clone());
-        if already {
-            prop_assert!(matches!(verdict, Ok(None)), "a duplicate close is a no-op: {:?}", verdict);
-        } else if closes_a_held_date {
-            let code = verdict.as_ref().map_err(ServiceError::error_code).err();
-            prop_assert_eq!(code, Some("ACCOUNT_HAS_LATER_TRANSACTIONS"), "{:?}", verdict);
-        } else {
-            prop_assert!(matches!(verdict, Ok(Some(_))), "a close that closes no held date is accepted: {:?}", verdict);
+        let everything: Vec<Directive> = lifecycle.iter().chain(&transactions).cloned().collect();
+        let orders = [
+            ("lifecycle first", everything.clone()),
+            ("transactions first", transactions.iter().chain(&lifecycle).cloned().collect()),
+            ("shuffled", shuffled(&everything, seed)),
+        ];
+        let mut balances: Vec<BTreeMap<String, String>> = Vec::new();
+        for (label, order) in orders {
+            let path = scratch_ledger("a2-0927-close");
+            let mut service = LedgerService::boot(&path, "nodeA".to_owned()).expect("boot");
+            stage_until_settled(&mut service, &order);
+            let held: BTreeSet<String> = everything
+                .iter()
+                .map(compute_content_id)
+                .filter(|id| service.contains_directive(id))
+                .collect();
+            let running_cash = cash_by_currency(service.read_model());
+            let restarted = reboot(service, &path, "nodeA");
+            let held_after: BTreeSet<String> = everything
+                .iter()
+                .map(compute_content_id)
+                .filter(|id| restarted.contains_directive(id))
+                .collect();
+            let quarantined = restarted.quarantined_ids().len();
+            let restarted_cash = cash_by_currency(restarted.read_model());
+            drop(restarted);
+            remove_scratch(&path);
+            prop_assert_eq!(&held, &expected, "{}: held set is not the data oracle's", label);
+            prop_assert_eq!(&held_after, &expected, "{}: the restart changed the held set", label);
+            prop_assert_eq!(quarantined, 0, "{}: the restart quarantined history", label);
+            prop_assert_eq!(&running_cash, &restarted_cash, "{}: balance after the restart", label);
+            balances.push(running_cash);
         }
-        let expected = if verdict.is_ok() { &with_close } else { &oracle };
-        for offset in 0..46 {
-            let on = day_2024(offset);
-            prop_assert_eq!(service.accounts().is_open_at(CASH, on), expected.open_at(on), "I3 on {}", on);
-        }
-        let ids = service.all_directive_ids();
-        let running_cash = cash_by_currency(service.read_model());
-        let restarted = reboot(service, &path, "nodeA");
-        let quarantined = restarted.quarantined_ids().len();
-        let ids_after = restarted.all_directive_ids();
-        let restarted_cash = cash_by_currency(restarted.read_model());
-        drop(restarted);
-        remove_scratch(&path);
-        prop_assert_eq!(quarantined, 0, "the restart un-served history the close was admitted beside");
-        prop_assert_eq!(ids, ids_after);
-        prop_assert_eq!(running_cash, restarted_cash);
+        prop_assert!(balances.windows(2).all(|pair| pair[0] == pair[1]), "orders disagree: {:?}", balances);
     }
 }
 
@@ -3855,12 +3873,16 @@ fn a2_0927_a_long_reopen_history_in_many_currencies_keeps_the_union_across_a_res
 /// every refusal retried, then both restart and exchange again. The available
 /// set is the same on both; the property is that they hold the same DAG.
 ///
-/// At HEAD R1 refuses the posting (I3, `ACCOUNT_CLOSED`, an account wait that
-/// no `open` will ever end) and R2 refuses the `close` for good
-/// (`ACCOUNT_HAS_LATER_TRANSACTIONS`); R2's own write names the posting as a
-/// parent, so R1 can never adopt it either — nor anything R2 writes after it.
+/// At `a5313a1` R1 refused the posting (I3, `ACCOUNT_CLOSED`, an account wait
+/// that no `open` will ever end) and R2 refused the `close` for good
+/// (`ACCOUNT_HAS_LATER_TRANSACTIONS`); R2's own write named the posting as a
+/// parent, so R1 could never adopt it either — nor anything R2 wrote after it.
+/// Since T98 (decision (54)) both are data: every replica holds the `close`
+/// and the posting, and the `close` is inert over the posting's interval.
+///
+/// Bug-catch: judge peer data by the authoring fold again and R1 never holds
+/// the posting.
 #[test]
-#[ignore = "A2-1: one peer's close and posting, delivered in opposite orders, partition two honest replicas for good"]
 fn a2_0927_1_one_peers_close_and_posting_in_opposite_orders_leave_two_replicas_converged() {
     const BANK: &str = "Assets:Bank";
     let base: Vec<Directive> = vec![
@@ -3992,10 +4014,14 @@ fn a4_0927_a_write_whose_reload_is_refused_for_a_link_is_not_in_the_balance() {
 /// follows the printed remedy — restore the record's original line — and the
 /// served-set rule holds it for good (I3: the account is closed at its date).
 /// The node and the mesh then disagree on the account forever, and every later
-/// peer write naming the record is unresolvable here. Fails at `a5313a1`
-/// (Cash 100 here, 105 on every replica that never edited the line).
+/// peer write naming the record is unresolvable here. Failed at `a5313a1`
+/// (Cash 100 here, 105 on every replica that never edited the line); since
+/// T98 (decision (54)) the served-set rule judges the restored record as data,
+/// which no `close` refuses, and every replica accepts the `close` as data.
+///
+/// Bug-catch: judge the served-set rule by the authoring fold again and the
+/// restored record stays held.
 #[test]
-#[ignore = "X3-2: a close judged against the served read model is accepted over a record held locally; the remedy then cannot bring it back"]
 fn x3_0927_2_a_close_over_a_locally_held_record_does_not_outlive_the_remedy() {
     let path = scratch_ledger("x3-0927-2");
     let mut service = LedgerService::boot(&path, "nodeA".to_owned()).expect("boot");
