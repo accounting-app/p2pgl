@@ -815,6 +815,19 @@ impl LedgerService {
             // as history, above any ratchet (a bootstrap join relies on it),
             // so the refusal says how to keep the record rather than holding
             // it — held live, it would be served only after a restart.
+            // L-114, decision (41) (b): while every signature this node
+            // checked failed, a typed line is not signed under a domain that
+            // is likely wrong — it is held in the file as written and adopted
+            // at the first boot under the right `meshId` and key. Dropping it
+            // (what a refused typed line otherwise gets) would lose the edit.
+            Err(error @ ServiceError::SignatureVerdict { .. }) if needs_stamp => {
+                self.hold_operator_input_as_written(content_id.clone(), directive.clone());
+                tally.refuse(
+                    content_id,
+                    format!("{error} — held in the file as written until then"),
+                );
+                return FileAdoption::Refused;
+            }
             Err(error @ ServiceError::LamportAdvance { .. })
                 if !needs_stamp && matches!(path, AdoptionPath::Live) =>
             {

@@ -1978,8 +1978,21 @@ impl Replica {
         path: PathBuf,
         mesh_id: &str,
     ) -> (Self, GlNodeBoot) {
+        Self::boot_like_gl_node_allowing(name, key, path, mesh_id, false)
+    }
+
+    /// [`Self::boot_like_gl_node`] with `signing.allowWritesWhenEverySignatureFails`
+    /// (L-114) — set, as `main.rs` sets it, before the signature passes.
+    fn boot_like_gl_node_allowing(
+        name: &str,
+        key: Arc<PeerKeySignatureProvider>,
+        path: PathBuf,
+        mesh_id: &str,
+        allow_writes: bool,
+    ) -> (Self, GlNodeBoot) {
         let mut svc = LedgerService::boot(path.clone(), "local".to_owned())
             .unwrap_or_else(|error| panic!("{name}: boot: {error}"));
+        svc.set_write_despite_signature_verdict(allow_writes);
         svc.set_author_id(key.public_key_hex());
         svc.set_signer(signer(&key));
         svc.set_verifier(verifier(mesh_id));
@@ -3565,39 +3578,75 @@ fn l99_a_wrong_mesh_id_keeps_the_clock_and_warns_once_on_boot_and_reload() {
     mesh.assert_converged_among("A6 / L-99 right meshId again", &[a, b], &[]);
 }
 
-/// A6-2 (0926): `every_checked_signature_failed` counted what this node signs
-/// itself as a verified signature. The README's stop → edit → start with a
-/// hand `open` appended, restarted under the wrong `meshId`: every history
-/// signature fails in the setters' passes (the release is held), then
-/// `finalize_operator_input` signs the hand line under the wrong domain and
-/// its own `verify_history_pass` accepted it — `signature_verified_total` = 1,
-/// the verdict flipped and `verify_own_history` stayed silent. The operator got
-/// one "signature does not verify — was this record edited?" WARN per record
-/// of the history instead of "check meshId / do not author" (L-99's remedy).
-/// Before T89 the WARN was judged per pass and fired here. Since T92 (L-114,
-/// decision (41)) finalize's own fresh signatures are not counted as verified
-/// history, so it fires again. (The same flip after one API write under the
-/// wrong domain is prevented by refusing the write, decision (41) (b) — see
-/// `l114_a_node_refuses_to_write_while_every_signature_fails`.)
+/// A6-2 (0926) and L-114: a hand `open` appended (the README's stop → edit →
+/// start), restarted under the wrong `meshId`: every history signature fails
+/// in the setters' passes (the release is held).
+///
+/// * **By default** (L-114, decision (41) (b)) `finalize_operator_input` does
+///   not sign the hand line under a domain that is likely wrong: it is held,
+///   kept in the file as written, the EVERY WARN says so — and a restart under
+///   the right `meshId` adopts it.
+/// * **With the override** (`signing.allowWritesWhenEverySignatureFails`) it
+///   signs it, and its own `verify_history_pass` accepts it. Before T92 that
+///   counted as a verified signature — `signature_verified_total` = 1, the
+///   verdict flipped and the operator got one "was this record edited?" WARN
+///   per history record instead of "check meshId" (L-99's remedy). Since T92
+///   finalize's own fresh signatures are not counted as verified history, so
+///   the WARN still fires.
+///
+/// Bug-catch: sign the hand line under the verdict and the default case
+/// serves it; count finalize's signatures as verified and the override case
+/// loses the WARN.
 #[test]
 fn a6_2_a_hand_line_in_the_same_boot_does_not_hide_a_wrong_mesh_id() {
-    let (mut mesh, path) = jumped_history_then_stop_a(9263);
-    let a = 0;
-    // A hand `open` of a new account: it validates without any of the
-    // history, so the rebase keeps it (a hand transaction on a history
-    // account would be refused with its `open` and change nothing here).
-    append_to_bean(&path, "\n2024-01-02 open Assets:Hand\n");
-    let logged = restart_under_mesh_id(&mut mesh, a, path, "another-mesh");
-    assert_eq!(
-        mesh.replicas[a].svc.directive_count(),
-        1,
-        "premise: every history record quarantined, the hand line served"
-    );
-    assert!(
-        logged.contains("EVERY signature"),
-        "every history signature failed under the wrong meshId, yet the WARN that says so (and \
-         says not to author) is missing with a hand line in the boot; logged:\n{logged}"
-    );
+    for allow_writes in [false, true] {
+        let (mut mesh, path) = jumped_history_then_stop_a(9263);
+        let a = 0;
+        // A hand `open` of a new account: it validates without any of the
+        // history, so the rebase keeps it (a hand transaction on a history
+        // account would be refused with its `open` and change nothing here).
+        append_to_bean(&path, "\n2024-01-02 open Assets:Hand\n");
+        let name = mesh.replicas[a].name.clone();
+        let ((replica, _), logged) = capture_warnings(|| {
+            Replica::boot_like_gl_node_allowing(
+                &name,
+                key_for_mesh(1, "another-mesh"),
+                path,
+                "another-mesh",
+                allow_writes,
+            )
+        });
+        mesh.replicas[a] = replica;
+        assert!(
+            logged.contains("EVERY signature"),
+            "allow_writes {allow_writes}: every history signature failed under the wrong \
+             meshId, yet the WARN that says so is missing with a hand line in the boot; \
+             logged:\n{logged}"
+        );
+        let hand_served = mesh.replicas[a].svc.accounts().has_open("Assets:Hand");
+        assert_eq!(
+            hand_served, allow_writes,
+            "the hand line is served only under the override (history all quarantined)"
+        );
+        if !allow_writes {
+            assert!(
+                logged.contains("adopted at the first boot under the right"),
+                "{logged}"
+            );
+            let path = mesh.stop(a);
+            assert!(
+                std::fs::read_to_string(&path)
+                    .expect("read")
+                    .contains("Assets:Hand"),
+                "held in the file as written"
+            );
+            restart_under_mesh_id(&mut mesh, a, path, MESH_ID);
+            assert!(
+                mesh.replicas[a].svc.accounts().has_open("Assets:Hand"),
+                "the first boot under the right meshId adopts it"
+            );
+        }
+    }
 }
 
 /// L-114 (T92, decision (41) (b)): a node restarted under the wrong
@@ -3610,9 +3659,13 @@ fn a6_2_a_hand_line_in_the_same_boot_does_not_hide_a_wrong_mesh_id() {
 /// operator's override (`signing.allowWritesWhenEverySignatureFails`) lets the
 /// write through, knowing that cost.
 ///
+/// A line typed into the file meanwhile is held there as written, not signed
+/// and not dropped.
+///
 /// Bug-catch: drop the verdict check from `next_stamp` and the write goes
-/// through and the next boot has no EVERY WARN; ignore the override and the
-/// last write is refused.
+/// through and the next boot has no EVERY WARN; drop the live hold and the
+/// typed line is deleted by the rewrite; ignore the override and the last
+/// write is refused.
 #[test]
 fn l114_a_node_refuses_to_write_while_every_signature_fails() {
     let a = 0;
@@ -3637,6 +3690,19 @@ fn l114_a_node_refuses_to_write_while_every_signature_fails() {
     };
     let error = open_written(&mut mesh.replicas[a]).expect_err("refused under the verdict");
     assert_eq!(error.error_code(), "EVERY_SIGNATURE_FAILED", "{error}");
+    // A line typed under the running node is held, not signed — and not
+    // dropped from the file, as a refused typed line otherwise would be.
+    let live_path = mesh.replicas[a].path.clone();
+    append_to_bean(&live_path, "\n2024-01-03 open Assets:Typed\n");
+    mesh.replicas[a].svc.reconcile_file().expect("reconcile");
+    assert!(!mesh.replicas[a].svc.accounts().has_open("Assets:Typed"));
+    mesh.replicas[a].svc.compact().expect("compact");
+    assert!(
+        std::fs::read_to_string(&live_path)
+            .expect("read")
+            .contains("Assets:Typed"),
+        "the typed line stays in the file"
+    );
     let path = mesh.stop(a);
     let after_write = restart_under_mesh_id(&mut mesh, a, path, "another-mesh");
     assert!(

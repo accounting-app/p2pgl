@@ -688,9 +688,11 @@ A node started with the wrong domain (or the wrong key) says so: at boot every
 signature in its history fails, it logs *"EVERY signature this node checked
 failed"*, and it **refuses API writes** (`EVERY_SIGNATURE_FAILED`) until it is
 restarted with the right `meshId` and key — the history is quarantined, not
-lost, and loads again then. A write made meanwhile would be signed under the
-wrong domain, and at the next boot it would verify and hide the warning. To
-write anyway, set `signing.allowWritesWhenEverySignatureFails: true`.
+lost, and loads again then. A line typed into the `.bean` meanwhile is held in
+the file as written, not signed, and adopted at that boot. A write made
+meanwhile would be signed under the wrong domain, and at the next boot it would
+verify and hide the warning. To write anyway, set
+`signing.allowWritesWhenEverySignatureFails: true`.
 
 **New mesh.** Generate a random UUID (`uuidgen`) and a unique `swarmTopic`, set
 both on every node before the first directive is written, and there is nothing

@@ -1411,6 +1411,19 @@ impl LedgerService {
         for content_id in &pending {
             let lamport = match self.next_stamp() {
                 Ok(lamport) => lamport,
+                Err(error @ ServiceError::SignatureVerdict { .. }) => {
+                    warn!(
+                        id = %content_id,
+                        %error,
+                        file = %self.file_path.display(),
+                        "quarantining operator input, kept in the file as written: every \
+                         signature this node checked failed, so it is not signed under a domain \
+                         that is likely wrong — it is adopted at the first boot under the right \
+                         p2p.meshId and key (L-114, H-08)"
+                    );
+                    unstampable.insert(content_id.clone());
+                    continue;
+                }
                 Err(error) => {
                     warn!(
                         id = %content_id,

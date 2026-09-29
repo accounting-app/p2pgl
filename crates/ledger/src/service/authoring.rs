@@ -611,7 +611,10 @@ impl LedgerService {
     /// L-114 (decision (41) (b)): refused first while every signature this
     /// node checked failed — a write now would be signed under the wrong
     /// domain and hide that verdict at the next boot — unless the operator
-    /// set the override. Every API write stamps here, and nothing else does.
+    /// set the override. Every record this node writes is stamped here: an
+    /// API write is refused with the error; a typed line (boot's
+    /// `finalize_operator_input`, the live reconcile) is held in the file as
+    /// written and adopted at the first boot under the right domain.
     pub(super) fn next_stamp(&self) -> Result<u64, ServiceError> {
         if !self.write_despite_signature_verdict && self.every_checked_signature_failed() {
             return Err(ServiceError::SignatureVerdict {
