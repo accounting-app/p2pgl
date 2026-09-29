@@ -1342,7 +1342,7 @@ openledger-v2/
 │   │   │   ├── access.rs     #   accessors, served views
 │   │   │   ├── lamport.rs, envelope.rs, resource_limits.rs,
 │   │   │   │   blocks.rs, file_io.rs, error.rs  # shared rules and I/O
-│   │   │   └── tests.rs      #   unit tests
+│   │   │   └── tests/        #   unit tests, one file per concern
 │   │   ├── src/hash.rs       # SHA-256 content hashing (I5)
 │   │   ├── src/verify.rs     # DAG integrity verification
 │   │   ├── src/read_model.rs # Reports (trial balance, balance sheet, etc.)

@@ -141,7 +141,7 @@ known residuals, see that task's "Done" note in the tracker.
 - Balances are exact sums, in any arrival order. A figure that does not fit a `Decimal` at its usual scale is rounded once, half to even, instead of at each scale. This is reachable only through amounts at widely different scales, such as `1000` plus `0.0000000000000000000000000001`. Such figures print up to one unit in the last place differently from before (L-79, T76).
 - `balance` assertions and `verify` compare against the exact sum. A claim that matches only the rounded figure now fails (L-79, T76).
 - The balance sheet's `Equity:Net-Income` prints `0.00` instead of `-0.00` for a currency whose net is exactly zero (T76).
-- Internal: `ledger::service` is split from one 25,000-line file into a module per concern (boot, the history checks, the quarantine, authoring, commit, recovery, reconcile, peer ingest, access, and the shared rules and file I/O). Every public path is unchanged and no behaviour changes.
+- Internal: `ledger::service` is split from one 25,000-line file into a module per concern (boot, the history checks, the quarantine, authoring, commit, recovery, reconcile, peer ingest, access, and the shared rules and file I/O). Every public path is unchanged and no behaviour changes. Its unit tests are split the same way, into `service/tests/`.
 
 ### Added
 

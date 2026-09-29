@@ -37,10 +37,10 @@
 //! below, so the properties do not depend on the Rust surface.
 //!
 //! CT-9 (byte-identical `.bean` after partition-and-converge) is pinned by
-//! `ledger::service::tests::ct9_two_nodes_converge_after_partition`; T76 must
+//! `ledger::service::tests::remote::ct9_two_nodes_converge_after_partition`; T76 must
 //! leave it green and byte-identical. The stored spelling of an amount (and so
 //! every content id) is pinned by `hash::tests::test_ct3_worked_fixture_txid`
-//! and `service::tests::test_single_currency_elision_txid_is_pinned`.
+//! and `service::tests::authoring::test_single_currency_elision_txid_is_pinned`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
