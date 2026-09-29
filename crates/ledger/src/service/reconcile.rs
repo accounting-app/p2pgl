@@ -561,17 +561,64 @@ impl LedgerService {
         tally: &mut AdoptionTally,
         path: AdoptionPath,
     ) -> FileAdoption {
+        if let Err(reason) = self.check_file_directive(&mut directive, &content_id, path) {
+            tally.refuse(content_id, reason);
+            return FileAdoption::Refused;
+        }
+        let stamp = match self.stamp_file_directive(&mut directive, &content_id, path) {
+            Ok(stamp) => stamp,
+            Err(reason) => {
+                tally.refuse(content_id, reason);
+                return FileAdoption::Refused;
+            }
+        };
+
+        // Validate transactions (I1–I3, I9).
+        //
+        // T81: operator input is this node's authorship and is counted as it
+        // will be stored, signature included (M-55); a complete envelope is
+        // history — a peer's record, or this node's own round-tripped — and
+        // is held to the rule every peer and boot hold history to (M-51).
+        let limits = if stamp.needs_stamp {
+            enforce_resource_limits_as_stored(&directive)
+        } else {
+            enforce_resource_limits_for(&directive, ResourceRule::History)
+        };
+        if let Err(error) = limits {
+            // T90 / L-126: a limit every peer holds history to — boot holds the
+            // record (and seeds the closure with it); so does the live path.
+            if !stamp.needs_stamp {
+                self.hold_refused_file_entry(&content_id, &directive);
+            }
+            tally.refuse(content_id, error.to_string());
+            return FileAdoption::Refused;
+        }
+        if let Directive::Transaction(txn) = &directive {
+            self.adopt_file_transaction(txn, &directive, content_id, tally, path, stamp)
+        } else {
+            self.adopt_file_non_transaction(directive, content_id, tally, path, stamp)
+        }
+    }
+
+    /// The checks a file directive passes before anything is stamped (H-04,
+    /// H-06, L-26, T41, M-20, T90, M-54, T81, L-75): each refusal is returned
+    /// with its reason and moves nothing — neither the clock nor an envelope.
+    fn check_file_directive(
+        &mut self,
+        directive: &mut Directive,
+        content_id: &str,
+        path: AdoptionPath,
+    ) -> Result<(), String> {
         // H-04: never adopt a directive whose date the file grammar cannot
         // read back — the next persist would brick every later boot. Checked
         // before the envelope stamp so a rejection cannot move the Lamport
         // clock either. `read_date` cannot currently yield such a year, so
         // this is a guard against future parser or format changes.
-        if let Err(error) = validate_directive_dates(&directive) {
-            tally.refuse(content_id, error.to_string());
-            return FileAdoption::Refused;
+        if let Err(error) = validate_directive_dates(directive) {
+            return Err(error.to_string());
         }
 
-        // H-06: a file may legitimately carry the four envelope keys at
+        // H-06: a file may legitimately carry the envelope keys at
         // directive level (that is how a peer's directive round-trips), but
         // any other `openledger-*` key — and any at posting level — is
         // unvalidated metadata that the content hash ignores and that
@@ -617,8 +664,8 @@ impl LedgerService {
         // pasted or re-read — is stripped as boot strips it, not refused and
         // then deleted from the file by the re-persist (the same bytes had two
         // fates). Operator input keeps H-06's refusal below.
-        if !Self::is_operator_input(&directive) {
-            let stray = strip_stray_envelope_keys(&mut directive);
+        if !Self::is_operator_input(directive) {
+            let stray = strip_stray_envelope_keys(directive);
             if !stray.is_empty() {
                 warn!(
                     id = %content_id,
@@ -630,38 +677,24 @@ impl LedgerService {
                 );
             }
         }
-        if let Err(error) = validate_body_envelope_keys(&directive, ENVELOPE_KEYS)
-            .and_then(|()| validate_body_strings(&directive))
+        if let Err(error) = validate_body_envelope_keys(directive, ENVELOPE_KEYS)
+            .and_then(|()| validate_body_strings(directive))
         {
-            tally.refuse(content_id, error.to_string());
-            return FileAdoption::Refused;
+            return Err(error.to_string());
         }
         // T90 / L-126: boot quarantines a record over the fan-in cap, the body
         // cap or with a malformed envelope, and keeps it in the file; so does
         // the live path now, for history.
-        if let Err(error) = validate_parent_fan_in(&directive)
-            .and_then(|()| validate_file_ingest_parity(&directive))
+        if let Err(error) =
+            validate_parent_fan_in(directive).and_then(|()| validate_file_ingest_parity(directive))
         {
-            self.hold_refused_file_entry(&content_id, &directive);
-            tally.refuse(content_id, error.to_string());
-            return FileAdoption::Refused;
+            self.hold_refused_file_entry(content_id, directive);
+            return Err(error.to_string());
         }
 
-        // Adopt: stamp envelope metadata only if missing.
-        // If the directive already has envelope keys (e.g. from another node),
-        // preserve them as-is to maintain content hash stability.
-        //
-        // M-47: "missing" is the same test boot applies — either key absent.
-        // A half envelope is operator input, and the whole envelope is this
-        // node's to stamp: a hand-typed lamport is not a clock value this
-        // node issued (honouring it could re-issue an `(author, lamport)`
-        // pair, M-18), and a signature under a freshly stamped lamport is
-        // stale by construction.
-        let needs_stamp = Self::is_operator_input(&directive);
-        // T84 / M-57, decision (16): boot's operator input is stamped for real
-        // in `finalize_operator_input`, after every pass has settled the clock;
-        // the lamport written here is a placeholder that does not move it.
-        let provisional_stamp = needs_stamp && matches!(path, AdoptionPath::Boot);
+        // The same test `stamp_file_directive` applies (M-47): operator input
+        // is what this node stamps; a complete envelope is history.
+        let needs_stamp = Self::is_operator_input(directive);
 
         // M-54 (T79): operator input is this node's own authorship. An entry
         // whose file-spelled `openledger-author` names another node cannot be
@@ -672,10 +705,9 @@ impl LedgerService {
         // anything is stamped; at boot the author may still be a placeholder
         // and the rule runs in `finalize_operator_input`.
         if needs_stamp && path == AdoptionPath::Live {
-            if let Some(other) = directive_author(&directive) {
+            if let Some(other) = directive_author(directive) {
                 if other != self.author_id {
-                    tally.refuse(content_id, Self::foreign_operator_input_reason(other));
-                    return FileAdoption::Refused;
+                    return Err(Self::foreign_operator_input_reason(other));
                 }
             }
         }
@@ -698,16 +730,12 @@ impl LedgerService {
                     .find(|parent| self.names_a_held_back_parent(parent))
                     .map(str::to_owned)
                 {
-                    self.hold_refused_file_entry(&content_id, &directive);
-                    tally.refuse(
-                        content_id,
-                        format!(
-                            "descends from {parent}, a record no peer accepts (over a limit peers \
+                    self.hold_refused_file_entry(content_id, directive);
+                    return Err(format!(
+                        "descends from {parent}, a record no peer accepts (over a limit peers \
                              hold history to, or an amount past the cap); quarantined with it \
                              (M-51, M-52)"
-                        ),
-                    );
-                    return FileAdoption::Refused;
+                    ));
                 }
             }
         }
@@ -733,21 +761,44 @@ impl LedgerService {
                     } else {
                         "exists nowhere in this ledger"
                     };
-                    tally.refuse(
-                        content_id,
-                        format!(
-                            "openledger-parents names {parent}, which {held}; a hand-spelled \
+                    return Err(format!(
+                        "openledger-parents names {parent}, which {held}; a hand-spelled \
                              parent must be a record this node serves, and since H-22 one in \
                              the quarantine does not count — remove the openledger-parents \
                              line to let this node choose the parents (L-75)"
-                        ),
-                    );
-                    return FileAdoption::Refused;
+                    ));
                 }
             }
         }
+        Ok(())
+    }
 
-        let metadata = directive_metadata_mut(&mut directive);
+    /// The clock value a file directive's adoption moves to, and its stamp
+    /// (M-47, T84, H-07, T63, L-140, L-114, L-40): operator input gets this
+    /// node's envelope and parents; history keeps its own.
+    fn stamp_file_directive(
+        &mut self,
+        directive: &mut Directive,
+        content_id: &str,
+        path: AdoptionPath,
+    ) -> Result<FileStamp, String> {
+        // Adopt: stamp envelope metadata only if missing.
+        // If the directive already has envelope keys (e.g. from another node),
+        // preserve them as-is to maintain content hash stability.
+        //
+        // M-47: "missing" is the same test boot applies — either key absent.
+        // A half envelope is operator input, and the whole envelope is this
+        // node's to stamp: a hand-typed lamport is not a clock value this
+        // node issued (honouring it could re-issue an `(author, lamport)`
+        // pair, M-18), and a signature under a freshly stamped lamport is
+        // stale by construction.
+        let needs_stamp = Self::is_operator_input(directive);
+        // T84 / M-57, decision (16): boot's operator input is stamped for real
+        // in `finalize_operator_input`, after every pass has settled the clock;
+        // the lamport written here is a placeholder that does not move it.
+        let provisional_stamp = needs_stamp && matches!(path, AdoptionPath::Boot);
+
+        let metadata = directive_metadata_mut(directive);
 
         // H-07: the clock value this adoption would move to, bounds-checked
         // BEFORE anything is written. The ceiling is not a wire rule — a
@@ -821,29 +872,20 @@ impl LedgerService {
             // at the first boot under the right `meshId` and key. Dropping it
             // (what a refused typed line otherwise gets) would lose the edit.
             Err(error @ ServiceError::SignatureVerdict { .. }) if needs_stamp => {
-                self.hold_operator_input_as_written(content_id.clone(), directive.clone());
-                tally.refuse(
-                    content_id,
-                    format!("{error} — held in the file as written until then"),
-                );
-                return FileAdoption::Refused;
+                self.hold_operator_input_as_written(content_id.to_owned(), directive.clone());
+                return Err(format!("{error} — held in the file as written until then"));
             }
             Err(error @ ServiceError::LamportAdvance { .. })
                 if !needs_stamp && matches!(path, AdoptionPath::Live) =>
             {
-                tally.refuse(
-                    content_id,
-                    format!(
-                        "{error} Refused by the running node only (L-140): boot adopts the \
+                return Err(format!(
+                    "{error} Refused by the running node only (L-140): boot adopts the \
                          same bytes as history, and this rewrite drops them — to keep the \
                          record, stop the node, put it back in the file and start it"
-                    ),
-                );
-                return FileAdoption::Refused;
+                ));
             }
             Err(error) => {
-                tally.refuse(content_id, error.to_string());
-                return FileAdoption::Refused;
+                return Err(error.to_string());
             }
         };
 
@@ -857,6 +899,13 @@ impl LedgerService {
                 metadata.insert("openledger-author".to_owned(), self.author_id.clone());
             }
             metadata.insert("openledger-lamport".to_owned(), next_lamport.to_string());
+            // Format v2: a typed line keeps v1 identity whatever this node
+            // writes through its API. The repairs every WARN prescribes —
+            // "delete its openledger-* lines so it is re-adopted under the
+            // same id" — depend on it: the stripped line is then the record's
+            // only copy, nothing here could tell it from a new one, and a v2
+            // id would make it a second record beside the one every peer
+            // holds. A line that spells `openledger-format: "2"` stays v2.
         }
         // L-55: `self.lamport_clock = next_lamport` used to sit here, ahead
         // of `enforce_resource_limits`, `validate_transaction`, the
@@ -875,281 +924,285 @@ impl LedgerService {
         // over-cap parent list signed here is refused by every peer exactly as
         // an over-cap local append was.
         let mut stamped_parents = false;
-        if let Directive::Transaction(txn) = &mut directive {
+        if let Directive::Transaction(txn) = &mut *directive {
             if !txn.metadata.contains_key("openledger-parents") {
                 stamped_parents = true;
                 txn.metadata.insert(
                     "openledger-parents".to_owned(),
-                    self.choose_committed_parents(&content_id),
+                    self.choose_committed_parents(content_id),
                 );
             }
         }
+        Ok(FileStamp {
+            needs_stamp,
+            provisional_stamp,
+            stamped_parents,
+            next_lamport,
+        })
+    }
 
-        // Validate transactions (I1–I3, I9).
-        //
-        // T81: operator input is this node's authorship and is counted as it
-        // will be stored, signature included (M-55); a complete envelope is
-        // history — a peer's record, or this node's own round-tripped — and
-        // is held to the rule every peer and boot hold history to (M-51).
-        let limits = if needs_stamp {
-            enforce_resource_limits_as_stored(&directive)
-        } else {
-            enforce_resource_limits_for(&directive, ResourceRule::History)
-        };
-        if let Err(error) = limits {
-            // T90 / L-126: a limit every peer holds history to — boot holds the
-            // record (and seeds the closure with it); so does the live path.
-            if !needs_stamp {
-                self.hold_refused_file_entry(&content_id, &directive);
-            }
-            tally.refuse(content_id, error.to_string());
-            return FileAdoption::Refused;
-        }
-        if let Directive::Transaction(txn) = &directive {
-            // T98 / M-09, decision (54): the file is data, judged by the rule
-            // every peer applies — a `close` never refuses it.
-            match validate_transaction_as_data(txn, &self.accounts) {
-                Ok(validated) => {
-                    // Build the final transaction with the resolved postings.
-                    let final_txn = Transaction {
-                        postings: validated.postings,
-                        ..txn.clone()
-                    };
-                    let mut final_directive = Directive::Transaction(final_txn);
-                    // L-11: sign over the id the DAG will actually store it
-                    // under. That is NOT `content_id` when I2 resolved an
-                    // elided posting — the resolved body hashes differently,
-                    // and a signature over the pre-resolution id would fail
-                    // on every peer.
-                    let stored_id = compute_content_id(&final_directive);
-                    // L-40: parents this node chose must not include a head
-                    // that already names `stored_id` through a dangling
-                    // `openledger-parents` — that is a cycle this node would
-                    // build itself, refused below and, had it landed,
-                    // quarantined with the operator's entry at next boot.
-                    // Chosen against `stored_id`, not `content_id`: the DAG
-                    // keys (and a planted pointer targets) the resolved
-                    // body. Identical to the provisional set on every
-                    // honest ledger. Parents the FILE spelled are the
-                    // operator's own and are left alone.
-                    if stamped_parents {
-                        let parents = self.choose_committed_parents(&stored_id);
-                        directive_metadata_mut(&mut final_directive)
-                            .insert("openledger-parents".to_owned(), parents);
-                    }
-                    // M-20 / L-02, the second application. The guard chain
-                    // above measured the body as the FILE spells it; I2
-                    // then resolved the elided posting, which is what the
-                    // signature, the DAG and every peer actually see. A
-                    // body within the cap before resolution can be over it
-                    // after, and the wire cap is enforced on the resolved
-                    // form — so the entry must be re-measured on this side
-                    // of `validate_transaction` and before
-                    // `sign_adopted_entry`. Costs one serialization on the
-                    // reconcile path only, which already rewrites the whole
-                    // file.
-                    if let Err(error) = enforce_economic_bean_limit(&final_directive) {
-                        if !needs_stamp {
-                            self.hold_refused_file_entry(&content_id, &directive);
-                        }
-                        tally.refuse(content_id, error.to_string());
-                        return FileAdoption::Refused;
-                    }
-                    // T85 / M-56, H-23: a full envelope is history, and history
-                    // this node serves must be what a peer can adopt — every
-                    // parent it names already here. Boot holds such a record
-                    // (`quarantine_unservable_history`); so does the live
-                    // path, in the quarantine, so the canonical re-persist
-                    // keeps it in the file and a peer that re-supplies its
-                    // parent (and then it) heals it. Before T85 the live path
-                    // inserted it leniently with a dangling parent (0924 §5).
-                    if !needs_stamp {
-                        let missing_parent = match &final_directive {
-                            Directive::Transaction(txn) => txn
-                                .parent_ids()
-                                .into_iter()
-                                .find(|parent| {
-                                    self.dag.get(parent).is_none()
-                                        && (!self.reconcile_batch_ids.contains(*parent)
-                                            || self.quarantined.contains_key(*parent))
-                                })
-                                .map(str::to_owned),
-                            _ => None,
-                        };
-                        if let Some(parent) = missing_parent {
-                            // T103 / L-141: counted, as boot counts it.
-                            self.fold_held_own_lamport(&final_directive);
-                            self.quarantined
-                                .entry(stored_id.clone())
-                                .or_insert_with(|| final_directive.clone());
-                            tally.refuse(
-                                content_id,
-                                format!(
-                                    "its parent {parent} is not served by this node, so no peer \
-                                     lacking it could adopt it; held in the quarantine until a \
-                                     peer re-supplies the parent (H-23)"
-                                ),
-                            );
-                            return FileAdoption::Refused;
-                        }
-                    }
-                    // H-20: a full envelope is adopted as history, and the
-                    // live path holds it to the same signature check boot
-                    // does — against the id it is stored under.
-                    // T80 / M-53: the same re-attribution boot applies.
-                    if !needs_stamp {
-                        if let Some(owned) =
-                            self.reattributed_placeholder_record(&stored_id, &final_directive)
-                        {
-                            final_directive = owned;
-                        } else if let HistoryVerdict::Refused(reason) =
-                            self.verify_history_directive(&stored_id, &final_directive)
-                        {
-                            tally.refuse(content_id, reason);
-                            return FileAdoption::Refused;
-                        }
-                    }
-                    self.sign_adopted_entry(&mut final_directive, &stored_id);
-                    match self.dag.insert(final_directive.clone(), false) {
-                        Ok(InsertResult::Inserted { .. }) => {
-                            // L-55: adopted, so the clock moves — and only now.
-                            // T84 / M-57, decision (16): except for operator
-                            // input adopted at boot, whose stamp here is
-                            // provisional — `finalize_operator_input` stamps
-                            // it from the clock the signature pass settles.
-                            let clock_before = self.lamport_clock;
-                            if !provisional_stamp {
-                                self.lamport_clock = next_lamport;
-                            }
-                            self.warn_if_adoption_opens_a_lamport_gap(
-                                clock_before,
-                                final_directive.lamport_clock(),
-                                directive_author(&final_directive),
-                            );
-                            self.read_model.index_directive(&final_directive);
-                            // M-46: adopted FROM the file, so on disk
-                            // already — not staged. Tracked apart from
-                            // `pending_ids` so the L-13 floor never counts
-                            // it as "never on disk"; its non-emptiness is
-                            // what makes the next commit the rewrite that
-                            // spells it canonically (see `prepare`).
-                            self.adopted_from_file.insert(stored_id.clone());
-                            // T90 / H-24: a copy of a closure member with
-                            // parents this node serves; no longer held back —
-                            // at boot once finalised (T99 / L-145).
-                            if path == AdoptionPath::Live {
-                                self.refused_history_closure.remove(&stored_id);
-                            }
-                            tally.new_directives += 1;
-                            FileAdoption::Inserted(stored_id)
-                        }
-                        Ok(InsertResult::Duplicate { .. }) => {
-                            tally.duplicates += 1;
-                            FileAdoption::Duplicate
-                        }
-                        Err(error) => {
-                            tally.refuse(content_id, error.to_string());
-                            FileAdoption::Refused
-                        }
-                    }
+    /// A file transaction, validated as data and inserted under the id its
+    /// resolved body hashes to (I1–I3, I9; L-11, M-20, T85, H-20).
+    fn adopt_file_transaction(
+        &mut self,
+        txn: &Transaction,
+        directive: &Directive,
+        content_id: String,
+        tally: &mut AdoptionTally,
+        path: AdoptionPath,
+        stamp: FileStamp,
+    ) -> FileAdoption {
+        // T98 / M-09, decision (54): the file is data, judged by the rule
+        // every peer applies — a `close` never refuses it.
+        match validate_transaction_as_data(txn, &self.accounts) {
+            Ok(validated) => {
+                // Build the final transaction with the resolved postings.
+                let final_txn = Transaction {
+                    postings: validated.postings,
+                    ..txn.clone()
+                };
+                let mut final_directive = Directive::Transaction(final_txn);
+                // L-11: sign over the id the DAG will actually store it
+                // under. That is NOT `content_id` when I2 resolved an
+                // elided posting — the resolved body hashes differently,
+                // and a signature over the pre-resolution id would fail
+                // on every peer.
+                let stored_id = compute_content_id(&final_directive);
+                // L-40: parents this node chose must not include a head
+                // that already names `stored_id` through a dangling
+                // `openledger-parents` — that is a cycle this node would
+                // build itself, refused below and, had it landed,
+                // quarantined with the operator's entry at next boot.
+                // Chosen against `stored_id`, not `content_id`: the DAG
+                // keys (and a planted pointer targets) the resolved
+                // body. Identical to the provisional set on every
+                // honest ledger. Parents the FILE spelled are the
+                // operator's own and are left alone.
+                if stamp.stamped_parents {
+                    let parents = self.choose_committed_parents(&stored_id);
+                    directive_metadata_mut(&mut final_directive)
+                        .insert("openledger-parents".to_owned(), parents);
                 }
-                Err(error) => {
-                    // T90 / L-126: a complete envelope the accounts do not
-                    // admit is held by boot's served-set rule (H-23) and kept
-                    // in the file; the live path holds it too, so the
-                    // re-persist does not delete what a restart would keep.
-                    if !needs_stamp {
-                        self.hold_refused_file_entry(&content_id, &directive);
+                // M-20 / L-02, the second application. The guard chain
+                // above measured the body as the FILE spells it; I2
+                // then resolved the elided posting, which is what the
+                // signature, the DAG and every peer actually see. A
+                // body within the cap before resolution can be over it
+                // after, and the wire cap is enforced on the resolved
+                // form — so the entry must be re-measured on this side
+                // of `validate_transaction` and before
+                // `sign_adopted_entry`. Costs one serialization on the
+                // reconcile path only, which already rewrites the whole
+                // file.
+                if let Err(error) = enforce_economic_bean_limit(&final_directive) {
+                    if !stamp.needs_stamp {
+                        self.hold_refused_file_entry(&content_id, directive);
                     }
                     tally.refuse(content_id, error.to_string());
-                    FileAdoption::Refused
+                    return FileAdoption::Refused;
                 }
-            }
-        } else {
-            // T98 / M-09 remainder, decision (54): a `close` in the file is
-            // data, like a peer's — never refused for the transactions dated
-            // after it (it is inert over any interval that holds one; see
-            // `AccountState::check_account_opened_by`). Refusing it made the
-            // verdict depend on what this node held when it read the line: a
-            // hand `close` judged at boot before a later hand re-`open` was
-            // held at one boot and served at the next (L-153), and one judged
-            // while a record was held only here was accepted where every peer
-            // refused it (M-75).
-            // L-77: a hand-typed `open` of an account that is already open is
-            // refused exactly as `open_account` refuses it. Operator input
-            // only: a full-envelope `open` is a peer's data (M-09) and joins
-            // the lifecycle set at its own position, as it does on the wire.
-            //
-            // T92 / L-121: on the live path only. At boot the node's own
-            // `open` of the account may be one the signature pass is about to
-            // hold (edited), which is exactly when the operator adds the hand
-            // `open` the H-23 WARN prescribes; `finalize_operator_input`
-            // judges L-77 once the pass has run. And no longer while a
-            // node-written `open` of the account is held (T85 / L-110,
-            // decision (20), retired 2026-09-26): with I9 the union over every
-            // `open` (T91), a second `open` the mesh may re-supply changes no
-            // verdict, and the refusal made the WARN's own remedy fail — boot
-            // and live alike (L-121, L-125).
-            if needs_stamp && path == AdoptionPath::Live {
-                if let Directive::Open(open) = &directive {
-                    if self.accounts.is_open(&open.account) {
+                // T85 / M-56, H-23: a full envelope is history, and history
+                // this node serves must be what a peer can adopt — every
+                // parent it names already here. Boot holds such a record
+                // (`quarantine_unservable_history`); so does the live
+                // path, in the quarantine, so the canonical re-persist
+                // keeps it in the file and a peer that re-supplies its
+                // parent (and then it) heals it. Before T85 the live path
+                // inserted it leniently with a dangling parent (0924 §5).
+                if !stamp.needs_stamp {
+                    let missing_parent = match &final_directive {
+                        Directive::Transaction(txn) => txn
+                            .parent_ids()
+                            .into_iter()
+                            .find(|parent| {
+                                self.dag.get(parent).is_none()
+                                    && (!self.reconcile_batch_ids.contains(*parent)
+                                        || self.quarantined.contains_key(*parent))
+                            })
+                            .map(str::to_owned),
+                        _ => None,
+                    };
+                    if let Some(parent) = missing_parent {
+                        // T103 / L-141: counted, as boot counts it.
+                        self.fold_held_own_lamport(&final_directive);
+                        self.quarantined
+                            .entry(stored_id.clone())
+                            .or_insert_with(|| final_directive.clone());
                         tally.refuse(
                             content_id,
-                            ServiceError::AccountAlreadyOpen {
-                                account: open.account.clone(),
-                            }
-                            .to_string(),
+                            format!(
+                                "its parent {parent} is not served by this node, so no peer \
+                                     lacking it could adopt it; held in the quarantine until a \
+                                     peer re-supplies the parent (H-23)"
+                            ),
                         );
                         return FileAdoption::Refused;
                     }
                 }
+                // H-20: a full envelope is adopted as history, and the
+                // live path holds it to the same signature check boot
+                // does — against the id it is stored under.
+                // T80 / M-53: the same re-attribution boot applies.
+                if !stamp.needs_stamp {
+                    if let Some(owned) =
+                        self.reattributed_placeholder_record(&stored_id, &final_directive)
+                    {
+                        final_directive = owned;
+                    } else if let HistoryVerdict::Refused(reason) =
+                        self.verify_history_directive(&stored_id, &final_directive)
+                    {
+                        tally.refuse(content_id, reason);
+                        return FileAdoption::Refused;
+                    }
+                }
+                self.sign_adopted_entry(&mut final_directive, &stored_id);
+                self.insert_file_directive(
+                    final_directive,
+                    stored_id,
+                    content_id,
+                    tally,
+                    path,
+                    stamp,
+                )
             }
-            // H-20, T80: see the transaction arm.
-            if !needs_stamp {
-                if let Some(owned) = self.reattributed_placeholder_record(&content_id, &directive) {
-                    directive = owned;
-                } else if let HistoryVerdict::Refused(reason) =
-                    self.verify_history_directive(&content_id, &directive)
-                {
-                    tally.refuse(content_id, reason);
+            Err(error) => {
+                // T90 / L-126: a complete envelope the accounts do not
+                // admit is held by boot's served-set rule (H-23) and kept
+                // in the file; the live path holds it too, so the
+                // re-persist does not delete what a restart would keep.
+                if !stamp.needs_stamp {
+                    self.hold_refused_file_entry(&content_id, directive);
+                }
+                tally.refuse(content_id, error.to_string());
+                FileAdoption::Refused
+            }
+        }
+    }
+
+    /// Any other file directive: stored exactly as parsed (T98, L-77, H-20).
+    fn adopt_file_non_transaction(
+        &mut self,
+        mut directive: Directive,
+        content_id: String,
+        tally: &mut AdoptionTally,
+        path: AdoptionPath,
+        stamp: FileStamp,
+    ) -> FileAdoption {
+        // T98 / M-09 remainder, decision (54): a `close` in the file is
+        // data, like a peer's — never refused for the transactions dated
+        // after it (it is inert over any interval that holds one; see
+        // `AccountState::check_account_opened_by`). Refusing it made the
+        // verdict depend on what this node held when it read the line: a
+        // hand `close` judged at boot before a later hand re-`open` was
+        // held at one boot and served at the next (L-153), and one judged
+        // while a record was held only here was accepted where every peer
+        // refused it (M-75).
+        // L-77: a hand-typed `open` of an account that is already open is
+        // refused exactly as `open_account` refuses it. Operator input
+        // only: a full-envelope `open` is a peer's data (M-09) and joins
+        // the lifecycle set at its own position, as it does on the wire.
+        //
+        // T92 / L-121: on the live path only. At boot the node's own
+        // `open` of the account may be one the signature pass is about to
+        // hold (edited), which is exactly when the operator adds the hand
+        // `open` the H-23 WARN prescribes; `finalize_operator_input`
+        // judges L-77 once the pass has run. And no longer while a
+        // node-written `open` of the account is held (T85 / L-110,
+        // decision (20), retired 2026-09-26): with I9 the union over every
+        // `open` (T91), a second `open` the mesh may re-supply changes no
+        // verdict, and the refusal made the WARN's own remedy fail — boot
+        // and live alike (L-121, L-125).
+        if stamp.needs_stamp && path == AdoptionPath::Live {
+            if let Directive::Open(open) = &directive {
+                if self.accounts.is_open(&open.account) {
+                    tally.refuse(
+                        content_id,
+                        ServiceError::AccountAlreadyOpen {
+                            account: open.account.clone(),
+                        }
+                        .to_string(),
+                    );
                     return FileAdoption::Refused;
                 }
             }
-            // L-11: a non-transaction body is stored exactly as parsed, so
-            // its content id is the one computed at the top of the loop.
-            self.sign_adopted_entry(&mut directive, &content_id);
-            // Non-transaction directives: insert, then record any lifecycle
-            // event under the content id the DAG assigned (M-09).
-            match self.dag.insert(directive.clone(), false) {
-                Ok(InsertResult::Inserted { .. }) => {
-                    // L-55, T84: see the transaction arm.
-                    let clock_before = self.lamport_clock;
-                    if !provisional_stamp {
-                        self.lamport_clock = next_lamport;
-                    }
-                    self.warn_if_adoption_opens_a_lamport_gap(
-                        clock_before,
-                        directive.lamport_clock(),
-                        directive_author(&directive),
-                    );
-                    self.accounts.record_lifecycle(&directive, &content_id);
-                    self.read_model.index_directive(&directive);
-                    // M-46: see the transaction arm above.
-                    self.adopted_from_file.insert(content_id.clone());
-                    if path == AdoptionPath::Live {
-                        self.refused_history_closure.remove(&content_id);
-                    }
-                    tally.new_directives += 1;
-                    FileAdoption::Inserted(content_id)
+        }
+        // H-20, T80: see the transaction arm.
+        if !stamp.needs_stamp {
+            if let Some(owned) = self.reattributed_placeholder_record(&content_id, &directive) {
+                directive = owned;
+            } else if let HistoryVerdict::Refused(reason) =
+                self.verify_history_directive(&content_id, &directive)
+            {
+                tally.refuse(content_id, reason);
+                return FileAdoption::Refused;
+            }
+        }
+        // L-11: a non-transaction body is stored exactly as parsed, so
+        // its id is the file's own — under Format v2, over the stamped
+        // envelope too (a v2 id covers the author and the marker).
+        let stored_id = compute_content_id(&directive);
+        self.sign_adopted_entry(&mut directive, &stored_id);
+        // Non-transaction directives: insert, then record any lifecycle
+        // event under the content id the DAG assigned (M-09).
+        self.insert_file_directive(directive, stored_id, content_id, tally, path, stamp)
+    }
+
+    /// Insert an adopted file directive under `stored_id` and account for it;
+    /// a DAG refusal is recorded under the file's `content_id`.
+    fn insert_file_directive(
+        &mut self,
+        directive: Directive,
+        stored_id: String,
+        content_id: String,
+        tally: &mut AdoptionTally,
+        path: AdoptionPath,
+        stamp: FileStamp,
+    ) -> FileAdoption {
+        match self.dag.insert(directive.clone(), false) {
+            Ok(InsertResult::Inserted { .. }) => {
+                // L-55: adopted, so the clock moves — and only now.
+                // T84 / M-57, decision (16): except for operator
+                // input adopted at boot, whose stamp here is
+                // provisional — `finalize_operator_input` stamps
+                // it from the clock the signature pass settles.
+                let clock_before = self.lamport_clock;
+                if !stamp.provisional_stamp {
+                    self.lamport_clock = stamp.next_lamport;
                 }
-                Ok(InsertResult::Duplicate { .. }) => {
-                    tally.duplicates += 1;
-                    FileAdoption::Duplicate
+                self.warn_if_adoption_opens_a_lamport_gap(
+                    clock_before,
+                    directive.lamport_clock(),
+                    directive_author(&directive),
+                );
+                // M-09: a lifecycle event is recorded under the id the DAG
+                // assigned (the non-transaction arm).
+                if !matches!(directive, Directive::Transaction(_)) {
+                    self.accounts.record_lifecycle(&directive, &stored_id);
                 }
-                Err(error) => {
-                    tally.refuse(content_id, error.to_string());
-                    FileAdoption::Refused
+                self.read_model.index_directive(&directive);
+                // M-46: adopted FROM the file, so on disk
+                // already — not staged. Tracked apart from
+                // `pending_ids` so the L-13 floor never counts
+                // it as "never on disk"; its non-emptiness is
+                // what makes the next commit the rewrite that
+                // spells it canonically (see `prepare`).
+                self.adopted_from_file.insert(stored_id.clone());
+                // T90 / H-24: a copy of a closure member with
+                // parents this node serves; no longer held back —
+                // at boot once finalised (T99 / L-145).
+                if path == AdoptionPath::Live {
+                    self.refused_history_closure.remove(&stored_id);
                 }
+                tally.new_directives += 1;
+                FileAdoption::Inserted(stored_id)
+            }
+            Ok(InsertResult::Duplicate { .. }) => {
+                tally.duplicates += 1;
+                FileAdoption::Duplicate
+            }
+            Err(error) => {
+                tally.refuse(content_id, error.to_string());
+                FileAdoption::Refused
             }
         }
     }
@@ -1234,6 +1287,7 @@ impl LedgerService {
             return;
         };
         let is_transaction = matches!(directive, Directive::Transaction(_));
+        let format = RecordFormat::of(directive);
         let metadata = directive_metadata_mut(directive);
 
         if metadata.contains_key(ENVELOPE_KEY_SIGNATURE) {
@@ -1301,8 +1355,24 @@ impl LedgerService {
         }
 
         let (parents, lamport) = Self::envelope_parents_and_lamport(metadata);
-        if let Some(signature_hex) = signer(content_id, is_transaction, parents, lamport) {
+        if let Some(signature_hex) = signer(content_id, is_transaction, parents, lamport, format) {
             metadata.insert(ENVELOPE_KEY_SIGNATURE.to_owned(), signature_hex);
         }
     }
+}
+
+/// How [`LedgerService::stamp_file_directive`] stamped a file directive — what
+/// the steps after it read.
+#[derive(Clone, Copy)]
+struct FileStamp {
+    /// Operator input: this node stamps and signs it (M-47).
+    needs_stamp: bool,
+    /// Boot's operator input: stamped for real by `finalize_operator_input`
+    /// (T84 / M-57).
+    provisional_stamp: bool,
+    /// This node chose the transaction's parents, so they are re-chosen
+    /// against the stored id (L-40).
+    stamped_parents: bool,
+    /// The clock value an insert moves to (L-55: only then).
+    next_lamport: u64,
 }

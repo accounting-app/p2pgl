@@ -63,6 +63,168 @@ impl LedgerService {
         mode: BootMode,
     ) -> Result<Self, ServiceError> {
         let configured: PathBuf = file_path.into();
+        let file_path = Self::resolve_boot_path(&configured, mode)?;
+        let journal_path = crate::journal::journal_path_for(&file_path);
+        let content =
+            Self::read_or_create_ledger_file(&configured, &file_path, &journal_path, mode)?;
+        let canonical_bytes = content.len() as u64;
+        let canonical_marker = FileMarker::of(&file_path);
+        let scan = Self::read_boot_journal(&journal_path)?;
+
+        // Extract leading comments (lines starting with `;` before any
+        // directive) from the CANONICAL text: the journal carries none, and a
+        // record header is a `;` line that would otherwise be mistaken for one.
+        let leading_comments = extract_leading_comments(&content);
+
+        // Canonical ∪ journal, as one `.bean`-shaped string. Each payload and
+        // the canonical text already end in `\n`, so one extra `\n` reproduces
+        // the blank-line separator `full_file_serialize` writes.
+        let mut combined = content.clone();
+        for payload in &scan.payloads {
+            if !combined.trim().is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(payload);
+        }
+
+        let ParsedBootText {
+            directives,
+            unparsable,
+            amount_cap_refused,
+            amount_cap_blocks,
+            salvaged,
+        } = Self::parse_boot_text(&combined, &file_path)?;
+        let mut directives = directives;
+        Self::drop_stray_envelope_keys(&mut directives, &file_path);
+
+        // Sort by canonical order for correct AccountState building.
+        let mut sorted: Vec<&Directive> = directives.iter().collect();
+        sorted.sort_by(|a, b| {
+            a.date()
+                .cmp(&b.date())
+                .then_with(|| a.type_priority().cmp(&b.type_priority()))
+        });
+        let cycle_blocked = Self::cycle_blocked_ids(&sorted, &file_path);
+        let BootLoad {
+            accounts,
+            dag,
+            mut lamport_high,
+            quarantined,
+            operator_input,
+            unverified_history,
+            content_rule_refused,
+            duplicate_copies,
+        } = Self::load_history(&sorted, &cycle_blocked, salvaged, &author_id, &file_path);
+        let lamport_clock =
+            Self::resume_boot_clock(&mut lamport_high, &unparsable, &author_id, &file_path);
+        // T72 / H-19, judged on the content since T83 (L-94): the lamport gap
+        // is no longer judged here, on the history as loaded, but by
+        // `verify_own_history`, over the history the node will serve — after
+        // the signature pass and the quarantines (T89 / L-100: it used to fire
+        // for a record the same boot then quarantined).
+        Self::warn_boot_quarantine(&quarantined, &unparsable, &file_path);
+
+        // Build the read model from all directives.
+        let all_directives: Vec<Directive> = dag.directives().into_iter().cloned().collect();
+        let read_model = ReadModel::build(&all_directives);
+
+        let mut service = LedgerService {
+            dag,
+            accounts,
+            read_model,
+            lamport_clock,
+            author_id,
+            file_path,
+            leading_comments,
+            // H-08: empty for every well-formed file; non-empty means the file
+            // holds records this boot would otherwise have let the next
+            // compaction delete.
+            quarantined,
+            // L-45: likewise, for the blocks that never became directives at
+            // all. Both halves are re-derived from the file on every boot, so
+            // neither is ever carried across a reload (see
+            // [`Self::adopt_reloaded`]).
+            quarantined_text: unparsable.into_iter().map(|block| block.text).collect(),
+            // L-30: the bytes we just read (or the empty file we just created)
+            // are the baseline every later persist compares against. Hashed
+            // over the CANONICAL text alone — the journal is not part of the
+            // artefact a human edits.
+            last_file_hash: file_content_hash(&content),
+            external_reconcile_count: 0,
+            // L-11: installed by the node after the key is loaded. H-13: which
+            // is why the operator input adopted below is signed later, by
+            // `finalize_operator_input`, and tracked here until then.
+            signer: None,
+            // H-20: likewise installed after the key is loaded; the history
+            // is verified the moment either the signer or the verifier is.
+            verifier: None,
+            unverified_history,
+            signature_quarantined_total: 0,
+            write_despite_signature_verdict: false,
+            signature_verified_total: 0,
+            signed_by_finalize: HashSet::new(),
+            signature_failed_total: 0,
+            release_on_hold: BTreeSet::new(),
+            refused_history_closure: BTreeSet::new(),
+            alternative_copies: BTreeMap::new(),
+            typed_copies: BTreeMap::new(),
+            quarantined_typed: BTreeMap::new(),
+            reconcile_batch_ids: HashSet::new(),
+            unsigned_operator_input: Vec::new(),
+            operator_input_with_file_author: BTreeSet::new(),
+            operator_input_as_written: BTreeMap::new(),
+            boot_outside_dag_lamports: std::mem::take(&mut lamport_high.outside_dag),
+            boot_clock_base: lamport_clock,
+            journal_path,
+            canonical_bytes,
+            canonical_marker,
+            // Boot read this file; it did not write it, so it may not be in
+            // canonical form. The first commit rewrites it, exactly as every
+            // pre-T44 persist did.
+            canonical_is_current: false,
+            canonical_over_cap: false,
+            canonical_journal_bytes: scan.file_bytes,
+            // Everything just loaded came off disk, so nothing is uncommitted.
+            pending_ids: Vec::new(),
+            // M-46: filled by the operator-input adoption below, not staged.
+            adopted_from_file: HashSet::new(),
+            // A torn tail must not be appended after: the scanner would read
+            // the truncated payload's bytes as the next record's header. The
+            // next commit rewrites the canonical file and deletes the journal,
+            // which is the only safe way to make the file appendable again.
+            // L-58: likewise a journal others can read — `append_record`
+            // refuses it, so only a compaction can make appending possible.
+            force_compaction: scan.torn_tail_bytes > 0 || scan.readable_by_others,
+            // M-43: the compaction that folds a torn journal renames it.
+            journal_torn_at_boot: scan.torn_tail_bytes > 0,
+            commit_generation: 0,
+            commit_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                IDLE_COMMIT_GENERATION,
+            )),
+            commit_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            commit_observer: None,
+            directive_id_snapshot: std::sync::Mutex::new(None),
+            served_id_snapshot: std::sync::Mutex::new(None),
+            withheld_snapshot: std::sync::Mutex::new(None),
+            staged_frontier: std::sync::Mutex::new(None),
+            join_trust: false,
+        };
+
+        service.settle_boot_history(
+            content_rule_refused,
+            amount_cap_refused,
+            duplicate_copies,
+            operator_input,
+            &amount_cap_blocks,
+            mode,
+        );
+
+        Ok(service)
+    }
+
+    /// The path boot works at (T82 / L-84, T93 / L-117): a symlinked `.bean` is
+    /// resolved on a process start; a reload uses the path it is handed.
+    fn resolve_boot_path(configured: &Path, mode: BootMode) -> Result<PathBuf, ServiceError> {
         // T82 / L-84: a symlinked `.bean` this node's user created is worked
         // at its target — journal, temp files and compactions included.
         //
@@ -77,7 +239,7 @@ impl LedgerService {
         // full rewrite that renames a regular file onto the path, replacing
         // the link (L-44).
         let file_path = if matches!(mode, BootMode::Reload) {
-            let is_link = std::fs::symlink_metadata(&configured)
+            let is_link = std::fs::symlink_metadata(configured)
                 .map(|metadata| metadata.file_type().is_symlink())
                 .unwrap_or(false);
             if is_link {
@@ -92,9 +254,9 @@ impl LedgerService {
                     ),
                 )));
             }
-            configured.clone()
+            configured.to_path_buf()
         } else {
-            crate::journal::resolve_ledger_path(&configured)?
+            crate::journal::resolve_ledger_path(configured)?
         };
         if file_path != configured {
             info!(
@@ -104,8 +266,17 @@ impl LedgerService {
                  target, so the link is kept (L-84)"
             );
         }
-        let journal_path = crate::journal::journal_path_for(&file_path);
+        Ok(file_path)
+    }
 
+    /// The canonical text, read — or, on a process start with nothing beside
+    /// it, created empty (H-15, T67).
+    fn read_or_create_ledger_file(
+        configured: &Path,
+        file_path: &Path,
+        journal_path: &Path,
+        mode: BootMode,
+    ) -> Result<String, ServiceError> {
         // Read the file, or — on a process start with nothing beside it —
         // create it.
         //
@@ -125,15 +296,15 @@ impl LedgerService {
         // "absent" and replaced by an empty ledger.
         if matches!(mode, BootMode::Fresh) {
             // L-57: once per process start, clear what crashed rewrites left.
-            sweep_stale_temporaries(&file_path, None);
+            sweep_stale_temporaries(file_path, None);
             // T87: and what a build that still wrote beside the LINK left
             // there (`<link>.tmp.*`); since T82 temp files sit beside the
             // target, so nothing else ever cleans those up.
             if file_path != configured {
-                sweep_stale_temporaries(&configured, Some(&file_path));
+                sweep_stale_temporaries(configured, Some(file_path));
             }
         }
-        let content = match read_ledger_file(&file_path) {
+        let content = match read_ledger_file(file_path) {
             Ok(content) => content,
             Err(ServiceError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 // T78: `lstat`, not `Path::exists()` — `exists()` follows a
@@ -144,7 +315,7 @@ impl LedgerService {
                 // NotFound, counts as present: the refusal below creates
                 // nothing.
                 let journal_exists = !matches!(
-                    std::fs::symlink_metadata(&journal_path),
+                    std::fs::symlink_metadata(journal_path),
                     Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
                 );
                 match mode {
@@ -180,16 +351,19 @@ impl LedgerService {
                         if let Some(parent) = file_path.parent() {
                             std::fs::create_dir_all(parent)?;
                         }
-                        persist_atomically(&file_path, "")?;
+                        persist_atomically(file_path, "")?;
                         String::new()
                     }
                 }
             }
             Err(error) => return Err(error),
         };
-        let canonical_bytes = content.len() as u64;
-        let canonical_marker = FileMarker::of(&file_path);
+        Ok(content)
+    }
 
+    /// The commit journal beside the ledger, with its torn-tail and
+    /// permission warnings (T44, M-35, M-43, L-58).
+    fn read_boot_journal(journal_path: &Path) -> Result<crate::journal::JournalScan, ServiceError> {
         // M-35: the journal is read under the full `MAX_LEDGER_FILE_BYTES`, not
         // under what the canonical file leaves of it. T44 invariant 5 —
         // canonical ∪ journal fits the cap — is enforced where the bytes are
@@ -204,7 +378,7 @@ impl LedgerService {
         // through the G-Set; the compaction that follows rewrites nothing
         // larger than it would have anyway.
         let journal_budget = MAX_LEDGER_FILE_BYTES;
-        let scan = crate::journal::read_journal(&journal_path, journal_budget)?;
+        let scan = crate::journal::read_journal(journal_path, journal_budget)?;
         if scan.torn_tail_bytes > 0 {
             // M-43: say only what the bytes show. "The node crashed mid-append"
             // and "its commit never reported success" are true of a genuine
@@ -238,23 +412,12 @@ impl LedgerService {
                  and the next commit compacts it away instead of appending to it (L-58)"
             );
         }
+        Ok(scan)
+    }
 
-        // Extract leading comments (lines starting with `;` before any
-        // directive) from the CANONICAL text: the journal carries none, and a
-        // record header is a `;` line that would otherwise be mistaken for one.
-        let leading_comments = extract_leading_comments(&content);
-
-        // Canonical ∪ journal, as one `.bean`-shaped string. Each payload and
-        // the canonical text already end in `\n`, so one extra `\n` reproduces
-        // the blank-line separator `full_file_serialize` writes.
-        let mut combined = content.clone();
-        for payload in &scan.payloads {
-            if !combined.trim().is_empty() {
-                combined.push('\n');
-            }
-            combined.push_str(payload);
-        }
-
+    /// Parse canonical ∪ journal, salvaging block by block when the whole
+    /// text does not parse (L-45, T81 / M-52).
+    fn parse_boot_text(combined: &str, file_path: &Path) -> Result<ParsedBootText, ServiceError> {
         // Parse directives.
         //
         // L-45: a block that does not parse costs the node that block, NOT the
@@ -291,11 +454,11 @@ impl LedgerService {
         let directives = if combined.trim().is_empty() {
             Vec::new()
         } else {
-            match parse_file(&combined) {
+            match parse_file(combined) {
                 Ok(directives) => directives,
                 Err(errors) => {
                     salvaged = true;
-                    let (directives, refused) = salvage_unparsable_blocks(&combined);
+                    let (directives, refused) = salvage_unparsable_blocks(combined);
                     // Fail closed if the splitter and the parser disagree about
                     // where the failure is: whole-file parse said no, per-block
                     // parse said every block is fine. That cannot happen while
@@ -334,7 +497,18 @@ impl LedgerService {
                 }
             }
         };
+        Ok(ParsedBootText {
+            directives,
+            unparsable,
+            amount_cap_refused,
+            amount_cap_blocks,
+            salvaged,
+        })
+    }
 
+    /// Drop the `openledger-*` keys outside the envelope from node-written
+    /// records (T83 / L-89, T89 / L-112).
+    fn drop_stray_envelope_keys(directives: &mut [Directive], file_path: &Path) {
         // T83 / L-89: H-06's closed envelope-key set. A directive-level
         // `openledger-*` key that is not one of the four envelope keys, on a
         // node-written record, used to load as verified history, be served
@@ -345,7 +519,6 @@ impl LedgerService {
         // every balance, and the next compaction writes it without the key.
         // (Operator input keeps its refusal on the file path.)
         // T89 / L-112: posting-level keys too.
-        let mut directives = directives;
         for directive in directives.iter_mut() {
             if Self::is_operator_input(directive) {
                 continue;
@@ -363,15 +536,11 @@ impl LedgerService {
                  and the next compaction writes the record without them (L-89, H-06)"
             );
         }
+    }
 
-        // Sort by canonical order for correct AccountState building.
-        let mut sorted: Vec<&Directive> = directives.iter().collect();
-        sorted.sort_by(|a, b| {
-            a.date()
-                .cmp(&b.date())
-                .then_with(|| a.type_priority().cmp(&b.type_priority()))
-        });
-
+    /// The transactions on, or descending from, an `openledger-parents` cycle,
+    /// named in a warning (L-17).
+    fn cycle_blocked_ids(sorted: &[&Directive], file_path: &Path) -> BTreeSet<String> {
         // L-17: refuse a hand-planted parent cycle *before* the load rather than
         // aborting in the middle of it. The DAG's I8 check catches such a pair
         // on the second insert and boot used to propagate that error, so a file
@@ -379,7 +548,7 @@ impl LedgerService {
         // content hash, so no id has to change — bricked every subsequent boot
         // of an otherwise perfectly good ledger. Name the offenders and load the
         // rest.
-        let cycle_blocked = directives_blocked_by_parent_cycles(&sorted);
+        let cycle_blocked = directives_blocked_by_parent_cycles(sorted);
         if !cycle_blocked.is_empty() {
             warn!(
                 blocked = cycle_blocked.len(),
@@ -391,7 +560,18 @@ impl LedgerService {
                  their openledger-parents metadata (H-08)"
             );
         }
+        cycle_blocked
+    }
 
+    /// Load the sorted history: insert what every peer would take, quarantine
+    /// the rest, park operator input, and fold the clock (H-08, H-13, M-18).
+    fn load_history(
+        sorted: &[&Directive],
+        cycle_blocked: &BTreeSet<String>,
+        salvaged: bool,
+        author_id: &str,
+        file_path: &Path,
+    ) -> BootLoad {
         // Build account state and insert into DAG.
         let mut accounts = AccountState::new();
         let mut dag = LedgerDag::new();
@@ -419,7 +599,7 @@ impl LedgerService {
         // `prefer_copies_whose_parents_are_served` after the loop.
         let mut duplicate_copies: Vec<(String, Directive)> = Vec::new();
 
-        for directive in &sorted {
+        for directive in sorted {
             // M-18 / T63: the clock is folded at each FATE below, not here.
             // Every directive that reaches the DAG counts; a directive that
             // does not (quarantined, or a duplicate body) counts only when it is
@@ -449,7 +629,7 @@ impl LedgerService {
             if !cycle_blocked.is_empty() && matches!(directive, Directive::Transaction(_)) {
                 let content_id = compute_content_id(directive);
                 if cycle_blocked.contains(&content_id) {
-                    lamport_high.note_if_own(directive, &author_id);
+                    lamport_high.note_if_own(directive, author_id);
                     // L-76: `entry().or_insert`, preferring the enveloped
                     // spelling. A plain `insert` let a later envelope-less
                     // copy of the same id replace the signed one; the
@@ -543,7 +723,7 @@ impl LedgerService {
                      to — kept in the file, kept out of the DAG, and with it every record that \
                      descends from it (named below) (M-51, H-08)"
                 );
-                lamport_high.note_if_own(directive, &author_id);
+                lamport_high.note_if_own(directive, author_id);
                 content_rule_refused.insert(content_id.clone());
                 Self::quarantine_keeping_envelope(
                     &mut quarantined,
@@ -569,7 +749,7 @@ impl LedgerService {
                      which every peer refuses — kept in the file, kept out of the DAG, and with it \
                      every record that descends from it (named below) (L-101, H-08)"
                 );
-                lamport_high.note_if_own(directive, &author_id);
+                lamport_high.note_if_own(directive, author_id);
                 content_rule_refused.insert(content_id.clone());
                 Self::quarantine_keeping_envelope(
                     &mut quarantined,
@@ -602,7 +782,7 @@ impl LedgerService {
                      kept in the file, kept out of the DAG; the rest of the file still loads \
                      (H-08, M-20)"
                 );
-                lamport_high.note_if_own(directive, &author_id);
+                lamport_high.note_if_own(directive, author_id);
                 Self::quarantine_keeping_envelope(
                     &mut quarantined,
                     content_id,
@@ -632,7 +812,7 @@ impl LedgerService {
                              balance — a fragment of a split block, not a record; kept in \
                              the file, kept out of the DAG (H-20, H-08)"
                         );
-                        lamport_high.note_if_own(directive, &author_id);
+                        lamport_high.note_if_own(directive, author_id);
                         Self::quarantine_keeping_envelope(
                             &mut quarantined,
                             content_id,
@@ -665,7 +845,7 @@ impl LedgerService {
                         "quarantining a directive the DAG refused at boot — kept in the file, \
                          kept out of the DAG; the rest of the file still loads (H-08)"
                     );
-                    lamport_high.note_if_own(directive, &author_id);
+                    lamport_high.note_if_own(directive, author_id);
                     Self::quarantine_keeping_envelope(
                         &mut quarantined,
                         content_id,
@@ -676,7 +856,7 @@ impl LedgerService {
             };
             match insert_result {
                 InsertResult::Inserted { content_id } => {
-                    lamport_high.note(directive, &author_id);
+                    lamport_high.note(directive, author_id);
                     accounts.record_lifecycle(directive, &content_id);
                     // H-20: loaded on the strength of its form; its signature
                     // is checked by `verify_own_history` once the node has
@@ -689,16 +869,35 @@ impl LedgerService {
                 // the DAG, so its lamport counts only if it is this node's own
                 // pair (T63; see `BootLamportHigh`).
                 InsertResult::Duplicate { content_id } => {
-                    lamport_high.note_if_own(directive, &author_id);
+                    lamport_high.note_if_own(directive, author_id);
                     duplicate_copies.push((content_id, (*directive).clone()));
                 }
             }
         }
+        BootLoad {
+            accounts,
+            dag,
+            lamport_high,
+            quarantined,
+            operator_input,
+            unverified_history,
+            content_rule_refused,
+            duplicate_copies,
+        }
+    }
 
+    /// The clock boot resumes at, with the ceiling warnings (M-18, H-07,
+    /// H-12, T72 (d)).
+    fn resume_boot_clock(
+        lamport_high: &mut BootLamportHigh,
+        unparsable: &[UnparsableBlock],
+        author_id: &str,
+        file_path: &Path,
+    ) -> u64 {
         // T78: an envelope naming this node inside a block boot could not
         // parse is a pair this node signed; see `BootLamportHigh`.
-        for block in &unparsable {
-            lamport_high.note_text_if_own(&block.text, &author_id);
+        for block in unparsable {
+            lamport_high.note_text_if_own(&block.text, author_id);
         }
         let max_lamport = lamport_high.value;
         let lamport_clock = if max_lamport > 0 {
@@ -755,12 +954,15 @@ impl LedgerService {
                  removed from the allowlist: {BOOTSTRAP_JOIN_REMEDY}"
             );
         }
-        // T72 / H-19, judged on the content since T83 (L-94): the lamport gap
-        // is no longer judged here, on the history as loaded, but by
-        // `verify_own_history`, over the history the node will serve — after
-        // the signature pass and the quarantines (T89 / L-100: it used to fire
-        // for a record the same boot then quarantined).
+        lamport_clock
+    }
 
+    /// The one boot line an operator can act on when anything was held (H-08).
+    fn warn_boot_quarantine(
+        quarantined: &BTreeMap<String, Directive>,
+        unparsable: &[UnparsableBlock],
+        file_path: &Path,
+    ) {
         // H-08: one line the operator can act on, after every per-directive
         // warning above. It states the contract the quarantine exists to make
         // true — the records are still in the file — because the pre-H-08
@@ -786,93 +988,20 @@ impl LedgerService {
                  node and repair them (H-08, L-45, H-20)"
             );
         }
+    }
 
-        // Build the read model from all directives.
-        let all_directives: Vec<Directive> = dag.directives().into_iter().cloned().collect();
-        let read_model = ReadModel::build(&all_directives);
-
-        let mut service = LedgerService {
-            dag,
-            accounts,
-            read_model,
-            lamport_clock,
-            author_id,
-            file_path,
-            leading_comments,
-            // H-08: empty for every well-formed file; non-empty means the file
-            // holds records this boot would otherwise have let the next
-            // compaction delete.
-            quarantined,
-            // L-45: likewise, for the blocks that never became directives at
-            // all. Both halves are re-derived from the file on every boot, so
-            // neither is ever carried across a reload (see
-            // [`Self::adopt_reloaded`]).
-            quarantined_text: unparsable.into_iter().map(|block| block.text).collect(),
-            // L-30: the bytes we just read (or the empty file we just created)
-            // are the baseline every later persist compares against. Hashed
-            // over the CANONICAL text alone — the journal is not part of the
-            // artefact a human edits.
-            last_file_hash: file_content_hash(&content),
-            external_reconcile_count: 0,
-            // L-11: installed by the node after the key is loaded. H-13: which
-            // is why the operator input adopted below is signed later, by
-            // `finalize_operator_input`, and tracked here until then.
-            signer: None,
-            // H-20: likewise installed after the key is loaded; the history
-            // is verified the moment either the signer or the verifier is.
-            verifier: None,
-            unverified_history,
-            signature_quarantined_total: 0,
-            write_despite_signature_verdict: false,
-            signature_verified_total: 0,
-            signed_by_finalize: HashSet::new(),
-            signature_failed_total: 0,
-            release_on_hold: BTreeSet::new(),
-            refused_history_closure: BTreeSet::new(),
-            alternative_copies: BTreeMap::new(),
-            typed_copies: BTreeMap::new(),
-            quarantined_typed: BTreeMap::new(),
-            reconcile_batch_ids: HashSet::new(),
-            unsigned_operator_input: Vec::new(),
-            operator_input_with_file_author: BTreeSet::new(),
-            operator_input_as_written: BTreeMap::new(),
-            boot_outside_dag_lamports: std::mem::take(&mut lamport_high.outside_dag),
-            boot_clock_base: lamport_clock,
-            journal_path,
-            canonical_bytes,
-            canonical_marker,
-            // Boot read this file; it did not write it, so it may not be in
-            // canonical form. The first commit rewrites it, exactly as every
-            // pre-T44 persist did.
-            canonical_is_current: false,
-            canonical_over_cap: false,
-            canonical_journal_bytes: scan.file_bytes,
-            // Everything just loaded came off disk, so nothing is uncommitted.
-            pending_ids: Vec::new(),
-            // M-46: filled by the operator-input adoption below, not staged.
-            adopted_from_file: HashSet::new(),
-            // A torn tail must not be appended after: the scanner would read
-            // the truncated payload's bytes as the next record's header. The
-            // next commit rewrites the canonical file and deletes the journal,
-            // which is the only safe way to make the file appendable again.
-            // L-58: likewise a journal others can read — `append_record`
-            // refuses it, so only a compaction can make appending possible.
-            force_compaction: scan.torn_tail_bytes > 0 || scan.readable_by_others,
-            // M-43: the compaction that folds a torn journal renames it.
-            journal_torn_at_boot: scan.torn_tail_bytes > 0,
-            commit_generation: 0,
-            commit_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-                IDLE_COMMIT_GENERATION,
-            )),
-            commit_gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            commit_observer: None,
-            directive_id_snapshot: std::sync::Mutex::new(None),
-            served_id_snapshot: std::sync::Mutex::new(None),
-            withheld_snapshot: std::sync::Mutex::new(None),
-            staged_frontier: std::sync::Mutex::new(None),
-            join_trust: false,
-        };
-
+    /// What follows the load, on the built service: the closure of refused
+    /// history, the operator input, re-admission, the served-set rule, and
+    /// the amount-cap WARNs (T81, H-13, T99, T84, T103).
+    fn settle_boot_history(
+        &mut self,
+        mut content_rule_refused: BTreeSet<String>,
+        amount_cap_refused: BTreeSet<String>,
+        duplicate_copies: Vec<(String, Directive)>,
+        operator_input: Vec<Directive>,
+        amount_cap_blocks: &[(usize, Vec<String>)],
+        mode: BootMode,
+    ) {
         // T81 / M-51, M-52: what descends from a record refused under a
         // content rule goes with it — before the operator input, so its
         // parents are chosen from what stays.
@@ -884,19 +1013,18 @@ impl LedgerService {
         // any of those steps had spoken, and judged "its parents resolve"
         // against a DAG that still held what the closure was about to take.
         for (content_id, copy) in duplicate_copies {
-            if service.dag.get(&content_id) != Some(&copy) {
-                service
-                    .alternative_copies
+            if self.dag.get(&content_id) != Some(&copy) {
+                self.alternative_copies
                     .entry(content_id)
                     .or_default()
                     .push(copy);
             }
         }
-        let closure_held = service.quarantine_descendants_of_refused_history(&content_rule_refused);
+        let closure_held = self.quarantine_descendants_of_refused_history(&content_rule_refused);
 
         // H-13: adopt the operator input, now that the whole history is in
         // place. Same path as a live hand edit, same order boot itself used.
-        service.adopt_operator_input_at_boot(operator_input);
+        self.adopt_operator_input_at_boot(operator_input);
 
         // T99 / L-144: a record the closure held because its parent was a
         // closure member is servable again once the operator input put a copy
@@ -904,7 +1032,7 @@ impl LedgerService {
         // closure was walked before that copy existed; before T99 the record
         // came back only at the next boot, after the compaction had rewritten
         // the parent.
-        service.readmit_closure_members_now_servable(&closure_held);
+        self.readmit_closure_members_now_servable(&closure_held);
 
         // T84 / H-23: and what no fresh replica could hold for any other
         // reason — a parent served nowhere, an account that does not admit it.
@@ -912,13 +1040,13 @@ impl LedgerService {
         // build's, or the operator's) are part of the accounts a peer judges
         // against; the rebuild re-chooses the parents of any operator input
         // that named what it takes out, so no hand line is signed over it.
-        service.quarantine_unservable_history();
+        self.quarantine_unservable_history();
 
         // T103 / M-73, decision (68a): each block refused for its amount is
         // named with what this node still holds because of it — and, once
         // nothing is, as a copy to delete when its restatement is served.
-        for (line, ids) in &amount_cap_blocks {
-            service.warn_amount_cap_block(*line, ids);
+        for (line, ids) in amount_cap_blocks {
+            self.warn_amount_cap_block(*line, ids);
         }
 
         // L-64 (T78): a process start says so when the canonical form will not
@@ -926,14 +1054,12 @@ impl LedgerService {
         // `finalize_operator_input`, whose author and signature are part of
         // what the compaction writes; a reload is a recovery rebuild and
         // stays quiet.
-        if service.unsigned_operator_input.is_empty() {
+        if self.unsigned_operator_input.is_empty() {
             // T82 / L-80: a reload measures too — the fact decides whether
             // writes are refused before staging — but only a process start
             // says so.
-            service.measure_canonical_over_cap(matches!(mode, BootMode::Fresh));
+            self.measure_canonical_over_cap(matches!(mode, BootMode::Fresh));
         }
-
-        Ok(service)
     }
 
     /// Warn when the canonical form of this ledger — what every compaction
@@ -1523,4 +1649,25 @@ impl LedgerService {
         self.warn_if_canonical_exceeds_cap();
         finalized
     }
+}
+
+/// What [`LedgerService::parse_boot_text`] returns.
+struct ParsedBootText {
+    directives: Vec<Directive>,
+    unparsable: Vec<UnparsableBlock>,
+    amount_cap_refused: BTreeSet<String>,
+    amount_cap_blocks: Vec<(usize, Vec<String>)>,
+    salvaged: bool,
+}
+
+/// What [`LedgerService::load_history`] returns.
+struct BootLoad {
+    accounts: AccountState,
+    dag: LedgerDag,
+    lamport_high: BootLamportHigh,
+    quarantined: BTreeMap<String, Directive>,
+    operator_input: Vec<Directive>,
+    unverified_history: BTreeSet<String>,
+    content_rule_refused: BTreeSet<String>,
+    duplicate_copies: Vec<(String, Directive)>,
 }
