@@ -82,6 +82,7 @@ known residuals, see that task's "Done" note in the tracker.
 
 ### Changed
 
+- A node whose boot finds that every signature in its history fails — the wrong `p2p.meshId` or node key — refuses API writes with `EVERY_SIGNATURE_FAILED` until it is restarted correctly. Before, the warning only advised against writing, and one write made anyway was signed under the wrong domain and hid the warning at the next boot (L-114). `signing.allowWritesWhenEverySignatureFails: true` restores the old behaviour.
 - `verify.errors` has one entry per offending node, capped at the first 1,000. The new `truncated` field counts the rest (L-63, T69).
 - `journal` query complexity now scales with `limit` and the selection: `max(512, (limit/100) × (1 + child))`. Large aliased requests may be refused (M-45, T69). `verify` weighs 2048, and a request may contain at most 2 (M-23, T54).
 - A local write whose journal record cannot fit under the 64 MiB cap is refused before staging with `RESOURCE_LIMIT_EXCEEDED` ("refused before staging, nothing changed"). It no longer stages, reloads and holds every other writer behind the reload (L-71, T77).

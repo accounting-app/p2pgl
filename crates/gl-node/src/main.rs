@@ -546,6 +546,14 @@ async fn main() {
     // Installed only with signing enabled (T80, 0924 §5): a disabled provider
     // signs nothing, and installing it made the ledger report
     // `signer_installed=true` on a node that cannot sign.
+    // L-114: before the passes the signer and verifier run, so the override
+    // is in place whatever they conclude.
+    shared_ledger
+        .write()
+        .await
+        .set_write_despite_signature_verdict(
+            config.signing.allow_writes_when_every_signature_fails,
+        );
     if config.signing.enabled {
         let signer_for_reconcile = Arc::clone(&signer);
         shared_ledger.write().await.set_signer(Arc::new(

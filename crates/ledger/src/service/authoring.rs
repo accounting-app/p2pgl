@@ -607,7 +607,17 @@ impl LedgerService {
     /// the mesh-wide remedy needs. Found by a scan, on the refusal path only —
     /// a node that reaches it can no longer author, so the scan costs nothing
     /// that matters, and no extra state has to survive reloads.
+    ///
+    /// L-114 (decision (41) (b)): refused first while every signature this
+    /// node checked failed — a write now would be signed under the wrong
+    /// domain and hide that verdict at the next boot — unless the operator
+    /// set the override. Every API write stamps here, and nothing else does.
     pub(super) fn next_stamp(&self) -> Result<u64, ServiceError> {
+        if !self.write_despite_signature_verdict && self.every_checked_signature_failed() {
+            return Err(ServiceError::SignatureVerdict {
+                failed: self.signature_failed_total,
+            });
+        }
         let next = self.lamport_clock.saturating_add(1);
         checked_lamport(next, None).map_err(|_| ServiceError::LamportCeiling {
             next,

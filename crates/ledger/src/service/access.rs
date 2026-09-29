@@ -359,6 +359,14 @@ impl LedgerService {
         self.verify_history_pass();
     }
 
+    /// L-114: write even while every signature this node checked failed —
+    /// the operator's override (`signing.allowWritesWhenEverySignatureFails`).
+    /// Off by default: such a write would be signed under the wrong domain
+    /// and hide the verdict at the next boot.
+    pub fn set_write_despite_signature_verdict(&mut self, allow: bool) {
+        self.write_despite_signature_verdict = allow;
+    }
+
     /// Install the verifier [`Self::verify_own_history`] checks loaded
     /// signatures with (H-20).
     ///

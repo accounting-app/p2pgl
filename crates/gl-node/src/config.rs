@@ -264,6 +264,13 @@ pub struct SigningConfig {
     #[serde(default)]
     #[allow(dead_code)] // Read when signing is wired (Phase 2).
     pub enabled: bool,
+
+    /// Write even while every signature this node checked failed (L-114).
+    /// Off by default: that verdict means the signature domain (`p2p.meshId`)
+    /// or the node key is wrong, and a record written then is signed under the
+    /// wrong domain — and at the next boot it verifies and hides the verdict.
+    #[serde(default)]
+    pub allow_writes_when_every_signature_fails: bool,
 }
 
 /// Peer-to-peer replication settings (§3.4, §3.9).
@@ -2028,6 +2035,19 @@ mod tests {
         let file = write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean", "graphiql": true }"#);
         let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
         assert!(config.graphiql_enabled());
+    }
+
+    /// L-114: the write override is off unless set.
+    #[test]
+    fn test_allow_writes_when_every_signature_fails_defaults_off() {
+        let file = write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean" }"#);
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        assert!(!config.signing.allow_writes_when_every_signature_fails);
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "signing": { "enabled": true, "allowWritesWhenEverySignatureFails": true } }"#,
+        );
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        assert!(config.signing.allow_writes_when_every_signature_fails);
     }
 
     /// H-19: `p2p.joinFrom` must name a peer this node accepts at all — it is

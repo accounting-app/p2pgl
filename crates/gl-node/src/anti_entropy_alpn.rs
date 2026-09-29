@@ -2578,6 +2578,8 @@ fn stage_refusal_is_permanent(error: &ServiceError) -> bool {
         | ServiceError::Journal { .. }
         | ServiceError::CommitInFlight
         | ServiceError::Parse(_) => false,
+        // L-114: only this node's own stamp refuses so — never a peer's record.
+        ServiceError::SignatureVerdict { .. } => false,
     }
 }
 

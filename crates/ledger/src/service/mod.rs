@@ -322,6 +322,9 @@ pub struct LedgerService {
     /// Refusals whose reason is "signature does not verify", across every
     /// pass (T89 / L-98).
     signature_failed_total: usize,
+    /// L-114: the operator's override — write even while every signature this
+    /// node checked failed (`signing.allowWritesWhenEverySignatureFails`).
+    write_despite_signature_verdict: bool,
     /// Operator input `finalize_operator_input` has just signed, awaiting the
     /// pass that checks it (T92 / L-114, decision (41)). The pass still checks
     /// each (a signer and a verifier bound to different mesh ids is what it

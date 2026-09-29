@@ -294,6 +294,8 @@ fn stage_refusal_is_permanent(error: &ServiceError) -> bool {
         | ServiceError::Journal { .. }
         | ServiceError::CommitInFlight
         | ServiceError::Parse(_) => false,
+        // L-114: only this node's own stamp refuses so — never a peer's record.
+        ServiceError::SignatureVerdict { .. } => false,
     }
 }
 
@@ -3574,9 +3576,9 @@ fn l99_a_wrong_mesh_id_keeps_the_clock_and_warns_once_on_boot_and_reload() {
 /// of the history instead of "check meshId / do not author" (L-99's remedy).
 /// Before T89 the WARN was judged per pass and fired here. Since T92 (L-114,
 /// decision (41)) finalize's own fresh signatures are not counted as verified
-/// history, so it fires again. (The same flip after one WRITE the node makes
-/// under the wrong domain is decision (41)'s residual — see
-/// `l114_one_write_under_the_wrong_domain_hides_the_verdict_at_the_next_boot`.)
+/// history, so it fires again. (The same flip after one API write under the
+/// wrong domain is prevented by refusing the write, decision (41) (b) — see
+/// `l114_a_node_refuses_to_write_while_every_signature_fails`.)
 #[test]
 fn a6_2_a_hand_line_in_the_same_boot_does_not_hide_a_wrong_mesh_id() {
     let (mut mesh, path) = jumped_history_then_stop_a(9263);
@@ -3598,28 +3600,53 @@ fn a6_2_a_hand_line_in_the_same_boot_does_not_hide_a_wrong_mesh_id() {
     );
 }
 
-/// L-114 (T92), the residual decision (41) accepts: with no hand line, a node
-/// restarted under the wrong `meshId` WARNs that every signature failed and
-/// not to author — the advice is advisory (decision (32)) — and authors once
-/// anyway. At the next boot, under the same config, that write is history
-/// signed under the domain now in use: it verifies, so not EVERY signature
-/// failed, and the history is reported record by record as "edited". Closing
-/// it needs the node to refuse to author while the verdict holds, decision
-/// (41)'s option (b), which was not chosen.
+/// L-114 (T92, decision (41) (b)): a node restarted under the wrong
+/// `meshId` WARNs that every signature failed and not to author. Before, the
+/// advice was only advice (decision (32)): it authored once anyway, and at the
+/// next boot that write was history signed under the domain in use — it
+/// verified, so not EVERY signature failed, and the history was reported
+/// record by record as "edited". Now the API write is refused
+/// (`EVERY_SIGNATURE_FAILED`), so the next boot says what the first did. The
+/// operator's override (`signing.allowWritesWhenEverySignatureFails`) lets the
+/// write through, knowing that cost.
+///
+/// Bug-catch: drop the verdict check from `next_stamp` and the write goes
+/// through and the next boot has no EVERY WARN; ignore the override and the
+/// last write is refused.
 #[test]
-#[ignore = "documented residual (T92, decision (41)): a write authored under the wrong meshId verifies at the next boot and hides the every-signature-failed WARN; refusing to author was not chosen"]
-fn l114_one_write_under_the_wrong_domain_hides_the_verdict_at_the_next_boot() {
+fn l114_a_node_refuses_to_write_while_every_signature_fails() {
     let a = 0;
     let (mut mesh, path) = jumped_history_then_stop_a(9270);
     let first = restart_under_mesh_id(&mut mesh, a, path, "another-mesh");
     assert!(first.contains("EVERY signature"), "premise: {first}");
-    mesh.replicas[a].open("Assets:Written");
+    let open_written = |replica: &mut Replica| {
+        let key = Arc::clone(&replica.key);
+        replica.svc.open_account_signing(
+            "Assets:Written".to_owned(),
+            day(1),
+            vec![],
+            move |content_id, parents, lamport| {
+                key.sign(&SignableMessage {
+                    content_id,
+                    is_transaction: false,
+                    parents,
+                    lamport,
+                })
+            },
+        )
+    };
+    let error = open_written(&mut mesh.replicas[a]).expect_err("refused under the verdict");
+    assert_eq!(error.error_code(), "EVERY_SIGNATURE_FAILED", "{error}");
     let path = mesh.stop(a);
     let after_write = restart_under_mesh_id(&mut mesh, a, path, "another-mesh");
     assert!(
         after_write.contains("EVERY signature"),
-        "at the boot after one write the WARN is missing; logged:\n{after_write}"
+        "the refused write leaves the verdict to the next boot; logged:\n{after_write}"
     );
+    mesh.replicas[a]
+        .svc
+        .set_write_despite_signature_verdict(true);
+    open_written(&mut mesh.replicas[a]).expect("the operator's override writes anyway");
 }
 
 /// A and B with history; X (allowlisted) serves two `open`s in a row, each

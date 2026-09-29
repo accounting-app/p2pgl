@@ -823,6 +823,7 @@ impl LedgerService {
             verifier: None,
             unverified_history,
             signature_quarantined_total: 0,
+            write_despite_signature_verdict: false,
             signature_verified_total: 0,
             signed_by_finalize: HashSet::new(),
             signature_failed_total: 0,

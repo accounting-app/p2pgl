@@ -500,6 +500,7 @@ boot saying so; `meshId` becomes required in a later release.
 | `http.maxConnections` | `1024` | Concurrently served connections; excess stays in the kernel backlog. `8`–`65536` |
 | `http.maxConnectionsPerIp` | `64` | Concurrent connections one client may hold (keyed per IPv4 address or IPv6 /64, like the rate limiter), so one address cannot take every slot. **It bounds one address or one /64, not one network:** a routed IPv6 /48 is 65,536 /64 keys, far past the global cap, so per-prefix limits wider than a /64 belong in your proxy or firewall. Addresses listed in `trustedProxies` are exempt — list your reverse proxy there, or every client behind it shares this cap. Clamped to `maxConnections`. `8`–`65536` |
 | `signing.enabled` | `false` | Sign transactions with Ed25519. Forced on when `p2p.enabled`. When on, the node's author id is its key's public half, P2P on or off |
+| `signing.allowWritesWhenEverySignatureFails` | `false` | Accept API writes even when every signature in the history failed at boot (a wrong `meshId` or key); by default they are refused with `EVERY_SIGNATURE_FAILED` (§Mesh identity) |
 | `p2p.enabled` | `false` | Enable Iroh mesh replication |
 | `p2p.secretKeyPath` | `./data/iroh.secret` | The node's Ed25519 key — its QUIC identity **and** its signing key. Created `0600` if absent. An existing file is refused unless it is a regular file (not a symlink), owned by the uid the node runs as, and not readable by group or other |
 | `p2p.bootstrapEndpointIds` | `[]` | Allowlisted peer EndpointIds; empty drops inbound `Supply` |
@@ -682,6 +683,14 @@ Leaving it unset keeps the pre-existing behaviour exactly: the domain is
 the verifier's own domain, so **changing the resolved domain invalidates every
 signature already persisted and every signature peers hold** — which is why the
 only safe `meshId` for an existing mesh is the string it already signs with.
+
+A node started with the wrong domain (or the wrong key) says so: at boot every
+signature in its history fails, it logs *"EVERY signature this node checked
+failed"*, and it **refuses API writes** (`EVERY_SIGNATURE_FAILED`) until it is
+restarted with the right `meshId` and key — the history is quarantined, not
+lost, and loads again then. A write made meanwhile would be signed under the
+wrong domain, and at the next boot it would verify and hide the warning. To
+write anyway, set `signing.allowWritesWhenEverySignatureFails: true`.
 
 **New mesh.** Generate a random UUID (`uuidgen`) and a unique `swarmTopic`, set
 both on every node before the first directive is written, and there is nothing

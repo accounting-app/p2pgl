@@ -55,9 +55,11 @@ impl LedgerService {
                  signature domain (p2p.meshId, or p2p.swarmTopic when meshId is unset) or the \
                  node key differs from the one this history was signed under. Check both \
                  before repairing anything — the records are quarantined, not lost, and load \
-                 again once the domain and key are right. Do not author until then: this \
-                 node's clock is left where the history put it, and records written under the \
-                 wrong domain are quarantined at the next correct boot (H-20, T80, L-99)"
+                 again once the domain and key are right. Do not author until then — this \
+                 node refuses its API writes while this holds (EVERY_SIGNATURE_FAILED; \
+                 signing.allowWritesWhenEverySignatureFails overrides it): its clock is left \
+                 where the history put it, and records written under the wrong domain are \
+                 quarantined at the next correct boot (H-20, T80, L-99, L-114)"
             );
         }
         if !self.unverified_history.is_empty() {

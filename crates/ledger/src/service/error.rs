@@ -75,6 +75,12 @@ pub enum ServiceError {
         local: u64,
         author: Option<String>,
     },
+    /// L-114 (decision (41) (b)): every signature this node checked failed —
+    /// its signature domain or key differs from the history's — so a record it
+    /// wrote now would be signed under the wrong domain, and at the next boot
+    /// would verify and hide that verdict. Refused unless the operator set the
+    /// override ([`LedgerService::set_write_despite_signature_verdict`]).
+    SignatureVerdict { failed: usize },
 }
 
 impl std::fmt::Display for ServiceError {
@@ -161,6 +167,16 @@ impl std::fmt::Display for ServiceError {
                      history has a second consequence: {BOOTSTRAP_JOIN_REMEDY}"
                 )
             }
+            ServiceError::SignatureVerdict { failed } => write!(
+                f,
+                "refused: every signature this node checked failed ({failed} of them), so its \
+                 signature domain (p2p.meshId, or p2p.swarmTopic when meshId is unset) or its \
+                 node key differs from the one the history was signed under. A record written \
+                 now would be signed under the wrong domain, and at the next boot it would \
+                 verify and hide that verdict. Fix the domain or the key and restart — the \
+                 history loads again — or set signing.allowWritesWhenEverySignatureFails to \
+                 write anyway (L-114)"
+            ),
             ServiceError::LamportAdvance {
                 remote,
                 local,
@@ -215,6 +231,7 @@ impl ServiceError {
             ServiceError::CommitInFlight => "COMMIT_IN_FLIGHT",
             ServiceError::LamportCeiling { .. } => "LAMPORT_CEILING",
             ServiceError::LamportAdvance { .. } => "LAMPORT_ADVANCE",
+            ServiceError::SignatureVerdict { .. } => "EVERY_SIGNATURE_FAILED",
         }
     }
 }

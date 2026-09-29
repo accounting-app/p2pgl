@@ -604,8 +604,10 @@ impl LedgerService {
         let commit_in_flight = std::sync::Arc::clone(&self.commit_in_flight);
         let commit_observer = self.commit_observer.take();
         let commit_generation = self.commit_generation;
-        // H-19: the join window is process state, like the signer.
+        // H-19: the join window is process state, like the signer; so is
+        // the operator's L-114 override (config).
         let join_trust = self.join_trust;
+        let write_despite_signature_verdict = self.write_despite_signature_verdict;
         // L-64: the rebuild read the very bytes this service last wrote or
         // read, so the file is as canonical as it was.
         let canonical_is_current =
@@ -622,6 +624,7 @@ impl LedgerService {
         self.commit_observer = commit_observer;
         self.commit_generation = commit_generation;
         self.join_trust = join_trust;
+        self.write_despite_signature_verdict = write_despite_signature_verdict;
         self.canonical_is_current = canonical_is_current;
     }
 }
