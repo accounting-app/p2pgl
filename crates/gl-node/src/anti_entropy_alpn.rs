@@ -581,6 +581,10 @@ pub struct AntiEntropyHandler {
     /// Peers whose `Supply` is deferred because the ledger is at its size cap
     /// (M-39, T69); clones share one map. See [`SupplyBackoff`].
     pub supply_backoff: SupplyBackoff,
+    /// The peer this node joins from (`p2p.joinFrom`, H-19): what it delivers
+    /// is staged as [`ledger::service::RemoteSource::JoinPeer`], adopted past
+    /// the adoption ratchet while the ledger's join window is open.
+    pub join_peer: Option<EndpointId>,
 }
 
 impl std::fmt::Debug for AntiEntropyHandler {
@@ -1282,6 +1286,7 @@ async fn run_head_exchange(
     if suppressed > 0 {
         debug!(peer = %remote, suppressed, "not re-wanting directives this peer served that were refused for good");
     }
+    close_join_window_if_joined(handler, remote, &want).await;
     // T88 / L-106: nor what can only wait on such a record — the buffered
     // descendants of a directive this peer served and this node refused for
     // good. Their missing parent is retried, never refused, so without this
@@ -1350,6 +1355,30 @@ fn order_want_for_peer(buffer: &OrphanBuffer, peer: &str, want: &mut Vec<String>
     p2p::anti_entropy::order_want_ancestors_first(want, |id| {
         buffer.known_missing_parents_from(peer, id)
     });
+}
+
+/// H-19: the join window closes once the join peer advertises nothing this
+/// node lacks and has not refused for good — it holds the peer's whole
+/// history, and from here the adoption ratchet applies to every peer. Read
+/// first under the read lock, so a joined node never takes the write lock for
+/// it again.
+async fn close_join_window_if_joined(
+    handler: &AntiEntropyHandler,
+    remote: EndpointId,
+    want: &[String],
+) {
+    if handler.join_peer != Some(remote)
+        || !want.is_empty()
+        || !handler.ledger.read().await.join_trust_open()
+    {
+        return;
+    }
+    handler.ledger.write().await.close_join_trust();
+    info!(
+        peer = %remote,
+        "joined: this node holds everything its join peer (p2p.joinFrom) serves; the adoption \
+         ratchet now applies to it like any peer (H-19)"
+    );
 }
 
 /// Append the ids of one advert page that have not been seen before (T41).
@@ -2197,7 +2226,14 @@ async fn stage_and_commit_batch(
             continue;
         }
         // Stage into memory only (NO persist) — persist happens once below.
-        match svc.stage_remote_directive(directive.clone()) {
+        // H-19: the join peer's history is adopted past the ratchet while the
+        // ledger's join window is open.
+        let source = if handler.join_peer == Some(remote) {
+            ledger::service::RemoteSource::JoinPeer
+        } else {
+            ledger::service::RemoteSource::Peer
+        };
+        match svc.stage_remote_directive_from(directive.clone(), source) {
             Ok(Some(content_id)) => {
                 info!(content_id = %content_id, peer = %remote, "merged remote directive from ALPN");
                 outcome.merged += 1;
@@ -2268,12 +2304,14 @@ async fn stage_and_commit_batch(
     // freed orphan is checked against the record the staged set has become
     // before it is staged — see `DrainBudget`.
     let mut budget = DrainBudget { headroom, staged };
+    let join_peer = handler.join_peer.map(|peer| peer.to_string());
     let drained = drain_orphans(
         &handler.orphan_buffer,
         &mut svc,
         handler.signing_enabled,
         &handler.allowlist,
         &handler.mesh_id,
+        join_peer.as_deref(),
         &mut budget,
     )
     .await;
@@ -2417,6 +2455,8 @@ struct DrainContext<'a> {
     signing_enabled: bool,
     allowlist: &'a PeerAllowlist,
     mesh_id: &'a str,
+    /// H-19: the join peer, as an orphan entry's `from_peer` spells it.
+    join_peer: Option<&'a str>,
 }
 
 /// How much record a drain may add (T77 / L-70): the headroom the chunk was
@@ -2627,7 +2667,13 @@ fn restage_freed_entry(
         debug!(content_id = %entry.id, bytes, "resolved orphan deferred: no room under the size cap");
         return Restaged::Deferred;
     }
-    match service.stage_remote_directive(entry.directive.clone()) {
+    // H-19: a freed entry the join peer delivered is still the join peer's.
+    let source = if context.join_peer.is_some() && context.join_peer == entry.from_peer.as_deref() {
+        ledger::service::RemoteSource::JoinPeer
+    } else {
+        ledger::service::RemoteSource::Peer
+    };
+    match service.stage_remote_directive_from(entry.directive.clone(), source) {
         Ok(Some(content_id)) => {
             info!(content_id = %content_id, "resolved orphan directive");
             budget.staged.add(bytes);
@@ -2718,12 +2764,14 @@ pub async fn drain_orphans(
     signing_enabled: bool,
     allowlist: &PeerAllowlist,
     mesh_id: &str,
+    join_peer: Option<&str>,
     budget: &mut DrainBudget,
 ) -> DrainOutcome {
     let context = DrainContext {
         signing_enabled,
         allowlist,
         mesh_id,
+        join_peer,
     };
     // L-35 / R-19: parent presence is asked of the DAG directly. The cloned
     // `all_directive_ids()` set this used to keep in step with its own stages
@@ -3219,6 +3267,7 @@ pub(crate) mod tests {
             limiter: ConnectionLimiter::new(limits),
             connections: PeerConnectionCache::new(),
             supply_backoff: SupplyBackoff::default(),
+            join_peer: None,
         }
     }
 
@@ -9180,6 +9229,138 @@ pub(crate) mod tests {
         assert!(
             !svc.accounts().is_open_at("Assets:Cash", day(2, 15)),
             "the sink agrees with the source that Cash is closed on 02-15"
+        );
+    }
+
+    /// H-19: gl-node's side of the join window. What the join peer
+    /// (`p2p.joinFrom`) delivers is staged as `RemoteSource::JoinPeer`, so a
+    /// record past the ratchet is adopted from it while the window is open,
+    /// and the same kind of record from any other peer is still deferred; the
+    /// Want session closes the window once the join peer advertises nothing
+    /// this node lacks, and only then.
+    ///
+    /// Bug-catch: stage every peer's directive as `RemoteSource::Peer` and the
+    /// join peer's record is refused; stage a freed orphan as any peer's and
+    /// the child past the gap is refused; let `close_join_window_if_joined` close
+    /// for any peer, or with something still wanted, and the window closes
+    /// early. (Its call in the Want session needs a network exchange; the
+    /// convergence harness pins the same rule.)
+    #[tokio::test]
+    async fn h19_the_join_peer_is_adopted_past_the_ratchet_until_it_has_nothing_left() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ledger: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("joiner.bean"), "joiner".to_owned())
+                .expect("boot"),
+        ));
+        let join = iroh::SecretKey::generate().public();
+        let other = iroh::SecretKey::generate().public();
+        let allowlist =
+            PeerAllowlist::parse(&[join.to_string(), other.to_string()]).expect("allowlist");
+        let mut handler = make_handler(ledger.clone(), allowlist);
+        handler.join_peer = Some(join);
+        assert!(ledger.write().await.open_join_trust());
+        let far = ledger::service::MAX_LAMPORT_ADVANCE + 10;
+        let open_by = |account: &str, author: &EndpointId| {
+            make_supply_entry(&ledger::model::Directive::Open(ledger::model::Open {
+                date: NaiveDate::from_ymd_opt(2024, 1, 1).expect("date"),
+                account: account.to_owned(),
+                currencies: Vec::new(),
+                metadata: std::collections::BTreeMap::from([
+                    ("openledger-author".to_owned(), author.to_string()),
+                    ("openledger-lamport".to_owned(), far.to_string()),
+                    ("openledger-parents".to_owned(), String::new()),
+                ]),
+            }))
+        };
+        let from_other = open_by("Assets:Other", &other);
+        let from_join = open_by("Assets:Joined", &join);
+        for (entry, peer) in [(&from_other, other), (&from_join, join)] {
+            apply_supply_entries_from(
+                &handler,
+                vec![entry.clone()],
+                peer,
+                SupplyOrigin::Wanted,
+                &mut FrameReservation::unmetered(),
+            )
+            .await;
+        }
+        {
+            let svc = ledger.read().await;
+            assert!(
+                svc.contains_directive(&from_join.id),
+                "the join peer's record past the gap is adopted"
+            );
+            assert!(
+                !svc.contains_directive(&from_other.id),
+                "another peer's is still ratcheted"
+            );
+        }
+        // A buffered record the join peer delivered is still its when its
+        // parent frees it: the child sits past the ratchet from its parent.
+        let clock = ledger.read().await.lamport_clock();
+        let equity = open_by("Equity:Opening", &join);
+        let txn_by = |narration: &str, lamport: u64, parents: &str| {
+            let posting = |account: &str, number: rust_decimal::Decimal| ledger::model::Posting {
+                account: account.to_owned(),
+                amount: Some(Amount {
+                    number,
+                    currency: "USD".to_owned(),
+                }),
+                cost: None,
+                price: None,
+                metadata: std::collections::BTreeMap::new(),
+            };
+            make_supply_entry(&ledger::model::Directive::Transaction(
+                ledger::model::Transaction {
+                    date: NaiveDate::from_ymd_opt(2024, 1, 2).expect("date"),
+                    flag: Flag::Complete,
+                    payee: None,
+                    narration: Some(narration.to_owned()),
+                    tags: vec![],
+                    links: vec![],
+                    postings: vec![
+                        posting("Assets:Joined", dec!(1)),
+                        posting("Equity:Opening", dec!(-1)),
+                    ],
+                    metadata: std::collections::BTreeMap::from([
+                        ("openledger-author".to_owned(), join.to_string()),
+                        ("openledger-lamport".to_owned(), lamport.to_string()),
+                        ("openledger-parents".to_owned(), parents.to_owned()),
+                    ]),
+                },
+            ))
+        };
+        let parent = txn_by("parent", clock + 2, "");
+        let child = txn_by(
+            "child past the gap",
+            clock + 2 + ledger::service::MAX_LAMPORT_ADVANCE + 10,
+            &parent.id,
+        );
+        for batch in [vec![equity], vec![child.clone()], vec![parent.clone()]] {
+            apply_supply_entries_from(
+                &handler,
+                batch,
+                join,
+                SupplyOrigin::Wanted,
+                &mut FrameReservation::unmetered(),
+            )
+            .await;
+        }
+        assert!(
+            ledger.read().await.contains_directive(&child.id),
+            "the freed orphan is staged as the join peer's"
+        );
+
+        close_join_window_if_joined(&handler, other, &[]).await;
+        close_join_window_if_joined(&handler, join, std::slice::from_ref(&from_other.id)).await;
+        assert!(
+            ledger.read().await.join_trust_open(),
+            "open while another peer is done, or the join peer still has something"
+        );
+        close_join_window_if_joined(&handler, join, &[]).await;
+        assert!(
+            !ledger.read().await.join_trust_open(),
+            "closed once the join peer has nothing left"
         );
     }
 

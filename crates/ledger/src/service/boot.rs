@@ -869,6 +869,7 @@ impl LedgerService {
             served_id_snapshot: std::sync::Mutex::new(None),
             withheld_snapshot: std::sync::Mutex::new(None),
             staged_frontier: std::sync::Mutex::new(None),
+            join_trust: false,
         };
 
         // T81 / M-51, M-52: what descends from a record refused under a

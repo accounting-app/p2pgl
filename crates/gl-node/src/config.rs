@@ -283,6 +283,15 @@ pub struct P2pConfig {
     #[serde(default)]
     pub bootstrap_endpoint_ids: Vec<String>,
 
+    /// The peer this node joins from (H-19): one of
+    /// [`bootstrap_endpoint_ids`](Self::bootstrap_endpoint_ids). While the
+    /// ledger holds none of this node's own records, the history this peer
+    /// serves is adopted past the adoption ratchet until the node holds all of
+    /// it — the trusted-bootstrap join taken over the wire instead of by
+    /// copying the peer's `.bean`. Every other check still applies.
+    #[serde(default)]
+    pub join_from: Option<String>,
+
     /// iroh-gossip announce cadence in milliseconds.
     #[serde(default = "default_gossip_interval")]
     #[allow(dead_code)] // Available for gossip pacing.
@@ -539,6 +548,7 @@ impl Default for P2pConfig {
             enabled: false,
             secret_key_path: default_secret_key_path(),
             bootstrap_endpoint_ids: Vec::new(),
+            join_from: None,
             gossip_interval_milliseconds: default_gossip_interval(),
             anti_entropy_interval_milliseconds: default_anti_entropy_interval(),
             swarm_topic: default_swarm_topic(),
@@ -1115,10 +1125,22 @@ impl NodeConfig {
         }
 
         if self.p2p.enabled {
-            if let Err(error) =
-                p2p::allowlist::PeerAllowlist::parse(&self.p2p.bootstrap_endpoint_ids)
-            {
-                return Err(ConfigError::Validation(error));
+            let allowlist =
+                match p2p::allowlist::PeerAllowlist::parse(&self.p2p.bootstrap_endpoint_ids) {
+                    Ok(allowlist) => allowlist,
+                    Err(error) => return Err(ConfigError::Validation(error)),
+                };
+            // H-19: the join peer is trusted with this node's first history,
+            // so it must be a peer this node accepts at all.
+            if let Some(join_from) = &self.p2p.join_from {
+                let peer = p2p::allowlist::PeerAllowlist::parse(std::slice::from_ref(join_from))
+                    .map_err(|error| ConfigError::Validation(format!("p2p.joinFrom: {error}")))?
+                    .bootstrap_peers();
+                if !peer.first().is_some_and(|peer| allowlist.admits(*peer)) {
+                    return Err(ConfigError::Validation(
+                        "p2p.joinFrom must be one of p2p.bootstrapEndpointIds".to_owned(),
+                    ));
+                }
             }
             if self.p2p.swarm_topic == default_swarm_topic() {
                 return Err(ConfigError::Validation(
@@ -2006,6 +2028,31 @@ mod tests {
         let file = write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean", "graphiql": true }"#);
         let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
         assert!(config.graphiql_enabled());
+    }
+
+    /// H-19: `p2p.joinFrom` must name a peer this node accepts at all — it is
+    /// trusted with the node's first history.
+    #[test]
+    fn test_join_from_must_be_an_allowlisted_peer() {
+        let peer_a = iroh::SecretKey::generate().public().to_string();
+        let stranger = iroh::SecretKey::generate().public().to_string();
+        let config_with = |join_from: &str| {
+            format!(
+                r#"{{ "ledgerPath": "./data/ledger.bean", "signing": {{ "enabled": true }},
+                "p2p": {{ "enabled": true, "bootstrapEndpointIds": ["{peer_a}"],
+                "swarmTopic": "my-org/ledger", "joinFrom": "{join_from}" }} }}"#
+            )
+        };
+        let file = write_temp_config(&config_with(&peer_a));
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        assert_eq!(config.p2p.join_from.as_deref(), Some(peer_a.as_str()));
+        for bad in [stranger.as_str(), "not-an-id"] {
+            let file = write_temp_config(&config_with(bad));
+            let Err(error) = NodeConfig::load_from_path(&file.path().to_path_buf()) else {
+                panic!("{bad}: refused");
+            };
+            assert!(format!("{error}").contains("p2p.joinFrom"), "{error}");
+        }
     }
 
     #[test]

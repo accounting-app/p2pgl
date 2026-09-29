@@ -49,6 +49,7 @@ pub use self::error::*;
 pub use self::file_io::*;
 pub use self::lamport::*;
 use self::reconcile::*;
+pub use self::remote::*;
 pub use self::resource_limits::*;
 
 /// What decides which records this node withholds from peers (T100 / L-148,
@@ -587,6 +588,10 @@ pub struct LedgerService {
     /// staged count and last id (T100 / L-149) — see
     /// [`Self::choose_committed_parents`].
     staged_frontier: std::sync::Mutex<Option<StagedFrontier>>,
+    /// The join window (H-19): while open, a directive the caller marks as
+    /// from the node's join peer ([`RemoteSource::JoinPeer`]) is adopted
+    /// without the adoption ratchet — see [`Self::open_join_trust`].
+    join_trust: bool,
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

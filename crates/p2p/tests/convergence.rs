@@ -45,7 +45,7 @@ use chrono::NaiveDate;
 use ledger::hash::compute_content_id;
 use ledger::model::{Amount, Directive, Flag, Open, Posting, Transaction};
 use ledger::service::{
-    DirectiveSigner, LedgerService, PostingInput, ServiceError, TransactionInput,
+    DirectiveSigner, LedgerService, PostingInput, RemoteSource, ServiceError, TransactionInput,
     MAX_LAMPORT_ADVANCE, MAX_PARENTS,
 };
 use ledger::validate::ValidationError;
@@ -350,6 +350,10 @@ struct Replica {
     /// A1 (0924): a replica "stopped" by [`Replica::stop`] leaves its `.bean`
     /// on disk for a later boot (the README's stop → edit → start).
     keep_files: bool,
+    /// H-19: the replica this one joins from (`p2p.joinFrom`), by name.
+    join_from: Option<String>,
+    /// The replica serving the batch `intake_from` is staging, by name.
+    delivering: Option<String>,
 }
 
 impl Replica {
@@ -378,6 +382,8 @@ impl Replica {
             permanent: BTreeMap::new(),
             retryable: BTreeMap::new(),
             keep_files: false,
+            join_from: None,
+            delivering: None,
         }
     }
 
@@ -489,6 +495,25 @@ impl Replica {
     /// (validators off the lock) and phase 2 (`stage_and_commit_batch`), the
     /// post-batch drain, and one commit for the batch. Returns what was staged.
     fn intake(&mut self, entries: Vec<SupplyEntry>, allowlist: &PeerAllowlist) -> usize {
+        self.intake_from(entries, allowlist, None)
+    }
+
+    /// [`Self::intake`] of a batch `from` served — gl-node's
+    /// `apply_supply_entries_from` names the delivering peer, and the join
+    /// peer's directives skip the ratchet while the join window is open (H-19).
+    fn intake_from(
+        &mut self,
+        entries: Vec<SupplyEntry>,
+        allowlist: &PeerAllowlist,
+        from: Option<&str>,
+    ) -> usize {
+        self.delivering = from.map(str::to_owned);
+        let staged = self.intake_batch(entries, allowlist);
+        self.delivering = None;
+        staged
+    }
+
+    fn intake_batch(&mut self, entries: Vec<SupplyEntry>, allowlist: &PeerAllowlist) -> usize {
         // Phase 1 — dedup before validate (M-14), then the wire validators.
         let mut admitted: Vec<(String, Directive)> = Vec::new();
         for entry in entries {
@@ -534,13 +559,29 @@ impl Replica {
         if self.svc.contains_directive(id) {
             return Staged::Duplicate;
         }
+        // H-19: the join peer's copies are buffered under its name, so a
+        // freed one is staged as the join peer's; any other peer's under one.
+        let from_join_peer = self.delivering.is_some() && self.delivering == self.join_from;
+        let buffered_as = if from_join_peer {
+            self.delivering.clone()
+        } else {
+            Some("peer".to_owned())
+        };
+        let source = if from_join_peer {
+            RemoteSource::JoinPeer
+        } else {
+            RemoteSource::Peer
+        };
         let missing = self.svc.missing_parent_ids(&directive);
         if let Some(first) = missing.first().cloned() {
             self.orphans
-                .insert(id.to_owned(), directive, missing, Some("peer".to_owned()));
+                .insert(id.to_owned(), directive, missing, buffered_as);
             return Staged::Buffered(format!("parent {first}"));
         }
-        match self.svc.stage_remote_directive(directive.clone()) {
+        match self
+            .svc
+            .stage_remote_directive_from(directive.clone(), source)
+        {
             Ok(Some(_)) => Staged::Inserted,
             Ok(None) => Staged::Duplicate,
             Err(error) => match account_wait_target(&error) {
@@ -549,7 +590,7 @@ impl Replica {
                         id.to_owned(),
                         directive,
                         vec![account.clone()],
-                        Some("peer".to_owned()),
+                        buffered_as,
                     );
                     Staged::Buffered(format!("account {account}"))
                 }
@@ -605,7 +646,11 @@ impl Replica {
             self.note_intake_refusal(&entry.id, &error);
             return false;
         }
-        match self.stage(&entry.id, entry.directive) {
+        // A freed entry is staged as its delivering peer's (H-19).
+        self.delivering = entry.from_peer.clone();
+        let outcome = self.stage(&entry.id, entry.directive);
+        self.delivering = None;
+        match outcome {
             Staged::Inserted => {
                 *staged += 1;
                 true
@@ -884,6 +929,18 @@ impl Mesh {
         self.push(Replica::boot_from_copy_of(name, key(key_seed), &source))
     }
 
+    /// Boot a fresh, empty replica that joins from `from` (`p2p.joinFrom`,
+    /// H-19): its join window is open until `from` has nothing left to give.
+    fn add_joining_from(&mut self, name: &str, key_seed: u8, from: usize) -> usize {
+        let mut replica = Replica::boot(name, key(key_seed));
+        replica.join_from = Some(self.replicas[from].name.clone());
+        assert!(
+            replica.svc.open_join_trust(),
+            "a fresh node opens its join window"
+        );
+        self.push(replica)
+    }
+
     /// Add a directive to the pool exactly as its author's node would serve it.
     fn record(&mut self, directive: &Directive) -> String {
         let entry = make_supply_entry(directive);
@@ -978,6 +1035,12 @@ impl Mesh {
                 })
                 .collect()
         };
+        let from_name = self.replicas[from].name.clone();
+        // H-19: the join window closes once the join peer has nothing this
+        // replica lacks and has not refused for good — gl-node's Want session.
+        if wanted.is_empty() && self.replicas[to].join_from.as_deref() == Some(from_name.as_str()) {
+            self.replicas[to].svc.close_join_trust();
+        }
         let wanted = self.order_ids(wanted, order);
         let holder = &self.replicas[from].svc;
         let entries = match build_supply(&wanted, |id| {
@@ -987,7 +1050,7 @@ impl Mesh {
             other => panic!("build_supply returned {other:?}"),
         };
         let allowlist = &self.allowlist;
-        self.replicas[to].intake(entries, allowlist)
+        self.replicas[to].intake_from(entries, allowlist, Some(&from_name))
     }
 
     fn counts(&self) -> Vec<usize> {
@@ -1340,27 +1403,28 @@ fn h21_disjoint_subset_delivery_of_a_parentless_flood_converges_without_local_au
 // ─── Case 4 (H-19, hunt.rs h1b) ─────────────────────────────────────────────
 
 /// X's maximal legal jump, honest authoring on top, X de-allowlisted; a fresh
-/// F joins by anti-entropy alone, once per delivery order. X's directive
-/// itself can never reach F (the allowlist is a policy verdict, not a
-/// divergence), so membership is compared modulo it; heads and balances
-/// exactly.
+/// F joins by anti-entropy from A, its join peer (`p2p.joinFrom`), once per
+/// delivery order. X's directive itself can never reach F (the allowlist is a
+/// policy verdict, not a divergence), so membership is compared modulo it;
+/// heads and balances exactly.
 ///
-/// At HEAD the verdict depends on the order: served the pre-jump history in
-/// causal (ascending-lamport) order, F's clock lands exactly one below the
-/// bridge and the first post-jump honest directive is a full ratchet step
-/// above it — stuck, the `h1b` shape. Served in any other order, every
-/// adoption below the local clock still moves the clock by one
-/// (`max(local, remote) + 1`), so a couple of lamport inversions inflate F's
-/// clock past the gap and it converges by luck. The test asserts convergence
-/// in every order and lists the stuck ones.
+/// With no join peer the verdict depended on the order: served the pre-jump
+/// history in causal (ascending-lamport) order, F's clock landed exactly one
+/// below the bridge and the first post-jump honest directive was a full
+/// ratchet step above it — stuck, the `h1b` shape, and no per-directive bound
+/// repairs that (decision (1)). Since the join window, F adopts A's history
+/// without the ratchet, as boot adopts a copy of A's `.bean`, and converges in
+/// every order; B's copies of the same records are still ratcheted.
+///
+/// Bug-catch: stage the join peer's directives with the ratchet
+/// (`RemoteSource::Peer`) and F is stuck under the causal orders.
 #[test]
-#[ignore = "documented limitation (H-19, T72 decision (1) revised): the ratchet is judged against the joiner's own clock and no per-directive bound repairs that, so anti-entropy alone cannot join past a removed author's jump; the fix is the trusted-bootstrap join (README §Mesh identity, 'Joining a mesh / removing a peer'), pinned by h19_fresh_node_bootstrapped_from_a_peers_file_converges, plus the boot/adoption warning that names the jump's author"]
 fn h19_fresh_node_converges_after_a_maximal_legal_jump_and_allowlist_removal() {
     let mut stuck: Vec<String> = Vec::new();
     for (i, order) in ORDERS.into_iter().enumerate() {
         let (mut mesh, jump_id, _after, _open) =
             h19_mesh(40 + u64::try_from(i).expect("small"), Jump::Open);
-        let f = mesh.add("F", 10);
+        let f = mesh.add_joining_from("F", 10, 0);
         let rounds = mesh.run_to_fixed_point(order);
         eprintln!(
             "case 4 (H-19) / {order:?}: anti-entropy rounds {rounds}, F clock {} holds {} of {}",
@@ -1374,7 +1438,7 @@ fn h19_fresh_node_converges_after_a_maximal_legal_jump_and_allowlist_removal() {
     }
     assert!(
         stuck.is_empty(),
-        "case 4 (H-19): the anti-entropy-only join is stuck under {} of {} delivery orders\n{}",
+        "case 4 (H-19): the join from A is stuck under {} of {} delivery orders\n{}",
         stuck.len(),
         ORDERS.len(),
         stuck.join("\n")
@@ -1475,10 +1539,14 @@ fn h19_removed_authors_transaction_partitions_an_anti_entropy_join_by_missing_pa
 
 /// A history file carrying one hand-typed jump ≥ `MAX_LAMPORT_ADVANCE` (a
 /// pre-T63 mesh). A boots on it and authors; a fresh F joins by anti-entropy
-/// with both authors allowlisted. Stuck at HEAD: F adopts the two opens below
-/// the jump and nothing above it.
+/// from A, its join peer, with both authors allowlisted. With no join peer F
+/// adopted the two opens below the jump and nothing above it, and no rule
+/// could tell the jump from an attack (decision (1)); the join window adopts
+/// A's history past it, and then closes — the ratchet applies again.
+///
+/// Bug-catch: stage the join peer's directives with the ratchet and F holds
+/// only the opens below the jump.
 #[test]
-#[ignore = "documented limitation (H-19, T72 decision (1) revised): a pre-T63 history with one jump ≥ 2^32 cannot be joined by anti-entropy alone, with or without the jump's author on the allowlist; the fix is the trusted-bootstrap join (README §Mesh identity, 'Joining a mesh / removing a peer'), pinned by h19_pre_t63_history_is_joinable_by_bootstrap; boot on such a history now warns, naming the jump's author"]
 fn h19_pre_t63_history_with_one_large_jump_is_joinable() {
     let mut mesh = Mesh::new(8);
     let jumper = key(202);
@@ -1488,7 +1556,7 @@ fn h19_pre_t63_history_with_one_large_jump_is_joinable() {
     assert_eq!(mesh.replicas[a].svc.directive_count(), 5);
     assert_eq!(mesh.replicas[a].svc.lamport_clock(), PRE_T63_JUMP + 4);
     mesh.append(a, "a-after-boot", 3, "Assets:Cash");
-    let f = mesh.add("F", 10);
+    let f = mesh.add_joining_from("F", 10, a);
     let rounds = mesh.run_to_fixed_point(Order::Ascending);
     eprintln!(
         "case 5 (H-19 pre-T63): anti-entropy rounds {rounds}, F clock {} holds {}",
@@ -1497,6 +1565,10 @@ fn h19_pre_t63_history_with_one_large_jump_is_joinable() {
     );
     let among = mesh.all();
     mesh.assert_converged_among("case 5 (H-19 pre-T63)", &among, &[]);
+    assert!(
+        !mesh.replicas[f].svc.join_trust_open(),
+        "the join window closed once A had nothing left to give"
+    );
 }
 
 /// The same pre-T63 file, joined by bootstrap: F boots on a copy of A's file
@@ -1926,6 +1998,8 @@ impl Replica {
             permanent: BTreeMap::new(),
             retryable: BTreeMap::new(),
             keep_files: false,
+            join_from: None,
+            delivering: None,
         };
         (
             replica,
@@ -3343,6 +3417,8 @@ fn l96_a_placeholder_history_resumes_at_one_clock_on_a_boot_and_an_l13_reload() 
             permanent: BTreeMap::new(),
             retryable: BTreeMap::new(),
             keep_files: true,
+            join_from: None,
+            delivering: None,
         };
         a.open("Assets:Cash");
         a.open("Equity:Opening");

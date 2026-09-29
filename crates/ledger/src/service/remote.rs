@@ -2,7 +2,50 @@
 
 use super::*;
 
+/// Who delivered a remote directive, for the adoption ratchet (H-19).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteSource {
+    /// Any peer: the ratchet applies ([`MAX_LAMPORT_ADVANCE`]).
+    Peer,
+    /// The peer this node joins from (`p2p.joinFrom`). While the join window
+    /// is open ([`LedgerService::open_join_trust`]) its directives are adopted
+    /// without the ratchet, as boot adopts a copy of its `.bean`; otherwise it
+    /// is any peer.
+    JoinPeer,
+}
+
 impl LedgerService {
+    /// Open the join window (H-19): from now until [`Self::close_join_trust`],
+    /// a directive staged with [`RemoteSource::JoinPeer`] is adopted without
+    /// the adoption ratchet — the trusted-bootstrap join, taken over the wire
+    /// instead of by copying the peer's `.bean`.
+    ///
+    /// Refused (returns `false`) when this ledger holds a record of this
+    /// node's own: a node that has written is not joining, and its clock is
+    /// the one the ratchet protects. Only the ratchet is lifted: the ceiling
+    /// (`lamport_value_is_legal`), the allowlist, the signature and every
+    /// content rule still apply, so the trust is exactly the file copy's — the
+    /// join peer's history, whatever its lamport gaps.
+    pub fn open_join_trust(&mut self) -> bool {
+        let own = self.author_id.clone();
+        let holds_own = self.dag.directives().into_iter().any(|directive| {
+            directive_author(directive).is_some_and(|author| is_own_author(author, &own))
+        });
+        self.join_trust = !holds_own;
+        self.join_trust
+    }
+
+    /// Close the join window: the ratchet applies to every peer again. The
+    /// node calls this once it holds everything the join peer serves.
+    pub fn close_join_trust(&mut self) {
+        self.join_trust = false;
+    }
+
+    /// Whether the join window is open ([`Self::open_join_trust`]).
+    pub fn join_trust_open(&self) -> bool {
+        self.join_trust
+    }
+
     /// Insert a validated remote directive into the ledger, persisting after it
     /// (P2P receive path, single-insert semantics).
     ///
@@ -47,6 +90,17 @@ impl LedgerService {
     pub fn stage_remote_directive(
         &mut self,
         directive: Directive,
+    ) -> Result<Option<String>, ServiceError> {
+        self.stage_remote_directive_from(directive, RemoteSource::Peer)
+    }
+
+    /// [`Self::stage_remote_directive`], naming who delivered the directive:
+    /// the join peer's directives skip the adoption ratchet while the join
+    /// window is open (H-19, [`Self::open_join_trust`]).
+    pub fn stage_remote_directive_from(
+        &mut self,
+        directive: Directive,
+        source: RemoteSource,
     ) -> Result<Option<String>, ServiceError> {
         let content_id = compute_content_id(&directive);
 
@@ -195,12 +249,17 @@ impl LedgerService {
         //
         // Ceiling first: an illegal VALUE is refused as such whatever the
         // local clock; the ratchet is the state-dependent second opinion.
+        // H-19: the join peer's history is taken as a copy of its `.bean` is
+        // at boot — past any gap — while the join window is open.
+        let ratchet = !(source == RemoteSource::JoinPeer && self.join_trust);
         let author = directive_author(&directive);
         let next_lamport = directive
             .lamport_clock()
             .map(|remote| {
                 let next = checked_lamport(self.lamport_clock.max(remote), author)?;
-                check_lamport_advance(self.lamport_clock, remote, author)?;
+                if ratchet {
+                    check_lamport_advance(self.lamport_clock, remote, author)?;
+                }
                 Ok::<u64, ServiceError>(next.saturating_add(1))
             })
             .transpose()?;

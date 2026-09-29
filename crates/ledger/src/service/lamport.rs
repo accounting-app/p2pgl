@@ -190,10 +190,11 @@ pub const BOOTSTRAP_JOIN_REMEDY: &str =
     "A node that joins later, or is rebuilt from an empty disk, cannot cross a gap this \
      size by anti-entropy alone once the author that made it is off the allowlist, and \
      anything authored on top of a removed author's transaction is refused for a \
-     missing parent: join such a node by bootstrap — stop a current peer, copy its \
-     compacted .bean (not its .journal) to the joiner's ledgerPath, and boot the joiner \
-     under its own key and author id; the copy loads as history and the joiner's clock \
-     resumes above it (H-19)";
+     missing parent: join such a node by bootstrap — for a gap alone, set p2p.joinFrom \
+     on the joiner to a current peer, whose history it then adopts past the gap; for a \
+     removed author's transaction too, stop a current peer, copy its compacted .bean (not \
+     its .journal) to the joiner's ledgerPath, and boot the joiner under its own key and \
+     author id; the copy loads as history and the joiner's clock resumes above it (H-19)";
 
 /// THE Lamport rule (T63 / H-12): a value is legal when a node that adopts it
 /// still has a clock below [`LAMPORT_CEILING`], i.e. `value + 1 < CEILING`.
@@ -263,7 +264,12 @@ pub(super) fn checked_lamport(value: u64, author: Option<&str>) -> Result<u64, S
 /// 3. **An exemption would be the attack.** "No bound on first contact" (or
 ///    while the clock is 0, or for an author not seen before) gives an
 ///    allowlisted peer exactly the single unbounded jump the ratchet exists to
-///    remove, on precisely the nodes least able to notice — new ones.
+///    remove, on precisely the nodes least able to notice — new ones. The one
+///    exemption there is, the join window (`p2p.joinFrom`,
+///    [`LedgerService::open_join_trust`]), is not first contact: it is one
+///    peer the operator names, on a node that has written nothing, until it
+///    holds that peer's history — the trust of copying that peer's `.bean`,
+///    which boot adopts past any gap anyway.
 ///
 /// # What the ratchet cannot do, and what does it instead (T72 / H-19)
 ///
@@ -286,7 +292,8 @@ pub(super) fn checked_lamport(value: u64, author: Option<&str>) -> Result<u64, S
 /// lamport rule says), so the ratchet stays exactly as it is and the join is
 /// procedural — the **trusted-bootstrap join**, [`BOOTSTRAP_JOIN_REMEDY`]: the
 /// joiner boots from a peer's compacted `.bean`, which loads as history and
-/// puts its clock above the gap. The state is no longer silent: boot and
+/// puts its clock above the gap, or — for a gap alone — names that peer in
+/// `p2p.joinFrom` and takes the same history over the wire (the join window). The state is no longer silent: boot and
 /// adoption warn when the history holds a lamport gap of at least
 /// [`LAMPORT_GAP_WARN`] ([`largest_lamport_gap`]), naming the author of the
 /// directive at its top.

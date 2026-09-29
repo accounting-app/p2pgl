@@ -144,6 +144,7 @@ known residuals, see that task's "Done" note in the tracker.
 
 ### Added
 
+- `p2p.joinFrom`: a node that has written nothing can join a mesh whose history carries a lamport gap by naming a current peer — its history is adopted past the adoption ratchet until the node holds all of it, then the ratchet applies to it like any peer. Before, such a node could only join by copying a peer's `.bean` (H-19). A removed author's transaction still needs the copy.
 - `watchLedgerFile` (default `false`): poll the `.bean` every 250 ms and fold hand edits in promptly (M-19, T52).
 - `http.maxConnectionsPerIp` (default 64, range `8`–`65536`, clamped to `maxConnections`; M-33, T55).
 - `p2p.antiEntropySessionSeconds` (300, `30`–`3600`), `p2p.antiEntropyMaxAdvertPages` (512, `256`–`1024`), `p2p.antiEntropyMaxAdvertIdBytes` (64 MiB, 16–64 MiB) and `p2p.antiEntropyMaxSessionFrames` (100000, `10000`–`1000000`) (R-7, T70).

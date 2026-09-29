@@ -477,6 +477,29 @@ async fn main() {
                 // R-7 (T70): the anti-entropy bounds come from `p2p.antiEntropy*`,
                 // validated at boot; an absent key keeps the built-in default.
                 let limits = config.p2p.anti_entropy_limits();
+                // H-19: the join peer (validated as allowlisted at config load).
+                let join_peer = config.p2p.join_from.as_ref().and_then(|raw| {
+                    p2p::allowlist::PeerAllowlist::parse(std::slice::from_ref(raw))
+                        .ok()
+                        .and_then(|peer| peer.bootstrap_peers().first().copied())
+                });
+                if let Some(peer) = join_peer {
+                    if shared_ledger.write().await.open_join_trust() {
+                        info!(
+                            peer = %peer,
+                            "joining from p2p.joinFrom: the history this peer serves is adopted \
+                             past the adoption ratchet until this node holds all of it (H-19)"
+                        );
+                    } else {
+                        warn!(
+                            peer = %peer,
+                            "p2p.joinFrom is set, but this ledger already holds records this node \
+                             wrote, so it is not joining and the adoption ratchet applies to every \
+                             peer; the setting only serves a node that has not written — remove it \
+                             (H-19)"
+                        );
+                    }
+                }
                 let handler = anti_entropy_alpn::AntiEntropyHandler {
                     ledger: shared_ledger.clone(),
                     broadcast: broadcast.clone(),
@@ -492,6 +515,7 @@ async fn main() {
                     connections: peer_connections::PeerConnectionCache::new(),
                     // M-39 (T69): one map for the node, shared by every clone.
                     supply_backoff: anti_entropy_alpn::SupplyBackoff::default(),
+                    join_peer,
                 };
                 Some((peer_node, handler))
             }
@@ -1595,6 +1619,7 @@ mod tests {
                 ),
                 connections: peer_connections::PeerConnectionCache::new(),
                 supply_backoff: anti_entropy_alpn::SupplyBackoff::default(),
+                join_peer: None,
             }
             .mesh_id;
             assert_eq!(

@@ -4055,6 +4055,73 @@ fn remote_close(account: &str, date: NaiveDate, lamport: u64) -> Directive {
     })
 }
 
+/// H-19: the join window. A node that holds none of its own records opens
+/// it, and while it is open the join peer's directives are adopted past the
+/// adoption ratchet — a history with a lamport gap no dense climb crosses —
+/// while any other peer's are still ratcheted and the ceiling still applies.
+/// Closed, the join peer is any peer again; and a node that has written does
+/// not open it.
+///
+/// Bug-catch: ignore `RemoteSource` in `stage_remote_directive_from` and the
+/// join peer's directive past the gap is refused.
+#[test]
+fn h19_the_join_window_lifts_the_ratchet_for_the_join_peer_only() {
+    let date = make_date(2024, 1, 1);
+    let (mut svc, path) = boot_empty();
+    assert!(
+        svc.open_join_trust(),
+        "a node with no records of its own opens it"
+    );
+    let far = MAX_LAMPORT_ADVANCE + 10;
+    let error = svc
+        .stage_remote_directive_from(remote_open("Assets:Other", date, far), RemoteSource::Peer)
+        .unwrap_err();
+    assert_eq!(
+        error.error_code(),
+        "LAMPORT_ADVANCE",
+        "any other peer is ratcheted"
+    );
+    svc.stage_remote_directive_from(
+        remote_open("Assets:Joined", date, far),
+        RemoteSource::JoinPeer,
+    )
+    .expect("the join peer's history is adopted past the gap");
+    assert_eq!(svc.lamport_clock(), far + 1);
+    let error = svc
+        .stage_remote_directive_from(
+            remote_open("Assets:Ceiling", date, LAMPORT_CEILING),
+            RemoteSource::JoinPeer,
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.error_code(),
+        "LAMPORT_CEILING",
+        "the ceiling still applies"
+    );
+
+    svc.close_join_trust();
+    assert!(!svc.join_trust_open());
+    let error = svc
+        .stage_remote_directive_from(
+            remote_open("Assets:Later", date, far + 1 + MAX_LAMPORT_ADVANCE),
+            RemoteSource::JoinPeer,
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.error_code(),
+        "LAMPORT_ADVANCE",
+        "closed: the join peer is any peer"
+    );
+    remove_ledger_and_journal(&path);
+
+    let (mut written, path) = setup_with_accounts();
+    assert!(
+        !written.open_join_trust(),
+        "a node that holds its own records is not joining"
+    );
+    remove_ledger_and_journal(&path);
+}
+
 fn remote_open(account: &str, date: NaiveDate, lamport: u64) -> Directive {
     Directive::Open(Open {
         date,

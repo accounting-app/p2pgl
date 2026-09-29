@@ -503,6 +503,7 @@ boot saying so; `meshId` becomes required in a later release.
 | `p2p.enabled` | `false` | Enable Iroh mesh replication |
 | `p2p.secretKeyPath` | `./data/iroh.secret` | The node's Ed25519 key — its QUIC identity **and** its signing key. Created `0600` if absent. An existing file is refused unless it is a regular file (not a symlink), owned by the uid the node runs as, and not readable by group or other |
 | `p2p.bootstrapEndpointIds` | `[]` | Allowlisted peer EndpointIds; empty drops inbound `Supply` |
+| `p2p.joinFrom` | unset | One of `bootstrapEndpointIds` that a node which has written nothing joins from: its history is adopted past the adoption ratchet until the node holds all of it (§Mesh identity, *Joining a mesh*) |
 | `p2p.gossipIntervalMilliseconds` | `5000` | Accepted but currently unused (reserved for gossip pacing) |
 | `p2p.antiEntropyIntervalMilliseconds` | `5000` | ALPN head-exchange cadence; minimum `100` |
 | `p2p.antiEntropySessionSeconds` | `300` | Wall-clock cap on one anti-entropy session, inbound and outbound; the server closes an expired connection with code 5 `session-deadline`. `30`–`3600` |
@@ -800,11 +801,26 @@ This is the join the test `h19_fresh_node_bootstrapped_from_a_peers_file_converg
 performs (`crates/p2p/tests/convergence.rs`): the copy boots with the peer's
 whole history, the removed author's directive included, every node authors on
 top, and the mesh converges — equal DAGs, heads and balances — with the joiner's
-own directive accepted everywhere. The anti-entropy-only join of the same mesh
-is the ignored case beside it, a documented limitation rather than a defect to
-be fixed by a looser bound: any exemption from the ratchet for a "first
-contact" is exactly the unbounded jump the ratchet exists to remove, on the
-nodes least able to notice.
+own directive accepted everywhere.
+
+**Joining over the wire instead (`p2p.joinFrom`).** When the history's problem
+is a gap alone — a removed author's jump that was an `open`, or a history
+written before the ratchet — the joiner can skip the copy: set `p2p.joinFrom`
+on it to a current peer's EndpointId (one of its `bootstrapEndpointIds`) and
+start it with an empty ledger. While the joiner holds no record of its own it
+adopts what that peer serves past the ratchet — the trust you would give that
+peer by copying its `.bean` — and every other check still applies (the
+ceiling, the allowlist, signatures, content). Once the peer has nothing left
+the joiner lacks, the window closes (*"joined: this node holds everything its
+join peer serves"*) and the ratchet applies to it like any peer. Records from
+any other peer are ratcheted throughout. A removed author's *transaction* is
+still refused by the allowlist, so a history built on one needs the copy above.
+Once joined you can remove the setting; a node that has written ignores it and
+says so at startup. The tests `h19_fresh_node_converges_after_a_maximal_legal_jump_and_allowlist_removal`
+and `h19_pre_t63_history_with_one_large_jump_is_joinable` perform this join.
+There is no exemption for "first contact" with an unnamed peer: that would be
+exactly the unbounded jump the ratchet exists to remove, on the nodes least
+able to notice.
 
 Two related rules that do **not** change: a transaction's parents are chosen
 so that no author's heads can crowd out another's (at most `max(1, 256 /
