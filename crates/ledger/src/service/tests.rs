@@ -5602,6 +5602,62 @@ fn test_reconcile_rejects_a_body_over_the_wire_size_cap() {
     std::fs::remove_file(path).ok();
 }
 
+/// A history record — a complete envelope — whose posting has no amount is
+/// refused by every peer (H-03: a remote transaction must arrive with every
+/// amount written, or it would be stored under another id), so no fresh
+/// replica could hold it or anything written on it. Boot served it whenever
+/// no verifier could judge its signature (found in T103 writing `l157_…`):
+/// the served-set rule asked only a peer's parent and account questions.
+/// It now holds it with its reason, and its child with it, and keeps both in
+/// the file.
+///
+/// Bug-catch: drop the elision check from `unservable_history`, or from the
+/// copy chooser (which would serve the record's own copy again), and the
+/// record is served.
+#[test]
+fn a_history_record_with_an_elided_posting_is_held_at_boot() {
+    let (svc, path) = setup_with_accounts();
+    drop(svc);
+    let elided = "2024-02-01 * \"Elided\"\n  \
+                  openledger-author: \"peer-x\"\n  \
+                  openledger-lamport: \"40\"\n  \
+                  openledger-parents: \"\"\n  \
+                  openledger-signature: \"ab\"\n  \
+                  Assets:Cash                                        7.00 USD\n  \
+                  Equity:Opening\n";
+    let elided_id = compute_content_id(&parse_file(elided).unwrap()[0]);
+    let child = format!(
+        "2024-02-02 * \"Child of elided\"\n  \
+         openledger-author: \"peer-x\"\n  \
+         openledger-lamport: \"41\"\n  \
+         openledger-parents: \"{elided_id}\"\n  \
+         openledger-signature: \"ab\"\n  \
+         Assets:Cash                                        1.00 USD\n  \
+         Equity:Opening                                    -1.00 USD\n"
+    );
+    append_to_file(&path, &format!("\n{elided}\n{child}"));
+
+    let (booted, logged) =
+        capture_warnings(|| LedgerService::boot(path.clone(), "test-peer".to_owned()));
+    let mut svc = booted.unwrap();
+    assert!(
+        transaction_named(&svc, "Elided").is_none()
+            && transaction_named(&svc, "Child of elided").is_none(),
+        "no peer could hold either, so neither is served"
+    );
+    let held = svc.quarantined_ids();
+    assert!(held.contains(&elided_id.as_str()), "{held:?}");
+    assert_eq!(held.len(), 2, "the record and its child: {held:?}");
+    assert!(
+        logged.contains("H-03") && logged.contains(&elided_id),
+        "{logged}"
+    );
+    svc.compact().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("Elided") && text.contains("Child of elided"));
+    remove_ledger_and_journal(&path);
+}
+
 /// L-157 (T103; A1 R4d): the T90 hold on the resolved-body cap. A
 /// complete envelope pasted into the file under a running node, whose body
 /// is under the cap as the file spells it and one byte over once I2

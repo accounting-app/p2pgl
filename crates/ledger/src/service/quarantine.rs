@@ -464,7 +464,10 @@ impl LedgerService {
             );
             for copy in copies {
                 if let Directive::Transaction(txn) = copy {
-                    if validate_transaction_as_data(txn, &self.accounts).is_err() {
+                    // The served-set rule's body questions (`unservable_history`).
+                    if validate_transaction_as_data(txn, &self.accounts).is_err()
+                        || elided_posting_count(txn) > 0
+                    {
                         continue;
                     }
                 }

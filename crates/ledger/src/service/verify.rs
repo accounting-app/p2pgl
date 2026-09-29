@@ -84,9 +84,11 @@ impl LedgerService {
     /// A peer adopts a transaction only when every parent it names is already
     /// in its DAG (`require_parents`) and it validates against the account
     /// state (`validate_transaction_as_data`: I1, I2, I3, I9 — T98's data
-    /// rule, under which no `close` refuses it) — the two checks
-    /// [`Self::stage_remote_directive`] applies. A record this node serves that
-    /// fails either is refused by every replica that lacks it, and so is
+    /// rule, under which no `close` refuses it) and has every amount written
+    /// (H-03: an elided posting would be stored under another id) — the checks
+    /// [`Self::stage_remote_directive`] applies to a transaction's body and
+    /// parents. A record this node serves that fails any of them is refused by
+    /// every replica that lacks it, and so is
     /// everything written after it: its descendants wait on a parent that
     /// never arrives. T79 (d) asked only "is the parent in my quarantine", and
     /// T81 only "did this boot refuse it under a content rule"; a parent whose
@@ -126,6 +128,14 @@ impl LedgerService {
                 unservable.insert(
                     content_id.to_owned(),
                     format!("a peer refuses it against the accounts this node serves: {error}"),
+                );
+            } else if elided_posting_count(txn) > 0 {
+                unservable.insert(
+                    content_id.to_owned(),
+                    "a posting has no amount, and a peer takes a transaction only with every \
+                     amount written (H-03) — write the amount back, which restores the \
+                     record's id, or restore the record from a peer or a backup"
+                        .to_owned(),
                 );
             }
         }

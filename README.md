@@ -860,8 +860,9 @@ get *into* this node, never how they leave it.
 every parent it names is already in its ledger and the accounts it posts to are
 open, on its date, for its currencies. A record this node holds that fails either
 test — its parent was edited, deleted, restated or held as unparsable text; the
-`open` it relies on was removed, or is dated after it — would be refused by every
-replica that lacks it, and so would everything this node writes afterwards. Boot
+`open` it relies on was removed, or is dated after it; a posting whose amount was
+deleted (a peer takes history only with every amount written) — would be refused
+by every replica that lacks it, and so would everything this node writes afterwards. Boot
 quarantines such records together with what descends from them, names each one
 and why in the log (*"quarantining a ledger record no fresh replica could hold"*,
 H-23), and keeps them in the file. On a mesh they come back when a peer holds
