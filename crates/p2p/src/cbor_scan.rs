@@ -335,6 +335,9 @@ pub enum CborScanError {
     Truncated,
     /// The frame does not open with a CBOR map.
     NotAMap,
+    /// A wire-v2 frame did not open with a one-entry map whose key names a
+    /// known variant (Format v2, Facet C).
+    NotOneVariant,
     /// An indefinite-length item (or a stray break code) was encountered.
     ///
     /// ciborium never emits one for a serde type, so this is always hostile or
@@ -401,6 +404,10 @@ impl std::fmt::Display for CborScanError {
         match self {
             Self::Truncated => write!(formatter, "truncated CBOR header"),
             Self::NotAMap => write!(formatter, "frame does not open with a CBOR map"),
+            Self::NotOneVariant => write!(
+                formatter,
+                "wire-v2 frame does not open with a one-entry map naming a known variant"
+            ),
             Self::IndefiniteLength => {
                 write!(formatter, "indefinite-length CBOR item in a wire frame")
             }
@@ -1078,8 +1085,9 @@ mod tests {
                     == Ok(ScanOutcome::WithinBounds)
             })
             .expect("an honest entry must fit its own budget");
+        // Format v2 added `openledger-format`: five envelope keys, so 19.
         assert_eq!(
-            needed, 17,
+            needed, 19,
             "an honest entry's item count changed: map header, 3 scalar fields, \
              the envelope key and header, and 2 per envelope key"
         );

@@ -141,14 +141,19 @@ fn sign(key: &PeerKeySignatureProvider, message: &SignableMessage<'_>) -> String
 /// The reconcile-path signer a node installs at boot (`set_signer`).
 fn signer(key: &Arc<PeerKeySignatureProvider>) -> DirectiveSigner {
     let key = Arc::clone(key);
-    Arc::new(move |content_id, is_transaction, parents, lamport| {
-        key.sign(&SignableMessage {
-            content_id,
-            is_transaction,
-            parents,
-            lamport,
-        })
-    })
+    Arc::new(
+        move |content_id, is_transaction, parents, lamport, format| {
+            key.sign_in(
+                p2p::union_merge::signature_version(format),
+                &SignableMessage {
+                    content_id,
+                    is_transaction,
+                    parents,
+                    lamport,
+                },
+            )
+        },
+    )
 }
 
 fn usd(amount: i64) -> Amount {
@@ -1932,8 +1937,10 @@ fn verifier(mesh_id: &str) -> DirectiveVerifier {
               parents: &str,
               lamport: &str,
               author: &str,
-              signature: &str| {
-            security::signing::verify_signature(
+              signature: &str,
+              format: ledger::hash::RecordFormat| {
+            security::signing::verify_signature_in(
+                p2p::union_merge::signature_version(format),
                 &SignableMessage {
                     content_id,
                     is_transaction,

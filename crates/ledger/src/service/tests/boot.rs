@@ -1620,7 +1620,7 @@ fn t80_the_signature_quarantine_total_counts_every_pass_and_a_total_failure_name
     // pass.
     let (last, logged) = capture_warnings(|| {
         svc.set_verifier(std::sync::Arc::new(
-            |_: &str, _, _: &str, _: &str, _: &str, _: &str| false,
+            |_: &str, _, _: &str, _: &str, _: &str, _: &str, _: crate::hash::RecordFormat| false,
         ));
         svc.verify_own_history()
     });
@@ -1769,7 +1769,7 @@ fn l99_on_a_domain_mismatch_the_clock_is_kept_and_the_node_is_told_not_to_author
     let clock = svc.lamport_clock();
     let (_, logged) = capture_warnings(|| {
         svc.set_verifier(std::sync::Arc::new(
-            |_: &str, _, _: &str, _: &str, _: &str, _: &str| false,
+            |_: &str, _, _: &str, _: &str, _: &str, _: &str, _: crate::hash::RecordFormat| false,
         ));
         svc.verify_own_history();
     });
@@ -2081,7 +2081,7 @@ fn l91_the_ceiling_refusal_names_an_own_record_held_as_text_when_it_is_the_only_
 // ── T83: diagnostics (L-83, L-89) ──
 
 /// L-89 (T83): a node-written record carrying a stray directive-level
-/// `openledger-*` key (not one of the four envelope keys) keeps loading —
+/// `openledger-*` key (not one of the envelope keys) keeps loading —
 /// same id, same signature, same balances — but without the key, and the
 /// compaction writes it back without it. Before T83 it loaded with the
 /// key, served it locally and wrote it back on every compaction.

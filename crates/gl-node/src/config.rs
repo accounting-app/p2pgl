@@ -168,6 +168,11 @@ pub struct NodeConfig {
     #[serde(default)]
     pub tls: TlsConfig,
 
+    /// Format v2 (T45): what this node emits, flipped mesh-wide; every node
+    /// accepts both formats whatever this says.
+    #[serde(default)]
+    pub format: FormatConfig,
+
     /// Connection-level HTTP hardening knobs (M-13).
     ///
     /// Optional in full: an absent `http` section reproduces the hardcoded
@@ -223,6 +228,47 @@ impl Default for HttpConfig {
             request_timeout_seconds: default_request_timeout_seconds(),
             max_connections: default_max_connections(),
             max_connections_per_ip: default_max_connections_per_ip(),
+        }
+    }
+}
+
+/// Format v2 (T45, docs/FORMAT_V2_DESIGN.md): the coordinated encoding
+/// transition. Each switch decides only what this node EMITS; a node accepts
+/// both formats always, so a mesh flips one node at a time.
+#[derive(Debug, Deserialize, Default, Clone, Copy)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub struct FormatConfig {
+    /// Dial anti-entropy and gossip in the wire-v2 encoding (Facet C): the
+    /// `openledger/anti-entropy/2` ALPN and the `<swarmTopic>/2` gossip topic.
+    /// Both ALPNs are served regardless.
+    #[serde(default)]
+    pub wire2: bool,
+
+    /// Write records in Format v2 (Facets A + B): `openledger-format: "2"`,
+    /// an id that covers the author (another author's copy of a body is
+    /// another record — M-10), signed in signature v4 (L-06). Records of both
+    /// formats are accepted regardless.
+    #[serde(default)]
+    pub idv2: bool,
+}
+
+impl FormatConfig {
+    /// The format of the records this node writes.
+    pub fn record_format(&self) -> ledger::hash::RecordFormat {
+        if self.idv2 {
+            ledger::hash::RecordFormat::V2
+        } else {
+            ledger::hash::RecordFormat::V1
+        }
+    }
+
+    /// The encoding this node dials and gossips in.
+    pub fn wire_codec(&self) -> p2p::protocol::WireCodec {
+        if self.wire2 {
+            p2p::protocol::WireCodec::V2
+        } else {
+            p2p::protocol::WireCodec::V1
         }
     }
 }
@@ -2035,6 +2081,37 @@ mod tests {
         let file = write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean", "graphiql": true }"#);
         let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
         assert!(config.graphiql_enabled());
+    }
+
+    /// Format v2: the `format` section defaults to v1 everywhere and refuses
+    /// a key it does not know.
+    #[test]
+    fn test_format_section_defaults_to_v1_and_is_strict() {
+        let file = write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean" }"#);
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("load");
+        assert_eq!(config.format.wire_codec(), p2p::protocol::WireCodec::V1);
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "format": { "wire2": true } }"#,
+        );
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("load");
+        assert_eq!(config.format.wire_codec(), p2p::protocol::WireCodec::V2);
+        assert_eq!(
+            config.format.record_format(),
+            ledger::hash::RecordFormat::V1
+        );
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "format": { "idv2": true } }"#,
+        );
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("load");
+        assert_eq!(
+            config.format.record_format(),
+            ledger::hash::RecordFormat::V2
+        );
+        assert_eq!(config.format.wire_codec(), p2p::protocol::WireCodec::V1);
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "format": { "wire3": true } }"#,
+        );
+        assert!(NodeConfig::load_from_path(&file.path().to_path_buf()).is_err());
     }
 
     /// L-114: the write override is off unless set.

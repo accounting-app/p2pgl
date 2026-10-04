@@ -218,6 +218,10 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
     // Envelope key set, value lengths and control characters: a map lookup and
     // a length per key, before the body costs anything (audit §5).
     validate_supply_envelope(&entry.envelope)?;
+    // Format v2: the marker's one value, and the author a v2 id is computed
+    // over — the rule the file paths apply.
+    ledger::service::validate_envelope_format_form(&entry.envelope)
+        .map_err(|error| MergeError::InvalidEnvelope(error.to_string()))?;
 
     // Exactly one directive block, counted without parsing (H-18). A body of
     // 524,288 two-byte blocks is refused here in one pass over the bytes, so
@@ -278,7 +282,9 @@ pub fn validate_supply_entry(entry: &SupplyEntry) -> Result<Directive, MergeErro
     // 2. Verify content hash (I5): id == hash(economic_bean). `claimed` is
     // carried verbatim because step 0 proved it is 64 hex characters (M-41);
     // it is not a length because an operator diffing two ids wants both.
-    let computed = compute_content_id(&directive);
+    // Format v2: the id is checked against the envelope the entry carries — a
+    // v2 id covers the author — before that envelope is merged into the body.
+    let computed = ledger::hash::compute_content_id_with_envelope(&directive, &entry.envelope);
     if computed != entry.id {
         return Err(MergeError::ContentHashMismatch {
             claimed: entry.id.clone(),
@@ -473,6 +479,18 @@ fn validate_supply_envelope(envelope: &BTreeMap<String, String>) -> Result<(), M
     Ok(())
 }
 
+/// The signed-message format a record in `format` carries (Format v2): v4 for
+/// a Format v2 record, v3 otherwise. The one mapping every signer and
+/// verifier uses.
+pub fn signature_version(
+    format: ledger::hash::RecordFormat,
+) -> security::signing::SignatureVersion {
+    match format {
+        ledger::hash::RecordFormat::V1 => security::signing::SignatureVersion::V3,
+        ledger::hash::RecordFormat::V2 => security::signing::SignatureVersion::V4,
+    }
+}
+
 /// Verify `openledger-signature` when signing is enabled (§3.5 step 4 / C-3).
 ///
 /// Signing off: unsigned entries are accepted. Signing on: missing or invalid
@@ -538,7 +556,8 @@ pub fn verify_remote_signature(
     let lamport = metadata
         .get("openledger-lamport")
         .ok_or_else(|| MergeError::EnvelopeMissing("openledger-lamport".to_owned()))?;
-    security::signing::verify_signature(
+    security::signing::verify_signature_in(
+        signature_version(ledger::hash::RecordFormat::of(directive)),
         &security::signing::SignableMessage {
             content_id: &content_id,
             is_transaction,
@@ -1798,14 +1817,21 @@ mod tests {
             ledger::service::LedgerService::boot(path, provider.public_key_hex()).unwrap();
         let for_signer = std::sync::Arc::clone(&provider);
         service.set_signer(std::sync::Arc::new(
-            move |content_id: &str, is_transaction: bool, parents: &str, lamport: &str| {
+            move |content_id: &str,
+                  is_transaction: bool,
+                  parents: &str,
+                  lamport: &str,
+                  format: ledger::hash::RecordFormat| {
                 use security::signing::SignatureProvider;
-                for_signer.sign(&security::signing::SignableMessage {
-                    content_id,
-                    is_transaction,
-                    parents,
-                    lamport,
-                })
+                for_signer.sign_in(
+                    super::signature_version(format),
+                    &security::signing::SignableMessage {
+                        content_id,
+                        is_transaction,
+                        parents,
+                        lamport,
+                    },
+                )
             },
         ));
         (service, provider)

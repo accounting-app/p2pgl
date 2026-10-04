@@ -341,6 +341,8 @@ impl CommitReceipt {
 pub struct RecoveryReload {
     pub(super) file_path: PathBuf,
     pub(super) author_id: String,
+    /// The format the rebuilt service writes in, as the one it replaces.
+    pub(super) emit_format: crate::hash::RecordFormat,
     pub(super) fingerprint: RecoveryFingerprint,
 }
 
@@ -358,6 +360,7 @@ impl RecoveryReload {
             self.file_path.clone(),
             self.author_id.clone(),
             BootMode::Reload,
+            self.emit_format,
         )
     }
 }

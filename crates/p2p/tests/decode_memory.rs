@@ -34,8 +34,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use p2p::cbor_scan::CborScanError;
 use p2p::protocol::{
-    DirectiveKind, SupplyEntry, WireError, WireMessage, MAX_MESSAGE_SIZE, MAX_SUPPLY_ENTRIES,
-    MAX_WANT_IDS, SUPPLY_TYPE_DISCRIMINATOR,
+    DirectiveKind, SupplyEntry, WireCodec, WireError, WireMessage, MAX_MESSAGE_SIZE,
+    MAX_SUPPLY_ENTRIES, MAX_WANT_IDS, SUPPLY_TYPE_DISCRIMINATOR, SUPPLY_VARIANT_DISCRIMINATOR_V2,
 };
 use p2p::union_merge::{validate_supply_entry, MergeError, MAX_REPORTED_PARSE_ERRORS};
 
@@ -1081,4 +1081,107 @@ fn every_admitted_frame_shape_peaks_under_an_absolute_bound() {
             "{name}: peaked at {peak} bytes, over the {ADMITTED_FRAME_PEAK_BYTES}-byte bound"
         );
     }
+}
+
+// ─── Format v2, Facet C: the same shapes in the wire-v2 encoding ─────────────
+
+/// `{"supply": {"v": 2, "entries": <tail>}}` — the bytes ciborium emits for a
+/// real wire-v2 `Supply`, up to the `entries` value.
+fn v2_supply_prefix() -> Vec<u8> {
+    let mut frame = vec![0xa1];
+    frame.extend_from_slice(SUPPLY_VARIANT_DISCRIMINATOR_V2);
+    frame.push(0xa2);
+    frame.extend_from_slice(b"\x61v\x02");
+    frame.extend_from_slice(b"\x67entries");
+    frame
+}
+
+/// Format v2, Facet C: the wire-v2 decode is held to the same bounds as v1 —
+/// a 16 MiB `Supply` claiming sixteen million entries, one hiding a
+/// sixteen-million-item array inside its single entry, and a 1 MiB `Want`
+/// claiming a million ids are each refused within `PEAK_BUDGET_MULTIPLE` of
+/// the frame, and an honest maximal `Supply` decodes within it.
+///
+/// Bug-catch: drop `prescan_frame_v2` from `decode_checked_in` and the
+/// over-claiming `Supply` is refused by serde instead (the wrong error), the
+/// hidden entry likewise.
+#[test]
+fn wire_v2_frames_are_refused_or_decoded_within_the_same_bounds() {
+    let _measuring = measurement_lock();
+    let codec = WireCodec::V2;
+
+    let mut forged = v2_supply_prefix();
+    forged.push(0x9a);
+    forged.extend_from_slice(&FORGED_ENTRIES.to_be_bytes());
+    forged.resize(forged.len() + FORGED_ENTRIES as usize, 0x00);
+    let mut hidden = v2_supply_prefix();
+    hidden.extend_from_slice(b"\x81\x9a");
+    hidden.extend_from_slice(&HIDDEN_ITEMS.to_be_bytes());
+    hidden.resize(hidden.len() + HIDDEN_ITEMS as usize, 0x00);
+    let mut want = vec![0xa1];
+    want.extend_from_slice(b"\x64want\xa2\x61v\x02\x63ids\x9a");
+    want.extend_from_slice(&FORGED_WANT_IDS.to_be_bytes());
+    want.resize(want.len() + FORGED_WANT_IDS as usize, 0x60);
+
+    for (label, frame, expected) in [
+        (
+            "forged supply",
+            &forged,
+            Some(WireError::BatchTooLarge {
+                kind: "supply",
+                count: FORGED_ENTRIES as usize,
+                max: MAX_SUPPLY_ENTRIES,
+            }),
+        ),
+        ("hidden entry", &hidden, None),
+        (
+            "forged want",
+            &want,
+            Some(WireError::BatchTooLarge {
+                kind: "want",
+                count: FORGED_WANT_IDS as usize,
+                max: MAX_WANT_IDS,
+            }),
+        ),
+    ] {
+        assert!(frame.len() <= MAX_MESSAGE_SIZE as usize);
+        let budget = frame.len() * PEAK_BUDGET_MULTIPLE;
+        let (result, peak) = peak_allocated_during(|| WireMessage::decode_checked_in(codec, frame));
+        println!("v2 {label}: {} bytes, peak {peak} bytes", frame.len());
+        let error = result.expect_err(label);
+        match expected {
+            Some(expected) => assert_eq!(error, expected, "{label}"),
+            None => assert!(
+                matches!(error, WireError::FramePrescan(_)),
+                "{label}: {error:?}"
+            ),
+        }
+        assert!(peak <= budget, "{label}: peak {peak} over {budget}");
+    }
+
+    let entries: Vec<SupplyEntry> = (0..MAX_SUPPLY_ENTRIES)
+        .map(|index| SupplyEntry {
+            id: format!("{index:064x}"),
+            kind: DirectiveKind::Open,
+            economic_bean: "x".repeat(32 * 1024),
+            envelope: ledger::service::ENVELOPE_KEYS
+                .iter()
+                .map(|key| ((*key).to_owned(), format!("peer-{index}")))
+                .collect(),
+        })
+        .collect();
+    let honest = WireMessage::supply(entries).to_cbor_in(codec).unwrap();
+    let budget = honest.len() * PEAK_BUDGET_MULTIPLE;
+    let (decoded, peak) = peak_allocated_during(|| WireMessage::decode_checked_in(codec, &honest));
+    println!(
+        "v2 honest supply: {} bytes, peak {peak} bytes",
+        honest.len()
+    );
+    assert!(
+        matches!(decoded, Ok(WireMessage::Supply { ref entries, .. }) if entries.len() == MAX_SUPPLY_ENTRIES)
+    );
+    assert!(
+        peak <= budget,
+        "honest v2 Supply peaked at {peak}, over {budget}"
+    );
 }

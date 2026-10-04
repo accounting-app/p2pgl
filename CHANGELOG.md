@@ -145,6 +145,7 @@ known residuals, see that task's "Done" note in the tracker.
 
 ### Added
 
+- Format v2 (T45; `docs/FORMAT_V2_DESIGN.md`), off by default and accepted always. `format.wire2`: the anti-entropy and gossip frames in an externally tagged encoding, on the `openledger/anti-entropy/2` protocol (served beside v1) and the `<swarmTopic>/2` topic. `format.idv2`: API writes carry `openledger-format: "2"`, their id covers their author (another peer can no longer take a record's id by publishing its body first — M-10) and they are signed over a length-prefixed message (L-06). Lines typed into the `.bean` keep v1 identity, so the file's repairs keep their ids.
 - `p2p.joinFrom`: a node that has written nothing can join a mesh whose history carries a lamport gap by naming a current peer — its history is adopted past the adoption ratchet until the node holds all of it, then the ratchet applies to it like any peer. Before, such a node could only join by copying a peer's `.bean` (H-19). A removed author's transaction still needs the copy.
 - `watchLedgerFile` (default `false`): poll the `.bean` every 250 ms and fold hand edits in promptly (M-19, T52).
 - `http.maxConnectionsPerIp` (default 64, range `8`–`65536`, clamped to `maxConnections`; M-33, T55).

@@ -602,7 +602,7 @@ fn local_write_record_bytes(
     write: LocalWrite<'_>,
     signer: Option<&dyn SignatureProvider>,
 ) -> Option<u64> {
-    let &[author_key, lamport_key, parents_key, signature_key] = ENVELOPE_KEYS else {
+    let &[author_key, lamport_key, parents_key, signature_key, format_key] = ENVELOPE_KEYS else {
         return None;
     };
     let lamport = service.lamport_clock().saturating_add(1).to_string();
@@ -662,6 +662,18 @@ fn local_write_record_bytes(
             (Directive::Close(close), false)
         }
     };
+    // Format v2: a v2 node's write carries the marker, and a v2 id covers the
+    // author and the marker — so they are on the record before its id is
+    // computed, exactly as `stamp_identity` puts them there.
+    if service.emit_format() == ledger::hash::RecordFormat::V2 {
+        envelope.insert(format_key.to_owned(), ledger::hash::FORMAT_V2.to_owned());
+        match &mut directive {
+            Directive::Transaction(transaction) => transaction.metadata = envelope.clone(),
+            Directive::Open(open) => open.metadata = envelope.clone(),
+            Directive::Close(close) => close.metadata = envelope.clone(),
+            _ => return None,
+        }
+    }
     let content_id = LedgerService::content_id(&directive);
     if service.contains_directive(&content_id) {
         return None;

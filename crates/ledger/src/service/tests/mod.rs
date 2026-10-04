@@ -345,7 +345,11 @@ fn file_with_parent_fan_in(parent_count: usize) -> String {
 /// `p2p::union_merge::tests::test_reconcile_signs_hand_edits_so_peers_accept_them`.
 fn marker_signer() -> crate::service::DirectiveSigner {
     std::sync::Arc::new(
-        |content_id: &str, is_transaction: bool, parents: &str, lamport: &str| {
+        |content_id: &str,
+         is_transaction: bool,
+         parents: &str,
+         lamport: &str,
+         _format: crate::hash::RecordFormat| {
             Some(format!(
                 "sig({content_id}|{is_transaction}|{parents}|{lamport})"
             ))
@@ -686,7 +690,11 @@ fn recording_signer() -> (
     let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let for_signer = std::sync::Arc::clone(&log);
     let signer: crate::service::DirectiveSigner = std::sync::Arc::new(
-        move |content_id: &str, _is_transaction: bool, _parents: &str, _lamport: &str| {
+        move |content_id: &str,
+              _is_transaction: bool,
+              _parents: &str,
+              _lamport: &str,
+              _format: crate::hash::RecordFormat| {
             for_signer.lock().unwrap().push(content_id.to_owned());
             Some(format!("sig({content_id})"))
         },
@@ -1376,7 +1384,8 @@ fn marker_verifier() -> DirectiveVerifier {
          parents: &str,
          lamport: &str,
          author: &str,
-         signature: &str| {
+         signature: &str,
+         _format: crate::hash::RecordFormat| {
             author == "test-peer"
                 && signature == format!("sig({content_id}|{is_transaction}|{parents}|{lamport})")
         },
@@ -1467,7 +1476,8 @@ fn edited_own_records_beside_verifying_foreign_ones() -> (PathBuf, DirectiveVeri
          parents: &str,
          lamport: &str,
          _: &str,
-         signature: &str| {
+         signature: &str,
+         _format: crate::hash::RecordFormat| {
             signature == format!("sig({content_id}|{is_transaction}|{parents}|{lamport})")
         },
     );

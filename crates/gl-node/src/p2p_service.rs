@@ -25,7 +25,7 @@ use crate::config::P2pConfig;
 use crate::fetch_coordinator::FetchCoordinator;
 
 use p2p::allowlist::PeerAllowlist;
-use p2p::gossip::{decode_broadcast, encode_broadcast, make_announce};
+use p2p::gossip::{decode_broadcast_in, encode_broadcast_in, make_announce};
 use p2p::node::{PeerNode, PeerNodeConfig};
 use p2p::orphan_buffer::{OrphanBuffer, ORPHAN_EVICTION_INTERVAL};
 use p2p::protocol::WireMessage;
@@ -40,6 +40,7 @@ use p2p::protocol::WireMessage;
 pub async fn boot_p2p(
     config: &P2pConfig,
     node_secret_key: &NodeSecretKey,
+    codec: p2p::protocol::WireCodec,
 ) -> Result<PeerNode, Box<dyn std::error::Error>> {
     let secret_key = node_secret_key.iroh_secret_key();
 
@@ -73,7 +74,11 @@ pub async fn boot_p2p(
 
     // Build PeerNode.
     let peer_config = PeerNodeConfig {
-        swarm_topic: config.swarm_topic.clone(),
+        // Format v2, Facet C: wire-v2 gossip runs on its own topic, so a v1
+        // node never receives a frame it cannot decode — the two partition
+        // cleanly instead of warning on every hint. The signature domain is
+        // resolved apart from this (`signature_domain`), so it is unchanged.
+        swarm_topic: gossip_swarm_topic(&config.swarm_topic, codec),
         // The bootstrap ids reach the node through `allowlist` (built from the
         // same `bootstrapEndpointIds` a few lines up) and nowhere else — the
         // duplicate `PeerNodeConfig::bootstrap_peers` field it used to be copied
@@ -118,11 +123,25 @@ fn log_node_ready(config: &P2pConfig) {
     );
 }
 
+/// The gossip topic preimage a node in `codec` joins: the configured topic for
+/// wire v1, `<topic>/2` for wire v2 (Format v2, Facet C).
+fn gossip_swarm_topic(swarm_topic: &str, codec: p2p::protocol::WireCodec) -> String {
+    match codec {
+        p2p::protocol::WireCodec::V1 => swarm_topic.to_owned(),
+        p2p::protocol::WireCodec::V2 => format!("{swarm_topic}/2"),
+    }
+}
+
 /// Route gossip and anti-entropy ALPNs. The returned `Router` must be kept alive.
+///
+/// Both anti-entropy encodings are served (Format v2, Facet C): a peer that
+/// dials wire v2 and one that dials wire v1 are each answered in their own;
+/// `format.wire2` decides only what this node dials.
 pub fn spawn_router(peer_node: &PeerNode, handler: AntiEntropyHandler) -> Router {
     Router::builder(peer_node.endpoint().clone())
         .accept(GOSSIP_ALPN, peer_node.gossip().clone())
-        .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler)
+        .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler.clone())
+        .accept(p2p::protocol::ANTI_ENTROPY_ALPN_V2, handler)
         .spawn()
 }
 
@@ -241,6 +260,8 @@ pub fn spawn_gossip_loop(
 ) -> tokio::sync::mpsc::Sender<ledger::model::Directive> {
     let gossip = peer_node.gossip().clone();
     let topic_id = peer_node.topic_id();
+    // Format v2, Facet C: this node's topic carries its own encoding.
+    let codec = handler.wire_codec;
     let registry = peer_node.registry.clone();
     let allowlist = peer_node.allowlist().clone();
     let bootstrap_peers = allowlist.bootstrap_peers();
@@ -278,7 +299,7 @@ pub fn spawn_gossip_loop(
                 // Handle outgoing: local directives to broadcast.
                 Some(directive) = gossip_receiver.recv() => {
                     let announce = make_announce(&directive);
-                    match encode_broadcast(&announce) {
+                    match encode_broadcast_in(codec, &announce) {
                         Ok(bytes) => {
                             if let Err(error) = sink.broadcast(bytes).await {
                                 warn!(%error, "failed to broadcast gossip announce");
@@ -316,7 +337,7 @@ pub fn spawn_gossip_loop(
                                 continue;
                             }
                             let data = msg.content.as_ref();
-                            match decode_broadcast(data) {
+                            match decode_broadcast_in(codec, data) {
                                 Ok(WireMessage::Announce { id, kind, .. }) => {
                                     // L-53: `id` is an untrusted string that
                                     // becomes a `FetchCoordinator` key (both
@@ -1210,6 +1231,21 @@ mod tests {
         let value = tracing::subscriber::with_default(subscriber, body);
         let logged = String::from_utf8_lossy(&buffer.0.lock().unwrap()).into_owned();
         (value, logged)
+    }
+
+    /// Format v2, Facet C: wire-v2 gossip runs on `<topic>/2`, so v1 and v2
+    /// nodes partition instead of sharing a topic one of them cannot decode;
+    /// wire v1 keeps the configured topic byte for byte.
+    #[test]
+    fn wire_v2_gossip_joins_its_own_topic() {
+        assert_eq!(
+            gossip_swarm_topic("my-org/ledger", p2p::protocol::WireCodec::V1),
+            "my-org/ledger"
+        );
+        assert_eq!(
+            gossip_swarm_topic("my-org/ledger", p2p::protocol::WireCodec::V2),
+            "my-org/ledger/2"
+        );
     }
 
     /// M-32: `topic = %config.swarm_topic` put the gossip join credential into

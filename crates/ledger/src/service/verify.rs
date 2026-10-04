@@ -633,6 +633,12 @@ impl LedgerService {
         if metadata.get(ENVELOPE_KEY_AUTHOR).map(String::as_str) != Some(PLACEHOLDER_AUTHOR) {
             return None;
         }
+        // The placeholder is a pre-T80 v1 author; a v2 record's id covers its
+        // author, so re-attributing one would change its id.
+        let format = RecordFormat::of(directive);
+        if format == RecordFormat::V2 {
+            return None;
+        }
         let lamport = metadata.get(ENVELOPE_KEY_LAMPORT)?;
         let signature = metadata.get(ENVELOPE_KEY_SIGNATURE)?;
         let parents = metadata
@@ -648,9 +654,10 @@ impl LedgerService {
                 lamport,
                 &self.author_id,
                 signature,
+                format,
             )
         } else if let Some(signer) = &self.signer {
-            signer(content_id, is_transaction, parents, lamport).as_deref()
+            signer(content_id, is_transaction, parents, lamport, format).as_deref()
                 == Some(signature.as_str())
         } else {
             false
@@ -715,6 +722,7 @@ impl LedgerService {
                         lamport,
                         author,
                         signature,
+                        RecordFormat::of(directive),
                     ) =>
                 {
                     HistoryVerdict::Verified
@@ -728,7 +736,13 @@ impl LedgerService {
         let Some(signer) = &self.signer else {
             return HistoryVerdict::Unverifiable;
         };
-        match signer(content_id, is_transaction, parents, lamport) {
+        match signer(
+            content_id,
+            is_transaction,
+            parents,
+            lamport,
+            RecordFormat::of(directive),
+        ) {
             // Signing disabled: this node produces no signatures and cannot
             // say what one should look like.
             None => HistoryVerdict::Unverifiable,

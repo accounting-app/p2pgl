@@ -33,10 +33,13 @@ pub(super) const ENVELOPE_KEY_LAMPORT: &str = "openledger-lamport";
 pub(super) const ENVELOPE_KEY_PARENTS: &str = "openledger-parents";
 /// `openledger-signature` — hex Ed25519 signature over the envelope binding.
 pub(super) const ENVELOPE_KEY_SIGNATURE: &str = "openledger-signature";
+/// `openledger-format` — `"2"` on a Format v2 record (identity v2, signature
+/// v4); absent on every v1 record. See [`crate::hash::RecordFormat`].
+pub(super) const ENVELOPE_KEY_FORMAT: &str = crate::hash::FORMAT_KEY;
 
 /// The closed set of envelope metadata keys (§3.3.1).
 ///
-/// These four keys — and only these — are written by
+/// These keys — and only these — are written by
 /// [`LedgerService::stamp_transaction_envelope`] and
 /// [`LedgerService::stamp_directive_envelope`], accepted in a remote `Supply`
 /// envelope (`p2p::union_merge::ALLOWED_ENVELOPE_KEYS` aliases this slice, so
@@ -49,6 +52,7 @@ pub const ENVELOPE_KEYS: &[&str] = &[
     ENVELOPE_KEY_LAMPORT,
     ENVELOPE_KEY_PARENTS,
     ENVELOPE_KEY_SIGNATURE,
+    ENVELOPE_KEY_FORMAT,
 ];
 
 /// Maximum number of entries in `openledger-parents` (M-4, L-14, T41).
@@ -205,7 +209,7 @@ pub fn validate_body_envelope_keys(
 }
 
 /// Drop every `openledger-*` key a node-written record may not carry — at
-/// directive level, one that is not one of the four [`ENVELOPE_KEYS`]; at
+/// directive level, one that is not one of the [`ENVELOPE_KEYS`]; at
 /// posting level, every one — and return what was dropped, posting-level keys
 /// prefixed `posting:` (T83 / L-89; T89 / L-109, L-112, decision (34)).
 ///

@@ -10,7 +10,7 @@ use ledger::hash::compute_content_id;
 use ledger::model::Directive;
 use ledger::serialize::economic_canonical_serialize;
 
-use crate::protocol::{DirectiveKind, SupplyEntry, WireMessage};
+use crate::protocol::{DirectiveKind, SupplyEntry, WireCodec, WireMessage};
 
 /// Create an announce message for a directive that was just inserted locally.
 pub fn make_announce(directive: &Directive) -> WireMessage {
@@ -47,7 +47,18 @@ pub fn encode_broadcast(msg: &WireMessage) -> Result<Bytes, String> {
 /// Enforces the 16 MiB cap and `v == 1` (H-7). Gossip is already framed by
 /// iroh-gossip, so this is CBOR-only (no extra length prefix).
 pub fn decode_broadcast(data: &[u8]) -> Result<WireMessage, String> {
-    WireMessage::decode_checked(data).map_err(|error| error.to_string())
+    decode_broadcast_in(WireCodec::V1, data)
+}
+
+/// [`encode_broadcast`] in `codec` (Format v2, Facet C): a wire-v2 node
+/// gossips on its own topic, in its own encoding.
+pub fn encode_broadcast_in(codec: WireCodec, msg: &WireMessage) -> Result<Bytes, String> {
+    Ok(Bytes::from(msg.to_cbor_in(codec)?))
+}
+
+/// [`decode_broadcast`] in `codec`: the same gates as the anti-entropy path.
+pub fn decode_broadcast_in(codec: WireCodec, data: &[u8]) -> Result<WireMessage, String> {
+    WireMessage::decode_checked_in(codec, data).map_err(|error| error.to_string())
 }
 
 /// Extract envelope metadata from a directive, for the wire.
@@ -189,6 +200,18 @@ mod tests {
             entry.id, computed_id,
             "Supply entry id must match hash of economic body"
         );
+    }
+
+    /// Format v2, Facet C: an announce round-trips in the wire-v2 encoding,
+    /// and neither encoding reads the other's bytes.
+    #[test]
+    fn wire_v2_broadcast_roundtrips_and_is_not_v1() {
+        let msg = WireMessage::announce("a".repeat(64), DirectiveKind::Transaction);
+        let v2 = encode_broadcast_in(WireCodec::V2, &msg).unwrap();
+        assert_eq!(decode_broadcast_in(WireCodec::V2, &v2).unwrap(), msg);
+        assert!(decode_broadcast(&v2).is_err());
+        let v1 = encode_broadcast(&msg).unwrap();
+        assert!(decode_broadcast_in(WireCodec::V2, &v1).is_err());
     }
 
     #[test]

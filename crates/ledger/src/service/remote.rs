@@ -155,7 +155,7 @@ impl LedgerService {
         // H-04: reject before the Lamport clock is adopted or the DAG touched.
         validate_directive_dates(&directive)?;
         // H-06: the merged envelope legitimately sits at directive level here,
-        // so the four envelope keys are allowed there — but nothing else with
+        // so the envelope keys are allowed there — but nothing else with
         // the prefix, and nothing at all at posting level (defense in depth
         // behind `validate_supply_entry`, which allows none anywhere).
         validate_body_envelope_keys(&directive, ENVELOPE_KEYS)?;

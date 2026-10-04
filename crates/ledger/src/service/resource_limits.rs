@@ -346,6 +346,36 @@ pub(super) fn validate_file_envelope_form(directive: &Directive) -> Result<(), S
     validate_parent_txid_form(directive)?;
     // M-20's lamport half.
     validate_envelope_lamport_form(directive)?;
+    // Format v2: the marker's one value, and the author its id depends on.
+    validate_envelope_format_form(directive.metadata())
+}
+
+/// Format v2: `openledger-format`, when present, is `"2"` — a record is in one
+/// format or the other, never an unknown third — and a v2 record names its
+/// author, since its id is computed over it. Shared by the file paths and the
+/// wire (`p2p::union_merge`), so the two cannot disagree about a marker.
+pub fn validate_envelope_format_form(
+    envelope: &std::collections::BTreeMap<String, String>,
+) -> Result<(), ServiceError> {
+    let Some(format) = envelope.get(ENVELOPE_KEY_FORMAT) else {
+        return Ok(());
+    };
+    if format != crate::hash::FORMAT_V2 {
+        return Err(ServiceError::InvalidInput {
+            message: format!(
+                "openledger-format must be \"{}\" (Format v2) or absent, got a {}-byte value",
+                crate::hash::FORMAT_V2,
+                format.len()
+            ),
+        });
+    }
+    if !envelope.contains_key(ENVELOPE_KEY_AUTHOR) {
+        return Err(ServiceError::InvalidInput {
+            message: "a Format v2 record (openledger-format: \"2\") must name its author: its \
+                      id is computed over it"
+                .to_owned(),
+        });
+    }
     Ok(())
 }
 

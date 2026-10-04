@@ -282,8 +282,16 @@ async fn main() {
     // Boot the ledger service (§3.3).
     // Replaced by the key's EndpointId once the key is loaded, whenever signing
     // is enabled (T80); a signing-off node keeps it.
+    //
+    // Format v2 (Facets A + B): the format this node writes through its API.
+    // Those writes happen once the key's author id is set, so a v2 id is
+    // computed over the final author.
     let author_id = ledger::service::PLACEHOLDER_AUTHOR.to_owned();
-    let service = match ledger::service::LedgerService::boot(&ledger_path, author_id) {
+    let service = match ledger::service::LedgerService::boot_emitting(
+        &ledger_path,
+        author_id,
+        config.format.record_format(),
+    ) {
         Ok(service) => service,
         Err(error) => {
             error!(%error, "failed to boot ledger service — aborting");
@@ -447,7 +455,7 @@ async fn main() {
             error!("p2p.enabled is true but no secret key was loaded — aborting");
             std::process::exit(1);
         };
-        match p2p_service::boot_p2p(&config.p2p, secret_key).await {
+        match p2p_service::boot_p2p(&config.p2p, secret_key, config.format.wire_codec()).await {
             Ok(peer_node) => {
                 // §3.3.1: the ledger author IS the endpoint id. T80 set it from
                 // the key above (signing is forced on with P2P); the endpoint
@@ -516,6 +524,8 @@ async fn main() {
                     // M-39 (T69): one map for the node, shared by every clone.
                     supply_backoff: anti_entropy_alpn::SupplyBackoff::default(),
                     join_peer,
+                    // Format v2, Facet C: what this node dials and gossips in.
+                    wire_codec: config.format.wire_codec(),
                 };
                 Some((peer_node, handler))
             }
@@ -557,13 +567,21 @@ async fn main() {
     if config.signing.enabled {
         let signer_for_reconcile = Arc::clone(&signer);
         shared_ledger.write().await.set_signer(Arc::new(
-            move |content_id: &str, is_transaction: bool, parents: &str, lamport: &str| {
-                signer_for_reconcile.sign(&security::signing::SignableMessage {
-                    content_id,
-                    is_transaction,
-                    parents,
-                    lamport,
-                })
+            move |content_id: &str,
+                  is_transaction: bool,
+                  parents: &str,
+                  lamport: &str,
+                  format: ledger::hash::RecordFormat| {
+                // Format v2: the record says which message it is signed in.
+                signer_for_reconcile.sign_in(
+                    p2p::union_merge::signature_version(format),
+                    &security::signing::SignableMessage {
+                        content_id,
+                        is_transaction,
+                        parents,
+                        lamport,
+                    },
+                )
             },
         ));
     }
@@ -585,8 +603,10 @@ async fn main() {
                   parents: &str,
                   lamport: &str,
                   author: &str,
-                  signature: &str| {
-                security::signing::verify_signature(
+                  signature: &str,
+                  format: ledger::hash::RecordFormat| {
+                security::signing::verify_signature_in(
+                    p2p::union_merge::signature_version(format),
                     &security::signing::SignableMessage {
                         content_id,
                         is_transaction,
@@ -1090,10 +1110,15 @@ fn build_signature_provider(
         };
         // Bind signatures to this node's mesh identity so they cannot be
         // replayed into another mesh (L2 / L-23).
+        // Format v2 (Facet B): the API's writes are this node's records, in its
+        // own format, so the provider signs them in that format's message.
         let provider = security::signing::PeerKeySignatureProvider::from_bytes(
             secret_key.bytes(),
             mesh_id.to_owned(),
-        );
+        )
+        .with_version(p2p::union_merge::signature_version(
+            config.format.record_format(),
+        ));
         info!(public_key = %provider.public_key_hex(), "signing enabled");
         Arc::new(provider)
     } else {
@@ -1628,6 +1653,7 @@ mod tests {
                 connections: peer_connections::PeerConnectionCache::new(),
                 supply_backoff: anti_entropy_alpn::SupplyBackoff::default(),
                 join_peer: None,
+                wire_codec: p2p::protocol::WireCodec::V1,
             }
             .mesh_id;
             assert_eq!(

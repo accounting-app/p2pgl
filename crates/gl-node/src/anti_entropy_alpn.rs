@@ -585,6 +585,10 @@ pub struct AntiEntropyHandler {
     /// is staged as [`ledger::service::RemoteSource::JoinPeer`], adopted past
     /// the adoption ratchet while the ledger's join window is open.
     pub join_peer: Option<EndpointId>,
+    /// The encoding this node dials and gossips in (`format.wire2`, Format
+    /// v2 Facet C). Inbound connections are served in whichever encoding their
+    /// ALPN names; this decides only what this node asks for.
+    pub wire_codec: p2p::protocol::WireCodec,
 }
 
 impl std::fmt::Debug for AntiEntropyHandler {
@@ -664,6 +668,10 @@ async fn serve_anti_entropy(
     connection: Connection,
     remote: EndpointId,
 ) -> Result<(), String> {
+    // Format v2, Facet C: an inbound connection is served in the encoding its
+    // ALPN names (the router routes only the two this node registers).
+    let codec = p2p::protocol::WireCodec::from_alpn(connection.alpn())
+        .unwrap_or(p2p::protocol::WireCodec::V1);
     // M-40: the session's wall-clock bound, started at accept. `io` alone is
     // per-frame and every frame refreshes it, so before this a peer that never
     // stalled — one ~30-byte `Announce` every `io - 1` — held this task and its
@@ -832,7 +840,7 @@ async fn serve_anti_entropy(
             // handling below, and is why only the read is wrapped.
             let read = tokio::time::timeout_at(
                 session.deadline,
-                read_message(&mut recv, frame_timeout, &mut reservation),
+                read_message_in(codec, &mut recv, frame_timeout, &mut reservation),
             )
             .await;
             let message = match read {
@@ -866,7 +874,7 @@ async fn serve_anti_entropy(
                     // L-01: charge for the whole advert before writing it.
                     requests_handled = requests_handled.saturating_add(pages.len());
                     for page in pages {
-                        if !write_within_session(&mut send, &page, &session).await? {
+                        if !write_within_session(&mut send, codec, &page, &session).await? {
                             ended =
                                 Some(session_deadline_mid_stream(handler, remote, streams_served));
                             break 'frames;
@@ -880,7 +888,7 @@ async fn serve_anti_entropy(
                     // read already took. Trimmed WHILE collecting (L-33).
                     let reply = collect_supply(&handler.ledger, &ids).await;
                     requests_handled = requests_handled.saturating_add(1);
-                    if !write_within_session(&mut send, &reply, &session).await? {
+                    if !write_within_session(&mut send, codec, &reply, &session).await? {
                         ended = Some(session_deadline_mid_stream(handler, remote, streams_served));
                         break 'frames;
                     }
@@ -980,13 +988,14 @@ fn session_deadline_mid_stream(
 /// exactly as `write_message` reported it before.
 async fn write_within_session(
     send: &mut SendStream,
+    codec: p2p::protocol::WireCodec,
     message: &WireMessage,
     session: &SessionBudget,
 ) -> Result<bool, String> {
     let Some(timeout) = session.clamped_io() else {
         return Ok(false);
     };
-    match write_message(send, message, timeout).await {
+    match write_message_in(codec, send, message, timeout).await {
         Ok(()) => Ok(true),
         Err(_) if session.expired() => Ok(false),
         Err(error) => Err(error),
@@ -1056,6 +1065,7 @@ async fn open_peer_session(
             &handler.allowlist,
             handler.timeouts.connect,
             Reuse::IfLive,
+            handler.wire_codec,
         )
         .await?;
     let open_error = match open_bi_bounded(&acquired.connection, handler.timeouts.open_stream).await
@@ -1086,6 +1096,7 @@ async fn open_peer_session(
             &handler.allowlist,
             handler.timeouts.connect,
             Reuse::Never,
+            handler.wire_codec,
         )
         .await?;
     match open_bi_bounded(&fresh.connection, handler.timeouts.open_stream).await {
@@ -1245,9 +1256,10 @@ async fn run_head_exchange(
 ) -> Result<(), String> {
     for page in local_have_heads_pages(&handler.ledger).await {
         let io = budget.charge_frame()?;
-        write_message(send, &page, io).await?;
+        write_message_in(handler.wire_codec, send, &page, io).await?;
     }
-    let (head_txids, directive_ids) = read_have_heads_advert(recv, remote, budget).await?;
+    let (head_txids, directive_ids) =
+        read_have_heads_advert(recv, handler.wire_codec, remote, budget).await?;
     // M-39: a peer backed off at the size cap is not asked for anything; the
     // advert above still ran, so it still learns our heads.
     if handler
@@ -1462,6 +1474,7 @@ fn check_advert_ids(remote: EndpointId, ids: &[String]) -> Result<(), String> {
 /// what the ids themselves can cost (M-26, L-53).
 async fn read_have_heads_advert(
     recv: &mut RecvStream,
+    codec: p2p::protocol::WireCodec,
     remote: EndpointId,
     budget: &mut SessionBudget,
 ) -> Result<(Vec<String>, Vec<String>), String> {
@@ -1478,7 +1491,7 @@ async fn read_have_heads_advert(
             directive_ids: page_directives,
             more,
             ..
-        } = read_message(recv, io_timeout, &mut FrameReservation::unmetered())
+        } = read_message_in(codec, recv, io_timeout, &mut FrameReservation::unmetered())
             .await
             .map_err(|error| error.to_string())?
         else {
@@ -1553,11 +1566,22 @@ async fn fetch_want_chunk(
         // chunks for an advert at the accumulation cap. Charging every frame
         // puts the whole of that under one budget and one deadline.
         let io_timeout = budget.charge_frame()?;
-        write_message(send, &WireMessage::want(remaining.clone()), io_timeout).await?;
+        write_message_in(
+            handler.wire_codec,
+            send,
+            &WireMessage::want(remaining.clone()),
+            io_timeout,
+        )
+        .await?;
         let io_timeout = budget.charge_frame()?;
-        let entries = match read_message(recv, io_timeout, &mut FrameReservation::unmetered())
-            .await
-            .map_err(|error| error.to_string())?
+        let entries = match read_message_in(
+            handler.wire_codec,
+            recv,
+            io_timeout,
+            &mut FrameReservation::unmetered(),
+        )
+        .await
+        .map_err(|error| error.to_string())?
         {
             WireMessage::Supply { entries, .. } => entries,
             other => {
@@ -2879,12 +2903,23 @@ fn made_progress(
     }
 }
 
+#[cfg(test)]
 async fn write_message(
     send: &mut SendStream,
     message: &WireMessage,
     io_timeout: Duration,
 ) -> Result<(), String> {
-    let bytes = message.to_wire()?;
+    write_message_in(p2p::protocol::WireCodec::V1, send, message, io_timeout).await
+}
+
+/// Write one length-prefixed frame in `codec`.
+async fn write_message_in(
+    codec: p2p::protocol::WireCodec,
+    send: &mut SendStream,
+    message: &WireMessage,
+    io_timeout: Duration,
+) -> Result<(), String> {
+    let bytes = message.to_wire_in(codec)?;
     match tokio::time::timeout(io_timeout, send.write_all(&bytes)).await {
         Ok(result) => result.map_err(|error| error.to_string()),
         // A stalled write is a torn-down session, not a clean shutdown, so this
@@ -2907,13 +2942,20 @@ async fn write_message(
 /// A frame within the cap is never rejectable here (only `Supply` legitimately
 /// exceeds it). A frame over the cap whose peek is too short to hold the
 /// discriminator is rejectable — it cannot be a well-formed `Supply`.
+#[cfg(test)]
 fn frame_is_rejectable(len: usize, peek: &[u8]) -> bool {
+    frame_is_rejectable_in(p2p::protocol::WireCodec::V1, len, peek)
+}
+
+/// [`frame_is_rejectable`] for the encoding `codec` names: a wire-v2 `Supply`
+/// opens with the one-entry map header and its `"supply"` key.
+fn frame_is_rejectable_in(codec: p2p::protocol::WireCodec, len: usize, peek: &[u8]) -> bool {
     if len <= NON_SUPPLY_FRAME_CAP {
         return false;
     }
     // The offset rule (map header at peek[0], tag entry after it) is stated once,
     // in `protocol`, so this gate and T43's pre-scan gate cannot drift apart.
-    !p2p::protocol::carries_supply_discriminator(peek)
+    !p2p::protocol::carries_supply_discriminator_in(codec, peek)
 }
 
 /// Why a frame read ended (T41).
@@ -3021,12 +3063,23 @@ impl ExactReader for RecvStream {
 /// Inbound (serve-side) reads pass a reservation from the handler's
 /// `ConnectionLimiter`; outbound reads pass [`FrameReservation::unmetered`] —
 /// see there for why the client side is not charged to the inbound budget.
+#[cfg(test)]
 async fn read_message(
     recv: &mut RecvStream,
     io_timeout: Duration,
     reservation: &mut FrameReservation,
 ) -> Result<WireMessage, FrameError> {
     read_frame(recv, io_timeout, reservation).await
+}
+
+/// [`read_message`] in `codec`.
+async fn read_message_in(
+    codec: p2p::protocol::WireCodec,
+    recv: &mut RecvStream,
+    io_timeout: Duration,
+    reservation: &mut FrameReservation,
+) -> Result<WireMessage, FrameError> {
+    read_frame_in(codec, recv, io_timeout, reservation).await
 }
 
 /// Read one length-prefixed CBOR frame, applying the M-16 oversized-frame gate
@@ -3044,7 +3097,22 @@ async fn read_message(
 /// bytes to serde. Nothing changes at this call site: the gate lives at the
 /// shared inbound choke point so the gossip-side decode is covered by the same
 /// code.
+#[cfg(test)]
 async fn read_frame<R>(
+    recv: &mut R,
+    io_timeout: Duration,
+    reservation: &mut FrameReservation,
+) -> Result<WireMessage, FrameError>
+where
+    R: ExactReader,
+{
+    read_frame_in(p2p::protocol::WireCodec::V1, recv, io_timeout, reservation).await
+}
+
+/// [`read_frame`] in `codec`: the same gates, with the peek and the decode of
+/// the encoding the connection speaks (Format v2, Facet C).
+async fn read_frame_in<R>(
+    codec: p2p::protocol::WireCodec,
     recv: &mut R,
     io_timeout: Duration,
     reservation: &mut FrameReservation,
@@ -3075,8 +3143,7 @@ where
     //    byte + the "type" entry: if it is not the `Supply` discriminator,
     //    reject now — WITHOUT reading or allocating the remaining `len` bytes.
     //    This tears down a ~670 MiB `Want`/`HaveHeads` vector after ~13 bytes.
-    let discriminator = p2p::protocol::SUPPLY_TYPE_DISCRIMINATOR;
-    let peek_len = 1 + discriminator.len();
+    let peek_len = codec.supply_peek_len();
     let mut body: Vec<u8> = Vec::new();
     if len > NON_SUPPLY_FRAME_CAP {
         let mut peek = vec![0u8; peek_len];
@@ -3085,7 +3152,7 @@ where
             Ok(Err(error)) => return Err(truncated_mid_frame(error)),
             Err(_elapsed) => return Err(FrameError::Timeout),
         }
-        if frame_is_rejectable(len, &peek) {
+        if frame_is_rejectable_in(codec, len, &peek) {
             return Err(FrameError::Protocol(format!(
                 "oversized non-supply frame: {len} bytes"
             )));
@@ -3130,7 +3197,8 @@ where
 
     // 4. Size + version + cardinality gates (H-7). Even a frame that passed the
     //    `Supply` discriminator gate is still bounded here.
-    WireMessage::decode_checked(&body).map_err(|error| FrameError::Protocol(error.to_string()))
+    WireMessage::decode_checked_in(codec, &body)
+        .map_err(|error| FrameError::Protocol(error.to_string()))
 }
 
 /// Test-only scaffolding. `pub(crate)` so the `p2p_service` network tests can
@@ -3270,6 +3338,7 @@ pub(crate) mod tests {
             connections: PeerConnectionCache::new(),
             supply_backoff: SupplyBackoff::default(),
             join_peer: None,
+            wire_codec: p2p::protocol::WireCodec::V1,
         }
     }
 
@@ -3383,6 +3452,63 @@ pub(crate) mod tests {
         .await
         .expect("a genuine large Supply must be accepted");
         assert_eq!(decoded, message, "round-trip mismatch on large Supply");
+    }
+
+    /// Format v2, Facet C: the reader's gates in the v2 encoding — an
+    /// oversized non-`Supply` v2 frame is refused after the peek (its body is
+    /// never provided), and a genuine large v2 `Supply` is read in full.
+    #[tokio::test]
+    async fn read_frame_in_v2_keeps_the_oversized_gate_and_admits_a_large_supply() {
+        let codec = p2p::protocol::WireCodec::V2;
+        let want_head = WireMessage::want(vec!["x".to_owned()])
+            .to_cbor_in(codec)
+            .unwrap();
+        let claimed_len = (NON_SUPPLY_FRAME_CAP + 1_000_000) as u32;
+        let mut framed = claimed_len.to_be_bytes().to_vec();
+        framed.extend_from_slice(&want_head);
+        let error = read_frame_in(
+            codec,
+            &mut slice_reader(&framed),
+            Duration::from_secs(1),
+            &mut FrameReservation::unmetered(),
+        )
+        .await
+        .expect_err("oversized non-supply v2 frame must be rejected");
+        assert!(
+            matches!(&error, FrameError::Protocol(message) if message.contains("oversized non-supply")),
+            "{error:?}"
+        );
+
+        let entries: Vec<p2p::protocol::SupplyEntry> = (0..12)
+            .map(|index| p2p::protocol::SupplyEntry {
+                id: format!("{index:064x}"),
+                kind: p2p::protocol::DirectiveKind::Open,
+                economic_bean: "x".repeat(120 * 1024),
+                envelope: std::collections::BTreeMap::new(),
+            })
+            .collect();
+        let message = WireMessage::supply(entries);
+        let wire = message.to_wire_in(codec).expect("frame large supply");
+        assert!(wire.len() - 4 > NON_SUPPLY_FRAME_CAP);
+        let decoded = read_frame_in(
+            codec,
+            &mut slice_reader(&wire),
+            Duration::from_secs(5),
+            &mut FrameReservation::unmetered(),
+        )
+        .await
+        .expect("a genuine large v2 Supply must be accepted");
+        assert_eq!(decoded, message);
+        // And a v1 frame is not read as v2.
+        let v1 = message.to_wire().expect("v1 frame");
+        assert!(read_frame_in(
+            codec,
+            &mut slice_reader(&v1),
+            Duration::from_secs(5),
+            &mut FrameReservation::unmetered(),
+        )
+        .await
+        .is_err());
     }
 
     /// Small frames of every variant still round-trip through the incremental
@@ -9363,6 +9489,109 @@ pub(crate) mod tests {
         assert!(
             !ledger.read().await.join_trust_open(),
             "closed once the join peer has nothing left"
+        );
+    }
+
+    /// Format v2, Facet C, over real QUIC: a server routing both anti-entropy
+    /// ALPNs answers each dialer in its own encoding, so a wire-v2 client and a
+    /// wire-v1 client both catch up from it. A wire-v2 client against a server
+    /// that routes only v1 gets nothing: it does not fall back to v1 — a
+    /// fallback is a downgrade path, and a failed dial is ambiguous with a down
+    /// peer.
+    ///
+    /// Bug-catch: dial v1 whatever `wire_codec` says, or serve v1 on the v2
+    /// ALPN, and the v2 client is never served (or the no-fallback client is).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wire_v2_and_v1_clients_both_catch_up_from_one_server() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+        let both = vec![
+            p2p::protocol::ANTI_ENTROPY_ALPN.to_vec(),
+            p2p::protocol::ANTI_ENTROPY_ALPN_V2.to_vec(),
+        ];
+        let bind = |alpns: Vec<Vec<u8>>| async move {
+            Endpoint::builder(presets::Minimal)
+                .alpns(alpns)
+                .bind()
+                .await
+                .expect("bind direct-only Iroh endpoint")
+        };
+        let endpoint_source = bind(both.clone()).await;
+        let endpoint_v1_only = bind(vec![p2p::protocol::ANTI_ENTROPY_ALPN.to_vec()]).await;
+        let endpoint_v1 = bind(both.clone()).await;
+        let endpoint_v2 = bind(both.clone()).await;
+        let endpoint_v2_stranded = bind(both).await;
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let boot = |name: &str, author: EndpointId| -> SharedLedger {
+            Arc::new(RwLock::new(
+                LedgerService::boot(temp_dir.path().join(name), author.to_string()).expect("boot"),
+            ))
+        };
+        let mut served = Vec::new();
+        let mut routers = Vec::new();
+        for (endpoint, name, v2) in [
+            (&endpoint_source, "source.bean", true),
+            (&endpoint_v1_only, "v1-only.bean", false),
+        ] {
+            let ledger = boot(name, endpoint.id());
+            {
+                let mut svc = ledger.write().await;
+                for account in ["Equity:Opening", "Assets:Cash"] {
+                    svc.open_account(account.to_owned(), day(1, 1), Vec::new())
+                        .expect("open");
+                }
+                svc.append_transaction(lifecycle_txn(
+                    "Assets:Cash",
+                    day(2, 1),
+                    rust_decimal::Decimal::from(7),
+                ))
+                .expect("append");
+            }
+            let clients = [
+                endpoint_v1.id().to_string(),
+                endpoint_v2.id().to_string(),
+                endpoint_v2_stranded.id().to_string(),
+            ];
+            let handler = make_handler(
+                ledger.clone(),
+                PeerAllowlist::parse(&clients).expect("allowlist"),
+            );
+            let mut router = Router::builder((*endpoint).clone())
+                .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler.clone());
+            if v2 {
+                router = router.accept(p2p::protocol::ANTI_ENTROPY_ALPN_V2, handler);
+            }
+            routers.push(router.spawn());
+            served.push(ledger);
+        }
+        let held = served[0].read().await.directive_count();
+        let mut outcomes = Vec::new();
+        for (endpoint, codec, server) in [
+            (&endpoint_v1, p2p::protocol::WireCodec::V1, &endpoint_source),
+            (&endpoint_v2, p2p::protocol::WireCodec::V2, &endpoint_source),
+            (
+                &endpoint_v2_stranded,
+                p2p::protocol::WireCodec::V2,
+                &endpoint_v1_only,
+            ),
+        ] {
+            let ledger = boot(&format!("{}.bean", endpoint.id()), endpoint.id());
+            let mut handler = make_handler(
+                ledger.clone(),
+                PeerAllowlist::parse(&[server.id().to_string()]).expect("allowlist"),
+            );
+            handler.wire_codec = codec;
+            wait_until_dialable(endpoint).await;
+            wait_until_dialable(server).await;
+            exchange_with_peer(endpoint, server.addr(), &handler).await;
+            outcomes.push(ledger.read().await.directive_count());
+        }
+        for router in routers {
+            let _ = router.shutdown().await;
+        }
+        assert_eq!(
+            outcomes,
+            vec![held, held, 0],
+            "(v1 client, v2 client, v2 client against a v1-only server)"
         );
     }
 

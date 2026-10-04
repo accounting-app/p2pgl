@@ -701,13 +701,20 @@ fn a_hand_transaction_adopted_with_a_signer_is_one_every_peer_accepts() {
     let path = scratch_ledger("m55");
     let mut node = LedgerService::boot(&path, key.public_key_hex()).expect("boot");
     node.set_signer(std::sync::Arc::new(
-        move |content_id: &str, is_transaction: bool, parents: &str, lamport: &str| {
-            signing.sign(&SignableMessage {
-                content_id,
-                is_transaction,
-                parents,
-                lamport,
-            })
+        move |content_id: &str,
+              is_transaction: bool,
+              parents: &str,
+              lamport: &str,
+              format: ledger::hash::RecordFormat| {
+            signing.sign_in(
+                p2p::union_merge::signature_version(format),
+                &SignableMessage {
+                    content_id,
+                    is_transaction,
+                    parents,
+                    lamport,
+                },
+            )
         },
     ));
     let sign_open = |key: std::sync::Arc<PeerKeySignatureProvider>| {
@@ -846,8 +853,10 @@ fn verifier() -> ledger::service::DirectiveVerifier {
               parents: &str,
               lamport: &str,
               author: &str,
-              signature: &str| {
-            security::signing::verify_signature(
+              signature: &str,
+              format: ledger::hash::RecordFormat| {
+            security::signing::verify_signature_in(
+                p2p::union_merge::signature_version(format),
                 &SignableMessage {
                     content_id,
                     is_transaction,
@@ -870,13 +879,20 @@ fn signing_node(path: &PathBuf, key: &std::sync::Arc<PeerKeySignatureProvider>) 
     let mut node = LedgerService::boot(path, key.public_key_hex()).expect("boot");
     let signing = std::sync::Arc::clone(key);
     node.set_signer(std::sync::Arc::new(
-        move |content_id: &str, is_transaction: bool, parents: &str, lamport: &str| {
-            signing.sign(&SignableMessage {
-                content_id,
-                is_transaction,
-                parents,
-                lamport,
-            })
+        move |content_id: &str,
+              is_transaction: bool,
+              parents: &str,
+              lamport: &str,
+              format: ledger::hash::RecordFormat| {
+            signing.sign_in(
+                p2p::union_merge::signature_version(format),
+                &SignableMessage {
+                    content_id,
+                    is_transaction,
+                    parents,
+                    lamport,
+                },
+            )
         },
     ));
     node.set_verifier(verifier());

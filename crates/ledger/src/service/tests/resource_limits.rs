@@ -1308,7 +1308,7 @@ fn test_remote_insert_rejects_body_envelope_keys() {
         .unwrap_err();
     assert_eq!(error.error_code(), "BODY_ENVELOPE_KEY");
 
-    // The four envelope keys at directive level are the normal case.
+    // The envelope keys at directive level are the normal case.
     assert!(svc
         .insert_remote_directive(Directive::Transaction(remote_transaction("honest", false)))
         .unwrap()

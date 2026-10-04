@@ -162,6 +162,7 @@ impl PeerConnectionCache {
         allowlist: &PeerAllowlist,
         connect_timeout: Duration,
         reuse: Reuse,
+        codec: p2p::protocol::WireCodec,
     ) -> Result<Acquired, AcquireError> {
         let slot = self.slot_for(addr.id, allowlist);
         let acquired = tokio::time::timeout(connect_timeout, async move {
@@ -186,7 +187,7 @@ impl PeerConnectionCache {
             // starting a second one.
             *pooled = None;
             let connection = endpoint
-                .connect(addr, p2p::protocol::ANTI_ENTROPY_ALPN)
+                .connect(addr, codec.alpn())
                 .await
                 .map_err(|error| AcquireError::Dial(error.to_string()))?;
             *pooled = Some(connection.clone());

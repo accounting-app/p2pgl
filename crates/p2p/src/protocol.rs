@@ -14,6 +14,14 @@ pub const WIRE_VERSION: u64 = 1;
 /// ALPN for the anti-entropy protocol.
 pub const ANTI_ENTROPY_ALPN: &[u8] = b"openledger/anti-entropy/1";
 
+/// ALPN for the anti-entropy protocol in the wire-v2 encoding (Format v2,
+/// Facet C). Served beside [`ANTI_ENTROPY_ALPN`] by every node that knows it;
+/// dialled only by a node configured for it (`format.wire2`).
+pub const ANTI_ENTROPY_ALPN_V2: &[u8] = b"openledger/anti-entropy/2";
+
+/// The in-band `v` a wire-v2 frame carries.
+pub const WIRE_VERSION_V2: u64 = 2;
+
 /// Maximum message size (16 MiB per §3.4.1).
 pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 
@@ -424,6 +432,282 @@ impl WireMessage {
         }
         let message = Self::decode_checked(&data[4..4 + len])?;
         Ok((message, 4 + len))
+    }
+}
+
+// ─── Wire v2 (Format v2, Facet C) ────────────────────────────────────────────
+//
+// The same messages, externally tagged: a frame is a one-entry map whose key is
+// the variant and whose value is the variant's fields, `{"supply": {"v": 2,
+// "entries": [...]}}`. serde dispatches on the key and decodes the body straight
+// into its struct, with no `Content` buffering of the whole frame — the
+// amplification the v1 pre-scans exist to bound. They stay, run over the inner
+// map, as belt-and-braces: cheap, and a bound on any future buffering inside a
+// variant. The encoding is chosen per connection by its ALPN, never in-band: a
+// frame's `v` cannot say how to decode the frame that carries it.
+
+/// Which encoding a connection, or a gossip topic, speaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireCodec {
+    /// `#[serde(tag = "type")]`, [`ANTI_ENTROPY_ALPN`], `v: 1`.
+    V1,
+    /// Externally tagged, [`ANTI_ENTROPY_ALPN_V2`], `v: 2`.
+    V2,
+}
+
+impl WireCodec {
+    /// The ALPN a connection in this encoding is opened with.
+    pub fn alpn(self) -> &'static [u8] {
+        match self {
+            WireCodec::V1 => ANTI_ENTROPY_ALPN,
+            WireCodec::V2 => ANTI_ENTROPY_ALPN_V2,
+        }
+    }
+
+    /// The encoding an accepted connection's ALPN names, if any.
+    pub fn from_alpn(alpn: &[u8]) -> Option<Self> {
+        if alpn == ANTI_ENTROPY_ALPN {
+            Some(WireCodec::V1)
+        } else if alpn == ANTI_ENTROPY_ALPN_V2 {
+            Some(WireCodec::V2)
+        } else {
+            None
+        }
+    }
+
+    /// How many leading bytes [`carries_supply_discriminator_in`] reads.
+    pub fn supply_peek_len(self) -> usize {
+        match self {
+            WireCodec::V1 => 1 + SUPPLY_TYPE_DISCRIMINATOR.len(),
+            WireCodec::V2 => 1 + SUPPLY_VARIANT_DISCRIMINATOR_V2.len(),
+        }
+    }
+}
+
+/// CBOR bytes of the `"supply"` key that opens a wire-v2 `Supply` frame, after
+/// the one-entry map header `0xA1`: `text(6) "supply"`.
+pub const SUPPLY_VARIANT_DISCRIMINATOR_V2: &[u8] = b"\x66supply";
+
+/// The one-entry map header every wire-v2 frame opens with.
+const V2_OUTER_MAP_HEADER: u8 = 0xA1;
+
+/// [`carries_supply_discriminator`] for the encoding `codec` names: whether
+/// `head` claims to be a `Supply`.
+pub fn carries_supply_discriminator_in(codec: WireCodec, head: &[u8]) -> bool {
+    match codec {
+        WireCodec::V1 => carries_supply_discriminator(head),
+        WireCodec::V2 => {
+            head.first() == Some(&V2_OUTER_MAP_HEADER)
+                && head.get(1..1 + SUPPLY_VARIANT_DISCRIMINATOR_V2.len())
+                    == Some(SUPPLY_VARIANT_DISCRIMINATOR_V2)
+        }
+    }
+}
+
+/// Every key a wire-v2 `Supply` body may carry: the variant's fields, no tag.
+pub(crate) const SUPPLY_V2_BODY_KEYS: &[&[u8]] = &[b"v", b"entries"];
+
+/// The wire-v2 frame, for decoding (owned).
+#[derive(Deserialize)]
+enum WireFrameV2 {
+    #[serde(rename = "announce")]
+    Announce {
+        v: u64,
+        id: String,
+        kind: DirectiveKind,
+    },
+    #[serde(rename = "have_heads")]
+    HaveHeads {
+        v: u64,
+        head_txids: Vec<String>,
+        #[serde(default)]
+        directive_ids: Vec<String>,
+        #[serde(default)]
+        more: bool,
+    },
+    #[serde(rename = "want")]
+    Want { v: u64, ids: Vec<String> },
+    #[serde(rename = "supply")]
+    Supply { v: u64, entries: Vec<SupplyEntry> },
+}
+
+/// The wire-v2 frame, for encoding (borrowed, so a 16 MiB `Supply` is not
+/// cloned to be sent).
+#[derive(Serialize)]
+enum WireFrameV2Ref<'a> {
+    #[serde(rename = "announce")]
+    Announce {
+        v: u64,
+        id: &'a str,
+        kind: &'a DirectiveKind,
+    },
+    #[serde(rename = "have_heads")]
+    HaveHeads {
+        v: u64,
+        head_txids: &'a [String],
+        #[serde(skip_serializing_if = "<[String]>::is_empty")]
+        directive_ids: &'a [String],
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        more: bool,
+    },
+    #[serde(rename = "want")]
+    Want { v: u64, ids: &'a [String] },
+    #[serde(rename = "supply")]
+    Supply { v: u64, entries: &'a [SupplyEntry] },
+}
+
+impl WireFrameV2 {
+    /// The in-memory message, with the in-band version checked: a wire-v2 frame
+    /// says `v: 2`; the in-memory message keeps [`WIRE_VERSION`], which is what
+    /// every in-memory reader of `v` compares against.
+    fn into_message(self) -> Result<WireMessage, WireError> {
+        let (v, message) = match self {
+            WireFrameV2::Announce { v, id, kind } => (v, WireMessage::announce(id, kind)),
+            WireFrameV2::HaveHeads {
+                v,
+                head_txids,
+                directive_ids,
+                more,
+            } => (
+                v,
+                WireMessage::have_heads_page(head_txids, directive_ids, more),
+            ),
+            WireFrameV2::Want { v, ids } => (v, WireMessage::want(ids)),
+            WireFrameV2::Supply { v, entries } => (v, WireMessage::supply(entries)),
+        };
+        if v != WIRE_VERSION_V2 {
+            return Err(WireError::UnsupportedVersion(v));
+        }
+        Ok(message)
+    }
+}
+
+impl WireMessage {
+    fn as_v2(&self) -> WireFrameV2Ref<'_> {
+        match self {
+            WireMessage::Announce { id, kind, .. } => WireFrameV2Ref::Announce {
+                v: WIRE_VERSION_V2,
+                id,
+                kind,
+            },
+            WireMessage::HaveHeads {
+                head_txids,
+                directive_ids,
+                more,
+                ..
+            } => WireFrameV2Ref::HaveHeads {
+                v: WIRE_VERSION_V2,
+                head_txids,
+                directive_ids,
+                more: *more,
+            },
+            WireMessage::Want { ids, .. } => WireFrameV2Ref::Want {
+                v: WIRE_VERSION_V2,
+                ids,
+            },
+            WireMessage::Supply { entries, .. } => WireFrameV2Ref::Supply {
+                v: WIRE_VERSION_V2,
+                entries,
+            },
+        }
+    }
+
+    /// Encode to CBOR bytes in `codec` (without length prefix).
+    pub fn to_cbor_in(&self, codec: WireCodec) -> Result<Vec<u8>, String> {
+        match codec {
+            WireCodec::V1 => self.to_cbor(),
+            WireCodec::V2 => {
+                let mut buffer = Vec::new();
+                ciborium::into_writer(&self.as_v2(), &mut buffer)
+                    .map_err(|error| error.to_string())?;
+                Ok(buffer)
+            }
+        }
+    }
+
+    /// [`Self::decode_checked`] for the encoding `codec` names: the same size,
+    /// pre-scan, version and cardinality gates.
+    pub fn decode_checked_in(codec: WireCodec, data: &[u8]) -> Result<Self, WireError> {
+        match codec {
+            WireCodec::V1 => Self::decode_checked(data),
+            WireCodec::V2 => {
+                if data.len() > MAX_MESSAGE_SIZE as usize {
+                    return Err(WireError::MessageTooLarge(data.len()));
+                }
+                prescan_frame_v2(data)?;
+                let frame: WireFrameV2 = ciborium::from_reader(data)
+                    .map_err(|error| WireError::CborDecode(elide_decode_error(&error)))?;
+                let message = frame.into_message()?;
+                message.check_cardinality()?;
+                Ok(message)
+            }
+        }
+    }
+
+    /// [`Self::to_wire`] in `codec`: `uint32_be || cbor_body`.
+    pub fn to_wire_in(&self, codec: WireCodec) -> Result<Vec<u8>, String> {
+        match codec {
+            WireCodec::V1 => self.to_wire(),
+            WireCodec::V2 => {
+                let cbor = self.to_cbor_in(codec)?;
+                if cbor.len() > MAX_MESSAGE_SIZE as usize {
+                    return Err(format!(
+                        "wire message is {} bytes (max {MAX_MESSAGE_SIZE})",
+                        cbor.len()
+                    ));
+                }
+                let len: u32 = cbor
+                    .len()
+                    .try_into()
+                    .expect("frame length fits u32: MAX_MESSAGE_SIZE (16 MiB) is checked above");
+                let mut buf = Vec::with_capacity(4 + cbor.len());
+                buf.extend_from_slice(&len.to_be_bytes());
+                buf.extend_from_slice(&cbor);
+                Ok(buf)
+            }
+        }
+    }
+}
+
+/// The wire-v2 pre-scan: the outer one-entry map and its variant key, then the
+/// v1 policies run over the variant's body map — the `Supply` arm strict
+/// (`entries` required and bounded, no key but `v` and `entries`), the others
+/// tolerant — exactly as [`prescan_frame`] runs them over a v1 frame.
+fn prescan_frame_v2(data: &[u8]) -> Result<(), WireError> {
+    const VARIANTS: [&[u8]; 4] = [b"announce", b"have_heads", b"want", b"supply"];
+    let refuse = || WireError::FramePrescan(CborScanError::NotOneVariant);
+    if data.first() != Some(&V2_OUTER_MAP_HEADER) {
+        return Err(refuse());
+    }
+    // A variant name is a short definite text string: major type 3 with its
+    // length in the header byte (every name is under 24 bytes).
+    let header = *data.get(1).ok_or_else(refuse)?;
+    if header >> 5 != 3 || header & 0x1F >= 24 {
+        return Err(refuse());
+    }
+    let name_end = 2 + usize::from(header & 0x1F);
+    let name = data.get(2..name_end).ok_or_else(refuse)?;
+    if !VARIANTS.contains(&name) {
+        return Err(refuse());
+    }
+    let body = &data[name_end..];
+    let outcome = if name == b"supply" {
+        cbor_scan::scan_supply_frame(body, SUPPLY_ARRAY_BOUNDS, SUPPLY_V2_BODY_KEYS)
+    } else {
+        cbor_scan::scan_bounded_arrays(body, NON_SUPPLY_ARRAY_BOUNDS)
+    }
+    .map_err(WireError::FramePrescan)?;
+    match outcome {
+        ScanOutcome::WithinBounds => Ok(()),
+        ScanOutcome::OverBound {
+            label,
+            claimed,
+            max,
+        } => Err(WireError::BatchTooLarge {
+            kind: label,
+            count: saturating_count(claimed),
+            max,
+        }),
     }
 }
 
@@ -1671,5 +1955,189 @@ mod tests {
             metadata: BTreeMap::new(),
         });
         assert_eq!(DirectiveKind::from_directive(&open), DirectiveKind::Open);
+    }
+
+    // ── Wire v2 (Format v2, Facet C) ─────────────────────────────────────
+
+    fn every_variant() -> Vec<WireMessage> {
+        vec![
+            WireMessage::announce("a".repeat(64), DirectiveKind::Open),
+            WireMessage::have_heads_page(vec!["h".repeat(64)], vec!["d".repeat(64)], true),
+            WireMessage::have_heads(vec!["h".repeat(64)], Vec::new()),
+            WireMessage::want(vec!["w".repeat(64)]),
+            WireMessage::supply(vec![SupplyEntry {
+                id: "s".repeat(64),
+                kind: DirectiveKind::Open,
+                economic_bean: "2024-01-01 open Assets:Cash USD".to_owned(),
+                envelope: BTreeMap::from([("openledger-lamport".to_owned(), "1".to_owned())]),
+            }]),
+        ]
+    }
+
+    /// Every variant round-trips through wire v2, and the in-memory message is
+    /// the one v1 decodes — the encoding is the only difference.
+    #[test]
+    fn wire_v2_roundtrips_every_variant() {
+        for message in every_variant() {
+            let bytes = message.to_cbor_in(WireCodec::V2).expect("encode v2");
+            let decoded = WireMessage::decode_checked_in(WireCodec::V2, &bytes).expect("decode v2");
+            assert_eq!(decoded, message, "{}", message.variant_name());
+            let framed = message.to_wire_in(WireCodec::V2).expect("frame v2");
+            assert_eq!(&framed[4..], bytes.as_slice());
+        }
+    }
+
+    /// A wire-v2 frame is a one-entry map whose key is the variant: the
+    /// layout the peek gate and the pre-scan rely on, pinned against real bytes,
+    /// with the in-band `v` = 2.
+    #[test]
+    fn wire_v2_frames_open_with_their_variant() {
+        for message in every_variant() {
+            let bytes = message.to_cbor_in(WireCodec::V2).expect("encode");
+            let name = message.variant_name().as_bytes();
+            assert_eq!(bytes[0], 0xA1, "{}", message.variant_name());
+            assert_eq!(usize::from(bytes[1] & 0x1F), name.len());
+            assert_eq!(&bytes[2..2 + name.len()], name);
+            let is_supply = matches!(message, WireMessage::Supply { .. });
+            assert_eq!(
+                carries_supply_discriminator_in(WireCodec::V2, &bytes),
+                is_supply
+            );
+            assert!(!carries_supply_discriminator_in(WireCodec::V1, &bytes));
+            let v1 = message.to_cbor().expect("encode v1");
+            assert!(!carries_supply_discriminator_in(WireCodec::V2, &v1));
+        }
+        let supply = WireMessage::supply(Vec::new())
+            .to_cbor_in(WireCodec::V2)
+            .expect("encode");
+        assert_eq!(
+            &supply[..forged_v2_supply(&[]).len()],
+            forged_v2_supply(&[]).as_slice(),
+            "the crafted prefix below is what ciborium emits"
+        );
+    }
+
+    /// `{"supply": {"v": 2, "entries": ` exactly as ciborium emits it.
+    fn forged_v2_supply(entries_tail: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0xA1];
+        frame.extend_from_slice(SUPPLY_VARIANT_DISCRIMINATOR_V2);
+        frame.push(0xA2);
+        frame.extend_from_slice(b"\x61v\x02");
+        frame.extend_from_slice(b"\x67entries");
+        frame.extend_from_slice(entries_tail);
+        frame
+    }
+
+    /// The v1 gates, run over a v2 frame's body: an over-count array is refused
+    /// from its header alone, with no element bytes behind it — so serde never
+    /// saw the frame.
+    #[test]
+    fn wire_v2_prescan_refuses_over_count_arrays_before_decoding() {
+        let over = u32::try_from(MAX_SUPPLY_ENTRIES + 1).expect("small");
+        let frame = forged_v2_supply(&array_header_claiming(over));
+        assert!(matches!(
+            WireMessage::decode_checked_in(WireCodec::V2, &frame),
+            Err(WireError::BatchTooLarge { kind: "supply", .. })
+        ));
+        let mut want = vec![0xA1];
+        want.extend_from_slice(b"\x64want\xA2\x61v\x02\x63ids");
+        want.extend_from_slice(&array_header_claiming(
+            u32::try_from(MAX_WANT_IDS + 1).expect("small"),
+        ));
+        assert!(matches!(
+            WireMessage::decode_checked_in(WireCodec::V2, &want),
+            Err(WireError::BatchTooLarge { kind: "want", .. })
+        ));
+    }
+
+    /// A `Supply` body holds only its own fields, as the v1 allowlist demands
+    /// of a v1 frame (H-09).
+    #[test]
+    fn wire_v2_supply_refuses_a_key_the_variant_does_not_define() {
+        let mut frame = vec![0xA1];
+        frame.extend_from_slice(SUPPLY_VARIANT_DISCRIMINATOR_V2);
+        frame.push(0xA3);
+        frame.extend_from_slice(b"\x61v\x02");
+        frame.extend_from_slice(b"\x63pad\x00");
+        frame.extend_from_slice(b"\x67entries\x80");
+        assert_eq!(
+            WireMessage::decode_checked_in(WireCodec::V2, &frame),
+            Err(WireError::FramePrescan(CborScanError::UnknownKey))
+        );
+    }
+
+    /// Anything but a one-entry map naming a known variant is refused by the
+    /// pre-scan: a v1 frame, a two-entry map, an unknown or long name.
+    #[test]
+    fn wire_v2_refuses_frames_not_shaped_as_one_variant() {
+        let not_one_variant = WireError::FramePrescan(CborScanError::NotOneVariant);
+        let v1 = WireMessage::want(vec!["x".to_owned()])
+            .to_cbor()
+            .expect("v1");
+        let mut two = vec![0xA2];
+        two.extend_from_slice(b"\x64want\xA0\x64want\xA0");
+        let mut unknown = vec![0xA1];
+        unknown.extend_from_slice(b"\x64pull\xA0");
+        let mut long = vec![0xA1, 0x78, 30];
+        long.extend_from_slice(&[b'a'; 30]);
+        for frame in [v1, two, unknown, long, Vec::new(), vec![0xA1]] {
+            assert_eq!(
+                WireMessage::decode_checked_in(WireCodec::V2, &frame),
+                Err(not_one_variant.clone()),
+                "{frame:02x?}"
+            );
+        }
+    }
+
+    /// A v2 frame says `v: 2`; anything else is refused, and a v2 frame is not
+    /// a v1 one.
+    #[test]
+    fn wire_v2_checks_its_in_band_version_and_is_not_v1() {
+        let mut frame = vec![0xA1];
+        frame.extend_from_slice(b"\x64want\xA2\x61v\x01\x63ids\x80");
+        assert_eq!(
+            WireMessage::decode_checked_in(WireCodec::V2, &frame),
+            Err(WireError::UnsupportedVersion(1))
+        );
+        let v2 = WireMessage::want(Vec::new())
+            .to_cbor_in(WireCodec::V2)
+            .expect("encode");
+        assert!(
+            WireMessage::decode_checked(&v2).is_err(),
+            "v1 does not read v2"
+        );
+        assert_eq!(
+            WireCodec::from_alpn(ANTI_ENTROPY_ALPN_V2),
+            Some(WireCodec::V2)
+        );
+        assert_eq!(WireCodec::from_alpn(ANTI_ENTROPY_ALPN), Some(WireCodec::V1));
+        assert_eq!(WireCodec::from_alpn(b"openledger/anti-entropy/3"), None);
+    }
+
+    /// Honest maximal traffic decodes in v2 too: a `Supply` at the entry cap and
+    /// a `Want` at the id cap.
+    #[test]
+    fn wire_v2_admits_honest_frames_at_the_caps() {
+        let entries = (0..MAX_SUPPLY_ENTRIES)
+            .map(|index| SupplyEntry {
+                id: format!("{index:064x}"),
+                kind: DirectiveKind::Open,
+                economic_bean: "2024-01-01 open Assets:Cash USD".to_owned(),
+                envelope: ledger::service::ENVELOPE_KEYS
+                    .iter()
+                    .map(|key| ((*key).to_owned(), "1".to_owned()))
+                    .collect(),
+            })
+            .collect();
+        let want = (0..MAX_WANT_IDS)
+            .map(|index| format!("{index:064x}"))
+            .collect();
+        for message in [WireMessage::supply(entries), WireMessage::want(want)] {
+            let bytes = message.to_cbor_in(WireCodec::V2).expect("encode");
+            assert_eq!(
+                WireMessage::decode_checked_in(WireCodec::V2, &bytes).expect("decode"),
+                message
+            );
+        }
     }
 }

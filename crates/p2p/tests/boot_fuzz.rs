@@ -53,10 +53,11 @@
 //! a foreign-author line with a hand line stamped on top of it, two
 //! verification passes rebasing the same line, the placeholder author spelled
 //! by hand, an edited `open` with a hand re-open and transaction, the crash
-//! window on a refused line, decision (7) itself, and item (d)'s WARN. Two are
-//! `#[ignore]`d with their finding: A1-1 (a hand line stamped over an edited
-//! lamport keeps that lamport through the rebase) and A1-2 (the per-record
-//! remedy silences (d) while the child stays unadoptable).
+//! window on a refused line, decision (7) itself, and item (d)'s WARN. Two
+//! were `#[ignore]`d with their finding and run since T84: A1-1 (a hand line
+//! stamped over an edited lamport kept that lamport through the rebase) and
+//! A1-2 (the per-record remedy silenced (d) while the child stayed
+//! unadoptable).
 //! `boot_fuzz_a1_operators` sweeps the green A1 operators.
 //!
 //! ## A1 (0926 re-audit of T84)
@@ -74,12 +75,12 @@
 //! [`Checks::ALL`], so every sweep runs it; [`Checks::WITHOUT_FRESH_PEER`] is
 //! what `ALL` was before, for the cases that show what check 7 adds. Operators `(ai)`–`(ak)` are the shapes T84 names (an
 //! `open` dated after its transactions, a deleted `open` restored by hand,
-//! the strip-the-envelope remedy). Three cases are `#[ignore]`d with their
-//! finding: A1-1 (a peer's `open` that narrows an account makes the next
-//! restart quarantine history every replica holds), A1-2 (finalize's ceiling
-//! refusal leaves a record served over the line it refused), A1-3 (the
-//! "add the missing open" remedy is refused for an `open` dated after its
-//! transactions).
+//! the strip-the-envelope remedy). Three cases were `#[ignore]`d with their
+//! finding: A1-1, run since T91 (a peer's `open` that narrowed an account made
+//! the next restart quarantine history every replica holds), and A1-2 and
+//! A1-3, run since T92 (finalize's ceiling refusal left a record served over
+//! the line it refused; the "add the missing open" remedy was refused for an
+//! `open` dated after its transactions).
 //!
 //! ## A3 (0927 re-audit of T92)
 //!
@@ -214,13 +215,20 @@ fn short(id: &str) -> &str {
 fn signer_for(provider: &Arc<PeerKeySignatureProvider>) -> DirectiveSigner {
     let provider = Arc::clone(provider);
     Arc::new(
-        move |content_id: &str, is_transaction: bool, parents: &str, lamport: &str| {
-            provider.sign(&SignableMessage {
-                content_id,
-                is_transaction,
-                parents,
-                lamport,
-            })
+        move |content_id: &str,
+              is_transaction: bool,
+              parents: &str,
+              lamport: &str,
+              format: ledger::hash::RecordFormat| {
+            provider.sign_in(
+                p2p::union_merge::signature_version(format),
+                &SignableMessage {
+                    content_id,
+                    is_transaction,
+                    parents,
+                    lamport,
+                },
+            )
         },
     )
 }
@@ -234,8 +242,10 @@ fn verifier() -> DirectiveVerifier {
               parents: &str,
               lamport: &str,
               author: &str,
-              signature: &str| {
-            security::signing::verify_signature(
+              signature: &str,
+              format: ledger::hash::RecordFormat| {
+            security::signing::verify_signature_in(
+                p2p::union_merge::signature_version(format),
                 &SignableMessage {
                     content_id,
                     is_transaction,
@@ -1252,8 +1262,8 @@ enum Operator {
 
 /// Every operator that is green: [`OPERATORS_ENABLED`] plus the A2 operators
 /// that pin an existing mechanism, the four T79 closed (x, y, z, aa) and
-/// T80's placeholder history. (ab) is excluded — its test is `#[ignore]`d
-/// with the finding id until T83.
+/// T80's placeholder history. (ab) is not in this sweep: its own test
+/// (`op_ab_…`, closed by T83) pins it, and [`every_green_operator`] runs it.
 const OPERATORS_ALL: [Operator; 30] = [
     Operator::EditNarration,
     Operator::EditAmountBalanced,

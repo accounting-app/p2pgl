@@ -51,7 +51,28 @@ impl LedgerService {
     /// [`Self::finalize_operator_input`] once the node key is installed. A
     /// refusal is quarantined. See [`Self::unsigned_operator_input`].
     pub fn boot(file_path: impl Into<PathBuf>, author_id: String) -> Result<Self, ServiceError> {
-        Self::boot_with(file_path, author_id, BootMode::Fresh)
+        Self::boot_with(file_path, author_id, BootMode::Fresh, RecordFormat::V1)
+    }
+
+    /// [`Self::boot`], writing records in `format` (Format v2, Facets A + B).
+    ///
+    /// Under [`RecordFormat::V2`] every record this node writes through its
+    /// API carries `openledger-format: "2"`: its id covers its author (the one
+    /// in force at the write), and it is signed in signature v4. A line typed
+    /// into the `.bean` keeps v1 identity — see `stamp_file_directive` — so the
+    /// file's repairs keep their ids. Records are accepted in both formats
+    /// whatever `format` says.
+    pub fn boot_emitting(
+        file_path: impl Into<PathBuf>,
+        author_id: String,
+        format: RecordFormat,
+    ) -> Result<Self, ServiceError> {
+        Self::boot_with(file_path, author_id, BootMode::Fresh, format)
+    }
+
+    /// The format of the records this node writes.
+    pub fn emit_format(&self) -> RecordFormat {
+        self.emit_format
     }
 
     /// [`Self::boot`] with the caller saying whether this is a process start
@@ -61,6 +82,7 @@ impl LedgerService {
         file_path: impl Into<PathBuf>,
         author_id: String,
         mode: BootMode,
+        emit_format: RecordFormat,
     ) -> Result<Self, ServiceError> {
         let configured: PathBuf = file_path.into();
         let file_path = Self::resolve_boot_path(&configured, mode)?;
@@ -208,6 +230,7 @@ impl LedgerService {
             withheld_snapshot: std::sync::Mutex::new(None),
             staged_frontier: std::sync::Mutex::new(None),
             join_trust: false,
+            emit_format,
         };
 
         service.settle_boot_history(
@@ -510,7 +533,7 @@ impl LedgerService {
     /// records (T83 / L-89, T89 / L-112).
     fn drop_stray_envelope_keys(directives: &mut [Directive], file_path: &Path) {
         // T83 / L-89: H-06's closed envelope-key set. A directive-level
-        // `openledger-*` key that is not one of the four envelope keys, on a
+        // `openledger-*` key that is not one of the envelope keys, on a
         // node-written record, used to load as verified history, be served
         // locally and be written back by every compaction. It is outside the
         // content hash and the signature, and no peer ever sees it
@@ -1606,6 +1629,7 @@ impl LedgerService {
                 continue;
             };
             let is_transaction = matches!(directive, Directive::Transaction(_));
+            let format = RecordFormat::of(directive);
             let metadata = directive_metadata_mut(directive);
             metadata.insert(ENVELOPE_KEY_AUTHOR.to_owned(), author_id.clone());
             finalized += 1;
@@ -1614,7 +1638,7 @@ impl LedgerService {
                     let (parents, lamport) = Self::envelope_parents_and_lamport(metadata);
                     let (parents, lamport) = (parents.to_owned(), lamport.to_owned());
                     if let Some(signature_hex) =
-                        signer(content_id, is_transaction, &parents, &lamport)
+                        signer(content_id, is_transaction, &parents, &lamport, format)
                     {
                         metadata.insert(ENVELOPE_KEY_SIGNATURE.to_owned(), signature_hex);
                         signed += 1;

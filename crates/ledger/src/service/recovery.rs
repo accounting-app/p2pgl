@@ -64,6 +64,7 @@ impl LedgerService {
         RecoveryReload {
             file_path: self.file_path.clone(),
             author_id: self.author_id.clone(),
+            emit_format: self.emit_format,
             fingerprint: self.recovery_fingerprint(),
         }
     }
@@ -166,6 +167,7 @@ impl LedgerService {
                 self.file_path.clone(),
                 self.author_id.clone(),
                 BootMode::Reload,
+                self.emit_format,
             )
         };
         match reloaded {

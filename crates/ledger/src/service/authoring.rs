@@ -191,6 +191,9 @@ impl LedgerService {
         // The content id hashes the economic body only — the envelope stamped
         // next is excluded — so it is known before stamping, and the stamp
         // needs it to choose parents that cannot close a cycle (L-40).
+        // Format v2: except the author and the marker, which a v2 id covers;
+        // they are stamped first.
+        self.stamp_identity(&mut resolved.metadata);
         let content_id = compute_content_id(&Directive::Transaction(resolved.clone()));
 
         // Stamp envelope metadata (§3.3.1, §3.4.2). Refuses at the Lamport
@@ -714,7 +717,21 @@ impl LedgerService {
             ENVELOPE_KEY_LAMPORT.to_owned(),
             self.lamport_clock.to_string(),
         );
+        self.stamp_identity(metadata);
         Ok(())
+    }
+
+    /// Format v2: on a node writing v2 records, stamp the author and
+    /// `openledger-format: "2"` — the two envelope values a v2 id is computed
+    /// over. Nothing on a v1 node.
+    pub(super) fn stamp_identity(&self, metadata: &mut Metadata) {
+        if self.emit_format == RecordFormat::V2 {
+            metadata.insert(ENVELOPE_KEY_AUTHOR.to_owned(), self.author_id.clone());
+            metadata.insert(
+                ENVELOPE_KEY_FORMAT.to_owned(),
+                crate::hash::FORMAT_V2.to_owned(),
+            );
+        }
     }
 
     pub(super) fn envelope_parents_and_lamport(metadata: &Metadata) -> (&str, &str) {

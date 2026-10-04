@@ -1,6 +1,6 @@
 # Format v2 — the coordinated identity / signature / wire version transition (T45)
 
-**Status: DESIGN FOR DECISION — nothing here is implemented.**
+**Status: IMPLEMENTED (2026-10-04), off by default — decisions 1–3 taken as recommended. See §7 for where the build departs from this design.**
 **Date: 2026-09-21 · Baseline: HEAD `13beca5` (T18–T44 complete) · Author: security-campaign orchestrator**
 
 This document designs the one deliberate compatibility break the remediation campaign
@@ -228,3 +228,62 @@ pattern (spec → Opus implementation → line review → independent verificati
 ordered C → A+B, with the re-audit (Step 6) either before wave C or after A+B — before
 is recommended, so the audit baselines the campaign as shipped and v2 lands against a
 clean register.
+
+---
+
+## 7. Implementation (2026-10-04)
+
+All three facets ship, each behind its own switch in a new top-level config
+section: `format.wire2` (Facet C) and `format.idv2` (Facets A + B, one flag day
+as Decision 2 chose). Both default to `false`; every node accepts both formats
+regardless.
+
+**Facet C, as designed.** `WireCodec` selects the encoding per connection from
+its ALPN (`openledger/anti-entropy/2` served beside v1 by every node) and per
+gossip topic (`<swarmTopic>/2`); the client side dials what `format.wire2`
+says, with no fallback. The v1 pre-scans are kept and run over the variant's
+body map. Measured with `decode_memory`'s v2 twin: forged frames are refused at
+a 0-byte peak, and an honest maximal `Supply` decodes at ~1.02× its size — the
+same as v1 on this machine, since ciborium's string copies dominate. So the
+gain is structural (the encoding no longer depends on the pre-scan to avoid
+buffering a frame whole) rather than a measured peak; the pre-scan does still
+fire, not "never" as §3 expected.
+
+**Facets A + B, with three departures:**
+
+1. **One marker, not two.** `openledger-format: "2"` selects identity v2 *and*
+   signature v4. §1 and §2 proposed `openledger-idv` and `openledger-sigv`;
+   with Decision 2 bundling them, a second key would only add a state ("v2 id,
+   v3 signature") nothing should produce. The marker has one legal value, and a
+   v2 record must name its author (refused on the wire and held at boot
+   otherwise).
+2. **Only API writes are emitted in v2.** A line typed into the `.bean` keeps
+   v1 identity. The repairs every WARN prescribes — "delete its `openledger-*`
+   lines so it is re-adopted under the same id" — depend on it: the stripped
+   line is then the record's only copy, nothing can tell it from a new line,
+   and a v2 id would make it a second record beside the one every peer holds.
+   (An "epoch rule" keying on records the node knows was tried first and fails
+   exactly there.) A typed line that spells the marker itself stays v2.
+   Consequence: a hand-typed record is still squattable as before; API writes —
+   the main path — are not.
+3. **The signer and verifier callbacks take the record's format.** A node
+   signs and verifies each record in the format its own envelope declares, not
+   in the node's emitting format. Otherwise a node switching to v2 re-derived
+   its own v1 signatures as v4 at boot, found every one "edited" and
+   quarantined its whole history.
+
+**Tests** (`crates/p2p/tests/format_v2.rs`, plus unit tests in `hash.rs`,
+`security::signing`, `protocol.rs`, `decode_memory.rs` and gl-node): the
+squatting regression pinned in both directions; a mixed v1/v2 mesh converging
+and surviving restarts; 120 arrival orders of a mixed set converging to
+byte-identical files; v1 history verifying after the switch; tamper evidence
+(a stripped marker fails the id check); the marker's validation on both paths;
+real-QUIC exchanges in both encodings against one server and no fallback to v1.
+Every mechanism is revert-proven except the router's v2 registration in
+`spawn_router`, which needs a real `PeerNode`.
+
+**Not done from §4:** the full epoch matrix (every existing permutation and
+byte-identity suite re-run at v1-only, v2-only and mixed) — the targeted tests
+above cover the mixed window instead; and §6's suggested re-audit, since the
+audit series has ended.
+

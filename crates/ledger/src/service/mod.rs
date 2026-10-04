@@ -12,7 +12,7 @@ use tracing::{error, info, warn};
 
 use crate::dag::{DagError, InsertResult, LedgerDag};
 use crate::error::ParseError;
-use crate::hash::compute_content_id;
+use crate::hash::{compute_content_id, RecordFormat};
 use crate::model::*;
 use crate::parse::{
     parse_file, reject_control_characters, validate_account_name, validate_currency, validate_link,
@@ -80,8 +80,12 @@ type StagedFrontier = (
 /// `is_transaction` is a parameter rather than a call-site constant because
 /// reconcile signs whatever kind the file happens to contain, and the signed
 /// message's domain prefix differs between `txid` and `directiveId`.
-pub type DirectiveSigner =
-    std::sync::Arc<dyn Fn(&str, bool, &str, &str) -> Option<String> + Send + Sync>;
+///
+/// Format v2: the last argument is the format of the record being signed, so
+/// the signer makes a v4 signature exactly for a Format v2 record (Facet B).
+pub type DirectiveSigner = std::sync::Arc<
+    dyn Fn(&str, bool, &str, &str, crate::hash::RecordFormat) -> Option<String> + Send + Sync,
+>;
 
 /// Verifies the signature a file directive carries (H-20).
 ///
@@ -94,8 +98,12 @@ pub type DirectiveSigner =
 /// `security`, so `gl-node` builds this from
 /// `security::signing::verify_signature` and installs it with
 /// [`LedgerService::set_verifier`].
-pub type DirectiveVerifier =
-    std::sync::Arc<dyn Fn(&str, bool, &str, &str, &str, &str) -> bool + Send + Sync>;
+///
+/// Format v2: the last argument is the format the record's own envelope
+/// declares, which selects the signed message (v3 or v4) checked against.
+pub type DirectiveVerifier = std::sync::Arc<
+    dyn Fn(&str, bool, &str, &str, &str, &str, crate::hash::RecordFormat) -> bool + Send + Sync,
+>;
 
 /// What [`LedgerService::verify_history_directive`] concluded about one
 /// directive's signature (H-20).
@@ -595,6 +603,10 @@ pub struct LedgerService {
     /// from the node's join peer ([`RemoteSource::JoinPeer`]) is adopted
     /// without the adoption ratchet — see [`Self::open_join_trust`].
     join_trust: bool,
+    /// The format of the records this node writes (Format v2): `V1` until the
+    /// mesh flips (`format.idv2`). Records are accepted in either format
+    /// whatever this says. See [`Self::boot_emitting`].
+    emit_format: crate::hash::RecordFormat,
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

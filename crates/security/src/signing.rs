@@ -48,6 +48,13 @@ pub trait SignatureProvider: Send + Sync {
     /// Sign a directive. Returns hex-encoded signature or None if signing disabled.
     fn sign(&self, message: &SignableMessage<'_>) -> Option<String>;
 
+    /// Sign a directive in `version`, whatever this provider's default — for a
+    /// caller signing a record whose format it knows (Format v2, Facet B).
+    fn sign_in(&self, version: SignatureVersion, message: &SignableMessage<'_>) -> Option<String> {
+        let _ = version;
+        self.sign(message)
+    }
+
     /// Verify a signature against a signable message and author public key (hex).
     /// Returns Ok(()) if valid, Err with reason if invalid.
     fn verify(
@@ -117,6 +124,64 @@ pub fn build_sign_message(message: &SignableMessage<'_>, mesh_id: &str) -> Strin
     )
 }
 
+// ─── Signature v4 (Format v2, Facet B) ───────────────────────────────────────
+
+/// Which signed-message format a signature is made over (Format v2, Facet B).
+///
+/// v3 joins the fields with `|` and is injective only because every field is
+/// held to a character set that cannot contain one (M-01). v4 length-prefixes
+/// each field, so it is injective by construction and those constraints are
+/// defence in depth (L-06). A record says which it carries: v4 exactly when its
+/// envelope has `openledger-format: "2"`. v3 is verified indefinitely — history
+/// is signed under it and cannot be re-signed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SignatureVersion {
+    /// `openledger-sig-v3|…` — every record without the Format v2 marker.
+    #[default]
+    V3,
+    /// `"openledger-sig-v4" ‖ LP(kind) ‖ LP(content_id) ‖ LP(parents) ‖
+    /// LP(lamport) ‖ LP(mesh_id)` — Format v2 records.
+    V4,
+}
+
+/// Domain prefix of a v4 signed message.
+const SIG_PREFIX_V4: &[u8] = b"openledger-sig-v4";
+
+/// The v4 signed message: the domain prefix, then each field as its 8-byte
+/// big-endian length followed by its bytes. No separator to inject, so no
+/// field can be moved across a boundary.
+pub fn build_sign_message_v4(message: &SignableMessage<'_>, mesh_id: &str) -> Vec<u8> {
+    let kind: &[u8] = if message.is_transaction {
+        b"txid"
+    } else {
+        b"directiveId"
+    };
+    let mut bytes = SIG_PREFIX_V4.to_vec();
+    for field in [
+        kind,
+        message.content_id.as_bytes(),
+        message.parents.as_bytes(),
+        message.lamport.as_bytes(),
+        mesh_id.as_bytes(),
+    ] {
+        bytes.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(field);
+    }
+    bytes
+}
+
+/// The bytes a `version` signature is made over.
+pub fn sign_message_bytes(
+    version: SignatureVersion,
+    message: &SignableMessage<'_>,
+    mesh_id: &str,
+) -> Vec<u8> {
+    match version {
+        SignatureVersion::V3 => build_sign_message(message, mesh_id).into_bytes(),
+        SignatureVersion::V4 => build_sign_message_v4(message, mesh_id),
+    }
+}
+
 // ─── Noop provider ───────────────────────────────────────────────────────────
 
 /// Signing disabled — the default (§3.8).
@@ -150,6 +215,9 @@ pub struct PeerKeySignatureProvider {
     /// Mesh/ledger identity bound into every signature (L2, L-23). Resolved by
     /// the caller — see [`build_sign_message`].
     mesh_id: String,
+    /// The format [`SignatureProvider::sign`] signs in: the format of the
+    /// records this node writes (Format v2). [`Self::sign_in`] names its own.
+    version: SignatureVersion,
 }
 
 impl PeerKeySignatureProvider {
@@ -158,7 +226,21 @@ impl PeerKeySignatureProvider {
         PeerKeySignatureProvider {
             signing_key,
             mesh_id,
+            version: SignatureVersion::V3,
         }
+    }
+
+    /// This provider, signing in `version` by default (Format v2: v4 on a node
+    /// that writes Format v2 records).
+    pub fn with_version(mut self, version: SignatureVersion) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// The hex signature over the `version` message.
+    fn signature_in(&self, version: SignatureVersion, message: &SignableMessage<'_>) -> String {
+        let encoded = sign_message_bytes(version, message, &self.mesh_id);
+        hex::encode(self.signing_key.sign(&encoded).to_bytes())
     }
 
     /// Create from raw secret key bytes (32 bytes) and the node's mesh id.
@@ -167,6 +249,7 @@ impl PeerKeySignatureProvider {
         PeerKeySignatureProvider {
             signing_key,
             mesh_id,
+            version: SignatureVersion::V3,
         }
     }
 
@@ -177,6 +260,7 @@ impl PeerKeySignatureProvider {
         PeerKeySignatureProvider {
             signing_key,
             mesh_id: String::new(),
+            version: SignatureVersion::V3,
         }
     }
 
@@ -188,9 +272,11 @@ impl PeerKeySignatureProvider {
 
 impl SignatureProvider for PeerKeySignatureProvider {
     fn sign(&self, message: &SignableMessage<'_>) -> Option<String> {
-        let encoded = build_sign_message(message, &self.mesh_id);
-        let signature = self.signing_key.sign(encoded.as_bytes());
-        Some(hex::encode(signature.to_bytes()))
+        Some(self.signature_in(self.version, message))
+    }
+
+    fn sign_in(&self, version: SignatureVersion, message: &SignableMessage<'_>) -> Option<String> {
+        Some(self.signature_in(version, message))
     }
 
     fn verify(
@@ -199,7 +285,13 @@ impl SignatureProvider for PeerKeySignatureProvider {
         signature_hex: &str,
         author_public_key_hex: &str,
     ) -> Result<(), SignatureError> {
-        verify_signature(message, signature_hex, author_public_key_hex, &self.mesh_id)
+        verify_signature_in(
+            self.version,
+            message,
+            signature_hex,
+            author_public_key_hex,
+            &self.mesh_id,
+        )
     }
 
     fn is_enabled(&self) -> bool {
@@ -212,6 +304,25 @@ impl SignatureProvider for PeerKeySignatureProvider {
 /// Envelope fields on `message` and `mesh_id` must match those used when
 /// signing (§3.8.1 / L2).
 pub fn verify_signature(
+    message: &SignableMessage<'_>,
+    signature_hex: &str,
+    author_public_key_hex: &str,
+    mesh_id: &str,
+) -> Result<(), SignatureError> {
+    verify_signature_in(
+        SignatureVersion::V3,
+        message,
+        signature_hex,
+        author_public_key_hex,
+        mesh_id,
+    )
+}
+
+/// [`verify_signature`] over the `version` message — the version the record's
+/// own envelope declares (Format v2). A record whose marker was flipped is
+/// checked against the wrong message and fails: fail-closed.
+pub fn verify_signature_in(
+    version: SignatureVersion,
     message: &SignableMessage<'_>,
     signature_hex: &str,
     author_public_key_hex: &str,
@@ -236,7 +347,7 @@ pub fn verify_signature(
     let verifying_key = VerifyingKey::from_bytes(&pk_array)
         .map_err(|e| SignatureError::InvalidPublicKey(e.to_string()))?;
 
-    let encoded = build_sign_message(message, mesh_id);
+    let encoded = sign_message_bytes(version, message, mesh_id);
     // `verify_strict`, not `verify` (L-07). The permissive check is the
     // cofactorless equation alone, which accepts a signature whose `R` — or
     // whose *author key* — is a small-order point, and such a pair verifies
@@ -247,7 +358,7 @@ pub fn verify_signature(
     // keys produced by `SigningKey`/Iroh are never small-order, and a real
     // signature's `R` is not either.
     verifying_key
-        .verify_strict(encoded.as_bytes(), &signature)
+        .verify_strict(&encoded, &signature)
         .map_err(|e| SignatureError::InvalidSignature(e.to_string()))
 }
 
@@ -656,6 +767,98 @@ mod tests {
             noop.sign(&sample_message("any-id", true)),
             None,
             "Noop should return None"
+        );
+    }
+
+    // ── Signature v4 (Format v2, Facet B) ────────────────────────────────
+
+    /// The v4 message is the domain prefix and each field length-prefixed,
+    /// pinned against bytes built by hand; a v4 signature verifies as v4 and
+    /// never as v3, and a v3 one never as v4.
+    #[test]
+    fn signature_v4_is_length_prefixed_and_not_v3() {
+        let message = sample_message("abc123", true);
+        let mut expected = b"openledger-sig-v4".to_vec();
+        for field in [&b"txid"[..], b"abc123", b"", b"1", b"my-org/ledger"] {
+            expected.extend_from_slice(&(field.len() as u64).to_be_bytes());
+            expected.extend_from_slice(field);
+        }
+        assert_eq!(build_sign_message_v4(&message, "my-org/ledger"), expected);
+
+        let provider = PeerKeySignatureProvider::from_bytes(&[7; 32], "my-org/ledger".to_owned());
+        let key = provider.public_key_hex();
+        let v4 = provider
+            .sign_in(SignatureVersion::V4, &message)
+            .expect("enabled");
+        let v3 = provider
+            .sign_in(SignatureVersion::V3, &message)
+            .expect("enabled");
+        assert_ne!(v3, v4);
+        assert!(
+            verify_signature_in(SignatureVersion::V4, &message, &v4, &key, "my-org/ledger").is_ok()
+        );
+        assert!(
+            verify_signature_in(SignatureVersion::V3, &message, &v4, &key, "my-org/ledger")
+                .is_err()
+        );
+        assert!(
+            verify_signature_in(SignatureVersion::V4, &message, &v3, &key, "my-org/ledger")
+                .is_err()
+        );
+        assert!(
+            verify_signature(&message, &v3, &key, "my-org/ledger").is_ok(),
+            "v3 is unchanged"
+        );
+        let defaulted = provider.with_version(SignatureVersion::V4);
+        assert_eq!(defaulted.sign(&message).as_deref(), Some(v4.as_str()));
+    }
+
+    /// v4 is injective where v3 leans on character sets: moving a byte from one
+    /// field into the next changes the v4 message — and the same move against
+    /// v3's `|` separators is exactly what M-01's charset rules exist to stop.
+    #[test]
+    fn signature_v4_is_injective_across_every_field_boundary() {
+        let base = SignableMessage {
+            content_id: "ab",
+            is_transaction: true,
+            parents: "cd",
+            lamport: "12",
+        };
+        let moved = SignableMessage {
+            content_id: "a",
+            is_transaction: true,
+            parents: "bcd",
+            lamport: "12",
+        };
+        assert_ne!(
+            build_sign_message_v4(&base, "m"),
+            build_sign_message_v4(&moved, "m")
+        );
+        let lamport_into_mesh = SignableMessage {
+            lamport: "1",
+            ..base
+        };
+        assert_ne!(
+            build_sign_message_v4(&base, "m"),
+            build_sign_message_v4(&lamport_into_mesh, "2m")
+        );
+        // v3 is NOT injective without the charset rules: two different field
+        // splits produce one message (L-06) — M-01's constraints are all that
+        // stands between this and a forged split. v4 tells them apart.
+        let a = SignableMessage {
+            parents: "x|lamport|1",
+            lamport: "2",
+            ..base
+        };
+        let b = SignableMessage {
+            parents: "x",
+            lamport: "1|lamport|2",
+            ..base
+        };
+        assert_eq!(build_sign_message(&a, "m"), build_sign_message(&b, "m"));
+        assert_ne!(
+            build_sign_message_v4(&a, "m"),
+            build_sign_message_v4(&b, "m")
         );
     }
 }

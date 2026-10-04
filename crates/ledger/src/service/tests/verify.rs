@@ -176,7 +176,8 @@ fn h20_a_foreign_record_with_a_bad_signature_is_quarantined_by_the_verifier() {
               _parents: &str,
               _lamport: &str,
               author: &str,
-              signature: &str| {
+              signature: &str,
+              _format: crate::hash::RecordFormat| {
             recorder
                 .lock()
                 .unwrap()

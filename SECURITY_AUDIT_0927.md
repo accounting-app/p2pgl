@@ -2,6 +2,8 @@
 
 **Date:** 2026-09-27 · **Baseline:** HEAD `a5313a1` (branch `main`, clean tree) · **Previous:** [SECURITY_AUDIT_0926.md](SECURITY_AUDIT_0926.md) (HEAD `8c0a87e`)
 
+**Closing verification:** 2026-10-05 at HEAD `ef584ee` — the fixes T98–T103 re-checked against this report; see [§10](#10-closing-verification-2026-10-05).
+
 Scope: re-verification of **every** claim, revert-proof, existing-test change, behaviour change, design deviation and
 residual in the T90–T97 "Done" notes of [docs/OUTSTANDING_TASKS_09_26.md](docs/OUTSTANDING_TASKS_09_26.md) against
 source at HEAD, plus fresh hunts over the ~3,600 lines T90–T97 added or changed (18 files, six commits after the 0926
@@ -1046,6 +1048,70 @@ Beyond the closures in §1.1, these were probed adversarially and held.
 - The M-65 cap refusal is ~1 ms with 0 reloads.
 - The T96 gap verdicts are as documented; the 17 × (2^28 − 1) blind spot is confirmed with no WARN.
 - README §Verify's own query returns the documented fields.
+
+## 10. Closing verification (2026-10-05)
+
+The audit series ended on 2026-09-28, before an audit re-checked T98–T103 as each earlier round was re-checked by
+the next. This section is that check, scoped by decision to **verification only**: does each fix still close the
+findings this report assigned it, at HEAD `ef584ee` — after the `service.rs` split into `service/`, the `boot_with`
+and `adopt_file_directive` refactors, the elided-posting fix (`76f2096`), H-19's join window, the l114 write refusal
+and Format v2. No new hunt was run, so this section adds no finding IDs.
+
+**Method.**
+- Every mechanism each task's Done note names was located in source at HEAD, and every acceptance and new test it
+  names exists and runs (none is `#[ignore]`d).
+- The workspace gate was run once.
+- Revert checks were re-run in a scratch copy of HEAD (each edit applied, its named tests run, the file restored and
+  compared byte-identical). They were re-written against HEAD's code, since the original edits targeted
+  `service.rs` before the split.
+- Each Done note's residuals were read against the code.
+- The audit probes from the scratch harnesses (A1–A6, X1–X3, D1) were **not** re-run.
+
+**Gate at HEAD:** `cargo test --workspace --locked --no-fail-fast` — **1,518 passed, 1 failed, 0 ignored**.
+- The failure was gl-node's `a_frame_trickled_past_the_deadline_is_cut_at_the_deadline` (M-40, from T41). It failed
+  in its setup (`connect_retry: no dial succeeded (connect timed out)`) under the gate's load, not on the deadline it
+  tests.
+- It passed 5 of 5 runs in isolation, and is not part of T98–T103.
+
+**Revert checks re-run: 30 of the 45 the Done notes record.** Every one failed its named tests as the note says,
+except T98 R4 (below).
+
+| Task | Re-run | Findings re-proven by a revert at HEAD | Not re-proven here (tests pass; the note's own proof stands) |
+|---|---|---|---|
+| T98 | R1, R4 (as R4b), R5, R6, R7, R8 | M-09 remainder, M-75 | H-25 and L-153: the refusal they came from is deleted, so there is nothing to revert to. Verified structurally instead: the remote `close` arm inserts with no refusal, and gl-node's permanence doc is corrected. `h25_…` and `l153_…` pass. |
+| T99 | R1b, R2, R3, R4, R7, R8 | M-72, L-143, L-144, L-145 | L-142 (falls out of M-72's fix), L-146 (`a3_0927_4_…` passes) |
+| T100 | R1, R2, R4, R5, R6 | M-74, L-147, L-148, L-154 | L-149 (cost only) |
+| T101 | R1–R5 | M-71, L-137, L-138, L-139, and A5-5 | — |
+| T102 | R1, R2, R3, R6 | M-76, L-151 | L-150 (`a6_0927_3_…` passes), L-152 (`l152_…` passes) |
+| T103 | R1, R3, R4, R5 | M-73, L-140, L-141 | L-155 and L-156 (texts, no test), L-157 (`l157_…` passes) |
+
+**One observation, not a gap: T98 R4 is pinned only as a pair since T99.**
+- The served-set rule judges a body by the data rule in two places: `unservable_history` (service/verify.rs:129)
+  and the copy chooser T99 added (service/quarantine.rs:468), which re-admits the DAG's own copy when its body
+  passes.
+- Each covers for the other. Reverting either alone to the authoring fold leaves `x3_0927_2_…` and
+  `a2_0927_an_ingested_close_is_data_…` green, and the served set really is unchanged. Reverting both fails both
+  tests.
+- At T98's commit only the first check existed, so its recorded R4 was correct then. The overlap is the same kind
+  T99's Done note records for the closure's rescue and the boot re-admission.
+
+**Residuals:** every residual in the six Done notes was checked against the code and still holds as stated. Among
+them:
+- `is_open` is still the plain lifecycle fold, and `AccountClosed` is still kept as an account-wait target;
+- `alternative_copies` is never cleared;
+- no lamport floor is persisted;
+- hints stay one per id;
+- the L-140 live refusal is not held.
+
+T103's unnumbered "new, for the next audit" item (boot served a complete envelope with an elided posting when no
+verifier could check it) was fixed in `76f2096`, pinned by `a_history_record_with_an_elided_posting_is_held_at_boot`.
+
+**Register after this check:**
+- **Closed by mechanism:** H-25, the M-09 remainder, M-71 … M-76, and L-137 … L-157 (L-155 and L-156 are texts,
+  checked by reading).
+- **Implemented as T45 (Format v2, `ef584ee`), off by default:** M-10 and L-06. They are closed on a mesh that turns
+  `format.idv2` on.
+- **Still deferred by decision:** H-01 (loopback API key) and L-23 (`meshId` still optional).
 
 ---
 

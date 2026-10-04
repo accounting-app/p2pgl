@@ -504,6 +504,8 @@ boot saying so; `meshId` becomes required in a later release.
 | `p2p.enabled` | `false` | Enable Iroh mesh replication |
 | `p2p.secretKeyPath` | `./data/iroh.secret` | The node's Ed25519 key — its QUIC identity **and** its signing key. Created `0600` if absent. An existing file is refused unless it is a regular file (not a symlink), owned by the uid the node runs as, and not readable by group or other |
 | `p2p.bootstrapEndpointIds` | `[]` | Allowlisted peer EndpointIds; empty drops inbound `Supply` |
+| `format.wire2` | `false` | Dial anti-entropy and gossip in the wire-v2 encoding (§Format v2). Both encodings are always served |
+| `format.idv2` | `false` | Write records in Format v2 — an id that covers the author, signed in signature v4 (§Format v2). Both formats are always accepted |
 | `p2p.joinFrom` | unset | One of `bootstrapEndpointIds` that a node which has written nothing joins from: its history is adopted past the adoption ratchet until the node holds all of it (§Mesh identity, *Joining a mesh*) |
 | `p2p.gossipIntervalMilliseconds` | `5000` | Accepted but currently unused (reserved for gossip pacing) |
 | `p2p.antiEntropyIntervalMilliseconds` | `5000` | ALPN head-exchange cadence; minimum `100` |
@@ -840,6 +842,44 @@ honest head unmerged), and a peer's transaction is never refused for the number
 of heads its author holds on this node (that bound made DAG membership depend on
 which subset a peer chose to serve first; frontier size is a cost every replica
 pays alike, divergence is not).
+
+### Format v2 (`format.wire2`, `format.idv2`)
+
+Format v2 is the one coordinated change to what nodes put on the wire and in
+the ledger (the design is `docs/FORMAT_V2_DESIGN.md`). Every node on this build
+**accepts** both formats; the two switches decide only what a node **emits**, so
+a mesh moves one node at a time. Upgrade every node to this build first: an
+older build refuses what a switched node sends.
+
+**`format.wire2` — the wire encoding.** Frames are sent externally tagged
+(`{"supply": {...}}`), so a node decodes a frame straight into its message
+instead of buffering it whole first; the size and count checks of the old
+encoding still run in front of it. A switched node dials the
+`openledger/anti-entropy/2` protocol and gossips on `<swarmTopic>/2`; every node
+serves both protocols, so anti-entropy works across a mixed mesh, while
+announcements reach only the nodes on the same topic until everyone has
+switched (anti-entropy still delivers everything). It changes nothing stored
+and can be switched back. Switch it first.
+
+**`format.idv2` — record identity and signatures.** A record written through
+the API carries `openledger-format: "2"`. Its id then covers its author as well
+as its body, so another peer that publishes the same body first owns only its
+own copy — not yours (before, the first copy of a body held the id, whoever
+signed it). And it is signed over a length-prefixed message, which no field
+value can shift across a field boundary. Two consequences to know before
+switching:
+
+- **The same body from two different authors is two records**, both counted.
+  The same author writing the same body twice is still one record.
+- **Existing records keep their v1 ids and signatures forever** — nothing is
+  rewritten — and a node that switches still verifies its own v1 history.
+
+A line typed into the `.bean` keeps v1 identity on a switched node, so every
+repair this README prescribes ("delete its `openledger-*` lines so it is
+re-adopted under the same id") still gives the record back its id; a typed line
+that spells `openledger-format: "2"` itself (with its `openledger-author`) stays
+v2. Like `meshId`, switch it mesh-wide in one window, so the mesh does not
+write the same transaction under both formats.
 
 ### Using Auth
 
