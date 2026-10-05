@@ -23,6 +23,7 @@ known residuals, see that task's "Done" note in the tracker.
 
 **Configuration**
 
+- **`auth.enabled` defaults to `true` (H-01).** A config with no `auth` section now requires `X-Api-Key` on `/graphql`. On a loopback bind with no key configured, the first boot generates one into `auth.apiKeyPath` (default `./data/api.key`, mode 0600) and later boots reuse it; clients must send it. To keep the old behaviour, set `"auth": { "enabled": false }` — loopback only, and boot WARNs every time. A public bind still needs a key you set.
 - `externalFileEdits` is removed, and a config that still carries it is refused at boot by name. It only ever gated the file watcher, so use `watchLedgerFile: true` for that. Hand edits are always adopted (M-19, T52).
 - Older binaries reject every new key listed under *Added* (`deny_unknown_fields`). That includes `watchLedgerFile`, `http.maxConnectionsPerIp` and the eight `p2p.antiEntropy*` keys (R-13).
 - `auth.apiKey`, from the file or `GL_NODE_API_KEY`, must be printable ASCII with no surrounding whitespace. Boot refuses any other key and does not echo it. A key like that could never match an `X-Api-Key` header, so every request got `401` (L-50, T55).
@@ -145,6 +146,7 @@ known residuals, see that task's "Done" note in the tracker.
 
 ### Added
 
+- `auth.apiKeyPath` (default `./data/api.key`): where a loopback node with no `auth.apiKey` keeps the key it generates on its first boot (H-01).
 - Format v2 (T45; `docs/FORMAT_V2_DESIGN.md`), off by default and accepted always. `format.wire2`: the anti-entropy and gossip frames in an externally tagged encoding, on the `openledger/anti-entropy/2` protocol (served beside v1) and the `<swarmTopic>/2` topic. `format.idv2`: API writes carry `openledger-format: "2"`, their id covers their author (another peer can no longer take a record's id by publishing its body first — M-10) and they are signed over a length-prefixed message (L-06). Lines typed into the `.bean` keep v1 identity, so the file's repairs keep their ids.
 - `p2p.joinFrom`: a node that has written nothing can join a mesh whose history carries a lamport gap by naming a current peer — its history is adopted past the adoption ratchet until the node holds all of it, then the ratchet applies to it like any peer. Before, such a node could only join by copying a peer's `.bean` (H-19). A removed author's transaction still needs the copy.
 - `watchLedgerFile` (default `false`): poll the `.bean` every 250 ms and fold hand edits in promptly (M-19, T52).
@@ -168,6 +170,7 @@ known residuals, see that task's "Done" note in the tracker.
 
 ### Security
 
+- **H-01:** the API is authenticated by default on a loopback bind too, with a generated key in a node-private file read under the node's secret-key rules (no symlink, owned by the node's user, mode 0600, one link). Before, any program or account on the machine — or a page past the browser checks — could write the ledger.
 - **H-07 / H-12:** one lamport-ceiling rule on every path, plus a `2^32` adoption ratchet. One peer directive can no longer make a node author records nobody accepts, or brick it on restart (T46, T63).
 - **H-08:** a lossy boot no longer reaches a rewrite. Refused records are quarantined, and compaction keeps them (T47).
 - **H-09 / H-18:** Supply decoding and validation are bounded. A 1 MiB hostile entry costs 136 B of error text instead of 195 MB and a 55 MB log line (T48, T66).

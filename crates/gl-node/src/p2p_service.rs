@@ -1141,8 +1141,12 @@ fn ensure_secret_key_permissions(
 /// destination. This mirrors the ledger's `persist_atomically` temp-file
 /// hardening. The caller is responsible for the path being free — the only
 /// caller unlinks an empty leftover first, and a genuine race loses the `open`
-/// rather than writing to the wrong file.
-fn write_secret_key_file(path: &Path, hex_key: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// rather than writing to the wrong file. The API key file (H-01) is written
+/// by the same function.
+pub(crate) fn write_secret_key_file(
+    path: &Path,
+    hex_key: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

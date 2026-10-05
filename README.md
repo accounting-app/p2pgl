@@ -46,12 +46,15 @@ You'll see:
 
 ```
 INFO  loading configuration path=gl-node.config.json
-INFO  gl-node starting address=127.0.0.1:4000 version=0.1.0 ledger=my-ledger.bean auth_enabled=false p2p_enabled=false graphiql=false
+INFO  generated a new API key; clients send the file's contents as the X-Api-Key header (H-01) path=./data/api.key
+INFO  gl-node starting address=127.0.0.1:4000 version=0.1.0 ledger=my-ledger.bean auth_enabled=true p2p_enabled=false graphiql=false
 ```
+
+Every `/graphql` request needs that key in an `X-Api-Key` header — see [Using Auth](#using-auth). The first boot writes it to `./data/api.key` (readable by your account only); later boots read it back.
 
 ### 4. Open GraphiQL
 
-The playground is **off** by default. Turn it on with `"graphiql": true` and visit **http://127.0.0.1:4000/graphql**. It is only available on a loopback bind — a non-loopback `bindAddress` with `graphiql` enabled is refused at boot, not silently downgraded.
+The playground is **off** by default. Turn it on with `"graphiql": true` and visit **http://127.0.0.1:4000/graphql**. It is only available on a loopback bind — a non-loopback `bindAddress` with `graphiql` enabled is refused at boot, not silently downgraded. Its queries need the API key like any other client: open the **Headers** panel and paste `{"X-Api-Key": "<the contents of data/api.key>"}`. The node never puts the key into the page itself.
 
 ### Upgrading
 
@@ -61,7 +64,11 @@ Read [`CHANGELOG.md`](CHANGELOG.md) before upgrading, starting with *Breaking*. 
 
 ## API Reference — curl Examples
 
-All examples assume the server is running at `http://127.0.0.1:4000`. Pipe through `| python3 -m json.tool` for pretty output.
+All examples assume the server is running at `http://127.0.0.1:4000`. Pipe through `| python3 -m json.tool` for pretty output. Every `/graphql` example sends the API key from `$GL_NODE_API_KEY`; on a local node with the default config, load it from the key file first:
+
+```bash
+export GL_NODE_API_KEY="$(cat data/api.key)"
+```
 
 ### Health Check
 
@@ -119,6 +126,7 @@ Before you can post transactions, you need to open accounts. This enforces the a
 
 ```bash
 curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "mutation { openAccount(name: \"Assets:Cash\", date: \"2024-01-01\", currencies: [\"USD\"]) }"
@@ -140,6 +148,7 @@ An account can end up with more than one `open` on a mesh — another node opene
 ```bash
 # Open a checking account that accepts USD only
 curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "mutation { openAccount(name: \"Assets:Bank:Checking\", date: \"2025-01-01\", currencies: [\"USD\"]) }"
@@ -147,6 +156,7 @@ curl -s -X POST http://127.0.0.1:4000/graphql \
 
 # Open an expense account (no currency restriction)
 curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "mutation { openAccount(name: \"Expenses:Food\", date: \"2025-01-01\") }"
@@ -154,6 +164,7 @@ curl -s -X POST http://127.0.0.1:4000/graphql \
 
 # Open multiple accounts at once using GraphQL aliases
 curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "mutation { a1: openAccount(name: \"Assets:Cash\", date: \"2024-01-01\", currencies: [\"USD\"]) a2: openAccount(name: \"Equity:Opening\", date: \"2024-01-01\") a3: openAccount(name: \"Expenses:Food\", date: \"2024-01-01\") a4: openAccount(name: \"Income:Salary\", date: \"2024-01-01\") }"
@@ -168,6 +179,7 @@ Every transaction **must balance** — the sum of all posting amounts must equal
 
 ```bash
 curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "mutation { appendTransaction(input: { date: \"2024-02-01\", narration: \"Salary deposit\", postings: [{ account: \"Assets:Cash\", amount: { number: \"5000\", currency: \"USD\" } }, { account: \"Income:Salary\", amount: { number: \"-5000\", currency: \"USD\" } }] }) { txid date narration postings { account amount { number currency } } } }"
@@ -195,6 +207,7 @@ curl -s -X POST http://127.0.0.1:4000/graphql \
 ```bash
 # Buy groceries (with payee, tags, and auto-calculated equity posting)
 curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "mutation { appendTransaction(input: { date: \"2024-03-15\", payee: \"Whole Foods\", narration: \"Weekly groceries\", tags: [\"food\", \"weekly\"], postings: [{ account: \"Expenses:Food\", amount: { number: \"89.50\", currency: \"USD\" } }, { account: \"Assets:Cash\", amount: { number: \"-89.50\", currency: \"USD\" } }] }) { txid narration } }"
@@ -202,6 +215,7 @@ curl -s -X POST http://127.0.0.1:4000/graphql \
 
 # Pending transaction (flag = "!")
 curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "mutation { appendTransaction(input: { date: \"2024-03-20\", flag: \"!\", narration: \"Pending refund\", postings: [{ account: \"Assets:Cash\", amount: { number: \"50\", currency: \"USD\" } }, { account: \"Expenses:Food\", amount: { number: \"-50\", currency: \"USD\" } }] }) { txid flag narration } }"
@@ -209,6 +223,7 @@ curl -s -X POST http://127.0.0.1:4000/graphql \
 
 # Multi-posting transaction (3+ legs)
 curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "mutation { appendTransaction(input: { date: \"2024-04-01\", narration: \"Split deposit across accounts\", postings: [{ account: \"Assets:Cash\", amount: { number: \"300\", currency: \"USD\" } }, { account: \"Assets:Bank:Checking\", amount: { number: \"700\", currency: \"USD\" } }, { account: \"Income:Salary\", amount: { number: \"-1000\", currency: \"USD\" } }] }) { txid narration } }"
@@ -216,6 +231,7 @@ curl -s -X POST http://127.0.0.1:4000/graphql \
 
 # With an elided posting (system auto-calculates the missing amount)
 curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "mutation { appendTransaction(input: { date: \"2024-04-15\", narration: \"Rent payment\", postings: [{ account: \"Expenses:Rent\", amount: { number: \"1500\", currency: \"USD\" } }, { account: \"Assets:Cash\" }] }) { txid postings { account amount { number currency } } } }"
@@ -230,6 +246,7 @@ curl -s -X POST http://127.0.0.1:4000/graphql \
 
 ```bash
 curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "mutation { closeAccount(name: \"Assets:Cash\", date: \"2024-12-31\") }"
@@ -269,6 +286,7 @@ Shows debit/credit totals for every account as of a given date.
 
 ```bash
 curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "{ trialBalance(at: \"2024-12-31\") { rows { account debit credit } totalDebit totalCredit } }"
@@ -285,6 +303,7 @@ Shows assets, liabilities, and equity as of a given date.
 
 ```bash
 curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "{ balanceSheet(at: \"2024-12-31\") { assets { account balances { number currency } } liabilities { account balances { number currency } } equity { account balances { number currency } } } }"
@@ -299,6 +318,7 @@ Shows income, expenses, and net for a date range.
 
 ```bash
 curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "{ incomeStatement(from: \"2024-01-01\", to: \"2024-12-31\") { income { account balances { number currency } } expenses { account balances { number currency } } net { number currency } } }"
@@ -316,6 +336,7 @@ List transactions with optional filters.
 ```bash
 # All transactions (default limit: 100)
 curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "{ journal { txid date narration postings { account amount { number currency } } } }"
@@ -323,6 +344,7 @@ curl -s -X POST http://127.0.0.1:4000/graphql \
 
 # Filter by account
 curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "{ journal(account: \"Assets:Cash\") { txid date narration postings { account amount { number currency } } } }"
@@ -330,6 +352,7 @@ curl -s -X POST http://127.0.0.1:4000/graphql \
 
 # Filter by date range with pagination
 curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "{ journal(from: \"2024-01-01\", to: \"2024-06-30\", limit: 10, offset: 0) { txid date narration } }"
@@ -352,6 +375,7 @@ curl -s -X POST http://127.0.0.1:4000/graphql \
 
 ```bash
 curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "{ transaction(txid: \"YOUR_TXID_HERE\") { txid date payee narration tags links author postings { account amount { number currency } } } }"
@@ -366,6 +390,7 @@ Replace `YOUR_TXID_HERE` with the `txid` returned from `appendTransaction`.
 
 ```bash
 curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "{ account(name: \"Assets:Cash\") { account balances { number currency } } }"
@@ -373,6 +398,7 @@ curl -s -X POST http://127.0.0.1:4000/graphql \
 
 # Balance as of a specific date
 curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "{ account(name: \"Assets:Cash\", at: \"2024-06-30\") { account balances { number currency } } }"
@@ -387,6 +413,7 @@ Checks that all content hashes and parent links are valid.
 
 ```bash
 curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "{ verify { ok nodesChecked errors truncated } }"
@@ -407,6 +434,7 @@ the file held as text because they do not parse — request them as
 
 ```bash
 curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "{ health { status heads peers version } }"
@@ -493,8 +521,9 @@ boot saying so; `meshId` becomes required in a later release.
 | `allowedHosts` | `[]` | Extra `Host` header values accepted, beyond loopback and the bind address. **Required (non-empty) on a non-loopback bind** — see below |
 | `trustedProxies` | `[]` | Reverse-proxy IPs whose `X-Forwarded-For` the rate limiter believes — see below |
 | `tls.mode` | `"disabled"` | `"disabled"` (loopback only) or `"terminated"` (TLS at a host/proxy). A non-loopback bind must be `"terminated"`; in-process TLS is not implemented |
-| `auth.enabled` | `false` | Require `X-Api-Key` header on GraphQL. Forced on for a non-loopback bind |
-| `auth.apiKey` | `""` | The API key value (required if auth enabled). Minimum 16 bytes; published placeholders are refused — see [API keys](#api-keys) |
+| `auth.enabled` | `true` | Require `X-Api-Key` header on GraphQL. May be turned off only on a loopback bind, and boot then WARNs that anything on the machine can write the ledger |
+| `auth.apiKey` | `""` | The API key value. Required on a non-loopback bind; on a loopback bind, empty means the key file below. Minimum 16 bytes; published placeholders are refused — see [API keys](#api-keys) |
+| `auth.apiKeyPath` | `"./data/api.key"` | Where a loopback node with no `apiKey` keeps the key it generates on its first boot (0600, owned by the node's user) — see [Using Auth](#using-auth) |
 | `http.headerReadTimeoutSeconds` | `30` | Time a client gets to send a complete request head; also bounds idle keep-alive. `1`–`300` |
 | `http.requestTimeoutSeconds` | `30` | Whole-request ceiling, body read and GraphQL execution included (`408` on expiry). `1`–`300` |
 | `http.maxConnections` | `1024` | Concurrently served connections; excess stays in the kernel backlog. `8`–`65536` |
@@ -611,7 +640,8 @@ mutations, so generate one — do not invent one by hand:
 openssl rand -hex 32
 ```
 
-Two boot rules back that up, and both apply whenever `auth.enabled` is true,
+Two boot rules back that up, and both apply whenever `auth.enabled` is true —
+to a key typed into the key file by hand too —
 including on a loopback bind (`bindAddress` is one edit away from `0.0.0.0`,
 and a key that was never secret does not become one):
 
@@ -883,8 +913,33 @@ write the same transaction under both formats.
 
 ### Using Auth
 
-When `auth.enabled` is `true`, add the header to all requests. Keep the key in
-the environment rather than pasting it into a shell history or a script:
+Auth is **on by default**, on every bind. Add the header to all `/graphql`
+requests.
+
+**A local node needs no setup.** With a loopback `bindAddress` and no
+`auth.apiKey` (and no `GL_NODE_API_KEY`), the first boot generates a random
+32-byte key and writes it, hex-encoded, to `auth.apiKeyPath` (default
+`./data/api.key`): a regular file, mode 0600, owned by the account the node runs
+as. Later boots read the same key back; the node never logs it. The file is
+held to the node's secret-key rules — a symlink at the path, a file another
+account owns or can read, or one with more than one link is refused at boot
+rather than used — and an empty file (a crash mid-write) is replaced by a new
+key. To rotate the key, stop the node, delete the file and start it. Read it
+into your client's environment:
+
+```bash
+export GL_NODE_API_KEY="$(cat data/api.key)"
+```
+
+Before this release a loopback node served its mutations to anything that could
+reach the port, with no key: another program or another account on the machine,
+or a web page that got past the browser checks (H-01). To keep that, set
+`"auth": { "enabled": false }` — allowed on a loopback bind only, and the node
+WARNs about it at every boot.
+
+**A public bind needs a key you set**, so its clients are given it on purpose:
+`auth.apiKey` or, better, the environment. Keep the key in the environment
+rather than pasting it into a shell history or a script:
 
 ```bash
 export GL_NODE_API_KEY="$(openssl rand -hex 32)"   # and restart the node

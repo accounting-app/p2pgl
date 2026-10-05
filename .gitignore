@@ -11,5 +11,7 @@
 *.secret
 identity.secret
 iroh.secret
+api.key
+*.api.key
 *.bean.lock
 *.bean.journal

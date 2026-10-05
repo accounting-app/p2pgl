@@ -90,6 +90,24 @@ fn claim_ledger_path(configured: &Path) -> Result<(PathBuf, ledger_lock::LedgerL
     Ok((resolved, guard))
 }
 
+/// H-01: auth is on by default. A loopback node with no key configured reads
+/// its key file, generating it on the first boot, and serves with that key; one
+/// with auth turned off WARNs, since it serves its mutations to anything that
+/// can reach the port.
+fn resolve_api_key(config: &mut NodeConfig) -> Result<(), String> {
+    if config.uses_api_key_file() {
+        config.auth.api_key = auth::load_or_create_api_key(Path::new(&config.auth.api_key_path))
+            .map_err(|error| error.to_string())?;
+    } else if !config.auth.enabled {
+        warn!(
+            "auth.enabled is false: every GraphQL request, mutations included, is served without \
+             an API key to any program or account on this machine that can reach the port. \
+             Remove \"enabled\": false from the auth section to require the key (H-01)"
+        );
+    }
+    Ok(())
+}
+
 /// The boot banner for records the signature check quarantined (H-20).
 ///
 /// T92 / M-69, decision (40): it defers to the per-record WARNs above it and
@@ -228,13 +246,18 @@ async fn main() {
 
     info!(path = %config_path.display(), "loading configuration");
 
-    let config = match NodeConfig::load_from_path(&config_path) {
+    let mut config = match NodeConfig::load_from_path(&config_path) {
         Ok(config) => config,
         Err(error) => {
             error!(%error, "failed to load configuration — aborting");
             std::process::exit(1);
         }
     };
+
+    if let Err(error) = resolve_api_key(&mut config) {
+        error!(%error, path = %config.auth.api_key_path, "failed to load or create the API key — aborting");
+        std::process::exit(1);
+    }
 
     // Ensure the ledger file's parent directory exists (§3.3). The `.bean` file
     // itself is deliberately NOT created here — see below.
@@ -1158,6 +1181,52 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H-01: a node with the default auth section serves with the key its key
+    /// file holds — generated on the first boot, the same on the next — and a
+    /// node that turns auth off generates nothing.
+    ///
+    /// Bug-catch: skip `resolve_api_key` in boot, or leave the key empty, and
+    /// the router's auth state has no key a client could send.
+    #[test]
+    fn h01_a_default_loopback_node_serves_with_its_key_file() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let key_path = directory.path().join("api.key");
+        let load = |auth: &str| {
+            let mut file = tempfile::NamedTempFile::new().expect("temp config file");
+            std::io::Write::write_all(
+                &mut file,
+                format!(r#"{{ "ledgerPath": "./data/ledger.bean"{auth} }}"#).as_bytes(),
+            )
+            .expect("write config");
+            NodeConfig::load_from_path(&file.path().to_path_buf()).expect("loads")
+        };
+        let key_setting = format!(
+            r#", "auth": {{ "apiKeyPath": {} }}"#,
+            serde_json::to_string(key_path.to_str().expect("utf-8 path")).expect("json")
+        );
+        let mut config = load(&key_setting);
+        resolve_api_key(&mut config).expect("resolved");
+        assert!(config.auth.enabled);
+        assert_eq!(config.auth.api_key.len(), 64);
+        assert_eq!(
+            std::fs::read_to_string(&key_path).expect("the key file"),
+            config.auth.api_key
+        );
+        let mut restarted = load(&key_setting);
+        resolve_api_key(&mut restarted).expect("resolved");
+        assert_eq!(restarted.auth.api_key, config.auth.api_key);
+
+        std::fs::remove_file(&key_path).expect("remove");
+        let disabled = format!(
+            r#", "auth": {{ "enabled": false, "apiKeyPath": {} }}"#,
+            serde_json::to_string(key_path.to_str().expect("utf-8 path")).expect("json")
+        );
+        let mut off = load(&disabled);
+        resolve_api_key(&mut off).expect("resolved");
+        assert!(off.auth.api_key.is_empty());
+        assert!(!key_path.exists(), "auth off generates no key");
+    }
 
     /// L-118 (T94): gl-node resolves a symlinked `.bean` before `boot`, so the
     /// boot is handed the target and T87's sweep beside the LINK never ran on

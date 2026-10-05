@@ -77,6 +77,44 @@ fn forbidden_api_key_match(api_key: &str) -> Option<&'static str> {
         .find(|forbidden| forbidden.eq_ignore_ascii_case(candidate))
 }
 
+/// The rules every API key must meet (L-08, L-50), whether it came from the
+/// config file, `GL_NODE_API_KEY` or the key file (H-01). The messages never
+/// echo the key.
+pub(crate) fn check_api_key(api_key: &str) -> Result<(), String> {
+    if let Some(sample) = forbidden_api_key_match(api_key) {
+        return Err(format!(
+            "auth.apiKey must not be the documented sample or placeholder \"{sample}\"; \
+             set a unique key or GL_NODE_API_KEY"
+        ));
+    }
+
+    if api_key.len() < MIN_API_KEY_BYTES {
+        return Err(format!(
+            "auth.apiKey must be at least {MIN_API_KEY_BYTES} bytes, got {}; \
+             it is the only credential guarding the writable GraphQL mutations",
+            api_key.len()
+        ));
+    }
+
+    // L-50: the key is compared against an `X-Api-Key` header value, so it
+    // must be something a client can actually send. A non-ASCII or
+    // control-character key booted fine and then 401'd every request forever —
+    // `HeaderValue::to_str` fails on the client's side of the comparison, so no
+    // request can ever match — and surrounding whitespace is stripped from
+    // header values in transit, so a padded key can never match either. The
+    // same `HeaderValue::from_str` test `allowedHosts` and
+    // `cors.allowedOrigins` already get.
+    if !is_header_safe_api_key(api_key) {
+        return Err(
+            "auth.apiKey must be printable ASCII with no leading or trailing whitespace; \
+                    it is sent as the X-Api-Key header, and any other value can never match, \
+                    so the node would reject every request (401) forever"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 /// Top-level node configuration.
 ///
 /// Deserialized from `gl-node.config.json` (or the path in `GL_NODE_CONFIG`).
@@ -274,17 +312,47 @@ impl FormatConfig {
 }
 
 /// Authentication settings (§3.8).
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthConfig {
-    /// Whether `X-Api-Key` is required on GraphQL endpoints.
-    #[serde(default)]
+    /// Whether `X-Api-Key` is required on GraphQL endpoints. On by default
+    /// (H-01): before, a loopback node served its mutations to anything that
+    /// could reach the port — another program, another account on the
+    /// machine, or a browser page past a hole in the request guard. Turning it
+    /// off is allowed on a loopback bind only, and WARNs at every boot.
+    #[serde(default = "default_auth_enabled")]
     pub enabled: bool,
 
-    /// The API key value. Required when `enabled` is true.
+    /// The API key value. Required on a non-loopback bind; on a loopback bind,
+    /// left empty, the key is read from `api_key_path` (generated there on
+    /// the first boot).
     #[serde(default)]
     pub api_key: String,
+
+    /// Where a loopback node keeps the API key it generated (H-01): a 0600
+    /// file owned by the node's user, read like the node's secret key. Used
+    /// only while `enabled` and no key is configured.
+    #[serde(default = "default_api_key_path")]
+    pub api_key_path: String,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_auth_enabled(),
+            api_key: String::new(),
+            api_key_path: default_api_key_path(),
+        }
+    }
+}
+
+fn default_auth_enabled() -> bool {
+    true
+}
+
+fn default_api_key_path() -> String {
+    "./data/api.key".to_owned()
 }
 
 /// Hand-written so the API key is never printed (T41) — see
@@ -297,6 +365,7 @@ impl std::fmt::Debug for AuthConfig {
             .debug_struct("AuthConfig")
             .field("enabled", &self.enabled)
             .field("api_key", &crate::auth::redact(&self.api_key))
+            .field("api_key_path", &self.api_key_path)
             .finish()
     }
 }
@@ -1101,8 +1170,9 @@ impl NodeConfig {
                 warn!(
                     env_var = API_KEY_ENV_VAR,
                     "GL_NODE_API_KEY is set but auth.enabled is false, so the key is IGNORED and \
-                     every GraphQL request, mutations included, is served without one; set \
-                     \"auth\": {{ \"enabled\": true }} to require it, or unset the variable"
+                     every GraphQL request, mutations included, is served without one; remove \
+                     \"enabled\": false from the auth section (auth is on by default) to \
+                     require it, or unset the variable"
                 );
             }
             config.auth.api_key = env_api_key;
@@ -1122,9 +1192,16 @@ impl NodeConfig {
             ));
         }
 
-        if self.auth.enabled && self.auth.api_key.is_empty() {
+        // H-01: a loopback node with no key configured uses the key file
+        // (`main` loads or generates it). A public bind is checked below,
+        // after M-2.
+        if self.uses_api_key_file()
+            && !self.binds_non_loopback()
+            && self.auth.api_key_path.is_empty()
+        {
             return Err(ConfigError::Validation(
-                "auth.apiKey is required when auth.enabled is true".to_owned(),
+                "auth.apiKeyPath is required when auth is enabled and no auth.apiKey is set"
+                    .to_owned(),
             ));
         }
 
@@ -1136,39 +1213,8 @@ impl NodeConfig {
         // fail-closed reading, and the right one — `bindAddress` is one edit away
         // from `0.0.0.0`, and a key that was never a secret does not become one
         // because today's listener is loopback.
-        if self.auth.enabled {
-            if let Some(sample) = forbidden_api_key_match(&self.auth.api_key) {
-                return Err(ConfigError::Validation(format!(
-                    "auth.apiKey must not be the documented sample or placeholder \"{sample}\"; \
-                     set a unique key or GL_NODE_API_KEY"
-                )));
-            }
-
-            if self.auth.api_key.len() < MIN_API_KEY_BYTES {
-                return Err(ConfigError::Validation(format!(
-                    "auth.apiKey must be at least {MIN_API_KEY_BYTES} bytes, got {}; \
-                     it is the only credential guarding the writable GraphQL mutations",
-                    self.auth.api_key.len()
-                )));
-            }
-
-            // L-50: the key is compared against an `X-Api-Key` header value, so
-            // it must be something a client can actually send. A non-ASCII or
-            // control-character key booted fine and then 401'd every request
-            // forever — `HeaderValue::to_str` fails on the client's side of the
-            // comparison, so no request can ever match — and surrounding
-            // whitespace is stripped from header values in transit, so a padded
-            // key can never match either. The same `HeaderValue::from_str`
-            // test `allowedHosts` and `cors.allowedOrigins` already get. The
-            // message deliberately does not echo the key.
-            if !is_header_safe_api_key(&self.auth.api_key) {
-                return Err(ConfigError::Validation(
-                    "auth.apiKey must be printable ASCII with no leading or trailing whitespace; \
-                     it is sent as the X-Api-Key header, and any other value can never match, \
-                     so the node would reject every request (401) forever"
-                        .to_owned(),
-                ));
-            }
+        if self.auth.enabled && !self.uses_api_key_file() {
+            check_api_key(&self.auth.api_key).map_err(ConfigError::Validation)?;
         }
 
         if self.p2p.enabled && self.p2p.secret_key_path.is_empty() {
@@ -1417,6 +1463,15 @@ impl NodeConfig {
             ));
         }
 
+        // H-01: a public bind needs a key its clients were given on purpose,
+        // never one generated into a file on the server.
+        if self.binds_non_loopback() && self.uses_api_key_file() {
+            return Err(ConfigError::Validation(
+                "auth.apiKey (or GL_NODE_API_KEY) is required when binding a non-loopback address"
+                    .to_owned(),
+            ));
+        }
+
         // H-01: fail closed. The request guard only admits the built-in loopback
         // hosts plus the bind address, so on a non-loopback bind the operator
         // must say which hostname(s)/IP(s) clients use — otherwise every request
@@ -1649,6 +1704,13 @@ impl NodeConfig {
     }
 
     /// True when the HTTP bind address is not loopback (I-1 / H-5 warning).
+    /// Whether the API key comes from `auth.apiKeyPath` (H-01): auth is on and
+    /// neither the config file nor `GL_NODE_API_KEY` supplied one. Validation
+    /// admits that only on a loopback bind.
+    pub fn uses_api_key_file(&self) -> bool {
+        self.auth.enabled && self.auth.api_key.is_empty()
+    }
+
     pub fn binds_non_loopback(&self) -> bool {
         !matches!(
             self.bind_address.as_str(),
@@ -1887,7 +1949,9 @@ mod tests {
         );
         assert!(!config.graphiql, "GraphiQL off by default");
         assert!(config.cors.allowed_origins.is_empty());
-        assert!(!config.auth.enabled);
+        assert!(config.auth.enabled, "auth is on by default (H-01)");
+        assert!(config.uses_api_key_file());
+        assert_eq!(config.auth.api_key_path, "./data/api.key");
         assert!(!config.signing.enabled);
         assert!(!config.p2p.enabled);
         assert_eq!(config.tls.mode, "disabled");
@@ -1962,15 +2026,29 @@ mod tests {
         assert!(error_message.contains("ledgerPath"));
     }
 
+    /// H-01: auth with no key configured takes the key file on a loopback
+    /// bind and is refused on a public one.
     #[test]
-    fn test_auth_enabled_without_key_rejected() {
+    fn test_auth_enabled_without_key_uses_the_key_file_on_loopback_only() {
         let file = write_temp_config(
             r#"{ "ledgerPath": "./data/ledger.bean", "auth": { "enabled": true, "apiKey": "" } }"#,
         );
-        let result = NodeConfig::load_from_path(&file.path().to_path_buf());
-        assert!(result.is_err());
-        let error_message = format!("{}", result.unwrap_err());
-        assert!(error_message.contains("apiKey"));
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("loopback");
+        assert!(config.uses_api_key_file());
+
+        let public = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "tls": { "mode": "terminated" }, "allowedHosts": ["ledger.example.com"] }"#,
+        );
+        let result = NodeConfig::load_from_path(&public.path().to_path_buf());
+        let error_message = format!("{}", result.expect_err("a public bind needs a key"));
+        assert!(error_message.contains("auth.apiKey"), "{error_message}");
+
+        let no_path = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "auth": { "apiKeyPath": "" } }"#,
+        );
+        let result = NodeConfig::load_from_path(&no_path.path().to_path_buf());
+        let error_message = format!("{}", result.expect_err("no key and nowhere to keep one"));
+        assert!(error_message.contains("auth.apiKeyPath"), "{error_message}");
     }
 
     /// M-19: the removed key is refused by name, with the replacement spelled
@@ -2036,7 +2114,7 @@ mod tests {
         // M-2: a non-loopback bind with auth off must fail closed, even when TLS
         // is terminated (otherwise an unauthenticated writable ledger is served).
         let file = write_temp_config(
-            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "tls": { "mode": "terminated" } }"#,
+            r#"{ "ledgerPath": "./data/ledger.bean", "bindAddress": "0.0.0.0", "tls": { "mode": "terminated" }, "auth": { "enabled": false } }"#,
         );
         let result = NodeConfig::load_from_path(&file.path().to_path_buf());
         assert!(result.is_err());
@@ -2058,11 +2136,15 @@ mod tests {
 
     #[test]
     fn test_loopback_bind_without_auth_still_allowed() {
-        // Loopback dev binds remain permissive without auth.
-        let file = write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean" }"#);
+        // H-01: a loopback bind may still turn auth off, but only by saying so
+        // (boot WARNs); with the auth section absent, auth is on.
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "auth": { "enabled": false } }"#,
+        );
         let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
         assert!(!config.binds_non_loopback());
         assert!(!config.auth.enabled);
+        assert!(!config.uses_api_key_file());
     }
 
     #[test]
@@ -3526,7 +3608,9 @@ mod tests {
     /// discarded — boot warns, names the variable, and never prints the key.
     #[test]
     fn test_environment_api_key_with_auth_disabled_warns_without_echoing_it() {
-        let file = write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean" }"#);
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "auth": { "enabled": false } }"#,
+        );
         let (config, logged) = capture_warnings(|| {
             NodeConfig::load_from_path_with_env_api_key(
                 file.path(),
