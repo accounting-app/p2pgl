@@ -3212,7 +3212,7 @@ pub(crate) mod tests {
     use chrono::NaiveDate;
     use iroh::endpoint::presets;
     use iroh::protocol::Router;
-    use iroh::{Endpoint, TransportAddr};
+    use iroh::Endpoint;
     use ledger::model::{Amount, Flag};
     use ledger::service::{LedgerService, PostingInput, TransactionInput};
     use rust_decimal_macros::dec;
@@ -3251,18 +3251,46 @@ pub(crate) mod tests {
             .expect("bind direct-only Iroh endpoint")
     }
 
+    /// Wait until `endpoint` has an IPv4 socket [`loopback_addr`] can name.
+    ///
+    /// It used to wait for `Endpoint::addr` to advertise an IP, and every test
+    /// dialled that advertisement — which names the machine's interface
+    /// addresses (Wi-Fi, VPN), never loopback. A test therefore dialled over
+    /// the LAN interface: a network change mid-run (a DHCP renewal, Wi-Fi power
+    /// save) timed the dial out (`a_frame_trickled_past_the_deadline_is_cut_at_the_deadline`,
+    /// 2026-10-05), and a machine with no network could run none of them.
     pub(crate) async fn wait_until_dialable(endpoint: &Endpoint) {
         for _ in 0..50 {
-            if endpoint.addr().addrs.iter().any(TransportAddr::is_ip) {
+            if endpoint
+                .bound_sockets()
+                .iter()
+                .any(|socket| socket.is_ipv4())
+            {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!(
-            "endpoint {} never advertised an IP address: {:?}",
+            "endpoint {} never bound an IPv4 socket: {:?}",
             endpoint.id(),
-            endpoint.addr()
+            endpoint.bound_sockets()
         );
+    }
+
+    /// Where a test dials `endpoint`: its own IPv4 socket, on loopback, so a
+    /// test never depends on the machine's network (see
+    /// [`wait_until_dialable`]).
+    pub(crate) fn loopback_addr(endpoint: &Endpoint) -> iroh::EndpointAddr {
+        let port = endpoint
+            .bound_sockets()
+            .into_iter()
+            .find(std::net::SocketAddr::is_ipv4)
+            .expect("an IPv4 socket (wait_until_dialable)")
+            .port();
+        iroh::EndpointAddr::new(endpoint.id()).with_ip_addr(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            port,
+        )))
     }
 
     fn balanced_funding_input() -> TransactionInput {
@@ -3616,8 +3644,8 @@ pub(crate) mod tests {
         wait_until_dialable(&endpoint_one).await;
         wait_until_dialable(&endpoint_two).await;
 
-        let addr_zero = endpoint_zero.addr();
-        let addr_one = endpoint_one.addr();
+        let addr_zero = loopback_addr(&endpoint_zero);
+        let addr_one = loopback_addr(&endpoint_one);
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         loop {
@@ -3712,7 +3740,7 @@ pub(crate) mod tests {
 
         wait_until_dialable(&endpoint_source).await;
         wait_until_dialable(&endpoint_sink).await;
-        let addr_source = endpoint_source.addr();
+        let addr_source = loopback_addr(&endpoint_source);
 
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -3835,7 +3863,7 @@ pub(crate) mod tests {
 
         wait_until_dialable(&endpoint_client).await;
         wait_until_dialable(&endpoint_tarpit).await;
-        let addr_tarpit = endpoint_tarpit.addr();
+        let addr_tarpit = loopback_addr(&endpoint_tarpit);
 
         // 4×io is a generous bound: the exchange should return at ~io (500 ms)
         // once the read against the silent peer times out.
@@ -3906,8 +3934,8 @@ pub(crate) mod tests {
         wait_until_dialable(&endpoint_source).await;
         wait_until_dialable(&endpoint_tarpit).await;
 
-        let addr_source = endpoint_source.addr();
-        let addr_tarpit = endpoint_tarpit.addr();
+        let addr_source = loopback_addr(&endpoint_source);
+        let addr_tarpit = loopback_addr(&endpoint_tarpit);
 
         // Each tick runs BOTH peers' exchanges concurrently, exactly as
         // `spawn_anti_entropy_loop` now does: spawn into a JoinSet and drain
@@ -4008,7 +4036,7 @@ pub(crate) mod tests {
 
         wait_until_dialable(&endpoint_client).await;
         wait_until_dialable(&endpoint_source).await;
-        let addr_source = endpoint_source.addr();
+        let addr_source = loopback_addr(&endpoint_source);
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -4451,7 +4479,7 @@ pub(crate) mod tests {
         ServePair {
             router,
             client,
-            addr: endpoint_server.addr(),
+            addr: loopback_addr(&endpoint_server),
             handler,
             _dir: dir,
         }
@@ -4930,7 +4958,7 @@ pub(crate) mod tests {
 
         wait_until_dialable(&endpoint_client).await;
         wait_until_dialable(&endpoint_flood).await;
-        let addr_flood = endpoint_flood.addr();
+        let addr_flood = loopback_addr(&endpoint_flood);
 
         let started = tokio::time::Instant::now();
         let outcome = tokio::time::timeout(
@@ -4990,7 +5018,7 @@ pub(crate) mod tests {
 
         wait_until_dialable(&endpoint_client).await;
         wait_until_dialable(&endpoint_flood).await;
-        let addr_flood = endpoint_flood.addr();
+        let addr_flood = loopback_addr(&endpoint_flood);
 
         let started = tokio::time::Instant::now();
         let outcome = tokio::time::timeout(
@@ -5046,7 +5074,7 @@ pub(crate) mod tests {
 
         wait_until_dialable(&endpoint_client).await;
         wait_until_dialable(&endpoint_liar).await;
-        let addr_liar = endpoint_liar.addr();
+        let addr_liar = loopback_addr(&endpoint_liar);
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(20),
@@ -5113,7 +5141,7 @@ pub(crate) mod tests {
 
         wait_until_dialable(&endpoint_source).await;
         wait_until_dialable(&endpoint_sink).await;
-        let addr_source = endpoint_source.addr();
+        let addr_source = loopback_addr(&endpoint_source);
 
         // A: four ids' worth of budget against a twenty-id advert.
         let starved = make_handler_with_timeouts(
@@ -5203,7 +5231,7 @@ pub(crate) mod tests {
 
         wait_until_dialable(&endpoint_client).await;
         wait_until_dialable(&endpoint_stingy).await;
-        let addr_stingy = endpoint_stingy.addr();
+        let addr_stingy = loopback_addr(&endpoint_stingy);
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(20),
@@ -5269,7 +5297,7 @@ pub(crate) mod tests {
 
         wait_until_dialable(&endpoint_server).await;
         wait_until_dialable(&endpoint_client).await;
-        let addr_server = endpoint_server.addr();
+        let addr_server = loopback_addr(&endpoint_server);
 
         // Connect and open nothing at all.
         let silent = connect_retry(&endpoint_client, addr_server.clone()).await;
@@ -5339,7 +5367,7 @@ pub(crate) mod tests {
 
         wait_until_dialable(&endpoint_server).await;
         wait_until_dialable(&endpoint_client).await;
-        let addr_server = endpoint_server.addr();
+        let addr_server = loopback_addr(&endpoint_server);
 
         let conn = connect_retry(&endpoint_client, addr_server.clone()).await;
         let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
@@ -5415,7 +5443,7 @@ pub(crate) mod tests {
 
         wait_until_dialable(&endpoint_server).await;
         wait_until_dialable(&endpoint_client).await;
-        let addr_server = endpoint_server.addr();
+        let addr_server = loopback_addr(&endpoint_server);
 
         // Establish and hold two connections; connectivity is proven here (these
         // panic if the path never comes up), so a later refusal is the cap, not
@@ -5492,7 +5520,7 @@ pub(crate) mod tests {
 
         wait_until_dialable(&endpoint_server).await;
         wait_until_dialable(&endpoint_client).await;
-        let addr_server = endpoint_server.addr();
+        let addr_server = loopback_addr(&endpoint_server);
 
         let conn = connect_retry(&endpoint_client, addr_server.clone()).await;
         let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
@@ -5579,7 +5607,7 @@ pub(crate) mod tests {
 
         wait_until_dialable(&endpoint_server).await;
         wait_until_dialable(&endpoint_client).await;
-        let addr_server = endpoint_server.addr();
+        let addr_server = loopback_addr(&endpoint_server);
 
         let conn = connect_retry(&endpoint_client, addr_server.clone()).await;
 
@@ -5689,7 +5717,7 @@ pub(crate) mod tests {
 
         wait_until_dialable(&endpoint_server).await;
         wait_until_dialable(&endpoint_client).await;
-        let addr_server = endpoint_server.addr();
+        let addr_server = loopback_addr(&endpoint_server);
 
         let conn = connect_retry(&endpoint_client, addr_server.clone()).await;
         let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
@@ -5806,7 +5834,7 @@ pub(crate) mod tests {
 
         wait_until_dialable(&endpoint_client).await;
         wait_until_dialable(&endpoint_source).await;
-        let addr_source = endpoint_source.addr();
+        let addr_source = loopback_addr(&endpoint_source);
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         loop {
@@ -5983,7 +6011,7 @@ pub(crate) mod tests {
 
         wait_until_dialable(&endpoint_client).await;
         wait_until_dialable(&endpoint_server).await;
-        let addr_server = endpoint_server.addr();
+        let addr_server = loopback_addr(&endpoint_server);
 
         ReusePair {
             endpoint_client,
@@ -7462,7 +7490,12 @@ pub(crate) mod tests {
 
         let mut rounds = 0usize;
         loop {
-            exchange_with_peer(&endpoint_sink, endpoint_source.addr(), &handler_sink).await;
+            exchange_with_peer(
+                &endpoint_sink,
+                loopback_addr(&endpoint_source),
+                &handler_sink,
+            )
+            .await;
             rounds += 1;
             let count = ledger_sink.read().await.directive_count();
             if count == total {
@@ -7536,7 +7569,12 @@ pub(crate) mod tests {
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
         loop {
-            exchange_with_peer(&endpoint_sink, endpoint_source.addr(), &handler_sink).await;
+            exchange_with_peer(
+                &endpoint_sink,
+                loopback_addr(&endpoint_source),
+                &handler_sink,
+            )
+            .await;
             let count = ledger_sink.read().await.directive_count();
             if count == COUNT {
                 break;
@@ -7885,7 +7923,12 @@ pub(crate) mod tests {
         };
 
         for _ in 0..3 {
-            exchange_with_peer(&endpoint_sink, endpoint_source.addr(), &handler_sink).await;
+            exchange_with_peer(
+                &endpoint_sink,
+                loopback_addr(&endpoint_source),
+                &handler_sink,
+            )
+            .await;
         }
         assert_eq!(
             times_wanted(&jump_entry.id),
@@ -7916,7 +7959,12 @@ pub(crate) mod tests {
             .lock()
             .expect("entries")
             .push(bridge_entry.clone());
-        exchange_with_peer(&endpoint_sink, endpoint_source.addr(), &handler_sink).await;
+        exchange_with_peer(
+            &endpoint_sink,
+            loopback_addr(&endpoint_source),
+            &handler_sink,
+        )
+        .await;
         {
             let svc = handler_sink.ledger.read().await;
             assert!(
@@ -7928,7 +7976,12 @@ pub(crate) mod tests {
                 "the clock is now within one step of the jump"
             );
         }
-        exchange_with_peer(&endpoint_sink, endpoint_source.addr(), &handler_sink).await;
+        exchange_with_peer(
+            &endpoint_sink,
+            loopback_addr(&endpoint_source),
+            &handler_sink,
+        )
+        .await;
         let _ = router_source.shutdown().await;
         assert!(
             times_wanted(&jump_entry.id) >= 2,
@@ -8151,7 +8204,12 @@ pub(crate) mod tests {
         };
 
         for _ in 0..3 {
-            exchange_with_peer(&endpoint_sink, endpoint_source.addr(), &handler_sink).await;
+            exchange_with_peer(
+                &endpoint_sink,
+                loopback_addr(&endpoint_source),
+                &handler_sink,
+            )
+            .await;
         }
         assert_eq!(
             times_wanted(&fixture.poison.id),
@@ -8171,7 +8229,12 @@ pub(crate) mod tests {
             .lock()
             .expect("entries")
             .push(entry_for(&seeded.source, &seeded.open_food));
-        exchange_with_peer(&endpoint_sink, endpoint_source.addr(), &handler_sink).await;
+        exchange_with_peer(
+            &endpoint_sink,
+            loopback_addr(&endpoint_source),
+            &handler_sink,
+        )
+        .await;
         let _ = router_source.shutdown().await;
 
         assert_eq!(times_wanted(&fixture.poison.id), 1, "still not re-wanted");
@@ -8276,7 +8339,12 @@ pub(crate) mod tests {
         };
 
         for _ in 0..3 {
-            exchange_with_peer(&endpoint_sink, endpoint_source.addr(), &handler_sink).await;
+            exchange_with_peer(
+                &endpoint_sink,
+                loopback_addr(&endpoint_source),
+                &handler_sink,
+            )
+            .await;
         }
         let _ = router_source.shutdown().await;
         assert_eq!(times_wanted(&x.id), 1, "L-34: the refused record itself");
@@ -8342,7 +8410,12 @@ pub(crate) mod tests {
         wait_until_dialable(&endpoint_sink).await;
 
         for _ in 0..2 {
-            exchange_with_peer(&endpoint_sink, endpoint_source.addr(), &handler_sink).await;
+            exchange_with_peer(
+                &endpoint_sink,
+                loopback_addr(&endpoint_source),
+                &handler_sink,
+            )
+            .await;
         }
         let _ = router_source.shutdown().await;
 
@@ -8553,7 +8626,7 @@ pub(crate) mod tests {
         wait_until_dialable(&endpoint_server).await;
         wait_until_dialable(&endpoint_client).await;
 
-        let connection = connect_retry(&endpoint_client, endpoint_server.addr()).await;
+        let connection = connect_retry(&endpoint_client, loopback_addr(&endpoint_server)).await;
         let (mut send, _recv) = connection.open_bi().await.expect("open stream");
         let ids: Vec<String> = (0..MAX_HAVE_HEADS)
             .map(|index| format!("{index:064x}"))
@@ -9695,7 +9768,7 @@ pub(crate) mod tests {
             handler.wire_codec = codec;
             wait_until_dialable(endpoint).await;
             wait_until_dialable(server).await;
-            exchange_with_peer(endpoint, server.addr(), &handler).await;
+            exchange_with_peer(endpoint, loopback_addr(server), &handler).await;
             outcomes.push(ledger.read().await.directive_count());
         }
         for router in routers {
@@ -9854,7 +9927,12 @@ pub(crate) mod tests {
         )
         .await;
         for _ in 0..3 {
-            exchange_with_peer(&endpoint_client, endpoint_source.addr(), &handler_client).await;
+            exchange_with_peer(
+                &endpoint_client,
+                loopback_addr(&endpoint_source),
+                &handler_client,
+            )
+            .await;
         }
         let held = {
             let svc = client.read().await;

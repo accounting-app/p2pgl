@@ -1189,8 +1189,8 @@ mod tests {
     use tokio::sync::RwLock;
 
     use crate::anti_entropy_alpn::tests::{
-        bind_direct_endpoint, make_handler, make_handler_with_timeouts, wait_until_dialable,
-        write_open_directive_ledger, EmptyPageFloodHandler, NET_TEST_LOCK,
+        bind_direct_endpoint, loopback_addr, make_handler, make_handler_with_timeouts,
+        wait_until_dialable, write_open_directive_ledger, EmptyPageFloodHandler, NET_TEST_LOCK,
     };
     use crate::anti_entropy_alpn::AntiEntropyTimeouts;
     use crate::graphql::SharedLedger;
@@ -1474,7 +1474,7 @@ mod tests {
 
         // Teach the client where the server lives. The loop itself only ever
         // holds the bare `EndpointId` from the allowlist.
-        address_lookup.add_endpoint_info(endpoint_server.addr());
+        address_lookup.add_endpoint_info(loopback_addr(&endpoint_server));
 
         // A gossip handle that never subscribes to anything: no topic, no
         // neighbors, no `NeighborUp` — the registry cannot be populated.
@@ -1619,7 +1619,7 @@ mod tests {
         // Only the flooder is resolvable to begin with: the loop holds bare
         // `EndpointId`s, so the source's dial cannot even start until its
         // address is published below.
-        address_lookup.add_endpoint_info(endpoint_flood.addr());
+        address_lookup.add_endpoint_info(loopback_addr(&endpoint_flood));
 
         // A gossip handle that never subscribes: the registry stays empty and
         // targets come from the allowlist alone, as in the M-11 test above.
@@ -1646,7 +1646,7 @@ mod tests {
 
         // NOW make the healthy peer reachable. Everything after this point
         // depends on a tick that the wedged drain would never have delivered.
-        address_lookup.add_endpoint_info(endpoint_source.addr());
+        address_lookup.add_endpoint_info(loopback_addr(&endpoint_source));
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
         let converged = loop {
@@ -1878,8 +1878,8 @@ mod tests {
         wait_until_dialable(&endpoint_flood_b).await;
 
         // Only the flooders resolve at first, so they take both slots.
-        address_lookup.add_endpoint_info(endpoint_flood_a.addr());
-        address_lookup.add_endpoint_info(endpoint_flood_b.addr());
+        address_lookup.add_endpoint_info(loopback_addr(&endpoint_flood_a));
+        address_lookup.add_endpoint_info(loopback_addr(&endpoint_flood_b));
 
         let gossip_client = iroh_gossip::net::Gossip::builder().spawn(endpoint_client.clone());
         let client_node = PeerNode::new(
@@ -1899,7 +1899,7 @@ mod tests {
             0,
             "precondition: the healthy peer is still unreachable"
         );
-        address_lookup.add_endpoint_info(endpoint_source.addr());
+        address_lookup.add_endpoint_info(loopback_addr(&endpoint_source));
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
         let converged = loop {
