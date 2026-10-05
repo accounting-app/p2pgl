@@ -438,16 +438,16 @@ pub struct P2pConfig {
 
     /// This mesh's identity, bound into every signature (L-23).
     ///
-    /// Optional, and when it is absent the signature domain falls back to
-    /// [`swarm_topic`](Self::swarm_topic) **exactly** as it behaved before this
-    /// field existed. That fallback is a hard compatibility constraint, not a
-    /// convenience: a signature is verified by *reconstructing* the signed
-    /// message with the verifier's own domain, so changing the domain a
-    /// deployment resolves to invalidates every signature it has already
-    /// persisted and every signature its peers hold. An existing deployment
-    /// that sets nothing here keeps verifying its history; one that sets a
-    /// `meshId` is choosing a new domain and must roll it out to the whole mesh
-    /// at once.
+    /// Required when `signing.enabled` (L-23). A node with signing off may
+    /// leave it out, and its domain then falls back to
+    /// [`swarm_topic`](Self::swarm_topic), unused. The value is compared byte
+    /// for byte: a signature is verified by *reconstructing* the signed message
+    /// with the verifier's own domain, so changing the domain a deployment
+    /// resolves to invalidates every signature it has already persisted and
+    /// every signature its peers hold. A mesh that signed before `meshId`
+    /// existed signed under its swarm topic, and keeps its history by setting
+    /// `meshId` to that topic verbatim on every node — the remedy the boot
+    /// refusal names.
     ///
     /// Why it exists: the swarm topic is also the gossip *join credential* —
     /// anyone holding the string plus one member id can join the overlay — and
@@ -1351,6 +1351,21 @@ impl NodeConfig {
                 mesh_id,
                 "the value is compared byte-for-byte on both sides of every signature",
             )?;
+        } else if self.signing.enabled {
+            // L-23 (R-9's announced step): a signing node names its mesh. The
+            // swarm topic is the gossip join credential; signing under it made
+            // "can reach this mesh" and "is this mesh" one claim, so two meshes
+            // that picked the same topic accepted each other's records. The
+            // refusal leads with the one value that keeps an existing mesh's
+            // signatures verifying, and never prints the topic (M-32, L-56).
+            return Err(ConfigError::Validation(
+                "p2p.meshId is required when signing.enabled is true. For an existing mesh, \
+                 set it to your current p2p.swarmTopic, copied byte for byte on every node — \
+                 any other value invalidates every signature already in the mesh; after that \
+                 the topic can change without touching signatures. For a new mesh, use a \
+                 random value such as the output of uuidgen (L-23, R-9)"
+                    .to_owned(),
+            ));
         }
         debug_assert!(
             Self::validate_signature_domain(
@@ -1718,46 +1733,28 @@ impl NodeConfig {
         )
     }
 
-    /// Log which field the signature domain resolved from (L-23) — and, when
-    /// `p2p.meshId` is unset on a node that signs, WARN with the one
-    /// history-preserving remedy (R-9).
+    /// Log which field the signature domain resolved from (L-23).
     ///
-    /// The R-9 decision: `meshId` becomes required a release from now, so an
-    /// operator must be told today, at `warn`, what to set it to — and the only
-    /// value that keeps an existing mesh's signatures verifying is the current
-    /// `swarmTopic`, byte for byte, because a signature is checked by
-    /// rebuilding the signed message with the verifier's own domain. The remedy
-    /// therefore LEADS with that sentence; the README's old `uuidgen` advice is
-    /// right for a new mesh and destroys an existing one's history.
+    /// Until `meshId` was required, a signing node without one WARNed here with
+    /// the remedy R-9 chose; that remedy is now the boot refusal in
+    /// [`Self::validate`], so a node that reaches this line and signs has a
+    /// `meshId`. Only a node with signing off can still resolve to the swarm
+    /// topic, and it has no signatures the domain could invalidate.
     ///
     /// Never prints the domain: on the fallback path it *is* the gossip join
     /// credential (M-32, L-56), so only its source, length and a four-character
-    /// prefix appear — the shape `main` always logged. A node with signing off
-    /// has no signatures to invalidate, so it gets the `info` line only.
+    /// prefix appear — the shape `main` always logged.
     pub fn log_signature_domain(&self) {
         let domain = self.p2p.signature_domain();
         let source = self.p2p.signature_domain_source();
         let length = domain.len();
         let prefix: String = domain.chars().take(4).collect();
-        if self.p2p.mesh_id.is_none() && self.signing.enabled {
-            warn!(
-                source,
-                length,
-                prefix = %prefix,
-                "p2p.meshId is unset, so this node's signature domain is p2p.swarmTopic; meshId \
-                 will be REQUIRED in a later release. Remedy: set p2p.meshId to your current \
-                 swarmTopic verbatim — any other value invalidates every signature already in \
-                 the mesh. Copy the value byte for byte on every node; after that the topic can \
-                 change without touching signatures (R-9, L-23)"
-            );
-        } else {
-            info!(
-                source,
-                length,
-                prefix = %prefix,
-                "mesh signature domain resolved"
-            );
-        }
+        info!(
+            source,
+            length,
+            prefix = %prefix,
+            "mesh signature domain resolved"
+        );
     }
 
     /// Whether to serve GraphiQL on `GET /graphql`.
@@ -1981,6 +1978,7 @@ mod tests {
                 "gossipIntervalMilliseconds": 3000,
                 "antiEntropyIntervalMilliseconds": 10000,
                 "swarmTopic": "my-org/ledger",
+                "meshId": "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
                 "relayMode": "disabled"
             }}
         }}"#
@@ -2203,7 +2201,7 @@ mod tests {
         let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
         assert!(!config.signing.allow_writes_when_every_signature_fails);
         let file = write_temp_config(
-            r#"{ "ledgerPath": "./data/ledger.bean", "signing": { "enabled": true, "allowWritesWhenEverySignatureFails": true } }"#,
+            r#"{ "ledgerPath": "./data/ledger.bean", "signing": { "enabled": true, "allowWritesWhenEverySignatureFails": true }, "p2p": { "meshId": "3f2504e0-4f89-41d3-9a0c-0305e82c3301" } }"#,
         );
         let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
         assert!(config.signing.allow_writes_when_every_signature_fails);
@@ -2219,7 +2217,8 @@ mod tests {
             format!(
                 r#"{{ "ledgerPath": "./data/ledger.bean", "signing": {{ "enabled": true }},
                 "p2p": {{ "enabled": true, "bootstrapEndpointIds": ["{peer_a}"],
-                "swarmTopic": "my-org/ledger", "joinFrom": "{join_from}" }} }}"#
+                "swarmTopic": "my-org/ledger", "meshId": "my-org/ledger",
+                "joinFrom": "{join_from}" }} }}"#
             )
         };
         let file = write_temp_config(&config_with(&peer_a));
@@ -2284,7 +2283,7 @@ mod tests {
     fn test_p2p_with_signing_accepted() {
         // The same config with signing on must load.
         let file = write_temp_config(
-            r#"{ "ledgerPath": "./data/ledger.bean", "p2p": { "enabled": true, "swarmTopic": "my-org/ledger" }, "signing": { "enabled": true } }"#,
+            r#"{ "ledgerPath": "./data/ledger.bean", "p2p": { "enabled": true, "swarmTopic": "my-org/ledger", "meshId": "my-org/ledger" }, "signing": { "enabled": true } }"#,
         );
         let config = NodeConfig::load_from_path(&file.path().to_path_buf()).unwrap();
         assert!(config.p2p.enabled);
@@ -2925,7 +2924,7 @@ mod tests {
             .expect("the shipped meshId is a well-formed domain");
     }
 
-    // ── R-9: the meshId-unset boot warning ─────────────────────────────
+    // ── L-23 / R-9: meshId on a signing node ──────────────────────────
 
     /// A signing node on a fixed topic, with or without a `meshId`.
     fn signing_config(topic: &str, mesh_id: Option<&str>, signing: bool) -> NodeConfig {
@@ -2941,34 +2940,35 @@ mod tests {
         NodeConfig::load_from_path(&file.path().to_path_buf()).expect("valid config")
     }
 
-    /// R-9: `meshId` unset on a signing node → a WARN whose remedy leads with
-    /// the verbatim-`swarmTopic` sentence, naming the field — and never the
-    /// topic, which on this path is the join credential and the domain.
+    /// L-23: `meshId` unset on a signing node is refused at boot, and the
+    /// refusal leads with the remedy that keeps an existing mesh's history (the
+    /// current `swarmTopic`, verbatim) — without printing the topic, which on
+    /// that path was the join credential and the domain.
     ///
-    /// Bug-catch: demote the `warn!` to `info!` (the pre-T71 line) and nothing
-    /// is captured at WARN.
+    /// Bug-catch: drop the refusal and the signing node boots on the topic
+    /// fallback.
     #[test]
-    fn test_mesh_id_unset_warns_with_the_verbatim_remedy_and_never_the_topic() {
+    fn test_mesh_id_unset_on_a_signing_node_is_refused_with_the_verbatim_remedy() {
         let topic = "acme/secret-join-topic-77";
-        let config = signing_config(topic, None, true);
-        let ((), logged) = capture_warnings(|| config.log_signature_domain());
-        assert!(logged.contains("WARN"), "must be a warning: {logged}");
+        let file = write_temp_config(&format!(
+            r#"{{ "ledgerPath": "./data/ledger.bean", "signing": {{ "enabled": true }},
+                  "p2p": {{ "swarmTopic": {} }} }}"#,
+            serde_json::json!(topic)
+        ));
+        let error = NodeConfig::load_from_path(&file.path().to_path_buf())
+            .expect_err("a signing node must name its mesh");
+        let message = error.to_string();
+        assert!(message.contains("p2p.meshId is required"), "{message}");
         assert!(
-            logged.contains(
-                "Remedy: set p2p.meshId to your current swarmTopic verbatim — any other value \
-                 invalidates every signature already in the mesh"
+            message.contains(
+                "set it to your current p2p.swarmTopic, copied byte for byte on every node — \
+                 any other value invalidates every signature already in the mesh"
             ),
-            "the remedy leads with the history-preserving value: {logged}"
+            "the refusal leads with the history-preserving value: {message}"
         );
-        assert!(
-            logged.contains("p2p.swarmTopic"),
-            "names swarmTopic: {logged}"
-        );
-        assert!(!logged.contains(topic), "the topic was printed: {logged}");
-        assert!(
-            logged.contains(&format!("length={}", topic.len())) && logged.contains("prefix=acme"),
-            "the redacted shape the boot log always used: {logged}"
-        );
+        assert!(!message.contains(topic), "the topic was printed: {message}");
+        // A node that does not sign has no domain to name.
+        signing_config(topic, None, false);
     }
 
     /// No warning once `meshId` is set (any value — the verbatim one included),

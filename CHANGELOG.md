@@ -23,6 +23,7 @@ known residuals, see that task's "Done" note in the tracker.
 
 **Configuration**
 
+- **`p2p.meshId` is required when `signing.enabled` is true (L-23).** A signing node without it refuses to boot; before, its signature domain fell back to `p2p.swarmTopic` with a warning. On an existing mesh set `meshId` to your current `swarmTopic`, byte for byte, on every node — that keeps every signature verifying, and can be done one node at a time. A new mesh should use a random value (`uuidgen`).
 - **`auth.enabled` defaults to `true` (H-01).** A config with no `auth` section now requires `X-Api-Key` on `/graphql`. On a loopback bind with no key configured, the first boot generates one into `auth.apiKeyPath` (default `./data/api.key`, mode 0600) and later boots reuse it; clients must send it. To keep the old behaviour, set `"auth": { "enabled": false }` — loopback only, and boot WARNs every time. A public bind still needs a key you set.
 - `externalFileEdits` is removed, and a config that still carries it is refused at boot by name. It only ever gated the file watcher, so use `watchLedgerFile: true` for that. Hand edits are always adopted (M-19, T52).
 - Older binaries reject every new key listed under *Added* (`deny_unknown_fields`). That includes `watchLedgerFile`, `http.maxConnectionsPerIp` and the eight `p2p.antiEntropy*` keys (R-13).
@@ -170,6 +171,7 @@ known residuals, see that task's "Done" note in the tracker.
 
 ### Security
 
+- **L-23:** a signing node must name its mesh, so a swarm topic two meshes happen to share no longer makes them accept each other's signed records (once each has its own `meshId`).
 - **H-01:** the API is authenticated by default on a loopback bind too, with a generated key in a node-private file read under the node's secret-key rules (no symlink, owned by the node's user, mode 0600, one link). Before, any program or account on the machine — or a page past the browser checks — could write the ledger.
 - **H-07 / H-12:** one lamport-ceiling rule on every path, plus a `2^32` adoption ratchet. One peer directive can no longer make a node author records nobody accepts, or brick it on restart (T46, T63).
 - **H-08:** a lossy boot no longer reaches a rewrite. Refused records are quarantined, and compaction keeps them (T47).

@@ -1589,69 +1589,51 @@ mod tests {
             );
         }
 
-        /// Compatibility pin: with `meshId` unset on both sides, two nodes on
-        /// one topic verify each other exactly as they did before L-23.
+        /// Compatibility pin (L-23): a history signed before `meshId` existed
+        /// was signed under the swarm topic, and the remedy the boot refusal
+        /// names — `meshId` set to that topic verbatim — keeps it verifying,
+        /// byte for byte.
         ///
-        /// This is the constraint the fallback exists for. A signature is
-        /// checked by *reconstructing* the signed message, so any change to the
-        /// domain an existing deployment resolves to would invalidate every
-        /// signature it has already persisted.
+        /// A signature is checked by *reconstructing* the signed message, so
+        /// any other value would invalidate every signature the mesh holds.
         #[test]
-        fn unset_mesh_id_falls_back_to_the_swarm_topic() {
+        fn a_mesh_id_set_to_the_old_topic_keeps_a_pre_l23_history_verifying() {
             let dir = tempfile::tempdir().expect("temp dir");
             let key = node_key(dir.path());
             let author = author_hex(&key);
 
-            let config_a = config_for("my-org/ledger", None);
-            let config_b = config_for("my-org/ledger", None);
-            assert_eq!(config_a.p2p.signature_domain(), "my-org/ledger");
-            assert_eq!(
-                config_a.p2p.signature_domain_source(),
-                "p2p.swarmTopic (meshId unset)"
-            );
+            // Signed as a pre-L-23 node did: under the topic string itself.
+            let pre_l23: Arc<dyn SignatureProvider> =
+                Arc::new(security::signing::PeerKeySignatureProvider::from_bytes(
+                    key.bytes(),
+                    "my-org/ledger".to_owned(),
+                ));
+            let directive = signed_directive(pre_l23.as_ref(), &author);
 
-            let directive = signed_directive(signer_for(&config_a, &key).as_ref(), &author);
+            let remedied = config_for("my-org/ledger", Some("my-org/ledger"));
+            assert_eq!(remedied.p2p.signature_domain_source(), "p2p.meshId");
             p2p::union_merge::verify_remote_signature(
                 &directive,
                 true,
-                config_b.p2p.signature_domain(),
+                remedied.p2p.signature_domain(),
             )
-            .expect("an unset meshId must keep verifying under the swarm topic");
-
-            // And the bytes are the pre-L-23 bytes: the signed message is the
-            // one built from the topic string itself.
-            let peer = security::signing::PeerKeySignatureProvider::from_bytes(
-                key.bytes(),
-                "my-org/ledger".to_owned(),
+            .expect("meshId = the old topic must keep the history verifying");
+            let fresh = config_for(
+                "my-org/ledger",
+                Some("44444444-4444-4444-8444-444444444444"),
             );
-            let content_id = match &directive {
-                ledger::model::Directive::Transaction(txn) => ledger::hash::compute_content_id(
-                    &ledger::model::Directive::Transaction(txn.clone()),
-                ),
-                other => ledger::hash::compute_content_id(other),
-            };
-            let message = SignableMessage {
-                content_id: &content_id,
-                is_transaction: true,
-                parents: "",
-                lamport: "1",
-            };
-            let signature = match &directive {
-                ledger::model::Directive::Transaction(txn) => txn
-                    .metadata
-                    .get("openledger-signature")
-                    .expect("signature")
-                    .clone(),
-                _ => unreachable!(),
-            };
-            peer.verify(&message, &signature, &author)
-                .expect("the fallback domain must be the swarm topic verbatim");
+            p2p::union_merge::verify_remote_signature(
+                &directive,
+                true,
+                fresh.p2p.signature_domain(),
+            )
+            .expect_err("any other meshId is a new domain");
         }
 
         /// The decoupling actually decouples: a directive signed under mesh id
-        /// X still verifies after the swarm topic is changed — and with no mesh
-        /// id, the same topic change breaks verification, which is the coupling
-        /// L-23 removes.
+        /// X still verifies after the swarm topic is changed — and signed
+        /// under the topic itself, the same change breaks verification, which
+        /// is the coupling L-23 removes.
         #[test]
         fn mesh_id_survives_a_swarm_topic_change() {
             let dir = tempfile::tempdir().expect("temp dir");
@@ -1671,17 +1653,17 @@ mod tests {
             )
             .expect("a mesh id must outlive the gossip topic it was once tied to");
 
-            // Contrast: the same topic change under the fallback invalidates
-            // the history, which is precisely why the two were separated.
-            let coupled_before = config_for("my-org/ledger", None);
-            let coupled_after = config_for("my-org/ledger-renamed", None);
-            let coupled = signed_directive(signer_for(&coupled_before, &key).as_ref(), &author);
-            p2p::union_merge::verify_remote_signature(
-                &coupled,
-                true,
-                coupled_after.p2p.signature_domain(),
-            )
-            .expect_err("without a mesh id the topic IS the domain, so renaming it breaks history");
+            // Contrast: signed under the topic itself — the pre-L-23 domain —
+            // the same rename invalidates the history, which is precisely why
+            // the two were separated.
+            let coupled: Arc<dyn SignatureProvider> =
+                Arc::new(security::signing::PeerKeySignatureProvider::from_bytes(
+                    key.bytes(),
+                    "my-org/ledger".to_owned(),
+                ));
+            let coupled = signed_directive(coupled.as_ref(), &author);
+            p2p::union_merge::verify_remote_signature(&coupled, true, "my-org/ledger-renamed")
+                .expect_err("when the topic IS the domain, renaming it breaks history");
         }
 
         /// The resolved domain reaches the ALPN verifier and the signer as one

@@ -504,8 +504,8 @@ boot if it is missing — the node will not start half-hardened.
 right value depends on whether the mesh already exists: on an **existing** mesh,
 set it to your current `swarmTopic` verbatim — any other value invalidates every
 signature already in the mesh. Read [Mesh identity](#mesh-identity-p2pmeshid)
-before you set one. A signing node with no `meshId` logs a warning at every
-boot saying so; `meshId` becomes required in a later release.
+before you set one. It is **required** whenever `signing.enabled` is true: a
+signing node without it refuses to boot, and the refusal names that remedy.
 
 > `"apiKey": "change-me"` above is a **placeholder that this node refuses to
 > boot with**, on purpose — see [API keys](#api-keys) before you copy the block.
@@ -547,8 +547,8 @@ boot saying so; `meshId` becomes required in a later release.
 | `p2p.antiEntropyMaxConcurrentExchanges` | `8` | Outbound anti-entropy exchanges this node runs at once, across all peers; past it, peers wait their turn in order. Each exchange against a hostile peer can hold ~130–150 MiB at worst. `1`–`64` |
 | `p2p.antiEntropySupplyBackoffSeconds` | `60` | When a peer's batch would not fit under the 64 MiB ledger cap, that peer's `Supply` is not applied again for this long (one warning per deferral). `5`–`3600` |
 | `p2p.relayMode` | `"n0"` | `"n0"` (public Iroh relays and discovery) or `"disabled"` (direct addresses only). Anything else is refused at boot — see [Relay mode](#relay-mode-p2prelaymode) |
-| `p2p.swarmTopic` | `openledger/transactions` | Gossip topic, and the signature domain while `meshId` is unset; required unique on a public bind. Same form as `meshId`: non-empty, no surrounding whitespace, ASCII letters, digits and `- _ . : /`, up to 128 bytes |
-| `p2p.meshId` | *(unset)* | Mesh identity bound into every signature. **Existing mesh: your current `swarmTopic`, verbatim** — any other value invalidates every signature already in the mesh. New mesh: a random UUID. Unset falls back to `swarmTopic` and draws a boot warning on a signing node — see below |
+| `p2p.swarmTopic` | `openledger/transactions` | Gossip topic (and, before `meshId` existed, the signature domain); required unique on a public bind. Same form as `meshId`: non-empty, no surrounding whitespace, ASCII letters, digits and `- _ . : /`, up to 128 bytes |
+| `p2p.meshId` | *(unset)* | Mesh identity bound into every signature. **Required when `signing.enabled`** — a signing node without it refuses to boot. **Existing mesh: your current `swarmTopic`, verbatim** — any other value invalidates every signature already in the mesh. New mesh: a random UUID — see below |
 
 **`allowedHosts`.** The request guard checks the `Host` header on every
 GraphQL request, which is what stops a DNS-rebinding page in a browser from
@@ -689,9 +689,9 @@ so check that your peers can actually connect before relying on it.
 
 > **On an existing mesh: set `p2p.meshId` to your current `swarmTopic`
 > verbatim — any other value invalidates every signature already in the mesh.**
-> Copy it byte for byte, on every node. A signing node with `meshId` unset logs
-> a boot warning that says exactly this, and `meshId` becomes **required** in a
-> later release.
+> Copy it byte for byte, on every node. `meshId` is **required** on any node
+> with `signing.enabled`: one without it refuses to boot with an error that
+> says exactly this (it never prints the topic).
 
 The swarm topic is a *reachability* string: anyone holding it
 plus one member EndpointId can join the gossip overlay. Using it as the
@@ -700,8 +700,9 @@ topic accepted each other's signed directives. Setting `meshId` separates the
 two; any identifier of ASCII letters, digits and `- _ . : /` up to 128 bytes is
 accepted.
 
-Because leaving `meshId` unset is the default and the topic then *is* the
-domain, **`swarmTopic` is held to exactly the same form rules** — non-empty, no
+Because a mesh that signed before `meshId` existed signed under its topic — and
+keeps that domain by copying the topic into `meshId` — **`swarmTopic` is held to
+exactly the same form rules** — non-empty, no
 leading or trailing whitespace, ASCII letters, digits and `- _ . : /`, at most
 128 bytes — and a value that breaks them is refused at boot rather than
 trimmed. The refusal names the field, the value's length and the byte offset of
@@ -710,11 +711,12 @@ topic differing by one space between two nodes is not a cosmetic difference: it
 is a different gossip overlay *and* a different signature domain, and it would
 otherwise surface much later as `InvalidSignature`.
 
-Leaving it unset keeps the pre-existing behaviour exactly: the domain is
-`swarmTopic`. A signature is checked by reconstructing the signed message with
-the verifier's own domain, so **changing the resolved domain invalidates every
-signature already persisted and every signature peers hold** — which is why the
-only safe `meshId` for an existing mesh is the string it already signs with.
+Before this release a signing node could leave it unset, and its domain was
+then `swarmTopic`. A signature is checked by reconstructing the signed message
+with the verifier's own domain, so **changing the resolved domain invalidates
+every signature already persisted and every signature peers hold** — which is
+why the only safe `meshId` for an existing mesh is the string it already signs
+with. A node with signing off may still leave `meshId` out; it signs nothing.
 
 A node started with the wrong domain (or the wrong key) says so: at boot every
 signature in its history fails, it logs *"EVERY signature this node checked
@@ -730,10 +732,10 @@ verify and hide the warning. To write anyway, set
 both on every node before the first directive is written, and there is nothing
 else to think about.
 
-**Existing mesh — the recommended step.** Set `meshId` to the current
-`swarmTopic`, byte for byte, on each node. The resolved domain does not change,
-so no signature is invalidated and no maintenance window is needed: nodes can
-be switched one at a time. What it buys is that the two are now separate
+**Existing mesh — the required step when you upgrade.** Set `meshId` to the
+current `swarmTopic`, byte for byte, on each node. The resolved domain does not
+change, so no signature is invalidated and no maintenance window is needed:
+nodes can be switched one at a time, before or as each one is upgraded. What it buys is that the two are now separate
 settings — from then on you can rotate `swarmTopic` (the join credential)
 without touching the signature domain. The shipped
 `deploy/gl-node.docker.json` does exactly this (`"meshId":
@@ -763,10 +765,9 @@ verifying. Do it only if you need it:
    is still in flight that needs its signature checked afterwards.
 
 **Confirm the boot log** either way. Each node logs the domain's `source`
-(`p2p.meshId` or `p2p.swarmTopic (meshId unset)`) with its length and a
-four-character prefix — never the value itself, because on the fallback path
-the domain *is* the gossip join credential. All nodes must report
-`source="p2p.meshId"` and the same length and prefix.
+with its length and a four-character prefix — never the value itself, because a
+`meshId` copied from the topic *is* the gossip join credential. All nodes must
+report `source="p2p.meshId"` and the same length and prefix.
 
 Rolling back is the same procedure in reverse, with the same window.
 
