@@ -332,14 +332,46 @@ fn t44_boot_over_canonical_plus_journal_matches_boot_over_the_compacted_file() {
 /// This is T29's 66-permutation shape at the scale the journal path can be
 /// exercised at — 24 orders of four lifecycle directives, each on its own
 /// ledger past the compaction threshold.
+///
+/// Run across the Format v2 epoch matrix (`docs/FORMAT_V2_DESIGN.md` §4):
+/// the four records in v1, in v2, and two of each.
 #[test]
 fn t44_compaction_is_byte_identical_across_every_arrival_order() {
-    let lifecycle = [
+    for v2 in [[false; 4], [true; 4], [false, true, false, true]] {
+        t44_compaction_is_byte_identical_across_every_arrival_order_in(v2);
+    }
+}
+
+/// [`t44_compaction_is_byte_identical_across_every_arrival_order`] with the
+/// records `v2` marks carrying the Format v2 marker.
+fn t44_compaction_is_byte_identical_across_every_arrival_order_in(v2: [bool; 4]) {
+    let mut lifecycle = [
         remote_open("Assets:Vault", make_date(2024, 3, 1), 10),
         remote_close("Assets:Vault", make_date(2024, 5, 1), 11),
         remote_open("Assets:Safe", make_date(2024, 4, 1), 12),
         remote_close("Assets:Safe", make_date(2024, 6, 1), 13),
     ];
+    for (directive, v2) in lifecycle.iter_mut().zip(v2) {
+        let metadata = match directive {
+            Directive::Open(open) => &mut open.metadata,
+            Directive::Close(close) => &mut close.metadata,
+            _ => unreachable!("the fixture is opens and closes"),
+        };
+        if v2 {
+            metadata.insert(
+                crate::hash::FORMAT_KEY.to_owned(),
+                crate::hash::FORMAT_V2.to_owned(),
+            );
+        }
+    }
+    for (directive, v2) in lifecycle.iter().zip(v2) {
+        let expected = if v2 {
+            crate::hash::RecordFormat::V2
+        } else {
+            crate::hash::RecordFormat::V1
+        };
+        assert_eq!(crate::hash::RecordFormat::of(directive), expected);
+    }
 
     let mut orders: Vec<Vec<usize>> = Vec::new();
     for a in 0..4 {
@@ -384,7 +416,7 @@ fn t44_compaction_is_byte_identical_across_every_arrival_order() {
     for (index, output) in outputs.iter().enumerate() {
         assert_eq!(
             output, &outputs[0],
-            "arrival order {:?} compacted to different canonical bytes",
+            "v2 {v2:?}: arrival order {:?} compacted to different canonical bytes",
             orders[index]
         );
     }

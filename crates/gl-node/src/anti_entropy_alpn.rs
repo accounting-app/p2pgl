@@ -6208,8 +6208,75 @@ pub(crate) mod tests {
     /// Seed a source ledger authored by `author` with 3 opens and 2 balanced
     /// transactions; `txn2` references `txn1` as its DAG parent.
     fn seed_mixed_source(dir: &std::path::Path, author: &str) -> SeededSource {
-        let mut source =
-            LedgerService::boot(dir.join("source.bean"), author.to_owned()).expect("boot source");
+        seed_mixed_source_in(dir, author, Epoch::V1)
+    }
+
+    /// The Format v2 epoch matrix (`docs/FORMAT_V2_DESIGN.md` §4): a fixture
+    /// written in v1 only, in v2 only, or by a node that switches from v1 to
+    /// v2 part way through — its first records v1, the rest v2.
+    #[derive(Clone, Copy, Debug)]
+    enum Epoch {
+        V1,
+        V2,
+        Mixed,
+    }
+
+    impl Epoch {
+        const ALL: [Epoch; 3] = [Epoch::V1, Epoch::V2, Epoch::Mixed];
+
+        /// The format the fixture's source starts writing in.
+        fn first(self) -> ledger::hash::RecordFormat {
+            match self {
+                Epoch::V2 => ledger::hash::RecordFormat::V2,
+                Epoch::V1 | Epoch::Mixed => ledger::hash::RecordFormat::V1,
+            }
+        }
+
+        /// Boot the fixture's source at `path`.
+        fn boot(self, path: std::path::PathBuf, author: &str) -> LedgerService {
+            LedgerService::boot_emitting(path, author.to_owned(), self.first())
+                .expect("boot source")
+        }
+
+        /// At the fixture's switch point: a `Mixed` source compacts and
+        /// restarts writing v2, as an operator switching `format.idv2` on
+        /// does; the others carry on as they are.
+        fn switch(self, source: LedgerService, author: &str) -> LedgerService {
+            if !matches!(self, Epoch::Mixed) {
+                return source;
+            }
+            let mut source = source;
+            source.compact().expect("compact before the switch");
+            let path = source.file_path().to_path_buf();
+            drop(source);
+            LedgerService::boot_emitting(path, author.to_owned(), ledger::hash::RecordFormat::V2)
+                .expect("reboot writing v2")
+        }
+
+        /// The fixture really is in this epoch: every record v1, every record
+        /// v2, or some of each.
+        fn assert_holds(self, source: &LedgerService) {
+            let formats: std::collections::BTreeSet<_> = source
+                .dag()
+                .directives()
+                .into_iter()
+                .map(|directive| format!("{:?}", ledger::hash::RecordFormat::of(directive)))
+                .collect();
+            let expected: &[&str] = match self {
+                Epoch::V1 => &["V1"],
+                Epoch::V2 => &["V2"],
+                Epoch::Mixed => &["V1", "V2"],
+            };
+            assert_eq!(
+                formats.iter().map(String::as_str).collect::<Vec<_>>(),
+                expected,
+                "{self:?}: the fixture's formats"
+            );
+        }
+    }
+
+    fn seed_mixed_source_in(dir: &std::path::Path, author: &str, epoch: Epoch) -> SeededSource {
+        let mut source = epoch.boot(dir.join("source.bean"), author);
         let day = NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid date");
         let open_cash = source
             .open_account("Assets:Cash".to_owned(), day, vec!["USD".to_owned()])
@@ -6224,6 +6291,7 @@ pub(crate) mod tests {
             .append_transaction(balanced_funding_input())
             .expect("append txn1")
             .txid;
+        let mut source = epoch.switch(source, author);
         let txn2 = source
             .append_transaction(TransactionInput {
                 date: NaiveDate::from_ymd_opt(2024, 1, 20).expect("valid date"),
@@ -6276,13 +6344,23 @@ pub(crate) mod tests {
     /// persist (M-15) changed nothing observable: `full_file_serialize` sorts
     /// and serializes each directive independently, so the on-disk snapshot is
     /// the same however many persists produced it.
+    ///
+    /// Run across the Format v2 epoch matrix: a v1 set, a v2 set, and a set
+    /// whose source switched from v1 to v2 part way.
     #[tokio::test]
     async fn batch_path_is_byte_identical_to_per_entry_path() {
+        for epoch in Epoch::ALL {
+            batch_path_is_byte_identical_to_per_entry_path_in(epoch).await;
+        }
+    }
+
+    async fn batch_path_is_byte_identical_to_per_entry_path_in(epoch: Epoch) {
         let author = iroh::SecretKey::generate().public();
         let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
         let temp_dir = tempfile::tempdir().expect("temp dir");
 
-        let seeded = seed_mixed_source(temp_dir.path(), &author.to_string());
+        let seeded = seed_mixed_source_in(temp_dir.path(), &author.to_string(), epoch);
+        epoch.assert_holds(&seeded.source);
 
         // A realistic mix: opens shuffled among themselves (independent), with
         // both transactions after their parents (so the per-entry path, which
@@ -6332,14 +6410,14 @@ pub(crate) mod tests {
         let per_entry_bytes = std::fs::read(&per_entry_path).expect("read per-entry file");
         assert_eq!(
             batch_bytes, per_entry_bytes,
-            "batched and per-entry .bean files must be byte-identical"
+            "{epoch:?}: batched and per-entry .bean files must be byte-identical"
         );
 
         let batch_ids = batch_ledger.read().await.all_directive_ids();
         let per_entry_ids = per_entry_ledger.read().await.all_directive_ids();
         assert_eq!(
             batch_ids, per_entry_ids,
-            "batched and per-entry directive-id sets must match"
+            "{epoch:?}: batched and per-entry directive-id sets must match"
         );
         assert_eq!(batch_ids.len(), 5);
     }
@@ -6625,10 +6703,17 @@ pub(crate) mod tests {
     /// the documented directive-set residual and lets the test demand an
     /// IDENTICAL accepted set from every order.
     fn seed_lifecycle_source(dir: &std::path::Path, author: &str) -> (LedgerService, Vec<String>) {
-        let mut source = LedgerService::boot(dir.join("lifecycle-source.bean"), author.to_owned())
-            .expect("boot lifecycle source");
+        seed_lifecycle_source_in(dir, author, Epoch::V1)
+    }
+
+    fn seed_lifecycle_source_in(
+        dir: &std::path::Path,
+        author: &str,
+        epoch: Epoch,
+    ) -> (LedgerService, Vec<String>) {
+        let mut source = epoch.boot(dir.join("lifecycle-source.bean"), author);
         // Creation order IS the canonical (date, type-priority) order.
-        let ids = vec![
+        let mut ids = vec![
             source
                 .open_account("Equity:Opening".to_owned(), day(1, 1), Vec::new())
                 .expect("open equity"),
@@ -6642,6 +6727,9 @@ pub(crate) mod tests {
                 .append_transaction(lifecycle_txn("Assets:Cash", day(1, 15), dec!(100)))
                 .expect("cash txn")
                 .txid,
+        ];
+        let mut source = epoch.switch(source, author);
+        ids.extend([
             source
                 .close_account("Assets:Cash".to_owned(), day(2, 1))
                 .expect("close cash"),
@@ -6658,7 +6746,7 @@ pub(crate) mod tests {
             source
                 .close_account("Assets:Bank".to_owned(), day(12, 31))
                 .expect("close bank"),
-        ];
+        ]);
 
         (source, ids)
     }
@@ -6782,13 +6870,23 @@ pub(crate) mod tests {
     /// arrived yet was rejected outright and never retried (the orphan buffer
     /// only ever waited on parents, and an `open` is never a parent), so the
     /// accepted set depended on arrival order and stayed different forever.
+    ///
+    /// Run across the Format v2 epoch matrix: a v1 set, a v2 set, and a set
+    /// whose source switched from v1 to v2 part way.
     #[tokio::test]
     async fn lifecycle_converges_under_every_arrival_order() {
+        for epoch in Epoch::ALL {
+            lifecycle_converges_under_every_arrival_order_in(epoch).await;
+        }
+    }
+
+    async fn lifecycle_converges_under_every_arrival_order_in(epoch: Epoch) {
         let author = iroh::SecretKey::generate().public();
         let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
         let temp_dir = tempfile::tempdir().expect("temp dir");
 
-        let (source, ids) = seed_lifecycle_source(temp_dir.path(), &author.to_string());
+        let (source, ids) = seed_lifecycle_source_in(temp_dir.path(), &author.to_string(), epoch);
+        epoch.assert_holds(&source);
         let sorted: Vec<p2p::protocol::SupplyEntry> =
             ids.iter().map(|id| entry_for(&source, id)).collect();
         assert_eq!(sorted.len(), 9, "the fixture shape is what the test claims");
@@ -6818,19 +6916,19 @@ pub(crate) mod tests {
             let state = apply_order(temp_dir.path(), &label, &allow, entries).await;
             assert_eq!(
                 state.directive_ids, reference.directive_ids,
-                "order {label}: accepted directive set diverged"
+                "{epoch:?} order {label}: accepted directive set diverged"
             );
             assert_eq!(
                 state.lifecycle, reference.lifecycle,
-                "order {label}: account lifecycle state diverged"
+                "{epoch:?} order {label}: account lifecycle state diverged"
             );
             assert_eq!(
                 state.balances, reference.balances,
-                "order {label}: balances diverged"
+                "{epoch:?} order {label}: balances diverged"
             );
             assert_eq!(
                 state.file_bytes, reference.file_bytes,
-                "order {label}: persisted .bean file is not byte-identical"
+                "{epoch:?} order {label}: persisted .bean file is not byte-identical"
             );
         }
     }
@@ -9499,8 +9597,13 @@ pub(crate) mod tests {
     /// fallback is a downgrade path, and a failed dial is ambiguous with a down
     /// peer.
     ///
-    /// Bug-catch: dial v1 whatever `wire_codec` says, or serve v1 on the v2
-    /// ALPN, and the v2 client is never served (or the no-fallback client is).
+    /// The serving node routes through the production
+    /// [`crate::p2p_service::spawn_router`] on a real `PeerNode`, so the
+    /// registration `main` uses is the one exercised.
+    ///
+    /// Bug-catch: dial v1 whatever `wire_codec` says, serve v1 on the v2
+    /// ALPN, or drop the v2 ALPN from `spawn_router`, and the v2 client is
+    /// never served (or the no-fallback client is).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn wire_v2_and_v1_clients_both_catch_up_from_one_server() {
         let _serialized = NET_TEST_LOCK.lock().await;
@@ -9551,16 +9654,26 @@ pub(crate) mod tests {
                 endpoint_v2.id().to_string(),
                 endpoint_v2_stranded.id().to_string(),
             ];
-            let handler = make_handler(
-                ledger.clone(),
-                PeerAllowlist::parse(&clients).expect("allowlist"),
-            );
-            let mut router = Router::builder((*endpoint).clone())
-                .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler.clone());
-            if v2 {
-                router = router.accept(p2p::protocol::ANTI_ENTROPY_ALPN_V2, handler);
-            }
-            routers.push(router.spawn());
+            let allowlist = PeerAllowlist::parse(&clients).expect("allowlist");
+            let handler = make_handler(ledger.clone(), allowlist.clone());
+            let router = if v2 {
+                // The production router, as `main` spawns it.
+                let node = p2p::node::PeerNode::new(
+                    (*endpoint).clone(),
+                    iroh_gossip::net::Gossip::builder().spawn((*endpoint).clone()),
+                    p2p::node::PeerNodeConfig {
+                        swarm_topic: "openledger/wire-v2-router".to_owned(),
+                        anti_entropy_interval_ms: 1_000,
+                    },
+                    allowlist,
+                );
+                crate::p2p_service::spawn_router(&node, handler)
+            } else {
+                Router::builder((*endpoint).clone())
+                    .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler)
+                    .spawn()
+            };
+            routers.push(router);
             served.push(ledger);
         }
         let held = served[0].read().await.directive_count();

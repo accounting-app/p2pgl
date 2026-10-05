@@ -279,11 +279,27 @@ and surviving restarts; 120 arrival orders of a mixed set converging to
 byte-identical files; v1 history verifying after the switch; tamper evidence
 (a stripped marker fails the id check); the marker's validation on both paths;
 real-QUIC exchanges in both encodings against one server and no fallback to v1.
-Every mechanism is revert-proven except the router's v2 registration in
-`spawn_router`, which needs a real `PeerNode`.
+Every mechanism is revert-proven. The router's v2 registration was the last
+without a proof; since 2026-10-05 the two-encoding QUIC test serves through the
+production `spawn_router` on a real `PeerNode`, and dropping the v2 ALPN from it
+fails that test.
 
-**Not done from §4:** the full epoch matrix (every existing permutation and
-byte-identity suite re-run at v1-only, v2-only and mixed) — the targeted tests
-above cover the mixed window instead; and §6's suggested re-audit, since the
-audit series has ended.
+**The epoch matrix (§4), added 2026-10-05.** The three suites §4 names run at
+v1-only, v2-only and mixed:
+- T29's arrival-order suite (`lifecycle_converges_under_every_arrival_order`,
+  65 orders);
+- T27's batch equivalence (`batch_path_is_byte_identical_to_per_entry_path`);
+- T44's compaction determinism
+  (`t44_compaction_is_byte_identical_across_every_arrival_order`, 24 orders).
+
+The two gl-node fixtures are written by a source node that starts in v1, or in
+v2, or — for the mixed epoch — writes its first records in v1, compacts and
+restarts writing v2, as an operator switching `format.idv2` on does. Each epoch
+asserts its fixture really holds the formats it claims. T44's fixture marks
+none, all, or two of its four records. With the 120-order mixed test in
+`format_v2.rs`, every ordering and byte-identity property §4 lists holds in
+each epoch.
+
+**Not done from §4:** §6's suggested re-audit, since the audit series has
+ended.
 
