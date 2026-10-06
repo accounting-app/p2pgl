@@ -1,0 +1,71 @@
+{
+  "V2T-R1-router-without-v2": {
+    "file": "crates/gl-node/src/p2p_service.rs",
+    "old": "        .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler.clone())\n        .accept(p2p::protocol::ANTI_ENTROPY_ALPN_V2, handler)\n",
+    "new": "        .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler)\n",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "wire_v2_and_v1_clients_both_catch_up"
+      ]
+    ]
+  },
+  "V2T-R2-mixed-never-switches": {
+    "file": "crates/gl-node/src/anti_entropy_alpn.rs",
+    "old": "            if !matches!(self, Epoch::Mixed) {\n                return source;",
+    "new": "            if true || !matches!(self, Epoch::Mixed) {\n                return source;",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "batch_path_is_byte_identical lifecycle_converges_under_every_arrival_order"
+      ]
+    ]
+  },
+  "V2T-R3-v2-epoch-starts-in-v1": {
+    "file": "crates/gl-node/src/anti_entropy_alpn.rs",
+    "old": "                Epoch::V2 => ledger::hash::RecordFormat::V2,\n                Epoch::V1 | Epoch::Mixed",
+    "new": "                Epoch::V2 => ledger::hash::RecordFormat::V1,\n                Epoch::V1 | Epoch::Mixed",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "batch_path_is_byte_identical lifecycle_converges_under_every_arrival_order"
+      ]
+    ]
+  },
+  "V2T-R4-t44-never-marks-v2": {
+    "file": "crates/ledger/src/service/tests/commit.rs",
+    "old": "        if v2 {\n            metadata.insert(",
+    "new": "        if false && v2 {\n            metadata.insert(",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "t44_compaction_is_byte_identical"
+      ]
+    ]
+  },
+  "FV2-R1-default-off": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "fn default_format_v2() -> bool {\n    true\n}",
+    "new": "fn default_format_v2() -> bool {\n    false\n}",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "test_format_section_defaults_to_v2"
+      ]
+    ]
+  }
+}

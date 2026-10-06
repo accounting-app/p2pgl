@@ -1,0 +1,274 @@
+{
+  "LH-R1-hold-skips-the-clock": {
+    "file": "crates/ledger/src/service/boot.rs",
+    "old": "        self.lamport_high.note_if_own(directive, author_id);\n        if seeds_closure {",
+    "new": "        if seeds_closure {",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        ""
+      ],
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "boot_fuzz",
+        ""
+      ],
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "m50_wire",
+        ""
+      ],
+      [
+        "-p",
+        "ledger",
+        "--test",
+        "exact_balances",
+        ""
+      ]
+    ]
+  },
+  "LH-R2-no-closure-seed": {
+    "file": "crates/ledger/src/service/boot.rs",
+    "old": "        if seeds_closure {",
+    "new": "        if false && seeds_closure {",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        ""
+      ],
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "boot_fuzz",
+        ""
+      ],
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "m50_wire",
+        ""
+      ],
+      [
+        "-p",
+        "ledger",
+        "--test",
+        "exact_balances",
+        ""
+      ]
+    ]
+  },
+  "LH-R3-resource-limit-record-only": {
+    "file": "crates/ledger/src/service/boot.rs",
+    "old": "(M-51, H-08)\"\n            );\n            return HistoryVerdict::hold_with_descendants(content_id);",
+    "new": "(M-51, H-08)\"\n            );\n            return HistoryVerdict::hold(content_id);",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        ""
+      ],
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "boot_fuzz",
+        ""
+      ],
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "m50_wire",
+        ""
+      ],
+      [
+        "-p",
+        "ledger",
+        "--test",
+        "exact_balances",
+        ""
+      ]
+    ]
+  },
+  "LH-R4-body-cap-record-only": {
+    "file": "crates/ledger/src/service/boot.rs",
+    "old": "(L-101, H-08)\"\n            );\n            return HistoryVerdict::hold_with_descendants(content_id);",
+    "new": "(L-101, H-08)\"\n            );\n            return HistoryVerdict::hold(content_id);",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        ""
+      ],
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "boot_fuzz",
+        ""
+      ],
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "m50_wire",
+        ""
+      ],
+      [
+        "-p",
+        "ledger",
+        "--test",
+        "exact_balances",
+        ""
+      ]
+    ]
+  },
+  "LH-R5-cycle-members-not-held": {
+    "file": "crates/ledger/src/service/boot.rs",
+    "old": "        if !cycle_blocked.is_empty() && matches!(directive, Directive::Transaction(_)) {",
+    "new": "        if false && !cycle_blocked.is_empty() && matches!(directive, Directive::Transaction(_)) {",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        ""
+      ],
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "boot_fuzz",
+        ""
+      ],
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "m50_wire",
+        ""
+      ],
+      [
+        "-p",
+        "ledger",
+        "--test",
+        "exact_balances",
+        ""
+      ]
+    ]
+  },
+  "LH-R7-dag-refusal-not-held": {
+    "file": "crates/ledger/src/service/boot.rs",
+    "old": "                self.hold(directive, content_id, false, author_id);\n                return;",
+    "new": "                let _ = content_id;\n                return;",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        ""
+      ],
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "boot_fuzz",
+        ""
+      ],
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "m50_wire",
+        ""
+      ],
+      [
+        "-p",
+        "ledger",
+        "--test",
+        "exact_balances",
+        ""
+      ]
+    ]
+  },
+  "LH-R8-hold-not-quarantined": {
+    "file": "crates/ledger/src/service/boot.rs",
+    "old": "        LedgerService::quarantine_keeping_envelope(\n            &mut self.quarantined,\n            content_id,\n            directive.clone(),\n        );",
+    "new": "        let _ = content_id;",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        ""
+      ],
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "boot_fuzz",
+        ""
+      ],
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "m50_wire",
+        ""
+      ],
+      [
+        "-p",
+        "ledger",
+        "--test",
+        "exact_balances",
+        ""
+      ]
+    ]
+  },
+  "LH-R9-operator-input-loaded-as-history": {
+    "file": "crates/ledger/src/service/boot.rs",
+    "old": "            return HistoryVerdict::OperatorInput;",
+    "new": "            return HistoryVerdict::Load;",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        ""
+      ],
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "boot_fuzz",
+        ""
+      ],
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "m50_wire",
+        ""
+      ],
+      [
+        "-p",
+        "ledger",
+        "--test",
+        "exact_balances",
+        ""
+      ]
+    ]
+  }
+}

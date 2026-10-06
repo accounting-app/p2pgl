@@ -1391,6 +1391,12 @@ decisions for a real deployment.
 ## Running Tests
 
 ```bash
+# Everything a change must pass before it is committed: fmt, clippy, all tests
+scripts/gate.sh
+
+# Prove a test catches the bug its fix closes (see CLAUDE.md, "Revert checks")
+scripts/revert_check.py scripts/revert_specs/h01_l23.json
+
 # Run the full workspace suite
 cargo test --workspace
 

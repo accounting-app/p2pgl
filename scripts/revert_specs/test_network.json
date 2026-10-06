@@ -1,0 +1,16 @@
+{
+  "FLK-R1-dial-an-unreachable-address": {
+    "file": "crates/gl-node/src/anti_entropy_alpn.rs",
+    "old": "            std::net::Ipv4Addr::LOCALHOST,\n            port,\n",
+    "new": "            std::net::Ipv4Addr::new(192, 0, 2, 1),\n            port,\n",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_frame_trickled_past_the_deadline"
+      ]
+    ]
+  }
+}

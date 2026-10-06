@@ -1,0 +1,71 @@
+name: Weekly health check
+
+# Every Monday, the same gate a change passes before it is committed, plus the
+# RustSec advisory audit, on the current main. A failure opens an issue (or
+# comments on the one already open), so a regression from a new toolchain, an
+# advisory or a flaky test is seen without anyone running anything. A Claude
+# routine runs the same checks weekly and explains failures (CLAUDE.md).
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+# Third-party actions are pinned to full commit SHAs, as in ci.yml (M-7); bump
+# both files together.
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-11
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Gate
+        id: gate
+        continue-on-error: true
+        shell: bash
+        run: scripts/gate.sh | tee gate-summary.txt
+      # On a schedule, audit-check opens an issue per advisory itself.
+      - name: Dependency audit
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Report a failed gate
+        if: steps.gate.outcome == 'failure'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "The weekly gate failed on \`${GITHUB_SHA::7}\` ([run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}))."
+            echo
+            echo '```'
+            cat gate-summary.txt
+            echo '```'
+            for step in fmt clippy tests; do
+              if [ -f "target/gate/$step.log" ] && ! grep -q "^== $step ... ok" gate-summary.txt; then
+                echo
+                echo "<details><summary>last lines of $step</summary>"
+                echo
+                echo '```'
+                tail -n 40 "target/gate/$step.log"
+                echo '```'
+                echo "</details>"
+              fi
+            done
+          } > report.md
+          open=$(gh issue list --state open --search "Weekly health check failed in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body-file report.md
+          else
+            gh issue create --title "Weekly health check failed" --body-file report.md
+          fi
+          exit 1

@@ -1,0 +1,468 @@
+{
+  "T98-R1-wire-authoring-fold": {
+    "file": "crates/ledger/src/service/remote.rs",
+    "old": "let validated = validate_transaction_as_data(txn, &self.accounts)?;",
+    "new": "let validated = validate_transaction(txn, &self.accounts)?;",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--test",
+        "exact_balances",
+        "a2_0927_1_"
+      ],
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "t98_an_ingested_close_is_data"
+      ]
+    ]
+  },
+  "T98-R5-no-inert-close": {
+    "file": "crates/ledger/src/service/access.rs",
+    "old": "validate_transaction_as_author(txn, &self.accounts, &|account, interval| {\n            self.read_model.holds_posting_in(account, interval)\n        })",
+    "new": "validate_transaction_as_author(txn, &self.accounts, &|_account, _interval| false)",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "t98_an_ingested_close_is_data test_remote_backdated_close_is_data"
+      ]
+    ]
+  },
+  "T98-R6-no-data-I9": {
+    "file": "crates/ledger/src/accounts.rs",
+    "old": "        if !index.first_open.as_ref().is_some_and(|key| *key < bound)\n            || index.admits_below(currency, &bound)\n        {",
+    "new": "        if true || !index.first_open.as_ref().is_some_and(|key| *key < bound)\n            || index.admits_below(currency, &bound)\n        {",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "t98_the_data_rule_ignores_closes"
+      ]
+    ]
+  },
+  "T98-R7-file-authoring-fold": {
+    "file": "crates/ledger/src/service/reconcile.rs",
+    "old": "match validate_transaction_as_data(txn, &self.accounts) {",
+    "new": "match validate_transaction(txn, &self.accounts) {",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "t98_a_hand_transaction_after_a_hand_close"
+      ]
+    ]
+  },
+  "T98-R8-rebase-authoring-fold": {
+    "file": "crates/ledger/src/service/quarantine.rs",
+    "old": "if let Err(error) = validate_transaction_as_data(txn, accounts) {",
+    "new": "if let Err(error) = validate_transaction(txn, accounts) {",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "t98_a_hand_transaction_after_a_hand_close"
+      ]
+    ]
+  },
+  "T98-R4b-served-rule-and-copy-chooser-authoring-fold": {
+    "edits": [
+      {
+        "file": "crates/ledger/src/service/verify.rs",
+        "old": "} else if let Err(error) = validate_transaction_as_data(txn, &self.accounts) {",
+        "new": "} else if let Err(error) = validate_transaction(txn, &self.accounts) {"
+      },
+      {
+        "file": "crates/ledger/src/service/quarantine.rs",
+        "old": "                    if validate_transaction_as_data(txn, &self.accounts).is_err()\n                        || elided_posting_count(txn) > 0",
+        "new": "                    if validate_transaction(txn, &self.accounts).is_err()\n                        || elided_posting_count(txn) > 0"
+      }
+    ],
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--test",
+        "exact_balances",
+        "x3_0927_2_ a2_0927_an_ingested_close_is_data"
+      ]
+    ]
+  },
+  "T99-R1b-no-closure-rescue-no-readmit": {
+    "edits": [
+      {
+        "file": "crates/ledger/src/service/quarantine.rs",
+        "old": "let (closure, replacements) = self.served_instead(closure, true);",
+        "new": "let (closure, replacements) = (closure, BTreeMap::<String, Directive>::new());"
+      },
+      {
+        "file": "crates/ledger/src/service/boot.rs",
+        "old": "self.readmit_closure_members_now_servable(&closure_held);",
+        "new": "let _ = &closure_held;"
+      }
+    ],
+    "runs": [
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "m50_wire",
+        "h24_after_a_crash a1_0927_after_a_crash"
+      ]
+    ]
+  },
+  "T99-R2-no-rescue-in-signature-pass": {
+    "file": "crates/ledger/src/service/verify.rs",
+    "old": "let (held, replacements) = self.served_instead(refused.keys().cloned().collect(), false);",
+    "new": "let (held, replacements): (BTreeSet<String>, BTreeMap<String, Directive>) = (refused.keys().cloned().collect(), BTreeMap::new());",
+    "runs": [
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "m50_wire",
+        "a1_0927_after_a_crash_a_re_entered_signature_held"
+      ]
+    ]
+  },
+  "T99-R3-no-rescue-in-rule-round": {
+    "file": "crates/ledger/src/service/verify.rs",
+    "old": "let (doomed, replacements) = self.served_instead(doomed, true);",
+    "new": "let (doomed, replacements) = (doomed, BTreeMap::<String, Directive>::new());",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "m72_a_record_first_loaded"
+      ]
+    ]
+  },
+  "T99-R4-no-parking": {
+    "file": "crates/ledger/src/service/boot.rs",
+    "old": "self.typed_copies.entry(existing).or_insert(directive);",
+    "new": "let _ = (existing, directive);",
+    "runs": [
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "boot_fuzz",
+        "a3_0927_1_ x1_0927_"
+      ]
+    ]
+  },
+  "T99-R7-no-readmission": {
+    "file": "crates/ledger/src/service/boot.rs",
+    "old": "self.readmit_closure_members_now_servable(&closure_held);",
+    "new": "let _ = &closure_held;",
+    "runs": [
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "boot_fuzz",
+        "a3_0927_2_"
+      ]
+    ]
+  },
+  "T99-R8-typed-spelling-not-kept": {
+    "file": "crates/ledger/src/service/boot.rs",
+    "old": "                self.quarantined_typed.insert(file_id, written);",
+    "new": "                Self::quarantine_keeping_envelope(&mut self.quarantined, file_id, written);",
+    "runs": [
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "boot_fuzz",
+        "a3_0927_3_"
+      ],
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "l145_a_typed_copy"
+      ]
+    ]
+  },
+  "T100-R1-no-length-check-in-compaction": {
+    "file": "crates/ledger/src/service/commit.rs",
+    "old": "            self.canonical_over_cap = length > MAX_LEDGER_FILE_BYTES;\n            if self.canonical_over_cap {",
+    "new": "            self.canonical_over_cap = length > MAX_LEDGER_FILE_BYTES;\n            if false && self.canonical_over_cap {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "m74_a_rewrite_over_the_cap"
+      ]
+    ]
+  },
+  "T100-R2-gate-on-file-headroom": {
+    "file": "crates/ledger/src/service/commit.rs",
+    "old": "        if append == 0 || !rewrites {",
+    "new": "        if true || append == 0 || !rewrites {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "m74_a_rewrite_over_the_cap"
+      ]
+    ]
+  },
+  "T100-R4-no-rollback": {
+    "file": "crates/ledger/src/service/recovery.rs",
+    "old": "    pub(super) fn discard_staged_writes(&mut self) {\n        if !self.pending_ids.is_empty() {",
+    "new": "    pub(super) fn discard_staged_writes(&mut self) {\n        if false && !self.pending_ids.is_empty() {",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--test",
+        "exact_balances",
+        "a4_0927_a_write_whose_reload"
+      ],
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "h15_a_recovery_reload m46_a_live_file m59_a_kept_envelope"
+      ]
+    ]
+  },
+  "T100-R5-staged-writes-served": {
+    "file": "crates/ledger/src/service/access.rs",
+    "old": "let mut withheld: HashSet<String> = self.pending_ids.iter().cloned().collect();",
+    "new": "let mut withheld: HashSet<String> = HashSet::new();",
+    "runs": [
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "convergence",
+        "x3_0927_1_"
+      ]
+    ]
+  },
+  "T100-R6-descendants-served": {
+    "file": "crates/ledger/src/service/access.rs",
+    "old": "        withheld.extend(frontier.iter().cloned());\n        while let",
+    "new": "        withheld.extend(frontier.iter().cloned());\n        frontier.clear();\n        while let",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "l154_a_child_of_a_line"
+      ]
+    ]
+  },
+  "T101-R1-no-parent-directory-compare": {
+    "file": "crates/ledger/src/journal.rs",
+    "old": "    if (at_parent.dev(), at_parent.ino()) != (named.st_dev as u64, named.st_ino as u64) {",
+    "new": "    if false && (at_parent.dev(), at_parent.ino()) != (named.st_dev as u64, named.st_ino as u64) {",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "m71_a_hard_link_in_a_directory"
+      ]
+    ]
+  },
+  "T101-R2-directory-opened-without-flags": {
+    "file": "crates/ledger/src/journal.rs",
+    "old": ".custom_flags(libc::O_DIRECTORY | libc::O_NONBLOCK)",
+    "new": ".custom_flags(0)",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "l138_a_fifo_at_the_link_directorys_path"
+      ]
+    ]
+  },
+  "T101-R3-any-acl-entry-refuses": {
+    "edits": [
+      {
+        "file": "crates/ledger/src/journal.rs",
+        "old": "            if acl_get_tag_type(entry, &mut tag) != 0 || tag != ACL_EXTENDED_ALLOW {",
+        "new": "            if acl_get_tag_type(entry, &mut tag) != 0 {"
+      },
+      {
+        "file": "crates/ledger/src/journal.rs",
+        "old": "                && acl_get_flag_np(flags, ACL_ENTRY_ONLY_INHERIT) == 1\n",
+        "new": "                && acl_get_flag_np(flags, ACL_ENTRY_ONLY_INHERIT) == 99\n"
+      },
+      {
+        "file": "crates/ledger/src/journal.rs",
+        "old": "            lets_write = LETS_ANOTHER_REPLACE_THE_LINK\n                .iter()\n                .any(|perm| acl_get_perm_np(perms, *perm) == 1);",
+        "new": "            lets_write = true || LETS_ANOTHER_REPLACE_THE_LINK\n                .iter()\n                .any(|perm| acl_get_perm_np(perms, *perm) == 1);"
+      }
+    ],
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "l137_only_an_acl_entry"
+      ]
+    ]
+  },
+  "T101-R4-no-identity-skip-in-sweep": {
+    "file": "crates/ledger/src/service/file_io.rs",
+    "old": "            if kept == Some((metadata.dev(), metadata.ino())) {",
+    "new": "            if false && kept == Some((metadata.dev(), metadata.ino())) {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "l139_claiming_a_link"
+      ]
+    ]
+  },
+  "T101-R5-unresolved-link-not-refused": {
+    "file": "crates/gl-node/src/main.rs",
+    "old": "    if std::fs::symlink_metadata(&resolved).is_ok_and(|metadata| metadata.is_symlink()) {",
+    "new": "    if false && std::fs::symlink_metadata(&resolved).is_ok_and(|metadata| metadata.is_symlink()) {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_link_that_cannot_be_followed"
+      ]
+    ]
+  },
+  "T102-R1-one-copy-per-id": {
+    "file": "crates/p2p/src/orphan_buffer.rs",
+    "old": "        if self.entries.contains_key(&key)\n            || self.copies.get(&id).is_some_and(|peers| {",
+    "new": "        if self.entries.contains_key(&key)\n            || self.copies.get(&id).is_some_and(|peers| !peers.is_empty()) || self.copies.get(&id).is_some_and(|peers| {",
+    "runs": [
+      [
+        "-p",
+        "p2p",
+        "--lib",
+        "m76_each_peers_copy"
+      ],
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "m76_another_peers_copies"
+      ]
+    ]
+  },
+  "T102-R2-want-ordered-by-any-copy": {
+    "file": "crates/p2p/src/orphan_buffer.rs",
+    "old": "        if let Some(entry) = self.entries.get(&(id.to_owned(), Some(peer.to_owned()))) {\n            return entry.missing_parents.clone();\n        }",
+    "new": "        let _ = peer;\n        if let Some(entry) = self.copies.get(id).and_then(|peers| peers.iter().find_map(|p| self.entries.get(&(id.to_owned(), p.clone())))) {\n            return entry.missing_parents.clone();\n        }",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "m76_a_peers_want_is_ordered"
+      ]
+    ]
+  },
+  "T102-R3-no-holds-in-buffered-from": {
+    "file": "crates/p2p/src/orphan_buffer.rs",
+    "old": "                        && !entry.missing_parents.iter().any(|parent| holds(parent))\n                })\n                .map(|entry| entry.missing_parents.as_slice())",
+    "new": "                        && !entry.missing_parents.iter().any(|parent| false && holds(parent))\n                })\n                .map(|entry| entry.missing_parents.as_slice())",
+    "runs": [
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "convergence",
+        "a6_0927_2_"
+      ]
+    ]
+  },
+  "T102-R6-stale-copies-kept": {
+    "file": "crates/p2p/src/orphan_buffer.rs",
+    "old": "        for peer in self.copies.get(parent_id).cloned().unwrap_or_default() {\n            self.remove(&(parent_id.to_owned(), peer));\n        }",
+    "new": "",
+    "runs": [
+      [
+        "-p",
+        "p2p",
+        "--lib",
+        "m76_each_peers_copy"
+      ]
+    ]
+  },
+  "T103-R1-block-warn-always-held-text": {
+    "file": "crates/ledger/src/service/quarantine.rs",
+    "old": "        if held.is_empty() {\n            warn!(\n                line,",
+    "new": "        if false && held.is_empty() {\n            warn!(\n                line,",
+    "runs": [
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "m50_wire",
+        "a1_0927_the_restate_remedy"
+      ]
+    ]
+  },
+  "T103-R3-no-fold-in-hold-refused": {
+    "file": "crates/ledger/src/service/quarantine.rs",
+    "old": "        self.fold_held_own_lamport(directive);\n        Self::quarantine_keeping_envelope(",
+    "new": "        Self::quarantine_keeping_envelope(",
+    "runs": [
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "m50_wire",
+        "a1_0927_a_held_own_record"
+      ]
+    ]
+  },
+  "T103-R4-no-fold-in-missing-parent-hold": {
+    "file": "crates/ledger/src/service/reconcile.rs",
+    "old": "                        self.fold_held_own_lamport(&final_directive);\n",
+    "new": "",
+    "runs": [
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "m50_wire",
+        "l141_a_held_own_record"
+      ]
+    ]
+  },
+  "T103-R5-no-live-only-clause": {
+    "file": "crates/ledger/src/service/reconcile.rs",
+    "old": "            Err(error @ ServiceError::LamportAdvance { .. })\n                if !needs_stamp && matches!(path, AdoptionPath::Live) =>",
+    "new": "            Err(error @ ServiceError::LamportAdvance { .. })\n                if false && !needs_stamp && matches!(path, AdoptionPath::Live) =>",
+    "runs": [
+      [
+        "-p",
+        "p2p",
+        "--test",
+        "m50_wire",
+        "a1_0927_a_pasted_record_over_the_lamport"
+      ]
+    ]
+  }
+}

@@ -1,0 +1,100 @@
+{
+  "H01-R1-auth-off-by-default": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "fn default_auth_enabled() -> bool {\n    true\n}",
+    "new": "fn default_auth_enabled() -> bool {\n    false\n}",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "test_minimal_config_loads h01_a_default_loopback_node"
+      ]
+    ]
+  },
+  "H01-R2-boot-skips-the-key-file": {
+    "file": "crates/gl-node/src/main.rs",
+    "old": "    if config.uses_api_key_file() {\n        config.auth.api_key",
+    "new": "    if false && config.uses_api_key_file() {\n        config.auth.api_key",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "h01_a_default_loopback_node"
+      ]
+    ]
+  },
+  "H01-R3-fresh-key-every-boot": {
+    "file": "crates/gl-node/src/auth.rs",
+    "old": "        Some(key) if !key.is_empty() => {",
+    "new": "        Some(key) if false && !key.is_empty() => {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "h01_the_api_key_file_is_created h01_a_default_loopback_node"
+      ]
+    ]
+  },
+  "H01-R4-file-key-unchecked": {
+    "file": "crates/gl-node/src/auth.rs",
+    "old": "            crate::config::check_api_key(&key)\n",
+    "new": "            Ok::<(), String>(())\n",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "h01_a_hand_written_api_key"
+      ]
+    ]
+  },
+  "H01-R5-public-bind-generates-a-key": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "        if self.binds_non_loopback() && self.uses_api_key_file() {",
+    "new": "        if false && self.binds_non_loopback() && self.uses_api_key_file() {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "test_auth_enabled_without_key_uses_the_key_file"
+      ]
+    ]
+  },
+  "H01-R6-key-file-read-as-node-read": {
+    "file": "crates/gl-node/src/auth.rs",
+    "old": "        ledger::journal::FileTrust::NodePrivate,\n        \"API key file\",",
+    "new": "        ledger::journal::FileTrust::NodeRead,\n        \"API key file\",",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "h01_an_api_key_file_others_can_read"
+      ]
+    ]
+  },
+  "L23-R1-no-refusal": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "        } else if self.signing.enabled {\n            // L-23",
+    "new": "        } else if false && self.signing.enabled {\n            // L-23",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "test_mesh_id_unset_on_a_signing_node"
+      ]
+    ]
+  }
+}
