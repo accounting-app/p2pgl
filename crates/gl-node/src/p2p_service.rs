@@ -1189,8 +1189,9 @@ mod tests {
     use tokio::sync::RwLock;
 
     use crate::anti_entropy_alpn::tests::{
-        bind_direct_endpoint, loopback_addr, make_handler, make_handler_with_timeouts,
-        wait_until_dialable, write_open_directive_ledger, EmptyPageFloodHandler, NET_TEST_LOCK,
+        bind_direct_endpoint, loopback_addr, loopback_endpoint_builder, make_handler,
+        make_handler_with_timeouts, wait_until_dialable, write_open_directive_ledger,
+        EmptyPageFloodHandler, NET_TEST_LOCK,
     };
     use crate::anti_entropy_alpn::AntiEntropyTimeouts;
     use crate::graphql::SharedLedger;
@@ -1415,7 +1416,7 @@ mod tests {
         let server_id = endpoint_server.id();
 
         let address_lookup = MemoryLookup::new();
-        let endpoint_client = iroh::Endpoint::builder(presets::Minimal)
+        let endpoint_client = loopback_endpoint_builder()
             .alpns(vec![p2p::protocol::ANTI_ENTROPY_ALPN.to_vec()])
             .address_lookup(address_lookup.clone())
             .bind()
@@ -1557,7 +1558,7 @@ mod tests {
         let flood_id = endpoint_flood.id();
 
         let address_lookup = MemoryLookup::new();
-        let endpoint_client = iroh::Endpoint::builder(presets::Minimal)
+        let endpoint_client = loopback_endpoint_builder()
             .alpns(vec![p2p::protocol::ANTI_ENTROPY_ALPN.to_vec()])
             .address_lookup(address_lookup.clone())
             .bind()
@@ -1813,7 +1814,7 @@ mod tests {
         let source_id = endpoint_source.id();
 
         let address_lookup = MemoryLookup::new();
-        let endpoint_client = iroh::Endpoint::builder(presets::Minimal)
+        let endpoint_client = loopback_endpoint_builder()
             .alpns(vec![p2p::protocol::ANTI_ENTROPY_ALPN.to_vec()])
             .address_lookup(address_lookup.clone())
             .bind()

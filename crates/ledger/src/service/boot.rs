@@ -588,6 +588,10 @@ impl LedgerService {
 
     /// Load the sorted history: insert what every peer would take, quarantine
     /// the rest, park operator input, and fold the clock (H-08, H-13, M-18).
+    ///
+    /// Each directive is judged first ([`Self::judge_history_directive`]) and
+    /// the verdict applied after: every refusal is one [`BootLoad::hold`], so
+    /// a refusal cannot forget the clock, the closure seed or the quarantine.
     fn load_history(
         sorted: &[&Directive],
         cycle_blocked: &BTreeSet<String>,
@@ -595,318 +599,214 @@ impl LedgerService {
         author_id: &str,
         file_path: &Path,
     ) -> BootLoad {
-        // Build account state and insert into DAG.
-        let mut accounts = AccountState::new();
-        let mut dag = LedgerDag::new();
-        // M-18 / T63: the highest Lamport value this node's clock must resume
-        // above, and the author of the directive that carries it (named in the
-        // H-12 boot warning). See `BootLamportHigh` for which directives count.
-        let mut lamport_high = BootLamportHigh::default();
-        // H-08: every directive this loop refuses, so the next compaction can
-        // write it back instead of deleting it. See `LedgerService::quarantined`
-        // for why a skip that reaches a rewrite destroys the record.
-        let mut quarantined: BTreeMap<String, Directive> = BTreeMap::new();
-        // H-13: directives with no envelope at all — operator input, adopted
-        // through the reconcile path once the history below is in place, in
-        // this same canonical order. See `LedgerService::unsigned_operator_input`.
-        let mut operator_input: Vec<Directive> = Vec::new();
-        // H-20: every enveloped directive the loop inserts, for the signature
-        // pass that runs once a signer or verifier is installed. See
-        // `LedgerService::unverified_history`.
-        let mut unverified_history: BTreeSet<String> = BTreeSet::new();
-        // T81 / M-51: records the history arm refused under a content rule,
-        // seeding the closure quarantine after construction.
-        let mut content_rule_refused: BTreeSet<String> = BTreeSet::new();
-        // T90 / H-24: the second copy of a transaction body already in the DAG
-        // — the same id under another envelope — for
-        // `prefer_copies_whose_parents_are_served` after the loop.
-        let mut duplicate_copies: Vec<(String, Directive)> = Vec::new();
-
+        let mut load = BootLoad::new();
         for directive in sorted {
             // M-18 / T63: the clock is folded at each FATE below, not here.
             // Every directive that reaches the DAG counts; a directive that
             // does not (quarantined, or a duplicate body) counts only when it is
             // this node's own — see `BootLamportHigh`.
-
-            // Insert into DAG (lenient mode: parents may not be present yet),
-            // then record any lifecycle event it carries under the content id
-            // the DAG just assigned (M-09).
-            //
-            // Boot deliberately applies NO lifecycle policy: no already-open
-            // rejection (and, since T98, no ingest path refuses a `close`
-            // either). The account state has to be a
-            // pure function of the persisted directive set, so that a node which
-            // boots from the file and a node which ingested the same directives
-            // one at a time agree exactly. A guard here would also reintroduce
-            // the order dependence M-09 is about — boot's `sorted` order is the
-            // canonical one, not the order the directives were accepted in —
-            // and could brick boot on a file the node itself wrote.
-            // Skip the cycle members (and their descendants) identified above.
-            // `cycle_blocked` is empty for every well-formed file, so this costs
-            // no hashing on a normal boot.
-            //
-            // H-08: skipped, NOT dropped. The id is already in hand, so the
-            // quarantine costs one clone of a directive this boot has decided
-            // not to load — and it is what keeps the record on disk when the
-            // startup compaction rewrites the file from the DAG.
-            if !cycle_blocked.is_empty() && matches!(directive, Directive::Transaction(_)) {
-                let content_id = compute_content_id(directive);
-                if cycle_blocked.contains(&content_id) {
-                    lamport_high.note_if_own(directive, author_id);
-                    // L-76: `entry().or_insert`, preferring the enveloped
-                    // spelling. A plain `insert` let a later envelope-less
-                    // copy of the same id replace the signed one; the
-                    // compaction then wrote the raw copy, and the next boot
-                    // re-authored the record under a fresh envelope while
-                    // every peer kept the original.
-                    Self::quarantine_keeping_envelope(
-                        &mut quarantined,
-                        content_id,
-                        (*directive).clone(),
-                    );
-                    continue;
-                }
-            }
-
-            // H-13: no author AND no lamport means no node wrote this — it is
-            // operator input, not history, and history's tolerant load below
-            // is the wrong path for it: that path applies no lifecycle rule,
-            // no body cap, no stamp and no signature, which is exactly how a
-            // hand-typed record became an envelope-less, peer-refused parent
-            // of everything this node authored afterwards. Parked here, in
-            // canonical order, and adopted after the history loop so its
-            // parents are the heads of the whole ledger, as a live append's
-            // would be. After the cycle scan on purpose: a hand-written
-            // `openledger-parents` that closes a cycle is quarantined with its
-            // partner (M-38's union), never adopted.
-            if Self::is_operator_input(directive) {
-                operator_input.push((*directive).clone());
-                continue;
-            }
-
-            // T41: `MAX_PARENTS` applied at the FILE ingress, tolerantly.
-            //
-            // The cap was enforced on the wire only, so a crafted or
-            // hand-edited `.bean` could name unboundedly many parents on one
-            // transaction — exactly what L-14's decoy does — and boot loaded it
-            // without complaint. Loading it is what makes the fan-in real: the
-            // directive becomes part of the served set, and every peer refuses
-            // it forever.
-            //
-            // Skipped with a warning rather than refused, per T35's rule: boot
-            // must never brick on a file the node can otherwise read. The
-            // consequence of skipping is understood — a transaction absent from
-            // the DAG is absent from the read model and from what this node
-            // serves — and is strictly better than carrying a directive the
-            // mesh will not accept.
-            //
-            // H-08: this is the skip site that needs no attacker at all. It
-            // fires on any file written BEFORE T41 existed, at the moment of
-            // the upgrade, on a node nobody has touched — and, before the
-            // quarantine, the startup compaction that followed erased whatever
-            // it skipped. Quarantine it.
-            //
-            // M-20: and the rest of the wire path's check set with it, by the
-            // identical argument. Boot was the other half of the sibling-path
-            // gap — an over-cap economic body (L-02), a malformed parent txid
-            // (L-29) or an unreadable `openledger-lamport` all loaded here
-            // without complaint, joined the served set, and were then refused
-            // by every peer forever. Same tolerant treatment, same quarantine,
-            // one call site so the two file paths cannot drift apart:
-            // `reconcile_content` runs the very same
-            // [`validate_file_ingest_parity`].
-            //
-            // Two things are deliberately NOT checked here, both recorded so
-            // the omission reads as a decision rather than an oversight:
-            //
-            // * `enforce_economic_bean_limit`. Boot loads history; reconcile
-            //   admits new records and signs them. See
-            //   [`validate_file_ingest_parity`] for the full argument and for
-            //   the residual it leaves.
-            // * [`LAMPORT_CEILING`]. T46 owns that bound and deliberately chose
-            //   warn-and-load at boot, so a poisoned clock stops *authoring*
-            //   loudly while reads, reports and the file stay intact. Since
-            //   T63 a directive quarantined here no longer feeds the clock
-            //   unless it is this node's own (`BootLamportHigh`), so a
-            //   quarantined FOREIGN value cannot poison authoring either.
-            // T81 / M-51: the content rules peers hold history to — the §3.12
-            // limits with the legacy ceilings, and the amount cap below. A
-            // record refused by one of THESE is refused by every peer, so what
-            // descends from it cannot replicate either: it seeds the closure
-            // quarantine after the loop. (Fan-in and envelope form refuse the
-            // record's envelope, not its content, and keep H-08's
-            // record-only quarantine.)
-            if let Err(error) = enforce_resource_limits_for(directive, ResourceRule::History) {
-                let content_id = compute_content_id(directive);
-                warn!(
-                    %error,
-                    id = %content_id,
-                    file = %file_path.display(),
-                    "quarantining a ledger-file directive over a limit every peer holds history \
-                     to — kept in the file, kept out of the DAG, and with it every record that \
-                     descends from it (named below) (M-51, H-08)"
-                );
-                lamport_high.note_if_own(directive, author_id);
-                content_rule_refused.insert(content_id.clone());
-                Self::quarantine_keeping_envelope(
-                    &mut quarantined,
+            match Self::judge_history_directive(directive, cycle_blocked, salvaged, file_path) {
+                HistoryVerdict::OperatorInput => load.operator_input.push((*directive).clone()),
+                HistoryVerdict::Hold {
                     content_id,
-                    (*directive).clone(),
-                );
-                continue;
+                    seeds_closure,
+                } => load.hold(directive, content_id, seeds_closure, author_id),
+                HistoryVerdict::Load => load.insert(directive, author_id, file_path),
             }
-            // T85 / L-101, decision (19): the wire's body cap is a content rule
-            // every peer holds history to as well — `validate_supply_entry`
-            // refuses an over-cap `economic_bean` for good — so it seeds the
-            // closure like the two above. T51 kept it off boot (see
-            // `enforce_economic_bean_limit`); the record it left served was
-            // M-51's shape: counted here, refused everywhere, and everything
-            // written on top of it stranded on every fresh replica.
-            if let Err(error) = enforce_economic_bean_limit(directive) {
-                let content_id = compute_content_id(directive);
-                warn!(
-                    %error,
-                    id = %content_id,
-                    file = %file_path.display(),
-                    "quarantining a ledger-file directive whose body is over the wire's size cap, \
-                     which every peer refuses — kept in the file, kept out of the DAG, and with it \
-                     every record that descends from it (named below) (L-101, H-08)"
-                );
-                lamport_high.note_if_own(directive, author_id);
-                content_rule_refused.insert(content_id.clone());
-                Self::quarantine_keeping_envelope(
-                    &mut quarantined,
-                    content_id,
-                    (*directive).clone(),
-                );
-                continue;
-            }
-            if let Err(error) = validate_parent_fan_in(directive)
-                .and_then(|()| validate_file_envelope_form(directive))
-                // H-17 (T65, T76): the amount cap as a directive-level
-                // quarantine arm too, so a transaction amount past
-                // `MAX_AMOUNT_MAGNITUDE` stays out of the DAG even if the
-                // parser's own check is ever loosened. `balance` and `price`
-                // amounts are not capped (never summed).
-                .and_then(|()| {
-                    crate::validate::check_directive_amounts(directive).map_err(|error| {
-                        ServiceError::ResourceLimitExceeded {
-                            message: error.to_string(),
-                        }
-                    })
-                })
-            {
-                let content_id = compute_content_id(directive);
-                warn!(
-                    %error,
-                    id = %content_id,
-                    file = %file_path.display(),
-                    "quarantining a ledger-file directive that the wire path would refuse — \
-                     kept in the file, kept out of the DAG; the rest of the file still loads \
-                     (H-08, M-20)"
-                );
-                lamport_high.note_if_own(directive, author_id);
-                Self::quarantine_keeping_envelope(
-                    &mut quarantined,
-                    content_id,
-                    (*directive).clone(),
-                );
-                continue;
-            }
+        }
+        load
+    }
 
-            // H-20 door (b): a transaction that reached this loop through the
-            // per-block salvage may be a fragment — a blank line typed inside
-            // a node-written block leaves a head that parses on its own with
-            // some of its postings — so it is held to I1 (balance, no
-            // unresolved elision) before insertion, exactly as every other
-            // ingress holds a new transaction. The whole-file path never
-            // yields one (a fragment that parses is what this arm is for),
-            // and a node-written record always balances, so a healthy boot
-            // pays nothing here.
-            if salvaged {
-                if let Directive::Transaction(txn) = directive {
-                    if let Some(reason) = Self::transaction_fails_i1(txn) {
-                        let content_id = compute_content_id(directive);
-                        warn!(
-                            reason = %reason,
-                            id = %content_id,
-                            file = %file_path.display(),
-                            "quarantining a salvaged ledger-file transaction that does not \
-                             balance — a fragment of a split block, not a record; kept in \
-                             the file, kept out of the DAG (H-20, H-08)"
-                        );
-                        lamport_high.note_if_own(directive, author_id);
-                        Self::quarantine_keeping_envelope(
-                            &mut quarantined,
-                            content_id,
-                            (*directive).clone(),
-                        );
-                        continue;
+    /// What boot does with one directive of the sorted history, and the
+    /// warning it logs when it holds one back. The checks run in this order,
+    /// and the first that refuses decides the warning and whether what
+    /// descends from the record is held with it.
+    fn judge_history_directive(
+        directive: &Directive,
+        cycle_blocked: &BTreeSet<String>,
+        salvaged: bool,
+        file_path: &Path,
+    ) -> HistoryVerdict {
+        // Insert into DAG (lenient mode: parents may not be present yet),
+        // then record any lifecycle event it carries under the content id
+        // the DAG just assigned (M-09).
+        //
+        // Boot deliberately applies NO lifecycle policy: no already-open
+        // rejection (and, since T98, no ingest path refuses a `close`
+        // either). The account state has to be a
+        // pure function of the persisted directive set, so that a node which
+        // boots from the file and a node which ingested the same directives
+        // one at a time agree exactly. A guard here would also reintroduce
+        // the order dependence M-09 is about — boot's `sorted` order is the
+        // canonical one, not the order the directives were accepted in —
+        // and could brick boot on a file the node itself wrote.
+        // Skip the cycle members (and their descendants) identified above.
+        // `cycle_blocked` is empty for every well-formed file, so this costs
+        // no hashing on a normal boot.
+        //
+        // H-08: skipped, NOT dropped. The id is already in hand, so the
+        // quarantine costs one clone of a directive this boot has decided
+        // not to load — and it is what keeps the record on disk when the
+        // startup compaction rewrites the file from the DAG.
+        if !cycle_blocked.is_empty() && matches!(directive, Directive::Transaction(_)) {
+            let content_id = compute_content_id(directive);
+            if cycle_blocked.contains(&content_id) {
+                return HistoryVerdict::hold(content_id);
+            }
+        }
+
+        // H-13: no author AND no lamport means no node wrote this — it is
+        // operator input, not history, and history's tolerant load below
+        // is the wrong path for it: that path applies no lifecycle rule,
+        // no body cap, no stamp and no signature, which is exactly how a
+        // hand-typed record became an envelope-less, peer-refused parent
+        // of everything this node authored afterwards. Parked here, in
+        // canonical order, and adopted after the history loop so its
+        // parents are the heads of the whole ledger, as a live append's
+        // would be. After the cycle scan on purpose: a hand-written
+        // `openledger-parents` that closes a cycle is quarantined with its
+        // partner (M-38's union), never adopted.
+        if Self::is_operator_input(directive) {
+            return HistoryVerdict::OperatorInput;
+        }
+
+        // T41: `MAX_PARENTS` applied at the FILE ingress, tolerantly.
+        //
+        // The cap was enforced on the wire only, so a crafted or
+        // hand-edited `.bean` could name unboundedly many parents on one
+        // transaction — exactly what L-14's decoy does — and boot loaded it
+        // without complaint. Loading it is what makes the fan-in real: the
+        // directive becomes part of the served set, and every peer refuses
+        // it forever.
+        //
+        // Skipped with a warning rather than refused, per T35's rule: boot
+        // must never brick on a file the node can otherwise read. The
+        // consequence of skipping is understood — a transaction absent from
+        // the DAG is absent from the read model and from what this node
+        // serves — and is strictly better than carrying a directive the
+        // mesh will not accept.
+        //
+        // H-08: this is the skip site that needs no attacker at all. It
+        // fires on any file written BEFORE T41 existed, at the moment of
+        // the upgrade, on a node nobody has touched — and, before the
+        // quarantine, the startup compaction that followed erased whatever
+        // it skipped. Quarantine it.
+        //
+        // M-20: and the rest of the wire path's check set with it, by the
+        // identical argument. Boot was the other half of the sibling-path
+        // gap — an over-cap economic body (L-02), a malformed parent txid
+        // (L-29) or an unreadable `openledger-lamport` all loaded here
+        // without complaint, joined the served set, and were then refused
+        // by every peer forever. Same tolerant treatment, same quarantine,
+        // one call site so the two file paths cannot drift apart:
+        // `reconcile_content` runs the very same
+        // [`validate_file_ingest_parity`].
+        //
+        // Two things are deliberately NOT checked here, both recorded so
+        // the omission reads as a decision rather than an oversight:
+        //
+        // * `enforce_economic_bean_limit`. Boot loads history; reconcile
+        //   admits new records and signs them. See
+        //   [`validate_file_ingest_parity`] for the full argument and for
+        //   the residual it leaves.
+        // * [`LAMPORT_CEILING`]. T46 owns that bound and deliberately chose
+        //   warn-and-load at boot, so a poisoned clock stops *authoring*
+        //   loudly while reads, reports and the file stay intact. Since
+        //   T63 a directive quarantined here no longer feeds the clock
+        //   unless it is this node's own (`BootLamportHigh`), so a
+        //   quarantined FOREIGN value cannot poison authoring either.
+        // T81 / M-51: the content rules peers hold history to — the §3.12
+        // limits with the legacy ceilings, and the amount cap below. A
+        // record refused by one of THESE is refused by every peer, so what
+        // descends from it cannot replicate either: it seeds the closure
+        // quarantine after the loop. (Fan-in and envelope form refuse the
+        // record's envelope, not its content, and keep H-08's
+        // record-only quarantine.)
+        if let Err(error) = enforce_resource_limits_for(directive, ResourceRule::History) {
+            let content_id = compute_content_id(directive);
+            warn!(
+                %error,
+                id = %content_id,
+                file = %file_path.display(),
+                "quarantining a ledger-file directive over a limit every peer holds history \
+                 to — kept in the file, kept out of the DAG, and with it every record that \
+                 descends from it (named below) (M-51, H-08)"
+            );
+            return HistoryVerdict::hold_with_descendants(content_id);
+        }
+        // T85 / L-101, decision (19): the wire's body cap is a content rule
+        // every peer holds history to as well — `validate_supply_entry`
+        // refuses an over-cap `economic_bean` for good — so it seeds the
+        // closure like the two above. T51 kept it off boot (see
+        // `enforce_economic_bean_limit`); the record it left served was
+        // M-51's shape: counted here, refused everywhere, and everything
+        // written on top of it stranded on every fresh replica.
+        if let Err(error) = enforce_economic_bean_limit(directive) {
+            let content_id = compute_content_id(directive);
+            warn!(
+                %error,
+                id = %content_id,
+                file = %file_path.display(),
+                "quarantining a ledger-file directive whose body is over the wire's size cap, \
+                 which every peer refuses — kept in the file, kept out of the DAG, and with it \
+                 every record that descends from it (named below) (L-101, H-08)"
+            );
+            return HistoryVerdict::hold_with_descendants(content_id);
+        }
+        if let Err(error) = validate_parent_fan_in(directive)
+            .and_then(|()| validate_file_envelope_form(directive))
+            // H-17 (T65, T76): the amount cap as a directive-level
+            // quarantine arm too, so a transaction amount past
+            // `MAX_AMOUNT_MAGNITUDE` stays out of the DAG even if the
+            // parser's own check is ever loosened. `balance` and `price`
+            // amounts are not capped (never summed).
+            .and_then(|()| {
+                crate::validate::check_directive_amounts(directive).map_err(|error| {
+                    ServiceError::ResourceLimitExceeded {
+                        message: error.to_string(),
                     }
-                }
-            }
+                })
+            })
+        {
+            let content_id = compute_content_id(directive);
+            warn!(
+                %error,
+                id = %content_id,
+                file = %file_path.display(),
+                "quarantining a ledger-file directive that the wire path would refuse — \
+                 kept in the file, kept out of the DAG; the rest of the file still loads \
+                 (H-08, M-20)"
+            );
+            return HistoryVerdict::hold(content_id);
+        }
 
-            // L-17: a DAG refusal must never abort the load. The cycle pre-scan
-            // above and `require_parents: false` between them rule out
-            // `CycleDetected` and `MissingParent`, but L-14 added a third
-            // refusal this arm really does see:
-            // [`DagError::CycleCheckExhausted`], the I8 check giving up on a
-            // parent graph crafted to make both of its search frontiers large
-            // at once.
-            //
-            // H-08: so this arm is reachable, and a refusal here must cost the
-            // directive its place in the DAG — never its place in the file.
-            // Quarantine it, for the same reason as the two sites above.
-            let insert_result = match dag.insert((*directive).clone(), false) {
-                Ok(result) => result,
-                Err(error) => {
+        // H-20 door (b): a transaction that reached this loop through the
+        // per-block salvage may be a fragment — a blank line typed inside
+        // a node-written block leaves a head that parses on its own with
+        // some of its postings — so it is held to I1 (balance, no
+        // unresolved elision) before insertion, exactly as every other
+        // ingress holds a new transaction. The whole-file path never
+        // yields one (a fragment that parses is what this arm is for),
+        // and a node-written record always balances, so a healthy boot
+        // pays nothing here.
+        if salvaged {
+            if let Directive::Transaction(txn) = directive {
+                if let Some(reason) = Self::transaction_fails_i1(txn) {
                     let content_id = compute_content_id(directive);
                     warn!(
-                        %error,
+                        reason = %reason,
                         id = %content_id,
                         file = %file_path.display(),
-                        "quarantining a directive the DAG refused at boot — kept in the file, \
-                         kept out of the DAG; the rest of the file still loads (H-08)"
+                        "quarantining a salvaged ledger-file transaction that does not \
+                         balance — a fragment of a split block, not a record; kept in \
+                         the file, kept out of the DAG (H-20, H-08)"
                     );
-                    lamport_high.note_if_own(directive, author_id);
-                    Self::quarantine_keeping_envelope(
-                        &mut quarantined,
-                        content_id,
-                        (*directive).clone(),
-                    );
-                    continue;
-                }
-            };
-            match insert_result {
-                InsertResult::Inserted { content_id } => {
-                    lamport_high.note(directive, author_id);
-                    accounts.record_lifecycle(directive, &content_id);
-                    // H-20: loaded on the strength of its form; its signature
-                    // is checked by `verify_own_history` once the node has
-                    // the means. Everything on this path carries an author
-                    // (H-13 parks the rest as operator input).
-                    unverified_history.insert(content_id);
-                }
-                // A duplicate body is the same directive: its event is already
-                // recorded, under the same content id. Its ENVELOPE is not in
-                // the DAG, so its lamport counts only if it is this node's own
-                // pair (T63; see `BootLamportHigh`).
-                InsertResult::Duplicate { content_id } => {
-                    lamport_high.note_if_own(directive, author_id);
-                    duplicate_copies.push((content_id, (*directive).clone()));
+                    return HistoryVerdict::hold(content_id);
                 }
             }
         }
-        BootLoad {
-            accounts,
-            dag,
-            lamport_high,
-            quarantined,
-            operator_input,
-            unverified_history,
-            content_rule_refused,
-            duplicate_copies,
-        }
+
+        HistoryVerdict::Load
     }
 
     /// The clock boot resumes at, with the ceiling warnings (M-18, H-07,
@@ -1684,14 +1584,153 @@ struct ParsedBootText {
     salvaged: bool,
 }
 
+/// What [`LedgerService::judge_history_directive`] decides for one directive.
+enum HistoryVerdict {
+    /// No envelope: parked, and adopted after the history (H-13).
+    OperatorInput,
+    /// Held back: kept in the file, out of the DAG (H-08). `seeds_closure`
+    /// when the refusal is a content rule every peer holds history to, so
+    /// what descends from the record is held with it (T81 / M-51).
+    Hold {
+        content_id: String,
+        seeds_closure: bool,
+    },
+    /// Every check passed: insert it into the DAG.
+    Load,
+}
+
+impl HistoryVerdict {
+    /// A refusal of the record alone.
+    fn hold(content_id: String) -> Self {
+        Self::Hold {
+            content_id,
+            seeds_closure: false,
+        }
+    }
+
+    /// A refusal under a content rule: the record and what descends from it.
+    fn hold_with_descendants(content_id: String) -> Self {
+        Self::Hold {
+            content_id,
+            seeds_closure: true,
+        }
+    }
+}
+
 /// What [`LedgerService::load_history`] returns.
 struct BootLoad {
     accounts: AccountState,
     dag: LedgerDag,
+    /// M-18 / T63: the highest Lamport value this node's clock must resume
+    /// above, and the author of the directive that carries it (named in the
+    /// H-12 boot warning). See `BootLamportHigh` for which directives count.
     lamport_high: BootLamportHigh,
+    /// H-08: every directive the load refuses, so the next compaction can
+    /// write it back instead of deleting it. See `LedgerService::quarantined`
+    /// for why a skip that reaches a rewrite destroys the record.
     quarantined: BTreeMap<String, Directive>,
+    /// H-13: directives with no envelope at all — operator input, adopted
+    /// through the reconcile path once the history is in place, in this same
+    /// canonical order. See `LedgerService::unsigned_operator_input`.
     operator_input: Vec<Directive>,
+    /// H-20: every enveloped directive the load inserts, for the signature
+    /// pass that runs once a signer or verifier is installed. See
+    /// `LedgerService::unverified_history`.
     unverified_history: BTreeSet<String>,
+    /// T81 / M-51: records the history arm refused under a content rule,
+    /// seeding the closure quarantine after construction.
     content_rule_refused: BTreeSet<String>,
+    /// T90 / H-24: the second copy of a transaction body already in the DAG
+    /// — the same id under another envelope — for the copy choice after the
+    /// load.
     duplicate_copies: Vec<(String, Directive)>,
+}
+
+impl BootLoad {
+    fn new() -> Self {
+        Self {
+            accounts: AccountState::new(),
+            dag: LedgerDag::new(),
+            lamport_high: BootLamportHigh::default(),
+            quarantined: BTreeMap::new(),
+            operator_input: Vec::new(),
+            unverified_history: BTreeSet::new(),
+            content_rule_refused: BTreeSet::new(),
+            duplicate_copies: Vec::new(),
+        }
+    }
+
+    /// Hold `directive` back: its lamport counts only if it is this node's
+    /// own (T63), a content-rule refusal seeds the closure (T81), and it is
+    /// kept for the compaction to write back (H-08).
+    fn hold(
+        &mut self,
+        directive: &Directive,
+        content_id: String,
+        seeds_closure: bool,
+        author_id: &str,
+    ) {
+        self.lamport_high.note_if_own(directive, author_id);
+        if seeds_closure {
+            self.content_rule_refused.insert(content_id.clone());
+        }
+        // L-76: `entry().or_insert`, preferring the enveloped spelling. A
+        // plain `insert` let a later envelope-less copy of the same id replace
+        // the signed one; the compaction then wrote the raw copy, and the next
+        // boot re-authored the record under a fresh envelope while every peer
+        // kept the original.
+        LedgerService::quarantine_keeping_envelope(
+            &mut self.quarantined,
+            content_id,
+            directive.clone(),
+        );
+    }
+
+    /// Insert `directive`, which every check admitted, into the DAG.
+    fn insert(&mut self, directive: &Directive, author_id: &str, file_path: &Path) {
+        // L-17: a DAG refusal must never abort the load. The cycle pre-scan
+        // and `require_parents: false` between them rule out `CycleDetected`
+        // and `MissingParent`, but L-14 added a third refusal this arm really
+        // does see: [`DagError::CycleCheckExhausted`], the I8 check giving up
+        // on a parent graph crafted to make both of its search frontiers
+        // large at once.
+        //
+        // H-08: so this arm is reachable, and a refusal here must cost the
+        // directive its place in the DAG — never its place in the file.
+        // Quarantine it, for the same reason as the judge's refusals.
+        let insert_result = match self.dag.insert(directive.clone(), false) {
+            Ok(result) => result,
+            Err(error) => {
+                let content_id = compute_content_id(directive);
+                warn!(
+                    %error,
+                    id = %content_id,
+                    file = %file_path.display(),
+                    "quarantining a directive the DAG refused at boot — kept in the file, \
+                     kept out of the DAG; the rest of the file still loads (H-08)"
+                );
+                self.hold(directive, content_id, false, author_id);
+                return;
+            }
+        };
+        match insert_result {
+            InsertResult::Inserted { content_id } => {
+                self.lamport_high.note(directive, author_id);
+                self.accounts.record_lifecycle(directive, &content_id);
+                // H-20: loaded on the strength of its form; its signature is
+                // checked by `verify_own_history` once the node has the means.
+                // Everything on this path carries an author (H-13 parks the
+                // rest as operator input).
+                self.unverified_history.insert(content_id);
+            }
+            // A duplicate body is the same directive: its event is already
+            // recorded, under the same content id. Its ENVELOPE is not in the
+            // DAG, so its lamport counts only if it is this node's own pair
+            // (T63; see `BootLamportHigh`).
+            InsertResult::Duplicate { content_id } => {
+                self.lamport_high.note_if_own(directive, author_id);
+                self.duplicate_copies.push((content_id, directive.clone()));
+            }
+        }
+    }
 }

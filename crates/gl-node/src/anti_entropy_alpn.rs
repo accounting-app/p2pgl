@@ -3243,8 +3243,29 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) async fn bind_direct_endpoint() -> Endpoint {
+    /// The builder every test endpoint starts from: no relay, no discovery,
+    /// no port mapping, and one IPv4 socket on loopback, so the endpoint
+    /// listens on, advertises and dials `127.0.0.1` alone and no packet
+    /// leaves the loopback interface.
+    ///
+    /// The defaults sent traffic off the machine's loopback: the socket bound
+    /// every interface and advertised the LAN address, and the port mapper
+    /// probed the gateway (UPnP's SSDP multicast, PCP, NAT-PMP). An outbound
+    /// firewall holding that traffic for a decision — LuLu on the development
+    /// machine, whose per-binary rules expire after 12 hours, so the first run
+    /// of a day asked again — failed QUIC tests at random: a dial that timed
+    /// out (2026-10-05) and an endpoint closed mid-test with code 0
+    /// (2026-10-06).
+    pub(crate) fn loopback_endpoint_builder() -> iroh::endpoint::Builder {
         Endpoint::builder(presets::Minimal)
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .expect("a loopback bind address")
+    }
+
+    pub(crate) async fn bind_direct_endpoint() -> Endpoint {
+        loopback_endpoint_builder()
             .alpns(vec![p2p::protocol::ANTI_ENTROPY_ALPN.to_vec()])
             .bind()
             .await
@@ -5191,7 +5212,7 @@ pub(crate) mod tests {
         let _serialized = NET_TEST_LOCK.lock().await;
 
         let endpoint_client = bind_direct_endpoint().await;
-        let endpoint_stingy = iroh::Endpoint::builder(presets::Minimal)
+        let endpoint_stingy = loopback_endpoint_builder()
             .alpns(vec![p2p::protocol::ANTI_ENTROPY_ALPN.to_vec()])
             .transport_config(
                 iroh::endpoint::QuicTransportConfig::builder()
@@ -9685,7 +9706,7 @@ pub(crate) mod tests {
             p2p::protocol::ANTI_ENTROPY_ALPN_V2.to_vec(),
         ];
         let bind = |alpns: Vec<Vec<u8>>| async move {
-            Endpoint::builder(presets::Minimal)
+            loopback_endpoint_builder()
                 .alpns(alpns)
                 .bind()
                 .await
