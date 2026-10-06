@@ -1510,15 +1510,22 @@ mod tests {
                 ],
                 metadata: BTreeMap::new(),
             };
-            let content_id =
-                ledger::hash::compute_content_id(&Directive::Transaction(transaction.clone()));
+            let record = Directive::Transaction(transaction.clone());
+            let content_id = ledger::hash::compute_content_id(&record);
+            // Signed in the record's own format, as the node's signer callback
+            // signs every record — not in the provider's default version,
+            // which is v4 on a node writing Format v2 (the default) while this
+            // hand-built record is v1.
             let signature = signer
-                .sign(&SignableMessage {
-                    content_id: &content_id,
-                    is_transaction: true,
-                    parents: "",
-                    lamport: "1",
-                })
+                .sign_in(
+                    p2p::union_merge::signature_version(ledger::hash::RecordFormat::of(&record)),
+                    &SignableMessage {
+                        content_id: &content_id,
+                        is_transaction: true,
+                        parents: "",
+                        lamport: "1",
+                    },
+                )
                 .expect("signing is enabled");
 
             let mut metadata = BTreeMap::new();

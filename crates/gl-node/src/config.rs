@@ -273,22 +273,40 @@ impl Default for HttpConfig {
 /// Format v2 (T45, docs/FORMAT_V2_DESIGN.md): the coordinated encoding
 /// transition. Each switch decides only what this node EMITS; a node accepts
 /// both formats always, so a mesh flips one node at a time.
-#[derive(Debug, Deserialize, Default, Clone, Copy)]
+///
+/// Both are on by default since 2026-10-06, before any release: a mesh is
+/// born in v2, with M-10 and L-06 closed, instead of every deployed mesh
+/// switching over later. Setting one to `false` is how a node keeps writing
+/// for peers on a build from before Format v2, which read neither.
+#[derive(Debug, Deserialize, Clone, Copy)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct FormatConfig {
     /// Dial anti-entropy and gossip in the wire-v2 encoding (Facet C): the
     /// `openledger/anti-entropy/2` ALPN and the `<swarmTopic>/2` gossip topic.
     /// Both ALPNs are served regardless.
-    #[serde(default)]
+    #[serde(default = "default_format_v2")]
     pub wire2: bool,
 
     /// Write records in Format v2 (Facets A + B): `openledger-format: "2"`,
     /// an id that covers the author (another author's copy of a body is
     /// another record — M-10), signed in signature v4 (L-06). Records of both
     /// formats are accepted regardless.
-    #[serde(default)]
+    #[serde(default = "default_format_v2")]
     pub idv2: bool,
+}
+
+impl Default for FormatConfig {
+    fn default() -> Self {
+        Self {
+            wire2: default_format_v2(),
+            idv2: default_format_v2(),
+        }
+    }
+}
+
+fn default_format_v2() -> bool {
+    true
 }
 
 impl FormatConfig {
@@ -2166,28 +2184,40 @@ mod tests {
     /// Format v2: the `format` section defaults to v1 everywhere and refuses
     /// a key it does not know.
     #[test]
-    fn test_format_section_defaults_to_v1_and_is_strict() {
-        let file = write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean" }"#);
+    fn test_format_section_defaults_to_v2_and_is_strict() {
+        // On by default (2026-10-06): with the section absent, and with it
+        // present but empty.
+        for content in [
+            r#"{ "ledgerPath": "./data/ledger.bean" }"#,
+            r#"{ "ledgerPath": "./data/ledger.bean", "format": {} }"#,
+        ] {
+            let file = write_temp_config(content);
+            let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("load");
+            assert_eq!(config.format.wire_codec(), p2p::protocol::WireCodec::V2);
+            assert_eq!(
+                config.format.record_format(),
+                ledger::hash::RecordFormat::V2
+            );
+        }
+        // Each switch turns off on its own.
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "format": { "wire2": false } }"#,
+        );
         let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("load");
         assert_eq!(config.format.wire_codec(), p2p::protocol::WireCodec::V1);
-        let file = write_temp_config(
-            r#"{ "ledgerPath": "./data/ledger.bean", "format": { "wire2": true } }"#,
-        );
-        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("load");
-        assert_eq!(config.format.wire_codec(), p2p::protocol::WireCodec::V2);
-        assert_eq!(
-            config.format.record_format(),
-            ledger::hash::RecordFormat::V1
-        );
-        let file = write_temp_config(
-            r#"{ "ledgerPath": "./data/ledger.bean", "format": { "idv2": true } }"#,
-        );
-        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("load");
         assert_eq!(
             config.format.record_format(),
             ledger::hash::RecordFormat::V2
         );
-        assert_eq!(config.format.wire_codec(), p2p::protocol::WireCodec::V1);
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "format": { "idv2": false } }"#,
+        );
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("load");
+        assert_eq!(
+            config.format.record_format(),
+            ledger::hash::RecordFormat::V1
+        );
+        assert_eq!(config.format.wire_codec(), p2p::protocol::WireCodec::V2);
         let file = write_temp_config(
             r#"{ "ledgerPath": "./data/ledger.bean", "format": { "wire3": true } }"#,
         );

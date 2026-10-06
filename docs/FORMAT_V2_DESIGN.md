@@ -1,6 +1,6 @@
 # Format v2 — the coordinated identity / signature / wire version transition (T45)
 
-**Status: IMPLEMENTED (2026-10-04), off by default — decisions 1–3 taken as recommended. See §7 for where the build departs from this design.**
+**Status: IMPLEMENTED (2026-10-04), on by default since 2026-10-06 — decisions 1–3 taken as recommended. See §7 for where the build departs from this design.**
 **Date: 2026-09-21 · Baseline: HEAD `13beca5` (T18–T44 complete) · Author: security-campaign orchestrator**
 
 This document designs the one deliberate compatibility break the remediation campaign
@@ -302,4 +302,9 @@ each epoch.
 
 **Not done from §4:** §6's suggested re-audit, since the audit series has
 ended.
+
+**On by default (2026-10-06).** Both switches default to `true`, before any
+release, so no deployed mesh has to switch over: a mesh is born in v2, with
+M-10 and L-06 closed. `false` remains for writing to nodes on a build from
+before Format v2.
 

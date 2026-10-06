@@ -533,8 +533,8 @@ signing node without it refuses to boot, and the refusal names that remedy.
 | `p2p.enabled` | `false` | Enable Iroh mesh replication |
 | `p2p.secretKeyPath` | `./data/iroh.secret` | The node's Ed25519 key — its QUIC identity **and** its signing key. Created `0600` if absent. An existing file is refused unless it is a regular file (not a symlink), owned by the uid the node runs as, and not readable by group or other |
 | `p2p.bootstrapEndpointIds` | `[]` | Allowlisted peer EndpointIds; empty drops inbound `Supply` |
-| `format.wire2` | `false` | Dial anti-entropy and gossip in the wire-v2 encoding (§Format v2). Both encodings are always served |
-| `format.idv2` | `false` | Write records in Format v2 — an id that covers the author, signed in signature v4 (§Format v2). Both formats are always accepted |
+| `format.wire2` | `true` | Dial anti-entropy and gossip in the wire-v2 encoding (§Format v2). Both encodings are always served; `false` only to talk to a node on a build from before Format v2 |
+| `format.idv2` | `true` | Write records in Format v2 — an id that covers the author, signed in signature v4 (§Format v2). Both formats are always accepted; `false` only to write for a node on a build from before Format v2 |
 | `p2p.joinFrom` | unset | One of `bootstrapEndpointIds` that a node which has written nothing joins from: its history is adopted past the adoption ratchet until the node holds all of it (§Mesh identity, *Joining a mesh*) |
 | `p2p.gossipIntervalMilliseconds` | `5000` | Accepted but currently unused (reserved for gossip pacing) |
 | `p2p.antiEntropyIntervalMilliseconds` | `5000` | ALPN head-exchange cadence; minimum `100` |
@@ -877,10 +877,13 @@ pays alike, divergence is not).
 ### Format v2 (`format.wire2`, `format.idv2`)
 
 Format v2 is the one coordinated change to what nodes put on the wire and in
-the ledger (the design is `docs/FORMAT_V2_DESIGN.md`). Every node on this build
-**accepts** both formats; the two switches decide only what a node **emits**, so
-a mesh moves one node at a time. Upgrade every node to this build first: an
-older build refuses what a switched node sends.
+the ledger (the design is `docs/FORMAT_V2_DESIGN.md`). Both switches are **on by
+default**, so a new mesh is in Format v2 from its first record. Every node on
+this build **accepts** both formats; the switches decide only what a node
+**emits**. A node on a build from before Format v2 reads neither: upgrade every
+node to this build, or set both switches to `false` on every node until the
+older ones are upgraded, then remove them (one node at a time is fine — a mesh
+holding both formats converges).
 
 **`format.wire2` — the wire encoding.** Frames are sent externally tagged
 (`{"supply": {...}}`), so a node decodes a frame straight into its message
@@ -890,27 +893,30 @@ encoding still run in front of it. A switched node dials the
 serves both protocols, so anti-entropy works across a mixed mesh, while
 announcements reach only the nodes on the same topic until everyone has
 switched (anti-entropy still delivers everything). It changes nothing stored
-and can be switched back. Switch it first.
+and can be switched back. On a mesh moving from `false` to the default, switch it
+first.
 
 **`format.idv2` — record identity and signatures.** A record written through
 the API carries `openledger-format: "2"`. Its id then covers its author as well
 as its body, so another peer that publishes the same body first owns only its
 own copy — not yours (before, the first copy of a body held the id, whoever
 signed it). And it is signed over a length-prefixed message, which no field
-value can shift across a field boundary. Two consequences to know before
-switching:
+value can shift across a field boundary. Two consequences to know:
 
 - **The same body from two different authors is two records**, both counted.
   The same author writing the same body twice is still one record.
 - **Existing records keep their v1 ids and signatures forever** — nothing is
-  rewritten — and a node that switches still verifies its own v1 history.
+  rewritten — and a node that switches still verifies its own v1 history. A
+  ledger written before this default keeps its v1 records; the node's new
+  writes are v2.
 
 A line typed into the `.bean` keeps v1 identity on a switched node, so every
 repair this README prescribes ("delete its `openledger-*` lines so it is
 re-adopted under the same id") still gives the record back its id; a typed line
 that spells `openledger-format: "2"` itself (with its `openledger-author`) stays
-v2. Like `meshId`, switch it mesh-wide in one window, so the mesh does not
-write the same transaction under both formats.
+v2. On a mesh moving from `false` to the default, switch it mesh-wide in one
+window, like `meshId`, so the mesh does not write the same transaction under
+both formats.
 
 ### Using Auth
 
