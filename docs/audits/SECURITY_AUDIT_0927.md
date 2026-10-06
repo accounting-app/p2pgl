@@ -5,7 +5,7 @@
 **Closing verification:** 2026-10-05 at HEAD `ef584ee` — the fixes T98–T103 re-checked against this report; see [§10](#10-closing-verification-2026-10-05).
 
 Scope: re-verification of **every** claim, revert-proof, existing-test change, behaviour change, design deviation and
-residual in the T90–T97 "Done" notes of [docs/OUTSTANDING_TASKS_09_26.md](docs/OUTSTANDING_TASKS_09_26.md) against
+residual in the T90–T97 "Done" notes of [docs/audits/OUTSTANDING_TASKS_09_26.md](OUTSTANDING_TASKS_09_26.md) against
 source at HEAD, plus fresh hunts over the ~3,600 lines T90–T97 added or changed (18 files, six commits after the 0926
 audit commit `d77fcf2`: T90 `e3efd6f`, T91 `a04f844`, T92 `ceec19e`, T93 `ac84d82`, T94–T96 `397d749`, T97 `a5313a1`),
 treated as unreviewed code. Priority went to:
@@ -152,36 +152,36 @@ and the named test failed.
 
 | ID | Task | Mechanism at HEAD | Pinned by | Revert-proof |
 |---|---|---|---|---|
-| H-24 | T90 | `names_a_held_back_parent` ([service.rs:5535](crates/ledger/src/service.rs#L5535)) on the wire (`:9354-9376`) and live (`:8237-8262`); pruning on adopt (`:9555-9558`, `:8550`, `:8649`); `prefer_copies_whose_parents_are_served` (`:5477`, called `:4126`) | `h24_*` ×3, `a2_a_restated_chain…`, `a2_a_record_reentered…`, X2 `c1f`/`c1e`/`c1d` | yes (A1 R1–R3, R5, R6; X2 own-id revert → `c1f` REFUSED-for-good) — **the preference is judged before the closure, the pass and the rule (M-72)** |
+| H-24 | T90 | `names_a_held_back_parent` ([service.rs:5535](../../crates/ledger/src/service.rs#L5535)) on the wire (`:9354-9376`) and live (`:8237-8262`); pruning on adopt (`:9555-9558`, `:8550`, `:8649`); `prefer_copies_whose_parents_are_served` (`:5477`, called `:4126`) | `h24_*` ×3, `a2_a_restated_chain…`, `a2_a_record_reentered…`, X2 `c1f`/`c1e`/`c1d` | yes (A1 R1–R3, R5, R6; X2 own-id revert → `c1f` REFUSED-for-good) — **the preference is judged before the closure, the pass and the rule (M-72)** |
 | L-126 | T90 | `hold_refused_file_entry` (`:5550`) in the parity (`:8191`), limits (`:8418`), validation (`:8570`), resolved-body-cap (`:8466`) and held-parent (`:8247`) arms | `l126_*`, `a2_the_live_reconcile_keeps…`, A1 `a1_0927_a_pasted_child…` | yes (A1 R4a–c, R4e); the resolved-body-cap arm is unpinned (R4d) — **the lamport arms are outside the list (L-140); a held own record's lamport is not counted (L-141)** |
-| M-63 | T91 | union in `currencies_at` / `check_currency_constraint_at` ([accounts.rs:374-401, 468](crates/ledger/src/accounts.rs#L374)) | `a1_0926_1_…`, `a2_a_peer_open_never…`, A2's two new property tests vs an independent oracle | yes (A2 R1); A1 `a1p0926 i9` re-run: N serves T1–T4 after its restart, F keeps W |
-| M-09 remainder (0926 X1 `n3e`) | T91 | `dates_a_close_would_close` ([accounts.rs:490-514](crates/ledger/src/accounts.rs#L490)) in `reject_backdated_close` ([service.rs:8860](crates/ledger/src/service.rs#L8860)) | `m09_a_close…`, gl-node `lifecycle_converges_when…` | yes (A2 R2) — **closed for `n3e`'s order only: a `close` staged before its re-open is refused and cached permanent (H-25); the concurrent shape stays open (§3)** |
-| M-64 | T92 | fixpoint `ids.len() + self.quarantine_unservable_history()` ([:4832](crates/ledger/src/service.rs#L4832)); ceiling arm runs the rule (`:4566-4572`) | `m64_…`, `a1_0926_2_…`, A3 `a3_0927_the_rule_holds_an_alternating_chain…` | yes (A3 R1, R1b; X1 R-a) — **recursive, one full rebuild per round (L-146)** |
-| M-69 | T92 | `SIGNATURE_QUARANTINE_BANNER` ([main.rs:90-97](crates/gl-node/src/main.rs#L90)) | `m69_…`; D1 `c_banner` three shapes on the binary (Cash 3, 0 held, fixed point); X1 `m6a`/`m6b` (Cash 88.00, peer 6/6) | Done note R7 |
+| M-63 | T91 | union in `currencies_at` / `check_currency_constraint_at` ([accounts.rs:374-401, 468](../../crates/ledger/src/accounts.rs#L374)) | `a1_0926_1_…`, `a2_a_peer_open_never…`, A2's two new property tests vs an independent oracle | yes (A2 R1); A1 `a1p0926 i9` re-run: N serves T1–T4 after its restart, F keeps W |
+| M-09 remainder (0926 X1 `n3e`) | T91 | `dates_a_close_would_close` ([accounts.rs:490-514](../../crates/ledger/src/accounts.rs#L490)) in `reject_backdated_close` ([service.rs:8860](../../crates/ledger/src/service.rs#L8860)) | `m09_a_close…`, gl-node `lifecycle_converges_when…` | yes (A2 R2) — **closed for `n3e`'s order only: a `close` staged before its re-open is refused and cached permanent (H-25); the concurrent shape stays open (§3)** |
+| M-64 | T92 | fixpoint `ids.len() + self.quarantine_unservable_history()` ([:4832](../../crates/ledger/src/service.rs#L4832)); ceiling arm runs the rule (`:4566-4572`) | `m64_…`, `a1_0926_2_…`, A3 `a3_0927_the_rule_holds_an_alternating_chain…` | yes (A3 R1, R1b; X1 R-a) — **recursive, one full rebuild per round (L-146)** |
+| M-69 | T92 | `SIGNATURE_QUARANTINE_BANNER` ([main.rs:90-97](../../crates/gl-node/src/main.rs#L90)) | `m69_…`; D1 `c_banner` three shapes on the binary (Cash 3, 0 held, fixed point); X1 `m6a`/`m6b` (Cash 88.00, peer 6/6) | Done note R7 |
 | L-114 | T92 | `signed_by_finalize` (`:4615`, `:4888`) | `a6_2_…`; X1 `n5` 1 WARN; D1 `c_every` 1 WARN; X3 `domain+handopen` SAME | yes (A3 R2) |
-| L-121, L-125 | T92 | L-77 at finalize via `is_open_excluding` (`:4490-4530`, [accounts.rs:527](crates/ledger/src/accounts.rs#L527)); live L-110 clause removed | `l121_…`, `l77_…`, `a1_0926_3_…`, `a2_the_l110_remedy…`, A3 `a3_0927_a_hand_open_then_the_original…` | yes (A3 R3, R3b; X1 R-c) — **a typed `open` with the held record's own id is dropped at boot (L-143)** |
+| L-121, L-125 | T92 | L-77 at finalize via `is_open_excluding` (`:4490-4530`, [accounts.rs:527](../../crates/ledger/src/accounts.rs#L527)); live L-110 clause removed | `l121_…`, `l77_…`, `a1_0926_3_…`, `a2_the_l110_remedy…`, A3 `a3_0927_a_hand_open_then_the_original…` | yes (A3 R3, R3b; X1 R-c) — **a typed `open` with the held record's own id is dropped at boot (L-143)** |
 | L-128, L-129 | T92 | `hand_parented_last` Kahn over `stored_content_id` (`:9673-9740`) | `a6_3_…`, `l108_a_hand_chain…`; A3 `a6cost 20000`: reverse 1.11× forward | yes (A3 R5) |
 | L-131 | T92 | pass skips pending operator input (`:4856-4866`) | `l131_…`, X1 `m4c` | yes (A3 R6, X1 R-b) — **only for a closure-held record (L-143); not a fixed point there (L-144); a typed copy finalize refuses is dropped (L-145)** |
-| M-65 | T93 | `choose_committed_parents` ([:6146](crates/ledger/src/service.rs#L6146), `:8398`, `:8449`); gl-node headroom 0 ([ledger_commit.rs:565](crates/gl-node/src/ledger_commit.rs#L565)) | `a3_1_…` ×2, `a3_m59_…`; A3's 0926 gl probe: mutations 1–2 refused in ~1 ms, running == restart | yes (A4 R1, X3 `X3_RE`) — **the gate trusts a stale fact while a rewrite is pending (M-74)** |
+| M-65 | T93 | `choose_committed_parents` ([:6146](../../crates/ledger/src/service.rs#L6146), `:8398`, `:8449`); gl-node headroom 0 ([ledger_commit.rs:565](../../crates/gl-node/src/ledger_commit.rs#L565)) | `a3_1_…` ×2, `a3_m59_…`; A3's 0926 gl probe: mutations 1–2 refused in ~1 ms, running == restart | yes (A4 R1, X3 `X3_RE`) — **the gate trusts a stale fact while a rewrite is pending (M-74)** |
 | L-115 | T93 | `discarded_own_high` (`:7189-7213`) | `l115_…`; X3 `diff=all` 0 of 52 reload re-issues | yes (X3 `X3_RA`); the re-application after `verify_own_history` (`:7213`) is unpinned (A4 R3b) — **lost at a restart (L-148)** |
 | L-116 | T93 | `served_directive` / `served_head_txids` / `served_sorted_directive_ids` (`:8959-9029`); gl-node `:1572`, `:1611` | gl-node `l116_…`, ledger `l116_the_served…`, X3 `k14` (1 envelope) | yes (X3 `X3_RD`) — **the signed child of a withheld line is advertised (L-154)** |
 | L-117 | T93 | `BootMode::Reload` refuses a link (`:3319-3334`) | `l117_…`; D1 `c_l117` on the binary | yes (A4 R5, X3 `X3_RB`) — **the refusal keeps the failed write (L-147)** |
-| L-122 | T93 | `has_later_intact_record` in the over-claim arm ([journal.rs:658-662](crates/ledger/src/journal.rs#L658)) | `l122_…`; D1 `c_l122` k = 1, 3, 5 corrupt on the binary; X3 `k17` 407 prefixes, 0 false positives | yes (A4 R6, X3 `X3_RC`) |
+| L-122 | T93 | `has_later_intact_record` in the over-claim arm ([journal.rs:658-662](../../crates/ledger/src/journal.rs#L658)) | `l122_…`; D1 `c_l122` k = 1, 3, 5 corrupt on the binary; X3 `k17` 407 prefixes, 0 false positives | yes (A4 R6, X3 `X3_RC`) |
 | L-124 | T93 | exemption removed (`:7256`), texts corrected | `m46_*`, `l104_*` | — (dead code; no outcome to revert) |
-| M-68 | T94 | `resolve_link_in_its_directory` ([journal.rs:247-341](crates/ledger/src/journal.rs#L247)): one handle, `fstat`, `fstatat`, `readlinkat`, `openat(O_NOFOLLOW)`, `(dev, ino)` compare | `m68_…`; A4 `raceswap` VICTIM=0 | yes (A5 R1) — **a hard link in the attacker's directory passes the identity compare (M-71); the test counts only the victim path (L-157)** |
-| L-118 | T94 | `claim_ledger_path` sweeps beside the link ([main.rs:72-79](crates/gl-node/src/main.rs#L72)) | gl-node `l118_…`; D1 `c_sweep` on the binary | yes (A5 R4) — **can delete the link's own target (L-139)** |
+| M-68 | T94 | `resolve_link_in_its_directory` ([journal.rs:247-341](../../crates/ledger/src/journal.rs#L247)): one handle, `fstat`, `fstatat`, `readlinkat`, `openat(O_NOFOLLOW)`, `(dev, ino)` compare | `m68_…`; A4 `raceswap` VICTIM=0 | yes (A5 R1) — **a hard link in the attacker's directory passes the identity compare (M-71); the test counts only the victim path (L-157)** |
+| L-118 | T94 | `claim_ledger_path` sweeps beside the link ([main.rs:72-79](../../crates/gl-node/src/main.rs#L72)) | gl-node `l118_…`; D1 `c_sweep` on the binary | yes (A5 R4) — **can delete the link's own target (L-139)** |
 | L-119 | T94 | identity compare replaces the string compare | `l119_…`; A4 `hops`: case and NFD variants resolve | probe (T87's compare no longer exists to restore) |
 | L-120 | T94 | macOS `acl_get_fd_np` + `acl_get_entry` (`:421-447`) | `l120_…`; X3 `k11`, D1 `chmod +a` refused, `chmod -N` fixes | yes (A5 R3) — **refuses every ACL entry, including macOS's default on `~` (L-137)** |
-| M-66, L-133 | T95 | `retain_not_doomed(peer, …, holds)` judges only the asked peer's copies ([orphan_buffer.rs:362-372](crates/p2p/src/orphan_buffer.rs#L362), `:406`) | `m66_…`, `l133_…`; **real QUIC**: attacked `C adopted true, D adopted true` (0926: false) | yes (A6 R1 over real QUIC in a scratch archive with the control green; R2) — **the buffer slot and the Want order still read any peer's copy (M-76)** |
+| M-66, L-133 | T95 | `retain_not_doomed(peer, …, holds)` judges only the asked peer's copies ([orphan_buffer.rs:362-372](../../crates/p2p/src/orphan_buffer.rs#L362), `:406`) | `m66_…`, `l133_…`; **real QUIC**: attacked `C adopted true, D adopted true` (0926: false) | yes (A6 R1 over real QUIC in a scratch archive with the control green; R2) — **the buffer slot and the Want order still read any peer's copy (M-76)** |
 | M-67 | T95 | one memoised pass | `m67_…`; `a5_7` child-first 13 ms (0926: 9.8 s) | yes (A6 R3: 62.6 s) — **`m67_`'s debug 2 s bound flakes under load (L-157)** |
 | L-130 | T95 | `retain_not_buffered_from` (`:458-527`) | `l130_…`; X2 `c3` 0 validated per tick | yes (A6 R4) — **no `holds` term (L-151)** |
 | L-132 | T95 | limiter note and CHANGELOG; `decode_memory` 224 MiB absolute pin | `decode_memory` 8/8; X2 `c5` 1.87 MiB per directive | — (a pin on a measured bound) |
 | L-134 | T95 | `hint_order` `VecDeque` (`:275`, `:586-603`) | `l134_…`; `a5_6` 1.3 µs per expiry | yes (A6 R5) — **the compaction drops the hint it just pushed (L-150)** |
-| L-127 | T96 | `lamport_gap_verdict(gap, without_named)`, strict `> 2^32` ([service.rs:1463-1482](crates/ledger/src/service.rs#L1463)) | `a6_1_…`, `a6_4_…`; D1 `c_gap96` on the binary | yes (A6 V1, V2) |
+| L-127 | T96 | `lamport_gap_verdict(gap, without_named)`, strict `> 2^32` ([service.rs:1463-1482](../../crates/ledger/src/service.rs#L1463)) | `a6_1_…`, `a6_4_…`; D1 `c_gap96` on the binary | yes (A6 V1, V2) |
 | L-123 | T96 | `dtolnay/rust-toolchain@02cb101` | `git ls-remote`: `HEAD`, `refs/heads/master`, `refs/tags/v1` | — |
 | L-135 | T96 | check 7 in `Checks::ALL`; `WITHOUT_FRESH_PEER`; the edited-record bound; the global always-interested subscriber | every sweep runs check 7; A6: the subscriber masks nothing | Done note R3–R6 |
 | L-136 | T96 | texts | D1: README §Verify's query returns the documented fields; "by itself" gone | — |
-| M-70 | T97 | `CurrencyIndex` ([accounts.rs:139-186](crates/ledger/src/accounts.rs#L139)) | `m70_*` ×2; A2's properties; D1 `c_m70` on the binary: 10,000 pairs 60.5 s vs 26.2 s debug, linear in records | yes (A2 R7, R8, R9) |
+| M-70 | T97 | `CurrencyIndex` ([accounts.rs:139-186](../../crates/ledger/src/accounts.rs#L139)) | `m70_*` ×2; A2's properties; D1 `c_m70` on the binary: 10,000 pairs 60.5 s vs 26.2 s debug, linear in records | yes (A2 R7, R8, R9) |
 
 ### 1.2 Unchanged by decision (4) and re-opened (1)
 
@@ -204,7 +204,7 @@ and the named test failed.
 
 **T91**
 - **"The verdict on the `close` does not depend on whether the re-`open` … arrived first"**
-  ([service.rs:8846-8848](crates/ledger/src/service.rs#L8846), CHANGELOG:195, README:136) is **wrong** in one order
+  ([service.rs:8846-8848](../../crates/ledger/src/service.rs#L8846), CHANGELOG:195, README:136) is **wrong** in one order
   (H-25).
 - **The gl-node acceptance test `lifecycle_converges_when_the_account_is_posted_to_after_a_reopen`** is a proxy. Its
   03-15 posting names the 06-01 Bank transaction, so it is usually buffered until after the `close`. With seeds
@@ -217,7 +217,7 @@ and the named test failed.
   makes it live, and four delivery orders give two different held sets (A2 `p3`).
 - **"Mixed versions … (README's 'upgrade every node' note)"** cites a note that gives only the T75–T80 reason (L-155).
 - **The six existing tests changed** (the "poison" `close` moved to 2024-01-10) are not weakened (A2).
-- **The `posting_dates` doc** at [read_model.rs:531-535](crates/ledger/src/read_model.rs#L531) ("nothing is ever
+- **The `posting_dates` doc** at [read_model.rs:531-535](../../crates/ledger/src/read_model.rs#L531) ("nothing is ever
   removed") is stale (Info).
 
 **T92**
@@ -289,20 +289,20 @@ Found independently by **A2** (A2-2) and **X2** (X2-1). **EXECUTED** through gl-
 (`apply_supply_entries`) with the Want the head exchange builds. **Fix-proven** (X2).
 
 **Mechanism.**
-- `reject_backdated_close` ([service.rs:8860](crates/ledger/src/service.rs#L8860)) refuses a `close` when a held
-  posting falls in `dates_a_close_would_close` ([accounts.rs:490-514](crates/ledger/src/accounts.rs#L490)). That
+- `reject_backdated_close` ([service.rs:8860](../../crates/ledger/src/service.rs#L8860)) refuses a `close` when a held
+  posting falls in `dates_a_close_would_close` ([accounts.rs:490-514](../../crates/ledger/src/accounts.rs#L490)). That
   interval ends at the next lifecycle event **this node holds**. Until the re-open lands, it is unbounded, so the
   posting after the re-open refuses the `close`.
 - `open` and `close` records name no parents (the lifecycle insert at `:9512-9541`).
 - `compute_want` asks for remote heads first, then ids in sorted order
-  ([p2p anti_entropy.rs:35-59, 88](crates/p2p/src/anti_entropy.rs#L35)), and `order_want_ancestors_first` (`:120`)
+  ([p2p anti_entropy.rs:35-59, 88](../../crates/p2p/src/anti_entropy.rs#L35)), and `order_want_ancestors_first` (`:120`)
   never moves a parentless id. So a `close` and its re-open are staged in content-id (hex) order, after the head.
 - gl-node classifies `AccountHasLaterTransactions` as permanent
-  ([anti_entropy_alpn.rs:2484-2510](crates/gl-node/src/anti_entropy_alpn.rs#L2484)). The justification there reads:
+  ([anti_entropy_alpn.rs:2484-2510](../../crates/gl-node/src/anti_entropy_alpn.rs#L2484)). The justification there reads:
   "the later posting that refutes the close is in a G-Set DAG and can never leave, so the close can never become
   acceptable". Since T91 a later **re-open** makes it acceptable.
 - It is not an account-wait target (`account_wait_target`, `:2535-2545`). The drain never re-tries it, and the L-34
-  cache keeps it out of the Want for 10 minutes per (peer, id) ([anti_entropy.rs:678](crates/p2p/src/anti_entropy.rs#L678)).
+  cache keeps it out of the Want for 10 minutes per (peer, id) ([anti_entropy.rs:678](../../crates/p2p/src/anti_entropy.rs#L678)).
 
 **Proof** (X2 `x2_p2a_close_before_its_reopen_in_want_order`, re-run in the scratch archive):
 ```
@@ -390,7 +390,7 @@ writes" understates it: T is not concurrent in `p2b`, and a single author suffic
 Found by **A5** (A5-1). **EXECUTED** as the same uid with the attacker's directory at 0777. The cross-uid hard-link
 premise is **PLAUSIBLE**.
 
-**Mechanism.** [journal.rs:328-341](crates/ledger/src/journal.rs#L328) calls `canonicalize(configured)` — a second,
+**Mechanism.** [journal.rs:328-341](../../crates/ledger/src/journal.rs#L328) calls `canonicalize(configured)` — a second,
 by-path walk — and accepts its result when `(dev, ino)` equals the file opened through the handle (`:314`). A hard
 link has the same `(dev, ino)`.
 - When the handle saw the operator's `node/`, but the swap put the attacker's `evil/` there for the second walk, the
@@ -428,7 +428,7 @@ README:1097-1098 either way. Acceptance: A5's proposed `a5_0927_a_path_through_a
 Found by **A1** (A1-1, A1-2) and **X1** (X1-2). **EXECUTED**; pinned: three `a1_0927_…` cases (`m50_wire.rs`,
 ignored).
 
-**Mechanism.** `prefer_copies_whose_parents_are_served` ([service.rs:5477](crates/ledger/src/service.rs#L5477))
+**Mechanism.** `prefer_copies_whose_parents_are_served` ([service.rs:5477](../../crates/ledger/src/service.rs#L5477))
 runs at `:4126`, before the closure walk (`:4127`), the operator input, the signature pass and the rule.
 - **Its "resolves" is "the parent is in the lenient, pre-closure DAG"** (`:5488-5495`). The file's D (naming the
   file's C, whose parent is the refused X) counts as resolving and is kept. The journal's C names D, which descends
@@ -460,7 +460,7 @@ Found by **A1** (A1-4) and **X2** (X2-3). **EXECUTED**; pinned: `a1_0927_the_res
 (`m50_wire.rs`, ignored).
 
 **Mechanism.**
-- The closure WARN ([service.rs:5588-5600](crates/ledger/src/service.rs#L5588)), the M-52 per-block WARN
+- The closure WARN ([service.rs:5588-5600](../../crates/ledger/src/service.rs#L5588)), the M-52 per-block WARN
   (`:3553-3566`), the H-08 banner and README (:58, :875-880, as reworded by T90 (d)) print at every boot of every
   node whose file holds the refused record. They keep printing after a restatement from another node has arrived and
   the closure is empty.
@@ -483,9 +483,9 @@ WARN says "delete this block".
 Found by **A4** (A4-1). **EXECUTED** on gl-node's GraphQL path and its peer path. **Fix-proven** for the kept-write
 state.
 
-**Mechanism.** `refuse_if_local_write_cannot_fit` ([ledger_commit.rs:556](crates/gl-node/src/ledger_commit.rs#L556))
+**Mechanism.** `refuse_if_local_write_cannot_fit` ([ledger_commit.rs:556](../../crates/gl-node/src/ledger_commit.rs#L556))
 decides on three inputs:
-- the file-based `append_headroom()` ([service.rs:6389-6398](crates/ledger/src/service.rs#L6389));
+- the file-based `append_headroom()` ([service.rs:6389-6398](../../crates/ledger/src/service.rs#L6389));
 - the over-cap fact, through headroom 0 (`:565`);
 - an exact estimate, skipped when `uncommitted_count() > 0` (`:573`).
 
@@ -494,7 +494,7 @@ includes the envelopes of lines still waiting for their rewrite, which `canonica
 - `prepare` re-measures the fact only if it is already set (`:6572`).
 - `persist_atomically` refuses an over-cap text as `Io(InvalidData)` (`:282-290`) and sets nothing.
 - Both REFUSING arms return (`:7128`, `:7151`) before the re-measure (`:7220`).
-- The L-70 peer backoff arms only on `ResourceLimitExceeded` ([anti_entropy_alpn.rs:2319](crates/gl-node/src/anti_entropy_alpn.rs#L2319)).
+- The L-70 peer backoff arms only on `ResourceLimitExceeded` ([anti_entropy_alpn.rs:2319](../../crates/gl-node/src/anti_entropy_alpn.rs#L2319)).
 
 **Proof** (A4 `a4_probe_window_and_remedy`, re-run):
 ```
@@ -529,8 +529,8 @@ the cap. An API-key holder can then keep it there.
 Found by **X3** (X3-2). **EXECUTED**; pinned: `x3_0927_2_…` (`exact_balances.rs`, ignored).
 
 **Mechanism.** Three checks read `latest_posting_date(_in)` over the read model
-([read_model.rs:1108](crates/ledger/src/read_model.rs#L1108)), which excludes the quarantine:
-- `close_account_staged` ([service.rs:6017](crates/ledger/src/service.rs#L6017));
+([read_model.rs:1108](../../crates/ledger/src/read_model.rs#L1108)), which excludes the quarantine:
+- `close_account_staged` ([service.rs:6017](../../crates/ledger/src/service.rs#L6017));
 - `reject_backdated_close` from the file path (`:8583`);
 - `reject_backdated_close` from the wire (`:9530`).
 
@@ -562,9 +562,9 @@ Found by **X2** (X2-2). **EXECUTED over real loopback QUIC** (scratch archive, c
 
 **Mechanism.**
 - A content id covers the body only, so M signs its own envelopes (its own parents) over H's bodies and pushes them
-  ([anti_entropy_alpn.rs:884-893](crates/gl-node/src/anti_entropy_alpn.rs#L884)).
+  ([anti_entropy_alpn.rs:884-893](../../crates/gl-node/src/anti_entropy_alpn.rs#L884)).
 - `insert_waiting` returns `Duplicate` for any existing entry, whoever delivered it
-  ([orphan_buffer.rs:692](crates/p2p/src/orphan_buffer.rs#L692)), and gl-node drops H's copy (`:2153-2172`).
+  ([orphan_buffer.rs:692](../../crates/p2p/src/orphan_buffer.rs#L692)), and gl-node drops H's copy (`:2153-2172`).
 - `known_missing_parents` (`:317`) reads M's copy's parents, and gl-node orders H's Want by it (`:1320-1325`).
 - T95 made only the two filters per-peer.
 
@@ -591,7 +591,7 @@ hints only.
 
 - **L-137 — The L-120 ACL rule refuses any ACL entry, including macOS's default `group:everyone deny delete` on `~`,
   `~/Desktop`, `~/Documents` and `~/Downloads`; its `chmod -N` remedy strips Apple's home-folder protection.** A5-2.
-  - `acl_get_entry(FIRST) == 0` ⇒ refuse ([journal.rs:421-447](crates/ledger/src/journal.rs#L421)); allow/deny,
+  - `acl_get_entry(FIRST) == 0` ⇒ refuse ([journal.rs:421-447](../../crates/ledger/src/journal.rs#L421)); allow/deny,
     permissions and inheritance are never read.
   - Re-run: `ls -led ~` → `0: group:everyone deny delete`; `p1 acls` refuses a deny-only entry, an `only_inherit`
     allow and the owner's `readextattr`.
@@ -603,7 +603,7 @@ hints only.
   - Fix (T101): `O_RDONLY | O_DIRECTORY | O_NONBLOCK | O_CLOEXEC` (`ENOTDIR` at once, checked by A5).
 - **L-139 — gl-node's sweep beside the link deletes the link's own target when the target is named like a reserved
   temporary (`<link>.tmp`, `<link>.tmp.<pid>.<16hex>`), and boot starts an empty ledger.** A5-4.
-  - `sweep_stale_temporaries` ([service.rs:226-271](crates/ledger/src/service.rs#L226)) never compares with the
+  - `sweep_stale_temporaries` ([service.rs:226-271](../../crates/ledger/src/service.rs#L226)) never compares with the
     resolved target.
   - Re-run `p1 sweeptarget`: `target exists after the sweep: false … boot: Ok(0) … target content now: Some("")`.
   - Fix (T101): skip the resolved target by `(dev, ino)`.
@@ -628,7 +628,7 @@ hints only.
   rule or the signature pass — or "the missing open" typed as the account's own `open` line — is dropped at boot as a
   duplicate, silently, while the live path adopts the same bytes.** A3-1, D1-1, X1-1.
   - `adopt_operator_input_at_boot` counts an id already in the DAG as a duplicate
-    ([service.rs:4350-4354](crates/ledger/src/service.rs#L4350)) before the pass and the rule have held the history
+    ([service.rs:4350-4354](../../crates/ledger/src/service.rs#L4350)) before the pass and the rule have held the history
     copy.
   - Re-runs:
     - D1 `c_l131b` on the binary: `served [] quarantined 2 … operator_input=0 … log lines naming L-131 / a duplicate:
@@ -685,7 +685,7 @@ hints only.
   - A4 `a4l3` (release, loaded): 1,000 staged × 5,000 lines 18–42 s; 0 staged × 5,000 lines 0.30 s.
   - Fix (T100): committed heads once per adoption pass.
 - **L-150 — T95's hint-queue compaction drops the entry it has just pushed, so that hint never expires.** A6-1.
-  - `push_back` at [orphan_buffer.rs:568](crates/p2p/src/orphan_buffer.rs#L568), `retain` against `parent_hints` at
+  - `push_back` at [orphan_buffer.rs:568](../../crates/p2p/src/orphan_buffer.rs#L568), `retain` against `parent_hints` at
     `:571-577`, insert only at `:579` (re-read in source).
   - Pinned: `a6_0927_3_…` (`convergence.rs`, ignored). Fix (T102): insert before compacting.
 - **L-151 — `retain_not_buffered_from` has no `holds`: a child buffered on a parent that then arrives through the file
@@ -721,7 +721,7 @@ hints only.
   - journal.rs:885-888 calls `fcntl` "an `unsafe` FFI call this crate avoids".
   - p2p_service.rs:1088-1090 says "the only production FFI declaration".
   - T95 inserted `type ServedIdSnapshot` between `sweep_stale_temporaries`' doc and the function
-    ([service.rs:193-209](crates/ledger/src/service.rs#L193)), so rustdoc attaches the L-57 text to the alias.
+    ([service.rs:193-209](../../crates/ledger/src/service.rs#L193)), so rustdoc attaches the L-57 text to the alias.
   - ci.yml:25-27 says "stable branch tip" beside the `master` pin.
   - boot_fuzz.rs:73 says check 7 "is off in `Checks::ALL`".
   - service.rs:3317-3318 names the REFUSING arm for the reload-failed arm.
@@ -830,10 +830,10 @@ modified or removed.
 
 | File | Before | After | New cases (pins) |
 |---|---|---|---|
-| [crates/p2p/tests/m50_wire.rs](crates/p2p/tests/m50_wire.rs) | 23 / 0 | **26 / 6 ign** | a chain re-entered parent-first served after a crash, no parent cycle ever written (R3, R7); a restated parent frees the held child's original copy live and on the wire (R568); a pasted child of a held record kept in the file as boot keeps it (R4e); ignored: A1-1 ×2 (M-72), A1-2 (M-72), A1-3 (L-140), A1-4 (M-73), A1-5 (L-141) |
-| [crates/ledger/tests/exact_balances.rs](crates/ledger/tests/exact_balances.rs) | 37 / 0 | **40 / 3 ign** | T91's union against an independent oracle in 3 orders + a restart (proptest; R1, R7, R9); an ingested `close` refused exactly when it would close a held transaction (proptest; R2, R5, R6 — R5/R6 caught by no other test); a 300-pair reopen history in 301 currencies across a restart (R1); ignored: A2-1 (M-09 remainder), A4-2 (L-147), X3-2 (M-75) |
-| [crates/p2p/tests/boot_fuzz.rs](crates/p2p/tests/boot_fuzz.rs) | 58 / 0 | **61 / 5 ign** | the rule holds an alternating chain over 5 rounds (R1); a hand `open` then the original returning changes no verdict, on Food and Travel (R3); a retyped copy refused at finalisation leaves the record held and on disk (R76); ignored: A3-1 (L-143), A3-2 (L-144), A3-3 (L-145), A3-4 (L-146), X1-1 (L-143) |
-| [crates/p2p/tests/convergence.rs](crates/p2p/tests/convergence.rs) | 37 / 3 ign | **38 / 6 ign** | the cached advert tracks a record staged while a line waits for its rewrite, replaying gl-node's head exchange, served views and both T95 filters (R7 — the first harness case to exercise T93's views and T95's filters); ignored: A6-1 (L-150), A6-2 (L-151), X3-1 (L-148) |
+| [crates/p2p/tests/m50_wire.rs](../../crates/p2p/tests/m50_wire.rs) | 23 / 0 | **26 / 6 ign** | a chain re-entered parent-first served after a crash, no parent cycle ever written (R3, R7); a restated parent frees the held child's original copy live and on the wire (R568); a pasted child of a held record kept in the file as boot keeps it (R4e); ignored: A1-1 ×2 (M-72), A1-2 (M-72), A1-3 (L-140), A1-4 (M-73), A1-5 (L-141) |
+| [crates/ledger/tests/exact_balances.rs](../../crates/ledger/tests/exact_balances.rs) | 37 / 0 | **40 / 3 ign** | T91's union against an independent oracle in 3 orders + a restart (proptest; R1, R7, R9); an ingested `close` refused exactly when it would close a held transaction (proptest; R2, R5, R6 — R5/R6 caught by no other test); a 300-pair reopen history in 301 currencies across a restart (R1); ignored: A2-1 (M-09 remainder), A4-2 (L-147), X3-2 (M-75) |
+| [crates/p2p/tests/boot_fuzz.rs](../../crates/p2p/tests/boot_fuzz.rs) | 58 / 0 | **61 / 5 ign** | the rule holds an alternating chain over 5 rounds (R1); a hand `open` then the original returning changes no verdict, on Food and Travel (R3); a retyped copy refused at finalisation leaves the record held and on disk (R76); ignored: A3-1 (L-143), A3-2 (L-144), A3-3 (L-145), A3-4 (L-146), X1-1 (L-143) |
+| [crates/p2p/tests/convergence.rs](../../crates/p2p/tests/convergence.rs) | 37 / 3 ign | **38 / 6 ign** | the cached advert tracks a record staged while a line waits for its rewrite, replaying gl-node's head exchange, served views and both T95 filters (R7 — the first harness case to exercise T93's views and T95's filters); ignored: A6-1 (L-150), A6-2 (L-151), X3-1 (L-148) |
 
 **Test suite.** `cargo test --workspace --locked --no-fail-fast` gave **1,437 passed, 0 failed, 3 ignored** before
 the audit, and **1,447 passed, 0 failed, 20 ignored** (425 + 8 + 610 + 40 + 10 + 195 + 61 + 38 + 8 + 26 + 5 + 21) after all passes completed, with the four files extended. The ignored cases are
@@ -913,7 +913,7 @@ Everything open as of this audit. IDs are stable across the 09/01 … 09/27 repo
 
 ## 8. Remediation backlog
 
-Tracked in [docs/OUTSTANDING_TASKS_09_27.md](docs/OUTSTANDING_TASKS_09_27.md). Task numbering continues from T97.
+Tracked in [docs/audits/OUTSTANDING_TASKS_09_27.md](OUTSTANDING_TASKS_09_27.md). Task numbering continues from T97.
 Effort: S = < ½ day, M = ~1–2 days. Every task keeps the campaign's rule: revert the fix → the named test fails →
 restore; residuals go in the tracker. The `#[ignore]`d cases in the four invariant files are the acceptance tests. Decisions
 (54)–(72) were taken on 2026-09-27 (the recommended option every time; (55)/(56) moot under (54a)) and are recorded in
@@ -1115,4 +1115,4 @@ verifier could check it) was fixed in `76f2096`, pinned by `a_history_record_wit
 
 ---
 
-*Previous audits: [SECURITY_AUDIT_0926.md](SECURITY_AUDIT_0926.md) · [SECURITY_AUDIT_0925.md](SECURITY_AUDIT_0925.md) · [SECURITY_AUDIT_0924.md](SECURITY_AUDIT_0924.md) · [SECURITY_AUDIT_0923.md](SECURITY_AUDIT_0923.md) · [SECURITY_AUDIT_0922-v2.md](SECURITY_AUDIT_0922-v2.md) · [SECURITY_AUDIT_0922.md](SECURITY_AUDIT_0922.md) · [SECURITY_AUDIT_0902.md](SECURITY_AUDIT_0902.md) · [SECURITY_AUDIT_0901.md](SECURITY_AUDIT_0901.md) · [docs/CLAUDE_SECURITY_AUDIT_0820.md](docs/CLAUDE_SECURITY_AUDIT_0820.md). Remediation trackers: [docs/OUTSTANDING_TASKS_09_27.md](docs/OUTSTANDING_TASKS_09_27.md) (T98–T103) · [docs/OUTSTANDING_TASKS_09_26.md](docs/OUTSTANDING_TASKS_09_26.md) (T90–T97) · [docs/OUTSTANDING_TASKS_09_25.md](docs/OUTSTANDING_TASKS_09_25.md) (T84–T89) · [docs/OUTSTANDING_TASKS_09_24.md](docs/OUTSTANDING_TASKS_09_24.md) (T79–T83).*
+*Previous audits: [SECURITY_AUDIT_0926.md](SECURITY_AUDIT_0926.md) · [SECURITY_AUDIT_0925.md](SECURITY_AUDIT_0925.md) · [SECURITY_AUDIT_0924.md](SECURITY_AUDIT_0924.md) · [SECURITY_AUDIT_0923.md](SECURITY_AUDIT_0923.md) · [SECURITY_AUDIT_0922-v2.md](SECURITY_AUDIT_0922-v2.md) · [SECURITY_AUDIT_0922.md](SECURITY_AUDIT_0922.md) · [SECURITY_AUDIT_0902.md](SECURITY_AUDIT_0902.md) · [SECURITY_AUDIT_0901.md](SECURITY_AUDIT_0901.md) · [docs/audits/CLAUDE_SECURITY_AUDIT_0820.md](CLAUDE_SECURITY_AUDIT_0820.md). Remediation trackers: [docs/audits/OUTSTANDING_TASKS_09_27.md](OUTSTANDING_TASKS_09_27.md) (T98–T103) · [docs/audits/OUTSTANDING_TASKS_09_26.md](OUTSTANDING_TASKS_09_26.md) (T90–T97) · [docs/audits/OUTSTANDING_TASKS_09_25.md](OUTSTANDING_TASKS_09_25.md) (T84–T89) · [docs/audits/OUTSTANDING_TASKS_09_24.md](OUTSTANDING_TASKS_09_24.md) (T79–T83).*

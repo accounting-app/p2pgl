@@ -90,7 +90,7 @@ const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 /// Refused connections get no admission cooldown: the refusal already reads
 /// nothing and spawns nothing, and what a reconnect loop costs is the kernel's
 /// accept-and-close, which a user-space cooldown cannot avoid (L-61 residual,
-/// see `docs/OUTSTANDING_TASKS_09_22_v2.md` T71).
+/// see `docs/audits/OUTSTANDING_TASKS_09_22_v2.md` T71).
 const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 64;
 
 /// Minimum gap between "per-IP cap reached" warnings, so a client hammering

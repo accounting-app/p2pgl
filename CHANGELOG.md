@@ -7,10 +7,10 @@ has been cut yet.
 ## [Unreleased] — security hardening (audits 0922, 0922-v2)
 
 This release fixes the findings in two audits:
-[SECURITY_AUDIT_0922.md](SECURITY_AUDIT_0922.md), tracked in
-[docs/OUTSTANDING_TASKS_09_22.md](docs/OUTSTANDING_TASKS_09_22.md) (T46–T60),
-and [SECURITY_AUDIT_0922-v2.md](SECURITY_AUDIT_0922-v2.md), tracked in
-[docs/OUTSTANDING_TASKS_09_22_v2.md](docs/OUTSTANDING_TASKS_09_22_v2.md)
+[SECURITY_AUDIT_0922.md](docs/audits/SECURITY_AUDIT_0922.md), tracked in
+[docs/audits/OUTSTANDING_TASKS_09_22.md](docs/audits/OUTSTANDING_TASKS_09_22.md) (T46–T60),
+and [SECURITY_AUDIT_0922-v2.md](docs/audits/SECURITY_AUDIT_0922-v2.md), tracked in
+[docs/audits/OUTSTANDING_TASKS_09_22_v2.md](docs/audits/OUTSTANDING_TASKS_09_22_v2.md)
 (T61–T71). Each entry names its finding ID and task. For the detail and any
 known residuals, see that task's "Done" note in the tracker.
 

@@ -129,7 +129,7 @@ Effort: S = <½ day, M = ~1–2 days.
 
 ## 0820 residual close-out (2026-09-01)
 
-The 2026-09-01 follow-up audit ([SECURITY_AUDIT_0901.md](../SECURITY_AUDIT_0901.md)) verified the
+The 2026-09-01 follow-up audit ([SECURITY_AUDIT_0901.md](SECURITY_AUDIT_0901.md)) verified the
 tasks above and flagged three residuals against the 0820 findings; all three are now closed:
 
 - ☑ **T2/M3 residual (0901-M-01)** — inbound `openledger-lamport` is now validated in

@@ -1411,8 +1411,8 @@ openledger-v2/
 ├── Cargo.toml                # Workspace root
 ├── Dockerfile                # Multi-stage Docker build
 ├── gl-node.config.json       # Minimal local config (edit or replace)
-├── SECURITY_AUDIT_0922.md    # Current security audit register
-├── docs/                     # Task trackers, Format v2 design
+├── docs/                     # Format v2 design
+│   └── audits/               # Security audit reports (latest: SECURITY_AUDIT_0927.md) and their task trackers
 ├── crates/
 │   ├── gl-node/              # HTTP server (Axum + GraphQL)
 │   │   ├── src/main.rs       # Entrypoint, boot, graceful shutdown

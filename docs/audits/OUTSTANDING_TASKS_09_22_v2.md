@@ -1,12 +1,12 @@
 # Outstanding Security Tasks — 2026-09-22 (v2)
 
-Remediation backlog for every open finding in [SECURITY_AUDIT_0922-v2.md](../SECURITY_AUDIT_0922-v2.md),
+Remediation backlog for every open finding in [SECURITY_AUDIT_0922-v2.md](SECURITY_AUDIT_0922-v2.md),
 the re-audit of T46–T60. Task numbering continues from [OUTSTANDING_TASKS_09_22.md](OUTSTANDING_TASKS_09_22.md)
 (T46–T60, all ☑). Line references are current as of HEAD `3d5ff71`.
 
 **Already closed — do not re-do:** the v2 re-audit verified **44** register entries closed by mechanism
 (H-08, H-09, H-10, H-11 · M-16, M-19…M-34 · L-01, L-02, L-29, L-33, L-34, L-36…L-42, L-44…L-54) and
-residuals R-11, R-12, R-21. See [SECURITY_AUDIT_0922-v2.md §1](../SECURITY_AUDIT_0922-v2.md). This tracker
+residuals R-11, R-12, R-21. See [SECURITY_AUDIT_0922-v2.md §1](SECURITY_AUDIT_0922-v2.md). This tracker
 covers only what is open: seven new Highs, eleven new Mediums, twelve new Lows, and the carried partials
 (H-07→H-12, H-01, M-06→M-40, L-23, L-35, L-43→M-39).
 
@@ -78,33 +78,33 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
   the baseline *before* it parses, so the next commit's adopt-before-persist sees "nothing changed" and
   rewrites the file over the operator's edit, valid lines included, after two log lines said it was safe.
 - **The defects, precisely:**
-  1. **H-13** — [service.rs:1937-1946](../crates/ledger/src/service.rs#L1937-L1946) boot inserts every parsed
-     directive with whatever metadata it has; [:2289](../crates/ledger/src/service.rs#L2289) records the
-     file's hash as the baseline; [:3526-3534](../crates/ledger/src/service.rs#L3526-L3534)
+  1. **H-13** — [service.rs:1937-1946](../../crates/ledger/src/service.rs#L1937-L1946) boot inserts every parsed
+     directive with whatever metadata it has; [:2289](../../crates/ledger/src/service.rs#L2289) records the
+     file's hash as the baseline; [:3526-3534](../../crates/ledger/src/service.rs#L3526-L3534)
      `adopt_external_edits` returns on an equal hash, so the startup compaction adopts nothing;
-     [main.rs:251](../crates/gl-node/src/main.rs#L251) compacts before [:392](../crates/gl-node/src/main.rs#L392)
+     [main.rs:251](../../crates/gl-node/src/main.rs#L251) compacts before [:392](../../crates/gl-node/src/main.rs#L392)
      installs the signer. Proof: `scratchpad/orch/offline-edit` (metadata `{}`, zero envelope lines on disk,
      next local txn parents = the hand txn).
-  2. **H-14** — [service.rs:3760-3763](../crates/ledger/src/service.rs#L3760-L3763) writes `last_file_hash`,
-     `canonical_bytes`, `canonical_marker` before the parse; [:3785](../crates/ledger/src/service.rs#L3785)
-     clears `canonical_is_current`; [:3826-3832](../crates/ledger/src/service.rs#L3826-L3832) returns
-     `Err(Parse)` restoring nothing; [:3695-3712](../crates/ledger/src/service.rs#L3695-L3712) and the
-     watcher [main.rs:474-477](../crates/gl-node/src/main.rs#L474-L477) restore nothing either. Proof: B2 `e1`.
+  2. **H-14** — [service.rs:3760-3763](../../crates/ledger/src/service.rs#L3760-L3763) writes `last_file_hash`,
+     `canonical_bytes`, `canonical_marker` before the parse; [:3785](../../crates/ledger/src/service.rs#L3785)
+     clears `canonical_is_current`; [:3826-3832](../../crates/ledger/src/service.rs#L3826-L3832) returns
+     `Err(Parse)` restoring nothing; [:3695-3712](../../crates/ledger/src/service.rs#L3695-L3712) and the
+     watcher [main.rs:474-477](../../crates/gl-node/src/main.rs#L474-L477) restore nothing either. Proof: B2 `e1`.
   3. **M-37(a)** — API-first ordering: `adopt_external_edits` parse failure → `prepare` `Err` →
-     `prepare_or_recover` ([ledger_commit.rs:353-370](../crates/gl-node/src/ledger_commit.rs#L353-L370)) →
-     `recover_failed_commit` ([service.rs:3279](../crates/ledger/src/service.rs#L3279)) → `boot`, which since
+     `prepare_or_recover` ([ledger_commit.rs:353-370](../../crates/gl-node/src/ledger_commit.rs#L353-L370)) →
+     `recover_failed_commit` ([service.rs:3279](../../crates/ledger/src/service.rs#L3279)) → `boot`, which since
      L-45 succeeds on the unparsable file and loads every parseable hand-typed block raw, bypassing I3,
-     H-06, L-26, L-02, the stamp and L-11. **M-37(b)** — `reconcile_file` ([:3668](../crates/ledger/src/service.rs#L3668)),
-     `reconcile_file_staged` ([:3709](../crates/ledger/src/service.rs#L3709)) and the watcher
-     ([main.rs:465](../crates/gl-node/src/main.rs#L465)) re-persist only when `new_directives > 0`, so a
+     H-06, L-26, L-02, the stamp and L-11. **M-37(b)** — `reconcile_file` ([:3668](../../crates/ledger/src/service.rs#L3668)),
+     `reconcile_file_staged` ([:3709](../../crates/ledger/src/service.rs#L3709)) and the watcher
+     ([main.rs:465](../../crates/gl-node/src/main.rs#L465)) re-persist only when `new_directives > 0`, so a
      *rejected-only* edit stays on disk and loads at the next boot (boot applies no I3). Proofs: `e1b`, `e12`, `e13`.
   4. **M-38** — reconcile has no Kahn pre-scan; the DAG's I8 passes the first member of a planted cycle;
-     `release_quarantined_now_in_dag` ([:4132](../crates/ledger/src/service.rs#L4132)) frees it; it becomes a
+     `release_quarantined_now_in_dag` ([:4132](../../crates/ledger/src/service.rs#L4132)) frees it; it becomes a
      head; the node's own later transactions descend from it and are quarantined at the next boot. Proof: `e3`.
-  5. **L-55** — [service.rs:3991](../crates/ledger/src/service.rs#L3991) assigns the reconcile lamport before
+  5. **L-55** — [service.rs:3991](../../crates/ledger/src/service.rs#L3991) assigns the reconcile lamport before
      `enforce_resource_limits` / `validate_transaction` / `dag.insert`; a rejected entry moves the clock.
-  6. **L-62** — `salvage_unparsable_blocks` ([:384](../crates/ledger/src/service.rs#L384)) parses each block
-     with `parse_file`, which strips a per-block BOM ([parse.rs:546](../crates/ledger/src/parse.rs#L546)); a
+  6. **L-62** — `salvage_unparsable_blocks` ([:384](../../crates/ledger/src/service.rs#L384)) parses each block
+     with `parse_file`, which strips a per-block BOM ([parse.rs:546](../../crates/ledger/src/parse.rs#L546)); a
      mid-file `U+FEFF` makes every block parse after the whole file failed → the fail-closed arm → `exit(1)`.
 - **Decision (taken): envelope-less file directives are operator input, adopted and signed at boot.**
 - **Change:** (a) `reconcile_content` parses first and commits `last_file_hash`/`canonical_bytes`/
@@ -117,13 +117,13 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
   and before the P2P tasks are spawned; (e) a reconcile with `rejected > 0` forces the compaction its
   warning promises; (f) `reconcile_content` runs `directives_blocked_by_parent_cycles` over
   `file_directives ∪ quarantine` and keeps blocked ids quarantined; (g) the reconcile lamport is assigned only
-  in the `Inserted` arm (mirror [:4753-4757](../crates/ledger/src/service.rs#L4753-L4757)); (h) salvage parses
+  in the `Inserted` arm (mirror [:4753-4757](../../crates/ledger/src/service.rs#L4753-L4757)); (h) salvage parses
   blocks without BOM stripping, or refuses a block that begins with `U+FEFF`; (i) README §Editing states the
   now-true behaviour.
-- **Files:** [service.rs](../crates/ledger/src/service.rs) (`boot`, `reconcile_content`,
+- **Files:** [service.rs](../../crates/ledger/src/service.rs) (`boot`, `reconcile_content`,
   `reconcile_file_staged`, `reconcile_file`, `salvage_unparsable_blocks`, the three lamport sites),
-  [ledger_commit.rs:353-370](../crates/gl-node/src/ledger_commit.rs#L353-L370), [main.rs:190-260,
-  320-400](../crates/gl-node/src/main.rs#L190), [README.md:643-700](../README.md#L643-L700).
+  [ledger_commit.rs:353-370](../../crates/gl-node/src/ledger_commit.rs#L353-L370), [main.rs:190-260,
+  320-400](../../crates/gl-node/src/main.rs#L190), [README.md:643-700](../../README.md#L643-L700).
 - **Verify:** the H-13 probe asserts the hand-typed record carries this node's author, lamport, parents and
   signature after boot + startup compaction, and that a second service's `stage_remote_directive` accepts it;
   the H-14 `e1` shape asserts the next write returns `PARSE_ERROR` and both hand-written lines survive, on
@@ -135,17 +135,17 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
 ### ☑ T62 — Recovery must never install an emptier ledger (H-15, M-35, L-64) — S
 > **Done 2026-09-23 (committed `f7f7e0c`).** Private `BootMode { Fresh, Reload }`: a reload never creates the `.bean`; a fresh boot refuses an absent `.bean` beside a journal (the `.lock` is not used as a signal — `main.rs` creates it before boot). `NotFound` in `adopt_external_edits`/`reconcile_file_staged` = nothing to adopt, forces a compaction that recreates the file from memory; the watcher reacts to `Deleted`. `finish_recovery` refuses a rebuild holding fewer than `dag.len() − pending_ids.len()` directives, keeps memory, sets `force_compaction`, and logs before/after counts on every install. Boot's journal budget is `MAX_LEDGER_FILE_BYTES`; the `TooLarge` message names a possibly folded leftover. `adopt_reloaded` keeps `canonical_is_current` when the rebuild read the bytes this service last wrote. Orchestrator re-ran `rm-bean` (3 → 4 → 5 directives, nothing lost) and `brick` (boots, 60,001 directives). **Behaviour change:** a missing `.bean` with a journal beside it refuses to boot. **Residual (L-64 half):** boot does not yet warn when `compaction_text().len() > MAX` for a dense hand-written file; the reload-induced wedge is gone.
 - **Why:** H-15 is the cheapest total loss in the series. `mv ledger.bean ledger.bak` under a running node:
-  the next `prepare` sees `FileMarker::of == None` ([service.rs:3190-3205](../crates/ledger/src/service.rs#L3190-L3205)),
+  the next `prepare` sees `FileMarker::of == None` ([service.rs:3190-3205](../../crates/ledger/src/service.rs#L3190-L3205)),
   escalates to a compaction, `adopt_external_edits` fails `NotFound`, the L-13 reload runs `boot`, and `boot`
-  **creates an empty file** ([:1937-1946](../crates/ledger/src/service.rs#L1937-L1946)) and `adopt_reloaded`
+  **creates an empty file** ([:1937-1946](../../crates/ledger/src/service.rs#L1937-L1946)) and `adopt_reloaded`
   installs it over the complete in-memory DAG. Nothing is logged on the successful-reload path. Proof: B8 `rm-bean`
   (`before 3 → after 0 → next write Ok, 1 directive`).
-- **M-35:** boot budgets the journal at `MAX − canonical_bytes` ([:1954-1955](../crates/ledger/src/service.rs#L1954-L1955))
-  and `read_journal` fails `TooLarge` before parsing ([journal.rs:177-179](../crates/ledger/src/journal.rs#L177-L179)).
-  After a crash between the compaction's rename and `remove_journal` ([:1516-1517](../crates/ledger/src/service.rs#L1516-L1517))
+- **M-35:** boot budgets the journal at `MAX − canonical_bytes` ([:1954-1955](../../crates/ledger/src/service.rs#L1954-L1955))
+  and `read_journal` fails `TooLarge` before parsing ([journal.rs:177-179](../../crates/ledger/src/journal.rs#L177-L179)).
+  After a crash between the compaction's rename and `remove_journal` ([:1516-1517](../../crates/ledger/src/service.rs#L1516-L1517))
   the state is `canonical + 2·journal`, over the cap whenever `journal > (64 MiB − canonical)/2` — a boot brick
   on a fully redundant journal. Proof: B1 `brick`.
-- **L-64 / R-2:** boot sets `canonical_is_current = false` ([:2300](../crates/ledger/src/service.rs#L2300)),
+- **L-64 / R-2:** boot sets `canonical_is_current = false` ([:2300](../../crates/ledger/src/service.rs#L2300)),
   so after *any* reload every write is a forced compaction; a file whose canonical spelling exceeds the cap
   then wedges every write, reloading on each attempt.
 - **Change:** `adopt_external_edits` and `reconcile_file_staged` treat `NotFound` as nothing-to-adopt and let
@@ -153,12 +153,12 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
   `.bean` is absent but a journal or `.lock` sidecar exists; every L-13 reload logs before/after directive
   counts and `finish_recovery` refuses to install a rebuild holding fewer directives than memory unless the
   caller asked for exactly that; boot's journal budget becomes `MAX_LEDGER_FILE_BYTES` (the journal is already
-  bounded at append time by the projection at [:2989-2999](../crates/ledger/src/service.rs#L2989-L2999) and the
+  bounded at append time by the projection at [:2989-2999](../../crates/ledger/src/service.rs#L2989-L2999) and the
   compacted file by `persist_atomically`); the `TooLarge` message says a journal older than the `.bean` may be
   a folded leftover; a reload does not by itself force a compaction (carry `canonical_is_current` when the
   reload read the bytes this service last wrote).
-- **Files:** [service.rs](../crates/ledger/src/service.rs) (`boot`, `adopt_external_edits`,
-  `reconcile_file_staged`, `finish_recovery`, `adopt_reloaded`), [journal.rs:168-184](../crates/ledger/src/journal.rs#L168-L184).
+- **Files:** [service.rs](../../crates/ledger/src/service.rs) (`boot`, `adopt_external_edits`,
+  `reconcile_file_staged`, `finish_recovery`, `adopt_reloaded`), [journal.rs:168-184](../../crates/ledger/src/journal.rs#L168-L184).
 - **Verify:** boot three directives, `remove_file(.bean)`, `open_account` → `Ok`, `directive_count() == 4`,
   file holds four; the `brick` fixture (`C + J > MAX`, `J ⊂ C`) boots with `directive_count == boot(C alone)`;
   a dense 63 MiB hand-written file boots and compacts; after one `recover_failed_commit()` on a healthy
@@ -166,14 +166,14 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
 
 ### ☑ T63 — The ceiling as one rule, plus the adoption ratchet (H-12) — S
 > **Done 2026-09-23 (committed `f7f7e0c`).** `lamport_value_is_legal(v) := v + 1 < CEILING` is the one rule, called by both stamp sites (`next_stamp`, largest stamp `CEILING-2`), the wire (`union_merge.rs`) and both adoption paths. `MAX_LAMPORT_ADVANCE = 2^32`; `check_lamport_advance` refuses `remote − local >= 2^32` on the remote and file paths with a new `LamportAdvance` error, classified **not permanent** (retried, not cached). Boot clock counts inserted directives plus quarantined ones authored by this node. Boot warns exactly when authoring will be refused (the stamp predicate on `clock + 1`, so it fires at `CEILING-2` too — a deliberate deviation from the tracker's `clock + 1 >= CEILING`) and again within 2^32 of the ceiling. `LamportCeiling` names the author and the mesh-wide remedy. **Fresh-join decision:** no first-contact exemption — an exemption would hand an allowlisted peer the one-step jump on every new node. Honest histories fit (`test_fresh_node_converges_with_a_history_reaching_1e9`), and larger totals converge over retried rounds because parents carry smaller lamports (`test_ratchet_refusal_is_retried_and_a_stepped_history_converges`, 3e9 → 12e9 in 4 rounds). Orchestrator re-ran the variant proof: the directive A authors at `CEILING-2` is adopted by B. **Behaviour change:** `2^53−1` is now refused everywhere; `LAMPORT_ADVANCE` is a new error. **Residuals:** a mesh already holding a single >2^32 jump cannot be joined until that directive is removed; the ratchet slows exhaustion to ~2^21 attributable directives rather than preventing it — the allowlist remains the control.
-- **Why:** H-07 is only partially closed. `checked_lamport` ([service.rs:929-934](../crates/ledger/src/service.rs#L929-L934))
-  is applied to `clock + 1` at the stamp sites ([:2737, :2759](../crates/ledger/src/service.rs#L2737)), to
-  `value` on the wire ([union_merge.rs:289-292](../crates/p2p/src/union_merge.rs#L289-L292)) and to
-  `max(local, remote) + 1` at adoption ([:4678-4681](../crates/ledger/src/service.rs#L4678-L4681)), so
+- **Why:** H-07 is only partially closed. `checked_lamport` ([service.rs:929-934](../../crates/ledger/src/service.rs#L929-L934))
+  is applied to `clock + 1` at the stamp sites ([:2737, :2759](../../crates/ledger/src/service.rs#L2737)), to
+  `value` on the wire ([union_merge.rs:289-292](../../crates/p2p/src/union_merge.rs#L289-L292)) and to
+  `max(local, remote) + 1` at adoption ([:4678-4681](../../crates/ledger/src/service.rs#L4678-L4681)), so
   `CEILING-1` is stamped and accepted on the wire but refused at adoption. One peer directive at `CEILING-3`
   makes every adopter author one silently unreplicable record and then brick on restart; the boot warning
-  ([:2231](../crates/ledger/src/service.rs#L2231), `>= CEILING`) never fires for the reachable `CEILING-1`;
-  `max_lamport` is scanned before every quarantine skip ([:2088](../crates/ledger/src/service.rs#L2088)), so
+  ([:2231](../../crates/ledger/src/service.rs#L2231), `>= CEILING`) never fires for the reachable `CEILING-1`;
+  `max_lamport` is scanned before every quarantine skip ([:2088](../../crates/ledger/src/service.rs#L2088)), so
   the quarantine writes the poison back forever; and removing the line is undone by the next anti-entropy
   tick. The repository's own tests pin both halves of the contradiction (`union_merge.rs:2160-2165` vs
   `service.rs:7337`). Proofs: A1 `h07proof`, A5 `r1_*`, `r1_bootwarn`.
@@ -187,8 +187,8 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
   boot warns when the file's clock is within 2^32 of the ceiling; `max_lamport` counts inserted directives
   only unless `openledger-author` is this node; `LamportCeiling` names the author id and states the
   mesh-wide remedy (allowlist removal plus coordinated removal on every node).
-- **Files:** [service.rs:916-934, 2088, 2223-2238, 2737, 2759, 3938-3991, 4678-4757](../crates/ledger/src/service.rs#L916),
-  [union_merge.rs:286-296](../crates/p2p/src/union_merge.rs#L286-L296), [anti_entropy_alpn.rs:1409-1437](../crates/gl-node/src/anti_entropy_alpn.rs#L1409-L1437)
+- **Files:** [service.rs:916-934, 2088, 2223-2238, 2737, 2759, 3938-3991, 4678-4757](../../crates/ledger/src/service.rs#L916),
+  [union_merge.rs:286-296](../../crates/p2p/src/union_merge.rs#L286-L296), [anti_entropy_alpn.rs:1409-1437](../../crates/gl-node/src/anti_entropy_alpn.rs#L1409-L1437)
   (classification of the new variant).
 - **Verify:** the `h07proof` shape ends in peer acceptance of the last authored directive; the restart half of
   `test_authoring_refuses_at_the_lamport_ceiling` asserts the warning fires at `CEILING-1`; a remote directive
@@ -199,10 +199,10 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
 ### ☑ T64 — Bounded parent choice (H-16) — S
 > **Done 2026-09-23 (committed `f7f7e0c`).** `choose_parents` keeps the 256 smallest admissible heads, used by the local stamp and file adoption; `validate_parent_fan_in` runs before the local insert; `MAX_UNMERGED_HEADS_PER_AUTHOR = 256` enforced on the remote path via `dag.heads_authored_by` with a new `UnmergedHeadLimit` error, not permanent. Honest shapes pinned: a first parentless transaction on an empty ledger and any transaction naming a current head are admitted. Orchestrator re-ran the variant proof: 257th single-author head refused; victim names 256 parents, peer accepts, reboot quarantines 0, balance 252. **Residual:** smallest-id parent choice lets an attacker who grinds small ids hold honest heads unmerged by this node; costs frontier size only, capped per author.
 - **Why:** `stamp_transaction_envelope` names **every** admissible head with no cap
-  ([service.rs:2746-2748](../crates/ledger/src/service.rs#L2746-L2748)) and the local insert
-  ([:2479](../crates/ledger/src/service.rs#L2479)) runs no `validate_parent_fan_in`; the remote path accepts
-  parentless transactions on a non-empty ledger ([union_merge.rs:226](../crates/p2p/src/union_merge.rs#L226),
-  [service.rs:4636-4646](../crates/ledger/src/service.rs#L4636-L4646) form only). 257 valid parentless
+  ([service.rs:2746-2748](../../crates/ledger/src/service.rs#L2746-L2748)) and the local insert
+  ([:2479](../../crates/ledger/src/service.rs#L2479)) runs no `validate_parent_fan_in`; the remote path accepts
+  parentless transactions on a non-empty ledger ([union_merge.rs:226](../../crates/p2p/src/union_merge.rs#L226),
+  [service.rs:4636-4646](../../crates/ledger/src/service.rs#L4636-L4646) form only). 257 valid parentless
   transactions (~64 KB) from one peer make the victim's next append name 257 parents: refused by every peer,
   and quarantined out of the victim's own DAG at its next boot — its own posting vanishes from its own
   balances — while the planted heads re-inflate so it repeats. Proof: B6 `heads_inflation_makes_local_append_over_cap`.
@@ -212,9 +212,9 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
   and let the rest merge on later appends; run `validate_parent_fan_in` before the local insert as an
   invariant; on the remote path refuse a transaction that names no current head while its author already
   owns ≥ 256 heads (state-dependent → not cached by the refusal cache; classify accordingly).
-- **Files:** [service.rs:2732-2757, 2474-2482, 4588-4770](../crates/ledger/src/service.rs#L2732),
-  [dag.rs:411-441](../crates/ledger/src/dag.rs#L411-L441) (a `heads_by_author` view if needed),
-  [anti_entropy_alpn.rs:1409-1437](../crates/gl-node/src/anti_entropy_alpn.rs#L1409-L1437).
+- **Files:** [service.rs:2732-2757, 2474-2482, 4588-4770](../../crates/ledger/src/service.rs#L2732),
+  [dag.rs:411-441](../../crates/ledger/src/dag.rs#L411-L441) (a `heads_by_author` view if needed),
+  [anti_entropy_alpn.rs:1409-1437](../../crates/gl-node/src/anti_entropy_alpn.rs#L1409-L1437).
 - **Verify:** stage `MAX_PARENTS + 1` parentless remote transactions, append locally, assert the stored
   directive passes `validate_parent_fan_in`, a second service accepts it, and reboot quarantines nothing;
   the 257th parentless transaction from one author is refused while a 256th is admitted; a transaction from
@@ -223,9 +223,9 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
 ### ☑ T65 — Exact, order-independent balances (H-17) — M
 > **Done 2026-09-23 (committed `f7f7e0c`).** Cap `MAX_AMOUNT_SIGNIFICANT_DIGITS = 21` (`validate.rs`): 2^26 postings × (10^21 − 1) < 2^96, so no same-scale sum can round, with 8× headroom over the M-35 worst case. Enforced in the parser (`from_str_exact` plus the cap — fractions over 28 digits are refused, no longer silently rounded), the GraphQL scalar, `validate_transaction` (inputs and the resolved elided leg), `enforce_resource_limits` for non-transaction directives, and the boot quarantine chain. **Design deviation from the tracker, accepted:** no scale cap. A scale ≤ 8 cap would make ordinary unit × rate legs (scale ≥ 10) unrecordable and quarantine existing history. Instead `ExactSum` keeps one exact partial per `(account, currency, scale)`, combined in ascending-scale order at read time, so the result is independent of arrival order by construction and no canonical re-fold is needed (which would have made gossip catch-up quadratic). No `saturating_*` remains on the validated path; an impossible overflow falls back without panicking and is counted by `over_cap_posting_count()`. Permanent 256-case proptest compares arrival order vs `build` vs reverse vs batched vs a shuffled replica, as printed text. Orchestrator re-ran the ±MAX peer proof: both refused, balance 7 on every view and after reboot. **Behaviour change:** amounts over 21 significant digits are refused; a mixed-scale balance may print with different trailing zeros than before. **Residuals:** exact i128 accumulation stays a design item; I1 products can round inside `rust_decimal` past scale 28 (deterministic); `verify` does not yet report `over_cap_posting_count() > 0`.
 - **Why:** `saturating_add` is not associative and neither is `Decimal` addition across a >28-digit scale
-  gap; live reports fold in arrival order ([read_model.rs:182, 617](../crates/ledger/src/read_model.rs#L182)),
-  `verify` and boot fold in date order ([:539](../crates/ledger/src/read_model.rs#L539)); no magnitude cap
-  exists at [parse.rs:195](../crates/ledger/src/parse.rs#L195), [scalars.rs:57](../crates/gl-node/src/graphql/scalars.rs#L57)
+  gap; live reports fold in arrival order ([read_model.rs:182, 617](../../crates/ledger/src/read_model.rs#L182)),
+  `verify` and boot fold in date order ([:539](../../crates/ledger/src/read_model.rs#L539)); no magnitude cap
+  exists at [parse.rs:195](../../crates/ledger/src/parse.rs#L195), [scalars.rs:57](../../crates/gl-node/src/graphql/scalars.rs#L57)
   or `enforce_resource_limits`. Two ~120-byte directives from a peer (`+MAX` later-dated, `−MAX`
   earlier-dated) zero any open account's live balance on a chosen replica while `verify` reports every
   assertion passing; a reboot changes the number; replicas holding the same set disagree. Proof: B6
@@ -237,10 +237,10 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
   in `Decimal`, so replace `saturating_add` with `checked_add` that cannot fail; fold the no-`at` path in
   canonical `(date, type priority, content id)` order so live reports and `verify` agree by construction;
   the cap is a single constant referenced by `validate.rs`, the GraphQL scalar and the wire validator.
-- **Files:** [read_model.rs](../crates/ledger/src/read_model.rs), [validate.rs](../crates/ledger/src/validate.rs),
-  [weights.rs](../crates/ledger/src/weights.rs), [parse.rs:158-197](../crates/ledger/src/parse.rs#L158-L197),
-  [scalars.rs](../crates/gl-node/src/graphql/scalars.rs), [union_merge.rs](../crates/p2p/src/union_merge.rs),
-  [service.rs](../crates/ledger/src/service.rs) (boot quarantine arm, `enforce_resource_limits`).
+- **Files:** [read_model.rs](../../crates/ledger/src/read_model.rs), [validate.rs](../../crates/ledger/src/validate.rs),
+  [weights.rs](../../crates/ledger/src/weights.rs), [parse.rs:158-197](../../crates/ledger/src/parse.rs#L158-L197),
+  [scalars.rs](../../crates/gl-node/src/graphql/scalars.rs), [union_merge.rs](../../crates/p2p/src/union_merge.rs),
+  [service.rs](../../crates/ledger/src/service.rs) (boot quarantine arm, `enforce_resource_limits`).
 - **Verify:** the B6 proptest as written (random arrival order vs `build` vs batched, with `±MAX` and mixed
   scales, checked at every prefix) passes; an over-cap amount is refused on all three ingress paths and
   quarantined at boot; `account()` equals the batched sweep at all times; CT-9 still byte-identical.
@@ -248,19 +248,19 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
 
 ### ☑ T66 — Bounded errors and unsolicited input on the wire (H-18, M-41, L-60) — S/M
 > **Done 2026-09-23 (committed `f7f7e0c`).** `parse_file_bounded` + `count_directive_headers`; `validate_supply_entry` now refuses cheaply first (content-id form, body length, envelope, one directive block) and parses with three errors kept, each ≤ 256 chars. Re-measured: the `"x\n"` × 512k shape went from 194.9 MB / 55 MB of log to **136 B / 87 B**. Bounded echoes everywhere on the intake/drain path (`log_error`), `frame=variant_name()`, keyword excerpt 60 chars, long envelope keys by length. HTTP: one process-wide throttle for guard refusals (one line per 10 s with `suppressed=N`, values cut at 128 chars) and `max_buf_size` 64 KiB. L-60: `fetch_want_chunk` keeps only Wanted ids; pushed Supply frames record no refusals (`SupplyOrigin`). **Behaviour changes:** a Supply entry with a malformed id is refused before parsing; HTTP heads over ~64–112 KiB get 431; new error texts and log fields. **Residuals:** a single 1 MiB bad line still peaks at 6× in the per-character scanner; pushed Supply frames are still fully validated (bounded); the unsolicited-entry warning is per round, not rate-limited.
-- **Why:** `validate_supply_entry` ([union_merge.rs:152-154](../crates/p2p/src/union_merge.rs#L152-L154))
-  runs `parse_file`, which pushes one `ParseError` per block with no cap ([parse.rs:592-599](../crates/ledger/src/parse.rs#L592-L599)),
+- **Why:** `validate_supply_entry` ([union_merge.rs:152-154](../../crates/p2p/src/union_merge.rs#L152-L154))
+  runs `parse_file`, which pushes one `ParseError` per block with no cap ([parse.rs:592-599](../../crates/ledger/src/parse.rs#L592-L599)),
   then Debug-renders and joins them all; a 1 MiB body of `"x\n"` × 524,288 costs **194,924,029 B (185.9×)**
-  and a **55 MB** `warn!` line at [anti_entropy_alpn.rs:1156](../crates/gl-node/src/anti_entropy_alpn.rs#L1156);
+  and a **55 MB** `warn!` line at [anti_entropy_alpn.rs:1156](../../crates/gl-node/src/anti_entropy_alpn.rs#L1156);
   32 such frames per peer ≈ 6 GB transient. **M-41:** the request guard's `warn!(%host)`/`(%origin)`/
-  content-type lines ([request_guard.rs:84, 105-108, 130](../crates/gl-node/src/request_guard.rs#L84)) sit
+  content-type lines ([request_guard.rs:84, 105-108, 130](../../crates/gl-node/src/request_guard.rs#L84)) sit
   outside the rate limiter and echo up to hyper's 417,792-byte head buffer (`serve_hardened` sets no
   `max_buf_size`) — measured 100–190 MB/s of log from one client; on the ALPN side `ContentHashMismatch{claimed}`
-  ([union_merge.rs:173-176](../crates/p2p/src/union_merge.rs#L173-L176)), the envelope-key echo (:305-307),
-  the keyword echo ([parse.rs:723, 758](../crates/ledger/src/parse.rs#L723)) and `warn!(?other)` at
-  [anti_entropy_alpn.rs:996](../crates/gl-node/src/anti_entropy_alpn.rs#L996) are unbounded. **L-60:** every
+  ([union_merge.rs:173-176](../../crates/p2p/src/union_merge.rs#L173-L176)), the envelope-key echo (:305-307),
+  the keyword echo ([parse.rs:723, 758](../../crates/ledger/src/parse.rs#L723)) and `warn!(?other)` at
+  [anti_entropy_alpn.rs:996](../../crates/gl-node/src/anti_entropy_alpn.rs#L996) are unbounded. **L-60:** every
   Supply entry is recorded as an intake refusal whether or not it was Wanted
-  ([:1140-1158](../crates/gl-node/src/anti_entropy_alpn.rs#L1140-L1158)), so a peer fills its own 4,096
+  ([:1140-1158](../../crates/gl-node/src/anti_entropy_alpn.rs#L1140-L1158)), so a peer fills its own 4,096
   quota and four peers FIFO-evict everyone's. Proofs: B5 `merge`, B4 live probes, B3 `[5]`.
 - **Change:** a `max_errors` variant of `parse_file` for the remote path (first three plus a count, each
   rendered through a 256-char `BoundedSink`-style truncation, never `collect`ing the full vector); run the
@@ -272,12 +272,12 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
   way `PerIpConnections::should_log_refusal` does, truncate echoed header values, set `http1().max_buf_size()`;
   filter Supply entries to the outstanding `remaining` set in `fetch_want_chunk` and in the serve loop's
   pushed-Supply arm before `apply_supply_entries` (drop + count unsolicited).
-- **Files:** [union_merge.rs:143-176, 303-320](../crates/p2p/src/union_merge.rs#L143),
-  [parse.rs:545-603, 723, 758](../crates/ledger/src/parse.rs#L545) (**not** `:195` — T65 owns that),
-  [protocol.rs:569-640](../crates/p2p/src/protocol.rs#L569) (`BoundedSink`),
-  [anti_entropy_alpn.rs:511, 996-1017, 1086-1341](../crates/gl-node/src/anti_entropy_alpn.rs#L996),
-  [request_guard.rs:58-139](../crates/gl-node/src/request_guard.rs#L58-L139),
-  [http_server.rs:229-395](../crates/gl-node/src/http_server.rs#L229-L395).
+- **Files:** [union_merge.rs:143-176, 303-320](../../crates/p2p/src/union_merge.rs#L143),
+  [parse.rs:545-603, 723, 758](../../crates/ledger/src/parse.rs#L545) (**not** `:195` — T65 owns that),
+  [protocol.rs:569-640](../../crates/p2p/src/protocol.rs#L569) (`BoundedSink`),
+  [anti_entropy_alpn.rs:511, 996-1017, 1086-1341](../../crates/gl-node/src/anti_entropy_alpn.rs#L996),
+  [request_guard.rs:58-139](../../crates/gl-node/src/request_guard.rs#L58-L139),
+  [http_server.rs:229-395](../../crates/gl-node/src/http_server.rs#L229-L395).
 - **Verify:** the `"x\n"` × 512k entry under `decode_memory.rs`'s counting allocator peaks ≤ 4× the body and
   `error.to_string().len() < 1024`; every echo shape (2 MiB id, 15 MiB envelope key, 1 MiB keyword, a
   HaveHeads page) renders `< 512` chars; N foreign-Host refusals emit ≤ K log lines and never echo more than
@@ -289,20 +289,20 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
 
 ### ☑ T67 — File-type discipline for every ledger-side open (M-36, L-57, L-58, L-59, R-17) — S/M
 > **Done 2026-09-23 (committed `c7698cf`).** One helper, `journal::open_checked` with a `FileTrust` level, for the `.bean` read, journal read and append, watcher read, `.lock` and key file: `lstat` (plain `stat` for the `.bean`) → regular file → open `O_NONBLOCK`, plus `O_NOFOLLOW` except for the `.bean` → `fstat` `is_file` and `(dev, ino)`; node-owned files additionally require `uid == geteuid()`, `nlink == 1`, and mode `& 0o077 == 0` (journal read only refuses group/world-*writable*; a readable-by-others journal loads with a warning and is compacted away). Reads go through `read_to_end_capped` (`take(cap + 1)`). `persist_atomically` uses `<name>.tmp.<pid>.<nonce>` and never unlinks what it finds at the temp name; `sweep_stale_temporaries` at process start removes this uid's stale temp files and symlinks and logs anything else. `ledger_lock` and the key reader use the helper; key files over 4 KiB are refused. **R-17 closed as "no hand-written extern declaration":** `libc` 0.2.189 is a direct dependency of `ledger` only (no new crate fetched); the single production `unsafe` is a documented `libc::geteuid()` call at `journal.rs:870`, which gl-node reaches through the ledger crate. **Symlinked `.bean` policy:** followed, target must be a regular file; a dangling link is refused (before, boot created an empty ledger over it); the first compaction replaces the link with a regular file. Orchestrator re-ran the B1 and B8 FIFO probes: every FIFO case refused in < 200 µs. **Behaviour changes:** FIFO/socket/device/directory/dangling link at `.bean` or journal refuses boot; journal, lock and key must be regular, unlinked, node-owned, single-link, and lock/key 0600; temp file naming changed. **Residuals:** a hard-linked or foreign-owned journal wedges writes (fail-closed, message names the remedy); the `.bean` has no owner/mode/link check by policy; `O_NONBLOCK` stays set on journal/lock descriptors (ignored for regular files on Linux, macOS, BSD).
-- **Why:** `append_record` ([journal.rs:291-306](../crates/ledger/src/journal.rs#L291-L306)) refuses only a
+- **Why:** `append_record` ([journal.rs:291-306](../../crates/ledger/src/journal.rs#L291-L306)) refuses only a
   symlink, then `open(O_WRONLY|O_APPEND|O_CREAT)` — on a FIFO this blocks before the post-open `is_file()`
   runs, **on the blocking thread that owns the `WritePermit`**: every writer waits on the gate forever,
   reads and `/health` stay green, SIGTERM's compaction waits forever, the restart parks in `read_journal`
-  ([:168-184](../crates/ledger/src/journal.rs#L168-L184)) with no exit code. `read_ledger_file`
-  ([service.rs:218-226](../crates/ledger/src/service.rs#L218-L226)) and `FileState::from_path`
-  ([file_watcher.rs:108](../crates/ledger/src/file_watcher.rs#L108)) have the same stat-then-read shape: a
+  ([:168-184](../../crates/ledger/src/journal.rs#L168-L184)) with no exit code. `read_ledger_file`
+  ([service.rs:218-226](../../crates/ledger/src/service.rs#L218-L226)) and `FileState::from_path`
+  ([file_watcher.rs:108](../../crates/ledger/src/file_watcher.rs#L108)) have the same stat-then-read shape: a
   FIFO passes the cap at `len == 0` and then streams past it (73 MB loaded through a 64 MiB cap), a symlink is
   read through. Confirmed by four passes, twice with the real binary. **L-57:** a directory at the predictable
-  `.tmp` ([service.rs:160-167](../crates/ledger/src/service.rs#L160-L167)) makes `remove_file` fail →
+  `.tmp` ([service.rs:160-167](../../crates/ledger/src/service.rs#L160-L167)) makes `remove_file` fail →
   every full rewrite fails. **L-58:** the journal's owner, mode and link count are never checked; a
   pre-planted 0644 or hard-linked journal receives every commit. **L-59:** `ledger_lock::acquire`
-  ([ledger_lock.rs:89-101](../crates/gl-node/src/ledger_lock.rs#L89-L101)) follows a symlink. The key reader
-  ([p2p_service.rs:898-926](../crates/gl-node/src/p2p_service.rs#L898-L926)) has a narrow lstat→open race.
+  ([ledger_lock.rs:89-101](../../crates/gl-node/src/ledger_lock.rs#L89-L101)) follows a symlink. The key reader
+  ([p2p_service.rs:898-926](../../crates/gl-node/src/p2p_service.rs#L898-L926)) has a narrow lstat→open race.
 - **Decision (taken): `libc` becomes a direct dependency** (already compiled into `gl-node` transitively;
   zero new code). Keep "no hand-written FFI in production" as the invariant and replace the `geteuid` block.
 - **Change:** one helper for every ledger-side open: `symlink_metadata` → require a regular file →
@@ -313,9 +313,9 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
   (`.tmp.<pid>.<nonce>`) with a boot-time sweep under the lock; `ledger_lock` refuses symlinks and checks
   the handle. The `.bean` may deliberately be a symlink in some deployments — refuse non-regular *after*
   following if so, but never block.
-- **Files:** [journal.rs](../crates/ledger/src/journal.rs), [service.rs:118-240](../crates/ledger/src/service.rs#L118-L240),
-  [file_watcher.rs:88-140](../crates/ledger/src/file_watcher.rs#L88-L140), [ledger_lock.rs](../crates/gl-node/src/ledger_lock.rs),
-  [p2p_service.rs:895-1050](../crates/gl-node/src/p2p_service.rs#L895), `crates/gl-node/Cargo.toml`,
+- **Files:** [journal.rs](../../crates/ledger/src/journal.rs), [service.rs:118-240](../../crates/ledger/src/service.rs#L118-L240),
+  [file_watcher.rs:88-140](../../crates/ledger/src/file_watcher.rs#L88-L140), [ledger_lock.rs](../../crates/gl-node/src/ledger_lock.rs),
+  [p2p_service.rs:895-1050](../../crates/gl-node/src/p2p_service.rs#L895), `crates/gl-node/Cargo.toml`,
   `crates/ledger/Cargo.toml`.
 - **Verify:** `mkfifo` at `.bean`, `.journal`, the key path → `boot`/`append_record`/`from_path` return
   `Err` within the test's timeout; a symlink at each → `Err`; a directory at `.tmp` → the write succeeds; a
@@ -326,13 +326,13 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
 ### ☑ T68 — Journal policy (M-43, M-44) — S
 > **Done 2026-09-23 (committed `c7698cf`).** A header whose length exceeds the remainder is `Corrupt` (boot refuses, naming the byte offset) when the claim exceeds the budget or a later record header follows; otherwise it is a torn tail. A final record that fails its checksum and contains a NUL is torn (M-44), as is a NUL-bearing header with no later record. After a boot that saw a torn tail, the folding compaction renames the journal to `<journal>.torn-<unix-secs>` (with `-N` on collision) and logs the path; boot ignores `.torn-*`. Warning text and module doc corrected (the hash is an unkeyed checksum). The `l41_*` tests were renamed `*_fails_closed*`: `usize::MAX` is over the budget and is now `Corrupt`, by the R-18 decision. Orchestrator re-ran the R-18 probe (`Corrupt at byte 163 … a later record header follows it`) and zero-fill (boots, torn warning, sidecar named). **Behaviour changes:** mid-journal damage and over-budget lengths refuse boot; zero-filled final records no longer do; torn journals are kept as `.torn-*` sidecars for the operator to inspect and remove. **Residual:** a damaged length on the *last* record that stays within budget is indistinguishable from a crash and is treated as torn — the sidecar keeps its bytes.
 - **Why:** R-18 confirmed three times: a mid-file header whose length exceeds the remainder is classified as
-  a torn tail ([journal.rs:224-233](../crates/ledger/src/journal.rs#L224-L233)), boot loads only the prefix,
-  the warning ([service.rs:1957-1966](../crates/ledger/src/service.rs#L1957-L1966)) says the node "crashed
+  a torn tail ([journal.rs:224-233](../../crates/ledger/src/journal.rs#L224-L233)), boot loads only the prefix,
+  the warning ([service.rs:1957-1966](../../crates/ledger/src/service.rs#L1957-L1966)) says the node "crashed
   mid-append" and the record "never reported success" — both false — and the startup compaction unlinks
   the journal. Not reachable by a crash (no `Append` is ever chosen while a torn tail is outstanding);
   reachable by one flipped digit or journal write access. **M-44 (plausible):** a crash-time zero-filled
   final payload on a metadata-first filesystem is a complete header with the wrong hash → `Corrupt`
-  ([:237-244](../crates/ledger/src/journal.rs#L237-L244)) → boot refusal, on a file the node wrote.
+  ([:237-244](../../crates/ledger/src/journal.rs#L237-L244)) → boot refusal, on a file the node wrote.
 - **Decision (taken): fail closed; torn journals are renamed, never unlinked.**
 - **Change:** a header whose length exceeds the remainder is `Corrupt` when the remainder contains a later
   `\n;;olj ` line or the claimed length exceeds the journal budget (a node-written payload can contain
@@ -341,25 +341,25 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
   `<journal>.torn-<unix-ts>` and logs its path; a **final** record whose payload contains a NUL byte is a
   torn tail, not corruption; fix the warning text and the module doc's "cannot be produced by a crash" and
   "fails closed on its hash" (it is an unkeyed checksum) claims.
-- **Files:** [journal.rs:168-282, 356-378](../crates/ledger/src/journal.rs#L168), [service.rs:1510-1553,
-  1957-1966](../crates/ledger/src/service.rs#L1510).
+- **Files:** [journal.rs:168-282, 356-378](../../crates/ledger/src/journal.rs#L168), [service.rs:1510-1553,
+  1957-1966](../../crates/ledger/src/service.rs#L1510).
 - **Verify:** the R-18 fixture (`86 → 986`, `999999`, `10^23`, `u64::MAX`) → `Err(Corrupt)` naming the
   offset; the `zero-fill` fixture boots with a torn warning; a real torn tail leaves a `.torn-*` sidecar and
   the next boot ignores it; `l41_*` still pass.
 
 ### ☑ T69 — Cost bounds on the read, watch and near-cap paths (M-39, M-42, M-45, L-63, L-65, L-35/R-19, L-43/R-20, R-5) — M
 > **Done 2026-09-23 (committed `46377a5`; two agents, disjoint files).** **M-39 / R-20:** `prepare_or_recover` is async, takes guard and `WritePermit` by value, drops the guard and runs `recover_off_lock` on a task that owns the permit (T61's `Parse` and `CommitInFlight` rules kept); all six call sites updated. `append_headroom()` on the service; `stage_and_commit_batch` compares the batch's estimated record size with the headroom **before staging** and, if it cannot fit, defers it and arms a 60 s per-peer `SupplyBackoff` (separate from the refusal cache, no ids recorded) that also suppresses re-pull and Want for that peer. Measured: near-cap batch deferred in 2.7 ms with no staging or reload (was a 2.2–3.7 s reload under the write lock per tick); a refused mutation's reload now leaves reads waiting at most 1.4 µs (5.4 s before). **M-42:** `FilePoller` reads and hashes only when the stat key (size, mtime, ctime, inode, device) changes, after a racy read (within 2 s of the mtime), or every 40 polls (10 s); polls run in `spawn_blocking`, `MissedTickBehavior::Delay`. Orchestrator re-ran the probe on 59 MiB: 2.1% of a core, down from 91%. **L-35 / R-19:** `compute_want_by_membership` (remote heads checked against membership — the T59 note) and lazy `paginate_have_heads_sorted` over `sorted_directive_ids()`; adverts byte-identical (tested over 7 shapes); no production `all_directive_ids()` caller remains. **R-5:** a cross-peer semaphore (default 8) acquired inside the spawned exchange; **design deviation, accepted:** the task *queues* for a slot (FIFO) rather than skipping the tick, because with a fixed allowlist order skipping lets stalled peers win every slot and starve a healthy one — the test proves it. **M-45:** `journal` weight `max(512, (limit/100).max(1) × (1 + child))`; eight aliased 10,000-row postings pages refused (six still admitted), dashboard still fits; txid passed, not re-hashed (`domain_txn_to_graphql` removed); postings built only when selected. **L-63:** `MissingParent` per node with a count; errors capped at 1,000 plus `truncated` (new GraphQL field); re-run: 1,024,000 errors / 166 MiB → 1,000 / 197 KiB. **L-65:** byte-budget docs state the real 2–6× multiple. **Behaviour changes:** near-cap peer batches deferred for 60 s with one warning; failed prepares reload off the lock; `verify.errors` is per node, capped, with `truncated`; large aliased `journal` requests may be refused; at most 8 concurrent outbound exchanges; `domain_txn_to_graphql` removed and `AntiEntropyHandler.supply_backoff` added (API). **Residuals:** a local write refused at the cap still pays a full (off-lock) reload while holding the permit; the headroom estimate over-counts ~190 B/entry and ignores drain-freed orphans; the 60 s backoff and the outbound bound have no config key yet (→ T71: `p2p.antiEntropyMaxConcurrentExchanges`, floor 1, ceiling 64); one `journal(limit:10000)` with postings can still materialise limit × 1,000 postings — a real fix needs a posting budget or cursor pagination (API change); README's `verify` example lacks `truncated` (→ T71).
-- **Why:** **M-39:** [anti_entropy_alpn.rs:1281](../crates/gl-node/src/anti_entropy_alpn.rs#L1281) calls
+- **Why:** **M-39:** [anti_entropy_alpn.rs:1281](../../crates/gl-node/src/anti_entropy_alpn.rs#L1281) calls
   `prepare_or_recover` with the ledger **write guard** held and the prepare-failure arm reloads inline
-  ([ledger_commit.rs:353-370](../crates/gl-node/src/ledger_commit.rs#L353-L370)); near the cap a 256-entry
+  ([ledger_commit.rs:353-370](../../crates/gl-node/src/ledger_commit.rs#L353-L370)); near the cap a 256-entry
   batch fails the projection deterministically, is rolled back, is not cached, and is re-Wanted next tick —
   measured 3.65 s of write-lock hold per tick per peer, forever. **M-42:** `FileState::from_path`
-  ([file_watcher.rs:90-112](../crates/ledger/src/file_watcher.rs#L90-L112)) reads and hashes the whole file
+  ([file_watcher.rs:90-112](../../crates/ledger/src/file_watcher.rs#L90-L112)) reads and hashes the whole file
   every 250 ms tick regardless of change — 216 ms/tick on 59 MiB (86% of a core), `Burst` semantics
-  ([main.rs:412-422](../crates/gl-node/src/main.rs#L412-L422)). **M-45:** the `journal` resolver's weight
-  ignores `limit` and child complexity ([query.rs:195-196](../crates/gl-node/src/graphql/query.rs#L195-L196))
+  ([main.rs:412-422](../../crates/gl-node/src/main.rs#L412-L422)). **M-45:** the `journal` resolver's weight
+  ignores `limit` and child complexity ([query.rs:195-196](../../crates/gl-node/src/graphql/query.rs#L195-L196))
   and `domain_txn_to_graphql` re-hashes per row (:383-388). **L-63:** `VerifyReport.errors` is one per
-  dangling edge ([verify.rs:164](../crates/ledger/src/verify.rs#L164)): 1,024,000 errors / 166 MiB.
+  dangling edge ([verify.rs:164](../../crates/ledger/src/verify.rs#L164)): 1,024,000 errors / 166 MiB.
   **L-65:** the byte budget charges the frame body only. **L-35/R-19:** `contains_directive`/`is_head`/
   `sorted_directive_ids` have zero production callers; `all_directive_ids()` still cloned at :801, :1020, :1581.
 - **Change:** an async `prepare_or_recover` that drops the guard and reuses `recover_off_lock` (the permit
@@ -373,11 +373,11 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
   switch the three `all_directive_ids()` callers (needs `compute_want`/`paginate_have_heads` variants in
   `p2p` that take a lookup and a sorted slice); document the byte budget's real multiple (≈ body + decoded +
   `Content` + staged).
-- **Files:** [ledger_commit.rs](../crates/gl-node/src/ledger_commit.rs), [mutation.rs:85-290](../crates/gl-node/src/graphql/mutation.rs#L85),
-  [anti_entropy_alpn.rs:794-813, 1018-1027, 1086-1341, 1567-1622](../crates/gl-node/src/anti_entropy_alpn.rs#L1086),
-  [anti_entropy.rs:35-116](../crates/p2p/src/anti_entropy.rs#L35), [file_watcher.rs](../crates/ledger/src/file_watcher.rs),
-  [main.rs:412-495](../crates/gl-node/src/main.rs#L412), [query.rs:11-62, 195-240, 281-320, 383-388](../crates/gl-node/src/graphql/query.rs#L195),
-  [verify.rs:140-204](../crates/ledger/src/verify.rs#L140), [connection_limiter.rs](../crates/gl-node/src/connection_limiter.rs) (docs).
+- **Files:** [ledger_commit.rs](../../crates/gl-node/src/ledger_commit.rs), [mutation.rs:85-290](../../crates/gl-node/src/graphql/mutation.rs#L85),
+  [anti_entropy_alpn.rs:794-813, 1018-1027, 1086-1341, 1567-1622](../../crates/gl-node/src/anti_entropy_alpn.rs#L1086),
+  [anti_entropy.rs:35-116](../../crates/p2p/src/anti_entropy.rs#L35), [file_watcher.rs](../../crates/ledger/src/file_watcher.rs),
+  [main.rs:412-495](../../crates/gl-node/src/main.rs#L412), [query.rs:11-62, 195-240, 281-320, 383-388](../../crates/gl-node/src/graphql/query.rs#L195),
+  [verify.rs:140-204](../../crates/ledger/src/verify.rs#L140), [connection_limiter.rs](../../crates/gl-node/src/connection_limiter.rs) (docs).
 - **Verify:** near-cap fixture, one 256-entry `apply_supply_entries`: the `RwLock` is never held > 100 ms
   (probe with a concurrent timed `read()`) and a second call does not re-stage; two consecutive watcher
   polls of an unchanged file perform one read; eight aliased `journal(limit: 10000)` with a postings
@@ -386,9 +386,9 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
 
 ### ☑ T70 — Server-side session deadline and cross-peer cap (M-40, M-06, R-5, R-7) — S/M
 > **Done 2026-09-23; the outbound semaphore (R-5) landed with T69.** Server `SessionBudget` built at accept (default 300 s); `accept_bi` and every frame clamped to `min(io, time left)`, the whole read additionally bounded by `timeout_at(deadline)` so a trickled frame cannot run 16–256 × `io` past it; close code 5 `session-deadline`. Per-peer GCRA accept bucket in `ConnectionLimiter::try_acquire` (burst 8, one per 2 s — honest pooled peers redial at most every ~30 s; a token is spent only when every other budget admits), refusal close code 6 `accept-rate-limit`; buckets survive disconnect so a reconnect loop cannot refill them; refusals logged once per 10 s and `accept` returns `Ok` so iroh does not log each one. R-7: six `p2p.antiEntropy*` keys with documented floors/ceilings, validated at boot, wired in `main.rs` by the orchestrator. **R-5 (cross-peer outbound semaphore) moves to T69**, which owns `p2p_service.rs`. **Behaviour changes:** inbound anti-entropy connections are closed after `antiEntropySessionSeconds`; per-peer accept rate; six new config keys (older binaries refuse them). **Residuals:** an honest pooled connection is now cut every 300 s (clean redial, at worst one failed tick); a refused connection still costs the QUIC handshake; the not-allowlisted refusal still returns `Err` and is logged unthrottled by iroh; `io` has no config key.
-- **Why:** `serve_anti_entropy` uses only the per-frame `io` ([anti_entropy_alpn.rs:353](../crates/gl-node/src/anti_entropy_alpn.rs#L353),
+- **Why:** `serve_anti_entropy` uses only the per-frame `io` ([anti_entropy_alpn.rs:353](../../crates/gl-node/src/anti_entropy_alpn.rs#L353),
   `accept_bi` :422, reads :478) and `max_requests_per_connection`; `timeouts.session` is consumed by the
-  client only ([:245](../crates/gl-node/src/anti_entropy_alpn.rs#L245)). A ~30 B `Announce` every 29 s holds
+  client only ([:245](../../crates/gl-node/src/anti_entropy_alpn.rs#L245)). A ~30 B `Announce` every 29 s holds
   a slot for ≈ 34 days; one peer pins 12.5% of the 256 global slots, eight pin all. Each 40 B
   `HaveHeads{more:false}` costs a full O(N) local advert under the read lock, bounded per connection but not
   across free reconnects. **R-5:** `InFlightGuard` is per-peer only; nothing bounds exchanges across peers
@@ -397,9 +397,9 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
   with a distinct code; a per-peer accept token bucket in `ConnectionLimiter::try_acquire`; a semaphore
   across concurrent outbound exchanges sized against the allowlist; config keys for the session, page, id-byte
   and frame bounds under `p2p.antiEntropy*`, validated like the existing interval.
-- **Files:** [anti_entropy_alpn.rs:137-275, 348-546](../crates/gl-node/src/anti_entropy_alpn.rs#L348),
-  [connection_limiter.rs](../crates/gl-node/src/connection_limiter.rs), [p2p_service.rs:426-632](../crates/gl-node/src/p2p_service.rs#L426),
-  [config.rs](../crates/gl-node/src/config.rs), README options table.
+- **Files:** [anti_entropy_alpn.rs:137-275, 348-546](../../crates/gl-node/src/anti_entropy_alpn.rs#L348),
+  [connection_limiter.rs](../../crates/gl-node/src/connection_limiter.rs), [p2p_service.rs:426-632](../../crates/gl-node/src/p2p_service.rs#L426),
+  [config.rs](../../crates/gl-node/src/config.rs), README options table.
 - **Verify:** a client sending `Announce` every `io/2` past `session` is closed with the session code; a
   peer reconnecting in a tight loop is admitted at the bucket rate only; with an allowlist of N + 1 peers at
   most N exchanges run concurrently and the healthy peer still converges.
@@ -412,11 +412,11 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
 > **Done 2026-09-23 (committed `af14603`).** **L-56:** the whitespace arm of `validate_signature_domain` prints `auth::redact(value)` and the byte offset of the whitespace, never the value. The existing malformed-topic test now asserts non-echo, and a sibling test covers `meshId` and the offset. Real binary: `got <redacted, 26 bytes, starts acme…> with whitespace at byte 25`. **L-61:** the per-IP cap doc (`http_server.rs`) and README row carry the /64 → /48 caveat (a routed /48 is 65,536 keys, so the cap bounds one address or one /64, not one network). **Admission cooldown not built, by decision:** the over-cap path already reads nothing and spawns nothing, and the measured cost (~52 µs per cycle) is the kernel's accept-and-close, which a user-space cooldown still pays. The cooldown would save only a mutex acquire and a hash lookup. It would add a second attacker-keyed map that needs its own bound, it would refuse honest clients for seconds after a transient overshoot, and it does nothing against the /48 case. **L-66:** async-graphql 7.2.1's `GraphiQLSource` has `.version()` but no way to set `integrity`, and its template hard-codes `react@18`/`react-dom@18` development builds. GraphiQL is pinned to `GRAPHIQL_VERSION = "4.1.2"`, which is what the floating `4` resolved to on 2026-09-23, so nothing an operator sees changes. **R-9:** new `NodeConfig::log_signature_domain` (called from `main.rs`) warns when `meshId` is unset on a signing node. The remedy leads with "set p2p.meshId to your current swarmTopic verbatim — any other value invalidates every signature already in the mesh". The warning prints only source, length and prefix. A node that does not sign gets the old `info` line, because it has no signatures to lose (a deliberate narrowing). README §Mesh identity was rewritten: `uuidgen` is for a new mesh, verbatim `swarmTopic` for an existing one (no window needed), and the old window procedure is kept for moving to a *different* domain. `deploy/gl-node.docker.json` sets `"meshId": "openledger/docker-dev"`, and the compose L-23 block is rewritten. **R-13:** `CHANGELOG.md` at the repo root has Breaking/Changed/Added/Removed/Security sections covering T46–T71. **T69's keys:** `p2p.antiEntropyMaxConcurrentExchanges` (1–64, default `DEFAULT_MAX_CONCURRENT_OUTBOUND_EXCHANGES` = 8) and `p2p.antiEntropySupplyBackoffSeconds` (5–3600, default `SUPPLY_HEADROOM_BACKOFF` = 60 s, now `pub`). The backoff became `AntiEntropyTimeouts::supply_backoff`, and `SupplyBackoff::arm` takes the duration. Both keys are wired in `anti_entropy_limits()`/`anti_entropy_timeouts()`, so `main.rs` needed no change for them. **§5:** `allowedHosts` entries go through `request_guard::split_authority` (now `pub(crate)`), which refuses a port, IPv6 brackets and a trailing dot, naming the spelling to use. Brackets are beyond the brief; they are the same never-matches shape. `GL_NODE_API_KEY` with `auth.enabled: false` warns without echoing the key. The README now documents the `OPTIONS`/`Allow` fingerprint, the `Origin` localhost↔127.0.0.1 equivalence, the new "commit journal" subsection (unkeyed checksum, "error but durable", `.torn-*`, file rules) and `truncated` in the `verify` example. Nine new tests, each proven by reverting the fix (13 reverts, including each `allowedHosts` arm, each bound and each wiring line separately). The real binary was booted for a padded topic, `meshId` unset and a port in `allowedHosts`. **Behaviour changes:** `allowedHosts` entries with a port, brackets or a trailing dot refuse boot; a signing node without `meshId` logs a WARN at every boot; two new config keys (older binaries refuse them); the GraphiQL asset URLs are exact. **Residuals:** (1) L-66: no SRI, and React stays a floating-minor development build from `unpkg.com`. A post-processing pass over `finish()`'s string (pin React to 18.3.1 and add `integrity` to the four known tags, with a test that fails if the template changes) would close it without self-hosting. Until then, `graphiql` defaults to off and is refused on non-loopback binds. (2) L-61: no admission cooldown (see above); fan-in wider than a /64 belongs to the proxy or firewall. (3) R-9: `meshId` is still optional, and making it required is the next release's change. (4) The other §5 items (non-canonical envelope spellings, `AccountClosed` drain churn, swallowed directory `fsync`s, `finish_recovery`'s stale `force_compaction`, the test-net notes) are unchanged and stay listed below.
 - **Decisions (taken):** `meshId` gets a boot `warn!` now and ships in `deploy/gl-node.docker.json`,
   required a release later; a `CHANGELOG.md` is added.
-- **Change:** `validate_signature_domain`'s whitespace arm ([config.rs:1063-1065](../crates/gl-node/src/config.rs#L1063-L1065))
+- **Change:** `validate_signature_domain`'s whitespace arm ([config.rs:1063-1065](../../crates/gl-node/src/config.rs#L1063-L1065))
   prints `crate::auth::redact(value)` or the byte offset, never the value (L-56); the per-IP cap docs
-  ([http_server.rs:73-79](../crates/gl-node/src/http_server.rs#L73-L79), README:462) carry the /48 caveat
+  ([http_server.rs:73-79](../../crates/gl-node/src/http_server.rs#L73-L79), README:462) carry the /48 caveat
   `rate_limit.rs:10-19` already states, and over-cap addresses get a short admission cooldown (L-61); GraphiQL
-  pins a version with SRI or is self-hosted ([graphql/mod.rs:107](../crates/gl-node/src/graphql/mod.rs#L107), L-66);
+  pins a version with SRI or is self-hosted ([graphql/mod.rs:107](../../crates/gl-node/src/graphql/mod.rs#L107), L-66);
   `main.rs:311` becomes a `warn!` when `meshId` is unset whose remedy text leads with *"set it to your current
   `swarmTopic` verbatim"*, README §Mesh identity says the same and stops recommending `uuidgen` for an
   existing mesh, `deploy/gl-node.docker.json` sets `meshId` (R-9); `CHANGELOG.md` covers `externalFileEdits`
@@ -426,9 +426,9 @@ T61–T64 go to one agent in that order or run sequentially; T65, T66, T67, T70 
   trailing dot are refused at boot; `GL_NODE_API_KEY` with `auth.enabled: false` warns; document `OPTIONS`
   (Allow-header fingerprint), `Origin` localhost/127.0.0.1 equivalence, "error but durable" on
   `remove_journal` failure, and the unkeyed journal hash.
-- **Files:** [config.rs](../crates/gl-node/src/config.rs), [main.rs:300-320](../crates/gl-node/src/main.rs#L300),
-  [http_server.rs](../crates/gl-node/src/http_server.rs), [graphql/mod.rs](../crates/gl-node/src/graphql/mod.rs),
-  [README.md](../README.md), [deploy/gl-node.docker.json](../deploy/gl-node.docker.json), `CHANGELOG.md` (new).
+- **Files:** [config.rs](../../crates/gl-node/src/config.rs), [main.rs:300-320](../../crates/gl-node/src/main.rs#L300),
+  [http_server.rs](../../crates/gl-node/src/http_server.rs), [graphql/mod.rs](../../crates/gl-node/src/graphql/mod.rs),
+  [README.md](../../README.md), [deploy/gl-node.docker.json](../../deploy/gl-node.docker.json), `CHANGELOG.md` (new).
 - **Verify:** the padded-topic boot error does not contain the topic; a port entry in `allowedHosts` is a
   `ConfigError::Validation`; boot with `meshId` unset logs a WARN naming `swarmTopic`;
   `test_shipped_sample_configs_still_validate` passes with `meshId` in the docker config.
@@ -471,7 +471,7 @@ orchestrator re-verifies each mechanism in source and re-runs the suite three ti
 
 ---
 
-*Audit: [SECURITY_AUDIT_0922-v2.md](../SECURITY_AUDIT_0922-v2.md). Previous trackers:
+*Audit: [SECURITY_AUDIT_0922-v2.md](SECURITY_AUDIT_0922-v2.md). Previous trackers:
 [OUTSTANDING_TASKS_09_22.md](OUTSTANDING_TASKS_09_22.md) (T46–T60, R-1…R-21) ·
 [OUTSTANDING_TASKS_09.md](OUTSTANDING_TASKS_09.md) (T18–T45) · [OUTSTANDING_TASKS.md](OUTSTANDING_TASKS.md)
-(T1–T17). Format v2 design: [FORMAT_V2_DESIGN.md](FORMAT_V2_DESIGN.md).*
+(T1–T17). Format v2 design: [FORMAT_V2_DESIGN.md](../FORMAT_V2_DESIGN.md).*
