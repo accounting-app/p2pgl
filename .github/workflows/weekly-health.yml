@@ -3,8 +3,7 @@ name: Weekly health check
 # Every Monday, the same gate a change passes before it is committed, plus the
 # RustSec advisory audit, on the current main. A failure opens an issue (or
 # comments on the one already open), so a regression from a new toolchain, an
-# advisory or a flaky test is seen without anyone running anything. A Claude
-# routine runs the same checks weekly and explains failures (CLAUDE.md).
+# advisory or a flaky test is seen without anyone running anything.
 on:
   schedule:
     - cron: "0 6 * * 1"
