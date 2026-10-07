@@ -1,0 +1,166 @@
+{
+  "R15-R1-peer-balance-unchecked": {
+    "file": "crates/ledger/src/service/remote.rs",
+    "old": "                validate_balance_as_data(balance, &self.accounts)?;\n",
+    "new": "                let _ = balance;\n",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "r15_a_peers_balance_waits_for_its_account"
+      ],
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "r15_a_balance_before_its_account_open_waits"
+      ]
+    ]
+  },
+  "R15-R2-file-balance-unchecked": {
+    "file": "crates/ledger/src/service/reconcile.rs",
+    "old": "        if let Directive::Balance(balance) = &directive {\n            if let Err(error) = validate_balance_as_data(balance, &self.accounts) {",
+    "new": "        if let (true, Directive::Balance(balance)) = (false, &directive) {\n            if let Err(error) = validate_balance_as_data(balance, &self.accounts) {",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "r15_a_balance_with_no_open_is_held_in_the_file"
+      ]
+    ]
+  },
+  "R15-R3-unopened-balance-served": {
+    "file": "crates/ledger/src/service/verify.rs",
+    "old": "            if let Some(Directive::Balance(balance)) = self.dag.get(content_id) {",
+    "new": "            if let (true, Some(Directive::Balance(balance))) = (false, self.dag.get(content_id)) {",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "r15_a_balance_with_no_open_is_held_in_the_file"
+      ]
+    ]
+  },
+  "R15-R4-chooser-rescues-the-copy": {
+    "file": "crates/ledger/src/service/quarantine.rs",
+    "old": "                        if validate_balance_as_data(balance, &self.accounts).is_err() =>",
+    "new": "                        if false && validate_balance_as_data(balance, &self.accounts).is_err() =>",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "r15_a_balance_with_no_open_is_held_in_the_file"
+      ]
+    ]
+  },
+  "B14-R1-no-summed-gap-warning": {
+    "file": "crates/ledger/src/service/verify.rs",
+    "old": "            self.warn_if_one_authors_steps_add_up_to_an_uncrossable_gap(None);\n            return;",
+    "new": "            if false {\n                self.warn_if_one_authors_steps_add_up_to_an_uncrossable_gap(None);\n            }\n            return;",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "b14_boot_warns_when_one_authors_steps_add_up_past_the_ratchet"
+      ]
+    ]
+  },
+  "C8-R1-silent-drop-without-operator-input": {
+    "file": "crates/ledger/src/service/boot.rs",
+    "old": "        if self.unsigned_operator_input.is_empty() {\n            self.drop_typed_copies_as_duplicates();\n            return 0;",
+    "new": "        if self.unsigned_operator_input.is_empty() {\n            self.typed_copies.clear();\n            return 0;",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "c8_a_block_repeating_a_served_record_is_named"
+      ]
+    ]
+  },
+  "C25-R1-old-banner-wording": {
+    "file": "crates/gl-node/src/main.rs",
+    "old": "     own warning, then restart: it says whether",
+    "new": "     warning as its warning says, then restart: it says whether",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "c25_the_quarantine_banner_defers"
+      ]
+    ]
+  },
+  "D6-R1-four-times-the-live-hints": {
+    "file": "crates/p2p/src/orphan_buffer.rs",
+    "old": "        if self.hint_order.len() > 2 * (MAX_PARENT_HINT_IDS / 2) {",
+    "new": "        if self.hint_order.len() > 2 * MAX_PARENT_HINT_IDS {",
+    "runs": [
+      [
+        "-p",
+        "p2p",
+        "--lib",
+        "d6_the_hint_queue_stays_within"
+      ]
+    ]
+  },
+  "R15-R5-live-reconcile-deletes-the-envelope": {
+    "file": "crates/ledger/src/service/reconcile.rs",
+    "old": "                if !stamp.needs_stamp {\n                    self.hold_refused_file_entry(&content_id, &directive);\n                }",
+    "new": "                if false {\n                    self.hold_refused_file_entry(&content_id, &directive);\n                }",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "r15_a_pasted_full_envelope_balance_with_no_open_is_held_live"
+      ]
+    ]
+  },
+  "R15-R6-rebase-skips-a-balance": {
+    "file": "crates/ledger/src/service/quarantine.rs",
+    "old": "            Directive::Balance(balance) => {\n                return validate_balance_as_data(balance, accounts)",
+    "new": "            Directive::Balance(balance) if false => {\n                return validate_balance_as_data(balance, accounts)",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "r15_a_hand_balance_goes_with_the_foreign_author_open"
+      ]
+    ]
+  },
+  "B14-R2-single-gap-hides-another-author": {
+    "file": "crates/ledger/src/service/verify.rs",
+    "old": "        self.warn_if_one_authors_steps_add_up_to_an_uncrossable_gap(Some(&named));",
+    "new": "        let _ = &named;",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "b14_a_single_gap_by_one_author_does_not_hide"
+      ]
+    ]
+  },
+  "C8-R2-silent-drop-beside-typed-input": {
+    "file": "crates/ledger/src/service/boot.rs",
+    "old": "        // keeps the node-written copy.\n        self.drop_typed_copies_as_duplicates();",
+    "new": "        // keeps the node-written copy.\n        self.typed_copies.clear();",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "c8_the_duplicate_is_named_beside_other_typed_input"
+      ]
+    ]
+  }
+}

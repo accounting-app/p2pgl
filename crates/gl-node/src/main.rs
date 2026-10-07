@@ -108,6 +108,27 @@ fn resolve_api_key(config: &mut NodeConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// The boot banner for records quarantined out of the DAG (H-08, R-12).
+///
+/// C25 (`docs/audits/RESIDUALS.md`): it defers to each record's own boot
+/// warning for the remedy. Since T103 the amount-cap warning tells the operator
+/// to delete a held block once its restatement is served — and the banner said
+/// "restate … as its warning says" over a warning that said delete. A constant
+/// so a test pins it (T103 noted the banner was pinned by none).
+const QUARANTINE_BANNER: &str =
+    "this node booted with ledger records quarantined out of the DAG: they stay in the .bean \
+     (every compaction rewrites them verbatim) but are NOT served, NOT in any balance and NOT \
+     replicated. The per-record boot warnings above give each one's reason — its \
+     openledger-parents metadata, a disallowed character, excess fan-in, a signature that does \
+     not verify, a parent no peer could resolve, or a block that does not parse at all (named \
+     by line number; it has no id). If the boot warnings above include \"EVERY signature this \
+     node checked failed\", fix p2p.meshId or the node key first and repair nothing: the \
+     records load again once both are right. Otherwise stop the node and follow each record's \
+     own warning, then restart: it says whether to repair the record, to restore it from a \
+     peer or a backup (H-23), to restate the chain on ONE node only — every other node adopts \
+     the restatement and must not restate — or, once that restatement is served, to delete the \
+     held block (H-08, L-45, M-73)";
+
 /// The boot banner for records the signature check quarantined (H-20).
 ///
 /// T92 / M-69, decision (40): it defers to the per-record WARNs above it and
@@ -361,19 +382,7 @@ async fn main() {
             unparsable_blocks = service.unparsable_block_count(),
             ids = %service.quarantined_ids().join(", "),
             path = %ledger_path.display(),
-            "this node booted with ledger records quarantined out of the DAG: they stay in \
-             the .bean (every compaction rewrites them verbatim) but are NOT served, NOT in any \
-             balance and NOT replicated. The per-record boot warnings above give each one's \
-             reason — its openledger-parents metadata, a disallowed character, excess fan-in, \
-             a signature that does not verify, a parent no peer could resolve, or a block that \
-             does not parse at all (named by line number; it has no id). If the boot warnings \
-             above include \"EVERY signature this node checked failed\", fix p2p.meshId or the \
-             node key first and repair nothing: the records load again once both are right. \
-             Otherwise stop the node, repair those records in the file, and restart. A repair \
-             that changes a record's body gives it a new id, and what descends from it stays \
-             held: restore the original from a peer or a backup where you can (H-23); where \
-             you cannot, restate the chain on ONE node only, as its warning says — every other \
-             node adopts the restatement and must not restate (H-08, L-45, M-73)"
+            "{QUARANTINE_BANNER}"
         );
     }
 
@@ -1422,6 +1431,22 @@ mod tests {
     }
 
     // ── L-23: mesh identity decoupled from the swarm topic ───────────────
+
+    /// C25: the quarantine banner defers to each record's own warning, which
+    /// may say to restate on one node or, once the restatement is served, to
+    /// delete the held block — it no longer says "restate … as its warning
+    /// says" over a warning that says delete.
+    ///
+    /// Bug-catch: put back "restate the chain on ONE node only, as its warning
+    /// says" and this fails.
+    #[test]
+    fn c25_the_quarantine_banner_defers_to_each_records_warning() {
+        assert!(QUARANTINE_BANNER.contains("follow each record's own warning"));
+        assert!(QUARANTINE_BANNER.contains("restate the chain on ONE node only"));
+        assert!(QUARANTINE_BANNER.contains("delete the held block"));
+        assert!(!QUARANTINE_BANNER.contains("as its warning says"));
+        assert!(QUARANTINE_BANNER.contains("fix p2p.meshId or the node key first"));
+    }
 
     mod mesh_identity {
         use super::*;

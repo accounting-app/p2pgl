@@ -463,13 +463,24 @@ impl LedgerService {
                     .flatten(),
             );
             for copy in copies {
-                if let Directive::Transaction(txn) = copy {
-                    // The served-set rule's body questions (`unservable_history`).
-                    if validate_transaction_as_data(txn, &self.accounts).is_err()
-                        || elided_posting_count(txn) > 0
+                // The served-set rule's body questions (`unservable_history`):
+                // a copy that fails them is no rescue.
+                match copy {
+                    Directive::Transaction(txn) => {
+                        if validate_transaction_as_data(txn, &self.accounts).is_err()
+                            || elided_posting_count(txn) > 0
+                        {
+                            continue;
+                        }
+                    }
+                    // R-15: an assertion's account is not a matter of which
+                    // copy, so no copy of one the rule holds is servable.
+                    Directive::Balance(balance)
+                        if validate_balance_as_data(balance, &self.accounts).is_err() =>
                     {
                         continue;
                     }
+                    _ => {}
                 }
                 if judge_signature
                     && Some(copy) != own
@@ -594,8 +605,22 @@ impl LedgerService {
         dag: &LedgerDag,
         accounts: &AccountState,
     ) -> Result<bool, String> {
-        let Directive::Transaction(txn) = directive else {
-            return Ok(false);
+        let txn = match directive {
+            Directive::Transaction(txn) => txn,
+            // R-15: an assertion has no parents to rebase, but its account's
+            // `open` may be one this boot quarantined — judged now, as the
+            // served-set rule would judge it at the next boot.
+            Directive::Balance(balance) => {
+                return validate_balance_as_data(balance, accounts)
+                    .map(|()| false)
+                    .map_err(|error| {
+                        format!(
+                            "{error} — without the records this boot quarantined, the entry no \
+                             longer validates (H-22)"
+                        )
+                    });
+            }
+            _ => return Ok(false),
         };
         let before = txn.metadata.get(ENVELOPE_KEY_PARENTS).cloned();
         if hand_parented {

@@ -1126,6 +1126,20 @@ impl LedgerService {
                 }
             }
         }
+        // R-15: a `balance` is held to the rule a peer's is — an `open` of its
+        // account on or before its date — on both file paths. A complete
+        // envelope is held in the file, as the transaction arm holds one
+        // (T90 / L-126): boot's served-set rule keeps it, so the live
+        // re-persist must not delete it.
+        if let Directive::Balance(balance) = &directive {
+            if let Err(error) = validate_balance_as_data(balance, &self.accounts) {
+                if !stamp.needs_stamp {
+                    self.hold_refused_file_entry(&content_id, &directive);
+                }
+                tally.refuse(content_id, error.to_string());
+                return FileAdoption::Refused;
+            }
+        }
         // H-20, T80: see the transaction arm.
         if !stamp.needs_stamp {
             if let Some(owned) = self.reattributed_placeholder_record(&content_id, &directive) {

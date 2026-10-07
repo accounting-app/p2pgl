@@ -1000,3 +1000,71 @@ fn l35_the_snapshot_does_not_survive_a_reload() {
     assert!(after.iter().all(|id| svc.contains_directive(id)));
     remove_ledger_and_journal(&path);
 }
+
+// ── R-15: a peer's `balance` needs its account ─────────────────────────
+
+fn remote_balance(account: &str, date: NaiveDate, lamport: u64) -> Directive {
+    Directive::Balance(Balance {
+        date,
+        account: account.to_owned(),
+        amount: Amount {
+            number: rust_decimal::Decimal::ZERO,
+            currency: "USD".to_owned(),
+        },
+        metadata: remote_envelope(lamport),
+    })
+}
+
+/// R-15: a peer's `balance` on an account no `open` by its date admits is
+/// refused as `AccountNotOpen` — the error gl-node buffers on the account —
+/// and is admitted once the `open` is held, so both arrival orders end with
+/// the same records. Before, any number of assertions on accounts the ledger
+/// never opened were admitted.
+///
+/// Bug-catch: drop `validate_balance_as_data` from `stage_remote_directive`
+/// and the assertion on the never-opened account is admitted.
+#[test]
+fn r15_a_peers_balance_waits_for_its_account_and_lands_after_the_open() {
+    let open = remote_open("Assets:Vault", make_date(2024, 3, 1), 10);
+    let balance = remote_balance("Assets:Vault", make_date(2024, 3, 2), 11);
+    let ghost = remote_balance("Assets:Ghost", make_date(2024, 3, 2), 12);
+
+    let path = test_file_path();
+    let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+    let refused = svc.stage_remote_directive(balance.clone());
+    assert!(
+        matches!(
+            refused,
+            Err(ServiceError::Validation(
+                ValidationError::AccountNotOpen { .. }
+            ))
+        ),
+        "before its open: {refused:?}"
+    );
+    assert!(svc.stage_remote_directive(open.clone()).unwrap().is_some());
+    assert!(svc
+        .stage_remote_directive(balance.clone())
+        .unwrap()
+        .is_some());
+    assert!(
+        matches!(
+            svc.stage_remote_directive(ghost.clone()),
+            Err(ServiceError::Validation(
+                ValidationError::AccountNotOpen { .. }
+            ))
+        ),
+        "an account that was never opened takes no assertion"
+    );
+    let first: BTreeSet<String> = svc.all_directive_ids().into_iter().collect();
+    remove_ledger_and_journal(&path);
+
+    // The other order reaches the same set.
+    let path = test_file_path();
+    let mut other = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+    assert!(other.stage_remote_directive(open).unwrap().is_some());
+    assert!(other.stage_remote_directive(balance).unwrap().is_some());
+    let second: BTreeSet<String> = other.all_directive_ids().into_iter().collect();
+    assert_eq!(first, second);
+    assert_eq!(first.len(), 2, "the open and its assertion");
+    remove_ledger_and_journal(&path);
+}

@@ -127,6 +127,52 @@ pub fn largest_lamport_gap(lamports: impl IntoIterator<Item = u64>) -> (u64, u64
     largest
 }
 
+/// The author whose records, left out, leave the largest gap — and that gap
+/// and the value at its top — when that gap is more than
+/// [`MAX_LAMPORT_ADVANCE`] (B14 of `docs/audits/RESIDUALS.md`).
+///
+/// [`largest_lamport_gap`] sees one step at a time, so an author who advanced
+/// the clock in many steps each below [`LAMPORT_GAP_WARN`] (17 steps of just
+/// under 2^28 already pass 2^32) drew no warning, yet once that author is off
+/// the allowlist a joiner refuses those records and faces the whole span as
+/// one gap it cannot cross. A value stays in the history when any record at it
+/// is by another author. `skip` names an author a warning has already named,
+/// left out of the search. `None` when no other author's removal leaves such
+/// a gap — always when every value is at most 2^32 (callers check the top
+/// first, so a normal history is not measured at all).
+pub fn gap_left_by_removing_an_author<'a>(
+    records: impl IntoIterator<Item = (u64, &'a str)>,
+    skip: Option<&str>,
+) -> Option<(String, u64, u64)> {
+    let mut by_value: std::collections::BTreeMap<u64, std::collections::BTreeSet<&'a str>> =
+        std::collections::BTreeMap::new();
+    for (value, author) in records {
+        by_value.entry(value).or_default().insert(author);
+    }
+    if by_value.keys().next_back().copied().unwrap_or(0) <= MAX_LAMPORT_ADVANCE {
+        return None;
+    }
+    let authors: std::collections::BTreeSet<&str> = by_value.values().flatten().copied().collect();
+    let mut worst: Option<(String, u64, u64)> = None;
+    for removed in authors.into_iter().filter(|author| Some(*author) != skip) {
+        let mut previous = 0u64;
+        let mut largest = (0u64, 0u64);
+        for (value, authors_at) in &by_value {
+            if authors_at.iter().all(|author| *author == removed) {
+                continue;
+            }
+            if value - previous > largest.0 {
+                largest = (value - previous, *value);
+            }
+            previous = *value;
+        }
+        if largest.0 > MAX_LAMPORT_ADVANCE && worst.as_ref().is_none_or(|w| largest.0 > w.1) {
+            worst = Some((removed.to_owned(), largest.0, largest.1));
+        }
+    }
+    worst
+}
+
 /// The operator-facing sentence every H-19 diagnostic ends with: how a node
 /// joins a mesh whose history carries a gap, or a removed author's records.
 ///

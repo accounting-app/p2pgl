@@ -1003,6 +1003,46 @@ fn m54_a_foreign_author_open_is_refused_at_finalisation_and_what_relied_on_it_go
     remove_ledger_and_journal(&path);
 }
 
+/// R-15 with M-54 on a signing-off node: a hand `balance` on an account
+/// whose hand `open` is refused at finalisation no longer validates
+/// either, so it is refused with the `open` instead of being stamped and
+/// served — the next boot's served-set rule would hold it, and a record
+/// must not be served at one boot and held at the next.
+///
+/// Bug-catch: drop the `Directive::Balance` arm of `rebase_operator_input`
+/// and the assertion is served on an account no peer has opened.
+#[test]
+fn r15_a_hand_balance_goes_with_the_foreign_author_open_it_relied_on() {
+    let (path, _) = signed_node_written_file();
+    append_to_file(
+        &path,
+        "\n2024-01-20 open Assets:Pasted USD\n\
+             \x20 openledger-author: \"a-different-node\"\n",
+    );
+    append_to_file(&path, "\n2024-01-26 balance Assets:Pasted 0 USD\n");
+    let mut svc = LedgerService::boot(path.clone(), "local".to_owned()).unwrap();
+    svc.set_author_id("test-peer".to_owned());
+    assert_eq!(
+        svc.unsigned_operator_input_count(),
+        2,
+        "premise: both adopted"
+    );
+
+    let (finalized, logged) = capture_warnings(|| svc.finalize_operator_input());
+    assert_eq!(finalized, 0);
+    assert!(logged.contains("(M-54)"), "{logged}");
+    assert!(logged.contains("no longer validates"), "{logged}");
+    assert!(!svc.accounts().is_open("Assets:Pasted"));
+    assert_eq!(svc.quarantined_count(), 2);
+    assert!(
+        svc.quarantined
+            .values()
+            .any(|directive| matches!(directive, Directive::Balance(_))),
+        "the assertion is held, not served"
+    );
+    remove_ledger_and_journal(&path);
+}
+
 /// H-22 on the recovery path: a reload re-derives operator input from
 /// the file with parents stamped over the edited record, and the carried
 /// signer is installed by assignment. The pass must run before the
@@ -2140,4 +2180,77 @@ fn l83_an_honest_adoption_below_a_high_clock_does_not_warn() {
     });
     assert!(!logged.contains("lamport gap"), "{logged}");
     std::fs::remove_file(path).ok();
+}
+
+/// C8 (`docs/audits/RESIDUALS.md`): a block typed into the file that repeats
+/// a record the node already holds and serves is the same record, so it is
+/// not adopted and the next compaction writes the record once — and that is
+/// now said, naming the record, instead of the typed block leaving the file
+/// with no line of its own.
+///
+/// Bug-catch: clear `typed_copies` without logging and nothing names it.
+#[test]
+fn c8_a_block_repeating_a_served_record_is_named_when_it_is_dropped() {
+    let path = test_file_path();
+    std::fs::write(
+        &path,
+        "2024-01-01 open Assets:Cash USD\n  openledger-author: \"peer-remote\"\n  \
+         openledger-lamport: \"1\"\n\n2024-01-01 open Assets:Cash USD\n",
+    )
+    .unwrap();
+    let (svc, logged) = capture_logs_at(tracing::Level::INFO, || {
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.finalize_operator_input();
+        svc
+    });
+    assert_eq!(svc.directive_count(), 1, "one record, served once");
+    let id = svc.all_directive_ids().into_iter().next().unwrap();
+    assert!(
+        logged.contains("repeats a record this node already holds and serves")
+            && logged.contains(&id),
+        "the dropped block is named: {logged}"
+    );
+    remove_ledger_and_journal(&path);
+}
+
+/// C8 with operator input beside it: the duplicate is named on the
+/// finalisation path that stamps typed lines too, not only on the early
+/// return taken when there is nothing to stamp.
+///
+/// Bug-catch: clear `typed_copies` without logging after the stamp loop's
+/// lifecycle checks and nothing names it.
+#[test]
+fn c8_the_duplicate_is_named_beside_other_typed_input() {
+    let path = test_file_path();
+    std::fs::write(
+        &path,
+        "2024-01-01 open Assets:Cash USD\n  openledger-author: \"peer-remote\"\n  \
+         openledger-lamport: \"1\"\n\n2024-01-01 open Assets:Cash USD\n\n\
+         2024-01-01 open Assets:Bank USD\n",
+    )
+    .unwrap();
+    let (svc, logged) = capture_logs_at(tracing::Level::INFO, || {
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        assert_eq!(
+            svc.unsigned_operator_input_count(),
+            1,
+            "premise: Bank is typed input"
+        );
+        svc.finalize_operator_input();
+        svc
+    });
+    assert_eq!(svc.directive_count(), 2, "Cash once, and Bank");
+    let cash = svc
+        .all_directive_ids()
+        .into_iter()
+        .find(|id| {
+            matches!(svc.get_directive(id), Some(Directive::Open(open)) if open.account == "Assets:Cash")
+        })
+        .unwrap();
+    assert!(
+        logged.contains("repeats a record this node already holds and serves")
+            && logged.contains(&cash),
+        "the dropped block is named: {logged}"
+    );
+    remove_ledger_and_journal(&path);
 }

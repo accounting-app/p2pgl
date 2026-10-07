@@ -1274,7 +1274,9 @@ const C_ID: &str = "53aba2c00f81056079896ce4c067f7ad43f72e1f42569cd6e7c4db640424
 const PRE_UPGRADE_CASH: &str = "1000000000000000000014";
 
 /// Stage `directives` into `service` as a peer's supply would arrive, retrying
-/// a `MISSING_PARENT` refusal once its parent lands (the orphan buffer's job).
+/// a `MISSING_PARENT` refusal once its parent lands (the orphan buffer's job)
+/// and an `ACCOUNT_NOT_OPEN` one once its account's `open` lands (gl-node's
+/// account wait — a `balance` waits there since R-15).
 /// Every body must pass the wire's re-parse first. Returns what never landed.
 fn sync_from_served(service: &mut LedgerService, directives: Vec<Directive>) -> Vec<String> {
     let mut pending = directives;
@@ -1290,7 +1292,11 @@ fn sync_from_served(service: &mut LedgerService, directives: Vec<Directive>) -> 
             }
             match service.stage_remote_directive(directive.clone()) {
                 Ok(_) => {}
-                Err(error) if error.error_code() == "MISSING_PARENT" => waiting.push(directive),
+                Err(error)
+                    if matches!(error.error_code(), "MISSING_PARENT" | "ACCOUNT_NOT_OPEN") =>
+                {
+                    waiting.push(directive)
+                }
                 Err(error) => refused.push(format!(
                     "{} refused [{}]: {error}",
                     compute_content_id(&directive),

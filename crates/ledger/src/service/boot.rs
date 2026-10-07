@@ -1328,6 +1328,23 @@ impl LedgerService {
         }
     }
 
+    /// Drop the blocks typed beside records this node still serves (T99 /
+    /// L-143) — the same records, so nothing adopts them and the compaction
+    /// writes each record once — saying so for each (C8 of
+    /// `docs/audits/RESIDUALS.md`), so a retyped block that leaves the file is
+    /// not a silent change.
+    pub(super) fn drop_typed_copies_as_duplicates(&mut self) {
+        for content_id in std::mem::take(&mut self.typed_copies).into_keys() {
+            info!(
+                id = %content_id,
+                file = %self.file_path.display(),
+                "a block typed into the ledger file repeats a record this node already holds \
+                 and serves; it is the same record, so the next compaction writes the record \
+                 once (L-143)"
+            );
+        }
+    }
+
     /// Give every directive [`Self::boot`] adopted as operator input its
     /// final envelope: this node's author id and, when a signer is installed,
     /// its signature (H-13).
@@ -1362,6 +1379,7 @@ impl LedgerService {
     /// were finalised.
     pub fn finalize_operator_input(&mut self) -> usize {
         if self.unsigned_operator_input.is_empty() {
+            self.drop_typed_copies_as_duplicates();
             return 0;
         }
         // M-54 (T79): an author the FILE spelled that is not this node. Boot
@@ -1446,7 +1464,7 @@ impl LedgerService {
         // T99 / L-143: a line typed beside a record still served is a
         // duplicate of it; nothing adopts it from here on, and the compaction
         // keeps the node-written copy.
-        self.typed_copies.clear();
+        self.drop_typed_copies_as_duplicates();
         // T84 / M-57, decision (16): the lamport, stamped here for the first
         // time — boot's was a placeholder that never moved the clock — from
         // the clock the signature pass and the L-87 release have settled, in

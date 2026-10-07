@@ -853,3 +853,93 @@ fn t98_a_hand_transaction_after_a_hand_close_is_data_at_boot_and_live() {
     );
     remove_ledger_and_journal(&path);
 }
+
+/// R-15: the file holds a `balance` to the rule a peer's is. A node-written
+/// assertion on an account with no `open` is held back by the served-set rule
+/// (kept in the file, not served) — no peer would take it — and one typed
+/// under a running node is refused.
+///
+/// Bug-catch: drop the `balance` arm of `unservable_history` and the history
+/// assertion is served; drop the check in `adopt_file_non_transaction` and
+/// the typed one is adopted.
+#[test]
+fn r15_a_balance_with_no_open_is_held_in_the_file_and_a_typed_one_is_refused() {
+    let path = test_file_path();
+    std::fs::write(
+        &path,
+        "2024-01-01 open Assets:Cash USD\n  openledger-author: \"peer-remote\"\n  \
+         openledger-lamport: \"1\"\n\n2024-01-02 balance Assets:Cash 0 USD\n  \
+         openledger-author: \"peer-remote\"\n  openledger-lamport: \"2\"\n\n\
+         2024-01-02 balance Assets:Ghost 0 USD\n  openledger-author: \"peer-remote\"\n  \
+         openledger-lamport: \"3\"\n",
+    )
+    .unwrap();
+    let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+    assert_eq!(
+        svc.directive_count(),
+        2,
+        "the open and its own assertion are served"
+    );
+    assert_eq!(svc.quarantined_count(), 1, "the ghost assertion is held");
+    svc.compact().unwrap();
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("Assets:Ghost"),
+        "held, not deleted: the compaction writes it back"
+    );
+
+    append_to_file(&path, "\n2024-01-03 balance Assets:Nowhere 0 USD\n");
+    let result = svc.reconcile_file().unwrap();
+    assert_eq!(result.new_directives, 0, "{result:?}");
+    assert_eq!(
+        result.rejected, 2,
+        "the typed assertion, and the held one judged again: {result:?}"
+    );
+    assert_eq!(svc.directive_count(), 2);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("Assets:Ghost"), "the held history line stays");
+    assert!(
+        !text.contains("Assets:Nowhere"),
+        "operator input a live reconcile refuses is dropped, as its summary says"
+    );
+    remove_ledger_and_journal(&path);
+}
+
+/// R-15 with T90 / L-126 on the live path: a complete-envelope `balance`
+/// pasted into the file under a running node, on an account no `open`
+/// admits, is history — the live reconcile refuses it but holds it in the
+/// file, as boot's served-set rule would keep it, instead of the
+/// re-persist deleting it.
+///
+/// Bug-catch: drop `hold_refused_file_entry` from the `balance` check in
+/// `adopt_file_non_transaction` and the rewrite deletes the record.
+#[test]
+fn r15_a_pasted_full_envelope_balance_with_no_open_is_held_live() {
+    let path = test_file_path();
+    std::fs::write(
+        &path,
+        "2024-01-01 open Assets:Cash USD\n  openledger-author: \"peer-remote\"\n  \
+         openledger-lamport: \"1\"\n",
+    )
+    .unwrap();
+    let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+    assert_eq!(svc.directive_count(), 1);
+
+    append_to_file(
+        &path,
+        "\n2024-01-02 balance Assets:Ghost 0 USD\n  openledger-author: \"peer-remote\"\n  \
+         openledger-lamport: \"2\"\n",
+    );
+    let result = svc.reconcile_file().unwrap();
+    assert_eq!(result.new_directives, 0, "{result:?}");
+    assert_eq!(result.rejected, 1, "{result:?}");
+    assert_eq!(svc.quarantined_count(), 1, "held, as boot would hold it");
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("Assets:Ghost"),
+        "the re-persist keeps what a restart would keep"
+    );
+    remove_ledger_and_journal(&path);
+}

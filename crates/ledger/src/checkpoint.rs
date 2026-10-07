@@ -694,10 +694,11 @@ mod tests {
     /// directives over the same dates and accounts.
     ///
     /// The two counts are independent on purpose. A `balance` directive is the
-    /// cheapest thing a peer can plant — `stage_remote_directive` routes it
-    /// through the `_ =>` catch-all with no lifecycle check and no requirement
-    /// that the account exist — so the assertion count is attacker-supplied,
-    /// and it used to *multiply* the cost of a whole-ledger rebuild.
+    /// cheapest thing a peer can plant — until R-15 (`docs/audits/RESIDUALS.md`)
+    /// `stage_remote_directive` admitted it with no requirement that the
+    /// account exist, and even now any number may sit on an opened account —
+    /// so the assertion count is attacker-supplied, and it used to *multiply*
+    /// the cost of a whole-ledger rebuild.
     fn assertion_load(txns: usize, assertions: usize) -> Vec<Directive> {
         let base = make_date(2024, 1, 1);
         let account = |i: usize| format!("Assets:A{:04}", i % LOAD_ACCOUNTS);

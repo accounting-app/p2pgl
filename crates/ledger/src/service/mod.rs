@@ -21,8 +21,8 @@ use crate::parse::{
 use crate::read_model::ReadModel;
 use crate::serialize::full_file_serialize;
 use crate::validate::{
-    validate_transaction, validate_transaction_as_author, validate_transaction_as_data,
-    AccountState, ValidationError,
+    validate_balance_as_data, validate_transaction, validate_transaction_as_author,
+    validate_transaction_as_data, AccountState, ValidationError,
 };
 
 mod access;

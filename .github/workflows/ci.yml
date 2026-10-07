@@ -50,6 +50,13 @@ jobs:
 
   audit:
     runs-on: ubuntu-latest
+    # audit-check reports through a check run on push and pull_request, which
+    # needs `checks: write`; without it the job fails after a clean audit
+    # ("Resource not accessible by integration"). Granted to this job only —
+    # the test job keeps the workflow's `contents: read`.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:

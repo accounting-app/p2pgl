@@ -71,6 +71,11 @@ fn ensure_every_callsite_is_interesting() {
 /// so this stays correct under `cargo test`'s thread-per-test parallelism —
 /// a concurrent test's logs never land in this buffer.
 fn capture_warnings<T>(body: impl FnOnce() -> T) -> (T, String) {
+    capture_logs_at(tracing::Level::WARN, body)
+}
+
+/// [`capture_warnings`] at `level` and above.
+fn capture_logs_at<T>(level: tracing::Level, body: impl FnOnce() -> T) -> (T, String) {
     ensure_every_callsite_is_interesting();
     use std::sync::{Arc, Mutex};
 
@@ -98,7 +103,7 @@ fn capture_warnings<T>(body: impl FnOnce() -> T) -> (T, String) {
     let subscriber = tracing_subscriber::fmt()
         .with_writer(buffer.clone())
         .with_ansi(false)
-        .with_max_level(tracing::Level::WARN)
+        .with_max_level(level)
         .finish();
     let value = tracing::subscriber::with_default(subscriber, body);
     let logged = String::from_utf8_lossy(&buffer.0.lock().unwrap()).into_owned();

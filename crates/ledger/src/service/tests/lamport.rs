@@ -915,3 +915,141 @@ fn test_a_rejected_remote_directive_does_not_move_the_clock() {
 
     std::fs::remove_file(path).ok();
 }
+
+/// B14 (`docs/audits/RESIDUALS.md`): the measurement behind the gradual-gap
+/// warning. 17 steps of just under 2^28 by one author pass 2^32 together:
+/// leave that author out and the remaining values jump more than 2^32 at
+/// once. 15 such steps do not; a value another author also holds stays; and
+/// a history that never passes 2^32 is not measured at all.
+#[test]
+fn b14_the_gap_left_by_removing_one_author() {
+    let step = (1u64 << 28) - 1;
+    let history = |steps: u64| {
+        let mut records = vec![(1u64, "peer-a")];
+        records.extend((1..=steps).map(|k| (1 + k * step, "peer-b")));
+        records.push((2 + steps * step, "peer-a"));
+        records
+    };
+    let (author, gap, top) =
+        gap_left_by_removing_an_author(history(17), None).expect("uncrossable");
+    assert_eq!(author, "peer-b");
+    assert_eq!(top, 2 + 17 * step);
+    assert_eq!(gap, top - 1);
+    assert!(gap > MAX_LAMPORT_ADVANCE && step < LAMPORT_GAP_WARN);
+    assert_eq!(gap_left_by_removing_an_author(history(15), None), None);
+    // Another author at one of the values keeps it in the history.
+    let mut shared = history(17);
+    shared.push((1 + 9 * step, "peer-c"));
+    assert_eq!(gap_left_by_removing_an_author(shared, None), None);
+    assert_eq!(
+        gap_left_by_removing_an_author([(1, "x"), (2, "y")], None),
+        None
+    );
+    // An author a warning already named is left out of the search.
+    assert_eq!(
+        gap_left_by_removing_an_author(history(17), Some("peer-b")),
+        None
+    );
+}
+
+/// B14: a history whose single gaps are all below the H-19 threshold, but
+/// whose one author advanced the clock past 2^32 in 17 steps, now draws a
+/// boot warning naming that author and the join remedy. Before, it booted
+/// silently, and a node joining after that author's removal was partitioned
+/// (0926 / 0927, "a blind spot since T83").
+///
+/// Bug-catch: drop the call to
+/// `warn_if_one_authors_steps_add_up_to_an_uncrossable_gap` and the boot is
+/// silent again.
+#[test]
+fn b14_boot_warns_when_one_authors_steps_add_up_past_the_ratchet() {
+    let step = (1u64 << 28) - 1;
+    let mut text = String::from(
+        "2024-01-01 open Assets:A0\n  openledger-author: \"peer-a\"\n  openledger-lamport: \"1\"\n",
+    );
+    for k in 1..=17u64 {
+        text.push_str(&format!(
+            "\n2024-01-01 open Assets:B{k}\n  openledger-author: \"peer-b\"\n  \
+             openledger-lamport: \"{}\"\n",
+            1 + k * step
+        ));
+    }
+    text.push_str(&format!(
+        "\n2024-01-01 open Assets:A1\n  openledger-author: \"peer-a\"\n  \
+         openledger-lamport: \"{}\"\n",
+        2 + 17 * step
+    ));
+    let path = test_file_path();
+    std::fs::write(&path, text).unwrap();
+    let (svc, logged) = capture_warnings(|| {
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.verify_own_history();
+        svc
+    });
+    assert_eq!(svc.directive_count(), 19);
+    assert!(
+        svc.lamport_gap() < LAMPORT_GAP_WARN,
+        "no single gap is diagnosed"
+    );
+    assert!(
+        logged.contains("advance the clock by more than 2^32 taken together")
+            && logged.contains("peer-b")
+            && logged.contains("p2p.joinFrom"),
+        "the gradual gap is diagnosed, names its author and states the join: {logged}"
+    );
+    std::fs::remove_file(path).ok();
+}
+
+/// B14 beside the single-gap warning: one author's lone jump of 2^29 draws
+/// the H-19 warning, and another author's 17 sub-2^28 steps past 2^32 must
+/// still be named — the single-gap warning names only the author at the top
+/// of its gap.
+///
+/// Bug-catch: call the B14 check only when no single gap is diagnosed and
+/// the second author's span goes unnamed.
+#[test]
+fn b14_a_single_gap_by_one_author_does_not_hide_another_authors_steps() {
+    let step = (1u64 << 28) - 1;
+    let jump = 1u64 << 29;
+    let mut text = String::from(
+        "2024-01-01 open Assets:A0\n  openledger-author: \"peer-a\"\n  openledger-lamport: \"1\"\n",
+    );
+    text.push_str(&format!(
+        "\n2024-01-01 open Assets:X\n  openledger-author: \"peer-x\"\n  \
+         openledger-lamport: \"{}\"\n",
+        1 + jump
+    ));
+    for k in 1..=17u64 {
+        text.push_str(&format!(
+            "\n2024-01-01 open Assets:B{k}\n  openledger-author: \"peer-b\"\n  \
+             openledger-lamport: \"{}\"\n",
+            1 + jump + k * step
+        ));
+    }
+    text.push_str(&format!(
+        "\n2024-01-01 open Assets:A1\n  openledger-author: \"peer-a\"\n  \
+         openledger-lamport: \"{}\"\n",
+        2 + jump + 17 * step
+    ));
+    let path = test_file_path();
+    std::fs::write(&path, text).unwrap();
+    let (svc, logged) = capture_warnings(|| {
+        let mut svc = LedgerService::boot(path.clone(), "test-peer".to_owned()).unwrap();
+        svc.verify_own_history();
+        svc
+    });
+    assert!(
+        svc.lamport_gap() >= LAMPORT_GAP_WARN,
+        "premise: one single gap"
+    );
+    assert!(
+        logged.contains("a lamport gap no honest mesh makes") && logged.contains("peer-x"),
+        "the single gap is diagnosed: {logged}"
+    );
+    assert!(
+        logged.contains("advance the clock by more than 2^32 taken together")
+            && logged.contains("peer-b"),
+        "and so is the other author's span: {logged}"
+    );
+    std::fs::remove_file(path).ok();
+}

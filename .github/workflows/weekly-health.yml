@@ -10,9 +10,12 @@ on:
     - cron: "0 6 * * 1"
   workflow_dispatch:
 
+# `checks: write`: on a manual run (workflow_dispatch) audit-check reports
+# through a check run, as in ci.yml; on the schedule it opens issues instead.
 permissions:
   contents: read
   issues: write
+  checks: write
 
 # Third-party actions are pinned to full commit SHAs, as in ci.yml (M-7); bump
 # both files together.

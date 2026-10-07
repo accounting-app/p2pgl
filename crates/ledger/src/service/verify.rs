@@ -109,6 +109,17 @@ impl LedgerService {
             if exempt.contains(content_id) {
                 continue;
             }
+            // R-15: a peer waits on the account of a `balance` whose account no
+            // `open` by its date admits, so this node does not serve one either.
+            if let Some(Directive::Balance(balance)) = self.dag.get(content_id) {
+                if let Err(error) = validate_balance_as_data(balance, &self.accounts) {
+                    unservable.insert(
+                        content_id.to_owned(),
+                        format!("a peer refuses it against the accounts this node serves: {error}"),
+                    );
+                }
+                continue;
+            }
             let Some(Directive::Transaction(txn)) = self.dag.get(content_id) else {
                 continue;
             };
@@ -266,7 +277,8 @@ impl LedgerService {
             ids = %ids.iter().cloned().collect::<Vec<_>>().join(", "),
             file = %self.file_path.display(),
             "ledger records QUARANTINED because no peer could adopt them: a parent this node \
-             does not serve, or a transaction the accounts it serves do not admit, and what \
+             does not serve, or a transaction or balance assertion the accounts it serves do \
+             not admit, and what \
              descends from them. Serving them would make everything this node writes \
              afterwards unadoptable by every peer. They return when a peer that holds them \
              re-supplies the missing parent and then them; a record no peer holds stays held \
@@ -274,7 +286,7 @@ impl LedgerService {
              missing record from a backup; or, for this node's own record whose envelope \
              lines were edited, delete that block's openledger-* lines so it is re-adopted \
              under the same id; or add the missing open, dated no later than the first \
-             transaction on the account (where the account's own open is served but dated \
+             transaction or assertion on the account (where the account's own open is served but dated \
              after it, correct that open's date instead); then restart. Otherwise rebuild \
              this node by the bootstrap join (H-23)"
         );
@@ -479,10 +491,12 @@ impl LedgerService {
     /// on the history this node serves (T89 / L-100) and worded by
     /// [`lamport_gap_verdict`] (L-111, L-113): a gap of at least
     /// [`LAMPORT_GAP_WARN`] between two consecutive lamports, naming the
-    /// author at the top of it.
+    /// author at the top of it — and then B14's summed span by any other
+    /// author.
     pub(super) fn warn_if_the_served_history_has_a_lamport_gap(&self) {
         let (gap, top) = self.lamport_gap_and_top();
         if gap < LAMPORT_GAP_WARN {
+            self.warn_if_one_authors_steps_add_up_to_an_uncrossable_gap(None);
             return;
         }
         let named = self
@@ -512,6 +526,50 @@ impl LedgerService {
             "the ledger history carries a lamport gap no honest mesh makes. Existing nodes \
              are unaffected. {}",
             lamport_gap_verdict(gap, without_named)
+        );
+        self.warn_if_one_authors_steps_add_up_to_an_uncrossable_gap(Some(&named));
+    }
+
+    /// The H-19 blind spot (B14 of `docs/audits/RESIDUALS.md`): no single gap
+    /// reaches [`LAMPORT_GAP_WARN`], but one author's records span more than
+    /// 2^32 taken together, so a joiner that refuses them — once the author is
+    /// off the allowlist — cannot cross the span by anti-entropy. `named` is
+    /// the author the single-gap warning already named, if it fired. A history
+    /// whose top is at most 2^32 costs one pass with no allocation.
+    fn warn_if_one_authors_steps_add_up_to_an_uncrossable_gap(&self, named: Option<&str>) {
+        let directives = self.dag.directives();
+        let top = directives
+            .iter()
+            .filter_map(|directive| directive.lamport_clock())
+            .max()
+            .unwrap_or(0);
+        if top <= MAX_LAMPORT_ADVANCE {
+            return;
+        }
+        let Some((author, gap, top)) = gap_left_by_removing_an_author(
+            directives.iter().filter_map(|directive| {
+                Some((
+                    directive.lamport_clock()?,
+                    directive_author(directive).unwrap_or("(unknown)"),
+                ))
+            }),
+            named,
+        ) else {
+            return;
+        };
+        warn!(
+            author = %author,
+            without_author = gap,
+            below = top - gap,
+            top,
+            file = %self.file_path.display(),
+            "the ledger history has no single lamport gap by this author that a warning \
+             names, but this author's records advance the clock by more than 2^32 taken \
+             together. Existing nodes are \
+             unaffected, and a node joining while the author is allowlisted crosses them. \
+             Once the author is off the allowlist, a joiner refuses those records and faces \
+             the whole span as one gap it cannot cross by anti-entropy (H-19). {}",
+            BOOTSTRAP_JOIN_REMEDY
         );
     }
 

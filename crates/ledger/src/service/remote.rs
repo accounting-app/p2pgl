@@ -325,6 +325,22 @@ impl LedgerService {
                     InsertResult::Duplicate { .. } => None,
                 }
             }
+            Directive::Balance(balance) => {
+                // R-15: an assertion is data on an account the ledger opened
+                // by its date. Refused until then with `AccountNotOpen`, which
+                // gl-node buffers on the account (as it does a transaction),
+                // so every arrival order admits the same assertions — and a
+                // peer can no longer add them on accounts that never existed.
+                validate_balance_as_data(balance, &self.accounts)?;
+                match self.dag.insert(directive.clone(), false)? {
+                    InsertResult::Inserted { content_id } => {
+                        self.read_model.index_directive(&directive);
+                        self.pending_ids.push(content_id.clone());
+                        Some(content_id)
+                    }
+                    InsertResult::Duplicate { .. } => None,
+                }
+            }
             _ => {
                 // All other directive types: insert directly.
                 match self.dag.insert(directive.clone(), false)? {

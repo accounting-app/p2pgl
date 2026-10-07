@@ -312,6 +312,20 @@ pub fn validate_transaction_as_data(
     validate_transaction_under(txn, accounts, LifecycleRule::Data)
 }
 
+/// I3 for a `balance` assertion as DATA (R-15): an `open` of its account dated
+/// on or before it, by the same rule a transaction is held to
+/// ([`AccountState::check_account_opened_by`]). Before, every path admitted a
+/// `balance` on any account at all, so one peer could add unlimited assertions
+/// on accounts the ledger never opened. A peer's assertion that fails this
+/// waits for the account's `open`, as a transaction does, so the admitted set
+/// does not depend on arrival order.
+pub fn validate_balance_as_data(
+    balance: &Balance,
+    accounts: &AccountState,
+) -> Result<(), ValidationError> {
+    accounts.check_account_opened_by(&balance.account, balance.date)
+}
+
 /// [`validate_transaction`] for THIS NODE'S OWN write (T98 / M-09 remainder,
 /// decision (54)): the lifecycle fold with its `close`s, except that a `close`
 /// is inert over an interval that already holds a transaction —

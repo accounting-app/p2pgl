@@ -7222,6 +7222,72 @@ pub(crate) mod tests {
         );
     }
 
+    /// R-15 — a peer's `balance` whose account `open` arrives later in the
+    /// batch waits on the account like a transaction, and lands once the
+    /// `open` does; one on an account no record opens is never admitted.
+    /// Before, both were admitted at once, so a peer could add assertions on
+    /// accounts the ledger never had.
+    ///
+    /// Bug-catch: drop `validate_balance_as_data` from
+    /// `stage_remote_directive` and both assertions merge at once.
+    #[tokio::test]
+    async fn r15_a_balance_before_its_account_open_waits_and_one_with_no_open_never_lands() {
+        let author = iroh::SecretKey::generate().public();
+        let allow = PeerAllowlist::parse(&[author.to_string()]).expect("allowlist");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let seeded = seed_mixed_source(temp_dir.path(), &author.to_string());
+
+        let balance = |account: &str, lamport: u64| {
+            let mut metadata = std::collections::BTreeMap::new();
+            metadata.insert("openledger-author".to_owned(), author.to_string());
+            metadata.insert("openledger-lamport".to_owned(), lamport.to_string());
+            make_supply_entry(&ledger::model::Directive::Balance(ledger::model::Balance {
+                date: NaiveDate::from_ymd_opt(2024, 1, 2).expect("valid date"),
+                account: account.to_owned(),
+                amount: Amount {
+                    number: rust_decimal::Decimal::ZERO,
+                    currency: "USD".to_owned(),
+                },
+                metadata,
+            }))
+        };
+        // Each assertion before any open; Assets:Cash's open after them.
+        let cash_assertion = balance("Assets:Cash", 40);
+        let entries = vec![
+            cash_assertion.clone(),
+            balance("Assets:Ghost", 41),
+            entry_for(&seeded.source, &seeded.open_cash),
+        ];
+
+        let sink: SharedLedger = Arc::new(RwLock::new(
+            LedgerService::boot(temp_dir.path().join("sink.bean"), "sink".to_owned())
+                .expect("boot sink"),
+        ));
+        let handler = make_handler(sink.clone(), allow);
+        let outcome =
+            apply_supply_entries(&handler, entries, iroh::SecretKey::generate().public()).await;
+        assert_eq!(
+            outcome.rejected, 0,
+            "a missing account is a wait, not a refusal"
+        );
+        assert_eq!(
+            outcome.buffered, 2,
+            "both assertions wait on their accounts"
+        );
+
+        let svc = sink.read().await;
+        assert!(
+            svc.contains_directive(&cash_assertion.id),
+            "the drain admitted the assertion once its account's open landed"
+        );
+        assert_eq!(svc.directive_count(), 2, "the open and its assertion only");
+        assert_eq!(
+            handler.orphan_buffer.read().await.len(),
+            1,
+            "the Assets:Ghost assertion still waits for an open that never comes"
+        );
+    }
+
     /// T29 (M-09) — the write-DoS. Before T29 a remote `close` was applied
     /// unconditionally with its error swallowed (`let _ =`), which shut the
     /// account on every replica and made every subsequent local append to it

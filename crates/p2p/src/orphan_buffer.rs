@@ -745,8 +745,13 @@ impl OrphanBuffer {
         }
         self.hint_order.push_back((now, id.to_owned()));
         // Forgotten hints leave their entry behind until it ages out; a peer
-        // churning hints must not grow the queue past twice the table's bound.
-        if self.hint_order.len() > 2 * MAX_PARENT_HINT_IDS {
+        // churning hints must not grow the queue past twice the hints the
+        // table can hold. A hint costs at least two ids (its own and one
+        // parent — none is recorded without a parent), so the table holds at
+        // most `MAX_PARENT_HINT_IDS / 2` hints. D6 (`docs/audits/RESIDUALS.md`):
+        // this compared the queue's HINTS with the table's IDS, `2 × 65,536`,
+        // which is four times the live maximum.
+        if self.hint_order.len() > 2 * (MAX_PARENT_HINT_IDS / 2) {
             let hints = &self.parent_hints;
             self.hint_order.retain(|(seen, id)| {
                 hints
@@ -1332,6 +1337,31 @@ mod tests {
         bounded.remember_parent_hint("one-more", &["p".to_owned()], now, None);
         assert!(bounded.known_missing_parents("one-more").is_empty());
         assert_eq!(bounded.parent_hints.len(), MAX_PARENT_HINT_IDS / 2);
+    }
+
+    /// D6 (`docs/audits/RESIDUALS.md`): a peer that keeps recording hints and
+    /// having them forgotten leaves stale entries in the expiry queue; the
+    /// queue is compacted once it holds twice the hints the table can hold
+    /// (`MAX_PARENT_HINT_IDS / 2`), never four times as many.
+    ///
+    /// Bug-catch: compare the queue with `2 * MAX_PARENT_HINT_IDS` again and
+    /// it grows to twice this bound.
+    #[test]
+    fn d6_the_hint_queue_stays_within_twice_the_live_hint_maximum() {
+        let mut buffer = OrphanBuffer::new();
+        let now = Instant::now();
+        let live_maximum = MAX_PARENT_HINT_IDS / 2;
+        for index in 0..4 * live_maximum {
+            let id = format!("h{index}");
+            buffer.remember_parent_hint(&id, &[format!("p{index}")], now, None);
+            buffer.forget_parent_hint(&id);
+            assert!(
+                buffer.hint_order.len() <= 2 * live_maximum,
+                "after {index} churned hints the queue holds {}",
+                buffer.hint_order.len()
+            );
+        }
+        assert!(buffer.parent_hints.is_empty());
     }
 
     /// L-107 (T88, decision (28)): one delivering peer's refused orphans may
