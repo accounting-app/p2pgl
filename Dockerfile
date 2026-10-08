@@ -18,8 +18,26 @@ FROM rust:1.91-slim@sha256:f75071363e7f4771769d4cf81b1b7b290e607f4d4459e8731f6ab
 
 WORKDIR /build
 
-# Copy workspace files.
+# Dependencies first, in a layer of their own. Only the manifests and the lock
+# file are copied, the workspace crates get stub sources, and every dependency
+# is compiled; Docker reuses this layer until Cargo.lock or a Cargo.toml
+# changes, so a source-only change rebuilds just the four workspace crates
+# (about a minute, instead of every crate again). The stubs' own artifacts are
+# then cleaned, so the binary below can only be built from the real sources —
+# release.sh checks that the image's binary reports the release version.
 COPY Cargo.toml Cargo.lock rustfmt.toml ./
+COPY crates/gl-node/Cargo.toml crates/gl-node/Cargo.toml
+COPY crates/ledger/Cargo.toml crates/ledger/Cargo.toml
+COPY crates/p2p/Cargo.toml crates/p2p/Cargo.toml
+COPY crates/security/Cargo.toml crates/security/Cargo.toml
+RUN mkdir -p crates/gl-node/src crates/ledger/src crates/p2p/src crates/security/src \
+    && echo 'fn main() {}' > crates/gl-node/src/main.rs \
+    && touch crates/ledger/src/lib.rs crates/p2p/src/lib.rs crates/security/src/lib.rs \
+    && cargo build --release --locked --bin gl-node \
+    && cargo clean --release -p gl-node -p ledger -p p2p -p security \
+    && rm -rf crates/*/src
+
+# The workspace sources.
 COPY crates/ crates/
 COPY testfixtures/ testfixtures/
 

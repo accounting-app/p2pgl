@@ -21,8 +21,9 @@ HTTP, iroh P2P, config), `security` (signing). Design and audit history live in
 - The `verifier` subagent runs the gate and revert checks and only reports; the
   `reviewer` subagent reviews the uncommitted diff against `REVIEW.md`. Both run
   before "ready to commit".
-- A feature starts as `docs/features/<name>/intent.md` then `plan.md`
-  (templates and the flow in `docs/features/README.md`), before any code.
+- New work starts as a build-log entry, `docs/build-log/NNN-<name>/` —
+  `intent.md` then `plan.md` before any code, and a `log.md` entry per unit
+  (templates and the flow in `docs/build-log/README.md`).
 - `.github/workflows/weekly-health.yml` runs the gate and `cargo audit` every
   Monday and opens an issue on failure.
 

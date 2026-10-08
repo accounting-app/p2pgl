@@ -21,7 +21,7 @@ Run three passes over the diff and the code it touches:
    the checked helpers, peers allowlisted, refusals fail closed. A change to a
    guard named after a finding (`H-xx`, `M-xx`, `L-xx`) needs its revert check
    to still fail its test.
-3. **Compliance** — matches `docs/features/<name>/plan.md` (or the tracker task
+3. **Compliance** — matches `docs/build-log/NNN-<name>/plan.md` (or the tracker task
    it implements) and `CLAUDE.md`: tests carry `Bug-catch:`, each new mechanism
    has a revert spec, README and CHANGELOG describe any behaviour change, network
    tests stay on loopback.

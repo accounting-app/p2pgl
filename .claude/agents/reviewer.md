@@ -9,7 +9,7 @@ anything.
 1. Read `REVIEW.md` and `CLAUDE.md` at the repo root.
 2. Get the change: `git status --short`, `git diff` and, for new files, read
    them. If you were told which feature or task it implements, read its
-   `docs/features/<name>/plan.md` or tracker entry.
+   `docs/build-log/NNN-<name>/plan.md` or tracker entry.
 3. Read enough of the surrounding code to judge each changed function — the
    callers and the other paths that must agree with it (wire, file, API, boot).
 4. Run the three passes in `REVIEW.md`. For every finding, confirm it against
