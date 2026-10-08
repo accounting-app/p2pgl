@@ -1,0 +1,30 @@
+{
+    "ledgerPath": "/data/ledger.bean",
+    "bindAddress": "0.0.0.0",
+    "port": 4000,
+    "watchLedgerFile": false,
+    "graphiql": false,
+    "cors": {
+        "allowedOrigins": []
+    },
+    "allowedHosts": [
+        "ledger.example.com"
+    ],
+    "trustedProxies": [],
+    "tls": {
+        "mode": "terminated"
+    },
+    "auth": {
+        "enabled": true,
+        "apiKey": ""
+    },
+    "signing": {
+        "enabled": true
+    },
+    "p2p": {
+        "enabled": true,
+        "secretKeyPath": "/data/iroh.secret",
+        "bootstrapEndpointIds": [],
+        "relayMode": "n0"
+    }
+}
