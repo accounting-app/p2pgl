@@ -480,6 +480,23 @@ pub struct P2pConfig {
     #[serde(default = "default_relay_mode")]
     pub relay_mode: String,
 
+    /// Where allowlisted peers can be reached directly:
+    /// `{ "<EndpointId>": ["host:port", …] }` (`docs/build-log/001-peer-discovery`).
+    /// Each key must be one of [`bootstrap_endpoint_ids`](Self::bootstrap_endpoint_ids):
+    /// an address is a hint for reaching a peer this node admits, never a reason
+    /// to admit one. Resolved at boot and every few minutes after
+    /// ([`crate::peer_addresses`]).
+    #[serde(default)]
+    pub peer_addresses: std::collections::BTreeMap<String, Vec<String>>,
+
+    /// The UDP port this node's P2P endpoint listens on, so peers can list it
+    /// in their `peerAddresses` (`docs/build-log/001-peer-discovery`). `0`, the
+    /// default, lets the system pick a free port at every boot — fine when
+    /// peers find this node through n0 or reach it only by dialling out, wrong
+    /// when they are told its address.
+    #[serde(default)]
+    pub listen_port: u16,
+
     // — Anti-entropy session bounds (R-7) —
     //
     // The T49/T58/T70 bounds had no config surface; these give them one. Every
@@ -557,6 +574,8 @@ impl std::fmt::Debug for P2pConfig {
             .field("swarm_topic", &crate::auth::redact(&self.swarm_topic))
             .field("mesh_id", &self.mesh_id.as_deref().map(crate::auth::redact))
             .field("relay_mode", &self.relay_mode)
+            .field("peer_addresses", &self.peer_addresses)
+            .field("listen_port", &self.listen_port)
             .field(
                 "anti_entropy_session_seconds",
                 &self.anti_entropy_session_seconds,
@@ -694,6 +713,8 @@ impl Default for P2pConfig {
             swarm_topic: default_swarm_topic(),
             mesh_id: None,
             relay_mode: default_relay_mode(),
+            peer_addresses: std::collections::BTreeMap::new(),
+            listen_port: 0,
             anti_entropy_session_seconds: default_anti_entropy_session_seconds(),
             anti_entropy_max_advert_pages: default_anti_entropy_max_advert_pages(),
             anti_entropy_max_advert_id_bytes: default_anti_entropy_max_advert_id_bytes(),
@@ -1259,6 +1280,7 @@ impl NodeConfig {
                     ));
                 }
             }
+            self.validate_peer_addresses(&allowlist)?;
             if self.p2p.swarm_topic == default_swarm_topic() {
                 return Err(ConfigError::Validation(
                     "p2p.swarmTopic must not be the public default \"openledger/transactions\" when p2p.enabled is true".to_owned(),
@@ -1625,6 +1647,24 @@ impl NodeConfig {
                  this entry would match nothing and every request would get 403 — list \"{}\" \
                  instead",
                 host.trim_end_matches('.')
+            )));
+        }
+        Ok(())
+    }
+
+    /// `p2p.peerAddresses` (`docs/build-log/001-peer-discovery`): every key is a
+    /// peer `bootstrapEndpointIds` admits — an address says where an admitted
+    /// peer is, it never admits one — and every value is 1 to
+    /// [`crate::peer_addresses::MAX_ADDRESSES_PER_PEER`] `host:port` addresses.
+    fn validate_peer_addresses(
+        &self,
+        allowlist: &p2p::allowlist::PeerAllowlist,
+    ) -> Result<(), ConfigError> {
+        let peers = crate::peer_addresses::PeerAddresses::from_config(&self.p2p.peer_addresses)
+            .map_err(ConfigError::Validation)?;
+        if let Some(stranger) = peers.peer_ids().find(|peer| !allowlist.admits(**peer)) {
+            return Err(ConfigError::Validation(format!(
+                "p2p.peerAddresses names {stranger}, which is not one of p2p.bootstrapEndpointIds — an address only says where an admitted peer is; add the peer to bootstrapEndpointIds first"
             )));
         }
         Ok(())
@@ -2260,6 +2300,58 @@ mod tests {
                 panic!("{bad}: refused");
             };
             assert!(format!("{error}").contains("p2p.joinFrom"), "{error}");
+        }
+    }
+
+    /// `p2p.peerAddresses` (`docs/build-log/001-peer-discovery`): addresses
+    /// for an allowlisted peer load; an address for a peer the allowlist does
+    /// not admit is refused — an address says where an admitted peer is, it
+    /// never admits one — and so are a malformed address, an empty list and a
+    /// key that is not an EndpointId, each naming the key.
+    ///
+    /// Bug-catch: drop the allowlist check in `validate_peer_addresses` and an
+    /// address for a stranger loads.
+    #[test]
+    fn test_peer_addresses_only_for_allowlisted_peers_and_well_formed() {
+        let peer_a = iroh::SecretKey::generate().public().to_string();
+        let stranger = iroh::SecretKey::generate().public().to_string();
+        let config_with = |addresses: &str| {
+            format!(
+                r#"{{ "ledgerPath": "./data/ledger.bean", "signing": {{ "enabled": true }},
+                "p2p": {{ "enabled": true, "bootstrapEndpointIds": ["{peer_a}"],
+                "swarmTopic": "my-org/ledger", "meshId": "my-org/ledger",
+                "relayMode": "disabled", "peerAddresses": {addresses} }} }}"#
+            )
+        };
+        let good = format!(r#"{{ "{peer_a}": ["ledger.example.com:4433", "203.0.113.7:4433"] }}"#);
+        let file = write_temp_config(&config_with(&good));
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        assert_eq!(config.p2p.peer_addresses[&peer_a].len(), 2);
+
+        for (bad, expected) in [
+            (
+                format!(r#"{{ "{stranger}": ["ledger.example.com:4433"] }}"#),
+                "not one of p2p.bootstrapEndpointIds",
+            ),
+            (
+                format!(r#"{{ "{peer_a}": ["https://ledger.example.com"] }}"#),
+                "is not a peer address",
+            ),
+            (format!(r#"{{ "{peer_a}": [] }}"#), "lists 0 addresses"),
+            (
+                r#"{ "not-an-id": ["ledger.example.com:4433"] }"#.to_owned(),
+                "is not an EndpointId",
+            ),
+        ] {
+            let file = write_temp_config(&config_with(&bad));
+            let Err(error) = NodeConfig::load_from_path(&file.path().to_path_buf()) else {
+                panic!("{bad}: refused");
+            };
+            let message = format!("{error}");
+            assert!(
+                message.contains("p2p.peerAddresses") && message.contains(expected),
+                "{bad}: {message}"
+            );
         }
     }
 

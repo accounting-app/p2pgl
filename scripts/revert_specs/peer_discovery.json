@@ -1,0 +1,114 @@
+{
+  "PD-R1-builder-without-the-lookup": {
+    "file": "crates/gl-node/src/p2p_service.rs",
+    "old": "    let builder = builder.address_lookup(address_lookup.clone());",
+    "new": "    let builder = builder;",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_peer_is_reached_at_its_configured_address_with_relays_off"
+      ]
+    ]
+  },
+  "PD-R2-refresh-never-runs": {
+    "file": "crates/gl-node/src/peer_addresses.rs",
+    "old": "        if self.is_empty() {",
+    "new": "        if true || self.is_empty() {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_peer_is_reached_at_its_configured_address_with_relays_off"
+      ]
+    ]
+  },
+  "PD-R3-address-for-a-stranger": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "peers.peer_ids().find(|peer| !allowlist.admits(**peer))",
+    "new": "peers.peer_ids().find(|_| false)",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "test_peer_addresses_only_for_allowlisted_peers_and_well_formed"
+      ]
+    ]
+  },
+  "PD-R4-refresh-piles-up-addresses": {
+    "file": "crates/gl-node/src/peer_addresses.rs",
+    "old": "            lookup.set_endpoint_info(EndpointAddr {",
+    "new": "            lookup.add_endpoint_info(EndpointAddr {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_refresh_replaces_a_peers_addresses_and_survives_an_outage"
+      ]
+    ]
+  },
+  "PD-R5-failed-address-forgets-its-socket": {
+    "file": "crates/gl-node/src/peer_addresses.rs",
+    "old": "let kept = last_known.get(&(*peer, index)).cloned().unwrap_or_default();",
+    "new": "let kept: Vec<SocketAddr> = Vec::new();",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_refresh_replaces_a_peers_addresses_and_survives_an_outage"
+      ]
+    ]
+  },
+  "PD-R6-mistyped-ip-taken-as-a-name": {
+    "file": "crates/gl-node/src/peer_addresses.rs",
+    "old": "        if host\n            .rsplit('.')",
+    "new": "        if false && host\n            .rsplit('.')",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_peer_address_is_host_and_port_and_nothing_else"
+      ]
+    ]
+  },
+  "PD-R7-warning-only-when-no-addresses-at-all": {
+    "file": "crates/gl-node/src/p2p_service.rs",
+    "old": "            .filter(|peer| !config.peer_addresses.contains_key(*peer))",
+    "new": "            .filter(|_| config.peer_addresses.is_empty())",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "relays_off_names_each_bootstrap_peer_without_an_address"
+      ]
+    ]
+  },
+  "PD-R8-listen-port-ignored": {
+    "file": "crates/gl-node/src/p2p_service.rs",
+    "old": "    let builder = if config.listen_port == 0 {",
+    "new": "    let builder = if true || config.listen_port == 0 {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_peer_is_reached_at_its_configured_address_with_relays_off"
+      ]
+    ]
+  }
+}

@@ -82,11 +82,14 @@
 # an EXISTING mesh, set meshId to your current swarmTopic verbatim — see the
 # README's `p2p.meshId` section.
 #
-# GraphiQL is off. p2p.relayMode is "disabled", and with it a node reaches no
-# peer — nothing yet gives it its peers' addresses, even on one Docker bridge —
-# so the three nodes run side by side but do not replicate. Set "n0" for them
-# to find each other through n0's public discovery and relays (CHANGELOG,
-# Known limits).
+# GraphiQL is off. p2p.relayMode is "disabled": a node reaches only the peers
+# its p2p.peerAddresses lists, and gl-node.docker.json lists none, so as shipped
+# the three nodes run side by side but do not replicate. To make them replicate
+# on this bridge, give each node's config its peers' EndpointIds (logged at
+# boot) in bootstrapEndpointIds, a fixed p2p.listenPort, and their addresses in
+# peerAddresses — e.g. "node-1:<its listenPort>" — or set "n0" to use n0's public
+# discovery and relays.
+# (docs/build-log/001-peer-discovery adds a relay service to this stack.)
 #
 # Each node gets its OWN volume and therefore its own .bean file. Pointing two
 # containers at one ledger volume now fails closed at startup on the

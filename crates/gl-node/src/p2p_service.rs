@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh::SecretKey;
@@ -44,22 +45,10 @@ pub async fn boot_p2p(
 ) -> Result<PeerNode, Box<dyn std::error::Error>> {
     let secret_key = node_secret_key.iroh_secret_key();
 
-    let builder = match config.relay_mode.as_str() {
-        "n0" => {
-            warn!("p2p.relayMode is n0 — endpoint uses public Iroh relays and discovery");
-            iroh::Endpoint::builder(presets::N0)
-        }
-        "disabled" => {
-            info!("p2p.relayMode is disabled — direct addresses only");
-            iroh::Endpoint::builder(presets::Minimal)
-        }
-        other => {
-            return Err(
-                format!("p2p.relayMode must be \"n0\" or \"disabled\", got \"{other}\"").into(),
-            );
-        }
-    };
-    let endpoint = builder.secret_key(secret_key).bind().await?;
+    let endpoint = endpoint_builder(config)?
+        .secret_key(secret_key)
+        .bind()
+        .await?;
 
     let node_id = endpoint.id();
     info!(
@@ -90,6 +79,71 @@ pub async fn boot_p2p(
     log_node_ready(config);
 
     Ok(node)
+}
+
+/// The endpoint `boot_p2p` binds, before its key: the relay profile from
+/// `p2p.relayMode`, plus an address lookup that `p2p.peerAddresses` fills
+/// (`docs/build-log/001-peer-discovery`) — created, wired and its refresh task
+/// started here, in one place, so the builder and the refresh cannot hold two
+/// different lookups. The lookup is added in every mode: with `"n0"` it sits
+/// beside n0's discovery, with `"disabled"` it is the only way this node finds
+/// a peer. Needs a Tokio runtime (the refresh task). Split out of `boot_p2p` so
+/// a test can bind the production builder on loopback.
+pub(crate) fn endpoint_builder(
+    config: &P2pConfig,
+) -> Result<iroh::endpoint::Builder, Box<dyn std::error::Error>> {
+    let peer_addresses = crate::peer_addresses::PeerAddresses::from_config(&config.peer_addresses)?;
+    let builder = match config.relay_mode.as_str() {
+        "n0" => {
+            warn!("p2p.relayMode is n0 — endpoint uses public Iroh relays and discovery");
+            iroh::Endpoint::builder(presets::N0)
+        }
+        "disabled" => {
+            info!("p2p.relayMode is disabled — direct addresses only");
+            iroh::Endpoint::builder(presets::Minimal)
+        }
+        other => {
+            return Err(
+                format!("p2p.relayMode must be \"n0\" or \"disabled\", got \"{other}\"").into(),
+            );
+        }
+    };
+    if config.relay_mode == "disabled" {
+        let unreachable: Vec<&String> = config
+            .bootstrap_endpoint_ids
+            .iter()
+            .filter(|peer| !config.peer_addresses.contains_key(*peer))
+            .collect();
+        if !unreachable.is_empty() {
+            warn!(
+                peers = ?unreachable,
+                "p2p.relayMode is disabled and these bootstrap peers have no p2p.peerAddresses entry: nothing tells this node where they are, so it cannot reach them — list their addresses in p2p.peerAddresses"
+            );
+        }
+    }
+    // `p2p.listenPort`: a fixed port peers can be told. IPv4 must bind (a
+    // port already in use stops boot, naming it); IPv6 may fail, as iroh's own
+    // default IPv6 bind may, on a machine without IPv6.
+    let builder = if config.listen_port == 0 {
+        builder
+    } else {
+        let port = config.listen_port;
+        builder
+            .bind_addr_with_opts(
+                (std::net::Ipv4Addr::UNSPECIFIED, port),
+                iroh::endpoint::BindOpts::default().set_is_default_route(true),
+            )?
+            .bind_addr_with_opts(
+                (std::net::Ipv6Addr::UNSPECIFIED, port),
+                iroh::endpoint::BindOpts::default()
+                    .set_is_default_route(true)
+                    .set_is_required(false),
+            )?
+    };
+    let address_lookup = MemoryLookup::new();
+    let builder = builder.address_lookup(address_lookup.clone());
+    peer_addresses.spawn_refresh(address_lookup);
+    Ok(builder)
 }
 
 /// The "P2P node ready" boot line, with the swarm topic redacted (M-32).
@@ -1524,6 +1578,160 @@ mod tests {
         );
 
         let _ = router_server.shutdown().await;
+    }
+
+    // ── 001-peer-discovery: a peer found by its configured address ───────
+
+    /// `p2p.peerAddresses` with relays off (`docs/build-log/001-peer-discovery`):
+    /// the production `endpoint_builder` carries the address lookup and starts
+    /// the refresh task, which resolves the configured `localhost:<port>`
+    /// through the system resolver (from `/etc/hosts`, no network) into it, and
+    /// a dial by the bare EndpointId — as every dial in the node is — reaches
+    /// the peer and syncs its records. Before, a `"disabled"` node had no way
+    /// to learn an address and reached no peer at all.
+    ///
+    /// The server listens on its configured `p2p.listenPort`, chosen before it
+    /// binds, so the client's address is written in advance, as in a real
+    /// deployment (iroh's default is a new random port at every boot).
+    ///
+    /// Bug-catch: drop the lookup from `endpoint_builder`, or make
+    /// `spawn_refresh` return early, and the dial finds no address; drop the
+    /// `listenPort` bind and the server listens elsewhere.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_peer_is_reached_at_its_configured_address_with_relays_off() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+
+        // The server listens on a port chosen in advance (`p2p.listenPort`),
+        // and the client is told that port before the server exists — as an
+        // operator writes both configs. Built with the production builder; the
+        // port mapper is turned off so nothing is sent off the machine.
+        let server_port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .and_then(|socket| socket.local_addr())
+            .expect("a free UDP port")
+            .port();
+        let server_config = P2pConfig {
+            enabled: true,
+            relay_mode: "disabled".to_owned(),
+            listen_port: server_port,
+            ..P2pConfig::default()
+        };
+        let endpoint_server = endpoint_builder(&server_config)
+            .expect("production builder")
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+            .alpns(vec![p2p::protocol::ANTI_ENTROPY_ALPN.to_vec()])
+            .bind()
+            .await
+            .expect("bind the server on its listen port");
+        let server_id = endpoint_server.id();
+        assert!(
+            endpoint_server
+                .bound_sockets()
+                .iter()
+                .any(|socket| socket.is_ipv4() && socket.port() == server_port),
+            "the server listens on p2p.listenPort: {:?}",
+            endpoint_server.bound_sockets()
+        );
+
+        let config = P2pConfig {
+            enabled: true,
+            relay_mode: "disabled".to_owned(),
+            bootstrap_endpoint_ids: vec![server_id.to_string()],
+            peer_addresses: std::collections::BTreeMap::from([(
+                server_id.to_string(),
+                vec![format!("localhost:{server_port}")],
+            )]),
+            ..P2pConfig::default()
+        };
+        // The production builder — its lookup and refresh task included —
+        // kept on loopback (LuLu, CLAUDE.md).
+        let endpoint_client = endpoint_builder(&config)
+            .expect("production builder")
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0")
+            .expect("a loopback bind address")
+            .alpns(vec![p2p::protocol::ANTI_ENTROPY_ALPN.to_vec()])
+            .bind()
+            .await
+            .expect("bind the client");
+        let client_id = endpoint_client.id();
+        wait_until_dialable(&endpoint_client).await;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server_path = temp_dir.path().join("server.bean");
+        write_open_directive_ledger(&server_path, 5, &server_id.to_string());
+        let ledger_server: SharedLedger = Arc::new(RwLock::new(
+            ledger::service::LedgerService::boot(server_path, server_id.to_string())
+                .expect("boot server ledger"),
+        ));
+        let ledger_client: SharedLedger = Arc::new(RwLock::new(
+            ledger::service::LedgerService::boot(
+                temp_dir.path().join("client.bean"),
+                client_id.to_string(),
+            )
+            .expect("boot client ledger"),
+        ));
+        let handler_server = make_handler(
+            ledger_server.clone(),
+            PeerAllowlist::parse(&[client_id.to_string()]).expect("server allowlist"),
+        );
+        let handler_client = make_handler_with_timeouts(
+            ledger_client.clone(),
+            PeerAllowlist::parse(&config.bootstrap_endpoint_ids).expect("client allowlist"),
+            AntiEntropyTimeouts {
+                connect: Duration::from_secs(2),
+                io: Duration::from_secs(5),
+                ..AntiEntropyTimeouts::default()
+            },
+        );
+        let router_server = Router::builder(endpoint_server.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler_server)
+            .spawn();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            exchange_with_peer(&endpoint_client, server_id, &handler_client).await;
+            let count = ledger_client.read().await.directive_count();
+            if count == 5 {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                let _ = router_server.shutdown().await;
+                panic!("the client never reached the server at its configured address: {count} of 5 records");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let _ = router_server.shutdown().await;
+    }
+
+    /// With relays off, a bootstrap peer that has no `p2p.peerAddresses` entry
+    /// cannot be reached, and boot says so, naming that peer — not the peers
+    /// that do have addresses. Before, such a node failed every dial in
+    /// silence.
+    ///
+    /// Bug-catch: drop the warning, or check only whether `peerAddresses` is
+    /// empty, and a peer left out of it goes unnamed.
+    #[tokio::test]
+    async fn relays_off_names_each_bootstrap_peer_without_an_address() {
+        let with_address = iroh::SecretKey::generate().public().to_string();
+        let without_address = iroh::SecretKey::generate().public().to_string();
+        let config = P2pConfig {
+            enabled: true,
+            relay_mode: "disabled".to_owned(),
+            bootstrap_endpoint_ids: vec![with_address.clone(), without_address.clone()],
+            peer_addresses: std::collections::BTreeMap::from([(
+                with_address.clone(),
+                vec!["127.0.0.1:9".to_owned()],
+            )]),
+            ..P2pConfig::default()
+        };
+        let (built, logged) = capture_info(|| endpoint_builder(&config));
+        built.expect("builds");
+        assert!(
+            logged.contains("have no p2p.peerAddresses entry") && logged.contains(&without_address),
+            "{logged}"
+        );
+        assert!(!logged.contains(&with_address), "{logged}");
     }
 
     // ── H-10: one stuck peer must not stop the scheduler ─────────────────

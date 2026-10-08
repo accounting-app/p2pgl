@@ -9,6 +9,7 @@ mod http_server;
 mod ledger_commit;
 mod ledger_lock;
 mod p2p_service;
+mod peer_addresses;
 mod peer_connections;
 mod rate_limit;
 mod request_guard;

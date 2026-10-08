@@ -7,7 +7,18 @@ break compatibility.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **`p2p.peerAddresses`** — where each allowlisted peer listens,
+  `{ "<EndpointId>": ["host:port", …] }`. Host names are resolved at boot and
+  every five minutes. With `relayMode: "disabled"` a node now reaches the peers
+  listed here, with no third party involved; before, it reached no peer at
+  all. An address is accepted only for a peer in `bootstrapEndpointIds`. An
+  older binary refuses a config with this key
+  (`docs/build-log/001-peer-discovery`).
+- **`p2p.listenPort`** — the UDP port the P2P endpoint listens on, so other
+  nodes can list it in their `peerAddresses`. The default, `0`, keeps today's
+  behaviour: a random port at every boot. A port already in use stops boot.
 
 ## [0.1.0] — 2026-10-07
 

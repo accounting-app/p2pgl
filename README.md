@@ -546,6 +546,8 @@ signing node without it refuses to boot, and the refusal names that remedy.
 | `p2p.antiEntropyAcceptRefillMilliseconds` | `2000` | One accept token back per this interval. `100`–`30000` |
 | `p2p.antiEntropyMaxConcurrentExchanges` | `8` | Outbound anti-entropy exchanges this node runs at once, across all peers; past it, peers wait their turn in order. Each exchange against a hostile peer can hold ~130–150 MiB at worst. `1`–`64` |
 | `p2p.antiEntropySupplyBackoffSeconds` | `60` | When a peer's batch would not fit under the 64 MiB ledger cap, that peer's `Supply` is not applied again for this long (one warning per deferral). `5`–`3600` |
+| `p2p.listenPort` | `0` | UDP port the P2P endpoint listens on. `0` picks a new random port at every boot; set a fixed port on any node whose address other nodes list in `peerAddresses`, and open it (UDP) in the firewall |
+| `p2p.peerAddresses` | `{}` | Where allowlisted peers listen: `{ "<EndpointId>": ["host:port", …] }`, 1–16 addresses each, every key one of `bootstrapEndpointIds`; names re-resolved every 5 minutes — see [Relay mode](#relay-mode-p2prelaymode) |
 | `p2p.relayMode` | `"n0"` | `"n0"` (public Iroh relays and discovery) or `"disabled"` (direct addresses only). Anything else is refused at boot — see [Relay mode](#relay-mode-p2prelaymode) |
 | `p2p.swarmTopic` | `openledger/transactions` | Gossip topic (and, before `meshId` existed, the signature domain); required unique on a public bind. Same form as `meshId`: non-empty, no surrounding whitespace, ASCII letters, digits and `- _ . : /`, up to 128 bytes |
 | `p2p.meshId` | *(unset)* | Mesh identity bound into every signature. **Required when `signing.enabled`** — a signing node without it refuses to boot. **Existing mesh: your current `swarmTopic`, verbatim** — any other value invalidates every signature already in the mesh. New mesh: a random UUID — see below |
@@ -681,9 +683,30 @@ which EndpointIds it talks to, and when and how much. That is why a node on
 `"n0"` logs a warning at every boot.
 
 `"disabled"` builds the endpoint with no relay and no discovery, so nothing
-about the node is published anywhere. The cost is reachability: peers connect
-on direct addresses only, and nothing in the config supplies those addresses,
-so check that your peers can actually connect before relying on it.
+about the node is published anywhere. Peers then connect on direct addresses
+only, and a node learns them from **`p2p.peerAddresses`**: each allowlisted
+peer's EndpointId mapped to where it listens —
+
+```json
+"peerAddresses": {
+  "<peer EndpointId>": ["ledger.acme.com:4433", "203.0.113.7:4433"]
+}
+```
+
+Each key must be one of `bootstrapEndpointIds` (an address says where an
+admitted peer is; it never admits one), with 1 to 16 addresses written
+`host:port` or `[v6]:port` (an incomplete IP such as `203.0.113:4433` is
+refused — the system resolver would read it as another host). Host names are
+resolved at boot and every five minutes after, so a server whose IP changes is
+followed; a name that does not resolve is logged and retried, and that
+address's last known IPs are kept meanwhile. With `"disabled"`, a bootstrap peer
+that has no `peerAddresses` entry cannot be reached, and boot names it. The
+port in an address is the peer's **`p2p.listenPort`** (UDP): by default a node
+listens on a new random port at every boot, so set a fixed one on every node
+others reach by address, and open it in the firewall. The peer must accept connections at that
+address: a server with a public address and an open port, or a machine on the
+same network. `peerAddresses` also works beside `"n0"`: its addresses are tried
+along with whatever n0's discovery finds.
 
 ### Mesh identity (`p2p.meshId`)
 

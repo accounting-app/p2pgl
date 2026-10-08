@@ -36,7 +36,7 @@ These **boot without being set, but the node is not ready** until they are:
 | `allowedHosts` | `ledger.example.com` matches no real request: every API call gets `403`. Set the host name clients use through the terminator. |
 | `trustedProxies` | Every client behind the terminator shares one rate-limit bucket (boot warns). Set the exact IP address the terminator connects from. |
 | `p2p.bootstrapEndpointIds` | Empty: the node accepts writes but **takes no records from any peer** — it is a mesh of one, and boot only says so at INFO. List the EndpointIds of the other nodes (each logs its own at boot: `Iroh endpoint bound node_id=…`). |
-| `p2p.relayMode` | `"n0"`, the only mode in which nodes reach each other today: n0's public discovery and relays connect them, and see each node's IP address, its peers and its traffic timing — not ledger data. With `"disabled"` a node reaches **no peer at all**, on any machine, because nothing yet tells it where its peers are (CHANGELOG, *Known limits*). |
+| `p2p.relayMode` | `"n0"` (the default): n0's public discovery and relays connect the nodes, and see each node's IP address, its peers and its traffic timing — not ledger data. `"disabled"`: no third party; a node reaches the peers listed in `p2p.peerAddresses` (`host:port` per peer, which must accept connections there — a server with a public address, or the same network), and boot names any bootstrap peer without an entry, since it cannot be reached. A node others reach by address needs a fixed `p2p.listenPort` (UDP), open in its firewall. |
 
 ## What a node keeps
 
