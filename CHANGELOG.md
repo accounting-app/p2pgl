@@ -1,18 +1,56 @@
 # Changelog
 
 All notable changes to this project are recorded here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). No versioned release
-has been cut yet.
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
+[Semantic Versioning](https://semver.org/) — below 1.0, a minor version may
+break compatibility.
 
-## [Unreleased] — security hardening (audits 0922, 0922-v2)
+## [Unreleased]
 
-This release fixes the findings in two audits:
+Nothing yet.
+
+## [0.1.0] — 2026-10-07
+
+The first release: a peer-to-peer, append-only, double-entry ledger in the
+Beancount format, with a GraphQL API over HTTP and replication over Iroh QUIC.
+
+**Status: pilot.** Its tests run nodes on one machine, over loopback; it has
+not yet run across real networks. Run it beside your existing books
+before relying on it.
+
+**Security.** Every finding of the security audits (`docs/audits/`, from
+`CLAUDE_SECURITY_AUDIT_0820.md` to `SECURITY_AUDIT_0927.md`) is closed: fixed,
+or — for the few limits this release keeps — accepted with its reason in
+[docs/audits/RESIDUALS.md](docs/audits/RESIDUALS.md).
+
+**Known limits.**
+
+- No TLS in the node: on any non-loopback bind the API must sit behind an HTTPS
+  terminator (`tls.mode: "terminated"`).
+- A node built before Format v2 can neither read v2 records nor speak the v2
+  wire; every node of a mesh runs this release or later.
+- Nodes on different machines find each other only through n0's public
+  discovery and relay service (`p2p.relayMode: "n0"`, the default). Ledger
+  traffic stays end-to-end encrypted, but n0 sees each node's IP address, its
+  peers and its traffic timing. With `"disabled"` there is no way yet to give a
+  node its peers' addresses, so it reaches no peer at all — on another machine,
+  the same host or a Docker bridge.
+- Pad synthesis is not wired in: a `pad` directive is kept and replicated but
+  changes no balance.
+
+> **First release:** the *Breaking* entries below describe changes from
+> pre-release builds. A fresh install can skip them; anyone who ran a
+> pre-release build reads them first.
+
+The entries below were written as the work landed, starting with the two
+audits:
 [SECURITY_AUDIT_0922.md](docs/audits/SECURITY_AUDIT_0922.md), tracked in
 [docs/audits/OUTSTANDING_TASKS_09_22.md](docs/audits/OUTSTANDING_TASKS_09_22.md) (T46–T60),
 and [SECURITY_AUDIT_0922-v2.md](docs/audits/SECURITY_AUDIT_0922-v2.md), tracked in
 [docs/audits/OUTSTANDING_TASKS_09_22_v2.md](docs/audits/OUTSTANDING_TASKS_09_22_v2.md)
-(T61–T71). Each entry names its finding ID and task. For the detail and any
-known residuals, see that task's "Done" note in the tracker.
+(T61–T71); the later audits are tracked in `docs/audits/OUTSTANDING_TASKS_09_23.md`
+to `OUTSTANDING_TASKS_09_27.md`. Each entry names its finding ID and task. For
+the detail and any known residuals, see that task's "Done" note in the tracker.
 
 > **Upgrading:** read *Breaking* first. Config files are parsed with
 > `deny_unknown_fields`, so an **older binary refuses a config that uses any key

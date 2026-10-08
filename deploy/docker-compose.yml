@@ -19,13 +19,13 @@
 # `deploy/.env.example` is the committed template and holds no secret.
 #
 # Each node exposes, ON THE HOST LOOPBACK INTERFACE ONLY:
-#   - node-0: http://127.0.0.1:3000/graphql  (POST; set X-Api-Key)
-#   - node-1: http://127.0.0.1:3001/graphql
-#   - node-2: http://127.0.0.1:3002/graphql
+#   - node-0: http://127.0.0.1:4000/graphql  (POST; set X-Api-Key)
+#   - node-1: http://127.0.0.1:4001/graphql
+#   - node-2: http://127.0.0.1:4002/graphql
 #   - All nodes: GET /health for health checks
 #
-# ── Why the ports are published as "127.0.0.1:PORT:3000" (L-03) ───────────────
-# `"3000:3000"` publishes on 0.0.0.0, i.e. every host interface. This stack
+# ── Why the ports are published as "127.0.0.1:PORT:4000" (L-03) ───────────────
+# `"4000:4000"` publishes on 0.0.0.0, i.e. every host interface. This stack
 # declares tls.mode "terminated" in gl-node.docker.json but contains no
 # terminator, so all-interfaces publishing served the writable GraphQL API as
 # plaintext HTTP to anything that could route to the host — the API key would
@@ -82,8 +82,11 @@
 # an EXISTING mesh, set meshId to your current swarmTopic verbatim — see the
 # README's `p2p.meshId` section.
 #
-# GraphiQL is off. p2p.relayMode is disabled (same Docker bridge); set "n0"
-# only when peers must traverse NAT via public Iroh relays.
+# GraphiQL is off. p2p.relayMode is "disabled", and with it a node reaches no
+# peer — nothing yet gives it its peers' addresses, even on one Docker bridge —
+# so the three nodes run side by side but do not replicate. Set "n0" for them
+# to find each other through n0's public discovery and relays (CHANGELOG,
+# Known limits).
 #
 # Each node gets its OWN volume and therefore its own .bean file. Pointing two
 # containers at one ledger volume now fails closed at startup on the
@@ -97,7 +100,7 @@ services:
       dockerfile: Dockerfile
     container_name: gl-node-0
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:4000:4000"
     volumes:
       - node0-data:/data
       - ./gl-node.docker.json:/data/gl-node.config.json:ro
@@ -120,7 +123,7 @@ services:
       dockerfile: Dockerfile
     container_name: gl-node-1
     ports:
-      - "127.0.0.1:3001:3000"
+      - "127.0.0.1:4001:4000"
     volumes:
       - node1-data:/data
       - ./gl-node.docker.json:/data/gl-node.config.json:ro
@@ -146,7 +149,7 @@ services:
       dockerfile: Dockerfile
     container_name: gl-node-2
     ports:
-      - "127.0.0.1:3002:3000"
+      - "127.0.0.1:4002:4000"
     volumes:
       - node2-data:/data
       - ./gl-node.docker.json:/data/gl-node.config.json:ro

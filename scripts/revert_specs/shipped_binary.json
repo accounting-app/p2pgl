@@ -1,0 +1,44 @@
+{
+  "SB-R1-health-check-probes-nothing": {
+    "file": "crates/gl-node/src/main.rs",
+    "old": "        Some(\"--health-check\") => CliAction::HealthCheck,",
+    "new": "        Some(\"--health-check\") => CliAction::Version,",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "the_shipped_binary"
+      ]
+    ]
+  },
+  "SB-R2-env-api-key-ignored": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "Self::load_from_path_with_env_api_key(config_path, std::env::var(API_KEY_ENV_VAR).ok())",
+    "new": "Self::load_from_path_with_env_api_key(config_path, None)",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "the_shipped_binary"
+      ]
+    ]
+  },
+  "SB-R3-no-sigterm-handler": {
+    "file": "crates/gl-node/src/main.rs",
+    "old": "        signal::unix::signal(signal::unix::SignalKind::terminate())\n            .expect(\"failed to install SIGTERM handler\")\n            .recv()\n            .await;",
+    "new": "        std::future::pending::<()>().await;",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "the_shipped_binary"
+      ]
+    ]
+  }
+}

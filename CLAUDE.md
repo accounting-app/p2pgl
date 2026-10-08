@@ -14,6 +14,10 @@ HTTP, iroh P2P, config), `security` (signing). Design and audit history live in
   `cargo test -p p2p --test <file> -- <filter>` — one test or area.
 - `scripts/revert_check.py scripts/revert_specs/<file>.json [NAME…]` — revert
   checks (below). `--check` validates anchors without building.
+- `crates/gl-node/tests/shipped_binary.rs` starts the built binary and drives
+  it over loopback HTTP; with `GL_NODE_PREVIOUS_BINARY` it also rehearses an
+  upgrade and rollback. `scripts/release.sh` builds and checks a release of the
+  committed tree (`docs/RELEASE.md`); operators follow `docs/OPERATIONS.md`.
 - The `verifier` subagent runs the gate and revert checks and only reports; the
   `reviewer` subagent reviews the uncommitted diff against `REVIEW.md`. Both run
   before "ready to commit".

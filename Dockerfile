@@ -63,7 +63,7 @@ ENV GL_NODE_CONFIG=/data/gl-node.config.json
 ENV RUST_LOG=info
 
 # Expose HTTP port (configurable via config).
-EXPOSE 3000
+EXPOSE 4000
 
 # Health check (§2.9) — probes GET /health on the running process.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

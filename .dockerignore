@@ -1,0 +1,23 @@
+# The image is built from Cargo.toml, Cargo.lock, rustfmt.toml, crates/ and
+# testfixtures/ only (see Dockerfile). Everything else stays out of the build
+# context — above all build output, ledgers and key material, which must never
+# be sent to the Docker daemon, let alone baked into a layer. `**/` matters:
+# a bare pattern matches only at the context root, and crates/ is copied whole.
+**/target/
+.git/
+.github/
+.claude/
+docs/
+deploy/
+config/
+scripts/
+**/*.bean
+!testfixtures/*.bean
+**/*.bean.lock
+**/*.bean.journal
+**/*.bean.journal.torn-*
+**/*.key
+**/*.secret
+**/.env
+**/data/
+gl-node.config.json
