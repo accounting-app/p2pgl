@@ -28,6 +28,7 @@ names what is missing:
 | `p2p.swarmTopic` | A topic of your own for this mesh, e.g. `openledger/<uuid>`; the public default is refused. The same value on every node of the mesh. |
 | `p2p.meshId` | **New mesh:** a fresh random UUID (`uuidgen`), the same on every node. **Existing mesh:** its current `swarmTopic`, copied byte for byte (README, *Mesh identity*). Never reuse a value from this repository or another mesh. |
 | `GL_NODE_API_KEY` (environment) | `openssl rand -hex 32`, a different key per node. Keep it out of the config file and out of shell history (a `.env` file only the node's user can read). |
+| `p2p.relayUrl` **or** `p2p.peerAddresses` | How the nodes find each other — the template runs `relayMode: "custom"`, which never uses n0 and refuses to boot with neither. **`relayUrl`**: `https://<your relay>` (see *Running a relay*), the same on every node; nodes behind routers reach each other through it. **`peerAddresses`**: each peer's `host:port`, for nodes with reachable addresses — and then a fixed `p2p.listenPort` (UDP) on every node, open in its firewall. Both together is fine. |
 
 These **boot without being set, but the node is not ready** until they are:
 
@@ -35,8 +36,60 @@ These **boot without being set, but the node is not ready** until they are:
 |---|---|
 | `allowedHosts` | `ledger.example.com` matches no real request: every API call gets `403`. Set the host name clients use through the terminator. |
 | `trustedProxies` | Every client behind the terminator shares one rate-limit bucket (boot warns). Set the exact IP address the terminator connects from. |
-| `p2p.bootstrapEndpointIds` | Empty: the node accepts writes but **takes no records from any peer** — it is a mesh of one, and boot only says so at INFO. List the EndpointIds of the other nodes (each logs its own at boot: `Iroh endpoint bound node_id=…`). |
-| `p2p.relayMode` | `"custom"` with `p2p.relayUrl` (recommended for production): the mesh's own relay connects the nodes, even behind routers, and n0 sees nothing. `"n0"` (the default): n0's public discovery and relays connect the nodes, and see each node's IP address, its peers and its traffic timing — not ledger data. `"disabled"`: no third party; a node reaches the peers listed in `p2p.peerAddresses` (`host:port` per peer, which must accept connections there — a server with a public address, or the same network), and boot names any bootstrap peer without an entry, since it cannot be reached. A node others reach by address needs a fixed `p2p.listenPort` (UDP), open in its firewall. |
+| `p2p.bootstrapEndpointIds` | Empty: the node accepts writes but **takes no records from any peer** — it is a mesh of one, and boot only says so at INFO. List the EndpointIds of the other nodes: run `gl-node --node-id` on each (same config and key path as the node; it creates the key on first use and starts nothing). |
+
+## Running a relay
+
+A mesh whose nodes sit behind routers (offices, laptops) needs a relay: a
+small server with a public address that every node connects out to, and that
+passes their traffic when they cannot reach each other directly. It is the
+official `iroh-relay` server; `deploy/iroh-relay/` builds it at the version the
+nodes use. Traffic through it stays end-to-end encrypted — the relay sees which
+nodes talk to each other and when, never ledger data — and it is yours, so n0
+sees nothing.
+
+1. **A server and a name.** Any small Linux server with a public IP. Point a
+   DNS name at it (`relay.example.com`), and open TCP 443 and 80 and UDP 7842.
+   Port 443 must reach the relay directly — no proxy that terminates TLS in
+   front of it: the relay serves its own HTTPS, and Let's Encrypt validates it
+   on that port.
+2. **The config.** Copy `deploy/iroh-relay/relay.toml.example` to `relay.toml`
+   and fill in the hostname, a contact address for Let's Encrypt, and the
+   allowlist: the EndpointId of **every node of the mesh** (`gl-node --node-id`
+   on each). The relay obtains and renews its certificate from Let's Encrypt
+   by itself. Nodes accept only a certificate from a public authority; a relay
+   with a company's own certificates is planned (`relayCaCert`), not supported
+   yet.
+3. **Run it.**
+   ```bash
+   docker build -t openledger/iroh-relay:1.0.3 deploy/iroh-relay
+   docker run -d --restart unless-stopped --name iroh-relay \
+     -p 80:80 -p 443:443 -p 7842:7842/udp \
+     -v "$(pwd)/relay.toml:/etc/iroh-relay/relay.toml:ro" \
+     -v iroh-relay-certs:/var/lib/iroh-relay \
+     openledger/iroh-relay:1.0.3
+   ```
+4. **The nodes.** Each sets `"relayMode": "custom"` and
+   `"relayUrl": "https://relay.example.com"` — one relay per mesh, the same URL
+   on every node. A node's boot log then says `p2p.relayMode is custom — the
+   mesh's own relay and direct addresses only; nothing goes to n0`.
+5. **Adding or removing a node:** edit the allowlist and restart the relay
+   (`docker restart iroh-relay`); nodes reconnect on their own. The image
+   refuses to start without `relay.toml` mounted, rather than run open. A node not on
+   the allowlist is refused outright — it never comes online at the relay.
+
+**One relay per mesh.** A node registers at exactly one relay, and that is
+where its peers look for it. If the relay is down, nodes that can reach each
+other directly (same network, or `peerAddresses`) keep syncing; the rest wait
+until it is back. Watch it like any service: that the container is running
+and `https://relay.example.com/` answers, and its log (`docker logs
+iroh-relay`) — a node it refuses shows as a `not authorized` warning, which
+does not name the node, so compare the allowlist with the nodes' ids when one
+cannot connect.
+
+For a **hosted relay serving many customers**, the example config shows an HTTP
+check instead of the allowlist: the relay asks your service about each
+connecting node, so admitting or removing one needs no restart.
 
 ## What a node keeps
 

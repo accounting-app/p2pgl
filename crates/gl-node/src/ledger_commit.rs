@@ -796,6 +796,7 @@ pub(crate) mod near_cap {
 
 #[cfg(test)]
 mod tests {
+    use crate::graphql::ExecuteAsOperator;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -948,8 +949,9 @@ mod tests {
 
         let timed_out = tokio::time::timeout(
             Duration::from_millis(150),
-            schema
-                .execute(r#"mutation { openAccount(name: "Assets:Timeout", date: "2024-01-01") }"#),
+            schema.execute_as_operator(
+                r#"mutation { openAccount(name: "Assets:Timeout", date: "2024-01-01") }"#,
+            ),
         )
         .await;
 
@@ -964,7 +966,9 @@ mod tests {
         );
 
         let next = schema
-            .execute(r#"mutation { openAccount(name: "Assets:After", date: "2024-01-02") }"#)
+            .execute_as_operator(
+                r#"mutation { openAccount(name: "Assets:After", date: "2024-01-02") }"#,
+            )
             .await;
         assert!(
             next.errors.is_empty(),
@@ -1401,7 +1405,9 @@ mod tests {
         let (stop, probe) = near_cap::spawn_read_latency_probe(&ledger);
         let started = std::time::Instant::now();
         let response = schema
-            .execute(r#"mutation { openAccount(name: "Assets:Over", date: "2024-01-01") }"#)
+            .execute_as_operator(
+                r#"mutation { openAccount(name: "Assets:Over", date: "2024-01-01") }"#,
+            )
             .await;
         let mutation_took = started.elapsed();
         stop.send(()).unwrap();
@@ -1517,7 +1523,7 @@ mod tests {
         );
         for attempt in 0..3 {
             let response = schema
-                .execute(format!(
+                .execute_as_operator(format!(
                     r#"mutation {{ openAccount(name: "Assets:A{attempt}", date: "2024-01-05") }}"#
                 ))
                 .await;
@@ -1587,7 +1593,7 @@ mod tests {
         );
         for attempt in 0..3 {
             let response = schema
-                .execute(format!(
+                .execute_as_operator(format!(
                     r#"mutation {{ openAccount(name: "Assets:A{attempt}", date: "2024-01-05") }}"#
                 ))
                 .await;
@@ -1624,7 +1630,9 @@ mod tests {
             .expect("a library stage");
         assert_eq!(ledger.read().await.uncommitted_count(), 1, "premise");
         let response = schema
-            .execute(r#"mutation { openAccount(name: "Assets:AfterStage", date: "2024-01-05") }"#)
+            .execute_as_operator(
+                r#"mutation { openAccount(name: "Assets:AfterStage", date: "2024-01-05") }"#,
+            )
             .await;
         assert_eq!(
             error_codes(&response),
@@ -1684,7 +1692,9 @@ mod tests {
         let mut refusals = Vec::new();
         let started = std::time::Instant::now();
         for attempt in 0..4 {
-            let response = schema.execute(lunch_mutation(2000, 2 + attempt)).await;
+            let response = schema
+                .execute_as_operator(lunch_mutation(2000, 2 + attempt))
+                .await;
             refusals.push((error_codes(&response), format!("{:?}", response.errors)));
             tokio::task::yield_now().await;
         }
@@ -1692,7 +1702,9 @@ mod tests {
         done.store(true, Ordering::SeqCst);
         let (worst_wait, samples) = honest.await.unwrap();
         let opened = schema
-            .execute(r#"mutation { openAccount(name: "Assets:Honest", date: "2024-01-05") }"#)
+            .execute_as_operator(
+                r#"mutation { openAccount(name: "Assets:Honest", date: "2024-01-05") }"#,
+            )
             .await;
         drop(guard);
 
@@ -1937,7 +1949,9 @@ mod tests {
         };
         let mut outcomes = Vec::new();
         for attempt in 0..4u32 {
-            let response = schema.execute(lunch_mutation(10, 10 + attempt)).await;
+            let response = schema
+                .execute_as_operator(lunch_mutation(10, 10 + attempt))
+                .await;
             outcomes.push((
                 error_codes(&response),
                 raw.text().matches("reload installed").count(),

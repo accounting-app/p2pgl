@@ -433,6 +433,146 @@ fn the_shipped_binary_serves_signs_stops_and_restarts() {
     assert_eq!(node.stop().code(), Some(0));
 }
 
+/// `gl-node --node-id` (`docs/build-log/001-peer-discovery`): before the node
+/// has ever started, it creates the node key and prints the EndpointId; again,
+/// it prints the same id; the key file is the node's alone (0600); and the
+/// node, once started, binds with exactly that id — so an operator can hand
+/// peers the id before the first boot.
+///
+/// Bug-catch: route `--node-id` anywhere else and no id is printed; print an
+/// id from anything but the node key and the running node disagrees with it.
+#[test]
+fn node_id_prints_the_id_the_node_will_have_before_it_starts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = dir.path().canonicalize().expect("canonical tempdir");
+    let mut node = Node::new(this_binary(), &dir);
+    let node_id = |node: &Node| {
+        let output = node
+            .command(&node.binary)
+            .arg("--node-id")
+            .output()
+            .expect("run --node-id");
+        assert!(
+            output.status.success(),
+            "--node-id: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("utf-8")
+            .trim()
+            .to_owned()
+    };
+
+    let first = node_id(&node);
+    assert_eq!(first.len(), 64, "an EndpointId in hex: {first:?}");
+    assert!(
+        first.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{first:?}"
+    );
+    assert_eq!(node_id(&node), first, "the same id every time");
+    let key_file = dir.join("data/iroh.secret");
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&key_file)
+                .expect("the key file exists")
+                .permissions()
+        ) & 0o777,
+        0o600,
+        "the node key is readable by its owner alone"
+    );
+
+    node.start("after-node-id")
+        .unwrap_or_else(|log| panic!("boot: {log}"));
+    // The log is colored: drop the ANSI escapes before matching `node_id=<id>`.
+    let mut log = String::new();
+    let raw = node.log("after-node-id");
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c == 'm' {
+                    break;
+                }
+            }
+        } else {
+            log.push(c);
+        }
+    }
+    assert!(
+        log.contains(&format!("node_id={first}")),
+        "the running node has the id --node-id printed ({first}):\n{log}"
+    );
+    assert_eq!(node.stop().code(), Some(0));
+}
+
+/// `--node-id` on a node that signs with P2P off loads the key and never
+/// creates one, as boot does: a missing key is an operator error there, not an
+/// identity to invent (`main.rs`, the key-loading comment).
+///
+/// Bug-catch: let `--node-id` create the key whenever signing is on and a
+/// signing-only node gets an identity its boot would have refused to invent.
+#[test]
+fn node_id_never_creates_a_key_for_a_signing_only_node() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = dir.path().canonicalize().expect("canonical tempdir");
+    let config = dir.join("gl-node.config.json");
+    std::fs::write(
+        &config,
+        json!({
+            "ledgerPath": "ledger.bean",
+            "signing": { "enabled": true },
+            "p2p": { "enabled": false, "meshId": "signing-only-test" },
+        })
+        .to_string(),
+    )
+    .expect("write config");
+    let output = Command::new(this_binary())
+        .arg("--node-id")
+        .current_dir(&dir)
+        .env("GL_NODE_CONFIG", &config)
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("run --node-id");
+    assert!(
+        !output.status.success(),
+        "a missing key is refused, not created"
+    );
+    assert!(output.stdout.is_empty(), "no id is printed");
+    assert!(
+        !dir.join("data/iroh.secret").exists(),
+        "no key file was created"
+    );
+}
+
+/// On a loopback node with auth turned off, every request runs as the
+/// operator (002-users-and-roles): the role check sees an admin caller, so
+/// writes still work, as they did before roles existed.
+///
+/// Bug-catch: attach no caller on the auth-off path and every request on
+/// such a node is refused.
+#[test]
+fn with_auth_off_a_loopback_node_still_serves_its_operator() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = dir.path().canonicalize().expect("canonical tempdir");
+    let mut node = Node::new(this_binary(), &dir);
+    let mut config: Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("gl-node.config.json")).expect("config"),
+    )
+    .expect("json");
+    config["auth"] = json!({ "enabled": false });
+    std::fs::write(dir.join("gl-node.config.json"), config.to_string()).expect("write config");
+
+    node.start("auth-off")
+        .unwrap_or_else(|log| panic!("boot: {log}"));
+    let (status, body) = node.graphql_with(
+        r#"mutation { openAccount(name: "Assets:Cash", date: "2024-01-01") }"#,
+        None,
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("errors").is_none(), "the operator writes: {body}");
+    assert_eq!(node.stop().code(), Some(0));
+}
+
 /// The upgrade and rollback procedure of docs/OPERATIONS.md, from the previous
 /// release's binary (`GL_NODE_PREVIOUS_BINARY`) to this one: the previous
 /// version writes a ledger and a backup is taken; this version starts on those

@@ -1,0 +1,135 @@
+{
+  "U-R1-schema-without-access-control": {
+    "file": "crates/gl-node/src/graphql/mod.rs",
+    "old": "        .extension(crate::access_control::AccessControl);",
+    "new": "        ;",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_read_caller_reads_and_is_refused_every_mutation"
+      ]
+    ]
+  },
+  "U-R2-role-never-compared": {
+    "file": "crates/gl-node/src/access_control.rs",
+    "old": "            Some(caller) if caller.role >= needed => Ok(document),",
+    "new": "            Some(caller) if caller.role >= Role::Read => Ok(document),",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_read_caller_reads_and_is_refused_every_mutation"
+      ]
+    ]
+  },
+  "U-R3-mutation-needs-only-read": {
+    "file": "crates/gl-node/src/access_control.rs",
+    "old": "            needed = needed.max(Role::Write);",
+    "new": "            needed = needed.max(Role::Read);",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_request_needs_the_strictest_role_anything_in_it_needs"
+      ],
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_read_caller_reads_and_is_refused_every_mutation"
+      ]
+    ]
+  },
+  "U-R4-inline-fragments-skipped": {
+    "file": "crates/gl-node/src/access_control.rs",
+    "old": "            Selection::InlineFragment(fragment) => root_fields_include_admin(",
+    "new": "            Selection::InlineFragment(fragment) => false && root_fields_include_admin(",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_request_needs_the_strictest_role_anything_in_it_needs"
+      ]
+    ]
+  },
+  "U-R5-no-caller-runs-as-operator": {
+    "file": "crates/gl-node/src/access_control.rs",
+    "old": "    ctx.data_opt::<Caller>()\n",
+    "new": "    Some(ctx.data_opt::<Caller>().unwrap_or(Box::leak(Box::new(Caller::operator()))))\n",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_request_without_a_caller_is_refused"
+      ]
+    ]
+  },
+  "U-R6-middleware-attaches-no-caller": {
+    "file": "crates/gl-node/src/auth.rs",
+    "old": "            request.extensions_mut().insert(Caller::operator());",
+    "new": "            let _ = Caller::operator();",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "the_shipped_binary_serves_signs_stops_and_restarts"
+      ]
+    ]
+  },
+  "U-R7-handler-drops-the-caller": {
+    "file": "crates/gl-node/src/graphql/mod.rs",
+    "old": "        request = request.data(caller);",
+    "new": "        let _ = caller;",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "the_shipped_binary_serves_signs_stops_and_restarts"
+      ]
+    ]
+  },
+  "U-R6b-auth-off-attaches-no-caller": {
+    "file": "crates/gl-node/src/auth.rs",
+    "old": "        request.extensions_mut().insert(Caller::operator());\n        return next.run(request).await;",
+    "new": "        return next.run(request).await;",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "with_auth_off_a_loopback_node_still_serves_its_operator"
+      ]
+    ]
+  },
+  "U-R8-named-fragments-skipped": {
+    "file": "crates/gl-node/src/access_control.rs",
+    "old": "visited.insert(name)",
+    "new": "false && visited.insert(name)",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_request_needs_the_strictest_role_anything_in_it_needs"
+      ]
+    ]
+  }
+}

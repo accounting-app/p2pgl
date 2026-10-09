@@ -1,0 +1,50 @@
+# Example config for the mesh's own relay (deploy/iroh-relay/Dockerfile,
+# docs/OPERATIONS.md "Running a relay"). Copy to relay.toml and fill in the
+# marked values. Every node of the mesh then sets:
+#
+#   "relayMode": "custom", "relayUrl": "https://relay.example.com"
+
+# Plain HTTP on 80 (the captive-portal probe nodes use); the relay itself
+# serves HTTPS on 443, where Let's Encrypt also validates it (TLS-ALPN-01) — so
+# 443 must reach this server directly, not through a TLS-terminating proxy.
+http_bind_addr = "[::]:80"
+
+# Address discovery over QUIC (UDP 7842): helps nodes behind routers find a
+# direct path, so less traffic goes through the relay.
+enable_quic_addr_discovery = true
+
+# Keep metrics off the public interface (or set enable_metrics = false).
+metrics_bind_addr = "127.0.0.1:9090"
+
+[tls]
+# FILL IN: the relay's public DNS name, pointing at this server.
+hostname = "relay.example.com"
+# A certificate from Let's Encrypt, obtained and renewed by the relay itself.
+# Nodes accept only certificates from public authorities (a self-signed or
+# private-CA certificate leaves them unable to connect).
+cert_mode = "LetsEncrypt"
+# FILL IN: an address Let's Encrypt may write to about expiring certificates.
+contact = "ops@example.com"
+cert_dir = "/var/lib/iroh-relay"
+
+# Admit only the mesh's own nodes, by EndpointId (`gl-node --node-id` on each).
+# FILL IN: the same ids as the nodes' p2p.bootstrapEndpointIds, plus each node's
+# own id.
+[access]
+allowlist = [
+    "<EndpointId of node 1>",
+    "<EndpointId of node 2>",
+]
+
+# A hosted relay serving many customers asks a service instead: for each
+# connecting node it sends a POST to `url` with the node's EndpointId (hex) in
+# the header `X-Iroh-NodeId` (the name iroh-relay 1.0.3 really sends, whatever
+# its docs say) and `Authorization: Bearer <bearer_token>`; a 200 response whose
+# body is exactly `true` (no newline) admits the node, anything else refuses it.
+# Replace the [access] table above with:
+#
+# [access.http]
+# url = "https://accounts.example.com/relay-access"
+# bearer_token = "<token the relay sends to that service>"
+# (or leave bearer_token out and set IROH_RELAY_HTTP_BEARER_TOKEN in the
+# relay's environment, to keep the token out of this file)

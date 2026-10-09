@@ -16,3 +16,5 @@ api.key
 *.bean.lock
 *.bean.journal
 .do_not_commit_please_ignore
+# Per-installation mesh configs written by deploy/mesh-init.sh
+deploy/mesh/

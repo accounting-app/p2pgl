@@ -11,6 +11,8 @@ use subtle::ConstantTimeEq;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
+use crate::access_control::Caller;
+
 /// Shared auth state for the middleware layer.
 #[derive(Clone)]
 pub struct AuthState {
@@ -84,9 +86,14 @@ impl AuthState {
 /// When `auth.enabled` is false, all requests pass through.
 /// When enabled, missing or mismatched `X-Api-Key` header returns HTTP 401
 /// with a GraphQL-shaped error body (§2.8 `UNAUTHORIZED`).
+///
+/// A request that gets through carries its [`Caller`] as a request extension,
+/// which the GraphQL handler hands to the role check (002-users-and-roles):
+/// the operator key is admin, and so is anyone on a loopback node with auth
+/// turned off (as before — nothing to tell callers apart by).
 pub async fn auth_middleware(
     axum::extract::State(auth_state): axum::extract::State<AuthState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
     // Always allow CORS preflight requests through (OPTIONS).
@@ -95,11 +102,15 @@ pub async fn auth_middleware(
     }
 
     if !auth_state.enabled {
+        request.extensions_mut().insert(Caller::operator());
         return next.run(request).await;
     }
 
     match auth_state.request_is_authenticated(request.headers()) {
-        true => next.run(request).await,
+        true => {
+            request.extensions_mut().insert(Caller::operator());
+            next.run(request).await
+        }
         false => {
             let error_body = json!({
                 "errors": [{

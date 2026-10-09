@@ -1,3 +1,4 @@
+mod access_control;
 mod anti_entropy_alpn;
 mod auth;
 mod config;
@@ -153,6 +154,7 @@ enum CliAction {
     Serve,
     Version,
     HealthCheck,
+    NodeId,
     Usage(String),
 }
 
@@ -162,11 +164,12 @@ fn parse_cli() -> CliAction {
         None => CliAction::Serve,
         Some("--version") | Some("-V") => CliAction::Version,
         Some("--health-check") => CliAction::HealthCheck,
+        Some("--node-id") => CliAction::NodeId,
         Some("--help") | Some("-h") => {
-            CliAction::Usage("Usage: gl-node [--health-check | --version]".to_owned())
+            CliAction::Usage("Usage: gl-node [--health-check | --node-id | --version]".to_owned())
         }
         Some(other) => CliAction::Usage(format!(
-            "unknown argument: {other}\nUsage: gl-node [--health-check | --version]"
+            "unknown argument: {other}\nUsage: gl-node [--health-check | --node-id | --version]"
         )),
     }
 }
@@ -236,6 +239,53 @@ fn run_health_check() -> ! {
     }
 }
 
+/// `gl-node --node-id`: print this node's EndpointId — what its peers list in
+/// `p2p.bootstrapEndpointIds` and `p2p.peerAddresses` — and exit, serving
+/// nothing (`docs/build-log/001-peer-discovery`). The key is loaded by the same
+/// rule boot applies (below): created on first use when P2P is on (CAP-4),
+/// required to exist when only signing is on, none at all otherwise. So the
+/// id printed is the id the node will have, before it ever starts.
+fn run_node_id() -> ! {
+    // Warnings to stderr — stdout carries only the id — so a key the loader
+    // had to regenerate (an empty key file, L-32: a new identity peers must
+    // be told) is said, not silent.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
+        .init();
+    let config_path =
+        std::env::var("GL_NODE_CONFIG").unwrap_or_else(|_| "gl-node.config.json".to_owned());
+    let config = match NodeConfig::load_from_path(&PathBuf::from(&config_path)) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("node-id: failed to load config: {error}");
+            std::process::exit(1);
+        }
+    };
+    let path = PathBuf::from(&config.p2p.secret_key_path);
+    let key = if config.p2p.enabled {
+        p2p_service::load_or_create_secret_key(&path)
+    } else if config.signing.enabled {
+        p2p_service::load_secret_key(&path)
+    } else {
+        eprintln!("node-id: this node has no key — p2p.enabled and signing.enabled are both off");
+        std::process::exit(1);
+    };
+    match key {
+        Ok(key) => {
+            println!("{}", key.iroh_secret_key().public());
+            std::process::exit(0);
+        }
+        Err(error) => {
+            eprintln!(
+                "node-id: the node key at {} could not be loaded: {error}",
+                path.display()
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     match parse_cli() {
@@ -245,6 +295,9 @@ async fn main() {
         }
         CliAction::HealthCheck => {
             run_health_check();
+        }
+        CliAction::NodeId => {
+            run_node_id();
         }
         CliAction::Usage(message) => {
             eprintln!("{message}");

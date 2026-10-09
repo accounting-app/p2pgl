@@ -27,6 +27,11 @@ pub const MAX_ADDRESSES_PER_PEER: usize = 16;
 /// How often configured addresses are resolved again.
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 
+/// How often while some configured address has never resolved — a node that
+/// boots before its peers exist (a compose stack, a mesh starting together)
+/// finds them within seconds, not at the next [`REFRESH_INTERVAL`].
+pub const UNRESOLVED_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
 /// How long one name may take to resolve before it counts as unresolved.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -168,6 +173,10 @@ pub struct PeerAddresses {
     /// The sockets each `(peer, address index)` resolved to last time, so an
     /// address that fails one refresh keeps its last known sockets.
     last_known: std::sync::Mutex<BTreeMap<(EndpointId, usize), Vec<SocketAddr>>>,
+    /// When each never-resolved address was last warned about: while the quick
+    /// retry runs every [`UNRESOLVED_RETRY_INTERVAL`], its WARN repeats only
+    /// every [`REFRESH_INTERVAL`] (`usize::MAX` stands for the per-peer line).
+    last_warned: std::sync::Mutex<BTreeMap<(EndpointId, usize), std::time::Instant>>,
 }
 
 impl PeerAddresses {
@@ -200,7 +209,27 @@ impl PeerAddresses {
             peers,
             relay: None,
             last_known: std::sync::Mutex::default(),
+            last_warned: std::sync::Mutex::default(),
         })
+    }
+
+    /// Whether to WARN about `key` now: always for an address that resolved
+    /// before (it fails only at the long interval), at most once per
+    /// [`REFRESH_INTERVAL`] for one that never has (retried every
+    /// [`UNRESOLVED_RETRY_INTERVAL`]).
+    fn should_warn(&self, key: (EndpointId, usize), resolved_before: bool) -> bool {
+        if resolved_before {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        let mut last_warned = self.last_warned.lock().expect("last_warned lock");
+        match last_warned.get(&key) {
+            Some(at) if now.duration_since(*at) < REFRESH_INTERVAL => false,
+            _ => {
+                last_warned.insert(key, now);
+                true
+            }
+        }
     }
 
     /// Reach every `bootstrap` peer through `relay` too — the mesh's own relay,
@@ -230,12 +259,14 @@ impl PeerAddresses {
     /// result. An address that fails this time contributes what it last
     /// resolved to (stale beats nothing), with a WARN naming the peer and the
     /// address; a peer none of whose addresses has ever resolved keeps no
-    /// entry.
-    pub async fn refresh<R, F>(&self, lookup: &MemoryLookup, resolve: R)
+    /// entry. Returns whether every configured address has resolved at least
+    /// once (so the next refresh may wait the long interval).
+    pub async fn refresh<R, F>(&self, lookup: &MemoryLookup, resolve: R) -> bool
     where
         R: Fn(String, u16) -> F,
         F: Future<Output = std::io::Result<Vec<SocketAddr>>>,
     {
+        let mut all_known = true;
         for (peer, addresses) in &self.peers {
             let mut resolved = BTreeSet::new();
             for (index, address) in addresses.iter().enumerate() {
@@ -251,11 +282,14 @@ impl PeerAddresses {
                         sockets
                     }
                     Err(error) => {
+                        all_known &= last_known.contains_key(&(*peer, index));
                         let kept = last_known.get(&(*peer, index)).cloned().unwrap_or_default();
-                        warn!(
-                            peer = %peer, address = %address, %error, kept = kept.len(),
-                            "a configured peer address does not resolve; its last known sockets (if any) are kept, and it is tried again at the next refresh"
-                        );
+                        if self.should_warn((*peer, index), !kept.is_empty()) {
+                            warn!(
+                                peer = %peer, address = %address, %error, kept = kept.len(),
+                                "a configured peer address does not resolve; its last known sockets (if any) are kept, and it is tried again — every 10 s until it first resolves, then every 5 min"
+                            );
+                        }
                         kept
                     }
                 };
@@ -265,10 +299,12 @@ impl PeerAddresses {
                 resolved.insert(TransportAddr::Relay(relay.clone()));
             }
             if resolved.is_empty() {
-                warn!(
-                    peer = %peer,
+                if self.should_warn((*peer, usize::MAX), false) {
+                    warn!(
+                        peer = %peer,
                     "no configured address of this peer has resolved yet; it is not reachable by address until one does"
-                );
+                    );
+                }
                 continue;
             }
             lookup.set_endpoint_info(EndpointAddr {
@@ -276,10 +312,13 @@ impl PeerAddresses {
                 addrs: resolved,
             });
         }
+        all_known
     }
 
-    /// Resolve now and every [`REFRESH_INTERVAL`] after, for as long as the
-    /// runtime lives. Nothing to do when no peer has an address.
+    /// Resolve now, then every [`UNRESOLVED_RETRY_INTERVAL`] while some address
+    /// has never resolved (a peer not up yet) and every [`REFRESH_INTERVAL`]
+    /// once all have, for as long as the runtime lives. Nothing to do when no
+    /// peer has an address and there is no relay.
     pub fn spawn_refresh(self, lookup: MemoryLookup) {
         if self.is_empty() {
             return;
@@ -288,12 +327,17 @@ impl PeerAddresses {
             peers = self.peers.len(),
             with_addresses = self.peers.values().filter(|addresses| !addresses.is_empty()).count(),
             relay = self.relay.is_some(),
-            "keeping peers in the address lookup: their p2p.peerAddresses, resolved now and every few minutes, and the mesh's relay if one is set"
+            "keeping peers in the address lookup: their p2p.peerAddresses (resolved now, every 10 s until each has resolved, then every 5 min) and the mesh's relay if one is set"
         );
         tokio::spawn(async move {
             loop {
-                self.refresh(&lookup, resolve_with_system_dns).await;
-                tokio::time::sleep(REFRESH_INTERVAL).await;
+                let all_known = self.refresh(&lookup, resolve_with_system_dns).await;
+                tokio::time::sleep(if all_known {
+                    REFRESH_INTERVAL
+                } else {
+                    UNRESOLVED_RETRY_INTERVAL
+                })
+                .await;
             }
         });
     }
@@ -372,9 +416,14 @@ mod tests {
     /// address a name ever had — and an address that fails a refresh keeps
     /// what it last resolved to, beside the addresses that did resolve.
     ///
+    /// It reports whether every address has resolved once, which picks the
+    /// quick retry (a peer not up yet) or the long interval.
+    ///
     /// Bug-catch: `add_endpoint_info` instead of `set_endpoint_info` keeps the
     /// old address beside the new one; dropping the per-address memory loses
-    /// the failed address's last socket while the other one still resolves.
+    /// the failed address's last socket while the other one still resolves;
+    /// report "all resolved" regardless and a node booted before its peers
+    /// waits the long interval to find them.
     #[tokio::test]
     async fn a_refresh_replaces_a_peers_addresses_and_survives_an_outage() {
         let peer = iroh::SecretKey::generate().public();
@@ -390,9 +439,20 @@ mod tests {
                 .unwrap_or_default()
         };
 
-        peers
-            .refresh(&lookup, |_, _| async move { Ok(vec![first]) })
-            .await;
+        assert!(
+            !peers
+                .refresh(&lookup, |_, _| async move {
+                    Err(std::io::Error::other("not up yet"))
+                })
+                .await,
+            "an address that has never resolved asks for the quick retry"
+        );
+        assert!(
+            peers
+                .refresh(&lookup, |_, _| async move { Ok(vec![first]) })
+                .await,
+            "once resolved, the long interval"
+        );
         assert_eq!(
             addresses(&lookup),
             BTreeSet::from([TransportAddr::Ip(first)])
@@ -416,6 +476,14 @@ mod tests {
             addresses(&lookup),
             BTreeSet::from([TransportAddr::Ip(moved)]),
             "an outage keeps the last known address"
+        );
+        assert!(
+            peers
+                .refresh(&lookup, |_, _| async move {
+                    Err(std::io::Error::other("resolver down"))
+                })
+                .await,
+            "an outage of an address that resolved before keeps the long interval"
         );
 
         // Two addresses: `a` fails this round while `b` moves. The entry holds

@@ -208,5 +208,61 @@
         "the_relay_admits_only_the_nodes_on_its_allowlist"
       ]
     ]
+  },
+  "PD-R16-node-id-not-routed": {
+    "file": "crates/gl-node/src/main.rs",
+    "old": "        Some(\"--node-id\") => CliAction::NodeId,",
+    "new": "        Some(\"--node-id\") => CliAction::Version,",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "node_id_prints_the_id_the_node_will_have_before_it_starts"
+      ]
+    ]
+  },
+  "PD-R17-template-on-n0": {
+    "file": "deploy/gl-node.production.json",
+    "old": "        \"relayMode\": \"custom\"",
+    "new": "        \"relayMode\": \"n0\"",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "test_production_template_refuses_to_boot_until_a_relay_or_addresses_are_chosen"
+      ]
+    ]
+  },
+  "PD-R18-never-resolved-waits-the-long-interval": {
+    "file": "crates/gl-node/src/peer_addresses.rs",
+    "old": "all_known &= last_known.contains_key(&(*peer, index));",
+    "new": "all_known &= true;",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_refresh_replaces_a_peers_addresses_and_survives_an_outage"
+      ]
+    ]
+  },
+  "PD-R19-node-id-creates-a-signing-only-key": {
+    "file": "crates/gl-node/src/main.rs",
+    "old": "        p2p_service::load_secret_key(&path)",
+    "new": "        p2p_service::load_or_create_secret_key(&path)",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "node_id_never_creates_a_key_for_a_signing_only_node"
+      ]
+    ]
   }
 }

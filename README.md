@@ -547,7 +547,7 @@ signing node without it refuses to boot, and the refusal names that remedy.
 | `p2p.antiEntropyMaxConcurrentExchanges` | `8` | Outbound anti-entropy exchanges this node runs at once, across all peers; past it, peers wait their turn in order. Each exchange against a hostile peer can hold ~130–150 MiB at worst. `1`–`64` |
 | `p2p.antiEntropySupplyBackoffSeconds` | `60` | When a peer's batch would not fit under the 64 MiB ledger cap, that peer's `Supply` is not applied again for this long (one warning per deferral). `5`–`3600` |
 | `p2p.listenPort` | `0` | UDP port the P2P endpoint listens on. `0` picks a new random port at every boot; set a fixed port on any node whose address other nodes list in `peerAddresses`, and open it (UDP) in the firewall |
-| `p2p.peerAddresses` | `{}` | Where allowlisted peers listen: `{ "<EndpointId>": ["host:port", …] }`, 1–16 addresses each, every key one of `bootstrapEndpointIds`; names re-resolved every 5 minutes — see [Relay mode](#relay-mode-p2prelaymode) |
+| `p2p.peerAddresses` | `{}` | Where allowlisted peers listen: `{ "<EndpointId>": ["host:port", …] }`, 1–16 addresses each, every key one of `bootstrapEndpointIds`; names re-resolved every 5 minutes (every 10 s until each has first resolved) — see [Relay mode](#relay-mode-p2prelaymode) |
 | `p2p.relayMode` | `"n0"` | `"n0"` (public Iroh relays and discovery), `"disabled"` (direct addresses only) or `"custom"` (the mesh's own relay, `relayUrl`, plus direct addresses; nothing goes to n0). Anything else is refused at boot — see [Relay mode](#relay-mode-p2prelaymode) |
 | `p2p.relayUrl` | unset | The mesh's own relay for `relayMode: "custom"`: `https://host[:port]` of an `iroh-relay` server, the same on every node; no user info, query or path. Refused with any other mode |
 | `p2p.swarmTopic` | `openledger/transactions` | Gossip topic (and, before `meshId` existed, the signature domain); required unique on a public bind. Same form as `meshId`: non-empty, no surrounding whitespace, ASCII letters, digits and `- _ . : /`, up to 128 bytes |
@@ -699,8 +699,10 @@ admitted peer is; it never admits one), with 1 to 16 addresses written
 `host:port` or `[v6]:port` (an incomplete IP such as `203.0.113:4433` is
 refused — the system resolver would read it as another host). Host names are
 resolved at boot and every five minutes after, so a server whose IP changes is
-followed; a name that does not resolve is logged and retried, and that
-address's last known IPs are kept meanwhile. With `"disabled"`, a bootstrap peer
+followed — every 10 seconds instead while an address has never resolved, so a
+node started before its peers finds them within seconds; a name that does not
+resolve is logged and retried, and that address's last known IPs are kept
+meanwhile. With `"disabled"`, a bootstrap peer
 that has no `peerAddresses` entry cannot be reached, and boot names it. The
 port in an address is the peer's **`p2p.listenPort`** (UDP): by default a node
 listens on a new random port at every boot, so set a fixed one on every node
@@ -1409,29 +1411,38 @@ volume.
 
 ### Multi-node stack
 
-`deploy/docker-compose.yml` brings up three nodes on one bridge network. Each
-needs its own API key:
+`deploy/docker-compose.yml` brings up three nodes on one bridge network that
+**replicate with each other**, over direct addresses on that network, with
+nothing going to n0. Prepare the mesh once, then start it:
 
 ```bash
-GL_NODE_0_API_KEY="$(openssl rand -hex 32)" \
-GL_NODE_1_API_KEY="$(openssl rand -hex 32)" \
-GL_NODE_2_API_KEY="$(openssl rand -hex 32)" \
-  docker compose -f deploy/docker-compose.yml up --build
+deploy/mesh-init.sh
+docker compose -f deploy/docker-compose.yml up -d    # or docker-compose
 ```
 
-To keep the keys out of your shell history, copy `deploy/.env.example` to
-`deploy/.env`, put the three values there, and run the plain `docker compose -f
-deploy/docker-compose.yml up --build` — Compose reads a `.env` beside the
-compose file automatically. `deploy/.env` is gitignored; `deploy/.env.example`
-is the committed template and holds no secret.
+`mesh-init.sh` creates `deploy/.env` with a fresh API key per node (if it does
+not exist), picks a new `meshId` and topic, asks each node for its EndpointId
+(`gl-node --node-id`, which creates the node's key in its volume and starts
+nothing), and writes `deploy/mesh/node-{0,1,2}.json`: `relayMode: "custom"`
+without a relay, `listenPort` 4433, and each peer's id and address
+(`node-1:4433`, …). Both `deploy/.env` and `deploy/mesh/` are gitignored —
+they belong to this installation.
 
-One shared key would mean compromising any single node grants write access to
-all of them, and rotating it is an all-or-nothing outage. The defaults for those
-three variables are unusable placeholders shorter than the 16-byte minimum, so a
-stack started without them fails to boot instead of coming up with a guessable
-credential. Ports are published on `127.0.0.1` only, for the reason above; the
-file's header comment covers the TLS terminator, `trustedProxies` and `meshId`
-decisions for a real deployment.
+**A stack that already holds history** keeps its records verifying only under
+the `meshId` they were signed with, so the script refuses to pick a fresh one
+when any node's volume holds a ledger. Stacks from before `mesh-init.sh` signed
+under `openledger/docker-dev`: run `MESH_ID=openledger/docker-dev
+deploy/mesh-init.sh`, keeping the volumes. Only for a new mesh with no history
+to keep: `down -v`, delete `deploy/mesh/`, run it again.
+
+One shared API key would mean compromising any single node grants write access
+to all of them, and rotating it is an all-or-nothing outage; the placeholders in
+`deploy/.env.example` are too short to boot, so a stack started with them fails
+instead of coming up with a guessable credential. Ports are published on
+`127.0.0.1` only, for the reason above; the file's header comment covers the TLS
+terminator and `trustedProxies` decisions for a real deployment, and
+`docs/OPERATIONS.md` how nodes on different machines find each other (*Running
+a relay*).
 
 ---
 

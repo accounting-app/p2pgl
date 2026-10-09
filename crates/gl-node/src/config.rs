@@ -3128,6 +3128,48 @@ mod tests {
         assert!(checked >= 4, "expected to find the shipped sample configs");
     }
 
+    /// The production template (`deploy/gl-node.production.json`, decision 1 of
+    /// `docs/build-log/001-peer-discovery`) runs `relayMode: "custom"` with
+    /// neither a relay nor an address, so — even with the mesh's topic and id
+    /// chosen — it refuses to boot, naming both ways out, until the operator
+    /// picks the mesh's own relay or its peers' addresses; it never falls back
+    /// to n0. With a `relayUrl` it loads.
+    ///
+    /// Bug-catch: ship the template with `"n0"` (or drop the "custom needs a
+    /// relay or addresses" rule) and a production node quietly uses n0.
+    #[test]
+    fn test_production_template_refuses_to_boot_until_a_relay_or_addresses_are_chosen() {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../deploy/gl-node.production.json");
+        let mut template: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("production template"))
+                .expect("the template is JSON");
+        // What the operator must choose anyway, plus a ledger path this test's
+        // working directory holds (the template's are the Docker image's).
+        template["ledgerPath"] = "./data/ledger.bean".into();
+        template["p2p"]["swarmTopic"] = "openledger/production-test".into();
+        template["p2p"]["meshId"] = "8a4f2c1e-0d3b-4c5a-9e7f-1b2d3c4e5f60".into();
+        let load = |template: &serde_json::Value| {
+            let file = write_temp_config(&template.to_string());
+            NodeConfig::load_from_path_with_env_api_key(
+                file.path(),
+                Some("unit-test-api-key-0123456789abcd".to_owned()),
+            )
+        };
+
+        let Err(error) = load(&template) else {
+            panic!("the template must not boot before a relay or addresses are chosen");
+        };
+        let message = format!("{error}");
+        assert!(
+            message.contains("p2p.relayUrl") && message.contains("p2p.peerAddresses"),
+            "{message}"
+        );
+
+        template["p2p"]["relayUrl"] = "https://relay.example.com".into();
+        load(&template).expect("with the mesh's relay the template boots");
+    }
+
     /// R-9: the shipped docker config sets `meshId` to its own `swarmTopic`
     /// byte for byte — the only value that keeps the stack's already-signed
     /// history verifying — and both pass the signature-domain rules.

@@ -25,6 +25,6 @@
         "enabled": true,
         "secretKeyPath": "/data/iroh.secret",
         "bootstrapEndpointIds": [],
-        "relayMode": "n0"
+        "relayMode": "custom"
     }
 }

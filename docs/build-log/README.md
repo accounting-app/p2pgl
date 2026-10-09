@@ -49,4 +49,6 @@ them (a typo, a one-line fix) gets no entry.
 
 | # | Work | Status |
 |---|---|---|
-| [001](001-peer-discovery/) | Peer discovery without a third party: own relay + direct addresses | step 2 of 3 (own relay) ready to commit; next: packaging and docs |
+| [001](001-peer-discovery/) | Peer discovery without a third party: own relay + direct addresses | done (45ff4e2) |
+| [002](002-users-and-roles/) | People, keys and roles: a key per person, admin / write / read, who entered each write | step 1 of 4 (roles on one node) ready to commit; next: access records |
+| — | Relay with a company's own certificate authority (`relayCaCert`) | planned (decision C, 2026-10-09) |

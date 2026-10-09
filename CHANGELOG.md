@@ -7,6 +7,30 @@ break compatibility.
 
 ## [Unreleased]
 
+### Changed
+
+- **`deploy/gl-node.production.json` uses `relayMode: "custom"`** and so
+  refuses to boot until the mesh's own relay (`p2p.relayUrl`) or the peers'
+  addresses (`p2p.peerAddresses`) are set; it no longer runs on n0's public
+  servers by default. The node's own default stays `"n0"`, so existing configs
+  are unchanged.
+- **The compose stack mounts `deploy/mesh/node-N.json`** (written by
+  `deploy/mesh-init.sh`) instead of the shared `gl-node.docker.json`. A stack
+  with history keeps its signatures by running
+  `MESH_ID=openledger/docker-dev deploy/mesh-init.sh`.
+
+### Security
+
+- **Every GraphQL request passes a role check before anything runs**
+  (`docs/build-log/002-users-and-roles`): queries need *read*, every mutation
+  *write*, by operation type — so a mutation added later is closed to read-only
+  keys without being guarded by hand — judged across every operation, alias
+  and fragment in the request. A request that reaches the schema without an
+  authenticated caller is refused. The node's key (`auth.apiKey`,
+  `GL_NODE_API_KEY`, the generated key file) is the *operator* and may do
+  everything, so nothing changes for existing setups; per-person keys and roles
+  come next.
+
 ### Fixed
 
 - The 0.1.0 known limit "nodes on different machines find each other only
@@ -18,7 +42,7 @@ break compatibility.
 
 - **`p2p.peerAddresses`** — where each allowlisted peer listens,
   `{ "<EndpointId>": ["host:port", …] }`. Host names are resolved at boot and
-  every five minutes. With `relayMode: "disabled"` a node now reaches the peers
+  every five minutes (every 10 s while an address has never resolved). With `relayMode: "disabled"` a node now reaches the peers
   listed here, with no third party involved; before, it reached no peer at
   all. An address is accepted only for a peer in `bootstrapEndpointIds`. An
   older binary refuses a config with this key
@@ -28,6 +52,17 @@ break compatibility.
   through it, and nothing goes to n0 — no n0 relay, no n0 discovery. One relay
   per mesh, `https` only. `relayUrl` with another mode, and `"custom"` with
   neither a relay nor `peerAddresses`, are refused at boot.
+- **`gl-node --node-id`** — prints the node's EndpointId (creating its key on
+  first use, by the same rule as boot) and exits without serving. Peers list
+  this id in `bootstrapEndpointIds` and `peerAddresses`, and a relay in its
+  allowlist — before the node ever starts.
+- **The mesh's own relay, packaged** — `deploy/iroh-relay/`: the official
+  `iroh-relay` 1.0.3 as a pinned image, with an example config (Let's Encrypt,
+  an allowlist of the mesh's EndpointIds, the HTTP check for a hosted relay
+  commented). `docs/OPERATIONS.md` *Running a relay* walks through it.
+- **The compose stack replicates** — `deploy/mesh-init.sh` gives the three
+  nodes a fresh mesh, their peers' ids and addresses on the Docker network;
+  before, they ran side by side without syncing.
 - **`p2p.listenPort`** — the UDP port the P2P endpoint listens on, so other
   nodes can list it in their `peerAddresses`. The default, `0`, keeps today's
   behaviour: a random port at every boot. A port already in use stops boot.

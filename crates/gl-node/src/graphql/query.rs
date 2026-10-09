@@ -548,6 +548,7 @@ fn clamp_journal_offset(offset: i32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graphql::ExecuteAsOperator;
 
     #[test]
     fn test_clamp_journal_limit_default_range() {
@@ -665,7 +666,7 @@ mod tests {
                 query.push_str(&format!(" a{i}: verify {{ ok }}"));
             }
             query.push('}');
-            schema.execute(query).await.errors
+            schema.execute_as_operator(query).await.errors
         }
 
         let admitted = aliased_verify_count(MAX_VERIFY_PER_REQUEST).await;
@@ -695,7 +696,7 @@ mod tests {
     async fn test_verify_weight_still_admits_a_full_dashboard_call() {
         let schema = crate::graphql::build_schema();
         let result = schema
-            .execute(
+            .execute_as_operator(
                 r#"{
                     verify { ok }
                     trialBalance(at: "2024-12-31") { totalDebit }
@@ -724,7 +725,7 @@ mod tests {
         let schema = super::super::schema_builder(true)
             .extension(async_graphql::extensions::Analyzer)
             .finish();
-        let response = schema.execute(query).await;
+        let response = schema.execute_as_operator(query).await;
         if !response.errors.is_empty() {
             return None;
         }
@@ -741,7 +742,10 @@ mod tests {
             query.push_str(&format!(" a{index}: {field}"));
         }
         query.push('}');
-        crate::graphql::build_schema().execute(query).await.errors
+        crate::graphql::build_schema()
+            .execute_as_operator(query)
+            .await
+            .errors
     }
 
     fn refused_on_complexity(errors: &[async_graphql::ServerError]) -> bool {
@@ -810,7 +814,10 @@ mod tests {
                 journal(limit: 100) {{ txid date narration {POSTINGS_SELECTION} }}
             }}"#
         );
-        let errors = crate::graphql::build_schema().execute(query).await.errors;
+        let errors = crate::graphql::build_schema()
+            .execute_as_operator(query)
+            .await
+            .errors;
         assert!(
             errors.is_empty(),
             "a dashboard with a 100-row journal page must fit the \
@@ -854,7 +861,7 @@ mod tests {
         );
 
         let response = schema
-            .execute(format!(
+            .execute_as_operator(format!(
                 r#"{{
                     bare: journal {{ txid }}
                     full: journal {{ txid {POSTINGS_SELECTION} }}
@@ -906,7 +913,7 @@ mod tests {
             None,
         );
         let response = schema
-            .execute(
+            .execute_as_operator(
                 r#"{
                     cash: account(name: "Assets:Cash") { balances { number } exact }
                     bank: account(name: "Assets:Bank") { balances { number } exact }

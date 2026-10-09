@@ -51,7 +51,14 @@ feeding that lookup is the whole of the node side.
    two nodes with no direct address configured converge through it; the
    endpoint's relay map and lookups name no n0 host; a relay with an allowlist
    refuses a node not on it.
-3. **Packaging and docs.** A pinned `deploy/iroh-relay/` image of the official
+3. **Packaging and docs** *(as built, after decision C of 2026-10-09: the
+   compose stack shows direct addresses, the relay is packaged for real
+   servers — a relay needs a public-CA certificate, which a local stack cannot
+   get; trusting a private CA, `relayCaCert`, is a later entry. Added on the
+   way: `gl-node --node-id` and `deploy/mesh-init.sh`, since a node's id exists
+   only once its key does, and the stack needs each peer's id up front; and a
+   10 s retry while an address has never resolved, found by the stack's
+   node-0 booting before its peers)*. Originally: a pinned `deploy/iroh-relay/` image of the official
    server (`iroh-relay` 1.0.3, `--features server --locked`) with an example
    config (allowlist access, and the HTTP check commented for the hosted case);
    a `relay` service in `deploy/docker-compose.yml` that the three nodes use —

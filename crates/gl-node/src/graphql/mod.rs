@@ -48,9 +48,12 @@ pub(crate) const HEAVY_RESOLVER_COMPLEXITY: usize = 512;
 fn schema_builder(
     enable_introspection: bool,
 ) -> async_graphql::SchemaBuilder<QueryRoot, MutationRoot, SubscriptionRoot> {
+    // 002-users-and-roles: every schema judges the caller's role before
+    // anything runs (deny by default; `crate::access_control`).
     let mut builder = Schema::build(QueryRoot, MutationRoot, SubscriptionRoot)
         .limit_depth(GRAPHQL_MAX_DEPTH)
-        .limit_complexity(GRAPHQL_MAX_COMPLEXITY);
+        .limit_complexity(GRAPHQL_MAX_COMPLEXITY)
+        .extension(crate::access_control::AccessControl);
     if !enable_introspection {
         builder = builder.disable_introspection();
     }
@@ -94,12 +97,47 @@ pub fn build_schema() -> AppSchema {
     schema_builder(true).finish()
 }
 
+/// Tests run the schema without the HTTP layer, so they attach the caller the
+/// middleware would: the operator. The schema itself has no fallback — a
+/// request with no caller is refused (`crate::access_control`).
+#[cfg(test)]
+pub(crate) trait ExecuteAsOperator {
+    async fn execute_as_operator(
+        &self,
+        request: impl Into<async_graphql::Request>,
+    ) -> async_graphql::Response;
+}
+
+#[cfg(test)]
+impl ExecuteAsOperator for AppSchema {
+    async fn execute_as_operator(
+        &self,
+        request: impl Into<async_graphql::Request>,
+    ) -> async_graphql::Response {
+        self.execute(
+            request
+                .into()
+                .data(crate::access_control::Caller::operator()),
+        )
+        .await
+    }
+}
+
 /// Handler for `POST /graphql` — execute a GraphQL request.
+///
+/// The caller the auth middleware authenticated rides along as request data,
+/// for [`crate::access_control::AccessControl`] to judge; a request that
+/// reached here without one is refused there.
 pub async fn graphql_handler(
     State(schema): State<AppSchema>,
+    caller: Option<axum::Extension<crate::access_control::Caller>>,
     request: GraphQLRequest,
 ) -> GraphQLResponse {
-    schema.execute(request.into_inner()).await.into()
+    let mut request = request.into_inner();
+    if let Some(axum::Extension(caller)) = caller {
+        request = request.data(caller);
+    }
+    schema.execute(request).await.into()
 }
 
 /// The GraphiQL release as a string literal, so the asset URLs below can be
@@ -390,7 +428,9 @@ mod tests {
     #[tokio::test]
     async fn test_schema_introspection() {
         let schema = build_schema();
-        let result = schema.execute("{ __schema { queryType { name } } }").await;
+        let result = schema
+            .execute_as_operator("{ __schema { queryType { name } } }")
+            .await;
         assert!(
             result.errors.is_empty(),
             "introspection errors: {:?}",
@@ -411,7 +451,7 @@ mod tests {
             query.push_str(&format!(" a{i}: verify {{ ok }}"));
         }
         query.push('}');
-        let result = schema.execute(query).await;
+        let result = schema.execute_as_operator(query).await;
         assert!(
             !result.errors.is_empty(),
             "64 aliased verify calls should exceed the complexity budget"
@@ -438,7 +478,7 @@ mod tests {
             ));
         }
         query.push('}');
-        let result = schema.execute(query).await;
+        let result = schema.execute_as_operator(query).await;
         assert!(
             result
                 .errors
@@ -461,7 +501,7 @@ mod tests {
             ));
         }
         query.push('}');
-        let result = schema.execute(query).await;
+        let result = schema.execute_as_operator(query).await;
         assert!(
             result
                 .errors
@@ -482,7 +522,7 @@ mod tests {
             query.push_str(&format!(" a{i}: account(name: \"Assets:X\") {{ account }}"));
         }
         query.push('}');
-        let result = schema.execute(query).await;
+        let result = schema.execute_as_operator(query).await;
         assert!(
             !result
                 .errors
@@ -497,7 +537,7 @@ mod tests {
     async fn test_complexity_allows_single_heavy_resolver() {
         // A single heavy resolver stays well within the budget.
         let schema = build_schema();
-        let result = schema.execute("{ verify { ok } }").await;
+        let result = schema.execute_as_operator("{ verify { ok } }").await;
         assert!(
             result.errors.is_empty(),
             "single verify should be allowed: {:?}",
@@ -509,7 +549,7 @@ mod tests {
     async fn test_health_query() {
         let schema = build_schema();
         let result = schema
-            .execute("{ health { status heads peers version } }")
+            .execute_as_operator("{ health { status heads peers version } }")
             .await;
         assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
         let data = result.data.into_json().unwrap();
@@ -521,7 +561,7 @@ mod tests {
     async fn test_all_query_fields_present() {
         let schema = build_schema();
         let result = schema
-            .execute(r#"{ __type(name: "QueryRoot") { fields { name } } }"#)
+            .execute_as_operator(r#"{ __type(name: "QueryRoot") { fields { name } } }"#)
             .await;
         assert!(result.errors.is_empty());
         let data = result.data.into_json().unwrap();
@@ -551,7 +591,7 @@ mod tests {
     async fn test_all_mutation_fields_present() {
         let schema = build_schema();
         let result = schema
-            .execute(r#"{ __type(name: "MutationRoot") { fields { name } } }"#)
+            .execute_as_operator(r#"{ __type(name: "MutationRoot") { fields { name } } }"#)
             .await;
         assert!(result.errors.is_empty());
         let data = result.data.into_json().unwrap();
@@ -572,7 +612,7 @@ mod tests {
         let schema = build_schema();
         for scalar_name in ["Date", "Decimal", "TxId"] {
             let query = format!(r#"{{ __type(name: "{scalar_name}") {{ name kind }} }}"#);
-            let result = schema.execute(&query).await;
+            let result = schema.execute_as_operator(&query).await;
             assert!(result.errors.is_empty());
             let data = result.data.into_json().unwrap();
             assert_eq!(
@@ -592,7 +632,7 @@ mod tests {
     async fn test_peer_type_exposes_membership_only() {
         let schema = build_schema();
         let result = schema
-            .execute(r#"{ __type(name: "Peer") { fields { name } } }"#)
+            .execute_as_operator(r#"{ __type(name: "Peer") { fields { name } } }"#)
             .await;
         assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
         let data = result.data.into_json().unwrap();
@@ -605,13 +645,13 @@ mod tests {
         assert_eq!(field_names, vec!["id"]);
 
         // And querying the removed field is now a schema error, not an empty list.
-        let removed = schema.execute("{ peers { id heads } }").await;
+        let removed = schema.execute_as_operator("{ peers { id heads } }").await;
         assert!(
             !removed.errors.is_empty(),
             "peers.heads must no longer resolve"
         );
 
-        let live = schema.execute("{ peers { id } }").await;
+        let live = schema.execute_as_operator("{ peers { id } }").await;
         assert!(live.errors.is_empty(), "errors: {:?}", live.errors);
     }
 
@@ -634,7 +674,9 @@ mod tests {
         );
 
         // Health should show 0 heads.
-        let result = schema.execute("{ health { status heads } }").await;
+        let result = schema
+            .execute_as_operator("{ health { status heads } }")
+            .await;
         assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
         let data = result.data.into_json().unwrap();
         assert_eq!(data["health"]["status"], "ok");
@@ -727,7 +769,7 @@ mod tests {
         );
         let (_dir, schema) = schema_over_ledger(&text);
         let result = schema
-            .execute("{ verify { quarantined unparsableBlocks } }")
+            .execute_as_operator("{ verify { quarantined unparsableBlocks } }")
             .await;
         assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
         let data = result.data.into_json().unwrap();
@@ -763,7 +805,7 @@ mod tests {
         }
         let (_dir, schema) = schema_over_ledger(&text);
         let result = schema
-            .execute("{ verify { quarantined quarantinedTotal } }")
+            .execute_as_operator("{ verify { quarantined quarantinedTotal } }")
             .await;
         assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
         let data = result.data.into_json().unwrap();
@@ -783,7 +825,7 @@ mod tests {
         // that expose the lie.
         let (_dir, schema) = schema_over_ledger(&ledger_asserting("999.00"));
 
-        let result = schema.execute(VERIFY_QUERY).await;
+        let result = schema.execute_as_operator(VERIFY_QUERY).await;
         assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
         let data = result.data.into_json().unwrap();
         let assertions = &data["verify"]["balanceAssertions"];
@@ -820,7 +862,7 @@ mod tests {
     async fn test_verify_reports_passing_balance_assertion() {
         let (_dir, schema) = schema_over_ledger(&ledger_asserting("1000.00"));
 
-        let result = schema.execute(VERIFY_QUERY).await;
+        let result = schema.execute_as_operator(VERIFY_QUERY).await;
         assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
         let data = result.data.into_json().unwrap();
         let assertions = &data["verify"]["balanceAssertions"];
@@ -838,7 +880,7 @@ mod tests {
         // An empty summary means "nothing claimed", not "nothing checked".
         let (_dir, schema) = schema_over_ledger("2024-01-01 open Assets:Cash USD\n");
 
-        let result = schema.execute(VERIFY_QUERY).await;
+        let result = schema.execute_as_operator(VERIFY_QUERY).await;
         assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
         let data = result.data.into_json().unwrap();
         let assertions = &data["verify"]["balanceAssertions"];
@@ -870,7 +912,9 @@ mod tests {
             false,
             None,
         );
-        let result = schema.execute("{ __schema { queryType { name } } }").await;
+        let result = schema
+            .execute_as_operator("{ __schema { queryType { name } } }")
+            .await;
         let data = result.data.into_json().unwrap();
         assert!(
             data["__schema"].is_null(),
@@ -896,7 +940,7 @@ mod tests {
         );
 
         let result = schema
-            .execute(
+            .execute_as_operator(
                 r#"
                 mutation {
                     appendTransaction(input: {
@@ -943,7 +987,7 @@ mod tests {
         // nothing else — otherwise the lifecycle check (I3) would mask the bug.
         for name in ["Assets:Cash", "Equity:Opening"] {
             let opened = schema
-                .execute(format!(
+                .execute_as_operator(format!(
                     r#"mutation {{ openAccount(name: "{name}", date: "2024-01-01") }}"#
                 ))
                 .await;
@@ -952,7 +996,7 @@ mod tests {
         let before = std::fs::read_to_string(&bean_path).unwrap();
 
         let result = schema
-            .execute(
+            .execute_as_operator(
                 r#"
                 mutation {
                     appendTransaction(input: {
@@ -1007,7 +1051,9 @@ mod tests {
         );
 
         let result = schema
-            .execute(r#"mutation { openAccount(name: "Assets:Cash", date: "9999-12-31") }"#)
+            .execute_as_operator(
+                r#"mutation { openAccount(name: "Assets:Cash", date: "9999-12-31") }"#,
+            )
             .await;
         assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
 
@@ -1018,6 +1064,104 @@ mod tests {
         );
         let rebooted = LedgerService::boot(&bean_path, "test-node".to_owned()).unwrap();
         assert_eq!(rebooted.directive_count(), 1);
+    }
+
+    // ── 002-users-and-roles: roles on the live schema ───────────────────
+
+    /// The production schema enforces the caller's role before anything runs:
+    /// a **read** caller gets every query and is refused every mutation — the
+    /// ledger unchanged — with `FORBIDDEN`; a **write** caller can post.
+    ///
+    /// Bug-catch: build the schema without `AccessControl`, or check the role
+    /// after the resolver ran, and the read caller's account is opened.
+    #[tokio::test]
+    async fn a_read_caller_reads_and_is_refused_every_mutation() {
+        use crate::access_control::{Caller, CallerId, Role};
+        let (_dir, ledger, schema) = schema_and_ledger_over(
+            "2024-01-01 open Assets:Cash USD\n2024-01-01 open Income:Salary USD\n",
+        );
+        let as_role = |role: Role, query: &str| {
+            async_graphql::Request::new(query).data(Caller {
+                who: CallerId::Operator,
+                role,
+            })
+        };
+
+        let read = schema
+            .execute(as_role(Role::Read, "{ verify { ok } }"))
+            .await;
+        assert!(
+            read.errors.is_empty(),
+            "a read caller reads: {:?}",
+            read.errors
+        );
+
+        let before = ledger.read().await.directive_count();
+        for mutation in [
+            r#"mutation { openAccount(name: "Assets:Bank", date: "2024-01-02") }"#,
+            r#"mutation { closeAccount(name: "Assets:Cash", date: "2024-02-01") }"#,
+            r#"mutation { appendTransaction(input: { date: "2024-01-03", narration: "x", postings: [
+                { account: "Assets:Cash", amount: { number: "1", currency: "USD" } },
+                { account: "Income:Salary" }] }) { txid } }"#,
+        ] {
+            let refused = schema.execute(as_role(Role::Read, mutation)).await;
+            let error = refused
+                .errors
+                .first()
+                .unwrap_or_else(|| panic!("refused: {mutation}"));
+            assert_eq!(
+                error
+                    .extensions
+                    .as_ref()
+                    .and_then(|e| e.get("code"))
+                    .map(ToString::to_string)
+                    .as_deref(),
+                Some("\"FORBIDDEN\""),
+                "{mutation}: {error:?}"
+            );
+        }
+        assert_eq!(
+            ledger.read().await.directive_count(),
+            before,
+            "nothing was written"
+        );
+
+        let written = schema
+            .execute(as_role(
+                Role::Write,
+                r#"mutation { openAccount(name: "Assets:Bank", date: "2024-01-02") }"#,
+            ))
+            .await;
+        assert!(
+            written.errors.is_empty(),
+            "a write caller writes: {:?}",
+            written.errors
+        );
+        assert_eq!(ledger.read().await.directive_count(), before + 1);
+    }
+
+    /// A request that reaches the schema with no authenticated caller — only
+    /// possible for a route that skipped the auth middleware — is refused, not
+    /// run as anyone: the schema has no fallback.
+    ///
+    /// Bug-catch: fall back to the operator when no caller is attached and a
+    /// route without the middleware runs as admin.
+    #[tokio::test]
+    async fn a_request_without_a_caller_is_refused() {
+        let (_dir, _ledger, schema) = schema_and_ledger_over("2024-01-01 open Assets:Cash USD\n");
+        let refused = schema.execute("{ verify { ok } }").await;
+        let error = refused.errors.first().expect("refused");
+        assert_eq!(
+            error
+                .extensions
+                .as_ref()
+                .and_then(|e| e.get("code"))
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("\"FORBIDDEN\""),
+            "{error:?}"
+        );
+        assert!(error.locations.is_empty(), "no made-up location: {error:?}");
     }
 
     // ── T33: `alreadyExisted` on appendTransaction (M-10, interim) ───────
@@ -1088,7 +1232,7 @@ mod tests {
         // payload must now carry that verdict on both calls.
         let (_dir, schema) = schema_over_ledger(RENT_ACCOUNTS);
 
-        let first = schema.execute(RENT_MUTATION).await;
+        let first = schema.execute_as_operator(RENT_MUTATION).await;
         assert!(first.errors.is_empty(), "errors: {:?}", first.errors);
         let first = first.data.into_json().unwrap();
         assert_eq!(
@@ -1096,7 +1240,7 @@ mod tests {
             "the first append really inserts: {first:?}"
         );
 
-        let second = schema.execute(RENT_MUTATION).await;
+        let second = schema.execute_as_operator(RENT_MUTATION).await;
         assert!(second.errors.is_empty(), "errors: {:?}", second.errors);
         let second = second.data.into_json().unwrap();
         assert_eq!(
@@ -1126,7 +1270,7 @@ mod tests {
             .unwrap()
             .expect("the squatter's entry is new to this node");
 
-        let result = schema.execute(RENT_MUTATION).await;
+        let result = schema.execute_as_operator(RENT_MUTATION).await;
         assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
         let data = result.data.into_json().unwrap();
         assert_eq!(
@@ -1148,7 +1292,7 @@ mod tests {
         let (_dir, schema) = schema_over_ledger(RENT_ACCOUNTS);
 
         let result = schema
-            .execute(
+            .execute_as_operator(
                 r#"
                 mutation {
                     appendTransaction(input: {
@@ -1189,7 +1333,7 @@ mod tests {
         // it being present on every successful append.
         let schema = build_schema();
         let result = schema
-            .execute(
+            .execute_as_operator(
                 r#"{ __type(name: "AppendedTransaction") {
                         fields { name type { kind ofType { name } } }
                    } }"#,

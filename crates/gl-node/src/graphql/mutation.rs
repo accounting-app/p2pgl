@@ -380,6 +380,7 @@ async fn gossip_after_unlock(ctx: &Context<'_>, directive: Option<ledger::model:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graphql::ExecuteAsOperator;
     use crate::graphql::{build_schema_with_service, SharedLedger};
     use ledger::service::LedgerService;
     use std::io;
@@ -465,7 +466,9 @@ mod tests {
 
         let mutation = tokio::spawn(async move {
             schema
-                .execute(r#"mutation { openAccount(name: "Assets:Cash", date: "2024-01-01") }"#)
+                .execute_as_operator(
+                    r#"mutation { openAccount(name: "Assets:Cash", date: "2024-01-01") }"#,
+                )
                 .await
         });
 
@@ -509,7 +512,9 @@ mod tests {
 
         let mutation = tokio::spawn(async move {
             schema
-                .execute(r#"mutation { closeAccount(name: "Assets:Cash", date: "2024-06-01") }"#)
+                .execute_as_operator(
+                    r#"mutation { closeAccount(name: "Assets:Cash", date: "2024-06-01") }"#,
+                )
                 .await
         });
 
@@ -535,7 +540,7 @@ mod tests {
 
         let mutation = tokio::spawn(async move {
             schema
-                .execute(
+                .execute_as_operator(
                     r#"mutation { appendTransaction(input: {
                         date: "2024-01-15",
                         narration: "Funding",
@@ -612,7 +617,7 @@ mod tests {
         while gossip.try_recv().is_ok() {}
 
         // First append: real, and it announces.
-        let first = schema.execute(FUNDING_MUTATION).await;
+        let first = schema.execute_as_operator(FUNDING_MUTATION).await;
         assert!(first.errors.is_empty(), "{:?}", first.errors);
         assert!(
             first.data.to_string().contains("alreadyExisted: false"),
@@ -626,7 +631,7 @@ mod tests {
         );
 
         // Second append of the identical body: idempotent, and silent.
-        let second = schema.execute(FUNDING_MUTATION).await;
+        let second = schema.execute_as_operator(FUNDING_MUTATION).await;
         assert!(second.errors.is_empty(), "{:?}", second.errors);
         assert!(
             second.data.to_string().contains("alreadyExisted: true"),
@@ -655,9 +660,11 @@ mod tests {
         let (_dir, ledger, schema, _broadcast, mut gossip) = schema_with_drainable_gossip();
 
         let open = r#"mutation { openAccount(name: "Assets:Cash", date: "2024-01-01") }"#;
-        assert!(schema.execute(open).await.errors.is_empty());
+        assert!(schema.execute_as_operator(open).await.errors.is_empty());
         assert!(schema
-            .execute(r#"mutation { closeAccount(name: "Assets:Cash", date: "2024-06-01") }"#)
+            .execute_as_operator(
+                r#"mutation { closeAccount(name: "Assets:Cash", date: "2024-06-01") }"#
+            )
             .await
             .errors
             .is_empty());
@@ -666,7 +673,7 @@ mod tests {
 
         // The identical `open` again: accepted (the account is closed now) and
         // a DAG duplicate (the content hash strips the envelope).
-        let reopened = schema.execute(open).await;
+        let reopened = schema.execute_as_operator(open).await;
         assert!(reopened.errors.is_empty(), "{:?}", reopened.errors);
         assert_eq!(
             ledger.read().await.directive_count(),
@@ -723,7 +730,9 @@ mod tests {
         let started = std::time::Instant::now();
         let mutation = tokio::spawn(async move {
             schema
-                .execute(r#"mutation { openAccount(name: "Assets:Cash", date: "2024-01-01") }"#)
+                .execute_as_operator(
+                    r#"mutation { openAccount(name: "Assets:Cash", date: "2024-01-01") }"#,
+                )
                 .await
         });
 
