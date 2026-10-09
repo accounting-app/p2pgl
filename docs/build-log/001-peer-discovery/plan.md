@@ -20,14 +20,19 @@ feeding that lookup is the whole of the node side.
   default is a new random port at every boot, so a `host:port` a peer is told
   needs a fixed port on the node it names. `0` (default) keeps today's
   behaviour.
-- **`relayMode: "custom"`** with **`p2p.relayUrls`** — `["https://relay.example.com"]`.
+- **`relayMode: "custom"`** with **`p2p.relayUrl`** — `"https://relay.example.com"`
+  (one relay per mesh: changed from a `relayUrls` list in step 2, because a
+  node registers at one relay and iroh's lookup holds one relay per peer, so
+  two relays could leave peers registered at different ones).
   The endpoint is built from `presets::Minimal` plus `RelayMode::Custom(map)`
   and the `MemoryLookup` — no n0 relay, no n0 discovery. Each bootstrap peer's
-  lookup entry also carries the relay URLs, so a peer behind a router is
-  reached through the relay. `"custom"` needs at least one of `relayUrls` or
-  `peerAddresses`; a URL must parse as a relay URL, be `https` (plain `http`
-  only to a loopback host, for tests and the dev compose stack), and carry no
-  user info or query (no secrets in config or logs).
+  lookup entry also carries the relay URL, so a peer behind a router is
+  reached through the relay. `"custom"` needs at least one of `relayUrl` or
+  `peerAddresses`; the URL must be `https` with only a host and port — no user
+  info, query or path (no secrets in config or logs). (Step 2 dropped the
+  planned plain-`http` exception for loopback: tests trust the in-process
+  relay's self-signed certificate in test code only, so no config value can
+  turn certificate checks off.)
 - **`"n0"` and `"disabled"`** keep today's meaning; `"disabled"` now also uses
   `peerAddresses`. Boot logs which mode is in force and, for `"n0"`, keeps its
   warning.
@@ -41,7 +46,7 @@ feeding that lookup is the whole of the node side.
    `MemoryLookup` at boot, DNS resolution and the refresh task. Tests on
    loopback: two P2P stacks with relays off converge through configured
    addresses only.
-2. **Own relay.** `relayMode: "custom"`, `relayUrls`, the endpoint built
+2. **Own relay.** `relayMode: "custom"`, `relayUrl`, the endpoint built
    without n0. Tests against an in-process `iroh-relay` server on 127.0.0.1:
    two nodes with no direct address configured converge through it; the
    endpoint's relay map and lookups name no n0 host; a relay with an allowlist
@@ -61,7 +66,8 @@ Each step is one commit, through the gate, with its revert checks and a
 
 - **Several relay URLs per peer.** iroh may try only one relay address per
   peer; a mesh with two relays could then miss a peer homed on the other.
-  Step 2 tests two relays; if it fails, the docs say one relay per mesh.
+  Settled in step 2: iroh's lookup holds one relay per peer and a node
+  registers at one relay, so the config takes one `relayUrl` per mesh.
 - **Plain-HTTP relays for tests and dev.** If the iroh client refuses `http`
   relay URLs, tests need the server's self-signed TLS with verification off,
   which must stay test-only (never reachable from config).

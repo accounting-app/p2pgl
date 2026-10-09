@@ -49,4 +49,4 @@ them (a typo, a one-line fix) gets no entry.
 
 | # | Work | Status |
 |---|---|---|
-| [001](001-peer-discovery/) | Peer discovery without a third party: own relay + direct addresses | step 1 of 3 (direct addresses) ready to commit; next: own relay |
+| [001](001-peer-discovery/) | Peer discovery without a third party: own relay + direct addresses | step 2 of 3 (own relay) ready to commit; next: packaging and docs |

@@ -42,6 +42,14 @@ zeroize = { workspace = true }
 
 
 [dev-dependencies]
+# An in-process iroh-relay server for the own-relay tests, on 127.0.0.1
+# (docs/build-log/001-peer-discovery). Test builds only: resolver 2 keeps
+# dev-dependency features out of the shipped binary.
+iroh = { workspace = true, features = ["test-utils"] }
+# Its access-control trait, for the relay allowlist test; already in the
+# lockfile through iroh's test-utils. Pinned to the iroh-relay that iroh uses:
+# bump the two together (a mismatch fails to compile).
+iroh-relay = { version = "=1.0.3", features = ["server"] }
 http-body-util = "0.1"
 tempfile = "3"
 rust_decimal_macros = "1"

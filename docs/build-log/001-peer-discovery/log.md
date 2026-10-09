@@ -34,3 +34,34 @@ to commit. The commit hash is filled in once the maintainer has committed.
   keeps one relay URL per peer (`add_endpoint_info` overwrites it), as the
   plan's first risk feared.
 - **Commit:** (pending)
+
+## 2026-10-08 — Step 2: the mesh's own relay
+
+- **What changed:** `relayMode: "custom"` with `p2p.relayUrl` (one `https`
+  relay per mesh): the endpoint is built from `presets::Minimal` plus that one
+  relay and the node's own lookup, where every bootstrap peer is entered at
+  the relay as well as at its addresses — no n0 relay, no n0 discovery.
+  Validation: `relayUrl` only with `"custom"`; `"custom"` needs a relay or
+  addresses; the URL is `https://host[:port]` only, and a refusal never repeats
+  it (a password or relay token must not reach the log). Tests run a real
+  `iroh-relay` in-process on 127.0.0.1 (iroh `test-utils` and `iroh-relay`
+  `server` as dev-dependencies: 40 lockfile crates, none in the shipped
+  binary, `cargo audit` clean).
+- **Review round** (reviewer subagent), all fixed: a refused relay URL echoed
+  its user info or token into the boot log — now only `scheme://host[:port]`
+  or a redaction; `"custom"` without a relay now gets the unreachable-peer
+  warning too; the allowlist test passed for the wrong reason (an admitted
+  stranger had not synced within its window either — PD-R15 did not bite) and
+  now asserts the relay's refusal itself (the stranger never comes online);
+  README states the relay needs a public-CA certificate; CHANGELOG retires the
+  0.1.0 "only through n0" limit.
+- **Gate:** `scripts/gate.sh` — 1,547 passed, 0 failed, 0 ignored (6 min 23 s).
+- **Revert checks:** `scripts/revert_specs/peer_discovery.json` — 15 of 15 bite
+  (steps 1 and 2).
+- **Departures from the plan:** one `relayUrl` instead of a `relayUrls` list
+  (plan.md updated): a node registers at one relay and iroh's lookup holds one
+  relay per peer. No plain-`http` exception for tests: they trust the test
+  relay's certificate in test code only. The plan's "relay map names no n0
+  host" check is covered by PD-R9 (an n0 preset adds lookups) rather than a
+  relay-map assertion.
+- **Commit:** (pending)

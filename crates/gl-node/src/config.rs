@@ -476,9 +476,18 @@ pub struct P2pConfig {
     #[serde(default)]
     pub mesh_id: Option<String>,
 
-    /// Iroh relay/discovery profile: `"n0"` (public relays) or `"disabled"` (direct-only).
+    /// Iroh relay/discovery profile: `"n0"` (n0's public relays and
+    /// discovery), `"disabled"` (direct addresses only) or `"custom"` (the
+    /// mesh's own relay, [`relay_url`](Self::relay_url), plus direct
+    /// addresses — nothing goes to n0; `docs/build-log/001-peer-discovery`).
     #[serde(default = "default_relay_mode")]
     pub relay_mode: String,
+
+    /// The mesh's own relay, for `relayMode: "custom"`: an `https` URL of an
+    /// `iroh-relay` server, the same on every node of the mesh. One relay per
+    /// mesh: every node registers there, and that is where its peers look.
+    #[serde(default)]
+    pub relay_url: Option<String>,
 
     /// Where allowlisted peers can be reached directly:
     /// `{ "<EndpointId>": ["host:port", …] }` (`docs/build-log/001-peer-discovery`).
@@ -574,6 +583,7 @@ impl std::fmt::Debug for P2pConfig {
             .field("swarm_topic", &crate::auth::redact(&self.swarm_topic))
             .field("mesh_id", &self.mesh_id.as_deref().map(crate::auth::redact))
             .field("relay_mode", &self.relay_mode)
+            .field("relay_url", &self.relay_url)
             .field("peer_addresses", &self.peer_addresses)
             .field("listen_port", &self.listen_port)
             .field(
@@ -713,6 +723,7 @@ impl Default for P2pConfig {
             swarm_topic: default_swarm_topic(),
             mesh_id: None,
             relay_mode: default_relay_mode(),
+            relay_url: None,
             peer_addresses: std::collections::BTreeMap::new(),
             listen_port: 0,
             anti_entropy_session_seconds: default_anti_entropy_session_seconds(),
@@ -1485,12 +1496,32 @@ impl NodeConfig {
         }
 
         match self.p2p.relay_mode.as_str() {
-            "n0" | "disabled" => {}
+            "n0" | "disabled" | "custom" => {}
             other => {
                 return Err(ConfigError::Validation(format!(
-                    "p2p.relayMode must be \"n0\" or \"disabled\", got \"{other}\""
+                    "p2p.relayMode must be \"n0\", \"disabled\" or \"custom\", got \"{other}\""
                 )));
             }
+        }
+        // 001-peer-discovery: a relay URL means the mesh's own relay, which only
+        // "custom" uses — refused elsewhere rather than silently ignored — and
+        // "custom" with neither a relay nor an address reaches no peer.
+        if let Some(relay_url) = &self.p2p.relay_url {
+            if self.p2p.relay_mode != "custom" {
+                return Err(ConfigError::Validation(format!(
+                    "p2p.relayUrl is set but p2p.relayMode is \"{}\"; a relay URL is used only with relayMode \"custom\"",
+                    self.p2p.relay_mode
+                )));
+            }
+            crate::peer_addresses::parse_relay_url(relay_url).map_err(ConfigError::Validation)?;
+        }
+        if self.p2p.relay_mode == "custom"
+            && self.p2p.relay_url.is_none()
+            && self.p2p.peer_addresses.is_empty()
+        {
+            return Err(ConfigError::Validation(
+                "p2p.relayMode \"custom\" needs the mesh's own relay (p2p.relayUrl) or peers' addresses (p2p.peerAddresses), or both; with neither this node reaches no peer, and nothing goes to n0".to_owned(),
+            ));
         }
 
         match self.tls.mode.as_str() {
@@ -2352,6 +2383,77 @@ mod tests {
                 message.contains("p2p.peerAddresses") && message.contains(expected),
                 "{bad}: {message}"
             );
+        }
+    }
+
+    /// `relayMode: "custom"` and `p2p.relayUrl` (`docs/build-log/001-peer-discovery`):
+    /// an `https` relay URL with `"custom"` loads; a relay URL with another mode
+    /// is refused rather than ignored; `"custom"` with neither a relay nor an
+    /// address is refused; and a URL that is not plain `https://host[:port]`
+    /// — `http`, user info, a query (a token), a path — is refused, naming
+    /// `p2p.relayUrl`.
+    ///
+    /// No refusal repeats the URL's password or token.
+    ///
+    /// Bug-catch: drop the `https` check and an unauthenticated relay loads;
+    /// drop the mode check and a relay URL beside `"n0"` is silently ignored;
+    /// echo the refused text and a password or relay token lands in the log.
+    #[test]
+    fn test_relay_url_only_with_custom_and_only_plain_https() {
+        let peer = iroh::SecretKey::generate().public().to_string();
+        let config_with = |p2p_extra: &str| {
+            format!(
+                r#"{{ "ledgerPath": "./data/ledger.bean", "signing": {{ "enabled": true }},
+                "p2p": {{ "enabled": true, "bootstrapEndpointIds": ["{peer}"],
+                "swarmTopic": "my-org/ledger", "meshId": "my-org/ledger", {p2p_extra} }} }}"#
+            )
+        };
+        for good in [
+            r#""relayMode": "custom", "relayUrl": "https://relay.example.com""#,
+            r#""relayMode": "custom", "relayUrl": "https://relay.example.com:8443/""#,
+        ] {
+            let file = write_temp_config(&config_with(good));
+            NodeConfig::load_from_path(&file.path().to_path_buf())
+                .unwrap_or_else(|error| panic!("{good}: {error}"));
+        }
+        for (bad, expected) in [
+            (
+                r#""relayMode": "n0", "relayUrl": "https://relay.example.com""#,
+                "used only with relayMode \"custom\"",
+            ),
+            (r#""relayMode": "custom""#, "needs the mesh's own relay"),
+            (
+                r#""relayMode": "custom", "relayUrl": "http://relay.example.com""#,
+                "must use https",
+            ),
+            (
+                r#""relayMode": "custom", "relayUrl": "https://user:pw@relay.example.com""#,
+                "must not carry user info",
+            ),
+            (
+                r#""relayMode": "custom", "relayUrl": "https://relay.example.com/?token=secret""#,
+                "must not carry a query",
+            ),
+            (
+                r#""relayMode": "custom", "relayUrl": "https://relay.example.com/relay""#,
+                "must not carry a path",
+            ),
+            (
+                r#""relayMode": "custom", "relayUrl": "relay.example.com""#,
+                "is not a URL",
+            ),
+            (r#""relayMode": "mine""#, "\"custom\", got \"mine\""),
+        ] {
+            let file = write_temp_config(&config_with(bad));
+            let Err(error) = NodeConfig::load_from_path(&file.path().to_path_buf()) else {
+                panic!("{bad}: refused");
+            };
+            let message = format!("{error}");
+            assert!(message.contains(expected), "{bad}: {message}");
+            // A refusal never repeats a credential it refuses (M-32 / L-56).
+            for secret in ["pw", "secret", "token="] {
+                assert!(!message.contains(secret), "{bad} leaks {secret}: {message}");
+            }
         }
     }
 

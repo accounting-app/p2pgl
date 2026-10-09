@@ -7,6 +7,13 @@ break compatibility.
 
 ## [Unreleased]
 
+### Fixed
+
+- The 0.1.0 known limit "nodes on different machines find each other only
+  through n0" no longer holds: a mesh can use its own relay
+  (`relayMode: "custom"`) or direct addresses (`p2p.peerAddresses`), with
+  nothing going to n0 (`docs/build-log/001-peer-discovery`).
+
 ### Added
 
 - **`p2p.peerAddresses`** — where each allowlisted peer listens,
@@ -16,6 +23,11 @@ break compatibility.
   all. An address is accepted only for a peer in `bootstrapEndpointIds`. An
   older binary refuses a config with this key
   (`docs/build-log/001-peer-discovery`).
+- **`relayMode: "custom"` and `p2p.relayUrl`** — the mesh's own relay (an
+  `iroh-relay` server) instead of n0's: nodes behind routers reach each other
+  through it, and nothing goes to n0 — no n0 relay, no n0 discovery. One relay
+  per mesh, `https` only. `relayUrl` with another mode, and `"custom"` with
+  neither a relay nor `peerAddresses`, are refused at boot.
 - **`p2p.listenPort`** — the UDP port the P2P endpoint listens on, so other
   nodes can list it in their `peerAddresses`. The default, `0`, keeps today's
   behaviour: a random port at every boot. A port already in use stops boot.

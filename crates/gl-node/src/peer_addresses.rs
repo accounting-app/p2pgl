@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use iroh::address_lookup::memory::MemoryLookup;
-use iroh::{EndpointAddr, EndpointId, TransportAddr};
+use iroh::{EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use tracing::{info, warn};
 
 /// Addresses one peer may list: enough for a few interfaces and both IP
@@ -115,10 +115,56 @@ fn is_dns_name(host: &str) -> bool {
         })
 }
 
-/// Every peer's configured addresses, parsed, with what each last resolved to.
+/// `p2p.relayUrl`: the mesh's own relay (`relayMode: "custom"`). `https` with a
+/// host and nothing else — no user info, query or fragment (no secrets in
+/// config or logs), no path. Plain `http` is refused: a relay carries every
+/// node's traffic, and its certificate is what proves it is the operator's.
+///
+/// A refusal never repeats the value it refuses: a URL refused for its user
+/// info or query may carry a password or a relay token, and the message goes
+/// to the boot log (the M-32 / L-56 rule). It names `scheme://host[:port]`
+/// when the value parses, and only its length and first characters when not.
+pub fn parse_relay_url(text: &str) -> Result<RelayUrl, String> {
+    let refuse = |shown: &str, why: &str| {
+        Err(format!(
+            "p2p.relayUrl ({shown}) {why} (write https://relay.example.com, the address of the mesh's own iroh-relay)"
+        ))
+    };
+    let Ok(url) = text.parse::<RelayUrl>() else {
+        return refuse(&crate::auth::redact(text), "is not a URL");
+    };
+    let shown = match (url.host_str(), url.port()) {
+        (Some(host), Some(port)) => format!("{}://{host}:{port}", url.scheme()),
+        (Some(host), None) => format!("{}://{host}", url.scheme()),
+        (None, _) => format!("{}://", url.scheme()),
+    };
+    let refuse = |why: &str| refuse(&shown, why);
+    if url.scheme() != "https" {
+        return refuse("must use https");
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return refuse("has no host");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return refuse("must not carry user info");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return refuse("must not carry a query or fragment");
+    }
+    if !matches!(url.path(), "" | "/") {
+        return refuse("must not carry a path");
+    }
+    Ok(url)
+}
+
+/// Every peer's configured addresses, parsed, with what each last resolved to,
+/// and the mesh's relay when there is one.
 #[derive(Debug, Default)]
 pub struct PeerAddresses {
     peers: BTreeMap<EndpointId, Vec<PeerAddress>>,
+    /// `p2p.relayUrl` (`relayMode: "custom"`): every bootstrap peer is reached
+    /// through it as well as at its own addresses.
+    relay: Option<RelayUrl>,
     /// The sockets each `(peer, address index)` resolved to last time, so an
     /// address that fails one refresh keeps its last known sockets.
     last_known: std::sync::Mutex<BTreeMap<(EndpointId, usize), Vec<SocketAddr>>>,
@@ -152,8 +198,24 @@ impl PeerAddresses {
         }
         Ok(Self {
             peers,
+            relay: None,
             last_known: std::sync::Mutex::default(),
         })
+    }
+
+    /// Reach every `bootstrap` peer through `relay` too — the mesh's own relay,
+    /// where each node is registered — including peers with no address of
+    /// their own (a node behind a router has none to give).
+    pub fn with_relay(
+        mut self,
+        relay: RelayUrl,
+        bootstrap: impl IntoIterator<Item = EndpointId>,
+    ) -> Self {
+        for peer in bootstrap {
+            self.peers.entry(peer).or_default();
+        }
+        self.relay = Some(relay);
+        self
     }
 
     pub fn is_empty(&self) -> bool {
@@ -199,6 +261,9 @@ impl PeerAddresses {
                 };
                 resolved.extend(sockets.into_iter().map(TransportAddr::Ip));
             }
+            if let Some(relay) = &self.relay {
+                resolved.insert(TransportAddr::Relay(relay.clone()));
+            }
             if resolved.is_empty() {
                 warn!(
                     peer = %peer,
@@ -221,7 +286,9 @@ impl PeerAddresses {
         }
         info!(
             peers = self.peers.len(),
-            "resolving configured peer addresses (p2p.peerAddresses)"
+            with_addresses = self.peers.values().filter(|addresses| !addresses.is_empty()).count(),
+            relay = self.relay.is_some(),
+            "keeping peers in the address lookup: their p2p.peerAddresses, resolved now and every few minutes, and the mesh's relay if one is set"
         );
         tokio::spawn(async move {
             loop {

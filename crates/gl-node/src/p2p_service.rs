@@ -92,7 +92,8 @@ pub async fn boot_p2p(
 pub(crate) fn endpoint_builder(
     config: &P2pConfig,
 ) -> Result<iroh::endpoint::Builder, Box<dyn std::error::Error>> {
-    let peer_addresses = crate::peer_addresses::PeerAddresses::from_config(&config.peer_addresses)?;
+    let mut peer_addresses =
+        crate::peer_addresses::PeerAddresses::from_config(&config.peer_addresses)?;
     let builder = match config.relay_mode.as_str() {
         "n0" => {
             warn!("p2p.relayMode is n0 — endpoint uses public Iroh relays and discovery");
@@ -102,13 +103,38 @@ pub(crate) fn endpoint_builder(
             info!("p2p.relayMode is disabled — direct addresses only");
             iroh::Endpoint::builder(presets::Minimal)
         }
+        // The mesh's own relay: `presets::Minimal` (no n0 relay, no n0
+        // discovery) plus that one relay, where every bootstrap peer is looked
+        // up as well as at its own addresses.
+        "custom" => {
+            let builder = iroh::Endpoint::builder(presets::Minimal);
+            match config.relay_url.as_deref() {
+                Some(text) => {
+                    let relay = crate::peer_addresses::parse_relay_url(text)?;
+                    info!(relay = %relay, "p2p.relayMode is custom — the mesh's own relay and direct addresses only; nothing goes to n0");
+                    let bootstrap =
+                        PeerAllowlist::parse(&config.bootstrap_endpoint_ids)?.bootstrap_peers();
+                    peer_addresses = peer_addresses.with_relay(relay.clone(), bootstrap);
+                    builder.relay_mode(iroh::RelayMode::custom([relay]))
+                }
+                None => {
+                    info!("p2p.relayMode is custom with no relay — direct addresses only; nothing goes to n0");
+                    builder
+                }
+            }
+        }
         other => {
-            return Err(
-                format!("p2p.relayMode must be \"n0\" or \"disabled\", got \"{other}\"").into(),
-            );
+            return Err(format!(
+                "p2p.relayMode must be \"n0\", \"disabled\" or \"custom\", got \"{other}\""
+            )
+            .into());
         }
     };
-    if config.relay_mode == "disabled" {
+    // No relay and no discovery — `"disabled"`, or `"custom"` without a
+    // relay — leaves a bootstrap peer with no address unreachable.
+    if config.relay_mode == "disabled"
+        || (config.relay_mode == "custom" && config.relay_url.is_none())
+    {
         let unreachable: Vec<&String> = config
             .bootstrap_endpoint_ids
             .iter()
@@ -117,7 +143,7 @@ pub(crate) fn endpoint_builder(
         if !unreachable.is_empty() {
             warn!(
                 peers = ?unreachable,
-                "p2p.relayMode is disabled and these bootstrap peers have no p2p.peerAddresses entry: nothing tells this node where they are, so it cannot reach them — list their addresses in p2p.peerAddresses"
+                "this node has no relay and no discovery (relayMode \"disabled\", or \"custom\" without relayUrl), and these bootstrap peers have no p2p.peerAddresses entry: nothing tells it where they are, so it cannot reach them — list their addresses in p2p.peerAddresses, or set the mesh's relay"
             );
         }
     }
@@ -1709,29 +1735,235 @@ mod tests {
     /// that do have addresses. Before, such a node failed every dial in
     /// silence.
     ///
+    /// The same holds for `"custom"` without a relay.
+    ///
     /// Bug-catch: drop the warning, or check only whether `peerAddresses` is
-    /// empty, and a peer left out of it goes unnamed.
+    /// empty, and a peer left out of it goes unnamed; warn only for
+    /// `"disabled"` and `"custom"` without a relay stays silent.
     #[tokio::test]
     async fn relays_off_names_each_bootstrap_peer_without_an_address() {
         let with_address = iroh::SecretKey::generate().public().to_string();
         let without_address = iroh::SecretKey::generate().public().to_string();
+        // `"disabled"`, and `"custom"` with no relay: neither has a relay or
+        // discovery to find a peer that has no address.
+        for relay_mode in ["disabled", "custom"] {
+            let config = P2pConfig {
+                enabled: true,
+                relay_mode: relay_mode.to_owned(),
+                bootstrap_endpoint_ids: vec![with_address.clone(), without_address.clone()],
+                peer_addresses: std::collections::BTreeMap::from([(
+                    with_address.clone(),
+                    vec!["127.0.0.1:9".to_owned()],
+                )]),
+                ..P2pConfig::default()
+            };
+            let (built, logged) = capture_info(|| endpoint_builder(&config));
+            built.expect("builds");
+            assert!(
+                logged.contains("have no p2p.peerAddresses entry")
+                    && logged.contains(&without_address),
+                "{relay_mode}: {logged}"
+            );
+            assert!(!logged.contains(&with_address), "{relay_mode}: {logged}");
+        }
+    }
+
+    /// A node endpoint for the own-relay tests: the production builder for
+    /// `relayMode: "custom"` with `relay`, then — test-only — trusting the
+    /// test relay's self-signed certificate, and **no IP sockets at all**, so
+    /// the relay is the only path between two such nodes.
+    async fn bind_relay_only_node(
+        key: iroh::SecretKey,
+        relay: &iroh::RelayUrl,
+        bootstrap: &[iroh::EndpointId],
+    ) -> iroh::Endpoint {
         let config = P2pConfig {
             enabled: true,
-            relay_mode: "disabled".to_owned(),
-            bootstrap_endpoint_ids: vec![with_address.clone(), without_address.clone()],
-            peer_addresses: std::collections::BTreeMap::from([(
-                with_address.clone(),
-                vec!["127.0.0.1:9".to_owned()],
-            )]),
+            relay_mode: "custom".to_owned(),
+            relay_url: Some(relay.to_string()),
+            bootstrap_endpoint_ids: bootstrap.iter().map(ToString::to_string).collect(),
             ..P2pConfig::default()
         };
-        let (built, logged) = capture_info(|| endpoint_builder(&config));
-        built.expect("builds");
-        assert!(
-            logged.contains("have no p2p.peerAddresses entry") && logged.contains(&without_address),
-            "{logged}"
+        let endpoint = endpoint_builder(&config)
+            .expect("production builder")
+            .ca_tls_config(iroh_relay::tls::CaTlsConfig::insecure_skip_verify())
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+            .clear_ip_transports()
+            .secret_key(key)
+            .alpns(vec![p2p::protocol::ANTI_ENTROPY_ALPN.to_vec()])
+            .bind()
+            .await
+            .expect("bind a relay-only node");
+        tokio::time::timeout(Duration::from_secs(20), endpoint.online())
+            .await
+            .expect("the node registers at the relay");
+        endpoint
+    }
+
+    /// Serve a 5-record ledger from `server` and pull from it with `client`,
+    /// dialling the bare EndpointId for up to `within`; how many records the
+    /// client then holds.
+    async fn records_pulled_through(
+        server: &iroh::Endpoint,
+        client: &iroh::Endpoint,
+        within: Duration,
+    ) -> usize {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let server_path = temp_dir.path().join("server.bean");
+        write_open_directive_ledger(&server_path, 5, &server.id().to_string());
+        let ledger_server: SharedLedger = Arc::new(RwLock::new(
+            ledger::service::LedgerService::boot(server_path, server.id().to_string())
+                .expect("boot server ledger"),
+        ));
+        let ledger_client: SharedLedger = Arc::new(RwLock::new(
+            ledger::service::LedgerService::boot(
+                temp_dir.path().join("client.bean"),
+                client.id().to_string(),
+            )
+            .expect("boot client ledger"),
+        ));
+        let handler_server = make_handler(
+            ledger_server,
+            PeerAllowlist::parse(&[client.id().to_string()]).expect("server allowlist"),
         );
-        assert!(!logged.contains(&with_address), "{logged}");
+        let handler_client = make_handler_with_timeouts(
+            ledger_client.clone(),
+            PeerAllowlist::parse(&[server.id().to_string()]).expect("client allowlist"),
+            AntiEntropyTimeouts {
+                connect: Duration::from_secs(2),
+                io: Duration::from_secs(5),
+                ..AntiEntropyTimeouts::default()
+            },
+        );
+        let router = Router::builder(server.clone())
+            .accept(p2p::protocol::ANTI_ENTROPY_ALPN, handler_server)
+            .spawn();
+        let deadline = tokio::time::Instant::now() + within;
+        let count = loop {
+            exchange_with_peer(client, server.id(), &handler_client).await;
+            let count = ledger_client.read().await.directive_count();
+            if count == 5 || tokio::time::Instant::now() > deadline {
+                break count;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        let _ = router.shutdown().await;
+        count
+    }
+
+    /// `relayMode: "custom"` (`docs/build-log/001-peer-discovery`, step 2): two
+    /// nodes with **no IP sockets and no configured address** sync through the
+    /// mesh's own relay — an in-process `iroh-relay` on 127.0.0.1 — so the
+    /// relay is provably the path; and the endpoint carries exactly one
+    /// address lookup, the node's own, so nothing asks n0's discovery.
+    ///
+    /// Bug-catch: build `"custom"` from `presets::N0` and a second (n0) lookup
+    /// appears; drop the relay from the lookup entries (`with_relay`) and the
+    /// client cannot find the server.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn nodes_find_each_other_through_the_meshs_own_relay_alone() {
+        let _serialized = NET_TEST_LOCK.lock().await;
+        let (_map, relay, _relay_server) = iroh::test_utils::run_relay_server()
+            .await
+            .expect("a relay on 127.0.0.1");
+        let (server_key, client_key) = (iroh::SecretKey::generate(), iroh::SecretKey::generate());
+        let (server_id, client_id) = (server_key.public(), client_key.public());
+        let server = bind_relay_only_node(server_key, &relay, &[client_id]).await;
+        let client = bind_relay_only_node(client_key, &relay, &[server_id]).await;
+
+        assert_eq!(
+            client.address_lookup().expect("lookups").len(),
+            1,
+            "only the node's own lookup — no n0 discovery"
+        );
+        assert_eq!(
+            records_pulled_through(&server, &client, Duration::from_secs(30)).await,
+            5,
+            "the client syncs through the relay"
+        );
+    }
+
+    /// The relay admits only the mesh's nodes: with an allowlist naming the
+    /// server and one client, that client syncs and a node not on it cannot
+    /// use the relay at all — the setting `deploy/` ships for a self-hosted
+    /// relay (`docs/build-log/001-peer-discovery`, decision 3).
+    ///
+    /// Bug-catch: admit everyone and the stranger syncs too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_relay_admits_only_the_nodes_on_its_allowlist() {
+        #[derive(Debug)]
+        struct Allowlist(std::collections::BTreeSet<iroh::EndpointId>);
+        impl iroh_relay::server::AccessControl for Allowlist {
+            async fn on_connect(
+                &self,
+                request: &iroh_relay::server::ClientRequest,
+            ) -> iroh_relay::server::Access {
+                if self.0.contains(&request.endpoint_id()) {
+                    iroh_relay::server::Access::Allow
+                } else {
+                    iroh_relay::server::Access::Deny { reason: None }
+                }
+            }
+        }
+
+        let _serialized = NET_TEST_LOCK.lock().await;
+        let (server_key, member_key, stranger_key) = (
+            iroh::SecretKey::generate(),
+            iroh::SecretKey::generate(),
+            iroh::SecretKey::generate(),
+        );
+        let (server_id, member_id, stranger_id) = (
+            server_key.public(),
+            member_key.public(),
+            stranger_key.public(),
+        );
+        let (_map, relay, _relay_server) = iroh::test_utils::run_relay_server_with_access(
+            true,
+            Arc::new(Allowlist([server_id, member_id].into())),
+        )
+        .await
+        .expect("a relay on 127.0.0.1");
+        let server = bind_relay_only_node(server_key, &relay, &[member_id, stranger_id]).await;
+        let member = bind_relay_only_node(member_key, &relay, &[server_id]).await;
+        assert_eq!(
+            records_pulled_through(&server, &member, Duration::from_secs(30)).await,
+            5,
+            "a node on the allowlist syncs"
+        );
+
+        // The stranger is refused by the relay: it never comes online there.
+        let stranger_config = P2pConfig {
+            enabled: true,
+            relay_mode: "custom".to_owned(),
+            relay_url: Some(relay.to_string()),
+            bootstrap_endpoint_ids: vec![server_id.to_string()],
+            ..P2pConfig::default()
+        };
+        let stranger = endpoint_builder(&stranger_config)
+            .expect("production builder")
+            .ca_tls_config(iroh_relay::tls::CaTlsConfig::insecure_skip_verify())
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+            .clear_ip_transports()
+            .secret_key(stranger_key)
+            .alpns(vec![p2p::protocol::ANTI_ENTROPY_ALPN.to_vec()])
+            .bind()
+            .await
+            .expect("bind the stranger");
+        // The relay's decision itself: the member and the server came online
+        // there within seconds (`bind_relay_only_node`); the stranger never
+        // does. (A record count alone proves nothing here: an admitted node
+        // that has not come online yet holds no records either.)
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), stranger.online())
+                .await
+                .is_err(),
+            "the relay must refuse a node not on its allowlist"
+        );
+        assert_eq!(
+            records_pulled_through(&server, &stranger, Duration::from_secs(3)).await,
+            0,
+            "a node the relay does not admit cannot reach the mesh through it"
+        );
     }
 
     // ── H-10: one stuck peer must not stop the scheduler ─────────────────

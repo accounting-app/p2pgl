@@ -548,7 +548,8 @@ signing node without it refuses to boot, and the refusal names that remedy.
 | `p2p.antiEntropySupplyBackoffSeconds` | `60` | When a peer's batch would not fit under the 64 MiB ledger cap, that peer's `Supply` is not applied again for this long (one warning per deferral). `5`–`3600` |
 | `p2p.listenPort` | `0` | UDP port the P2P endpoint listens on. `0` picks a new random port at every boot; set a fixed port on any node whose address other nodes list in `peerAddresses`, and open it (UDP) in the firewall |
 | `p2p.peerAddresses` | `{}` | Where allowlisted peers listen: `{ "<EndpointId>": ["host:port", …] }`, 1–16 addresses each, every key one of `bootstrapEndpointIds`; names re-resolved every 5 minutes — see [Relay mode](#relay-mode-p2prelaymode) |
-| `p2p.relayMode` | `"n0"` | `"n0"` (public Iroh relays and discovery) or `"disabled"` (direct addresses only). Anything else is refused at boot — see [Relay mode](#relay-mode-p2prelaymode) |
+| `p2p.relayMode` | `"n0"` | `"n0"` (public Iroh relays and discovery), `"disabled"` (direct addresses only) or `"custom"` (the mesh's own relay, `relayUrl`, plus direct addresses; nothing goes to n0). Anything else is refused at boot — see [Relay mode](#relay-mode-p2prelaymode) |
+| `p2p.relayUrl` | unset | The mesh's own relay for `relayMode: "custom"`: `https://host[:port]` of an `iroh-relay` server, the same on every node; no user info, query or path. Refused with any other mode |
 | `p2p.swarmTopic` | `openledger/transactions` | Gossip topic (and, before `meshId` existed, the signature domain); required unique on a public bind. Same form as `meshId`: non-empty, no surrounding whitespace, ASCII letters, digits and `- _ . : /`, up to 128 bytes |
 | `p2p.meshId` | *(unset)* | Mesh identity bound into every signature. **Required when `signing.enabled`** — a signing node without it refuses to boot. **Existing mesh: your current `swarmTopic`, verbatim** — any other value invalidates every signature already in the mesh. New mesh: a random UUID — see below |
 
@@ -707,6 +708,29 @@ others reach by address, and open it in the firewall. The peer must accept conne
 address: a server with a public address and an open port, or a machine on the
 same network. `peerAddresses` also works beside `"n0"`: its addresses are tried
 along with whatever n0's discovery finds.
+
+`"custom"` uses **the mesh's own relay** instead of n0's: an `iroh-relay`
+server you (or your provider) run, named by **`p2p.relayUrl`** —
+
+```json
+"relayMode": "custom",
+"relayUrl": "https://relay.example.com"
+```
+
+Every node registers at that relay, and every bootstrap peer is looked up
+there as well as at its `peerAddresses`, so nodes behind office routers reach
+each other with no address of their own to give. Traffic through the relay
+stays end-to-end encrypted; the relay's operator — you — sees which nodes talk
+to each other, n0 sees nothing (no n0 relay, no n0 discovery). Use **one relay
+per mesh**, the same `relayUrl` on every node: a node registers at exactly one
+relay, and that is where its peers look for it. The URL must be `https` with
+nothing but a host and port, and the relay's certificate must come from a
+public certificate authority (for example Let's Encrypt, which `iroh-relay`
+can obtain itself): nodes verify it against the standard public roots, and a
+self-signed or private-CA certificate leaves them unable to connect.
+`"custom"` with neither `relayUrl` nor `peerAddresses` is refused, since it
+would reach no peer. Configure the relay to admit only the mesh's own nodes —
+an allowlist of their EndpointIds in the relay's own config.
 
 ### Mesh identity (`p2p.meshId`)
 

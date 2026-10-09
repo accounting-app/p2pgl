@@ -110,5 +110,103 @@
         "a_peer_is_reached_at_its_configured_address_with_relays_off"
       ]
     ]
+  },
+  "PD-R9-custom-built-on-n0": {
+    "file": "crates/gl-node/src/p2p_service.rs",
+    "old": "            let builder = iroh::Endpoint::builder(presets::Minimal);",
+    "new": "            let builder = iroh::Endpoint::builder(presets::N0);",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "nodes_find_each_other_through_the_meshs_own_relay_alone"
+      ]
+    ]
+  },
+  "PD-R10-peers-not-looked-up-at-the-relay": {
+    "file": "crates/gl-node/src/peer_addresses.rs",
+    "old": "                resolved.insert(TransportAddr::Relay(relay.clone()));",
+    "new": "                let _ = relay;",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "nodes_find_each_other_through_the_meshs_own_relay_alone"
+      ]
+    ]
+  },
+  "PD-R11-relay-url-beside-another-mode": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "            if self.p2p.relay_mode != \"custom\" {",
+    "new": "            if false {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "test_relay_url_only_with_custom_and_only_plain_https"
+      ]
+    ]
+  },
+  "PD-R12-plain-http-relay": {
+    "file": "crates/gl-node/src/peer_addresses.rs",
+    "old": "    if url.scheme() != \"https\" {",
+    "new": "    if false {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "test_relay_url_only_with_custom_and_only_plain_https"
+      ]
+    ]
+  },
+  "PD-R13-refusal-echoes-the-url": {
+    "file": "crates/gl-node/src/peer_addresses.rs",
+    "old": "    let refuse = |why: &str| refuse(&shown, why);",
+    "new": "    let refuse = |why: &str| refuse(text, why);",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "test_relay_url_only_with_custom_and_only_plain_https"
+      ]
+    ]
+  },
+  "PD-R14-custom-without-relay-stays-silent": {
+    "file": "crates/gl-node/src/p2p_service.rs",
+    "old": "        || (config.relay_mode == \"custom\" && config.relay_url.is_none())",
+    "new": "        || false",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "relays_off_names_each_bootstrap_peer_without_an_address"
+      ]
+    ]
+  },
+  "PD-R15-relay-admits-everyone": {
+    "file": "crates/gl-node/src/p2p_service.rs",
+    "old": "                    iroh_relay::server::Access::Deny { reason: None }",
+    "new": "                    iroh_relay::server::Access::Allow",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_relay_admits_only_the_nodes_on_its_allowlist"
+      ]
+    ]
   }
 }
