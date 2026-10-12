@@ -1,6 +1,7 @@
 use async_graphql::{Context, ErrorExtensions, Object, Result};
 use std::sync::Arc;
 
+use super::access::{self, AccessChange, AccessRole, GrantedAccess};
 use super::broadcast::TransactionBroadcast;
 use super::inputs;
 use super::query::txn_to_graphql;
@@ -272,6 +273,49 @@ impl MutationRoot {
         Ok(true)
     }
 
+    /// Give a person access (`docs/build-log/002-users-and-roles`): a new
+    /// person when `userId` is left out — `name` then required — or, for
+    /// someone on the access list, a new role, expiry and key (their old key
+    /// stops working; `name` left out keeps theirs). The payload carries the
+    /// key this once: the node keeps only its hash. `expires` is the last day
+    /// the key is accepted. Admin only.
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
+    async fn grant_access(
+        &self,
+        ctx: &Context<'_>,
+        name: Option<String>,
+        role: AccessRole,
+        expires: Option<DateScalar>,
+        user_id: Option<String>,
+    ) -> Result<GrantedAccess> {
+        let granted = access::change_access(
+            ctx,
+            AccessChange::Grant {
+                user_id,
+                name,
+                role,
+                expires: expires.map(|date| date.0),
+            },
+        )
+        .await?;
+        Ok(granted.expect("a grant returns what it granted"))
+    }
+
+    /// End a person's access: their key is refused on every node once the
+    /// record reaches it. Admin only.
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
+    async fn revoke_access(&self, ctx: &Context<'_>, user_id: String) -> Result<bool> {
+        access::change_access(ctx, AccessChange::Revoke { user_id }).await?;
+        Ok(true)
+    }
+
+    /// Change a person's name; their role, expiry and key stay. Admin only.
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
+    async fn rename_user(&self, ctx: &Context<'_>, user_id: String, name: String) -> Result<bool> {
+        access::change_access(ctx, AccessChange::Rename { user_id, name }).await?;
+        Ok(true)
+    }
+
     /// Close an account (FR-3 AC2).
     // Each mutation costs a durable write and an fsync, so alias batching must
     // be budget-limited like the heavy read resolvers (M-1/M-03). T44 made that
@@ -340,7 +384,7 @@ impl MutationRoot {
 /// server-side only. Other variants carry no sensitive data and are surfaced
 /// as-is to help API callers correct their request. The machine-readable `code`
 /// is preserved in every case.
-fn service_error_to_graphql(error: ServiceError) -> async_graphql::Error {
+pub(super) fn service_error_to_graphql(error: ServiceError) -> async_graphql::Error {
     let code = error.error_code();
     let message = match &error {
         ServiceError::Io(io_error) => {
@@ -371,7 +415,10 @@ fn service_error_to_graphql(error: ServiceError) -> async_graphql::Error {
 /// task is gone, the directive is already durably persisted, and anti-entropy
 /// will carry it to peers regardless — failing the mutation would be a lie about
 /// what was written.
-async fn gossip_after_unlock(ctx: &Context<'_>, directive: Option<ledger::model::Directive>) {
+pub(super) async fn gossip_after_unlock(
+    ctx: &Context<'_>,
+    directive: Option<ledger::model::Directive>,
+) {
     if let (Some(directive), Ok(sender)) = (directive, ctx.data::<GossipSender>()) {
         let _ = sender.send(directive).await;
     }

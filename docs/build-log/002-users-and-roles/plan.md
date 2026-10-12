@@ -23,7 +23,9 @@ protocol — and the books keep a permanent account of who had what access when.
 - **The access list** is a fold over every `openledger-access` event the node
   serves, in the ledger's deterministic order (lamport, then content id): a
   grant sets a user's role, key hash and expiry (a new grant replaces the old
-  key — rotation); a revoke ends the user. Every node folds the same records
+  key — rotation); a revoke ends the user for good (step 3: a grant of a
+  revoked id, before or after it, counts for nothing — a rotation that raced
+  the revoke loses). Every node folds the same records
   in the same order, so every node reaches the same list; a concurrent grant
   and revoke resolve the same way everywhere.
 - **Keys:** 32 random bytes, shown once; only the SHA-256 is stored (safe for a
@@ -72,8 +74,9 @@ protocol — and the books keep a permanent account of who had what access when.
 ## Risks
 
 - **Access records are part of the books.** Anyone who receives the `.bean`
-  (an auditor, an export) sees user ids, roles, expiry and key hashes — not
-  names, not keys. The hashes are of 256-bit random keys: not reversible.
+  (an auditor, an export) sees user ids, names, roles, expiry and key hashes —
+  never a key. The hashes are of 256-bit random keys: not reversible. Names
+  were kept out until decision 2 was revised (2026-10-12: no EU scope).
 - **A compromised admitted node can grant itself access** — as it can already
   write any transaction. `auth.adminNodes` limits it to named nodes.
 - **Revocation on a partitioned node** waits for replication (above).
@@ -87,7 +90,9 @@ protocol — and the books keep a permanent account of who had what access when.
 
 - A separate replicated user store with its own protocol: a second trust and
   replication path to secure, for what the ledger already does.
-- Names in the records: not erasable (decision 2).
+- Names kept off the ledger (the original decision 2, for erasure): revised
+  2026-10-12 — no EU scope, and a name the whole mesh shares beats a name only
+  one node knows.
 - Users per node: decision 5.
 - A `custom` record type: the parser refuses `custom` today; `event` exists
   and is valid Beancount.

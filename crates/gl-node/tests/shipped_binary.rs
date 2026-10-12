@@ -548,8 +548,12 @@ fn node_id_never_creates_a_key_for_a_signing_only_node() {
 /// operator (002-users-and-roles): the role check sees an admin caller, so
 /// writes still work, as they did before roles existed.
 ///
+/// It issues no one a key, though: with auth off, `gl-node user add` (as any
+/// local process) is refused (`NO_ACCESS_LIST`).
+///
 /// Bug-catch: attach no caller on the auth-off path and every request on
-/// such a node is refused.
+/// such a node is refused; keep an access list with auth off and any local
+/// process mints admin keys the whole mesh honours.
 #[test]
 fn with_auth_off_a_loopback_node_still_serves_its_operator() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -570,6 +574,89 @@ fn with_auth_off_a_loopback_node_still_serves_its_operator() {
     );
     assert_eq!(status, 200, "{body}");
     assert!(body.get("errors").is_none(), "the operator writes: {body}");
+    // 002 step 3 review I-1: anything on this machine is the operator here,
+    // so it must not issue keys the whole mesh would honour.
+    let output = node
+        .command(&node.binary)
+        .args(["user", "add", "--name", "Mallory", "--role", "admin"])
+        .output()
+        .expect("run gl-node user");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "refused");
+    assert!(stderr.contains("NO_ACCESS_LIST"), "{stderr}");
+    assert_eq!(node.stop().code(), Some(0));
+}
+
+/// `gl-node user` against the shipped binary (002-users-and-roles step 3):
+/// with the operator key from the node's own environment, `user add` prints a
+/// key that works at once with the role given — reads, but not writes, for
+/// read — and `user list` shows the person by name; after a restart the signed
+/// access records verify and the key still works; `user revoke` ends it (401).
+///
+/// Bug-catch: drop the `user` subcommand and every `gl-node user` exits with
+/// the usage; sign access records over the wrong message and the restart
+/// quarantines them, so the key stops working.
+#[test]
+fn people_are_managed_with_gl_node_user() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = dir.path().canonicalize().expect("canonical tempdir");
+    let mut node = Node::new(this_binary(), &dir);
+    node.start("users")
+        .unwrap_or_else(|log| panic!("boot: {log}"));
+    // A fn, not a closure: the node is stopped and restarted in between.
+    fn user(node: &Node, args: &[&str]) -> String {
+        let output = node
+            .command(&node.binary)
+            .arg("user")
+            .args(args)
+            .output()
+            .expect("run gl-node user");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "user {args:?}: {stderr}");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+    let field = |output: &str, label: &str| {
+        output
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(label))
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_else(|| panic!("{label} in {output}"))
+    };
+
+    let added = user(&node, &["add", "--name", "Ana Ruiz", "--role", "read"]);
+    let (id, key) = (field(&added, "user id:"), field(&added, "key:"));
+    let (status, body) = node.graphql_with("{ verify { ok } }", Some(&key));
+    assert_eq!(
+        (status, &body["data"]["verify"]["ok"]),
+        (200, &json!(true)),
+        "{body}"
+    );
+    let (status, body) = node.graphql_with(
+        r#"mutation { openAccount(name: "Assets:Cash", date: "2024-01-01") }"#,
+        Some(&key),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["errors"][0]["extensions"]["code"], "FORBIDDEN",
+        "{body}"
+    );
+    let listed = user(&node, &["list"]);
+    assert!(
+        listed.contains(&id) && listed.contains("Ana Ruiz"),
+        "{listed}"
+    );
+
+    assert_eq!(node.stop().code(), Some(0));
+    node.start("users-restarted")
+        .unwrap_or_else(|log| panic!("restart: {log}"));
+    node.assert_verified("after the restart");
+    let (status, body) = node.graphql_with("{ verify { ok } }", Some(&key));
+    assert_eq!(status, 200, "the key survives a restart: {body}");
+
+    user(&node, &["revoke", &id]);
+    let (status, _) = node.graphql_with("{ verify { ok } }", Some(&key));
+    assert_eq!(status, 401, "revoked");
+    assert!(user(&node, &["list"]).starts_with("No one is on the access list"));
     assert_eq!(node.stop().code(), Some(0));
 }
 

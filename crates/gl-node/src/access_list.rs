@@ -4,14 +4,19 @@
 //! It is folded from the ledger's access records ([`ledger::access_record`]) —
 //! `event "openledger-access"` records that replicate like every other — in the
 //! order every node computes the same way: lamport, then content id. A `grant`
-//! sets a person's role, key hash and expiry (a later grant replaces their key:
-//! rotation); a `revoke` ends them. Every node folds the same records in the
-//! same order, so every node of the mesh reaches the same list, and a
-//! concurrent grant and revoke resolve the same way everywhere.
+//! sets a person's name, role, key hash and expiry (a later grant replaces
+//! their key: rotation); a `rename` changes the name and nothing else; a
+//! `revoke` ends them **for good** — a grant of that user id anywhere in the
+//! order, before or after, counts for nothing once it is revoked, so a key
+//! rotated on one node while another revoked the person never brings them
+//! back (step 3 review). Every node folds the same records in the same order,
+//! so every node of the mesh reaches the same list, and a concurrent grant and
+//! revoke resolve the same way everywhere: the revoke wins.
 //!
-//! The fold is cheap (the DAG keeps an index of access records), so it runs on
-//! each request: nothing to cache, nothing to go stale. A record that is
-//! malformed, or written by a node outside `auth.adminNodes`, is skipped.
+//! The DAG keeps an index of access records and bumps a generation when one
+//! arrives, so the fold runs only when the records change
+//! (`crate::auth::AccessSource`). A record that is malformed, or written by a
+//! node outside `auth.adminNodes`, is skipped.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -24,6 +29,9 @@ use crate::access_control::{Caller, CallerId, Role};
 /// One person's current access.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AccessEntry {
+    /// The person's name, as the admin typed it (decision 2, revised
+    /// 2026-10-12: names live in the access records).
+    pub name: String,
     pub role: Role,
     /// SHA-256 of the person's key, lowercase hex.
     pub key_sha256: String,
@@ -37,6 +45,7 @@ impl std::fmt::Debug for AccessEntry {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("AccessEntry")
+            .field("name", &self.name)
             .field("role", &self.role)
             .field("key_sha256", &"<redacted>")
             .field("expires", &self.expires)
@@ -55,6 +64,7 @@ pub struct AccessList {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Change {
     Grant { user: String, entry: AccessEntry },
+    Rename { user: String, name: String },
     Revoke { user: String },
 }
 
@@ -85,16 +95,35 @@ impl AccessList {
             })
             .collect();
         ordered.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        // A revoked user id is never granted again: the API only ever revokes
+        // someone on the list and gives a new person a new id, so a grant of a
+        // revoked id is a rotation that raced the revoke — and the revoke wins.
+        let revoked: HashSet<String> = ordered
+            .iter()
+            .filter_map(|(_, _, change)| match change {
+                Change::Revoke { user } => Some(user.clone()),
+                _ => None,
+            })
+            .collect();
 
         let mut list = AccessList::default();
         for (_, _, change) in ordered {
             match change {
                 Change::Grant { user, entry } => {
-                    list.users.insert(user, entry);
+                    if !revoked.contains(&user) {
+                        list.users.insert(user, entry);
+                    }
                 }
-                Change::Revoke { user } => {
-                    list.users.remove(&user);
+                // A rename of someone not on the list (never granted, or
+                // revoked first in the order) changes nothing.
+                Change::Rename { user, name } => {
+                    if let Some(entry) = list.users.get_mut(&user) {
+                        entry.name = name;
+                    }
                 }
+                // Applied above: a revoked id's grants are skipped, so it is
+                // never on the list.
+                Change::Revoke { .. } => {}
             }
         }
         list
@@ -131,6 +160,54 @@ pub fn sha256_hex(key: &str) -> String {
     hex::encode(Sha256::digest(key.as_bytes()))
 }
 
+/// 32 bytes from the OS CSPRNG: the draw that makes the node's identity key
+/// and its operator key, so no second random source is needed.
+fn random_bytes() -> zeroize::Zeroizing<[u8; 32]> {
+    zeroize::Zeroizing::new(iroh::SecretKey::generate().to_bytes())
+}
+
+/// A new person's key: 32 random bytes, hex — as strong as the operator key.
+pub fn new_key() -> String {
+    hex::encode(random_bytes().as_slice())
+}
+
+/// A new user id: `u_` and 64 random bits, hex.
+pub fn new_user_id() -> String {
+    format!("u_{}", hex::encode(&random_bytes()[..8]))
+}
+
+/// A new access record nonce: 128 random bits, hex
+/// ([`ledger::access_record::ACCESS_RECORD_NONCE`]).
+pub fn new_record_nonce() -> String {
+    hex::encode(&random_bytes()[..16])
+}
+
+/// The longest name an access record may carry, in characters.
+pub const MAX_NAME_CHARS: usize = 100;
+
+/// A person's name as an access record may carry it: not blank, no longer than
+/// [`MAX_NAME_CHARS`], no space at either end, and no control or invisible
+/// formatting character — a bidi override or a zero-width character would let
+/// a name read as someone else's in `user list` and the journal.
+pub fn is_valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.trim() == name
+        && name.chars().count() <= MAX_NAME_CHARS
+        && !name
+            .chars()
+            .any(|c| c.is_control() || is_invisible_format(c))
+}
+
+/// The Unicode format characters that change how text around them reads
+/// without showing: bidi marks, embeddings, overrides and isolates;
+/// zero-width spaces and joiners; the byte-order mark.
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}'
+    )
+}
+
 /// A user id: `u_` and 16 lowercase hex digits.
 pub fn is_user_id(text: &str) -> bool {
     text.strip_prefix("u_").is_some_and(|hex| {
@@ -155,8 +232,15 @@ fn parse_change(action: &str, fields: &BTreeMap<String, String>) -> Option<Chang
     if by != "operator" && !is_user_id(by) {
         return None;
     }
+    let name = || {
+        fields
+            .get("name")
+            .filter(|name| is_valid_name(name))
+            .cloned()
+    };
     match action {
         "grant" => {
+            let name = name()?;
             let role = match fields.get("role")?.as_str() {
                 "read" => Role::Read,
                 "write" => Role::Write,
@@ -178,12 +262,17 @@ fn parse_change(action: &str, fields: &BTreeMap<String, String>) -> Option<Chang
             Some(Change::Grant {
                 user,
                 entry: AccessEntry {
+                    name,
                     role,
                     key_sha256: key_sha256.clone(),
                     expires,
                 },
             })
         }
+        "rename" => Some(Change::Rename {
+            user,
+            name: name()?,
+        }),
         "revoke" => Some(Change::Revoke { user }),
         _ => None,
     }
@@ -222,6 +311,7 @@ mod tests {
         let hash = sha256_hex(key);
         let mut fields = vec![
             ("user", USER),
+            ("name", "Ana Ruiz"),
             ("role", role),
             ("key-sha256", hash.as_str()),
             ("by", "operator"),
@@ -250,13 +340,15 @@ mod tests {
     }
 
     /// The fold (002-users-and-roles): records count in lamport order whatever
-    /// order they arrive in — a revoke after a grant ends it, a revoke before
-    /// it does not; a later grant replaces the key (rotation); a key is
+    /// order they arrive in — a revoke ends the user id for good, whether the
+    /// grant is before or after it (a rotation that raced a revoke loses); a
+    /// later grant replaces the key (rotation); a key is
     /// accepted through its expiry day and refused after; equal lamports are
     /// settled by content id, the same way everywhere.
     ///
     /// Bug-catch: fold in arrival order and two nodes that received the same
-    /// records in different orders disagree on who may write.
+    /// records in different orders disagree on who may write; let a grant
+    /// revive a revoked id and a rotation that raced a revoke undoes it.
     #[test]
     fn the_access_list_is_the_same_whatever_order_records_arrive_in() {
         let (granted, revoked) = (grant(5, "key-one", "write", None), revoke(7));
@@ -267,10 +359,11 @@ mod tests {
             assert!(fold(&records).users.is_empty(), "the revoke is later");
         }
         let earlier_revoke = revoke(3);
-        assert_eq!(
-            fold(&[("g", &granted), ("r", &earlier_revoke)]).users[USER].role,
-            Role::Write,
-            "a revoke before the grant does not end it"
+        assert!(
+            fold(&[("g", &granted), ("r", &earlier_revoke)])
+                .users
+                .is_empty(),
+            "a revoke is final: a grant of the id, even a later one, does not bring them back"
         );
 
         let rotated = grant(6, "key-two", "read", None);
@@ -313,6 +406,96 @@ mod tests {
         }
     }
 
+    /// Names (decision 2, revised): a grant carries the person's name and a
+    /// `rename` changes it, keeping role, key and expiry. A rename counts only
+    /// for someone on the list at that point in the order — not before their
+    /// grant, not after their revoke — and a grant or rename whose name is
+    /// blank, padded, too long or holds a control or invisible formatting
+    /// character (a bidi override) counts for nothing.
+    ///
+    /// Bug-catch: let a rename replace the whole entry and it drops the
+    /// person's key; apply it to anyone and a rename revives a revoked person.
+    #[test]
+    fn a_rename_changes_the_name_and_nothing_else() {
+        let rename = |lamport: u64, name: &str| {
+            record(
+                lamport,
+                "node-a",
+                "rename",
+                &[("user", USER), ("name", name), ("by", "operator")],
+            )
+        };
+        let granted = grant(5, "key-one", "write", Some("2026-11-30"));
+        let renamed = rename(6, "Ana Ruiz-Soto");
+        let list = fold(&[("r", &renamed), ("g", &granted)]);
+        let entry = &list.users[USER];
+        assert_eq!(entry.name, "Ana Ruiz-Soto");
+        assert_eq!(entry.role, Role::Write);
+        assert_eq!(
+            entry.expires,
+            NaiveDate::from_ymd_opt(2026, 11, 30),
+            "the expiry is kept"
+        );
+        assert!(
+            list.authenticate("key-one", day(1)).is_some(),
+            "the key is kept"
+        );
+
+        let early = rename(4, "Before The Grant");
+        assert_eq!(
+            fold(&[("g", &granted), ("e", &early)]).users[USER].name,
+            "Ana Ruiz",
+            "a rename before the grant changes nothing"
+        );
+        let revoked = revoke(7);
+        let late = rename(8, "After The Revoke");
+        assert!(
+            fold(&[("g", &granted), ("v", &revoked), ("l", &late)])
+                .users
+                .is_empty(),
+            "a rename after the revoke brings no one back"
+        );
+
+        let too_long = "x".repeat(MAX_NAME_CHARS + 1);
+        for bad in [
+            "",
+            " Ana",
+            "Ana ",
+            "Ana\nRuiz",
+            "Ana\u{202E}ziuR",
+            "An\u{200B}a",
+            too_long.as_str(),
+        ] {
+            let bad_rename = rename(6, bad);
+            assert_eq!(
+                fold(&[("g", &granted), ("r", &bad_rename)]).users[USER].name,
+                "Ana Ruiz",
+                "{bad:?}"
+            );
+            let hash = sha256_hex("key");
+            let bad_grant = record(
+                1,
+                "node-a",
+                "grant",
+                &[
+                    ("user", USER),
+                    ("name", bad),
+                    ("role", "write"),
+                    ("key-sha256", &hash),
+                    ("by", "operator"),
+                ],
+            );
+            assert!(fold(&[("x", &bad_grant)]).users.is_empty(), "{bad:?}");
+        }
+        let longest = "x".repeat(MAX_NAME_CHARS);
+        let fits = rename(6, &longest);
+        assert_eq!(
+            fold(&[("g", &granted), ("r", &fits)]).users[USER].name,
+            longest,
+            "exactly the limit is allowed"
+        );
+    }
+
     /// A malformed access record — a bad user id, role, key hash or `by`, an
     /// unknown action, no lamport — changes nothing; and with
     /// `auth.adminNodes` set, records from any other node are ignored; a
@@ -331,6 +514,7 @@ mod tests {
                 "grant",
                 &[
                     ("user", "alice"),
+                    ("name", "Ana Ruiz"),
                     ("role", "write"),
                     ("key-sha256", &hash),
                     ("by", "operator"),
@@ -342,6 +526,7 @@ mod tests {
                 "grant",
                 &[
                     ("user", USER),
+                    ("name", "Ana Ruiz"),
                     ("role", "owner"),
                     ("key-sha256", &hash),
                     ("by", "operator"),
@@ -355,6 +540,7 @@ mod tests {
                 "grant",
                 &[
                     ("user", USER),
+                    ("name", "Ana Ruiz"),
                     ("role", "write"),
                     ("key-sha256", &"A".repeat(64)),
                     ("by", "operator"),
@@ -366,6 +552,7 @@ mod tests {
                 "grant",
                 &[
                     ("user", USER),
+                    ("name", "Ana Ruiz"),
                     ("role", "write"),
                     ("key-sha256", "abc"),
                     ("by", "operator"),
@@ -377,6 +564,7 @@ mod tests {
                 "grant",
                 &[
                     ("user", USER),
+                    ("name", "Ana Ruiz"),
                     ("role", "write"),
                     ("key-sha256", &hash),
                     ("by", "root"),
@@ -419,6 +607,7 @@ mod tests {
                 "grant",
                 &[
                     ("user", "u_000000000000000a"),
+                    ("name", "Ana Ruiz"),
                     ("role", "read"),
                     ("key-sha256", &hash),
                     ("by", "operator"),
@@ -430,6 +619,7 @@ mod tests {
                 "grant",
                 &[
                     ("user", "u_000000000000000b"),
+                    ("name", "Ana Ruiz"),
                     ("role", "admin"),
                     ("key-sha256", &hash),
                     ("by", "operator"),
@@ -499,6 +689,7 @@ mod tests {
                 "grant",
                 fields(&[
                     ("user", USER),
+                    ("name", "Ana Ruiz"),
                     ("role", "write"),
                     ("key-sha256", &hash),
                     ("by", "operator"),

@@ -104,7 +104,7 @@
 //! commit is in flight, so a caller that forgets the permit gets a loud
 //! `COMMIT_IN_FLIGHT` error rather than a silently interleaved write.
 
-use ledger::model::{Close, Directive, Metadata, Open, Posting, Transaction};
+use ledger::model::{Close, Directive, Event, Metadata, Open, Posting, Transaction};
 use ledger::service::{
     LedgerService, PendingCommit, RecoveryReload, ServiceError, TransactionInput, ENVELOPE_KEYS,
     MAX_ECONOMIC_BEAN_LENGTH, MAX_LEDGER_FILE_BYTES,
@@ -483,8 +483,8 @@ where
     }
 }
 
-/// A local write one of the three GraphQL mutations is about to stage (T77 /
-/// L-71) — the input, before any envelope exists.
+/// A local write a GraphQL mutation is about to stage (T77 / L-71) — the
+/// input, before any envelope exists.
 pub(crate) enum LocalWrite<'a> {
     /// `appendTransaction`.
     Transaction(&'a TransactionInput),
@@ -498,6 +498,13 @@ pub(crate) enum LocalWrite<'a> {
     Close {
         account: &'a str,
         date: chrono::NaiveDate,
+    },
+    /// `grantAccess`, `revokeAccess`, `renameUser`: an access record
+    /// (`docs/build-log/002-users-and-roles`) — its action and own fields.
+    Access {
+        date: chrono::NaiveDate,
+        action: &'a str,
+        fields: &'a Metadata,
     },
 }
 
@@ -533,7 +540,8 @@ const LOCAL_WRITE_FAST_PATH_HEADROOM: u64 = 2 * MAX_ECONOMIC_BEAN_LENGTH as u64;
 /// Called with the permit and the write lock held, immediately before the
 /// `*_staged` call, so nothing moves between the answer and the stage. It
 /// builds the directive the stage would store — the resolved transaction
-/// (`LedgerService::validate_own_transaction`), or the `open` / `close` — with the envelope the
+/// (`LedgerService::validate_own_transaction`), the `open` / `close`, or the
+/// access record (an `event`, its own fields beside it) — with the envelope the
 /// stamp would give it: this node's author, the next lamport, for a
 /// transaction EVERY head it may name as a parent (a superset of the at most
 /// `MAX_PARENTS` the stamp picks, so never shorter), and the signature the
@@ -661,6 +669,19 @@ fn local_write_record_bytes(
             };
             (Directive::Close(close), false)
         }
+        LocalWrite::Access {
+            date,
+            action,
+            fields,
+        } => {
+            let event = Event {
+                date,
+                event_type: ledger::access_record::ACCESS_EVENT_TYPE.to_owned(),
+                description: action.to_owned(),
+                metadata: fields.clone(),
+            };
+            (Directive::Event(event), false)
+        }
     };
     // Format v2: a v2 node's write carries the marker, and a v2 id covers the
     // author and the marker — so they are on the record before its id is
@@ -671,6 +692,8 @@ fn local_write_record_bytes(
             Directive::Transaction(transaction) => transaction.metadata = envelope.clone(),
             Directive::Open(open) => open.metadata = envelope.clone(),
             Directive::Close(close) => close.metadata = envelope.clone(),
+            // An event's own fields stay beside the envelope.
+            Directive::Event(event) => event.metadata.extend(envelope.clone()),
             _ => return None,
         }
     }
@@ -702,6 +725,7 @@ fn local_write_record_bytes(
         Directive::Transaction(transaction) => transaction.metadata = envelope,
         Directive::Open(open) => open.metadata = envelope,
         Directive::Close(close) => close.metadata = envelope,
+        Directive::Event(event) => event.metadata.extend(envelope),
         _ => return None,
     }
     Some(
@@ -738,6 +762,15 @@ pub(crate) mod near_cap {
     /// at the compaction and in every L-13 reload — which is exactly what makes
     /// a reload slow enough here to be observed from a concurrent reader.
     pub(crate) fn near_cap_ledger(path: &Path, headroom: u64) -> SharedLedger {
+        near_cap_ledger_emitting(path, headroom, ledger::hash::RecordFormat::V1)
+    }
+
+    /// [`near_cap_ledger`] for a node that writes records in `format`.
+    pub(crate) fn near_cap_ledger_emitting(
+        path: &Path,
+        headroom: u64,
+        format: ledger::hash::RecordFormat,
+    ) -> SharedLedger {
         const LINE: usize = 1 << 20;
         let target = usize::try_from(MAX_LEDGER_FILE_BYTES - headroom).unwrap();
         let mut text = String::with_capacity(target);
@@ -756,7 +789,8 @@ pub(crate) mod near_cap {
         }
         std::fs::write(path, &text).unwrap();
         drop(text);
-        let mut service = LedgerService::boot(path, "near-cap".to_owned()).unwrap();
+        let mut service =
+            LedgerService::boot_emitting(path, "near-cap".to_owned(), format).unwrap();
         // Boot read a file it did not write, so the first commit would be a
         // compaction; take it here, as the node's startup compaction does.
         service.compact().unwrap();

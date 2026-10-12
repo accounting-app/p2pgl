@@ -1009,6 +1009,44 @@ curl -s -X POST http://127.0.0.1:4000/graphql \
 
 The `/health` endpoint never *requires* authentication. On a non-loopback bind it discloses its version/heads/peers detail only to a request carrying a valid `X-Api-Key`. It is not unconditional, though: like `/graphql`, it answers `403` to a request whose `Host` is not in `allowedHosts`, and `429` past its own rate limit — see [Health Check](#health-check).
 
+### People and keys
+
+Besides the operator key, each person can have a key of their own, with a role:
+**read** (reports, balances, the journal), **write** (also enter transactions
+and manage accounts) or **admin** (also manage people). Grants live in the
+ledger as access records and replicate like any record, so a key works on every
+node of the mesh. People's keys need a signing node (`signing.enabled`; every
+mesh signs). `auth.adminNodes` limits which nodes may change who has access.
+
+Manage people from the node's machine, as the node's user (in Docker,
+`docker exec <container> gl-node user …`). The commands read the node's config
+from `GL_NODE_CONFIG` and use its operator key:
+
+```bash
+gl-node user add --name "Ana Ruiz" --role write --expires 2026-12-31
+gl-node user list
+gl-node user rename u_7f3a9c21d4e8b605 --name "Ana Ruiz-Soto"
+gl-node user add --user u_7f3a9c21d4e8b605 --role read   # new role and key; the old key stops working
+gl-node user revoke u_7f3a9c21d4e8b605
+```
+
+`user add` prints the person's id and key **once**. The node keeps only the
+key's SHA-256, so a lost key is replaced with a new `user add --user`. If
+`user add` fails without an answer (a timeout), run `user list` before trying
+again: the person may already be there, and a second `add --name` makes a
+second person. The
+person sends the key as `X-Api-Key`. `--expires` is the last day the key works.
+A revocation reaches each node as fast as replication does; a node cut off
+from the mesh accepts the key until it hears of it.
+
+The same operations are in the API, for an admin key: `grantAccess(name, role,
+expires, userId)` (returns `userId` and `key`), `revokeAccess(userId)`,
+`renameUser(userId, name)` and the query `accessList`. A refused change comes
+back with a code: `INVALID_INPUT` (someone not on the list, a blank name, a
+past expiry), `NO_ACCESS_LIST` (signing or auth is off) or `NOT_AN_ADMIN_NODE` (this
+node is outside `auth.adminNodes`). Names, roles, expiry dates and key hashes
+are part of the books: anyone given the `.bean` sees them, never a key.
+
 ### Editing the `.bean` file by hand
 
 **Editing a `.bean` file while the node that owns it is running is not

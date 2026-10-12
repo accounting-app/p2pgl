@@ -1,3 +1,4 @@
+pub mod access;
 pub mod broadcast;
 pub mod inputs;
 pub mod mutation;
@@ -63,13 +64,8 @@ fn schema_builder(
 /// Channel used to announce locally inserted directives on the gossip topic (R1).
 pub type GossipSender = tokio::sync::mpsc::Sender<ledger::model::Directive>;
 
-/// Build the async-graphql schema with the live ledger service.
-///
-/// Injects `SharedLedger`, `TransactionBroadcast`, `PeerRegistry`, and
-/// `SignatureProvider` into the schema data so resolvers can access them
-/// via `ctx.data_unchecked::<T>()`.
-///
-/// Introspection is enabled only when GraphiQL is on (loopback playground).
+/// Tests' schema: [`build_schema_with_access`] with no access list.
+#[cfg(test)]
 pub fn build_schema_with_service(
     ledger: SharedLedger,
     broadcast: TransactionBroadcast,
@@ -78,6 +74,35 @@ pub fn build_schema_with_service(
     enable_introspection: bool,
     gossip_sender: Option<GossipSender>,
 ) -> AppSchema {
+    build_schema_with_access(
+        ledger,
+        broadcast,
+        peer_registry,
+        signer,
+        enable_introspection,
+        gossip_sender,
+        None,
+    )
+}
+
+/// Build the async-graphql schema with the live ledger service.
+///
+/// Injects `SharedLedger`, `TransactionBroadcast`, `PeerRegistry`,
+/// `SignatureProvider` and the access list the admin API manages
+/// (`crate::graphql::access`) into the schema data so resolvers can access
+/// them via `ctx.data_unchecked::<T>()`. A node that does not sign has no
+/// access list, and refuses the admin API.
+///
+/// Introspection is enabled only when GraphiQL is on (loopback playground).
+pub fn build_schema_with_access(
+    ledger: SharedLedger,
+    broadcast: TransactionBroadcast,
+    peer_registry: p2p::node::PeerRegistry,
+    signer: std::sync::Arc<dyn security::signing::SignatureProvider>,
+    enable_introspection: bool,
+    gossip_sender: Option<GossipSender>,
+    access: Option<crate::auth::AccessSource>,
+) -> AppSchema {
     let mut builder = schema_builder(enable_introspection)
         .data(ledger)
         .data(broadcast)
@@ -85,6 +110,9 @@ pub fn build_schema_with_service(
         .data(signer);
     if let Some(sender) = gossip_sender {
         builder = builder.data(sender);
+    }
+    if let Some(access) = access {
+        builder = builder.data(access);
     }
     builder.finish()
 }

@@ -50,5 +50,5 @@ them (a typo, a one-line fix) gets no entry.
 | # | Work | Status |
 |---|---|---|
 | [001](001-peer-discovery/) | Peer discovery without a third party: own relay + direct addresses | done (d84083a) |
-| [002](002-users-and-roles/) | People, keys and roles: a key per person, admin / write / read, who entered each write | step 2 of 4 (access records) ready to commit; next: admin API + CLI |
+| [002](002-users-and-roles/) | People, keys and roles: a key per person, admin / write / read, who entered each write | step 3 of 4 (admin API + CLI) ready to commit; next: who entered it + docs |
 | — | Relay with a company's own certificate authority (`relayCaCert`) | planned (decision C, 2026-10-09) |

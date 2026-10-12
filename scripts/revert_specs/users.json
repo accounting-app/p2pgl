@@ -149,6 +149,13 @@
         "--bin",
         "gl-node",
         "two_nodes_converge_on_the_same_access_list"
+      ],
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_key_granted_on_one_node_works_on_another"
       ]
     ]
   },
@@ -360,8 +367,8 @@
   },
   "U-R23-peoples-keys-without-signing": {
     "file": "crates/gl-node/src/auth.rs",
-    "old": "    config\n        .signing\n        .enabled\n        .then(|| AccessSource::new(ledger, admin_nodes))",
-    "new": "    let _ = config;\n    Some(AccessSource::new(ledger, admin_nodes))",
+    "old": "    (config.auth.enabled && config.signing.enabled)",
+    "new": "    (config.auth.enabled)",
     "runs": [
       [
         "-p",
@@ -388,8 +395,8 @@
   },
   "U-R25-revoke-ignored": {
     "file": "crates/gl-node/src/access_list.rs",
-    "old": "                    list.users.remove(&user);",
-    "new": "                    let _ = user;",
+    "old": "                Change::Revoke { user } => Some(user.clone()),",
+    "new": "                Change::Revoke { .. } => None,",
     "runs": [
       [
         "-p",
@@ -452,6 +459,356 @@
         "--bin",
         "gl-node",
         "malformed_records_and_other_nodes_records_change_nothing"
+      ]
+    ]
+  },
+  "U-R30-grant-access-not-admin-only": {
+    "file": "crates/gl-node/src/access_control.rs",
+    "old": "pub const ADMIN_FIELDS: &[&str] = &[\"grantAccess\", \"revokeAccess\", \"renameUser\", \"accessList\"];",
+    "new": "pub const ADMIN_FIELDS: &[&str] = &[\"revokeAccess\", \"renameUser\", \"accessList\"];",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "an_admin_grants_renames_regrants_and_revokes"
+      ]
+    ]
+  },
+  "U-R31-access-list-not-admin-only": {
+    "file": "crates/gl-node/src/access_control.rs",
+    "old": "pub const ADMIN_FIELDS: &[&str] = &[\"grantAccess\", \"revokeAccess\", \"renameUser\", \"accessList\"];",
+    "new": "pub const ADMIN_FIELDS: &[&str] = &[\"grantAccess\", \"revokeAccess\", \"renameUser\"];",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "an_admin_grants_renames_regrants_and_revokes"
+      ]
+    ]
+  },
+  "U-R32-rename-ignored": {
+    "file": "crates/gl-node/src/access_list.rs",
+    "old": "                        entry.name = name;",
+    "new": "                        let _ = (entry, name);",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_rename_changes_the_name_and_nothing_else"
+      ],
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "an_admin_grants_renames_regrants_and_revokes"
+      ]
+    ]
+  },
+  "U-R33-names-unchecked": {
+    "file": "crates/gl-node/src/access_list.rs",
+    "old": "            .filter(|name| is_valid_name(name))",
+    "new": "            .filter(|_| true)",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_rename_changes_the_name_and_nothing_else"
+      ]
+    ]
+  },
+  "U-R34-revoke-for-someone-not-listed": {
+    "file": "crates/gl-node/src/graphql/access.rs",
+    "old": "            on_the_list(&user_id)?;\n            fields.insert(\"user\".to_owned(), user_id);\n            Ok(PlannedRecord {\n                action: \"revoke\",",
+    "new": "            fields.insert(\"user\".to_owned(), user_id);\n            Ok(PlannedRecord {\n                action: \"revoke\",",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_admin_api_refuses_what_would_not_count"
+      ]
+    ]
+  },
+  "U-R35-past-expiry-accepted": {
+    "file": "crates/gl-node/src/graphql/access.rs",
+    "old": "            if let Some(last) = expires.filter(|last| *last < today) {",
+    "new": "            if let Some(last) = expires.filter(|_| false) {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_admin_api_refuses_what_would_not_count"
+      ]
+    ]
+  },
+  "U-R36-writes-outside-admin-nodes": {
+    "file": "crates/gl-node/src/graphql/access.rs",
+    "old": "        .is_some_and(|nodes| !nodes.contains(svc.author_id()))",
+    "new": "        .is_some_and(|_| false)",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_admin_api_refuses_what_would_not_count"
+      ]
+    ]
+  },
+  "U-R37-key-stored-not-hashed": {
+    "file": "crates/gl-node/src/graphql/access.rs",
+    "old": "            fields.insert(\"key-sha256\".to_owned(), access_list::sha256_hex(&key));",
+    "new": "            fields.insert(\"key-sha256\".to_owned(), key.clone());",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "an_admin_grants_renames_regrants_and_revokes"
+      ],
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_grant_and_its_name_survive_a_reboot"
+      ]
+    ]
+  },
+  "U-R38-granter-always-operator": {
+    "file": "crates/gl-node/src/graphql/access.rs",
+    "old": "        Ok(CallerId::User(user_id)) => user_id.clone(),",
+    "new": "        Ok(CallerId::User(_)) => \"operator\".to_owned(),",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "an_admin_grants_renames_regrants_and_revokes"
+      ]
+    ]
+  },
+  "U-R39-access-write-skips-fit-check": {
+    "file": "crates/gl-node/src/ledger_commit.rs",
+    "old": "            (Directive::Event(event), false)",
+    "new": "            {\n                let _ = event;\n                return None;\n            }",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_grant_that_cannot_fit_is_refused_before_staging"
+      ]
+    ]
+  },
+  "U-R40-cli-sends-no-key": {
+    "file": "crates/gl-node/src/user_cli.rs",
+    "old": "        request.push_str(&format!(\"X-Api-Key: {key}\\r\\n\"));",
+    "new": "        let _ = key;",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_cli_manages_people_through_the_node"
+      ]
+    ]
+  },
+  "U-R41-cli-sends-no-host": {
+    "file": "crates/gl-node/src/user_cli.rs",
+    "old": "        \"POST /graphql HTTP/1.1\\r\\nHost: {authority}\\r\\n",
+    "new": "        \"POST /graphql HTTP/1.1\\r\\nX-Host: {authority}\\r\\n",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_cli_manages_people_through_the_node"
+      ]
+    ]
+  },
+  "U-R42-chunks-not-decoded": {
+    "file": "crates/gl-node/src/user_cli.rs",
+    "old": "                && value.split(',').any(|coding| coding.trim() == \"chunked\")",
+    "new": "                && false",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_chunked_answer_is_put_back_together"
+      ]
+    ]
+  },
+  "U-R43-role-sent-as-typed": {
+    "file": "crates/gl-node/src/user_cli.rs",
+    "old": "                \"read\" | \"write\" | \"admin\" => role.to_ascii_uppercase(),",
+    "new": "                \"read\" | \"write\" | \"admin\" => role.clone(),",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_role_is_sent_as_the_apis_enum"
+      ],
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_cli_manages_people_through_the_node"
+      ]
+    ]
+  },
+  "U-R44-cli-creates-the-key-file": {
+    "file": "crates/gl-node/src/auth.rs",
+    "old": "    match read_api_key_file(path) {",
+    "new": "    match load_or_create_api_key(path).map(|key| Some(Zeroizing::new(key))) {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_cli_reads_the_key_file_and_never_creates_one"
+      ]
+    ]
+  },
+  "U-R45-user-command-not-routed": {
+    "file": "crates/gl-node/src/main.rs",
+    "old": "        Some(\"user\") => CliAction::User(args.collect()),\n",
+    "new": "",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "people_are_managed_with_gl_node_user"
+      ]
+    ]
+  },
+  "U-R46-access-list-with-auth-off": {
+    "file": "crates/gl-node/src/auth.rs",
+    "old": "    (config.auth.enabled && config.signing.enabled)",
+    "new": "    config.signing.enabled",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "only_a_signing_node_honours_peoples_keys"
+      ],
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "with_auth_off_a_loopback_node_still_serves_its_operator"
+      ]
+    ]
+  },
+  "U-R47-revoke-not-final": {
+    "file": "crates/gl-node/src/access_list.rs",
+    "old": "                    if !revoked.contains(&user) {",
+    "new": "                    if !revoked.is_empty() || revoked.is_empty() {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_access_list_is_the_same_whatever_order_records_arrive_in"
+      ]
+    ]
+  },
+  "U-R48-caller-not-rechecked": {
+    "file": "crates/gl-node/src/graphql/access.rs",
+    "old": "    if by != \"operator\"\n",
+    "new": "    if false\n",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_caller_no_longer_an_admin_is_refused_under_the_lock"
+      ]
+    ]
+  },
+  "U-R49-add-without-name": {
+    "file": "crates/gl-node/src/user_cli.rs",
+    "old": "            if user.is_none() && name.is_none() {",
+    "new": "            if false {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "user_commands_parse_as_the_usage_says"
+      ]
+    ]
+  },
+  "U-R50-access-record-signed-as-transaction": {
+    "file": "crates/gl-node/src/graphql/access.rs",
+    "old": "                    is_transaction: false,",
+    "new": "                    is_transaction: true,",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "people_are_managed_with_gl_node_user"
+      ]
+    ]
+  },
+  "U-R51-v2-access-write-skips-fit-check": {
+    "file": "crates/gl-node/src/ledger_commit.rs",
+    "old": "            Directive::Event(event) => event.metadata.extend(envelope.clone()),",
+    "new": "            Directive::Event(_) => return None,",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_grant_that_cannot_fit_is_refused_before_staging"
+      ]
+    ]
+  },
+  "U-R52-invisible-characters-in-names": {
+    "file": "crates/gl-node/src/access_list.rs",
+    "old": "            .any(|c| c.is_control() || is_invisible_format(c))",
+    "new": "            .any(|c| c.is_control() || (is_invisible_format(c) && false))",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_rename_changes_the_name_and_nothing_else"
       ]
     ]
   }

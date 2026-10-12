@@ -253,6 +253,16 @@ impl QueryRoot {
         Ok(None)
     }
 
+    /// Everyone who has access to this mesh's API, by user id: name, role and
+    /// expiry (`docs/build-log/002-users-and-roles`) — never a key or its hash.
+    /// Admin only.
+    async fn access_list(
+        &self,
+        ctx: &Context<'_>,
+    ) -> async_graphql::Result<Vec<super::access::PersonAccess>> {
+        super::access::access_list(ctx).await
+    }
+
     /// Verify DAG integrity and balance assertions (FR-5 AC1, §3.6).
     ///
     /// `ok`/`errors` cover the structural checks — content hashes (I5), parent

@@ -55,8 +55,18 @@ break compatibility.
   access record typed into the `.bean` without an envelope is refused, and one
   with a made-up envelope fails its signature check. **`auth.adminNodes`**
   (optional; needs signing) limits whose access records count. `/health` shows
-  its detail to any valid key, a person's included. (Issuing keys — the admin
-  API and `gl-node user …` — comes next.)
+  its detail to any valid key, a person's included.
+- **Managing people: the admin API and `gl-node user`**
+  (`docs/build-log/002-users-and-roles`, README *People and keys*): an admin
+  key can `grantAccess` (a new person, or a new role, expiry and key for one
+  already on the list), `revokeAccess`, `renameUser` and list everyone
+  (`accessList`). `gl-node user add | list | rename | revoke` does the same
+  from the node's machine, with the operator key. A person's key is 32 random
+  bytes, returned once; access records carry the person's name and the admin
+  who made the change (`by`). A revocation is final: a user id once revoked is
+  never granted again, so a key rotation that raced it loses. A node with auth
+  or signing off keeps no access list and refuses the admin API
+  (`NO_ACCESS_LIST`).
 - **`p2p.peerAddresses`** — where each allowlisted peer listens,
   `{ "<EndpointId>": ["host:port", …] }`. Host names are resolved at boot and
   every five minutes (every 10 s while an address has never resolved). With `relayMode: "disabled"` a node now reaches the peers

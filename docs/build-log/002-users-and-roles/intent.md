@@ -77,8 +77,8 @@ read access; the operator (or our hosted service) who administers keys.
    it; most keys have none.
 5. **Scope:** a key works on **every node of the mesh**, so a person is not
    locked out when one node is down. The list of people replicates across the
-   mesh — user id, key hash, role, expiry, signed like ledger records — while
-   names stay local to the nodes that hold them (decision 2), erasable.
+   mesh — user id, name, key hash, role, expiry, signed like ledger records
+   (names in the records since decision 2 was revised, 2026-10-12).
 
 ## Not in this work
 

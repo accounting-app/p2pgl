@@ -70,20 +70,21 @@ impl AccessSource {
     }
 }
 
-/// Whether this node honours people's keys, and from where (review I-2): only
-/// on a node that signs and verifies. Without signing, nothing proves who wrote
-/// a record, so a line typed into the `.bean` with a made-up envelope would
-/// read as history and could grant itself admin; such a node accepts the
-/// operator key alone. (A mesh always signs: `p2p.enabled` requires it.)
+/// Whether this node keeps an access list — honours people's keys and serves
+/// the admin API — and from where: only on a node that signs and verifies, with
+/// auth on. Without signing, nothing proves who wrote a record, so a line typed
+/// into the `.bean` with a made-up envelope would read as history and could
+/// grant itself admin (review I-2); such a node accepts the operator key
+/// alone. (A mesh always signs: `p2p.enabled` requires it.) With auth off,
+/// anything on the machine is the operator, so its grants — which count on
+/// every node of the mesh — would hand admin keys to whoever asked (step 3
+/// review I-1); and such a node accepts no keys anyway.
 pub fn access_source_for(
     config: &crate::config::NodeConfig,
     ledger: crate::graphql::SharedLedger,
     admin_nodes: Option<std::sync::Arc<std::collections::HashSet<String>>>,
 ) -> Option<AccessSource> {
-    config
-        .signing
-        .enabled
-        .then(|| AccessSource::new(ledger, admin_nodes))
+    (config.auth.enabled && config.signing.enabled).then(|| AccessSource::new(ledger, admin_nodes))
 }
 
 /// Hand-written so the API key is never printed (T41).
@@ -253,6 +254,26 @@ pub(crate) fn load_or_create_api_key(path: &Path) -> Result<String, Box<dyn std:
     Ok(key)
 }
 
+/// The API key a running node keeps at `path`, for a client on the same machine
+/// (`gl-node user`, `crate::user_cli`): read under the same rules as the
+/// node reads it, and never created — a missing or empty file means the node
+/// has not made its key yet, and a client that invented one would lock the
+/// node's own operator out.
+pub(crate) fn read_existing_api_key(path: &Path) -> Result<Zeroizing<String>, String> {
+    match read_api_key_file(path) {
+        Ok(Some(key)) if !key.is_empty() => {
+            crate::config::check_api_key(&key)
+                .map_err(|error| format!("API key file {}: {error}", path.display()))?;
+            Ok(key)
+        }
+        Ok(_) => Err(format!(
+            "no API key at {}: start the node once to create it, or set GL_NODE_API_KEY",
+            path.display()
+        )),
+        Err(error) => Err(format!("API key file {}: {error}", path.display())),
+    }
+}
+
 /// The trimmed contents of the API key file, or `None` if nothing is at the
 /// path.
 fn read_api_key_file(path: &Path) -> Result<Option<Zeroizing<String>>, Box<dyn std::error::Error>> {
@@ -310,10 +331,13 @@ mod tests {
     /// People's keys are honoured only on a node that signs (review I-2):
     /// without signatures nothing proves who wrote an access record, so a line
     /// typed into the `.bean` with a made-up envelope could grant itself admin.
-    /// A signing-off node accepts the operator key alone.
+    /// A signing-off node accepts the operator key alone. And only with auth
+    /// on (step 3 review I-1): with auth off anything on the machine is the
+    /// operator, and must not be able to issue keys the whole mesh honours.
     ///
     /// Bug-catch: build the access source regardless of signing and a node
-    /// with signing off honours forged access records.
+    /// with signing off honours forged access records; regardless of auth, and
+    /// any local process mints mesh-wide admin keys.
     #[tokio::test]
     async fn only_a_signing_node_honours_peoples_keys() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -322,14 +346,19 @@ mod tests {
                 .expect("boot");
         let ledger: crate::graphql::SharedLedger =
             std::sync::Arc::new(tokio::sync::RwLock::new(service));
-        let config = |signing: bool| -> crate::config::NodeConfig {
+        let config = |signing: bool, auth: bool| -> crate::config::NodeConfig {
             serde_json::from_str(&format!(
-                r#"{{ "ledgerPath": "ledger.bean", "signing": {{ "enabled": {signing} }} }}"#
+                r#"{{ "ledgerPath": "ledger.bean", "signing": {{ "enabled": {signing} }},
+                     "auth": {{ "enabled": {auth} }} }}"#
             ))
             .expect("config")
         };
-        assert!(access_source_for(&config(false), ledger.clone(), None).is_none());
-        assert!(access_source_for(&config(true), ledger, None).is_some());
+        assert!(access_source_for(&config(false, true), ledger.clone(), None).is_none());
+        assert!(
+            access_source_for(&config(true, false), ledger.clone(), None).is_none(),
+            "auth off"
+        );
+        assert!(access_source_for(&config(true, true), ledger, None).is_some());
     }
 
     /// `authenticate` (002-users-and-roles): the operator key is the operator;
@@ -411,6 +440,7 @@ mod tests {
             "grant",
             &[
                 ("user", user),
+                ("name", "Ana Ruiz"),
                 ("role", "read"),
                 ("key-sha256", &hash),
                 ("by", "operator"),
@@ -449,6 +479,7 @@ mod tests {
             "grant",
             &[
                 ("user", user),
+                ("name", "Ana Ruiz"),
                 ("role", "write"),
                 ("key-sha256", &hash),
                 ("expires", &yesterday),
@@ -488,6 +519,40 @@ mod tests {
         assert_eq!(mode_of(&path), 0o600);
         let second = load_or_create_api_key(&path).expect("loaded");
         assert_eq!(second, first, "the key survives a restart");
+    }
+
+    /// `gl-node user` reads the node's key file under the node's own rules
+    /// and never creates one: a missing or empty file is an error that says
+    /// to start the node, the file stays absent, and a file others can read
+    /// is refused as the node refuses it.
+    ///
+    /// Bug-catch: read through `load_or_create_api_key` and the CLI invents an
+    /// operator key the node never had, then is refused with it.
+    #[cfg(unix)]
+    #[test]
+    fn the_cli_reads_the_key_file_and_never_creates_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("api.key");
+        let error = read_existing_api_key(&path).expect_err("no file yet");
+        assert!(error.contains("start the node"), "{error}");
+        assert!(!path.exists(), "nothing created");
+
+        let created = load_or_create_api_key(&path).expect("the node creates it");
+        assert_eq!(
+            read_existing_api_key(&path).expect("read").as_str(),
+            created
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert!(read_existing_api_key(&path).is_err(), "others can read it");
+
+        let empty = directory.path().join("empty.key");
+        write_private(&empty, "");
+        assert!(read_existing_api_key(&empty)
+            .expect_err("empty")
+            .contains("start the node"));
+        assert_eq!(std::fs::read_to_string(&empty).expect("kept"), "");
     }
 
     /// H-01: a key file another account can read is refused, as the node's

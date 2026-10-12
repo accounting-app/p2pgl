@@ -17,12 +17,13 @@ mod rate_limit;
 mod request_guard;
 #[cfg(test)]
 mod test_support;
+mod user_cli;
 
 use auth::AuthState;
 use config::NodeConfig;
 use graphql::broadcast::TransactionBroadcast;
 use graphql::{
-    build_schema_with_service, graphiql_handler, graphql_handler, AppSchema, SharedLedger,
+    build_schema_with_access, graphiql_handler, graphql_handler, AppSchema, SharedLedger,
 };
 use health::{health_handler, probe_local_health, HealthState};
 use rate_limit::RateLimiter;
@@ -156,8 +157,12 @@ enum CliAction {
     Version,
     HealthCheck,
     NodeId,
+    /// `gl-node user …` and its arguments (`user_cli`).
+    User(Vec<String>),
     Usage(String),
 }
+
+const USAGE: &str = "Usage: gl-node [--health-check | --node-id | --version | user …]";
 
 fn parse_cli() -> CliAction {
     let mut args = std::env::args().skip(1);
@@ -166,12 +171,9 @@ fn parse_cli() -> CliAction {
         Some("--version") | Some("-V") => CliAction::Version,
         Some("--health-check") => CliAction::HealthCheck,
         Some("--node-id") => CliAction::NodeId,
-        Some("--help") | Some("-h") => {
-            CliAction::Usage("Usage: gl-node [--health-check | --node-id | --version]".to_owned())
-        }
-        Some(other) => CliAction::Usage(format!(
-            "unknown argument: {other}\nUsage: gl-node [--health-check | --node-id | --version]"
-        )),
+        Some("user") => CliAction::User(args.collect()),
+        Some("--help") | Some("-h") => CliAction::Usage(format!("{USAGE}\n{}", user_cli::USAGE)),
+        Some(other) => CliAction::Usage(format!("unknown argument: {other}\n{USAGE}")),
     }
 }
 
@@ -299,6 +301,9 @@ async fn main() {
         }
         CliAction::NodeId => {
             run_node_id();
+        }
+        CliAction::User(args) => {
+            user_cli::run(&args);
         }
         CliAction::Usage(message) => {
             eprintln!("{message}");
@@ -927,16 +932,6 @@ async fn main() {
         None
     };
 
-    // Build the GraphQL schema with live service + peer registry + signer.
-    let schema = build_schema_with_service(
-        shared_ledger.clone(),
-        broadcast,
-        peer_registry.clone(),
-        signer,
-        config.graphiql_enabled(),
-        gossip_sender,
-    );
-
     // Auth state for middleware (§3.8).
     // 002-users-and-roles: people's keys come from the ledger's access
     // records, judged on each request; the operator key stays the node's own.
@@ -948,7 +943,7 @@ async fn main() {
         }
     };
     let access = auth::access_source_for(&config, shared_ledger.clone(), admin_nodes);
-    if access.is_none()
+    if !config.signing.enabled
         && shared_ledger
             .read()
             .await
@@ -961,6 +956,17 @@ async fn main() {
             "the ledger holds access records (people's keys), but signing.enabled is off: without signatures nothing proves who wrote them, so only the operator key is accepted — turn signing on to honour people's keys"
         );
     }
+    // Build the GraphQL schema with live service + peer registry + signer, and
+    // the access list the admin API manages.
+    let schema = build_schema_with_access(
+        shared_ledger.clone(),
+        broadcast,
+        peer_registry.clone(),
+        signer,
+        config.graphiql_enabled(),
+        gossip_sender,
+        access.clone(),
+    );
     let auth_state = AuthState {
         enabled: config.auth.enabled,
         api_key: config.auth.api_key.clone(),
