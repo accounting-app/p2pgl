@@ -69,7 +69,9 @@ pub async fn health_handler(
     State(state): State<HealthState>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let detailed = !state.public_bind || state.auth.request_is_authenticated(&headers);
+    // Any valid key — the operator's or a person's, any role — sees the detail
+    // (002-users-and-roles): a read key already sees more through the reports.
+    let detailed = !state.public_bind || state.auth.authenticate(&headers).await.is_some();
     if !detailed {
         return (
             StatusCode::OK,
@@ -160,6 +162,7 @@ mod tests {
             auth: crate::auth::AuthState {
                 enabled: false,
                 api_key: String::new(),
+                access: None,
             },
         };
 
@@ -202,6 +205,7 @@ mod tests {
             auth: crate::auth::AuthState {
                 enabled: !api_key.is_empty(),
                 api_key: api_key.to_owned(),
+                access: None,
             },
         };
         let router = Router::new()

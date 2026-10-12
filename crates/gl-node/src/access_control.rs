@@ -51,6 +51,9 @@ pub enum CallerId {
     /// key file) — or anyone at all on a loopback node with auth turned off.
     /// Admin on this node only; never replicated.
     Operator,
+    /// A person, by their user id (`u_` and 16 hex digits), from the access
+    /// list the ledger's access records fold to (`crate::access_list`).
+    User(String),
 }
 
 impl Caller {

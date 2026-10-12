@@ -17,7 +17,73 @@ use crate::access_control::Caller;
 #[derive(Clone)]
 pub struct AuthState {
     pub enabled: bool,
+    /// The node's operator key (`auth.apiKey`, `GL_NODE_API_KEY`, the key file).
     pub api_key: String,
+    /// Where people's keys come from: the ledger's access records
+    /// (`crate::access_list`). `None`: the operator key is the only key.
+    pub access: Option<AccessSource>,
+}
+
+/// The folded access list and the `LedgerDag::access_generation` it was folded at.
+type CachedAccessList = (u64, std::sync::Arc<crate::access_list::AccessList>);
+
+/// The ledger whose access records hold people's keys, the nodes whose
+/// records count (`auth.adminNodes`; `None` = every node the mesh admits), and
+/// the last folded list, kept until the ledger's access records change.
+#[derive(Clone)]
+pub struct AccessSource {
+    pub ledger: crate::graphql::SharedLedger,
+    pub admin_nodes: Option<std::sync::Arc<std::collections::HashSet<String>>>,
+    /// `(LedgerDag::access_generation, list)`: refolded only when it moves, so
+    /// a request costs a comparison however many access records there are.
+    cache: std::sync::Arc<std::sync::Mutex<Option<CachedAccessList>>>,
+}
+
+impl AccessSource {
+    pub fn new(
+        ledger: crate::graphql::SharedLedger,
+        admin_nodes: Option<std::sync::Arc<std::collections::HashSet<String>>>,
+    ) -> Self {
+        AccessSource {
+            ledger,
+            admin_nodes,
+            cache: std::sync::Arc::default(),
+        }
+    }
+
+    /// The access list as the ledger's access records fold to now.
+    pub async fn current(&self) -> std::sync::Arc<crate::access_list::AccessList> {
+        let ledger = self.ledger.read().await;
+        let generation = ledger.dag().access_generation();
+        let mut cache = self.cache.lock().expect("access list cache lock");
+        match &*cache {
+            Some((cached, list)) if *cached == generation => list.clone(),
+            _ => {
+                let list = std::sync::Arc::new(crate::access_list::AccessList::fold(
+                    ledger.dag().access_records(),
+                    self.admin_nodes.as_deref(),
+                ));
+                *cache = Some((generation, list.clone()));
+                list
+            }
+        }
+    }
+}
+
+/// Whether this node honours people's keys, and from where (review I-2): only
+/// on a node that signs and verifies. Without signing, nothing proves who wrote
+/// a record, so a line typed into the `.bean` with a made-up envelope would
+/// read as history and could grant itself admin; such a node accepts the
+/// operator key alone. (A mesh always signs: `p2p.enabled` requires it.)
+pub fn access_source_for(
+    config: &crate::config::NodeConfig,
+    ledger: crate::graphql::SharedLedger,
+    admin_nodes: Option<std::sync::Arc<std::collections::HashSet<String>>>,
+) -> Option<AccessSource> {
+    config
+        .signing
+        .enabled
+        .then(|| AccessSource::new(ledger, admin_nodes))
 }
 
 /// Hand-written so the API key is never printed (T41).
@@ -37,6 +103,8 @@ impl std::fmt::Debug for AuthState {
             .debug_struct("AuthState")
             .field("enabled", &self.enabled)
             .field("api_key", &redact(&self.api_key))
+            // Whether people's keys are looked up, never what the list holds.
+            .field("access_list", &self.access.is_some())
             .finish()
     }
 }
@@ -60,7 +128,10 @@ pub(crate) fn redact(secret: &str) -> String {
 }
 
 impl AuthState {
-    /// Does this request carry a valid `X-Api-Key`? (§3.8)
+    /// Who this request's `X-Api-Key` belongs to, if anyone (§3.8): the
+    /// operator key (compared in constant time, as always), or a person's key
+    /// from the access list the ledger's access records fold to — expired and
+    /// revoked keys belong to no one (002-users-and-roles).
     ///
     /// This is the single decision [`auth_middleware`] makes, factored out so
     /// `/health` can ask the same question (L-09). Health is deliberately *not*
@@ -68,16 +139,23 @@ impl AuthState {
     /// prober — so it needs the check without the 401, and it must not grow a
     /// second, subtly different key comparison to get it.
     ///
-    /// Note this answers "carries a valid key", not "is allowed through":
+    /// Note this answers "whose key is this", not "is allowed through":
     /// `enabled` is the middleware's policy, not part of the credential check.
-    /// With auth disabled there is no key to match, so this is `false`, and the
+    /// With auth disabled there is no key to match, so this is `None`, and the
     /// health handler's loopback branch is what keeps a local node informative.
-    pub fn request_is_authenticated(&self, headers: &axum::http::HeaderMap) -> bool {
-        self.enabled
-            && headers
-                .get("x-api-key")
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|key| api_key_matches(key, &self.api_key))
+    pub async fn authenticate(&self, headers: &axum::http::HeaderMap) -> Option<Caller> {
+        if !self.enabled {
+            return None;
+        }
+        let key = headers.get("x-api-key")?.to_str().ok()?;
+        if api_key_matches(key, &self.api_key) {
+            return Some(Caller::operator());
+        }
+        let source = self.access.as_ref()?;
+        source
+            .current()
+            .await
+            .authenticate(key, chrono::Utc::now().date_naive())
     }
 }
 
@@ -106,12 +184,12 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
-    match auth_state.request_is_authenticated(request.headers()) {
-        true => {
-            request.extensions_mut().insert(Caller::operator());
+    match auth_state.authenticate(request.headers()).await {
+        Some(caller) => {
+            request.extensions_mut().insert(caller);
             next.run(request).await
         }
-        false => {
+        None => {
             let error_body = json!({
                 "errors": [{
                     "message": "Missing or invalid API key",
@@ -228,6 +306,158 @@ fn api_key_matches(provided: &str, expected: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// People's keys are honoured only on a node that signs (review I-2):
+    /// without signatures nothing proves who wrote an access record, so a line
+    /// typed into the `.bean` with a made-up envelope could grant itself admin.
+    /// A signing-off node accepts the operator key alone.
+    ///
+    /// Bug-catch: build the access source regardless of signing and a node
+    /// with signing off honours forged access records.
+    #[tokio::test]
+    async fn only_a_signing_node_honours_peoples_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service =
+            ledger::service::LedgerService::boot(dir.path().join("node.bean"), "node-a".to_owned())
+                .expect("boot");
+        let ledger: crate::graphql::SharedLedger =
+            std::sync::Arc::new(tokio::sync::RwLock::new(service));
+        let config = |signing: bool| -> crate::config::NodeConfig {
+            serde_json::from_str(&format!(
+                r#"{{ "ledgerPath": "ledger.bean", "signing": {{ "enabled": {signing} }} }}"#
+            ))
+            .expect("config")
+        };
+        assert!(access_source_for(&config(false), ledger.clone(), None).is_none());
+        assert!(access_source_for(&config(true), ledger, None).is_some());
+    }
+
+    /// `authenticate` (002-users-and-roles): the operator key is the operator;
+    /// a person's key is that person, with the role their grant gives, read
+    /// from the ledger's access records on each request; once they are
+    /// revoked, or their key has expired, or their grant came from a node not
+    /// in `auth.adminNodes`, the key belongs to no one.
+    ///
+    /// Bug-catch: look people's keys up only at boot and a revocation takes
+    /// effect at the next restart; drop the expiry check and an auditor's
+    /// month never ends.
+    #[tokio::test]
+    async fn a_persons_key_has_their_role_until_revoked_or_expired() {
+        use crate::access_control::{CallerId, Role};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service =
+            ledger::service::LedgerService::boot(dir.path().join("node.bean"), "node-a".to_owned())
+                .expect("boot");
+        let author = service.author_id().to_owned();
+        let ledger: crate::graphql::SharedLedger =
+            std::sync::Arc::new(tokio::sync::RwLock::new(service));
+        let state = |admin_nodes: Option<&str>| AuthState {
+            enabled: true,
+            api_key: "operator-key-0123456789abcdef".to_owned(),
+            access: Some(AccessSource::new(
+                ledger.clone(),
+                admin_nodes.map(|node| std::sync::Arc::new([node.to_owned()].into())),
+            )),
+        };
+        let headers = |key: &str| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("x-api-key", key.parse().unwrap());
+            headers
+        };
+        let record = |action: &str, pairs: &[(&str, &str)]| {
+            let ledger = ledger.clone();
+            let action = action.to_owned();
+            let mut fields: std::collections::BTreeMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            fields.insert(
+                "record".to_owned(),
+                format!(
+                    "{:032x}",
+                    NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ),
+            );
+            async move {
+                ledger
+                    .write()
+                    .await
+                    .record_access_event_staged(
+                        chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+                        &action,
+                        fields,
+                        |_, _, _| None,
+                    )
+                    .expect("recorded");
+            }
+        };
+        let user = "u_0123456789abcdef";
+        let key = "person-key-fedcba9876543210";
+        let hash = crate::access_list::sha256_hex(key);
+        // One state for the whole test, as the running node keeps one: its
+        // cached access list must follow every new access record.
+        let node = state(None);
+
+        assert_eq!(
+            state(None)
+                .authenticate(&headers("operator-key-0123456789abcdef"))
+                .await,
+            Some(Caller::operator())
+        );
+        assert_eq!(node.authenticate(&headers(key)).await, None, "no grant yet");
+
+        record(
+            "grant",
+            &[
+                ("user", user),
+                ("role", "read"),
+                ("key-sha256", &hash),
+                ("by", "operator"),
+            ],
+        )
+        .await;
+        let caller = node.authenticate(&headers(key)).await.expect("granted");
+        assert_eq!(
+            (caller.who, caller.role),
+            (CallerId::User(user.to_owned()), Role::Read)
+        );
+        assert!(
+            state(Some(&author))
+                .authenticate(&headers(key))
+                .await
+                .is_some(),
+            "this node is an admin node"
+        );
+        assert_eq!(
+            state(Some("someone-else"))
+                .authenticate(&headers(key))
+                .await,
+            None,
+            "a grant from a node outside adminNodes counts for nothing"
+        );
+
+        record("revoke", &[("user", user), ("by", "operator")]).await;
+        assert_eq!(
+            node.authenticate(&headers(key)).await,
+            None,
+            "revoked at once"
+        );
+
+        let yesterday = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).to_string();
+        record(
+            "grant",
+            &[
+                ("user", user),
+                ("role", "write"),
+                ("key-sha256", &hash),
+                ("expires", &yesterday),
+                ("by", "operator"),
+            ],
+        )
+        .await;
+        assert_eq!(node.authenticate(&headers(key)).await, None, "expired");
+    }
 
     /// Write `content` at `path` as a 0600 file, as the node would.
     #[cfg(unix)]
@@ -348,6 +578,7 @@ mod tests {
             AuthState {
                 enabled: true,
                 api_key: secret.to_owned(),
+                access: None,
             }
         );
         assert!(
@@ -365,6 +596,7 @@ mod tests {
             AuthState {
                 enabled: true,
                 api_key: "abcdef".to_owned(),
+                access: None,
             }
         );
         assert!(!short.contains("abcd"), "{short}");
@@ -376,6 +608,7 @@ mod tests {
             AuthState {
                 enabled: false,
                 api_key: String::new(),
+                access: None,
             }
         );
         assert!(unset.contains("<unset>"), "{unset}");
@@ -392,6 +625,7 @@ mod tests {
         let application = build_app(AuthState {
             enabled: false,
             api_key: String::new(),
+            access: None,
         });
         let request = Request::get("/protected").body(Body::empty()).unwrap();
         let response = application.oneshot(request).await.unwrap();
@@ -403,6 +637,7 @@ mod tests {
         let application = build_app(AuthState {
             enabled: true,
             api_key: "test-secret".to_owned(),
+            access: None,
         });
         let request = Request::get("/protected")
             .header("x-api-key", "test-secret")
@@ -417,6 +652,7 @@ mod tests {
         let application = build_app(AuthState {
             enabled: true,
             api_key: "test-secret".to_owned(),
+            access: None,
         });
         let request = Request::get("/protected").body(Body::empty()).unwrap();
         let response = application.oneshot(request).await.unwrap();
@@ -432,6 +668,7 @@ mod tests {
         let application = build_app(AuthState {
             enabled: true,
             api_key: "test-secret".to_owned(),
+            access: None,
         });
         let request = Request::get("/protected")
             .header("x-api-key", "wrong-key")

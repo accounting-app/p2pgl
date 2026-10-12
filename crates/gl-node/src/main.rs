@@ -1,4 +1,5 @@
 mod access_control;
+mod access_list;
 mod anti_entropy_alpn;
 mod auth;
 mod config;
@@ -937,9 +938,33 @@ async fn main() {
     );
 
     // Auth state for middleware (§3.8).
+    // 002-users-and-roles: people's keys come from the ledger's access
+    // records, judged on each request; the operator key stays the node's own.
+    let admin_nodes = match config.auth.admin_node_ids() {
+        Ok(nodes) => nodes.map(std::sync::Arc::new),
+        Err(error) => {
+            error!(%error, "auth.adminNodes — aborting");
+            std::process::exit(1);
+        }
+    };
+    let access = auth::access_source_for(&config, shared_ledger.clone(), admin_nodes);
+    if access.is_none()
+        && shared_ledger
+            .read()
+            .await
+            .dag()
+            .access_records()
+            .next()
+            .is_some()
+    {
+        warn!(
+            "the ledger holds access records (people's keys), but signing.enabled is off: without signatures nothing proves who wrote them, so only the operator key is accepted — turn signing on to honour people's keys"
+        );
+    }
     let auth_state = AuthState {
         enabled: config.auth.enabled,
         api_key: config.auth.api_key.clone(),
+        access,
     };
 
     // Health state with live shared ledger + peer registry.

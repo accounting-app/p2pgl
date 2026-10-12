@@ -54,7 +54,8 @@ read access; the operator (or our hosted service) who administers keys.
   node of the mesh, and shows their name wherever the name is known.
 - A key works on every node of the mesh: issued or revoked on one admin node,
   it is accepted or refused on all of them once the change has replicated.
-- An erased name is gone from every node that had it; the books still verify.
+- A person's name shows on every node of the mesh, and a rename reaches every
+  node like any other access record.
 - The old single key still works after the upgrade, as admin.
 - No key, and no hash of one, appears in a log, an error or `Debug` output.
 
@@ -63,9 +64,13 @@ read access; the operator (or our hosted service) who administers keys.
 1. **Key management:** both — `gl-node user add | list | revoke` on the node
    (self-hosting, and the first admin before any key exists), and GraphQL admin
    operations for an admin key (the hosted service, a future web UI).
-2. **Who-entered-it:** the record carries a stable opaque user id; each node
-   keeps the id → name mapping locally, where it can be corrected or erased.
-   The books stay whole when a person's data is erased; only the name goes.
+2. **Who-entered-it:** the record carries a stable opaque user id.
+   *Revised 2026-10-12:* GDPR is out of scope (no EU launch or customers), so
+   the person's name travels in the access records and shows on every node of
+   the mesh; a rename is a new access record, and earlier names stay in the
+   books' history. (Before: names in a node-local, erasable file — which showed
+   a name only on the node where it was entered.) Other privacy laws remain for
+   the maintainer's legal check.
 3. **Roles:** admin / write / read for now, checked per operation so finer
    permissions can come later without changing anyone's key.
 4. **Expiry:** a key may carry an optional expiry date and is refused after

@@ -1,6 +1,6 @@
 # Log: peer discovery without a third party
 
-Status: done (2026-10-09, last commit 45ff4e2).
+Status: done (2026-10-09, last commit d84083a).
 
 One entry per commit-sized unit, newest last, written when the unit is ready
 to commit. The commit hash is filled in once the maintainer has committed.
@@ -115,4 +115,4 @@ to commit. The commit hash is filled in once the maintainer has committed.
   network); `spawn_refresh`'s choice of interval is covered through
   `refresh`'s result (PD-R18), not the loop itself. Follow-ups: audit the
   relay crate's own lockfile when bumping it; `relayCaCert` (planned entry).
-- **Commit:** 45ff4e2
+- **Commit:** d84083a

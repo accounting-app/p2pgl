@@ -1126,6 +1126,18 @@ impl LedgerService {
                 }
             }
         }
+        // 002-users-and-roles: an access record changes who may use the API,
+        // and an admin's request through the API is the only way to write
+        // one. Typed into the file it would grant access no admin granted, so
+        // operator input is refused — on both paths. A full envelope is a
+        // peer's or this node's own record, history like any other.
+        if stamp.needs_stamp && crate::access_record::is_access_record(&directive) {
+            tally.refuse(
+                content_id,
+                "an access record (event \"openledger-access\") is written only when an admin asks the node through its API, never typed into the ledger file: it would grant access no admin granted".to_owned(),
+            );
+            return FileAdoption::Refused;
+        }
         // R-15: a `balance` is held to the rule a peer's is — an `open` of its
         // account on or before its date — on both file paths. A complete
         // envelope is held in the file, as the transaction arm holds one

@@ -523,6 +523,7 @@ signing node without it refuses to boot, and the refusal names that remedy.
 | `tls.mode` | `"disabled"` | `"disabled"` (loopback only) or `"terminated"` (TLS at a host/proxy). A non-loopback bind must be `"terminated"`; in-process TLS is not implemented |
 | `auth.enabled` | `true` | Require `X-Api-Key` header on GraphQL. May be turned off only on a loopback bind, and boot then WARNs that anything on the machine can write the ledger |
 | `auth.apiKey` | `""` | The API key value. Required on a non-loopback bind; on a loopback bind, empty means the key file below. Minimum 16 bytes; published placeholders are refused — see [API keys](#api-keys) |
+| `auth.adminNodes` | unset | EndpointIds of the nodes whose access records (people's keys, roles, revocations) count; unset, every node the mesh admits. Needs `signing.enabled` (people's keys are honoured only on a signing node); an empty list is refused |
 | `auth.apiKeyPath` | `"./data/api.key"` | Where a loopback node with no `apiKey` keeps the key it generates on its first boot (0600, owned by the node's user) — see [Using Auth](#using-auth) |
 | `http.headerReadTimeoutSeconds` | `30` | Time a client gets to send a complete request head; also bounds idle keep-alive. `1`–`300` |
 | `http.requestTimeoutSeconds` | `30` | Whole-request ceiling, body read and GraphQL execution included (`408` on expiry). `1`–`300` |

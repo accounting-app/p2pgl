@@ -27,9 +27,9 @@ protocol — and the books keep a permanent account of who had what access when.
   in the same order, so every node reaches the same list; a concurrent grant
   and revoke resolve the same way everywhere.
 - **Keys:** 32 random bytes, shown once; only the SHA-256 is stored (safe for a
-  256-bit random secret) and only the hash is compared, in constant time. The
-  records never hold a name; names live in a node-local file
-  (`auth.namesPath`), editable and erasable (decision 2).
+  256-bit random secret) and only the hash is compared, in constant time. A
+  grant carries the person's `name` (decision 2, revised 2026-10-12: no EU
+  scope); a `rename` record changes it, keeping role and key.
 - **Who may change the list.** A node writes an access record only when an
   admin asked it to (checked locally), and peers accept access records on the
   same trust as every other record: signed by a node they admit. A node the
@@ -61,10 +61,10 @@ protocol — and the books keep a permanent account of who had what access when.
    middleware, `auth.adminNodes`. Tests: grant, rotate, revoke, expiry;
    two nodes converging on the same list; a concurrent grant and revoke; a
    forged or hand-typed record refused.
-3. **The admin API and CLI.** `grantAccess`, `revokeAccess`, `accessList`
-   (admin only); `gl-node user add | list | revoke | rename | forget` as a thin
-   client of that API on loopback, with the operator key; the local names file
-   and erasure.
+3. **The admin API and CLI.** `grantAccess`, `revokeAccess`, `renameUser`,
+   `accessList` (admin only); `gl-node user add | list | revoke | rename` as a
+   thin client of that API on loopback, with the operator key. Names live in
+   the access records (decision 2 revised); the fold carries them.
 4. **Who entered it, and docs.** `entered-by` on API writes; the journal shows
    it; README (*Using Auth* rewritten), OPERATIONS (*People and keys*),
    CHANGELOG.

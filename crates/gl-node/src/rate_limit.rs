@@ -1071,6 +1071,7 @@ mod tests {
             crate::auth::AuthState {
                 enabled: false,
                 api_key: String::new(),
+                access: None,
             },
             crate::health::HealthState {
                 ledger: shared,
@@ -1079,6 +1080,7 @@ mod tests {
                 auth: crate::auth::AuthState {
                     enabled: false,
                     api_key: String::new(),
+                    access: None,
                 },
             },
             crate::request_guard::RequestGuardState {

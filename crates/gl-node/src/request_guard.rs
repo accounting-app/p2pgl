@@ -510,6 +510,7 @@ mod tests {
             AuthState {
                 enabled: false,
                 api_key: String::new(),
+                access: None,
             },
             HealthState {
                 ledger: shared,
@@ -518,6 +519,7 @@ mod tests {
                 auth: AuthState {
                     enabled: false,
                     api_key: String::new(),
+                    access: None,
                 },
             },
             state,

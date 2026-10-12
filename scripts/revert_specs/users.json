@@ -78,8 +78,8 @@
   },
   "U-R6-middleware-attaches-no-caller": {
     "file": "crates/gl-node/src/auth.rs",
-    "old": "            request.extensions_mut().insert(Caller::operator());",
-    "new": "            let _ = Caller::operator();",
+    "old": "            request.extensions_mut().insert(caller);",
+    "new": "            let _ = caller;",
     "runs": [
       [
         "-p",
@@ -129,6 +129,329 @@
         "--bin",
         "gl-node",
         "a_request_needs_the_strictest_role_anything_in_it_needs"
+      ]
+    ]
+  },
+  "U-R9-access-records-not-indexed": {
+    "file": "crates/ledger/src/dag.rs",
+    "old": "        if crate::access_record::is_access_record(&node.directive) {",
+    "new": "        if false && crate::access_record::is_access_record(&node.directive) {",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "an_access_record_is_written_indexed_and_survives_a_restart"
+      ],
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "two_nodes_converge_on_the_same_access_list"
+      ]
+    ]
+  },
+  "U-R10-hand-typed-access-record-accepted": {
+    "file": "crates/ledger/src/service/reconcile.rs",
+    "old": "        if stamp.needs_stamp && crate::access_record::is_access_record(&directive) {",
+    "new": "        if false && crate::access_record::is_access_record(&directive) {",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "a_hand_typed_access_record_is_refused_and_a_written_one_kept"
+      ]
+    ]
+  },
+  "U-R11-fold-in-arrival-order": {
+    "file": "crates/gl-node/src/access_list.rs",
+    "old": "        ordered.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));",
+    "new": "        let _ = &mut ordered;",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_access_list_is_the_same_whatever_order_records_arrive_in"
+      ]
+    ]
+  },
+  "U-R12-keys-never-expire": {
+    "file": "crates/gl-node/src/access_list.rs",
+    "old": "        if entry.expires.is_some_and(|last| today > last) {",
+    "new": "        if false && entry.expires.is_some_and(|last| today > last) {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_access_list_is_the_same_whatever_order_records_arrive_in"
+      ],
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_persons_key_has_their_role_until_revoked_or_expired"
+      ]
+    ]
+  },
+  "U-R13-admin-nodes-ignored": {
+    "file": "crates/gl-node/src/access_list.rs",
+    "old": "                if admin_nodes.is_some_and(|nodes| !nodes.contains(author)) {",
+    "new": "                if admin_nodes.is_some_and(|_| false) && author.is_empty() {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "malformed_records_and_other_nodes_records_change_nothing"
+      ],
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_persons_key_has_their_role_until_revoked_or_expired"
+      ]
+    ]
+  },
+  "U-R14-key-hash-unchecked": {
+    "file": "crates/gl-node/src/access_list.rs",
+    "old": "            if key_sha256.len() != 64",
+    "new": "            if false && key_sha256.len() != 64",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "malformed_records_and_other_nodes_records_change_nothing"
+      ]
+    ]
+  },
+  "U-R15-people-never-looked-up": {
+    "file": "crates/gl-node/src/auth.rs",
+    "old": "        let source = self.access.as_ref()?;",
+    "new": "        let source = None::<&AccessSource>?;",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_persons_key_has_their_role_until_revoked_or_expired"
+      ]
+    ]
+  },
+  "U-R16-unparsable-admin-node-accepted": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "            self.auth.admin_node_ids()?;",
+    "new": "            let _ = self.auth.admin_node_ids();",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "test_admin_nodes_are_endpoint_ids"
+      ]
+    ]
+  },
+  "U-R14b-key-hash-not-hex": {
+    "file": "crates/gl-node/src/access_list.rs",
+    "old": "                || !key_sha256",
+    "new": "                || false && !key_sha256",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "malformed_records_and_other_nodes_records_change_nothing"
+      ]
+    ]
+  },
+  "U-R17-access-record-without-nonce": {
+    "file": "crates/ledger/src/service/authoring.rs",
+    "old": ".is_some_and(|nonce| crate::access_record::is_access_record_nonce(nonce))",
+    "new": ".is_some_and(|_nonce| true)",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "every_access_record_is_unique_and_a_duplicate_is_refused"
+      ]
+    ]
+  },
+  "U-R18-duplicate-reported-as-written": {
+    "file": "crates/ledger/src/service/authoring.rs",
+    "old": "            InsertResult::Duplicate { content_id } => {\n                return Err(ServiceError::InvalidInput {\n                    message: format!(\"access record {content_id} already exists",
+    "new": "            InsertResult::Duplicate { content_id } => {\n                if true { return Ok(content_id); }\n                return Err(ServiceError::InvalidInput {\n                    message: format!(\"access record {content_id} already exists",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "every_access_record_is_unique_and_a_duplicate_is_refused"
+      ]
+    ]
+  },
+  "U-R19-fold-accepts-records-without-nonce": {
+    "file": "crates/gl-node/src/access_list.rs",
+    "old": ".is_some_and(|nonce| ledger::access_record::is_access_record_nonce(nonce))",
+    "new": ".is_some_and(|_nonce| true)",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "malformed_records_and_other_nodes_records_change_nothing"
+      ]
+    ]
+  },
+  "U-R20-access-strings-unchecked": {
+    "file": "crates/ledger/src/service/authoring.rs",
+    "old": "        validate_body_strings(&directive)?;",
+    "new": "        let _ = &directive;",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "every_access_record_is_unique_and_a_duplicate_is_refused"
+      ]
+    ]
+  },
+  "U-R21-shared-hash-picks-someone": {
+    "file": "crates/gl-node/src/access_list.rs",
+    "old": "        let (user, entry) = matched.filter(|_| matches == 1)?;",
+    "new": "        let (user, entry) = matched.filter(|_| matches > 0)?;",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "malformed_records_and_other_nodes_records_change_nothing"
+      ]
+    ]
+  },
+  "U-R22-cache-never-refreshed": {
+    "file": "crates/gl-node/src/auth.rs",
+    "old": "            Some((cached, list)) if *cached == generation => list.clone(),",
+    "new": "            Some((_cached, list)) => list.clone(),",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_persons_key_has_their_role_until_revoked_or_expired"
+      ]
+    ]
+  },
+  "U-R23-peoples-keys-without-signing": {
+    "file": "crates/gl-node/src/auth.rs",
+    "old": "    config\n        .signing\n        .enabled\n        .then(|| AccessSource::new(ledger, admin_nodes))",
+    "new": "    let _ = config;\n    Some(AccessSource::new(ledger, admin_nodes))",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "only_a_signing_node_honours_peoples_keys"
+      ]
+    ]
+  },
+  "U-R24-admin-nodes-without-signing": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "            if !self.signing.enabled {\n                return Err(ConfigError::Validation(\n                    \"auth.adminNodes needs signing.enabled",
+    "new": "            if false {\n                return Err(ConfigError::Validation(\n                    \"auth.adminNodes needs signing.enabled",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "test_admin_nodes_are_endpoint_ids"
+      ]
+    ]
+  },
+  "U-R25-revoke-ignored": {
+    "file": "crates/gl-node/src/access_list.rs",
+    "old": "                    list.users.remove(&user);",
+    "new": "                    let _ = user;",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_access_list_is_the_same_whatever_order_records_arrive_in"
+      ]
+    ]
+  },
+  "U-R26-access-field-forges-envelope": {
+    "file": "crates/ledger/src/service/authoring.rs",
+    "old": "        validate_body_envelope_keys(&directive, &[])?;\n        // L-26 / T41",
+    "new": "        // L-26 / T41",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "an_access_record_is_written_indexed_and_survives_a_restart"
+      ]
+    ]
+  },
+  "U-R27-any-user-id": {
+    "file": "crates/gl-node/src/access_list.rs",
+    "old": ".filter(|user| is_user_id(user))?",
+    "new": ".filter(|_user| true)?",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "malformed_records_and_other_nodes_records_change_nothing"
+      ]
+    ]
+  },
+  "U-R28-any-granter": {
+    "file": "crates/gl-node/src/access_list.rs",
+    "old": "    if by != \"operator\" && !is_user_id(by) {",
+    "new": "    if by.is_empty() {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "malformed_records_and_other_nodes_records_change_nothing"
+      ]
+    ]
+  },
+  "U-R29-unknown-role-accepted": {
+    "file": "crates/gl-node/src/access_list.rs",
+    "old": "                _ => return None,",
+    "new": "                _ => Role::Read,",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "malformed_records_and_other_nodes_records_change_nothing"
       ]
     ]
   }

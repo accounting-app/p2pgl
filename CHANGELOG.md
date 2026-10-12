@@ -40,6 +40,23 @@ break compatibility.
 
 ### Added
 
+- **People's keys, from the ledger** (`docs/build-log/002-users-and-roles`):
+  besides the operator key, the node accepts each person's key from the
+  ledger's access records — `event "openledger-access"` grants and
+  revocations, replicated to every node like any record, with a role (read,
+  write, admin) and an optional expiry. Every node folds the same records in
+  the same order to the same list, so a key works on every node of the mesh,
+  and a revocation takes effect on each node as soon as it arrives there. Only
+  the key's SHA-256 is stored, compared in constant time; every access record
+  carries a random `record` value, so no two are ever the same record. People's
+  keys are honoured **only on a node that signs** (`signing.enabled`; every
+  mesh does): without signatures nothing proves who wrote a record, so a node
+  with signing off accepts its operator key alone, and says so at boot. An
+  access record typed into the `.bean` without an envelope is refused, and one
+  with a made-up envelope fails its signature check. **`auth.adminNodes`**
+  (optional; needs signing) limits whose access records count. `/health` shows
+  its detail to any valid key, a person's included. (Issuing keys — the admin
+  API and `gl-node user …` — comes next.)
 - **`p2p.peerAddresses`** — where each allowlisted peer listens,
   `{ "<EndpointId>": ["host:port", …] }`. Host names are resolved at boot and
   every five minutes (every 10 s while an address has never resolved). With `relayMode: "disabled"` a node now reaches the peers

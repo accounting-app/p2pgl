@@ -2,6 +2,7 @@ use super::*;
 use rust_decimal_macros::dec;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod access_record;
 mod authoring;
 mod boot;
 mod commit;

@@ -23,6 +23,11 @@ struct DagNode {
 
 // ─── Ledger DAG ──────────────────────────────────────────────────────────────
 
+/// Draws [`LedgerDag::access_generation`] values: unique across every DAG of
+/// the process, so a DAG rebuilt after a quarantine never shares one with the
+/// DAG it replaced.
+static NEXT_ACCESS_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// The core data structure: a G-Set of directives with a Merkle-DAG over transactions.
 #[derive(Debug, Clone)]
 pub struct LedgerDag {
@@ -32,6 +37,14 @@ pub struct LedgerDag {
     heads: HashSet<String>,
     /// Insertion order (for deterministic iteration).
     insertion_order: Vec<String>,
+    /// The content ids of access records (`crate::access_record`), in
+    /// insertion order: the few records the node's access list is folded from
+    /// on every request, without scanning the whole DAG.
+    access_ids: Vec<String>,
+    /// Changes whenever an access record is inserted: a number drawn from a
+    /// counter shared by every DAG in the process, so a rebuilt DAG never
+    /// repeats a value an earlier one had (`access_generation`).
+    access_generation: u64,
     /// Reverse edges recorded for parents that were not in the DAG yet, keyed by
     /// the missing parent's content ID (L-17).
     ///
@@ -147,6 +160,8 @@ impl LedgerDag {
             nodes: HashMap::new(),
             heads: HashSet::new(),
             insertion_order: Vec::new(),
+            access_ids: Vec::new(),
+            access_generation: 0,
             pending_children: HashMap::new(),
             cycle_check_budget: MAX_CYCLE_CHECK_VISITS,
         }
@@ -215,6 +230,11 @@ impl LedgerDag {
             parents: parents.clone(),
             children: backfilled_children,
         };
+        if crate::access_record::is_access_record(&node.directive) {
+            self.access_ids.push(content_id.clone());
+            self.access_generation =
+                NEXT_ACCESS_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.nodes.insert(content_id.clone(), node);
         self.insertion_order.push(content_id.clone());
 
@@ -506,6 +526,24 @@ impl LedgerDag {
             .get(missing)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    /// A value that changes whenever this DAG gains an access record, and that
+    /// no other DAG in the process ever has while holding different ones —
+    /// what a cache of the folded access list is keyed by. `0` for a DAG with
+    /// none.
+    pub fn access_generation(&self) -> u64 {
+        self.access_generation
+    }
+
+    /// Every access record in the DAG with its content id, in insertion order
+    /// (`crate::access_record`). Cheap: an index, not a scan.
+    pub fn access_records(&self) -> impl Iterator<Item = (&str, &Directive)> + '_ {
+        self.access_ids.iter().filter_map(|id| {
+            self.nodes
+                .get(id)
+                .map(|node| (id.as_str(), &node.directive))
+        })
     }
 
     /// Every content ID in the G-Set, in no particular order, without

@@ -452,6 +452,77 @@ impl LedgerService {
         Ok(content_id)
     }
 
+    /// Record an access record (`crate::access_record`) into **memory only** —
+    /// durable on the next commit, like [`Self::open_account_staged`]
+    /// (`docs/build-log/002-users-and-roles`). `action` is the event's
+    /// description (`grant`, `revoke`); `fields` are its own metadata — user,
+    /// role, key hash, expiry, the granting admin — and may not use the
+    /// `openledger-` envelope prefix, which is stamped here as on every record
+    /// this node writes. They must carry a fresh
+    /// [`crate::access_record::ACCESS_RECORD_NONCE`], so no two access records
+    /// share an id; a record that would duplicate an existing one is refused,
+    /// never reported as written. Whether the caller may change access, and
+    /// whether the fields make sense, is the node's decision, made before this
+    /// is called.
+    pub fn record_access_event_staged(
+        &mut self,
+        date: NaiveDate,
+        action: &str,
+        fields: Metadata,
+        sign: impl FnOnce(&str, &str, &str) -> Option<String>,
+    ) -> Result<String, ServiceError> {
+        // H-04 / L-02: every refusal before the clock moves.
+        validate_ledger_date(date)?;
+        if !fields
+            .get(crate::access_record::ACCESS_RECORD_NONCE)
+            .is_some_and(|nonce| crate::access_record::is_access_record_nonce(nonce))
+        {
+            return Err(ServiceError::InvalidInput {
+                message: "an access record needs a `record` field of 32 random lowercase hex digits, so that it is unique".to_owned(),
+            });
+        }
+        let mut directive = Directive::Event(Event {
+            date,
+            event_type: crate::access_record::ACCESS_EVENT_TYPE.to_owned(),
+            description: action.to_owned(),
+            metadata: fields,
+        });
+        validate_body_envelope_keys(&directive, &[])?;
+        // L-26 / T41: control characters and the metadata-key charset, as on
+        // the peer path — keys are written to the file unquoted.
+        validate_body_strings(&directive)?;
+        enforce_resource_limits(&directive)?;
+        enforce_economic_bean_limit(&directive)?;
+
+        let Directive::Event(event) = &mut directive else {
+            unreachable!("constructed as an event directly above")
+        };
+        self.stamp_directive_envelope(&mut event.metadata)?;
+        let content_id = compute_content_id(&directive);
+        let Directive::Event(event) = &mut directive else {
+            unreachable!("constructed as an event directly above")
+        };
+        let (parents, lamport) = Self::envelope_parents_and_lamport(&event.metadata);
+        if let Some(signature_hex) = sign(&content_id, parents, lamport) {
+            event
+                .metadata
+                .insert(ENVELOPE_KEY_SIGNATURE.to_owned(), signature_hex);
+        }
+
+        let content_id = match self.dag.insert(directive.clone(), false)? {
+            InsertResult::Inserted { content_id } => content_id,
+            InsertResult::Duplicate { content_id } => {
+                return Err(ServiceError::InvalidInput {
+                    message: format!("access record {content_id} already exists; a new access record needs a fresh `record` value"),
+                });
+            }
+        };
+        self.read_model.index_directive(&directive);
+        // T44: durable on the next commit.
+        self.pending_ids.push(content_id.clone());
+        Ok(content_id)
+    }
+
     // ── Envelope stamping (§3.3.1, §3.4.2) ───────────────────────────────
 
     /// Stamp transaction-level envelope metadata (parents + author + lamport).

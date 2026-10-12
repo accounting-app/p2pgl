@@ -353,6 +353,37 @@ pub struct AuthConfig {
     /// only while `enabled` and no key is configured.
     #[serde(default = "default_api_key_path")]
     pub api_key_path: String,
+
+    /// The nodes whose access records count (`docs/build-log/002-users-and-roles`):
+    /// EndpointIds. Unset, every node the mesh admits may change who has
+    /// access — as every such node may already write any record. Set, a grant
+    /// or revocation written by any other node is ignored.
+    #[serde(default)]
+    pub admin_nodes: Option<Vec<String>>,
+}
+
+impl AuthConfig {
+    /// `adminNodes` as the node ids access records carry in
+    /// `openledger-author` (one canonical spelling, whatever form the config
+    /// used), or `None` when unset.
+    pub fn admin_node_ids(&self) -> Result<Option<std::collections::HashSet<String>>, ConfigError> {
+        let Some(nodes) = &self.admin_nodes else {
+            return Ok(None);
+        };
+        nodes
+            .iter()
+            .map(|raw| {
+                raw.parse::<iroh::EndpointId>()
+                    .map(|id| id.to_string())
+                    .map_err(|error| {
+                        ConfigError::Validation(format!(
+                            "auth.adminNodes entry \"{raw}\" is not an EndpointId: {error}"
+                        ))
+                    })
+            })
+            .collect::<Result<_, _>>()
+            .map(Some)
+    }
 }
 
 impl Default for AuthConfig {
@@ -361,6 +392,7 @@ impl Default for AuthConfig {
             enabled: default_auth_enabled(),
             api_key: String::new(),
             api_key_path: default_api_key_path(),
+            admin_nodes: None,
         }
     }
 }
@@ -384,6 +416,7 @@ impl std::fmt::Debug for AuthConfig {
             .field("enabled", &self.enabled)
             .field("api_key", &crate::auth::redact(&self.api_key))
             .field("api_key_path", &self.api_key_path)
+            .field("admin_nodes", &self.admin_nodes)
             .finish()
     }
 }
@@ -1483,6 +1516,22 @@ impl NodeConfig {
         // reason — a typo is a typo whether or not `p2p.enabled` is set yet.
         self.validate_anti_entropy_bounds()?;
 
+        // 002-users-and-roles: an `adminNodes` entry that does not parse would
+        // be no node at all — every access record would then be ignored.
+        if let Some(nodes) = &self.auth.admin_nodes {
+            if !self.signing.enabled {
+                return Err(ConfigError::Validation(
+                    "auth.adminNodes needs signing.enabled: without signatures a record's author is only what it says, and people's keys are not honoured".to_owned(),
+                ));
+            }
+            if nodes.is_empty() {
+                return Err(ConfigError::Validation(
+                    "auth.adminNodes is empty: leave it out to let every mesh node change access, or list the nodes that may".to_owned(),
+                ));
+            }
+            self.auth.admin_node_ids()?;
+        }
+
         // M-04: a trusted proxy entry that does not parse would be silently
         // dropped from the trust set, leaving the operator believing
         // `X-Forwarded-For` is honoured while every client still shares the
@@ -2455,6 +2504,51 @@ mod tests {
                 assert!(!message.contains(secret), "{bad} leaks {secret}: {message}");
             }
         }
+    }
+
+    /// `auth.adminNodes` (002-users-and-roles): EndpointIds, loaded in the
+    /// spelling access records carry; an entry that is not one, or an empty
+    /// list (which would silently ignore every access record), is refused, and
+    /// so is the setting on a node that does not sign.
+    ///
+    /// Bug-catch: accept an unparsable entry and it matches no node, so every
+    /// grant is silently ignored.
+    #[test]
+    fn test_admin_nodes_are_endpoint_ids() {
+        let node = iroh::SecretKey::generate().public().to_string();
+        let config_with = |nodes: &str| {
+            format!(
+                r#"{{ "ledgerPath": "./data/ledger.bean", "signing": {{ "enabled": true }},
+                "p2p": {{ "meshId": "my-org/ledger" }}, "auth": {{ "adminNodes": {nodes} }} }}"#
+            )
+        };
+        let file = write_temp_config(&config_with(&format!(r#"["{node}"]"#)));
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("loads");
+        assert_eq!(
+            config.auth.admin_node_ids().expect("ids"),
+            Some([node.clone()].into())
+        );
+        for (bad, expected) in [
+            (r#"["not-a-node"]"#, "is not an EndpointId"),
+            ("[]", "auth.adminNodes is empty"),
+        ] {
+            let file = write_temp_config(&config_with(bad));
+            let Err(error) = NodeConfig::load_from_path(&file.path().to_path_buf()) else {
+                panic!("{bad}: refused");
+            };
+            assert!(format!("{error}").contains(expected), "{bad}: {error}");
+        }
+        // Without signing nothing proves a record's author (review I-2).
+        let file = write_temp_config(&format!(
+            r#"{{ "ledgerPath": "./data/ledger.bean", "auth": {{ "adminNodes": ["{node}"] }} }}"#
+        ));
+        let Err(error) = NodeConfig::load_from_path(&file.path().to_path_buf()) else {
+            panic!("adminNodes without signing: refused");
+        };
+        assert!(
+            format!("{error}").contains("needs signing.enabled"),
+            "{error}"
+        );
     }
 
     #[test]
