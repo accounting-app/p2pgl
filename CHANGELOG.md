@@ -67,6 +67,16 @@ break compatibility.
   never granted again, so a key rotation that raced it loses. A node with auth
   or signing off keeps no access list and refuses the admin API
   (`NO_ACCESS_LIST`).
+- **Who entered each write** (README *People and keys*, OPERATIONS *People
+  and keys*): a transaction, `open` or `close` made with a person's key
+  carries their user id (`entered-by: "u_…"`), part of the record and its
+  signature. The journal's `Transaction` (and the `appendTransaction`
+  payload) gains `enteredBy` and `enteredByName` — the person's latest name,
+  kept after their access ends. Writes made with the operator key carry
+  nothing new, so existing setups write exactly the records they did. One
+  person entering the same entry twice through one node is still one record;
+  two people entering it are two. An entry typed into the `.bean` with
+  `entered-by` is refused.
 - **`p2p.peerAddresses`** — where each allowlisted peer listens,
   `{ "<EndpointId>": ["host:port", …] }`. Host names are resolved at boot and
   every five minutes (every 10 s while an address has never resolved). With `relayMode: "disabled"` a node now reaches the peers

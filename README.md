@@ -970,8 +970,29 @@ both formats.
 
 ### Using Auth
 
-Auth is **on by default**, on every bind. Add the header to all `/graphql`
-requests.
+Auth is **on by default**, on every bind. Every `/graphql` request carries a
+key in an `X-Api-Key` header. A node accepts two kinds:
+
+- **The operator key**: the node's own (`auth.apiKey`, `GL_NODE_API_KEY` or
+  the generated key file, below). It may do everything on this node, and it
+  is never replicated: each node has its own. Use it to run the node and to
+  issue the first people's keys.
+- **People's keys**: one per person, with a role, issued by an admin and
+  honoured by every node of the mesh (below, *People and keys*).
+
+Each request is checked against the caller's role **before anything runs**:
+
+| Role | May |
+|---|---|
+| `read` | Every query: reports, balances, the journal, `verify` |
+| `write` | Also every mutation: transactions, opening and closing accounts |
+| `admin` | Also manage people: `grantAccess`, `revokeAccess`, `renameUser`, `accessList` |
+
+The rule goes by operation type, so a mutation added later needs `write`
+without anyone guarding it. A request mixing several operations, aliases or
+fragments is held to the strictest thing in it. A missing or unknown key gets
+**HTTP 401**; a known key whose role is too low gets HTTP 200 with a GraphQL
+error coded **`FORBIDDEN`**, and nothing runs.
 
 **A local node needs no setup.** With a loopback `bindAddress` and no
 `auth.apiKey` (and no `GL_NODE_API_KEY`), the first boot generates a random
@@ -992,7 +1013,10 @@ Before this release a loopback node served its mutations to anything that could
 reach the port, with no key: another program or another account on the machine,
 or a web page that got past the browser checks (H-01). To keep that, set
 `"auth": { "enabled": false }` — allowed on a loopback bind only, and the node
-WARNs about it at every boot.
+WARNs about it at every boot. Such a node has no people: everything on the
+machine is its operator, so it accepts no people's keys and refuses the admin
+API (`NO_ACCESS_LIST`) — otherwise any local program could issue keys the
+whole mesh honours.
 
 **A public bind needs a key you set**, so its clients are given it on purpose:
 `auth.apiKey` or, better, the environment. Keep the key in the environment
@@ -1038,6 +1062,22 @@ second person. The
 person sends the key as `X-Api-Key`. `--expires` is the last day the key works.
 A revocation reaches each node as fast as replication does; a node cut off
 from the mesh accepts the key until it hears of it.
+
+**Who entered it.** A person's writes (transactions, opening and closing an
+account) carry their user id in the record, `entered-by: "u_…"`, signed with
+it. The journal shows it as `enteredBy`, with `enteredByName`: their latest
+name, kept after their access is revoked. Writes made with the operator key
+carry none, exactly as before people had keys, so `enteredBy` is empty for
+the operator, for lines typed into the `.bean`, and for history from before.
+An entry typed into the `.bean` with an `entered-by` line is refused: the node
+would sign someone's name to an entry they did not make. `entered-by` is part
+of a record's identity: one person entering the same entry twice through the
+same node makes one record (`alreadyExisted`), and two people entering it make
+two. With Format v2 (the default) the node is in the id too, so the same entry
+retried through *another* node is a second record — retry through the node
+that timed out. Another node of the mesh can write any `entered-by` it likes,
+as it can write any record: it names who entered a record, it does not prove
+it.
 
 The same operations are in the API, for an admin key: `grantAccess(name, role,
 expires, userId)` (returns `userId` and `key`), `revokeAccess(userId)`,

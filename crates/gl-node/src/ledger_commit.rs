@@ -563,6 +563,7 @@ const LOCAL_WRITE_FAST_PATH_HEADROOM: u64 = 2 * MAX_ECONOMIC_BEAN_LENGTH as u64;
 pub(crate) fn refuse_if_local_write_cannot_fit(
     service: &LedgerService,
     write: LocalWrite<'_>,
+    entered_by: Option<&str>,
     signer: Option<&dyn SignatureProvider>,
 ) -> Result<(), ServiceError> {
     // T100 / M-74, decision (61): the headroom of the commit this write will
@@ -588,7 +589,7 @@ pub(crate) fn refuse_if_local_write_cannot_fit(
     if headroom >= LOCAL_WRITE_FAST_PATH_HEADROOM {
         return Ok(());
     }
-    let Some(record) = local_write_record_bytes(service, write, signer) else {
+    let Some(record) = local_write_record_bytes(service, write, entered_by, signer) else {
         return Ok(());
     };
     if record <= headroom {
@@ -608,6 +609,7 @@ pub(crate) fn refuse_if_local_write_cannot_fit(
 fn local_write_record_bytes(
     service: &LedgerService,
     write: LocalWrite<'_>,
+    entered_by: Option<&str>,
     signer: Option<&dyn SignatureProvider>,
 ) -> Option<u64> {
     let &[author_key, lamport_key, parents_key, signature_key, format_key] = ENVELOPE_KEYS else {
@@ -617,6 +619,11 @@ fn local_write_record_bytes(
     let mut envelope = Metadata::new();
     envelope.insert(author_key.to_owned(), service.author_id().to_owned());
     envelope.insert(lamport_key.to_owned(), lamport.clone());
+    // Step 4: a person's write carries `entered-by` in its body — in the id
+    // and in the record — so it rides with the envelope into the metadata.
+    if let Some(who) = entered_by {
+        envelope.insert(ledger::access_record::ENTERED_BY.to_owned(), who.to_owned());
+    }
     let (mut directive, is_transaction) = match write {
         LocalWrite::Transaction(input) => {
             let body = Transaction {
@@ -685,9 +692,16 @@ fn local_write_record_bytes(
     };
     // Format v2: a v2 node's write carries the marker, and a v2 id covers the
     // author and the marker — so they are on the record before its id is
-    // computed, exactly as `stamp_identity` puts them there.
-    if service.emit_format() == ledger::hash::RecordFormat::V2 {
+    // computed, exactly as `stamp_identity` puts them there. Step 4: a
+    // person's `entered-by` is in the id in both formats, so in v1 too the
+    // record carries it before the id is computed (review I-1: without it the
+    // id was the operator's body's, and a duplicate was judged by the wrong
+    // record). A v1 id ignores the envelope keys that come along.
+    let v2 = service.emit_format() == ledger::hash::RecordFormat::V2;
+    if v2 {
         envelope.insert(format_key.to_owned(), ledger::hash::FORMAT_V2.to_owned());
+    }
+    if v2 || entered_by.is_some() {
         match &mut directive {
             Directive::Transaction(transaction) => transaction.metadata = envelope.clone(),
             Directive::Open(open) => open.metadata = envelope.clone(),
@@ -1774,11 +1788,12 @@ mod tests {
 
     /// T77 / L-71: the pre-stage estimate is the record the stage produces —
     /// for a transaction naming several heads, an `open`, and a `close`, each
-    /// signed by a real Ed25519 key — so the check never refuses a write that
-    /// would fit, and a write it admits never fails the projection.
+    /// signed by a real Ed25519 key, the first two a person's (`entered-by`)
+    /// — so the check never refuses a write that would fit, and a write it
+    /// admits never fails the projection.
     ///
-    /// Bug-catch: estimate without the signature (or without the parents) and
-    /// the estimate falls short of the staged record.
+    /// Bug-catch: estimate without the signature (or without the parents, or
+    /// without `entered-by`) and the estimate falls short of the staged record.
     #[test]
     fn l71_the_pre_stage_estimate_is_the_staged_record() {
         let dir = tempfile::tempdir().unwrap();
@@ -1818,11 +1833,17 @@ mod tests {
         }
 
         let input = lunch_input(300, 3);
-        let predicted =
-            local_write_record_bytes(&service, LocalWrite::Transaction(&input), Some(&signer))
-                .expect("predictable");
+        // Step 4: a person's write carries `entered-by`; the estimate counts it.
+        let person = Some("u_000000000000000a");
+        let predicted = local_write_record_bytes(
+            &service,
+            LocalWrite::Transaction(&input),
+            person,
+            Some(&signer),
+        )
+        .expect("predictable");
         let id = service
-            .append_transaction_staged(input, sign(true))
+            .append_transaction_staged_by(input, person, sign(true))
             .unwrap()
             .txid;
         assert!(
@@ -1836,6 +1857,35 @@ mod tests {
         assert_eq!(predicted, record_of(&service, &id), "transaction");
         service.persist_or_reload().unwrap();
 
+        // Review I-1: the operator's entry has the bare body's id; a person's
+        // identical entry is a different record, which the estimate must
+        // build — and the person's own retry is the duplicate it skips.
+        let input = lunch_input(40, 6);
+        service.append_transaction(input.clone()).unwrap();
+        let predicted = local_write_record_bytes(
+            &service,
+            LocalWrite::Transaction(&input),
+            person,
+            Some(&signer),
+        )
+        .expect("a new record, not the operator's");
+        let id = service
+            .append_transaction_staged_by(input.clone(), person, sign(true))
+            .unwrap()
+            .txid;
+        assert_eq!(predicted, record_of(&service, &id), "beside the operator's");
+        assert_eq!(
+            local_write_record_bytes(
+                &service,
+                LocalWrite::Transaction(&input),
+                person,
+                Some(&signer)
+            ),
+            None,
+            "the person's retry is the duplicate"
+        );
+        service.persist_or_reload().unwrap();
+
         let currencies = vec!["USD".to_owned(), "EUR".to_owned()];
         let predicted = local_write_record_bytes(
             &service,
@@ -1844,11 +1894,18 @@ mod tests {
                 date: day(4),
                 currencies: &currencies,
             },
+            person,
             Some(&signer),
         )
         .expect("predictable");
         let id = service
-            .open_account_staged("Assets:Bank".into(), day(4), currencies, sign(false))
+            .open_account_staged_by(
+                "Assets:Bank".into(),
+                day(4),
+                currencies,
+                person,
+                sign(false),
+            )
             .unwrap();
         assert_eq!(predicted, record_of(&service, &id), "open");
         service.persist_or_reload().unwrap();
@@ -1859,6 +1916,7 @@ mod tests {
                 account: "Assets:Bank",
                 date: day(5),
             },
+            None,
             Some(&signer),
         )
         .expect("predictable");

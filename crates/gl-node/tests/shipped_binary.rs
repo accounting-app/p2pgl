@@ -590,8 +590,10 @@ fn with_auth_off_a_loopback_node_still_serves_its_operator() {
 /// `gl-node user` against the shipped binary (002-users-and-roles step 3):
 /// with the operator key from the node's own environment, `user add` prints a
 /// key that works at once with the role given — reads, but not writes, for
-/// read — and `user list` shows the person by name; after a restart the signed
-/// access records verify and the key still works; `user revoke` ends it (401).
+/// read — and `user list` shows the person by name; a writer's entries carry
+/// their id (`entered-by`); after a restart the signed access records and
+/// entries verify, the key still works and the journal names the writer;
+/// `user revoke` ends it (401).
 ///
 /// Bug-catch: drop the `user` subcommand and every `gl-node user` exits with
 /// the usage; sign access records over the wrong message and the restart
@@ -646,13 +648,41 @@ fn people_are_managed_with_gl_node_user() {
         "{listed}"
     );
 
+    // Step 4: a writer's entries carry their id, signed with the record.
+    let writer = user(&node, &["add", "--name", "Bea Soto", "--role", "write"]);
+    let (bea, bea_key) = (field(&writer, "user id:"), field(&writer, "key:"));
+    for account in ["Assets:Cash", "Income:Salary"] {
+        let (status, body) = node.graphql_with(
+            &format!(r#"mutation {{ openAccount(name: "{account}", date: "2024-01-01") }}"#),
+            Some(&bea_key),
+        );
+        assert!(status == 200 && body.get("errors").is_none(), "{body}");
+    }
+    let (status, body) = node.graphql_with(
+        r#"mutation { appendTransaction(input: { date: "2024-01-02", narration: "by Bea", postings: [
+            { account: "Assets:Cash", amount: { number: "5", currency: "USD" } },
+            { account: "Income:Salary" }] }) { txid signature } }"#,
+        Some(&bea_key),
+    );
+    assert!(status == 200 && body.get("errors").is_none(), "{body}");
+
     assert_eq!(node.stop().code(), Some(0));
     node.start("users-restarted")
         .unwrap_or_else(|log| panic!("restart: {log}"));
     node.assert_verified("after the restart");
     let (status, body) = node.graphql_with("{ verify { ok } }", Some(&key));
     assert_eq!(status, 200, "the key survives a restart: {body}");
+    let journal = node.graphql("{ journal { narration enteredBy enteredByName signature } }");
+    let entry = journal["data"]["journal"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["narration"] == "by Bea"))
+        .cloned()
+        .unwrap_or_else(|| panic!("{journal}"));
+    assert_eq!(entry["enteredBy"], json!(bea), "{entry}");
+    assert_eq!(entry["enteredByName"], "Bea Soto");
+    assert!(entry["signature"].is_string(), "signed: {entry}");
 
+    user(&node, &["revoke", &bea]);
     user(&node, &["revoke", &id]);
     let (status, _) = node.graphql_with("{ verify { ok } }", Some(&key));
     assert_eq!(status, 401, "revoked");

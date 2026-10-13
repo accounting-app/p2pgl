@@ -20,6 +20,16 @@ pub const ACCESS_EVENT_TYPE: &str = "openledger-access";
 /// id, two nodes keeping different copies under one id.
 pub const ACCESS_RECORD_NONCE: &str = "record";
 
+/// The metadata key naming the person who entered a record through the API:
+/// `entered-by: "u_…"` (`docs/build-log/002-users-and-roles`, step 4). An
+/// ordinary body key, not the `openledger-` envelope: it is part of the
+/// record's id and covered by its signature, so it cannot be changed without
+/// the change showing. The node writes it for a person's writes only; a
+/// record without it was entered with the node's operator key, by hand in
+/// the `.bean`, or before people had keys. An entry typed into the `.bean`
+/// with it is refused (`reconcile`): the node would sign it as theirs.
+pub const ENTERED_BY: &str = "entered-by";
+
 /// Whether `value` is a well-formed [`ACCESS_RECORD_NONCE`].
 pub fn is_access_record_nonce(value: &str) -> bool {
     value.len() == 32

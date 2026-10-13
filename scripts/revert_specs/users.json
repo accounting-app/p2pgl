@@ -811,5 +811,162 @@
         "a_rename_changes_the_name_and_nothing_else"
       ]
     ]
+  },
+  "U-R53-operator-stamped-as-a-person": {
+    "file": "crates/gl-node/src/graphql/mutation.rs",
+    "old": "        Ok(crate::access_control::CallerId::User(user_id)) => Some(user_id.clone()),\n        _ => None,",
+    "new": "        Ok(crate::access_control::CallerId::User(user_id)) => Some(user_id.clone()),\n        _ => Some(\"operator\".to_owned()),",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_journal_shows_who_entered_each_write"
+      ]
+    ]
+  },
+  "U-R54-transaction-not-attributed": {
+    "file": "crates/gl-node/src/graphql/mutation.rs",
+    "old": "            .append_transaction_staged_by(\n                domain_input,\n                entered_by.as_deref(),",
+    "new": "            .append_transaction_staged_by(\n                domain_input,\n                None,",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_journal_shows_who_entered_each_write"
+      ]
+    ]
+  },
+  "U-R55-open-not-attributed": {
+    "file": "crates/ledger/src/service/authoring.rs",
+    "old": "            currencies,\n            metadata,\n        });",
+    "new": "            currencies,\n            metadata: {\n                let _ = metadata;\n                BTreeMap::new()\n            },\n        });",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "a_persons_write_carries_entered_by_in_its_id"
+      ],
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_journal_shows_who_entered_each_write"
+      ]
+    ]
+  },
+  "U-R56-estimate-without-entered-by": {
+    "file": "crates/gl-node/src/ledger_commit.rs",
+    "old": "    if let Some(who) = entered_by {",
+    "new": "    if let Some(who) = entered_by.filter(|_| false) {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "l71_the_pre_stage_estimate_is_the_staged_record"
+      ]
+    ]
+  },
+  "U-R57-names-only-of-current-people": {
+    "file": "crates/gl-node/src/graphql/types.rs",
+    "old": "        list.names.get(user_id).cloned()",
+    "new": "        list.users.get(user_id).map(|entry| entry.name.clone())",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_journal_shows_who_entered_each_write"
+      ]
+    ]
+  },
+  "U-R58-blank-entered-by-accepted": {
+    "file": "crates/ledger/src/service/authoring.rs",
+    "old": "        if who.trim().is_empty() {",
+    "new": "        if false {",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "a_persons_write_carries_entered_by_in_its_id"
+      ]
+    ]
+  },
+  "U-R59-entered-by-control-characters-accepted": {
+    "file": "crates/ledger/src/service/authoring.rs",
+    "old": "        reject_control_characters(crate::access_record::ENTERED_BY, who)",
+    "new": "        Ok::<(), String>(())",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "a_persons_write_carries_entered_by_in_its_id"
+      ]
+    ]
+  },
+  "U-R60-close-not-attributed": {
+    "file": "crates/gl-node/src/graphql/mutation.rs",
+    "old": "            .close_account_staged_by(\n                name,\n                date.0,\n                entered_by.as_deref(),",
+    "new": "            .close_account_staged_by(\n                name,\n                date.0,\n                None,",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_journal_shows_who_entered_each_write"
+      ]
+    ]
+  },
+  "U-R61-v1-estimate-id-without-entered-by": {
+    "file": "crates/gl-node/src/ledger_commit.rs",
+    "old": "    if v2 || entered_by.is_some() {",
+    "new": "    if v2 {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "l71_the_pre_stage_estimate_is_the_staged_record"
+      ]
+    ]
+  },
+  "U-R62-typed-entered-by-accepted": {
+    "file": "crates/ledger/src/service/reconcile.rs",
+    "old": "        if stamp.needs_stamp\n            && directive\n                .metadata()\n                .contains_key(crate::access_record::ENTERED_BY)",
+    "new": "        if false\n            && directive\n                .metadata()\n                .contains_key(crate::access_record::ENTERED_BY)",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "a_hand_typed_entered_by_is_refused_and_a_written_one_kept"
+      ]
+    ]
+  },
+  "U-R63-rename-names-anyone": {
+    "file": "crates/gl-node/src/access_list.rs",
+    "old": "                    if let Some(known) = list.names.get_mut(user) {\n                        *known = name.clone();\n                    }",
+    "new": "                    list.names.insert(user.clone(), name.clone());",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_rename_changes_the_name_and_nothing_else"
+      ]
+    ]
   }
 }

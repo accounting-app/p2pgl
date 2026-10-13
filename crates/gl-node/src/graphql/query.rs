@@ -466,6 +466,7 @@ pub fn txn_to_graphql(
             .cloned()
             .unwrap_or_default(),
         signature: txn.metadata.get("openledger-signature").cloned(),
+        entered_by: txn.metadata.get(ledger::access_record::ENTERED_BY).cloned(),
         parents: txn
             .metadata
             .get("openledger-parents")

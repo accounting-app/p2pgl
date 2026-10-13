@@ -171,6 +171,55 @@ Roll back every node of the mesh, as you upgraded every node.
 Every release rehearses this upgrade and rollback from the previous release's
 binary, on one machine (`docs/RELEASE.md`).
 
+## People and keys
+
+Each person who uses the API gets a key of their own, with a role: `read`,
+`write` or `admin` (README, *Using Auth* and *People and keys*). Grants live in
+the ledger and replicate, so a key issued on one node works on every node of
+the mesh. Keep the operator key (`GL_NODE_API_KEY`) to yourself; give people
+their own.
+
+**Before the first grant.** People's keys need signing on (every mesh signs)
+and auth on. To keep grants on chosen nodes only, list them in
+`auth.adminNodes` (their EndpointIds, the same list on every node): grants
+written on any other node then count nowhere, and that node refuses them with
+`NOT_AN_ADMIN_NODE`.
+
+**Commands.** On an admin node, as the node's user (in Docker,
+`docker exec <container> gl-node …`):
+
+| Task | Command |
+|---|---|
+| Give someone access | `gl-node user add --name "Ana Ruiz" --role write [--expires 2026-12-31]` |
+| See who has access | `gl-node user list` |
+| Change a role, or replace a lost or leaked key | `gl-node user add --user <id> --role <role>`: a new key; the old one stops working |
+| Fix a name | `gl-node user rename <id> --name "…"` |
+| End someone's access | `gl-node user revoke <id>` |
+
+`user add` prints the key **once**; the node keeps only its hash. Hand it over
+on a channel you trust, never in the same message as the node's address. If
+`user add` gives no answer (a timeout), run `user list` before trying again: a
+second `add --name` makes a second person.
+
+**Expiry** is checked by each node on its own clock: the key works through
+the expiry day (UTC) and not after. An auditor's or a contractor's key should
+have one.
+
+**Revocation is final.** A revoked user id never comes back, even through a
+key rotation another node made at the same time; give the person a new
+`user add` if they return. A revoke reaches each node as fast as replication
+does — seconds on a healthy mesh. **A node cut off from the mesh honours a
+revoked key until it hears of the revoke.** For a leaked admin key, revoke it
+and check that every node is replicating (*What to watch*, *Replication*);
+stop any node you cannot reach until it has caught up.
+
+**What the books show.** Access records are part of the ledger: anyone given
+the `.bean` (an auditor, an export, a backup) sees user ids, names, roles,
+expiry dates and key hashes, never a key. Every transaction, `open` and
+`close` a person enters carries their user id (`entered-by`), and the journal
+shows who entered each entry by name. Writes made with the operator key carry
+none, and an entry typed into the `.bean` may not carry one (it is refused).
+
 ## What to watch
 
 `GET /health` answers liveness (the Docker image's `HEALTHCHECK` runs

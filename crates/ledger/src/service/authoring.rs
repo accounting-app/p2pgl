@@ -96,6 +96,20 @@ impl LedgerService {
         input: TransactionInput,
         sign: impl FnOnce(&str, &str, &str) -> Option<String>,
     ) -> Result<AppendOutcome, ServiceError> {
+        self.append_transaction_staged_by(input, None, sign)
+    }
+
+    /// [`Self::append_transaction_staged`] for a write a person made:
+    /// `entered_by` is stamped as [`crate::access_record::ENTERED_BY`] in the
+    /// body, so it is part of the id — the same person entering the same entry
+    /// twice is one record, two people entering it are two.
+    pub fn append_transaction_staged_by(
+        &mut self,
+        input: TransactionInput,
+        entered_by: Option<&str>,
+        sign: impl FnOnce(&str, &str, &str) -> Option<String>,
+    ) -> Result<AppendOutcome, ServiceError> {
+        let metadata = entered_by_metadata(entered_by)?;
         // H-04: a date the file grammar cannot read back would brick the next
         // boot, so refuse it before anything is built, stamped, or persisted.
         validate_ledger_date(input.date)?;
@@ -122,7 +136,7 @@ impl LedgerService {
                     metadata: BTreeMap::new(),
                 })
                 .collect(),
-            metadata: BTreeMap::new(),
+            metadata,
         });
 
         // §3.12: resource limit checks — the same `enforce_resource_limits` the
@@ -285,6 +299,20 @@ impl LedgerService {
         currencies: Vec<String>,
         sign: impl FnOnce(&str, &str, &str) -> Option<String>,
     ) -> Result<String, ServiceError> {
+        self.open_account_staged_by(account, date, currencies, None, sign)
+    }
+
+    /// [`Self::open_account_staged`] for a write a person made; see
+    /// [`Self::append_transaction_staged_by`].
+    pub fn open_account_staged_by(
+        &mut self,
+        account: String,
+        date: NaiveDate,
+        currencies: Vec<String>,
+        entered_by: Option<&str>,
+        sign: impl FnOnce(&str, &str, &str) -> Option<String>,
+    ) -> Result<String, ServiceError> {
+        let metadata = entered_by_metadata(entered_by)?;
         validate_account_name(&account).map_err(|_| ServiceError::InvalidAccountName {
             account: account.clone(),
         })?;
@@ -311,7 +339,7 @@ impl LedgerService {
             date,
             account: account.clone(),
             currencies,
-            metadata: BTreeMap::new(),
+            metadata,
         });
         enforce_resource_limits(&directive)?;
         // L-02: `currencies` has no cardinality cap and currency codes are 24
@@ -386,6 +414,19 @@ impl LedgerService {
         date: NaiveDate,
         sign: impl FnOnce(&str, &str, &str) -> Option<String>,
     ) -> Result<String, ServiceError> {
+        self.close_account_staged_by(account, date, None, sign)
+    }
+
+    /// [`Self::close_account_staged`] for a write a person made; see
+    /// [`Self::append_transaction_staged_by`].
+    pub fn close_account_staged_by(
+        &mut self,
+        account: String,
+        date: NaiveDate,
+        entered_by: Option<&str>,
+        sign: impl FnOnce(&str, &str, &str) -> Option<String>,
+    ) -> Result<String, ServiceError> {
+        let metadata = entered_by_metadata(entered_by)?;
         validate_account_name(&account).map_err(|_| ServiceError::InvalidAccountName {
             account: account.clone(),
         })?;
@@ -414,7 +455,7 @@ impl LedgerService {
         let mut directive = Directive::Close(Close {
             date,
             account: account.clone(),
-            metadata: BTreeMap::new(),
+            metadata,
         });
         enforce_resource_limits(&directive)?;
         // L-02: a `close` is bounded by its account name, which has a charset
@@ -817,4 +858,23 @@ impl LedgerService {
                 .unwrap_or(""),
         )
     }
+}
+
+/// The body metadata a write carries for `entered_by` (step 4): nothing for
+/// the operator, or [`crate::access_record::ENTERED_BY`] — refused before
+/// anything is stamped if it holds a control character or is blank, since it
+/// is written to the file as a quoted value like any other.
+fn entered_by_metadata(entered_by: Option<&str>) -> Result<Metadata, ServiceError> {
+    let mut metadata = Metadata::new();
+    if let Some(who) = entered_by {
+        if who.trim().is_empty() {
+            return Err(ServiceError::InvalidInput {
+                message: "entered-by is blank".to_owned(),
+            });
+        }
+        reject_control_characters(crate::access_record::ENTERED_BY, who)
+            .map_err(|message| ServiceError::InvalidInput { message })?;
+        metadata.insert(crate::access_record::ENTERED_BY.to_owned(), who.to_owned());
+    }
+    Ok(metadata)
 }

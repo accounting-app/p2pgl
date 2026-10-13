@@ -81,6 +81,7 @@ mod tests {
             author: "local".to_owned(),
             signature: None,
             parents: vec![],
+            entered_by: None,
         }
     }
 

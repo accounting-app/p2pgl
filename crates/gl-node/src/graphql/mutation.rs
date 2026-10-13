@@ -97,11 +97,13 @@ impl MutationRoot {
         let permit = acquire_write_permit(ledger).await;
         let mut svc = ledger.write().await;
         let signer = ctx.data::<Arc<dyn SignatureProvider>>().ok().cloned();
+        let entered_by = entered_by(ctx);
         // T77 / L-71: at the size cap, refuse BEFORE staging — see
         // `refuse_if_local_write_cannot_fit`.
         if let Err(error) = refuse_if_local_write_cannot_fit(
             &svc,
             LocalWrite::Transaction(&domain_input),
+            entered_by.as_deref(),
             signer.as_deref(),
         ) {
             drop(svc);
@@ -112,16 +114,20 @@ impl MutationRoot {
         // It is the only party that can — re-checking here would be a
         // get-then-append race — and the answer rides out on `alreadyExisted`.
         let outcome = svc
-            .append_transaction_staged(domain_input, |id, parents, lamport| {
-                signer.as_ref().and_then(|provider| {
-                    provider.sign(&SignableMessage {
-                        content_id: id,
-                        is_transaction: true,
-                        parents,
-                        lamport,
+            .append_transaction_staged_by(
+                domain_input,
+                entered_by.as_deref(),
+                |id, parents, lamport| {
+                    signer.as_ref().and_then(|provider| {
+                        provider.sign(&SignableMessage {
+                            content_id: id,
+                            is_transaction: true,
+                            parents,
+                            lamport,
+                        })
                     })
-                })
-            })
+                },
+            )
             .map_err(service_error_to_graphql)?;
         let content_id = outcome.txid;
         // M-39: a failed prepare releases the write lock BEFORE its L-13
@@ -218,6 +224,7 @@ impl MutationRoot {
         let permit = acquire_write_permit(ledger).await;
         let mut svc = ledger.write().await;
         let signer = ctx.data::<Arc<dyn SignatureProvider>>().ok().cloned();
+        let entered_by = entered_by(ctx);
         let currencies = currencies.unwrap_or_default();
         // T77 / L-71: see `append_transaction`.
         if let Err(error) = refuse_if_local_write_cannot_fit(
@@ -227,6 +234,7 @@ impl MutationRoot {
                 date: date.0,
                 currencies: &currencies,
             },
+            entered_by.as_deref(),
             signer.as_deref(),
         ) {
             drop(svc);
@@ -234,16 +242,22 @@ impl MutationRoot {
             return Err(service_error_to_graphql(error));
         }
         let content_id = svc
-            .open_account_staged(name, date.0, currencies, |id, parents, lamport| {
-                signer.as_ref().and_then(|provider| {
-                    provider.sign(&SignableMessage {
-                        content_id: id,
-                        is_transaction: false,
-                        parents,
-                        lamport,
+            .open_account_staged_by(
+                name,
+                date.0,
+                currencies,
+                entered_by.as_deref(),
+                |id, parents, lamport| {
+                    signer.as_ref().and_then(|provider| {
+                        provider.sign(&SignableMessage {
+                            content_id: id,
+                            is_transaction: false,
+                            parents,
+                            lamport,
+                        })
                     })
-                })
-            })
+                },
+            )
             .map_err(service_error_to_graphql)?;
         // M-39: see `append_transaction`.
         let (svc, pending, permit) = prepare_or_recover(ledger, svc, false, permit)
@@ -257,8 +271,10 @@ impl MutationRoot {
         // `already_existed` signal to suppress a duplicate re-gossip with.
         // `open_account_signing` returns a bare `String`, and its DAG-duplicate
         // arm is reachable — reopening an account after it was closed, with an
-        // identical date and currency list, hashes to the id the first `open`
-        // already has (the content hash strips the envelope, M-10), so the guard
+        // identical date and currency list, by the same person (step 4:
+        // `entered-by` is in the id; another person's reopen is a new record),
+        // hashes to the id the first `open` already has (the content hash
+        // strips the envelope, M-10), so the guard
         // above passes and the insert is a duplicate. Giving it the
         // `AppendOutcome` treatment means changing a public service signature
         // and the mutation's `Boolean` payload, which is an API change rather
@@ -336,6 +352,7 @@ impl MutationRoot {
         let permit = acquire_write_permit(ledger).await;
         let mut svc = ledger.write().await;
         let signer = ctx.data::<Arc<dyn SignatureProvider>>().ok().cloned();
+        let entered_by = entered_by(ctx);
         // T77 / L-71: see `append_transaction`.
         if let Err(error) = refuse_if_local_write_cannot_fit(
             &svc,
@@ -343,6 +360,7 @@ impl MutationRoot {
                 account: &name,
                 date: date.0,
             },
+            entered_by.as_deref(),
             signer.as_deref(),
         ) {
             drop(svc);
@@ -350,16 +368,21 @@ impl MutationRoot {
             return Err(service_error_to_graphql(error));
         }
         let content_id = svc
-            .close_account_staged(name, date.0, |id, parents, lamport| {
-                signer.as_ref().and_then(|provider| {
-                    provider.sign(&SignableMessage {
-                        content_id: id,
-                        is_transaction: false,
-                        parents,
-                        lamport,
+            .close_account_staged_by(
+                name,
+                date.0,
+                entered_by.as_deref(),
+                |id, parents, lamport| {
+                    signer.as_ref().and_then(|provider| {
+                        provider.sign(&SignableMessage {
+                            content_id: id,
+                            is_transaction: false,
+                            parents,
+                            lamport,
+                        })
                     })
-                })
-            })
+                },
+            )
             .map_err(service_error_to_graphql)?;
         // M-39: see `append_transaction`.
         let (svc, pending, permit) = prepare_or_recover(ledger, svc, false, permit)
@@ -374,6 +397,19 @@ impl MutationRoot {
             .map_err(service_error_to_graphql)?;
         gossip_after_unlock(ctx, to_gossip).await;
         Ok(true)
+    }
+}
+
+/// Who entered a write (`docs/build-log/002-users-and-roles`, step 4): a
+/// person's user id, stamped as `entered-by`; none for the operator, whose
+/// writes stay exactly the records they were before people had keys.
+fn entered_by(ctx: &Context<'_>) -> Option<String> {
+    match ctx
+        .data::<crate::access_control::Caller>()
+        .map(|caller| &caller.who)
+    {
+        Ok(crate::access_control::CallerId::User(user_id)) => Some(user_id.clone()),
+        _ => None,
     }
 }
 

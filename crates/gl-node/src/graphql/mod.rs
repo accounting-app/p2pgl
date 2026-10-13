@@ -161,7 +161,7 @@ pub async fn graphql_handler(
     caller: Option<axum::Extension<crate::access_control::Caller>>,
     request: GraphQLRequest,
 ) -> GraphQLResponse {
-    let mut request = request.into_inner();
+    let mut request = request.into_inner().data(types::NamesSnapshot::default());
     if let Some(axum::Extension(caller)) = caller {
         request = request.data(caller);
     }

@@ -58,6 +58,11 @@ impl std::fmt::Debug for AccessEntry {
 pub struct AccessList {
     /// By user id (`u_` and 16 hex digits).
     pub users: BTreeMap<String, AccessEntry>,
+    /// Every person's name, by user id — set by each grant, changed by a
+    /// rename of someone already granted earlier in the order, and kept after
+    /// a revoke, so the journal can still say who entered a record (step 4).
+    /// A rename of an id no grant came before names no one.
+    pub names: BTreeMap<String, String>,
 }
 
 /// What one access record says, once parsed.
@@ -108,6 +113,17 @@ impl AccessList {
 
         let mut list = AccessList::default();
         for (_, _, change) in ordered {
+            match &change {
+                Change::Grant { user, entry } => {
+                    list.names.insert(user.clone(), entry.name.clone());
+                }
+                Change::Rename { user, name } => {
+                    if let Some(known) = list.names.get_mut(user) {
+                        *known = name.clone();
+                    }
+                }
+                Change::Revoke { .. } => {}
+            }
             match change {
                 Change::Grant { user, entry } => {
                     if !revoked.contains(&user) {
@@ -440,6 +456,17 @@ mod tests {
             list.authenticate("key-one", day(1)).is_some(),
             "the key is kept"
         );
+
+        // The names the journal uses: a grant names, a revoke keeps the name,
+        // a rename of an id never granted before it names no one.
+        let revoked_now = revoke(7);
+        assert_eq!(
+            fold(&[("g", &granted), ("v", &revoked_now)]).names[USER],
+            "Ana Ruiz",
+            "kept after the revoke"
+        );
+        let stray = rename(4, "Never Granted");
+        assert!(fold(&[("s", &stray)]).names.is_empty());
 
         let early = rename(4, "Before The Grant");
         assert_eq!(

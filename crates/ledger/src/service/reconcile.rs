@@ -573,6 +573,23 @@ impl LedgerService {
             }
         };
 
+        // 002 step 4: `entered-by` names the person whose API write this is,
+        // and only the node writes it. Typed into the file it would be signed
+        // by this node as that person's, indistinguishable from their own
+        // write — so operator input carrying it is refused, on both paths, as
+        // a typed access record is. A full envelope is history.
+        if stamp.needs_stamp
+            && directive
+                .metadata()
+                .contains_key(crate::access_record::ENTERED_BY)
+        {
+            tally.refuse(
+                content_id,
+                "an entry typed into the ledger file may not carry `entered-by`: the node writes it for a person's write through the API, and on a typed line it would sign someone's name to an entry they did not make. Remove the line; the entry is then the operator's".to_owned(),
+            );
+            return FileAdoption::Refused;
+        }
+
         // Validate transactions (I1–I3, I9).
         //
         // T81: operator input is this node's authorship and is counted as it

@@ -1,4 +1,4 @@
-use async_graphql::SimpleObject;
+use async_graphql::{ComplexObject, Context, SimpleObject};
 
 use super::scalars::{DateScalar, DecimalScalar, TransactionId};
 
@@ -20,6 +20,7 @@ pub struct Posting {
 
 /// A complete journal entry with DAG metadata.
 #[derive(SimpleObject, Debug, Clone)]
+#[graphql(complex)]
 pub struct Transaction {
     pub txid: TransactionId,
     pub date: DateScalar,
@@ -36,7 +37,36 @@ pub struct Transaction {
     pub signature: Option<String>,
     /// Parent `txid`s in the DAG. Empty for genesis transactions.
     pub parents: Vec<TransactionId>,
+    /// The user id of the person who entered it through the API
+    /// (`entered-by`, `docs/build-log/002-users-and-roles`). None: entered
+    /// with a node's operator key, typed into the `.bean`, or written before
+    /// people had keys.
+    pub entered_by: Option<String>,
 }
+
+#[ComplexObject]
+impl Transaction {
+    /// The name of the person in `enteredBy`, as this node's access list
+    /// knows it — their latest name, kept after their access is revoked. None
+    /// when no one entered it, or the node keeps no access list or has not
+    /// heard of them.
+    async fn entered_by_name(&self, ctx: &Context<'_>) -> Option<String> {
+        let user_id = self.entered_by.as_ref()?;
+        let source = ctx.data_opt::<crate::auth::AccessSource>()?;
+        let list = match ctx.data_opt::<NamesSnapshot>() {
+            Some(snapshot) => snapshot.0.get_or_init(|| source.current()).await.clone(),
+            None => source.current().await,
+        };
+        list.names.get(user_id).cloned()
+    }
+}
+
+/// The access list one request reads names from (step 4 review): taken once,
+/// on the first `enteredByName`, so a journal page of many rows costs one
+/// look rather than one ledger read lock per row — and every row of one answer
+/// is named from the same list.
+#[derive(Default)]
+pub struct NamesSnapshot(tokio::sync::OnceCell<std::sync::Arc<crate::access_list::AccessList>>);
 
 /// The payload of the `appendTransaction` mutation (M-10).
 ///

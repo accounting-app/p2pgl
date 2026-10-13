@@ -313,6 +313,7 @@ pub(super) async fn change_access(
             action,
             fields: &fields,
         },
+        None,
         signer.as_deref(),
     )
     .map_err(service_error_to_graphql)?;
@@ -841,6 +842,111 @@ mod tests {
         copy_new_records(&first, &second).await;
         let (status, _) = second.post(&key, query(READ)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "revoked there too");
+    }
+
+    /// Who entered it (step 4): a person's writes carry their user id
+    /// (`entered-by`) and the journal shows it with their name — the latest
+    /// one, and still after their access is revoked; the operator's writes
+    /// carry none.
+    ///
+    /// Bug-catch: stamp the operator's id on every write and the journal
+    /// cannot tell people apart; look names up in the current list only and
+    /// a revoked clerk's entries lose their name.
+    #[tokio::test]
+    async fn the_journal_shows_who_entered_each_write() {
+        let node = node(true, None);
+        for account in ["Assets:Cash", "Income:Salary"] {
+            let open =
+                format!(r#"mutation {{ openAccount(name: "{account}", date: "2026-01-01") }}"#);
+            let (_, body) = node.post(OPERATOR, query(&open)).await;
+            assert!(body["errors"].is_null(), "{body}");
+        }
+        let (ana, ana_key) = granted(&node, OPERATOR, grant(Some("Ana Ruiz"), "WRITE", None)).await;
+        let post = |narration: &str| {
+            query(&format!(
+                r#"mutation {{ appendTransaction(input: {{ date: "2026-01-02", narration: "{narration}", postings: [
+                    {{ account: "Assets:Cash", amount: {{ number: "5", currency: "USD" }} }},
+                    {{ account: "Income:Salary" }}] }}) {{ txid enteredBy enteredByName }} }}"#
+            ))
+        };
+        let (_, body) = node.post(&ana_key, post("by Ana")).await;
+        let appended = &body["data"]["appendTransaction"];
+        assert_eq!(appended["enteredBy"], json!(ana), "{body}");
+        assert_eq!(appended["enteredByName"], "Ana Ruiz");
+        let (_, body) = node.post(OPERATOR, post("by the operator")).await;
+        assert_eq!(
+            body["data"]["appendTransaction"]["enteredBy"],
+            Value::Null,
+            "{body}"
+        );
+        let (_, body) = node.post(&ana_key, query(OPEN)).await;
+        assert!(body["errors"].is_null(), "{body}");
+        let close = r#"mutation { closeAccount(name: "Assets:Bank", date: "2026-01-03") }"#;
+        let (_, body) = node.post(&ana_key, query(close)).await;
+        assert!(body["errors"].is_null(), "{body}");
+        let closed_by: Vec<String> = node
+            .ledger
+            .read()
+            .await
+            .dag()
+            .directives()
+            .into_iter()
+            .filter_map(|directive| match directive {
+                ledger::model::Directive::Close(close) => close
+                    .metadata
+                    .get(ledger::access_record::ENTERED_BY)
+                    .cloned(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(closed_by, vec![ana.clone()], "the close names Ana too");
+        let opened_by: Vec<String> = node
+            .ledger
+            .read()
+            .await
+            .dag()
+            .directives()
+            .into_iter()
+            .filter_map(|directive| match directive {
+                ledger::model::Directive::Open(open) if open.account == "Assets:Bank" => open
+                    .metadata
+                    .get(ledger::access_record::ENTERED_BY)
+                    .cloned(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened_by, vec![ana.clone()], "the open names Ana too");
+
+        let journal = || async {
+            let (_, body) = node
+                .post(
+                    OPERATOR,
+                    query("{ journal { narration enteredBy enteredByName } }"),
+                )
+                .await;
+            body["data"]["journal"].clone()
+        };
+        let rename =
+            format!(r#"mutation {{ renameUser(userId: "{ana}", name: "Ana Ruiz-Soto") }}"#);
+        node.post(OPERATOR, query(&rename)).await;
+        let revoke = format!(r#"mutation {{ revokeAccess(userId: "{ana}") }}"#);
+        node.post(OPERATOR, query(&revoke)).await;
+        let rows = journal().await;
+        let row = |narration: &str| {
+            rows.as_array()
+                .and_then(|rows| rows.iter().find(|row| row["narration"] == narration))
+                .cloned()
+                .unwrap_or_else(|| panic!("{narration} in {rows}"))
+        };
+        assert_eq!(
+            row("by Ana"),
+            json!({ "narration": "by Ana", "enteredBy": ana, "enteredByName": "Ana Ruiz-Soto" }),
+            "the latest name, after the revoke"
+        );
+        assert_eq!(
+            row("by the operator"),
+            json!({ "narration": "by the operator", "enteredBy": null, "enteredByName": null })
+        );
     }
 
     /// A grant is durable and its name survives the `.bean`: a name with

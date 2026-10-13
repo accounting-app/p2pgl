@@ -50,5 +50,6 @@ them (a typo, a one-line fix) gets no entry.
 | # | Work | Status |
 |---|---|---|
 | [001](001-peer-discovery/) | Peer discovery without a third party: own relay + direct addresses | done (d84083a) |
-| [002](002-users-and-roles/) | People, keys and roles: a key per person, admin / write / read, who entered each write | step 3 of 4 (admin API + CLI) ready to commit; next: who entered it + docs |
+| [002](002-users-and-roles/) | People, keys and roles: a key per person, admin / write / read, who entered each write | done (4 of 4, cd51455) |
+| [003](003-multi-ledger-node/) | Several company ledgers on one node, isolated, added at runtime | intent and plan approved (2026-10-14); step 1 next |
 | — | Relay with a company's own certificate authority (`relayCaCert`) | planned (decision C, 2026-10-09) |

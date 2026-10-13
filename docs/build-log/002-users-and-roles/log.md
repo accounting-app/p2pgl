@@ -1,6 +1,6 @@
 # Log: people, keys and roles
 
-Status: in progress.
+Status: done (four steps, the last cd51455).
 
 One entry per commit-sized unit, newest last, written when the unit is ready
 to commit. The commit hash is filled in once the maintainer has committed.
@@ -134,4 +134,62 @@ to commit. The commit hash is filled in once the maintainer has committed.
   stays theirs); `gl-node user add --user` is its CLI form. The CLI speaks
   HTTP/1.1 itself (as `--health-check` does) rather than adding an HTTP client
   dependency.
-- **Commit:** (pending)
+- **Commit:** 5503657
+
+## 2026-10-12 — Step 4: who entered it, and the docs
+
+- **What changed:** ledger — `access_record::ENTERED_BY` (`entered-by`), and
+  `append_transaction_staged_by`, `open_account_staged_by`,
+  `close_account_staged_by`: the existing staged calls with the person who
+  entered the write, stamped into the body before the id is computed (refused
+  blank or with a control character). gl-node — the three mutations pass the
+  caller's user id (none for the operator); the size-cap estimate counts the
+  line; the access list keeps every name it has seen (`names`, revoked people
+  included); the journal's `Transaction` gains `enteredBy` and
+  `enteredByName`. README *Using Auth* rewritten (two kinds of key, the roles
+  table, 401 versus `FORBIDDEN`, auth off has no people), *People and keys*
+  gains *Who entered it*; OPERATIONS *People and keys* (before the first
+  grant, the commands, expiry, revocation and the partitioned node, what the
+  books show); CHANGELOG (*Added*).
+- **Decision: `entered-by` is part of the id.** The id hashes the body's
+  metadata (only `openledger-` envelope keys are left out), so `entered-by`
+  in the body is covered by the id and the signature — attribution cannot be
+  edited without the edit showing. The consequence: one person entering the
+  same entry twice is one record, as before, but two people entering it are
+  two. Putting it in the envelope instead would leave it out of the id but
+  is a wire change every older node refuses (the envelope is a closed set).
+  The operator's writes carry no `entered-by`, so an existing client
+  retrying an entry from before the upgrade still dedups.
+- **Tests:** the ledger (stored, in the id, the dedup rule, open and close,
+  a reboot, refusals); the estimate equals the staged record with
+  `entered-by`; the journal through the real router (a person's write and
+  the operator's, the name after a rename and a revoke, the open); the
+  shipped binary — a writer's signed entry in Format v2 verifies after a
+  restart and the journal names them.
+- **Review round** (reviewer subagent): two Important findings, both fixed.
+  (I-1) On a Format v1 node the size-cap estimate computed the id before
+  `entered-by` was on the body, so it judged a person's write by the
+  operator's record: resubmitting an operator entry's body as a person was
+  taken for a duplicate, staged anyway and paid for with a reload (L-71
+  again), and a person's own retry was refused for the cap instead of
+  reported as `alreadyExisted`. The estimate now puts `entered-by` on the
+  record before the id in both formats; the estimate test covers both
+  cases. (I-2) A line typed into the `.bean` could carry any `entered-by`,
+  and the node signed it as that person's; operator input carrying it is now
+  refused, live and at boot, as a typed access record is. Also: the close's
+  attribution is tested through the mutation; the journal reads names from
+  one snapshot of the access list per request (`NamesSnapshot`) instead of a
+  ledger read lock per row; names follow the fold's rule (a rename of an id
+  never granted names no one); U-R57 now reverts what its Bug-catch names;
+  the README's dedup sentence says Format v2 puts the node in the id, so a
+  retry through another node is a second record; the T41 comment and doc
+  wording corrected.
+- **Gate:** `scripts/gate.sh` — 1,579 passed, 0 failed, 0 ignored (6 min 56 s).
+- **Revert checks:** `scripts/revert_specs/users.json` — 11 of 11 new checks
+  bite (U-R53 to U-R63). `NamesSnapshot` has none: it changes how often the
+  list is read, not what any answer says, so no test can tell it apart.
+- **Departures from the plan:** none beyond the decision above; the plan
+  said "the name where this node knows it", and a revoked person's name is
+  still known.
+- **Commit:** cd51455
+
