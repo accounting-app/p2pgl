@@ -80,11 +80,12 @@ impl AccessSource {
 /// every node of the mesh — would hand admin keys to whoever asked (step 3
 /// review I-1); and such a node accepts no keys anyway.
 pub fn access_source_for(
-    config: &crate::config::NodeConfig,
+    auth_enabled: bool,
+    config: &crate::config::LedgerConfig,
     ledger: crate::graphql::SharedLedger,
     admin_nodes: Option<std::sync::Arc<std::collections::HashSet<String>>>,
 ) -> Option<AccessSource> {
-    (config.auth.enabled && config.signing.enabled).then(|| AccessSource::new(ledger, admin_nodes))
+    (auth_enabled && config.signing.enabled).then(|| AccessSource::new(ledger, admin_nodes))
 }
 
 /// Hand-written so the API key is never printed (T41).
@@ -353,12 +354,26 @@ mod tests {
             ))
             .expect("config")
         };
-        assert!(access_source_for(&config(false, true), ledger.clone(), None).is_none());
+        assert!(access_source_for(
+            true,
+            &config(false, true).ledger_config(),
+            ledger.clone(),
+            None
+        )
+        .is_none());
         assert!(
-            access_source_for(&config(true, false), ledger.clone(), None).is_none(),
+            access_source_for(
+                false,
+                &config(true, false).ledger_config(),
+                ledger.clone(),
+                None
+            )
+            .is_none(),
             "auth off"
         );
-        assert!(access_source_for(&config(true, true), ledger, None).is_some());
+        assert!(
+            access_source_for(true, &config(true, true).ledger_config(), ledger, None).is_some()
+        );
     }
 
     /// `authenticate` (002-users-and-roles): the operator key is the operator;

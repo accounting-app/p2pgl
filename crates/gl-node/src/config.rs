@@ -367,22 +367,52 @@ impl AuthConfig {
     /// `openledger-author` (one canonical spelling, whatever form the config
     /// used), or `None` when unset.
     pub fn admin_node_ids(&self) -> Result<Option<std::collections::HashSet<String>>, ConfigError> {
-        let Some(nodes) = &self.admin_nodes else {
-            return Ok(None);
-        };
-        nodes
-            .iter()
-            .map(|raw| {
-                raw.parse::<iroh::EndpointId>()
-                    .map(|id| id.to_string())
-                    .map_err(|error| {
-                        ConfigError::Validation(format!(
-                            "auth.adminNodes entry \"{raw}\" is not an EndpointId: {error}"
-                        ))
-                    })
-            })
-            .collect::<Result<_, _>>()
-            .map(Some)
+        admin_node_ids(self.admin_nodes.as_deref())
+    }
+}
+
+/// `auth.adminNodes` as the node ids access records carry: each entry parsed
+/// as an `EndpointId` and written back in its canonical form.
+fn admin_node_ids(
+    nodes: Option<&[String]>,
+) -> Result<Option<std::collections::HashSet<String>>, ConfigError> {
+    let Some(nodes) = nodes else {
+        return Ok(None);
+    };
+    nodes
+        .iter()
+        .map(|raw| {
+            raw.parse::<iroh::EndpointId>()
+                .map(|id| id.to_string())
+                .map_err(|error| {
+                    ConfigError::Validation(format!(
+                        "auth.adminNodes entry \"{raw}\" is not an EndpointId: {error}"
+                    ))
+                })
+        })
+        .collect::<Result<_, _>>()
+        .map(Some)
+}
+
+/// The settings that belong to one ledger rather than to the node
+/// (`docs/build-log/003-multi-ledger-node`): its file, the watcher, signing,
+/// Format, its mesh, and whose access records count. Today every node has one,
+/// read from the config file ([`NodeConfig::ledger_config`]).
+#[derive(Debug, Clone)]
+pub struct LedgerConfig {
+    pub ledger_path: String,
+    pub watch_ledger_file: bool,
+    pub signing: SigningConfig,
+    pub format: FormatConfig,
+    pub p2p: P2pConfig,
+    /// `auth.adminNodes`.
+    pub admin_nodes: Option<Vec<String>>,
+}
+
+impl LedgerConfig {
+    /// See [`AuthConfig::admin_node_ids`].
+    pub fn admin_node_ids(&self) -> Result<Option<std::collections::HashSet<String>>, ConfigError> {
+        admin_node_ids(self.admin_nodes.as_deref())
     }
 }
 
@@ -422,7 +452,7 @@ impl std::fmt::Debug for AuthConfig {
 }
 
 /// Signing settings (§3.8.1).
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct SigningConfig {
@@ -440,7 +470,7 @@ pub struct SigningConfig {
 }
 
 /// Peer-to-peer replication settings (§3.4, §3.9).
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct P2pConfig {
@@ -653,9 +683,34 @@ impl std::fmt::Debug for P2pConfig {
 }
 
 impl P2pConfig {
+    /// Log which field the signature domain resolved from (L-23).
+    ///
+    /// Until `meshId` was required, a signing node without one WARNed here with
+    /// the remedy R-9 chose; that remedy is now the boot refusal in
+    /// [`Self::validate`], so a node that reaches this line and signs has a
+    /// `meshId`. Only a node with signing off can still resolve to the swarm
+    /// topic, and it has no signatures the domain could invalidate.
+    ///
+    /// Never prints the domain: on the fallback path it *is* the gossip join
+    /// credential (M-32, L-56), so only its source, length and a four-character
+    /// prefix appear — the shape `main` always logged.
+    pub fn log_signature_domain(&self) {
+        let domain = self.signature_domain();
+        let source = self.signature_domain_source();
+        let length = domain.len();
+        let prefix: String = domain.chars().take(4).collect();
+        info!(
+            source,
+            length,
+            prefix = %prefix,
+            "mesh signature domain resolved"
+        );
+    }
+
     /// The domain every signature on this node is bound to (L-23).
     ///
-    /// The **single** resolution point: `main` calls this once at boot and
+    /// The **single** resolution point: `ledger_runtime::start` calls this once
+    /// at boot and
     /// hands the result to the signer and to the ALPN verification path, so no
     /// other site reads `swarm_topic` for signature purposes and the two cannot
     /// disagree.
@@ -1871,28 +1926,16 @@ impl NodeConfig {
         )
     }
 
-    /// Log which field the signature domain resolved from (L-23).
-    ///
-    /// Until `meshId` was required, a signing node without one WARNed here with
-    /// the remedy R-9 chose; that remedy is now the boot refusal in
-    /// [`Self::validate`], so a node that reaches this line and signs has a
-    /// `meshId`. Only a node with signing off can still resolve to the swarm
-    /// topic, and it has no signatures the domain could invalidate.
-    ///
-    /// Never prints the domain: on the fallback path it *is* the gossip join
-    /// credential (M-32, L-56), so only its source, length and a four-character
-    /// prefix appear — the shape `main` always logged.
-    pub fn log_signature_domain(&self) {
-        let domain = self.p2p.signature_domain();
-        let source = self.p2p.signature_domain_source();
-        let length = domain.len();
-        let prefix: String = domain.chars().take(4).collect();
-        info!(
-            source,
-            length,
-            prefix = %prefix,
-            "mesh signature domain resolved"
-        );
+    /// This node's one ledger's settings, as the config file gives them.
+    pub fn ledger_config(&self) -> LedgerConfig {
+        LedgerConfig {
+            ledger_path: self.ledger_path.clone(),
+            watch_ledger_file: self.watch_ledger_file,
+            signing: self.signing.clone(),
+            format: self.format,
+            p2p: self.p2p.clone(),
+            admin_nodes: self.auth.admin_nodes.clone(),
+        }
     }
 
     /// Whether to serve GraphiQL on `GET /graphql`.
@@ -3341,7 +3384,7 @@ mod tests {
             signing_config(topic, Some("3f2504e0-4f89-41d3-9a0c-0305e82c3301"), true),
             signing_config(topic, None, false),
         ] {
-            let ((), logged) = capture_warnings(|| config.log_signature_domain());
+            let ((), logged) = capture_warnings(|| config.p2p.log_signature_domain());
             assert!(logged.is_empty(), "unexpected warning: {logged}");
         }
     }

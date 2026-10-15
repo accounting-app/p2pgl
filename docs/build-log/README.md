@@ -51,5 +51,5 @@ them (a typo, a one-line fix) gets no entry.
 |---|---|---|
 | [001](001-peer-discovery/) | Peer discovery without a third party: own relay + direct addresses | done (d84083a) |
 | [002](002-users-and-roles/) | People, keys and roles: a key per person, admin / write / read, who entered each write | done (4 of 4, cd51455) |
-| [003](003-multi-ledger-node/) | Several company ledgers on one node, isolated, added at runtime | intent and plan approved (2026-10-14); step 1 next |
+| [003](003-multi-ledger-node/) | Several company ledgers on one node, isolated, added at runtime | step 1 of 5 (carve out one ledger) ready to commit |
 | — | Relay with a company's own certificate authority (`relayCaCert`) | planned (decision C, 2026-10-09) |

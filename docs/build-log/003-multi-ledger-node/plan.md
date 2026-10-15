@@ -60,6 +60,11 @@ signing, Format, the file watcher; its access list and `auth.adminNodes`.
    auth per ledger, the unknown-name rule, per-ledger failure, the cross-ledger
    checks, per-ledger `/health` plus a node summary, `--ledger <name>` on
    `gl-node user` and `--node-id`. README (*Several ledgers*), CHANGELOG.
+   Once a failed ledger no longer ends the process, `start` must undo what it
+   began: validate everything (`adminNodes`) before spawning a task, and on a
+   later failure stop the P2P tasks, the watcher and the endpoint before
+   releasing the lock; and `build_signature_provider` must return an error
+   instead of exiting (step 1 review).
 3. **Fairness and scale.** The in-flight cap; a 100-ledger boot (P2P off) and
    a 10-ledger mesh on loopback, measured (boot time, memory, open files) into
    `notes/`; parallel compaction at shutdown, with the time it needs written

@@ -43,8 +43,8 @@
   },
   "H01-R4-file-key-unchecked": {
     "file": "crates/gl-node/src/auth.rs",
-    "old": "            crate::config::check_api_key(&key)\n",
-    "new": "            Ok::<(), String>(())\n",
+    "old": "            crate::config::check_api_key(&key)\n                .map_err(|error| format!(\"API key file {}: {error}\", path.display()))?;\n            info!(",
+    "new": "            Ok::<(), String>(())\n                .map_err(|error| format!(\"API key file {}: {error}\", path.display()))?;\n            info!(",
     "runs": [
       [
         "-p",

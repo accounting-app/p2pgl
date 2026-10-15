@@ -8,10 +8,10 @@
 //! or two containers sharing a volume.
 //!
 //! The fix is an exclusive advisory lock on a `<ledgerPath>.lock` sidecar,
-//! taken once per process at startup and held for the lifetime of the process.
+//! taken when the node starts the ledger and held for as long as it runs it.
 //! A second instance fails closed with a message naming the path.
 //!
-//! # Why the lock lives in `main`, not in `LedgerService::boot`
+//! # Why the lock lives in the node (`ledger_runtime::start`), not in `LedgerService::boot`
 //!
 //! Putting it in the library's `boot` looks tidier and is wrong. T27's
 //! [`ledger::service::LedgerService::persist_or_reload`] recovers from a failed
@@ -22,7 +22,7 @@
 //! recoverable persist failure into a hard boot failure. Library and test users
 //! also legitimately boot many services (on distinct temp files) in one process.
 //!
-//! A process-level lock in `main` covers the real threat — two *processes* on
+//! A lock the node takes covers the real threat — two *processes* on
 //! one ledger — while leaving the library unlocked.
 //!
 //! # Bonus: it makes the stale-temp sweep at boot safe
@@ -31,7 +31,7 @@
 //! `<name>.tmp.<pid>.<nonce>` per call and never unlinks what it finds; boot
 //! sweeps the `<name>.tmp*` leftovers of crashed rewrites once, at process
 //! start. Without a process lock that sweep could delete a *sibling* process's
-//! in-flight temp. `main` takes this lock before it boots, so no sibling can be
+//! in-flight temp. `ledger_runtime::start` takes this lock before it boots, so no sibling can be
 //! mid-persist on this ledger and every temp the sweep finds is a crashed
 //! leftover. (Library users that do not take the lock keep that exposure —
 //! documented at the sweep.)
@@ -154,7 +154,7 @@ mod tests {
     }
 
     /// The lock is on the sidecar, so the ledger file itself need not exist yet
-    /// — `main` takes the lock before it creates an empty `.bean`.
+    /// — the node takes the lock before it creates an empty `.bean`.
     #[test]
     fn acquire_does_not_require_the_ledger_file_to_exist() {
         let temp_dir = tempfile::tempdir().expect("temp dir");

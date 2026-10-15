@@ -80,8 +80,8 @@
       },
       {
         "file": "crates/ledger/src/service/quarantine.rs",
-        "old": "                    if validate_transaction_as_data(txn, &self.accounts).is_err()\n                        || elided_posting_count(txn) > 0",
-        "new": "                    if validate_transaction(txn, &self.accounts).is_err()\n                        || elided_posting_count(txn) > 0"
+        "old": "                        if validate_transaction_as_data(txn, &self.accounts).is_err()\n                            || elided_posting_count(txn) > 0",
+        "new": "                        if validate_transaction(txn, &self.accounts).is_err()\n                            || elided_posting_count(txn) > 0"
       }
     ],
     "runs": [
