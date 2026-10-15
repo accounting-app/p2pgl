@@ -33,7 +33,7 @@ use p2p::protocol::WireMessage;
 
 /// Boot the P2P subsystem: create the Iroh endpoint from the node's key.
 ///
-/// The key material is loaded by `main` and handed in (L-04) rather than read
+/// The key material is loaded by `ledger_runtime::start` and handed in (L-04) rather than read
 /// here, so the QUIC identity and the directive signer provably derive from a
 /// single read of a single open file descriptor.
 ///
@@ -2899,10 +2899,11 @@ mod tests {
         );
     }
 
-    /// T80 / M-53: the author id `main` sets from the loaded key, before P2P
+    /// T80 / M-53: the author id `ledger_runtime::start` sets from the loaded
+    /// key, before P2P
     /// boots, is the endpoint id P2P would announce and the key the signer
     /// signs with — so a node that signs with P2P off writes the author id it
-    /// will have with P2P on, and `main`'s consistency check never fires.
+    /// will have with P2P on, and its consistency check never fires.
     #[test]
     fn t80_the_author_id_from_the_key_is_the_endpoint_id_and_the_signing_key() {
         let secret = SecretKey::generate();

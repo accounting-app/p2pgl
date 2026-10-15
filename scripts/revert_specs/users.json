@@ -367,8 +367,8 @@
   },
   "U-R23-peoples-keys-without-signing": {
     "file": "crates/gl-node/src/auth.rs",
-    "old": "    (config.auth.enabled && config.signing.enabled)",
-    "new": "    (config.auth.enabled)",
+    "old": "    (auth_enabled && config.signing.enabled)",
+    "new": "    (auth_enabled)",
     "runs": [
       [
         "-p",
@@ -709,8 +709,8 @@
   },
   "U-R46-access-list-with-auth-off": {
     "file": "crates/gl-node/src/auth.rs",
-    "old": "    (config.auth.enabled && config.signing.enabled)",
-    "new": "    config.signing.enabled",
+    "old": "    (auth_enabled && config.signing.enabled)",
+    "new": "    (config.signing.enabled)",
     "runs": [
       [
         "-p",
