@@ -26,6 +26,7 @@ use crate::graphql::{build_schema_with_access, AppSchema, SharedLedger};
 use crate::health::HealthState;
 
 /// What a ledger needs from the node that hosts it.
+#[derive(Clone)]
 pub(crate) struct NodeSettings {
     /// `auth.enabled`.
     pub auth_enabled: bool,
@@ -46,6 +47,48 @@ pub(crate) type NodeIds = Arc<std::sync::Mutex<std::collections::BTreeMap<String
 /// A ledger that could not start. The reason was logged where it was found.
 #[derive(Debug)]
 pub(crate) struct StartFailed;
+
+/// Claim each ledger's node id in the order given — the config file's ledger
+/// first, then the folders by name — and name the ledgers whose key another
+/// ledger before them already has (003, decision 1). Done before the ledgers
+/// boot in parallel, so which of two ledgers sharing a key is served is the
+/// same at every restart, and the config file's ledger always keeps its key.
+/// A key that cannot be read here is left for the ledger's own start to
+/// report. A P2P ledger's key is created here on its first boot, as its start
+/// would create it.
+pub(crate) fn settle_node_keys(
+    ledgers: &[(String, LedgerConfig)],
+    node_ids: &NodeIds,
+) -> Vec<(String, String)> {
+    let mut refused = Vec::new();
+    let mut ids = node_ids.lock().expect("node ids lock");
+    for (name, config) in ledgers {
+        let path = PathBuf::from(&config.p2p.secret_key_path);
+        let key = if config.p2p.enabled {
+            crate::p2p_service::load_or_create_secret_key(&path)
+        } else if config.signing.enabled {
+            crate::p2p_service::load_secret_key(&path)
+        } else {
+            continue;
+        };
+        let Ok(key) = key else {
+            continue;
+        };
+        let id = key.author_id();
+        match ids.get(&id) {
+            Some(other) => refused.push((
+                name.clone(),
+                format!(
+                    "its node key is also ledger \"{other}\"'s: one node id in two meshes would tie them together; give each ledger its own key"
+                ),
+            )),
+            None => {
+                ids.insert(id, name.clone());
+            }
+        }
+    }
+    refused
+}
 
 /// A started ledger: what the node serves it with, and what [`Self::stop`]
 /// shuts down.
@@ -142,11 +185,17 @@ async fn start_ledger(
     // Those writes happen once the key's author id is set, so a v2 id is
     // computed over the final author.
     let author_id = ledger::service::PLACEHOLDER_AUTHOR.to_owned();
-    let service = match ledger::service::LedgerService::boot_emitting(
-        &ledger_path,
-        author_id,
-        config.format.record_format(),
-    ) {
+    // 003 step 3 (review): the boot reads, hashes and verifies the whole file
+    // — seconds for a large ledger — so it runs on the blocking pool, not on a
+    // runtime worker the ledgers already started need for their P2P.
+    let boot_path = ledger_path.clone();
+    let format = config.format.record_format();
+    let booted = tokio::task::spawn_blocking(move || {
+        ledger::service::LedgerService::boot_emitting(&boot_path, author_id, format)
+    })
+    .await
+    .unwrap_or_else(|panic| std::panic::resume_unwind(panic.into_panic()));
+    let service = match booted {
         Ok(service) => service,
         Err(error) => {
             error!(%error, "failed to boot ledger service; this ledger is not served");
@@ -258,10 +307,13 @@ async fn start_ledger(
     // key in two ledgers — a copied folder, or the config file pointed at a
     // folder's key — would be one node id in two meshes, tying them together;
     // refused here, before anything joins a mesh.
+    // `settle_node_keys` has already claimed the ids in a fixed order (the
+    // config file's ledger, then the folders by name); this is the backstop
+    // for a ledger started any other way.
     if let Some(secret_key) = node_secret_key.as_ref() {
         let id = secret_key.author_id();
         let mut ids = node.node_ids.lock().expect("node ids lock");
-        if let Some(other) = ids.get(&id) {
+        if let Some(other) = ids.get(&id).filter(|other| *other != name) {
             error!(
                 other_ledger = %other,
                 "this ledger's node key is also ledger \"{other}\"'s: one node id in two meshes would tie them together; give each ledger its own key; this ledger is not served"
@@ -901,5 +953,50 @@ mod tests {
             "beta has acme's key"
         );
         acme.stop().await;
+    }
+
+    /// Review: which of two ledgers sharing a node key is served is settled
+    /// in the order given — the config file's ledger, then the folders by name
+    /// — before anything boots in parallel, so it is the same at every
+    /// restart: the earlier keeps its key, the later is refused.
+    ///
+    /// Bug-catch: leave it to the boots racing in parallel and a copied folder
+    /// is served on one restart and its original on the next.
+    #[test]
+    fn shared_node_keys_are_settled_in_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = |name: &str, copy_of: Option<&str>| {
+            let path = dir.path().join(format!("{name}.secret"));
+            match copy_of {
+                Some(original) => {
+                    std::fs::copy(dir.path().join(format!("{original}.secret")), &path)
+                        .expect("a copied key");
+                }
+                None => {
+                    crate::p2p_service::load_or_create_secret_key(&path).expect("a key");
+                }
+            }
+            let mut config = ledger_at(&dir.path().join(format!("{name}.bean")));
+            config.signing.enabled = true;
+            config.p2p.secret_key_path = path.to_string_lossy().into_owned();
+            (name.to_owned(), config)
+        };
+        let ledgers = vec![
+            key("default", None),
+            key("acme", Some("default")),
+            key("beta", None),
+            key("zeta", Some("beta")),
+        ];
+        for _ in 0..2 {
+            let refused: Vec<String> = settle_node_keys(&ledgers, &NodeIds::default())
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            assert_eq!(
+                refused,
+                ["acme", "zeta"],
+                "the earlier keeps its key, every time"
+            );
+        }
     }
 }

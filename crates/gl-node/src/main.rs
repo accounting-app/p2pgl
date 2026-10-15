@@ -378,29 +378,6 @@ async fn main() {
         public_bind: config.binds_non_loopback(),
         node_ids: ledger_runtime::NodeIds::default(),
     };
-    let served_ledgers = ledgers::Ledgers::new(config.auth.enabled, config.auth.api_key.clone());
-    start_ledgers(&config, &node_settings, &served_ledgers).await;
-    // A node with nothing to serve stops, as a one-ledger node whose ledger
-    // could not start always has; one healthy ledger is enough to serve.
-    if served_ledgers.running_count().await == 0 {
-        error!("no ledger could be served — aborting");
-        std::process::exit(1);
-    }
-
-    // Host / Content-Type / Origin guard state (H-01).
-    let guard_state = RequestGuardState {
-        allowed_hosts: Arc::new(config.allowed_host_set()),
-        allowed_origins: Arc::new(config.cors.allowed_origins.iter().cloned().collect()),
-        // L-51: behind a terminator the node's public origin is https.
-        tls_terminated: config.tls.mode == "terminated",
-    };
-
-    // A non-loopback bind with auth disabled is rejected at config validation
-    // (M-2), so by this point a public bind always has auth enabled.
-    if config.tls.mode == "terminated" {
-        info!("TLS assumed terminated at the host or reverse proxy (in-process TLS is not implemented)");
-    }
-
     // Rate limiter keyed on the real client (M-04). With no trusted proxy the
     // key is the TCP peer, which behind a terminator is the proxy itself — one
     // bucket for every client at once — so say so loudly rather than silently
@@ -430,6 +407,34 @@ async fn main() {
         );
     }
     let rate_limiter = RateLimiter::graphql().with_trusted_proxies(trusted_proxies.clone());
+
+    let served_ledgers = ledgers::Ledgers::new(
+        config.auth.enabled,
+        config.auth.api_key.clone(),
+        config.http.max_requests_per_ledger,
+        rate_limiter.clone(),
+    );
+    start_ledgers(&config, &node_settings, &served_ledgers).await;
+    // A node with nothing to serve stops, as a one-ledger node whose ledger
+    // could not start always has; one healthy ledger is enough to serve.
+    if served_ledgers.running_count().await == 0 {
+        error!("no ledger could be served — aborting");
+        std::process::exit(1);
+    }
+
+    // Host / Content-Type / Origin guard state (H-01).
+    let guard_state = RequestGuardState {
+        allowed_hosts: Arc::new(config.allowed_host_set()),
+        allowed_origins: Arc::new(config.cors.allowed_origins.iter().cloned().collect()),
+        // L-51: behind a terminator the node's public origin is https.
+        tls_terminated: config.tls.mode == "terminated",
+    };
+
+    // A non-loopback bind with auth disabled is rejected at config validation
+    // (M-2), so by this point a public bind always has auth enabled.
+    if config.tls.mode == "terminated" {
+        info!("TLS assumed terminated at the host or reverse proxy (in-process TLS is not implemented)");
+    }
 
     let application = build_application_with_limiter(
         served_ledgers.clone(),
@@ -528,35 +533,93 @@ async fn start_ledgers(
         config::ledgers_in_conflict(&candidates, config.max_ledgers)
             .into_iter()
             .collect();
-    for (name, loaded) in &found {
-        let refusal = match loaded {
+    // 003 step 3: the config file's ledger first — it wins any conflict, a
+    // shared node key included — then the folders in parallel, up to one per
+    // core: each boot reads, hashes and verifies its whole file, and one after
+    // another a node of many large ledgers kept every company waiting.
+    let mut queue = Vec::new();
+    for (name, loaded) in found {
+        let refusal = match &loaded {
             Err(reason) => Some(reason.clone()),
-            Ok(_) => conflicts.get(name).cloned(),
+            Ok(_) => conflicts.get(&name).cloned(),
         };
-        if let Some(reason) = refusal {
-            error!(ledger = %name, %reason, "ledger not served");
-            served.insert_failed(name, reason).await;
-            continue;
+        match (refusal, loaded) {
+            (Some(reason), _) => {
+                error!(ledger = %name, %reason, "ledger not served");
+                served.insert_failed(&name, reason).await;
+            }
+            (None, Ok(ledger_config)) => queue.push((name, ledger_config)),
+            (None, Err(_)) => {}
         }
-        let Ok(ledger_config) = loaded else {
-            continue;
-        };
-        match ledger_runtime::start(name, ledger_config, node).await {
-            Ok(running) => {
-                info!(ledger = %name, "ledger served");
-                if let Err(running) = served.insert_running(name, running, node.graphiql).await {
-                    error!(ledger = %name, "a ledger of this name is already served; stopping this one");
-                    running.stop().await;
-                }
+    }
+    // Review: the node ids, settled in order before anything boots in parallel.
+    let shared_keys: std::collections::HashMap<String, String> =
+        ledger_runtime::settle_node_keys(&queue, &node.node_ids)
+            .into_iter()
+            .collect();
+    let mut kept = Vec::new();
+    for (name, ledger_config) in queue {
+        match shared_keys.get(&name) {
+            Some(reason) => {
+                error!(ledger = %name, %reason, "ledger not served");
+                served.insert_failed(&name, reason.clone()).await;
             }
-            Err(ledger_runtime::StartFailed) => {
-                served
-                    .insert_failed(
-                        name,
-                        "it could not start; this ledger's boot log says why".to_owned(),
-                    )
-                    .await;
+            None => kept.push((name, ledger_config)),
+        }
+    }
+    let mut queue = kept.into_iter();
+    if let Some((name, ledger_config)) = queue.next() {
+        let started = ledger_runtime::start(&name, &ledger_config, node).await;
+        serve_started(served, &name, started, node.graphiql).await;
+    }
+    let parallel = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    let gate = Arc::new(tokio::sync::Semaphore::new(parallel));
+    let mut starting = tokio::task::JoinSet::new();
+    for (name, ledger_config) in queue {
+        let (gate, node) = (Arc::clone(&gate), node.clone());
+        starting.spawn(async move {
+            let _turn = gate
+                .acquire_owned()
+                .await
+                .expect("the boot gate is never closed");
+            let started = ledger_runtime::start(&name, &ledger_config, &node).await;
+            (name, started)
+        });
+    }
+    while let Some(joined) = starting.join_next().await {
+        match joined {
+            Ok((name, started)) => serve_started(served, &name, started, node.graphiql).await,
+            // Review: a panic in a ledger's boot stops the node, as it did
+            // before boots ran in parallel — never a ledger silently gone,
+            // perhaps still writing without its lock.
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => error!(%error, "a ledger's boot was cancelled"),
+        }
+    }
+}
+
+/// Record what one ledger's start gave: served, or refused with its reason.
+async fn serve_started(
+    served: &ledgers::Ledgers,
+    name: &str,
+    started: Result<ledger_runtime::RunningLedger, ledger_runtime::StartFailed>,
+    graphiql: bool,
+) {
+    match started {
+        Ok(running) => {
+            info!(ledger = %name, "ledger served");
+            if let Err(running) = served.insert_running(name, running, graphiql).await {
+                error!(ledger = %name, "a ledger of this name is already served; stopping this one");
+                running.stop().await;
             }
+        }
+        Err(ledger_runtime::StartFailed) => {
+            served
+                .insert_failed(
+                    name,
+                    "it could not start; this ledger's boot log says why".to_owned(),
+                )
+                .await;
         }
     }
 }
@@ -577,7 +640,12 @@ pub(crate) fn build_application(
     graphiql: bool,
 ) -> Router {
     // 003: the node serving this one ledger as its `default`.
-    let ledgers = ledgers::Ledgers::new(auth_state.enabled, auth_state.api_key.clone());
+    let ledgers = ledgers::Ledgers::new(
+        auth_state.enabled,
+        auth_state.api_key.clone(),
+        config::default_max_requests_per_ledger(),
+        RateLimiter::graphql(),
+    );
     ledgers.insert_parts(
         config::DEFAULT_LEDGER,
         schema,
@@ -598,7 +666,9 @@ pub(crate) fn build_application(
 /// 003: auth is each ledger's own, so it sits inside the ledger's router
 /// (`ledgers::ledger_router`), reached through the node's routes — `/graphql`
 /// and `/health` for the `default` ledger, `/ledgers/<name>/…` for the others
-/// — after the guard and the limiter, as before.
+/// — after the guard and the limiter, as before. GraphQL's limiter is each
+/// ledger's own too (a client's budget is per ledger), checked first when
+/// `Ledgers::dispatch` routes the request; `/health` keeps one node-wide.
 ///
 /// `/health` is behind the guard and a limiter too (H-01 residual, L-42), and
 /// outside auth only (§2.9: it must answer an unauthenticated prober). Before
@@ -609,7 +679,9 @@ pub(crate) fn build_application(
 /// who a client is, a budget of its own.
 ///
 /// `limiter` carries the trusted-proxy set, so how a client is identified is a
-/// boot-time decision rather than a per-request one (M-04).
+/// boot-time decision rather than a per-request one (M-04). Since 003 it
+/// drives `/health` only; GraphQL's limiters are the ledgers' own, built from
+/// the same limiter by `Ledgers::new` (`main` passes clones of one).
 pub(crate) fn build_application_with_limiter(
     ledgers: ledgers::Ledgers,
     guard_state: RequestGuardState,
@@ -630,14 +702,13 @@ pub(crate) fn build_application_with_limiter(
         rate_limit::HEALTH_RATE_LIMIT,
         rate_limit::HEALTH_RATE_WINDOW,
     );
+    // 003 step 3: GraphQL's rate limit is each ledger's own, checked when the
+    // request is routed to it (`Ledgers::dispatch`), so a client's budget is
+    // per ledger.
     let graphql_routes = Router::new()
         .route("/graphql", default_graphql)
         .route("/ledgers/{name}/graphql", post(ledgers::named_graphql))
         .with_state(ledgers.clone())
-        .layer(middleware::from_fn_with_state(
-            limiter,
-            rate_limit::rate_limit,
-        ))
         .layer(middleware::from_fn_with_state(
             guard_state.clone(),
             request_guard::request_guard,

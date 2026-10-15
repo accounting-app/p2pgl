@@ -45,8 +45,9 @@ signing, Format, the file watcher; its access list and `auth.adminNodes`.
   `<ledgersDir>/.removed/<name>-<UTC time>/`; nothing is deleted.
 - **Fairness:** each ledger already has its own write permit, caches and P2P
   limits. Added: an in-flight request cap per ledger (a hot ledger answers
-  503 past it; the others are unaffected), and the client rate limit stays
-  per client across ledgers. Boot refuses two ledgers with the same `meshId`,
+  503 past it; the others are unaffected), and a client's GraphQL rate
+  limit is per ledger (the maintainer's choice in step 3; the plan had kept
+  one per client across the node). Boot refuses two ledgers with the same `meshId`,
   listen port, key path or ledger path, and more than `maxLedgers` (100).
 
 ## Order of work

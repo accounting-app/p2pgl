@@ -42,7 +42,7 @@ pub async fn boot_p2p(
     config: &P2pConfig,
     node_secret_key: &NodeSecretKey,
     codec: p2p::protocol::WireCodec,
-) -> Result<PeerNode, Box<dyn std::error::Error>> {
+) -> Result<PeerNode, Box<dyn std::error::Error + Send + Sync>> {
     let secret_key = node_secret_key.iroh_secret_key();
 
     let endpoint = endpoint_builder(config)?
@@ -91,7 +91,7 @@ pub async fn boot_p2p(
 /// a test can bind the production builder on loopback.
 pub(crate) fn endpoint_builder(
     config: &P2pConfig,
-) -> Result<iroh::endpoint::Builder, Box<dyn std::error::Error>> {
+) -> Result<iroh::endpoint::Builder, Box<dyn std::error::Error + Send + Sync>> {
     let mut peer_addresses =
         crate::peer_addresses::PeerAddresses::from_config(&config.peer_addresses)?;
     let builder = match config.relay_mode.as_str() {

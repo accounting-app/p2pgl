@@ -102,7 +102,16 @@ pub struct RateLimiter {
     /// Shared with [`Self::sibling`]s: it is a statement about the deployment,
     /// not about one table.
     untrusted_forwarder_warned: Arc<AtomicBool>,
+    /// Ceiling on tracked buckets: [`MAX_BUCKETS`], or less for a ledger's own
+    /// table on a node of several (003, [`Self::with_max_buckets`]).
+    max_buckets: usize,
 }
+
+/// A folder ledger's own GraphQL table holds at most this many clients (003):
+/// a node of 100 ledgers then holds at most 100 × 8,192 buckets however many
+/// addresses a flood uses, where 100 full tables of [`MAX_BUCKETS`] would be
+/// about 500 MiB. Past it the M-21 shared overflow applies, as at the full cap.
+pub const LEDGER_MAX_BUCKETS: usize = 8_192;
 
 /// The bucket table plus the book-keeping that keeps sweeps amortized (L-24).
 #[derive(Debug)]
@@ -178,7 +187,27 @@ impl RateLimiter {
             window,
             trusted_proxies: Arc::new(HashSet::new()),
             untrusted_forwarder_warned: Arc::new(AtomicBool::new(false)),
+            max_buckets: MAX_BUCKETS,
         }
+    }
+
+    /// A limiter with a table of its own, the same budget, and the same idea
+    /// of who a client is (003): one per ledger, so a client's GraphQL budget
+    /// is per ledger it uses.
+    pub fn twin(&self) -> Self {
+        self.sibling(self.limit, self.window)
+    }
+
+    /// This limiter, tracking at most `max_buckets` clients (003).
+    pub fn with_max_buckets(mut self, max_buckets: usize) -> Self {
+        self.max_buckets = max_buckets.min(MAX_BUCKETS);
+        self
+    }
+
+    /// The most clients this limiter tracks.
+    #[cfg(test)]
+    pub(crate) fn max_buckets(&self) -> usize {
+        self.max_buckets
     }
 
     /// A limiter with its own table and budget that identifies clients exactly
@@ -332,11 +361,11 @@ impl RateLimiter {
         }
 
         // A key we have never seen costs a slot.
-        if buckets.windows.len() >= MAX_BUCKETS {
+        if buckets.windows.len() >= self.max_buckets {
             if now.duration_since(buckets.last_prune) >= CAP_PRUNE_COOLDOWN {
                 self.prune(&mut buckets, now);
             }
-            if buckets.windows.len() >= MAX_BUCKETS {
+            if buckets.windows.len() >= self.max_buckets {
                 // M-21: never admit free. Every untracked key shares one
                 // budget while the table is full; see `Buckets::overflow` for
                 // why this and not eviction or refusal.
@@ -362,7 +391,7 @@ impl RateLimiter {
     fn charge_overflow(&self, overflow: &mut Window, now: Instant) -> bool {
         if now.duration_since(overflow.started) >= self.window || overflow.count == 0 {
             warn!(
-                max_buckets = MAX_BUCKETS,
+                max_buckets = self.max_buckets,
                 limit = self.limit,
                 "rate-limit table is full — every client not already tracked now shares one \
                  overflow budget of `limit` requests per window (M-21); a full table means \
@@ -488,21 +517,30 @@ pub async fn rate_limit(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let peer = request
+    if !limiter.allow_request(peer_of(&request), request.headers()) {
+        return too_many_requests();
+    }
+    next.run(request).await
+}
+
+/// The TCP peer of `request` (127.0.0.1 without `ConnectInfo`: `oneshot`).
+pub(crate) fn peer_of(request: &Request<Body>) -> IpAddr {
+    request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|connect| connect.0.ip())
-        .unwrap_or(IpAddr::from([127, 0, 0, 1]));
-    if !limiter.allow_request(peer, request.headers()) {
-        let error_body = json!({
-            "errors": [{
-                "message": "Rate limit exceeded",
-                "extensions": { "code": "RATE_LIMITED" }
-            }]
-        });
-        return (StatusCode::TOO_MANY_REQUESTS, axum::Json(error_body)).into_response();
-    }
-    next.run(request).await
+        .unwrap_or(IpAddr::from([127, 0, 0, 1]))
+}
+
+/// The answer past a client's budget.
+pub(crate) fn too_many_requests() -> Response {
+    let error_body = json!({
+        "errors": [{
+            "message": "Rate limit exceeded",
+            "extensions": { "code": "RATE_LIMITED" }
+        }]
+    });
+    (StatusCode::TOO_MANY_REQUESTS, axum::Json(error_body)).into_response()
 }
 
 #[cfg(test)]
@@ -541,6 +579,28 @@ mod tests {
         assert!(limiter.allow(ip));
         assert!(limiter.allow(ip));
         assert!(!limiter.allow(ip));
+    }
+
+    /// 003: a smaller table (a folder ledger's) overflows sooner — past its
+    /// cap every new client shares the one overflow budget (M-21) — and
+    /// tracked clients keep their own.
+    ///
+    /// Bug-catch: ignore the smaller cap and a node of 100 ledgers holds 100
+    /// full tables under a flood of addresses.
+    #[test]
+    fn a_smaller_table_overflows_sooner() {
+        let limiter = RateLimiter::new(1, Duration::from_secs(60)).with_max_buckets(2);
+        let client = |last: u8| IpAddr::V4(Ipv4Addr::new(10, 0, 0, last));
+        assert!(
+            limiter.allow(client(1)) && limiter.allow(client(2)),
+            "two tracked"
+        );
+        assert!(
+            limiter.allow(client(3)),
+            "the third takes the overflow budget"
+        );
+        assert!(!limiter.allow(client(4)), "the fourth shares it, spent");
+        assert_eq!(limiter.bucket_count(), 2);
     }
 
     #[test]

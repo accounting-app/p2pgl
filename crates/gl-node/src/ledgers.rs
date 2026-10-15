@@ -34,12 +34,22 @@ use crate::config::{is_valid_ledger_name, DEFAULT_LEDGER};
 use crate::graphql::{graphiql_handler, graphql_handler, AppSchema};
 use crate::health::{health_handler, HealthState};
 use crate::ledger_runtime::RunningLedger;
+use crate::rate_limit::{peer_of, too_many_requests, RateLimiter, LEDGER_MAX_BUCKETS};
+
+/// A ledger's request slots (003, step 3): GraphQL requests it serves at once.
+type Slots = Arc<tokio::sync::Semaphore>;
 
 /// One ledger as the node holds it.
 enum Served {
     Running {
         router: Router,
         auth: AuthState,
+        /// The same slots the router's `/graphql` takes from.
+        #[cfg_attr(not(test), allow(dead_code))]
+        slots: Slots,
+        /// This ledger's own GraphQL rate limit: a client's budget is per
+        /// ledger (003 step 3, the maintainer's choice).
+        limiter: RateLimiter,
         /// Taken by [`Ledgers::stop_all`]; `None` for a ledger built from
         /// parts (tests).
         running: Mutex<Option<Box<RunningLedger>>>,
@@ -54,14 +64,26 @@ pub(crate) struct Ledgers {
     by_name: Arc<RwLock<BTreeMap<String, Arc<Served>>>>,
     /// The operator key's check: the node's own key, admin of every ledger.
     operator: AuthState,
+    /// `http.maxRequestsPerLedger`.
+    max_requests: usize,
+    /// The GraphQL limiter every ledger's own is a twin of.
+    template: RateLimiter,
+    /// The budget every caller no ledger accepts shares, per client — no key,
+    /// a wrong key, a name not served: making names up buys no budget, and a
+    /// stranger's 429 comes at the same count whatever name it tries.
+    strangers: RateLimiter,
 }
 
-/// A ledger's own router: `/graphql` behind its auth, and `/health`.
+/// A ledger's own router: `/graphql` behind its auth and its request slots
+/// (auth first, so only a caller the ledger accepts takes a slot — a stranger
+/// can neither fill a ledger's slots nor tell a busy ledger from no ledger),
+/// and `/health`.
 pub(crate) fn ledger_router(
     schema: AppSchema,
     auth: AuthState,
     health: HealthState,
     graphiql: bool,
+    slots: Slots,
 ) -> Router {
     let graphql = if graphiql {
         Router::new().route("/graphql", get(graphiql_handler).post(graphql_handler))
@@ -70,6 +92,7 @@ pub(crate) fn ledger_router(
     };
     graphql
         .with_state(schema)
+        .layer(middleware::from_fn_with_state(slots, take_a_slot))
         .layer(middleware::from_fn_with_state(auth, auth::auth_middleware))
         .merge(
             Router::new()
@@ -78,18 +101,66 @@ pub(crate) fn ledger_router(
         )
 }
 
+/// Serve the request in one of the ledger's slots, or answer 503
+/// `LEDGER_BUSY` when all are in use (003, step 3): a ledger flooded by its
+/// own callers slows only itself.
+async fn take_a_slot(
+    State(slots): State<Slots>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    let Ok(_slot) = slots.try_acquire_owned() else {
+        let mut response = refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "LEDGER_BUSY",
+            "this ledger is serving as many requests as it takes at once; try again shortly"
+                .to_owned(),
+        );
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("1"),
+        );
+        return response;
+    };
+    next.run(request).await
+}
+
 impl Ledgers {
     /// No ledgers yet; `operator_enabled` and `operator_key` are `auth.enabled`
-    /// and the node's key.
-    pub(crate) fn new(operator_enabled: bool, operator_key: String) -> Self {
+    /// and the node's key; `max_requests` is `http.maxRequestsPerLedger`.
+    pub(crate) fn new(
+        operator_enabled: bool,
+        operator_key: String,
+        max_requests: usize,
+        limiter: RateLimiter,
+    ) -> Self {
         Ledgers {
+            strangers: limiter.twin(),
+            template: limiter,
             by_name: Arc::default(),
             operator: AuthState {
                 enabled: operator_enabled,
                 api_key: operator_key,
                 access: None,
             },
+            max_requests,
         }
+    }
+
+    /// A ledger's own GraphQL limiter: the config file's ledger keeps the full
+    /// table it always had; a folder ledger's holds fewer clients
+    /// ([`LEDGER_MAX_BUCKETS`]), so a node of many is bounded as one was.
+    fn limiter_for(&self, name: &str) -> RateLimiter {
+        let limiter = self.template.twin();
+        if name == DEFAULT_LEDGER {
+            limiter
+        } else {
+            limiter.with_max_buckets(LEDGER_MAX_BUCKETS)
+        }
+    }
+
+    fn slots(&self) -> Slots {
+        Arc::new(tokio::sync::Semaphore::new(self.max_requests))
     }
 
     /// Serve `running` as `name`. GraphiQL is the `default` ledger's only (its
@@ -105,15 +176,19 @@ impl Ledgers {
         if by_name.contains_key(name) {
             return Err(Box::new(running));
         }
+        let slots = self.slots();
         let router = ledger_router(
             running.schema.clone(),
             running.auth.clone(),
             running.health.clone(),
             graphiql && name == DEFAULT_LEDGER,
+            slots.clone(),
         );
         let served = Served::Running {
             router,
             auth: running.auth.clone(),
+            slots,
+            limiter: self.limiter_for(name),
             running: Mutex::new(Some(Box::new(running))),
         };
         by_name.insert(name.to_owned(), Arc::new(served));
@@ -131,9 +206,12 @@ impl Ledgers {
         health: HealthState,
         graphiql: bool,
     ) {
+        let slots = self.slots();
         let served = Served::Running {
-            router: ledger_router(schema, auth.clone(), health, graphiql),
+            router: ledger_router(schema, auth.clone(), health, graphiql, slots.clone()),
             auth,
+            slots,
+            limiter: self.limiter_for(name),
             running: Mutex::new(None),
         };
         self.by_name
@@ -164,7 +242,9 @@ impl Ledgers {
             .count()
     }
 
-    /// Stop every running ledger (the shutdown half of each, in name order).
+    /// Stop every running ledger — the shutdown half of each, all at once
+    /// (003, step 3): a node with many ledgers compacts them in parallel, so
+    /// it fits in the time a container stop allows.
     pub(crate) async fn stop_all(&self) {
         let all: Vec<(String, Arc<Served>)> = self
             .by_name
@@ -173,14 +253,21 @@ impl Ledgers {
             .iter()
             .map(|(name, served)| (name.clone(), served.clone()))
             .collect();
+        let mut stopping = tokio::task::JoinSet::new();
         for (name, served) in all {
             if let Served::Running { running, .. } = &*served {
                 if let Some(running) = running.lock().await.take() {
-                    running
-                        .stop()
-                        .instrument(tracing::info_span!("ledger", ledger = %name))
-                        .await;
+                    stopping.spawn(
+                        running
+                            .stop()
+                            .instrument(tracing::info_span!("ledger", ledger = %name)),
+                    );
                 }
+            }
+        }
+        while let Some(stopped) = stopping.join_next().await {
+            if let Err(error) = stopped {
+                warn!(%error, "a ledger's shutdown did not finish");
             }
         }
     }
@@ -204,6 +291,28 @@ impl Ledgers {
                 .authenticate(request.headers())
                 .await
                 .is_some();
+        // GraphQL's rate limit, per client and ledger — for callers the ledger
+        // accepts (its people, the operator), whose requests are charged to
+        // the ledger's own table. Everyone else — no key, a wrong key, a name
+        // not served — shares one strangers' table per client, so a stranger
+        // sees the same budget whatever name it tries: choosing the table by
+        // the name alone told a spent budget (429) from a fresh one (401) and
+        // so which names are served (review). Every request is charged once,
+        // before anything but the key checks runs.
+        if !health {
+            let accepted = match served.as_deref() {
+                Some(Served::Running { auth, limiter, .. }) => (operator
+                    || auth.authenticate(request.headers()).await.is_some())
+                .then_some(limiter),
+                _ => None,
+            };
+            let limiter = accepted.unwrap_or(&self.strangers);
+            let allowed = tracing::info_span!("ledger", ledger = %name)
+                .in_scope(|| limiter.allow_request(peer_of(&request), request.headers()));
+            if !allowed {
+                return too_many_requests();
+            }
+        }
         let (router, auth) = match served.as_deref() {
             Some(Served::Running { router, auth, .. }) => (router.clone(), auth),
             Some(Served::Failed(reason)) if operator => {
@@ -321,9 +430,15 @@ mod tests {
 
     /// A node serving `default` and `acme`, with `broken` refused at boot —
     /// each ledger with its own books and its own access list.
-    fn node() -> (tempfile::TempDir, Router, SharedLedger, SharedLedger) {
+    fn node() -> (
+        tempfile::TempDir,
+        Router,
+        SharedLedger,
+        SharedLedger,
+        Ledgers,
+    ) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let ledgers = Ledgers::new(true, OPERATOR.to_owned());
+        let ledgers = Ledgers::new(true, OPERATOR.to_owned(), 64, RateLimiter::graphql());
         let mut shared = Vec::new();
         for name in ["default", "acme"] {
             let service = ledger::service::LedgerService::boot(
@@ -364,7 +479,7 @@ mod tests {
             )),
         );
         let app = crate::build_application_with_limiter(
-            ledgers,
+            ledgers.clone(),
             RequestGuardState {
                 allowed_hosts: Arc::new(["127.0.0.1".to_owned()].into()),
                 allowed_origins: Arc::new(HashSet::new()),
@@ -376,7 +491,7 @@ mod tests {
         );
         let acme = shared.pop().expect("acme");
         let default = shared.pop().expect("default");
-        (dir, app, default, acme)
+        (dir, app, default, acme, ledgers)
     }
 
     async fn send(
@@ -435,7 +550,7 @@ mod tests {
     /// entries land in another's books, and its keys open the other's.
     #[tokio::test]
     async fn each_ledger_answers_with_its_own_books_and_keys() {
-        let (_dir, app, default, acme) = node();
+        let (_dir, app, default, acme, _) = node();
         let open = |account: &str| {
             format!(r#"mutation {{ openAccount(name: "{account}", date: "2026-01-01") }}"#)
         };
@@ -489,6 +604,135 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
+    /// 003 step 3: a ledger serves at most `http.maxRequestsPerLedger`
+    /// GraphQL requests at once — past it, 503 `LEDGER_BUSY` with
+    /// `Retry-After` — while the node's other ledgers answer as usual; and the
+    /// slots are counted after the key check, so a stranger still gets 401
+    /// from a busy ledger, never a 503 that would say it exists.
+    ///
+    /// Bug-catch: share one set of slots across ledgers and one company's
+    /// flood stops every company on the node.
+    #[tokio::test]
+    async fn a_busy_ledger_slows_only_itself() {
+        let (_dir, app, _, _, ledgers) = node();
+        let slots = match &*ledgers.get("acme").await.expect("acme") {
+            super::Served::Running { slots, .. } => slots.clone(),
+            super::Served::Failed(_) => panic!("acme is served"),
+        };
+        let held = slots
+            .clone()
+            .try_acquire_many_owned(64)
+            .expect("every slot");
+        let read = "{ verify { ok } }";
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/ledgers/acme/graphql")
+                    .header("host", "127.0.0.1")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", OPERATOR)
+                    .body(Body::from(json!({ "query": read }).to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "1");
+        let (status, _) = post(&app, "/graphql", Some(OPERATOR), read).await;
+        assert_eq!(status, StatusCode::OK, "the other ledger is untouched");
+        let (status, _) = post(&app, "/ledgers/acme/graphql", None, read).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a stranger still gets 401"
+        );
+        drop(held);
+        let (status, _) = post(&app, "/ledgers/acme/graphql", Some(OPERATOR), read).await;
+        assert_eq!(status, StatusCode::OK, "served again once a slot is free");
+    }
+
+    /// 003 step 3, the maintainer's choice: a client's GraphQL budget is per
+    /// ledger it is accepted by — spending it on one company leaves it whole on
+    /// another — while every caller no ledger accepts (no key, a wrong key, a
+    /// name not served) shares one strangers' budget, so making names up buys
+    /// nothing and a stranger's 429 is the same for a served name as for an
+    /// unknown one.
+    ///
+    /// Bug-catch: one table for every ledger and an accountant's app working
+    /// across forty companies shares one minute's budget among them all; choose
+    /// the table by the name and a stranger can tell served names by which
+    /// ones still answer 401 once the strangers' budget is spent.
+    #[tokio::test]
+    async fn the_rate_limit_is_per_client_and_ledger() {
+        let (_dir, app, _, _, _) = node();
+        let read = "{ verify { ok } }";
+        let limit = crate::rate_limit::GRAPHQL_RATE_LIMIT;
+        for _ in 0..limit {
+            let (status, _) = post(&app, "/graphql", Some(OPERATOR), read).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let (status, body) = post(&app, "/graphql", Some(OPERATOR), read).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        let (status, _) = post(&app, "/ledgers/acme/graphql", Some(OPERATOR), read).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the same client's budget on another ledger"
+        );
+
+        for index in 0..limit {
+            let (status, _) = post(
+                &app,
+                &format!("/ledgers/made-up-{index}/graphql"),
+                None,
+                read,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        let (status, _) = post(&app, "/ledgers/another-made-up/graphql", None, read).await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "made-up names share one budget"
+        );
+        // Review: and a served name, asked without a key, is charged to the
+        // same strangers' budget — 429 like the made-up ones, not a fresh
+        // budget's 401 that would say the name is served.
+        for path in ["/ledgers/acme/graphql", "/graphql"] {
+            let (status, _) = post(&app, path, None, read).await;
+            assert_eq!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "{path} without a key"
+            );
+        }
+        let (status, _) = post(&app, "/ledgers/acme/graphql", Some(OPERATOR), read).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the ledger's own callers keep theirs"
+        );
+    }
+
+    /// 003: a folder ledger's limiter tracks fewer clients than the config
+    /// file's ledger's, which keeps the full table it always had.
+    ///
+    /// Bug-catch: give every ledger a full table and a flood of addresses
+    /// across 100 ledgers holds 100 of them.
+    #[tokio::test]
+    async fn a_folder_ledgers_limiter_is_smaller() {
+        let (_dir, _app, _, _, ledgers) = node();
+        let max_buckets = |served: &super::Served| match served {
+            super::Served::Running { limiter, .. } => limiter.max_buckets(),
+            super::Served::Failed(_) => 0,
+        };
+        let acme = ledgers.get("acme").await.expect("acme");
+        let default = ledgers.get("default").await.expect("default");
+        assert_eq!(max_buckets(&acme), crate::rate_limit::LEDGER_MAX_BUCKETS);
+        assert!(max_buckets(&default) > crate::rate_limit::LEDGER_MAX_BUCKETS);
+    }
+
     /// Review I-1: a refusal recorded under a name already served — a folder
     /// named `default` beside the config file's ledger — never replaces the
     /// served ledger, and a second ledger of a served name is handed back.
@@ -497,7 +741,7 @@ mod tests {
     /// is orphaned — unreachable, its lock released, its tasks still writing.
     #[tokio::test]
     async fn a_refusal_never_replaces_a_served_ledger() {
-        let ledgers = Ledgers::new(true, OPERATOR.to_owned());
+        let ledgers = Ledgers::new(true, OPERATOR.to_owned(), 64, RateLimiter::graphql());
         let dir = tempfile::tempdir().expect("tempdir");
         let service =
             ledger::service::LedgerService::boot(dir.path().join("x.bean"), "x".to_owned())
@@ -543,7 +787,7 @@ mod tests {
     /// companies a node serves, name by name.
     #[tokio::test]
     async fn a_ledger_not_served_is_told_only_to_the_operator() {
-        let (_dir, app, _, _) = node();
+        let (_dir, app, _, _, _) = node();
         let (_, body) = post(&app, "/ledgers/acme/graphql", Some(OPERATOR), &grant("Ana")).await;
         let acme_key = body["data"]["grantAccess"]["key"]
             .as_str()

@@ -700,7 +700,8 @@ fn people_are_managed_with_gl_node_user() {
 /// a restart acme's key still works.
 ///
 /// A folder named `default` in `ledgersDir` is ignored: the config file's
-/// ledger stays served (review I-1).
+/// ledger stays served (review I-1); and a folder holding a copy of the config
+/// file's node key is refused while the config file's ledger keeps it.
 ///
 /// Bug-catch: stop the node when one ledger folder does not load and every
 /// company on it goes down with the one; let `--node-id` ignore `--ledger`
@@ -731,6 +732,36 @@ fn several_ledgers_are_served_side_by_side() {
     std::fs::create_dir_all(&broken).expect("broken folder");
     std::fs::write(broken.join("ledger.json"), "{").expect("broken ledger.json");
     std::fs::create_dir_all(dir.join("data/ledgers/default")).expect("a stray default folder");
+    // A folder holding a copy of the config file's own node key (review):
+    // the config file's ledger keeps its key, the copy is refused.
+    let copied = dir.join("data/ledgers/copied");
+    std::fs::create_dir_all(&copied).expect("copied folder");
+    let own_id = node
+        .command(&node.binary)
+        .arg("--node-id")
+        .output()
+        .expect("create the node's key");
+    assert!(
+        own_id.status.success(),
+        "{}",
+        String::from_utf8_lossy(&own_id.stderr)
+    );
+    std::fs::copy(dir.join("data/iroh.secret"), copied.join("iroh.secret")).expect("copy the key");
+    std::fs::write(
+        copied.join("ledger.json"),
+        json!({
+            "signing": { "enabled": true },
+            "p2p": {
+                "enabled": true,
+                "relayMode": "disabled",
+                "bootstrapEndpointIds": [],
+                "swarmTopic": format!("shipped-binary/copied-{}", random_hex(8)),
+                "meshId": format!("copied-{}", random_hex(16)),
+            },
+        })
+        .to_string(),
+    )
+    .expect("copied ledger.json");
     node.start("ledgers")
         .unwrap_or_else(|log| panic!("boot: {log}"));
 
@@ -824,6 +855,12 @@ fn several_ledgers_are_served_side_by_side() {
     assert_eq!(status, 503, "{body}");
     let (status, _) = at("/ledgers/broken/graphql", None, "{ verify { ok } }");
     assert_eq!(status, 401);
+    let (status, body) = at(
+        "/ledgers/copied/graphql",
+        Some(&operator),
+        "{ verify { ok } }",
+    );
+    assert_eq!(status, 503, "the copy of the node's key is refused: {body}");
 
     assert_eq!(node.stop().code(), Some(0));
     node.start("ledgers-restarted")

@@ -183,8 +183,8 @@
   },
   "L-R14-one-broken-folder-stops-the-node": {
     "file": "crates/gl-node/src/main.rs",
-    "old": "            error!(ledger = %name, %reason, \"ledger not served\");",
-    "new": "            error!(ledger = %name, %reason, \"ledger not served\");\n            std::process::exit(1);",
+    "old": "            (Some(reason), _) => {\n                error!(ledger = %name, %reason, \"ledger not served\");",
+    "new": "            (Some(reason), _) => {\n                error!(ledger = %name, %reason, \"ledger not served\");\n                std::process::exit(1);",
     "runs": [
       [
         "-p",
@@ -262,8 +262,8 @@
   },
   "L-R19-two-ledgers-one-node-key": {
     "file": "crates/gl-node/src/ledger_runtime.rs",
-    "old": "        if let Some(other) = ids.get(&id) {",
-    "new": "        if let Some(other) = ids.get(\"never a node id\") {",
+    "old": "        if let Some(other) = ids.get(&id).filter(|other| *other != name) {",
+    "new": "        if let Some(other) = ids.get(\"never a node id\").filter(|other| *other != name) {",
     "runs": [
       [
         "-p",
@@ -285,6 +285,167 @@
         "--bin",
         "gl-node",
         "ledger_folders_lists_ledgers_and_refuses_what_is_not_one"
+      ]
+    ]
+  },
+  "L-R21-no-request-cap": {
+    "file": "crates/gl-node/src/ledgers.rs",
+    "old": "    let Ok(_slot) = slots.try_acquire_owned() else {",
+    "new": "    let Ok(_slot) = Ok::<(), ()>(()) else {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_busy_ledger_slows_only_itself"
+      ]
+    ]
+  },
+  "L-R22-slots-taken-before-the-key-check": {
+    "file": "crates/gl-node/src/ledgers.rs",
+    "old": "        .layer(middleware::from_fn_with_state(slots, take_a_slot))\n        .layer(middleware::from_fn_with_state(auth, auth::auth_middleware))",
+    "new": "        .layer(middleware::from_fn_with_state(auth, auth::auth_middleware))\n        .layer(middleware::from_fn_with_state(slots, take_a_slot))",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_busy_ledger_slows_only_itself"
+      ]
+    ]
+  },
+  "L-R23-request-cap-unchecked": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "        if !(1..=MAX_MAX_CONNECTIONS).contains(&self.http.max_requests_per_ledger) {",
+    "new": "        if !(0..=MAX_MAX_CONNECTIONS).contains(&self.http.max_requests_per_ledger) {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "ledgers_dir_and_max_ledgers_are_checked"
+      ]
+    ]
+  },
+  "L-R24-node-keys-not-settled": {
+    "file": "crates/gl-node/src/ledger_runtime.rs",
+    "old": "        match ids.get(&id) {",
+    "new": "        match None::<&String> {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "shared_node_keys_are_settled_in_order"
+      ]
+    ]
+  },
+  "L-R25-config-file-ledger-settled-last": {
+    "file": "crates/gl-node/src/main.rs",
+    "old": "        ledger_runtime::settle_node_keys(&queue, &node.node_ids)",
+    "new": "        ledger_runtime::settle_node_keys(&queue.iter().rev().cloned().collect::<Vec<_>>(), &node.node_ids)",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "several_ledgers_are_served_side_by_side"
+      ]
+    ]
+  },
+  "L-R26-one-set-of-slots-for-every-ledger": {
+    "file": "crates/gl-node/src/ledgers.rs",
+    "old": "        Arc::new(tokio::sync::Semaphore::new(self.max_requests))",
+    "new": "        {\n            static SHARED: std::sync::OnceLock<Slots> = std::sync::OnceLock::new();\n            SHARED\n                .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(self.max_requests)))\n                .clone()\n        }",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_busy_ledger_slows_only_itself"
+      ]
+    ]
+  },
+  "L-R27-one-rate-limit-table-for-every-ledger": {
+    "file": "crates/gl-node/src/ledgers.rs",
+    "old": "        let limiter = self.template.twin();",
+    "new": "        let limiter = self.strangers.clone();",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_rate_limit_is_per_client_and_ledger"
+      ]
+    ]
+  },
+  "L-R28-made-up-names-unlimited": {
+    "file": "crates/gl-node/src/ledgers.rs",
+    "old": "        if !health {",
+    "new": "        if !health && served.is_some() {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_rate_limit_is_per_client_and_ledger"
+      ]
+    ]
+  },
+  "L-R29-folder-ledgers-get-full-tables": {
+    "file": "crates/gl-node/src/ledgers.rs",
+    "old": "            limiter.with_max_buckets(LEDGER_MAX_BUCKETS)",
+    "new": "            limiter",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_folder_ledgers_limiter_is_smaller"
+      ]
+    ]
+  },
+  "L-R30-table-cap-ignored": {
+    "file": "crates/gl-node/src/rate_limit.rs",
+    "old": "        self.max_buckets = max_buckets.min(MAX_BUCKETS);",
+    "new": "        let _ = max_buckets;",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_smaller_table_overflows_sooner"
+      ],
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_folder_ledgers_limiter_is_smaller"
+      ]
+    ]
+  },
+  "L-R31-rate-limit-table-chosen-by-name": {
+    "file": "crates/gl-node/src/ledgers.rs",
+    "old": "                Some(Served::Running { auth, limiter, .. }) => (operator\n                    || auth.authenticate(request.headers()).await.is_some())\n                .then_some(limiter),",
+    "new": "                Some(Served::Running { auth, limiter, .. }) => {\n                    let _ = auth;\n                    Some(limiter)\n                }",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_rate_limit_is_per_client_and_ledger"
       ]
     ]
   }

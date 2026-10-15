@@ -220,6 +220,52 @@ expiry dates and key hashes, never a key. Every transaction, `open` and
 shows who entered each entry by name. Writes made with the operator key carry
 none, and an entry typed into the `.bean` may not carry one (it is refused).
 
+## Sizing a node with several ledgers
+
+A node can serve up to 100 ledgers (README, *Several ledgers*). What limits it
+is memory: every ledger's history lives in memory while the node runs.
+
+| Per ledger | Memory |
+|---|---|
+| Empty | about 1 MiB |
+| 10,000 entries | about 45 MiB |
+| 100,000 entries | about 450 MiB (estimated from the above) |
+
+Booting adds memory that stays with the process: ledgers start in parallel, up
+to one per core, and each start uses about as much again as its ledger. On a
+2-core server that is about two ledgers' worth; on 10 cores, ten. A 2-core,
+2 GiB server holds about 35 ledgers of 10,000 entries. These are measurements
+of one build on one machine
+(`docs/build-log/003-multi-ledger-node/notes/measurements.md`); check yours
+with `scripts/measure_ledgers.py`.
+
+- **Open files:** allow at least 4,096 (`ulimit -n`; systemd `LimitNOFILE`).
+  A ledger with P2P uses about 5, and every HTTP connection one more.
+- **Boot:** the config file's ledger starts first, then the others in
+  parallel; 30 ledgers of 10,000 entries each served all of them 5 s after
+  start on 10 cores. Give a container's health check a start period of at
+  least 30 s, more for a large node on few cores.
+- **Stop:** every ledger compacts its journal on the way out, all at once —
+  about a second for 30 busy ledgers on 10 cores. A large node on few cores
+  can need longer than `docker stop`'s 10 s: set `stop_grace_period: 60s`.
+  If the stop is cut short, nothing is lost: the journal is intact and the
+  next boot folds it in.
+- **A busy ledger** answers `503 LEDGER_BUSY` (with `Retry-After: 1`) past
+  `http.maxRequestsPerLedger` requests at once (default 64); the node's other
+  ledgers are not slowed. A slot is taken only after the key check, so only
+  that ledger's own callers can fill its slots — a person with a read key
+  among them, until the request timeout. Clients should retry; each retry
+  still counts against the rate limit below.
+- **The rate limit is per client and ledger** (60 GraphQL requests a minute
+  for each ledger a client uses): an accountant's app working across forty
+  companies has forty budgets. Requests naming a ledger the node does not
+  serve, and any request without a key that ledger accepts, share one
+  strangers' budget per client, so trying made-up names gains nothing.
+  `/health` keeps one node-wide budget per client (120 a minute). A flood from
+  more than 8,192 addresses at one ledger in a minute leaves that ledger's new
+  clients sharing one budget until it ends (the log says which ledger); its
+  known clients are not affected.
+
 ## What to watch
 
 `GET /health` answers liveness (the Docker image's `HEALTHCHECK` runs

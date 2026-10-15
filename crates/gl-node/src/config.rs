@@ -269,6 +269,13 @@ pub struct HttpConfig {
     /// Values above `maxConnections` behave as `maxConnections`.
     #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: usize,
+
+    /// GraphQL requests one ledger serves at once (003): past it the ledger
+    /// answers 503 `LEDGER_BUSY`, and the node's other ledgers are untouched.
+    /// Counted after the key check, so only callers the ledger accepts use a
+    /// slot.
+    #[serde(default = "default_max_requests_per_ledger")]
+    pub max_requests_per_ledger: usize,
 }
 
 impl Default for HttpConfig {
@@ -278,6 +285,7 @@ impl Default for HttpConfig {
             request_timeout_seconds: default_request_timeout_seconds(),
             max_connections: default_max_connections(),
             max_connections_per_ip: default_max_connections_per_ip(),
+            max_requests_per_ledger: default_max_requests_per_ledger(),
         }
     }
 }
@@ -1524,6 +1532,10 @@ fn default_max_connections() -> usize {
     HttpServerSettings::default().max_connections
 }
 
+pub(crate) fn default_max_requests_per_ledger() -> usize {
+    64
+}
+
 fn default_max_connections_per_ip() -> usize {
     HttpServerSettings::default().max_connections_per_ip
 }
@@ -1931,6 +1943,14 @@ impl NodeConfig {
                  {MAX_MAX_CONNECTIONS}, got {}; below the floor a browser's normal parallel \
                  connections are refused",
                 self.http.max_connections_per_ip
+            )));
+        }
+
+        // 003: one ledger's share of the node's request slots.
+        if !(1..=MAX_MAX_CONNECTIONS).contains(&self.http.max_requests_per_ledger) {
+            return Err(ConfigError::Validation(format!(
+                "http.maxRequestsPerLedger must be between 1 and {MAX_MAX_CONNECTIONS}, got {}",
+                self.http.max_requests_per_ledger
             )));
         }
 
@@ -2931,7 +2951,8 @@ mod tests {
 
     /// 003: `ledgersDir` is held to the `ledgerPath` rule (no `..`, under the
     /// working directory), the config file's ledger may not sit inside it,
-    /// and `maxLedgers` is 1 to [`MAX_LEDGERS`].
+    /// `maxLedgers` is 1 to [`MAX_LEDGERS`], and `http.maxRequestsPerLedger`
+    /// (default 64) is at least 1.
     ///
     /// Bug-catch: let `ledgerPath` sit in `ledgersDir` and a folder named for
     /// its directory is the same ledger twice.
@@ -2948,6 +2969,14 @@ mod tests {
             ),
             (r#""maxLedgers": 0"#, "maxLedgers must be between"),
             (r#""maxLedgers": 101"#, "maxLedgers must be between"),
+            (
+                r#""http": { "maxRequestsPerLedger": 0 }"#,
+                "http.maxRequestsPerLedger must be between",
+            ),
+            (
+                r#""http": { "maxRequestsPerLedger": 65537 }"#,
+                "http.maxRequestsPerLedger must be between",
+            ),
         ] {
             let file = write_temp_config(&format!(
                 r#"{{ "ledgerPath": "./data/ledger.bean", {fields} }}"#
@@ -2963,6 +2992,7 @@ mod tests {
             (config.ledgers_dir.as_str(), config.max_ledgers),
             ("./data/ledgers", 100)
         );
+        assert_eq!(config.http.max_requests_per_ledger, 64);
     }
 
     /// `auth.adminNodes` (002-users-and-roles): EndpointIds, loaded in the
