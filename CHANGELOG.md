@@ -9,6 +9,12 @@ break compatibility.
 
 ### Changed
 
+- **`ledgerPath` inside `ledgersDir` is refused at boot** (003): that folder
+  holds the node's other ledgers, and the default `ledgersDir` is
+  `./data/ledgers` — a `ledgerPath` such as `./data/ledgers/x.bean` must move.
+- **`gl-node --node-id` refuses arguments it does not know** (exit 2); it
+  takes `--ledger NAME`.
+
 - **`deploy/gl-node.production.json` uses `relayMode: "custom"`** and so
   refuses to boot until the mesh's own relay (`p2p.relayUrl`) or the peers'
   addresses (`p2p.peerAddresses`) are set; it no longer runs on n0's public
@@ -40,6 +46,17 @@ break compatibility.
 
 ### Added
 
+- **Several ledgers on one node** (`docs/build-log/003-multi-ledger-node`,
+  README *Several ledgers*): beside the config file's ledger (`default`, at
+  `/graphql` as before), every folder in **`ledgersDir`** (default
+  `./data/ledgers`) is a ledger of its own — its `ledger.json` (the ledger's
+  `signing`, `format`, `p2p`, `watchLedgerFile`, `auth.adminNodes`), its
+  `.bean`, its node key and mesh, its people — served at
+  `/ledgers/<name>/graphql`. Keys are per ledger; the operator key works on
+  all. A ledger that does not load is logged and skipped while the rest
+  serve. `gl-node user` and `gl-node --node-id` take `--ledger`.
+  **`maxLedgers`** (default 100). Nothing changes for a node with no ledger
+  folders.
 - **People's keys, from the ledger** (`docs/build-log/002-users-and-roles`):
   besides the operator key, the node accepts each person's key from the
   ledger's access records — `event "openledger-access"` grants and

@@ -35,7 +35,13 @@ pub(crate) struct NodeSettings {
     pub graphiql: bool,
     /// Whether the node binds a non-loopback address (L-09, `/health`).
     pub public_bind: bool,
+    /// The node ids of the ledgers started so far, by id, with their ledger's
+    /// name (003, decision 1): no two ledgers share a node key.
+    pub node_ids: NodeIds,
 }
+
+/// See [`NodeSettings::node_ids`].
+pub(crate) type NodeIds = Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>;
 
 /// A ledger that could not start. The reason was logged where it was found.
 #[derive(Debug)]
@@ -54,11 +60,36 @@ pub(crate) struct RunningLedger {
     _lock: crate::ledger_lock::LedgerLock,
 }
 
-/// Start the ledger `config` describes; see the module doc for the order.
+/// Start the ledger `name` that `config` describes; see the module doc for
+/// the order. Every line it logs, and every task it spawns, carries the
+/// ledger's name (a `ledger` span).
 pub(crate) async fn start(
+    name: &str,
     config: &LedgerConfig,
     node: &NodeSettings,
 ) -> Result<RunningLedger, StartFailed> {
+    use tracing::Instrument;
+    start_ledger(name, config, node)
+        .instrument(tracing::info_span!("ledger", ledger = %name))
+        .await
+}
+
+async fn start_ledger(
+    name: &str,
+    config: &LedgerConfig,
+    node: &NodeSettings,
+) -> Result<RunningLedger, StartFailed> {
+    // 003: everything that can refuse the ledger is judged before anything is
+    // spawned, so a refused ledger leaves no task running without its lock.
+    // `auth.adminNodes` was parsed here last; it is checked first now.
+    let admin_nodes = match config.admin_node_ids() {
+        Ok(nodes) => nodes.map(std::sync::Arc::new),
+        Err(error) => {
+            error!(%error, "auth.adminNodes; this ledger is not served");
+            return Err(StartFailed);
+        }
+    };
+
     // Ensure the ledger file's parent directory exists (§3.3). The `.bean` file
     // itself is deliberately NOT created here — see below.
     let ledger_path = PathBuf::from(&config.ledger_path);
@@ -89,7 +120,7 @@ pub(crate) async fn start(
             (resolved, guard)
         }
         Err(error) => {
-            error!(%error, "cannot use the configured ledger path — aborting");
+            error!(%error, "cannot use the configured ledger path; this ledger is not served");
             return Err(StartFailed);
         }
     };
@@ -118,7 +149,7 @@ pub(crate) async fn start(
     ) {
         Ok(service) => service,
         Err(error) => {
-            error!(%error, "failed to boot ledger service — aborting");
+            error!(%error, "failed to boot ledger service; this ledger is not served");
             return Err(StartFailed);
         }
     };
@@ -207,7 +238,7 @@ pub(crate) async fn start(
         match crate::p2p_service::load_or_create_secret_key(&secret_key_path) {
             Ok(key) => Some(key),
             Err(error) => {
-                error!(%error, path = %secret_key_path.display(), "failed to load or create the node secret key — aborting");
+                error!(%error, path = %secret_key_path.display(), "failed to load or create the node secret key; this ledger is not served");
                 return Err(StartFailed);
             }
         }
@@ -215,13 +246,30 @@ pub(crate) async fn start(
         match crate::p2p_service::load_secret_key(&secret_key_path) {
             Ok(key) => Some(key),
             Err(error) => {
-                error!(%error, path = %secret_key_path.display(), "signing enabled but secret key could not be loaded — aborting");
+                error!(%error, path = %secret_key_path.display(), "signing enabled but secret key could not be loaded; this ledger is not served");
                 return Err(StartFailed);
             }
         }
     } else {
         None
     };
+
+    // 003, decision 1 (review M-2): a ledger's node key is its own. The same
+    // key in two ledgers — a copied folder, or the config file pointed at a
+    // folder's key — would be one node id in two meshes, tying them together;
+    // refused here, before anything joins a mesh.
+    if let Some(secret_key) = node_secret_key.as_ref() {
+        let id = secret_key.author_id();
+        let mut ids = node.node_ids.lock().expect("node ids lock");
+        if let Some(other) = ids.get(&id) {
+            error!(
+                other_ledger = %other,
+                "this ledger's node key is also ledger \"{other}\"'s: one node id in two meshes would tie them together; give each ledger its own key; this ledger is not served"
+            );
+            return Err(StartFailed);
+        }
+        ids.insert(id, name.to_owned());
+    }
 
     // T80 / M-53: the author id is the key. Set here — as soon as the key is
     // loaded, before the signer, the verifier and `finalize_operator_input` —
@@ -264,7 +312,7 @@ pub(crate) async fn start(
     // its own identity.
     let p2p_identity = if config.p2p.enabled {
         let Some(secret_key) = node_secret_key.as_ref() else {
-            error!("p2p.enabled is true but no secret key was loaded — aborting");
+            error!("p2p.enabled is true but no secret key was loaded; this ledger is not served");
             return Err(StartFailed);
         };
         match crate::p2p_service::boot_p2p(&config.p2p, secret_key, config.format.wire_codec())
@@ -283,8 +331,11 @@ pub(crate) async fn start(
                         ledger_author = %ledger_author,
                         endpoint_id = %iroh_author_id,
                         "the ledger author id derived from the node key differs from the P2P \
-                         endpoint id — aborting (T80)"
+                         endpoint id — this ledger is not served (T80)"
                     );
+                    // 003: the endpoint is closed, not dropped, so the ledger
+                    // leaves nothing listening behind it.
+                    peer_node.endpoint().close().await;
                     return Err(StartFailed);
                 }
 
@@ -344,7 +395,7 @@ pub(crate) async fn start(
                 Some((peer_node, handler))
             }
             Err(error) => {
-                error!(%error, "failed to boot P2P — aborting (p2p.enabled is true)");
+                error!(%error, "failed to boot P2P — this ledger is not served (p2p.enabled is true)");
                 return Err(StartFailed);
             }
         }
@@ -361,8 +412,11 @@ pub(crate) async fn start(
     // hand edits and those now get signed at adoption (L-11): an adoption that
     // ran before the signer was installed would persist an entry no peer will
     // ever accept, which is the exact failure L-11 closes.
-    let signer =
-        crate::build_signature_provider(config, node_secret_key.as_ref(), &signature_domain);
+    let Some(signer) =
+        crate::build_signature_provider(config, node_secret_key.as_ref(), &signature_domain)
+    else {
+        return Err(StartFailed);
+    };
 
     // L-11: hand the service a signing callback so reconcile can stamp entries
     // the operator added by hand, exactly as `appendTransaction` stamps its own.
@@ -527,7 +581,7 @@ pub(crate) async fn start(
     let file_watcher_handle = if config.watch_ledger_file {
         let watcher_ledger = shared_ledger.clone();
         let watcher_path = ledger_path.clone();
-        let handle = tokio::spawn(async move {
+        let handle = crate::spawn_in_span(async move {
             use ledger::file_watcher::{FileChangeKind, FilePoller, FileState};
             // M-42: a stateful poller that reads + hashes the file only when
             // its stat identity changed (or every `FULL_READ_EVERY` polls,
@@ -662,13 +716,6 @@ pub(crate) async fn start(
     // Auth state for middleware (§3.8).
     // 002-users-and-roles: people's keys come from the ledger's access
     // records, judged on each request; the operator key stays the node's own.
-    let admin_nodes = match config.admin_node_ids() {
-        Ok(nodes) => nodes.map(std::sync::Arc::new),
-        Err(error) => {
-            error!(%error, "auth.adminNodes — aborting");
-            return Err(StartFailed);
-        }
-    };
     let access = crate::auth::access_source_for(
         node.auth_enabled,
         config,
@@ -755,5 +802,104 @@ impl RunningLedger {
                 warn!(%error, "P2P router shutdown error");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings() -> NodeSettings {
+        NodeSettings {
+            auth_enabled: true,
+            operator_key: "operator-key-for-the-runtime-tests-0123456789".to_owned(),
+            graphiql: false,
+            public_bind: false,
+            node_ids: NodeIds::default(),
+        }
+    }
+
+    fn ledger_at(path: &std::path::Path) -> LedgerConfig {
+        let file = tempfile::NamedTempFile::new().expect("config file");
+        std::fs::write(file.path(), r#"{ "ledgerPath": "./data/ledger.bean" }"#).expect("write");
+        let mut config = crate::config::NodeConfig::load_from_path(&file.path().to_path_buf())
+            .expect("config")
+            .ledger_config();
+        config.ledger_path = path.to_string_lossy().into_owned();
+        config
+    }
+
+    /// 003: a ledger that cannot start leaves nothing behind — refused for its
+    /// `adminNodes`, it touched nothing on disk (the check runs before
+    /// anything else); refused later (signing on, no key), it released its
+    /// lock, so the same ledger starts at once with a good config — and stops.
+    ///
+    /// Bug-catch: check `adminNodes` after P2P and the watcher are spawned
+    /// and a refused ledger leaves them running with no lock held.
+    #[tokio::test]
+    async fn a_ledger_that_cannot_start_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("acme").join("ledger.bean");
+
+        let mut bad_admins = ledger_at(&path);
+        bad_admins.admin_nodes = Some(vec!["not-an-endpoint-id".to_owned()]);
+        assert!(start("acme", &bad_admins, &settings()).await.is_err());
+        assert!(!dir.path().join("acme").exists(), "nothing was touched");
+
+        let mut no_key = ledger_at(&path);
+        no_key.signing.enabled = true;
+        no_key.p2p.mesh_id = Some("acme-mesh".to_owned());
+        no_key.p2p.secret_key_path = dir
+            .path()
+            .join("missing.secret")
+            .to_string_lossy()
+            .into_owned();
+        assert!(start("acme", &no_key, &settings()).await.is_err());
+
+        let running = start("acme", &ledger_at(&path), &settings())
+            .await
+            .expect("the lock was released");
+        running.stop().await;
+    }
+
+    /// 003, decision 1 (review M-2): two ledgers with the same node key — a
+    /// copied folder — are refused: the second does not start, so one node
+    /// id never sits in two meshes.
+    ///
+    /// Bug-catch: skip the check and a copied folder's mesh learns the
+    /// identity the node has in the original's.
+    #[tokio::test]
+    async fn a_second_ledger_with_the_same_node_key_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let original = dir.path().join("acme.secret");
+        crate::p2p_service::load_or_create_secret_key(&original).expect("a key");
+        let copy = dir.path().join("beta.secret");
+        std::fs::copy(&original, &copy).expect("a copied key");
+        let signing = |path: &std::path::Path, key: &std::path::Path, mesh: &str| {
+            let mut config = ledger_at(path);
+            config.signing.enabled = true;
+            config.p2p.mesh_id = Some(mesh.to_owned());
+            config.p2p.secret_key_path = key.to_string_lossy().into_owned();
+            config
+        };
+        let node = settings();
+        let acme = start(
+            "acme",
+            &signing(&dir.path().join("acme.bean"), &original, "acme"),
+            &node,
+        )
+        .await
+        .expect("acme starts");
+        assert!(
+            start(
+                "beta",
+                &signing(&dir.path().join("beta.bean"), &copy, "beta"),
+                &node
+            )
+            .await
+            .is_err(),
+            "beta has acme's key"
+        );
+        acme.stop().await;
     }
 }

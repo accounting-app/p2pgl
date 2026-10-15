@@ -191,16 +191,21 @@ pub async fn auth_middleware(
             request.extensions_mut().insert(caller);
             next.run(request).await
         }
-        None => {
-            let error_body = json!({
-                "errors": [{
-                    "message": "Missing or invalid API key",
-                    "extensions": { "code": "UNAUTHORIZED" }
-                }]
-            });
-            (StatusCode::UNAUTHORIZED, Json(error_body)).into_response()
-        }
+        None => unauthorized(),
     }
+}
+
+/// The 401 a request without a key this ledger accepts gets (§2.8
+/// `UNAUTHORIZED`) — also what a request naming a ledger this node does not
+/// serve gets (003), so a name cannot be probed.
+pub(crate) fn unauthorized() -> Response {
+    let error_body = json!({
+        "errors": [{
+            "message": "Missing or invalid API key",
+            "extensions": { "code": "UNAUTHORIZED" }
+        }]
+    });
+    (StatusCode::UNAUTHORIZED, Json(error_body)).into_response()
 }
 
 /// Upper bound on the API key file's size (H-01): 64 hex characters plus room
