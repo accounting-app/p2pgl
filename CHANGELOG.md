@@ -55,8 +55,13 @@ break compatibility.
   `/ledgers/<name>/graphql`. Keys are per ledger; the operator key works on
   all. A ledger that does not load is logged and skipped while the rest
   serve. `gl-node user` and `gl-node --node-id` take `--ledger`.
-  **`maxLedgers`** (default 100). Nothing changes for a node with no ledger
-  folders.
+  **`maxLedgers`** (default 100). Ledgers boot and stop in parallel; a busy
+  ledger answers `503 LEDGER_BUSY` past **`http.maxRequestsPerLedger`**
+  requests at once (default 64) without slowing the others; and a client's
+  GraphQL rate limit (60 a minute) is per ledger, so one client working across
+  many companies is not throttled by the total. OPERATIONS *Sizing a node with
+  several ledgers* gives the memory budget. Nothing
+  changes for a node with no ledger folders.
 - **People's keys, from the ledger** (`docs/build-log/002-users-and-roles`):
   besides the operator key, the node accepts each person's key from the
   ledger's access records — `event "openledger-access"` grants and

@@ -120,4 +120,86 @@ to commit. The commit hash is filled in once the maintainer has committed.
 - **Departures from the plan:** `/health` stays the `default` ledger's, a
   named ledger's `/health` needs its key, GraphiQL is `default`'s only, and
   the node summary moves to step 4 (plan.md updated).
+- **Commit:** 958255c
+
+## 2026-10-15 — Step 3: fairness and scale
+
+- **What changed:** `http.maxRequestsPerLedger` (default 64): each ledger's
+  `/graphql` takes one of its own slots, after its key check, and answers
+  `503 LEDGER_BUSY` with `Retry-After` when they are all in use — a flooded
+  ledger slows only itself, and a stranger cannot fill a ledger's slots or
+  learn from a 503 that it exists. Ledgers boot in parallel, the config
+  file's first (it wins any conflict), then the folders up to one per core;
+  `boot_p2p`'s error became `Send + Sync` for that. `stop_all` stops every
+  ledger at once. `scripts/measure_ledgers.py` measures a node of N ledgers
+  (`--p2p`, `--entries`) and a two-node mesh of paired ledgers (`--mesh`);
+  the results are in `notes/measurements.md`. README (one config row),
+  OPERATIONS (*Sizing a node with several ledgers*), CHANGELOG.
+- **Measured** (release build, loopback; `notes/measurements.md`): 100 P2P
+  ledgers boot in 2.1 s (11.2 s one after another) in 107 MiB with 466 open
+  files; 30 ledgers of 10,000 entries boot in 4.5 s (17.2 s) in 1.75 GiB
+  (1.24 GiB one after another: parallel boot keeps about one ledger's worth
+  per core); every stop under 1.3 s; a two-node mesh of 100 paired ledgers
+  replicates every entry, none into the wrong ledger. Memory is the limit:
+  about 45 MiB per 10,000 entries.
+- **The rate limit, per client and ledger** (the maintainer's choice,
+  2026-10-15, of keep / raise / per client and ledger): the plan kept one
+  GraphQL budget per client across the node, so an accountant's app working
+  across 40 companies from one address shared 60 requests a minute among them.
+  Now each ledger has its own limiter — the hardened table, unchanged — for
+  the callers it accepts (its people, the operator), so a client's budget is
+  per ledger; every other caller — no key, a wrong key, a name not served —
+  shares one strangers' table per client, so made-up names buy nothing and a
+  stranger's 429 comes at the same count whatever name it tries. (The first
+  version chose the table by the name alone, which let a stranger spend the
+  shared table on made-up names and then see which names still answered 401
+  from a fresh one: an oracle for which companies are served. Caught in a
+  second review round; L-R31 pins it.) The check moved from a layer on the
+  GraphQL routes into `Ledgers::dispatch`, after the key checks and before
+  anything else. A folder ledger's table holds at most 8,192 clients (the
+  config file's keeps 65,536): full, about 0.8 MiB, so 100 folder ledgers
+  under a flood of addresses hold about 80 MiB of buckets rather than about
+  600 MiB, held until restart (a sweep frees entries, not capacity). Past the
+  cap the M-21 shared overflow applies, as before: 8,192 distinct clients in a
+  minute is still an attack, not one company's load, but it is a cheaper one
+  (an IPv6 /51 rather than a /48), and the company's newcomers then share one
+  budget until it ends. The full-table warning names the ledger. `/health`
+  keeps its one node-wide limiter.
+- **Tests:** a busy ledger slows only itself (503 with `Retry-After`, the
+  other ledger answers, a stranger still gets 401, served again once a slot
+  frees); `http.maxRequestsPerLedger` bounds; the rate limit per client and
+  ledger, and made-up names sharing one budget; a folder ledger's smaller
+  table, and a smaller table overflowing sooner.
+- **Review round** (reviewer subagent; nothing Important): parallel boot had
+  made two paths worse, both fixed. A panic in a folder's boot was caught by
+  the `JoinSet` and the ledger vanished — no record, no name in the log, and
+  any tasks it had spawned still writing after its lock dropped; it now stops
+  the node, as a panic in boot always did. And which of two folders sharing a
+  node key was served depended on which finished booting first; the node ids
+  are now settled before the parallel boots, in a fixed order (the config
+  file's ledger, then the folders by name: `settle_node_keys`), with the
+  ledger's own check as the backstop. Also: the synchronous ledger boot runs
+  on the blocking pool, so the P2P of ledgers already started keeps running
+  while the rest boot (this is what raised boot memory: the boots now truly
+  overlap); `measure_ledgers.py` kills its node on every failure, keeps the
+  work directory (and the log it names) when something fails, picks UDP ports
+  below the ephemeral range on both address families, and says that its P2P
+  modes send the gateway port-mapping probes a production node sends; the
+  sizing numbers are this build's and the boot memory per core is stated;
+  OPERATIONS adds the stop grace period, that a busy ledger's slots can be
+  held by its own read keys, and that a retry counts against the rate limit;
+  `maxRequestsPerLedger`'s upper bound is tested; the test helper uses the
+  default instead of `64`.
+- **Gate:** `scripts/gate.sh` — 1,595 passed, 0 failed, 0 ignored (6 min 40 s), on the final tree with the rate-limit change.
+- **Revert checks:** `ledgers.json` — L-R21 (no cap), L-R22 (slots taken
+  before the key check), L-R23 (the bound), L-R24 (node keys not settled),
+  L-R25 (the config file's ledger settled last), L-R26 (one set of slots for
+  every ledger), L-R27 (one rate-limit table for every ledger), L-R28 (made-up
+  names unlimited), L-R29 (folder ledgers get full tables), L-R30 (the table
+  cap ignored), L-R31 (the table chosen by the name) bite; L-R14 and L-R19 re-anchored. None for parallel boot and
+  stop themselves, the blocking-pool boot, or a panic stopping the node: the
+  first three change how long, not what (the measurements pin them), and no
+  test can make a boot panic without a fault-injection hook.
+- **Departures from the plan:** parallel boot is new (the plan had parallel
+  stop only): sequential boot measured 17 s for 30 busy ledgers.
 - **Commit:** (pending)
