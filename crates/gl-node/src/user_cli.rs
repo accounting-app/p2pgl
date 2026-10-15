@@ -23,7 +23,8 @@ pub const USAGE: &str = "Usage:
       (someone already on the list: new role, expiry and key; their old key stops working)
   gl-node user list
   gl-node user rename USER_ID --name NAME
-  gl-node user revoke USER_ID";
+  gl-node user revoke USER_ID
+Each takes --ledger NAME for a ledger other than the config file's own.";
 
 /// One `gl-node user` command, parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,9 +218,51 @@ fn render(command: &UserCommand, data: &Value) -> String {
 /// people fits many times over.
 const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Send `body` to the node's `/graphql` on `host:port` with `api_key`, and
-/// return the GraphQL response.
-fn exchange(host: &str, port: u16, api_key: Option<&str>, body: &Value) -> Result<Value, String> {
+/// `--ledger NAME` taken out of `args` (003), anywhere in them, with the rest:
+/// the ledger the command is for — `default`, the config file's own, unless
+/// named.
+pub fn take_ledger(args: &[String]) -> Result<(String, Vec<String>), String> {
+    let mut ledger = None;
+    let mut rest = Vec::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--ledger" {
+            let name = args.next().ok_or("--ledger needs a value")?;
+            if ledger.replace(name.clone()).is_some() {
+                return Err("--ledger given twice".to_owned());
+            }
+        } else {
+            rest.push(arg.clone());
+        }
+    }
+    let ledger = ledger.unwrap_or_else(|| crate::config::DEFAULT_LEDGER.to_owned());
+    if ledger != crate::config::DEFAULT_LEDGER && !crate::config::is_valid_ledger_name(&ledger) {
+        return Err(format!(
+            "{ledger:?} is not a ledger name: 1 to 40 of a-z, 0-9 and -, not starting with -"
+        ));
+    }
+    Ok((ledger, rest))
+}
+
+/// The GraphQL path of `ledger` on its node (003): `/graphql` for the config
+/// file's own, `/ledgers/<name>/graphql` for the others.
+pub fn graphql_path(ledger: &str) -> String {
+    if ledger == crate::config::DEFAULT_LEDGER {
+        "/graphql".to_owned()
+    } else {
+        format!("/ledgers/{ledger}/graphql")
+    }
+}
+
+/// Send `body` to the node's `path` on `host:port` with `api_key`, and return
+/// the GraphQL response.
+fn exchange(
+    host: &str,
+    port: u16,
+    path: &str,
+    api_key: Option<&str>,
+    body: &Value,
+) -> Result<Value, String> {
     let address = format!("{host}:{port}");
     let authority = if host.contains(':') {
         format!("[{host}]:{port}")
@@ -238,7 +281,7 @@ fn exchange(host: &str, port: u16, api_key: Option<&str>, body: &Value) -> Resul
         .map_err(|error| error.to_string())?;
     let payload = body.to_string();
     let mut request = format!(
-        "POST /graphql HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\n\
+        "POST {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\n\
          Content-Length: {}\r\nConnection: close\r\n",
         payload.len()
     );
@@ -336,13 +379,25 @@ fn graphql_errors(answer: &Value) -> Option<String> {
 }
 
 /// Run `command` against the node at `host:port`: what to print, or why not.
+#[cfg(test)]
 pub fn execute(
     host: &str,
     port: u16,
     api_key: Option<&str>,
     command: &UserCommand,
 ) -> Result<String, String> {
-    let answer = exchange(host, port, api_key, &request_body(command)?)?;
+    execute_on(host, port, "/graphql", api_key, command)
+}
+
+/// [`execute`] against the ledger at `path` ([`graphql_path`]).
+pub fn execute_on(
+    host: &str,
+    port: u16,
+    path: &str,
+    api_key: Option<&str>,
+    command: &UserCommand,
+) -> Result<String, String> {
+    let answer = exchange(host, port, path, api_key, &request_body(command)?)?;
     if let Some(errors) = graphql_errors(&answer) {
         return Err(errors);
     }
@@ -351,7 +406,14 @@ pub fn execute(
 
 /// `gl-node user …`: parse, find the node and its operator key, run, exit.
 pub fn run(args: &[String]) -> ! {
-    let command = match parse(args) {
+    let (ledger, args) = match take_ledger(args) {
+        Ok(taken) => taken,
+        Err(error) => {
+            eprintln!("user: {error}\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    let command = match parse(&args) {
         Ok(command) => command,
         Err(error) => {
             eprintln!("user: {error}\n{USAGE}");
@@ -386,9 +448,10 @@ pub fn run(args: &[String]) -> ! {
         "::" => "::1",
         other => other,
     };
-    match execute(
+    match execute_on(
         host,
         config.port,
+        &graphql_path(&ledger),
         api_key.as_ref().map(|key| key.as_str()),
         &command,
     ) {
@@ -560,6 +623,7 @@ mod tests {
             exchange(
                 "127.0.0.1",
                 port,
+                "/graphql",
                 Some(&person),
                 &json!({ "query": "{ verify { ok } }" }),
             )

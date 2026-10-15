@@ -211,7 +211,7 @@
   },
   "PD-R16-node-id-not-routed": {
     "file": "crates/gl-node/src/main.rs",
-    "old": "        Some(\"--node-id\") => CliAction::NodeId,",
+    "old": "        Some(\"--node-id\") => CliAction::NodeId(args.collect()),",
     "new": "        Some(\"--node-id\") => CliAction::Version,",
     "runs": [
       [

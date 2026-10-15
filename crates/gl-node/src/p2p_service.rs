@@ -18,7 +18,7 @@ use iroh::protocol::Router;
 use iroh::SecretKey;
 use iroh_gossip::net::GOSSIP_ALPN;
 use tokio_stream::StreamExt;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 use zeroize::Zeroizing;
 
 use crate::anti_entropy_alpn::{exchange_with_peer, fetch_want, AntiEntropyHandler};
@@ -350,7 +350,7 @@ pub fn spawn_gossip_loop(
     let (gossip_sender, mut gossip_receiver) =
         tokio::sync::mpsc::channel::<ledger::model::Directive>(256);
 
-    tokio::spawn(async move {
+    crate::spawn_in_span(async move {
         // Join the gossip topic with configured bootstrap peers (R2 / §3.9).
         let Some(topic) =
             subscribe_with_retry(|| gossip.subscribe(topic_id, bootstrap_peers.clone())).await
@@ -462,7 +462,7 @@ pub fn spawn_gossip_loop(
                                         // `relay` is the EndpointId we fetch
                                         // from; it is `Copy`, so the `move`
                                         // block copies it in.
-                                        tokio::spawn(async move {
+                                        crate::spawn_in_span(async move {
                                             fetch_want(&endpoint, relay, vec![fetch_id.clone()], &handler).await;
                                             // Success = we actually have it now;
                                             // otherwise the guard's Drop
@@ -557,7 +557,7 @@ where
     F: Fn(iroh::EndpointId) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(async move {
+    crate::spawn_in_span(async move {
         let mut interval = tokio::time::interval(tick);
         info!(
             interval_ms = tick.as_millis() as u64,
@@ -632,35 +632,38 @@ where
                 };
                 let run = exchange(peer_id);
                 let slots = Arc::clone(&exchange_slots);
-                set.spawn(async move {
-                    // Held for the whole exchange; its `Drop` is what releases
-                    // the peer, on every path including a panic.
-                    let _claim = claim;
-                    // R-5: a slot is acquired HERE, inside the task, so the
-                    // tick loop never waits on it — a saturated bound only
-                    // means this task parks, is carried by the drain below
-                    // like any straggler, and its peer is skipped by `claim`
-                    // until it has run.
-                    //
-                    // It WAITS rather than `try_acquire`s and gives up. The
-                    // allowlist iterates in a fixed order, and the semaphore
-                    // queue is FIFO: a peer refused this tick would re-race the
-                    // same peers in the same order next tick, so a set of
-                    // stalled peers that always re-acquire first could starve a
-                    // healthy one for as long as they keep stalling. Queued, the
-                    // healthy peer takes the FIRST slot that frees — at most
-                    // one exchange's session deadline away — ahead of any peer
-                    // that re-queues after it. The queue itself is bounded by
-                    // `claim`: one waiter per allowlisted peer.
-                    //
-                    // The permit is RAII like the claim: every exit — success,
-                    // error, panic, the task being aborted — returns it.
-                    let Ok(_slot) = slots.acquire_owned().await else {
-                        // Closed: never, the semaphore is never closed.
-                        return;
-                    };
-                    run.await;
-                });
+                set.spawn(
+                    async move {
+                        // Held for the whole exchange; its `Drop` is what releases
+                        // the peer, on every path including a panic.
+                        let _claim = claim;
+                        // R-5: a slot is acquired HERE, inside the task, so the
+                        // tick loop never waits on it — a saturated bound only
+                        // means this task parks, is carried by the drain below
+                        // like any straggler, and its peer is skipped by `claim`
+                        // until it has run.
+                        //
+                        // It WAITS rather than `try_acquire`s and gives up. The
+                        // allowlist iterates in a fixed order, and the semaphore
+                        // queue is FIFO: a peer refused this tick would re-race the
+                        // same peers in the same order next tick, so a set of
+                        // stalled peers that always re-acquire first could starve a
+                        // healthy one for as long as they keep stalling. Queued, the
+                        // healthy peer takes the FIRST slot that frees — at most
+                        // one exchange's session deadline away — ahead of any peer
+                        // that re-queues after it. The queue itself is bounded by
+                        // `claim`: one waiter per allowlisted peer.
+                        //
+                        // The permit is RAII like the claim: every exit — success,
+                        // error, panic, the task being aborted — returns it.
+                        let Ok(_slot) = slots.acquire_owned().await else {
+                            // Closed: never, the semaphore is never closed.
+                            return;
+                        };
+                        run.await;
+                    }
+                    .in_current_span(),
+                );
             }
             if skipped > 0 {
                 // `debug!`, not `warn!`: a legitimate large catch-up routinely
@@ -805,7 +808,7 @@ fn spawn_orphan_eviction_loop_with<F>(
 ) where
     F: Fn() -> Instant + Send + 'static,
 {
-    tokio::spawn(async move {
+    crate::spawn_in_span(async move {
         let mut interval = tokio::time::interval(interval_period);
         info!(
             interval_seconds = interval_period.as_secs(),

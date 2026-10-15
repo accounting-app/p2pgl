@@ -11,6 +11,7 @@ mod http_server;
 mod ledger_commit;
 mod ledger_lock;
 mod ledger_runtime;
+mod ledgers;
 mod p2p_service;
 mod peer_addresses;
 mod peer_connections;
@@ -20,10 +21,14 @@ mod request_guard;
 mod test_support;
 mod user_cli;
 
+#[cfg(test)]
 use auth::AuthState;
 use config::NodeConfig;
-use graphql::{graphiql_handler, graphql_handler, AppSchema};
-use health::{health_handler, probe_local_health, HealthState};
+#[cfg(test)]
+use graphql::AppSchema;
+use health::probe_local_health;
+#[cfg(test)]
+use health::HealthState;
 use rate_limit::RateLimiter;
 use request_guard::RequestGuardState;
 
@@ -151,13 +156,15 @@ enum CliAction {
     Serve,
     Version,
     HealthCheck,
-    NodeId,
+    /// `--node-id` and what follows it (`--ledger NAME`).
+    NodeId(Vec<String>),
     /// `gl-node user …` and its arguments (`user_cli`).
     User(Vec<String>),
     Usage(String),
 }
 
-const USAGE: &str = "Usage: gl-node [--health-check | --node-id | --version | user …]";
+const USAGE: &str =
+    "Usage: gl-node [--health-check | --node-id [--ledger NAME] | --version | user …]";
 
 fn parse_cli() -> CliAction {
     let mut args = std::env::args().skip(1);
@@ -165,7 +172,7 @@ fn parse_cli() -> CliAction {
         None => CliAction::Serve,
         Some("--version") | Some("-V") => CliAction::Version,
         Some("--health-check") => CliAction::HealthCheck,
-        Some("--node-id") => CliAction::NodeId,
+        Some("--node-id") => CliAction::NodeId(args.collect()),
         Some("user") => CliAction::User(args.collect()),
         Some("--help") | Some("-h") => CliAction::Usage(format!("{USAGE}\n{}", user_cli::USAGE)),
         Some(other) => CliAction::Usage(format!("unknown argument: {other}\n{USAGE}")),
@@ -243,7 +250,7 @@ fn run_health_check() -> ! {
 /// rule boot applies (below): created on first use when P2P is on (CAP-4),
 /// required to exist when only signing is on, none at all otherwise. So the
 /// id printed is the id the node will have, before it ever starts.
-fn run_node_id() -> ! {
+fn run_node_id(args: &[String]) -> ! {
     // Warnings to stderr — stdout carries only the id — so a key the loader
     // had to regenerate (an empty key file, L-32: a new identity peers must
     // be told) is said, not silent.
@@ -258,6 +265,30 @@ fn run_node_id() -> ! {
         Err(error) => {
             eprintln!("node-id: failed to load config: {error}");
             std::process::exit(1);
+        }
+    };
+    // 003: `--ledger NAME` for one of the node's other ledgers, whose key is
+    // in its folder; none for the config file's own.
+    let ledger = match user_cli::take_ledger(args) {
+        Ok((ledger, rest)) if rest.is_empty() => ledger,
+        Ok((_, rest)) => {
+            eprintln!("node-id: unknown argument {}\n{USAGE}", rest[0]);
+            std::process::exit(2);
+        }
+        Err(error) => {
+            eprintln!("node-id: {error}");
+            std::process::exit(2);
+        }
+    };
+    let config = if ledger == config::DEFAULT_LEDGER {
+        config.ledger_config()
+    } else {
+        match config::LedgerConfig::load_folder(&Path::new(&config.ledgers_dir).join(&ledger)) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("node-id: ledger {ledger:?}: {error}");
+                std::process::exit(1);
+            }
         }
     };
     let path = PathBuf::from(&config.p2p.secret_key_path);
@@ -294,8 +325,8 @@ async fn main() {
         CliAction::HealthCheck => {
             run_health_check();
         }
-        CliAction::NodeId => {
-            run_node_id();
+        CliAction::NodeId(args) => {
+            run_node_id(&args);
         }
         CliAction::User(args) => {
             user_cli::run(&args);
@@ -335,20 +366,26 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // 003-multi-ledger-node: the node's ledger is started by
+    // 003-multi-ledger-node: each ledger is started by
     // `ledger_runtime::start`, which runs the boot sequence that lived here —
     // key, author, signer, verifier, operator input, compaction, then P2P and
-    // the watcher (H-13, L-04, T80) — in the same order.
+    // the watcher (H-13, L-04, T80) — in the same order: the config file's own
+    // ledger (`default`), then every folder in `ledgersDir`.
     let node_settings = ledger_runtime::NodeSettings {
         auth_enabled: config.auth.enabled,
         operator_key: config.auth.api_key.clone(),
         graphiql: config.graphiql_enabled(),
         public_bind: config.binds_non_loopback(),
+        node_ids: ledger_runtime::NodeIds::default(),
     };
-    let Ok(running_ledger) = ledger_runtime::start(&config.ledger_config(), &node_settings).await
-    else {
+    let served_ledgers = ledgers::Ledgers::new(config.auth.enabled, config.auth.api_key.clone());
+    start_ledgers(&config, &node_settings, &served_ledgers).await;
+    // A node with nothing to serve stops, as a one-ledger node whose ledger
+    // could not start always has; one healthy ledger is enough to serve.
+    if served_ledgers.running_count().await == 0 {
+        error!("no ledger could be served — aborting");
         std::process::exit(1);
-    };
+    }
 
     // Host / Content-Type / Origin guard state (H-01).
     let guard_state = RequestGuardState {
@@ -395,9 +432,7 @@ async fn main() {
     let rate_limiter = RateLimiter::graphql().with_trusted_proxies(trusted_proxies.clone());
 
     let application = build_application_with_limiter(
-        running_ledger.schema.clone(),
-        running_ledger.auth.clone(),
-        running_ledger.health.clone(),
+        served_ledgers.clone(),
         guard_state,
         config.cors_layer(),
         config.graphiql_enabled(),
@@ -447,9 +482,83 @@ async fn main() {
         std::process::exit(1);
     }
 
-    running_ledger.stop().await;
+    served_ledgers.stop_all().await;
 
     info!("gl-node shut down gracefully");
+}
+
+/// Start the config file's ledger and every ledger folder in `ledgersDir`
+/// (003), each through [`ledger_runtime::start`]. A folder that does not load,
+/// a ledger in conflict with one started before it (`ledgers_in_conflict`),
+/// and a ledger that fails to start are each logged and recorded as refused;
+/// the rest are served.
+async fn start_ledgers(
+    config: &NodeConfig,
+    node: &ledger_runtime::NodeSettings,
+    served: &ledgers::Ledgers,
+) {
+    let mut found: Vec<(String, Result<config::LedgerConfig, String>)> = vec![(
+        config::DEFAULT_LEDGER.to_owned(),
+        Ok(config.ledger_config()),
+    )];
+    match config::ledger_folders(Path::new(&config.ledgers_dir)) {
+        Ok(folders) => {
+            for (name, folder) in folders {
+                // Review I-1: `default` is the config file's ledger, never a
+                // folder's — it is already first in `found`.
+                if name == config::DEFAULT_LEDGER {
+                    error!(dir = %config.ledgers_dir, "a folder or file named \"default\" in ledgersDir is ignored: \"default\" is the config file's own ledger");
+                    continue;
+                }
+                let loaded = folder.and_then(|path| {
+                    config::LedgerConfig::load_folder(&path).map_err(|error| error.to_string())
+                });
+                found.push((name, loaded));
+            }
+        }
+        Err(error) => {
+            error!(%error, dir = %config.ledgers_dir, "could not read ledgersDir; its ledgers are not served");
+        }
+    }
+    let candidates: Vec<(&str, &config::LedgerConfig)> = found
+        .iter()
+        .filter_map(|(name, loaded)| loaded.as_ref().ok().map(|config| (name.as_str(), config)))
+        .collect();
+    let conflicts: std::collections::HashMap<String, String> =
+        config::ledgers_in_conflict(&candidates, config.max_ledgers)
+            .into_iter()
+            .collect();
+    for (name, loaded) in &found {
+        let refusal = match loaded {
+            Err(reason) => Some(reason.clone()),
+            Ok(_) => conflicts.get(name).cloned(),
+        };
+        if let Some(reason) = refusal {
+            error!(ledger = %name, %reason, "ledger not served");
+            served.insert_failed(name, reason).await;
+            continue;
+        }
+        let Ok(ledger_config) = loaded else {
+            continue;
+        };
+        match ledger_runtime::start(name, ledger_config, node).await {
+            Ok(running) => {
+                info!(ledger = %name, "ledger served");
+                if let Err(running) = served.insert_running(name, running, node.graphiql).await {
+                    error!(ledger = %name, "a ledger of this name is already served; stopping this one");
+                    running.stop().await;
+                }
+            }
+            Err(ledger_runtime::StartFailed) => {
+                served
+                    .insert_failed(
+                        name,
+                        "it could not start; this ledger's boot log says why".to_owned(),
+                    )
+                    .await;
+            }
+        }
+    }
 }
 
 /// Assemble the application with a default limiter (no trusted proxies).
@@ -467,15 +576,16 @@ pub(crate) fn build_application(
     cors: CorsLayer,
     graphiql: bool,
 ) -> Router {
-    build_application_with_limiter(
+    // 003: the node serving this one ledger as its `default`.
+    let ledgers = ledgers::Ledgers::new(auth_state.enabled, auth_state.api_key.clone());
+    ledgers.insert_parts(
+        config::DEFAULT_LEDGER,
         schema,
         auth_state,
         health_state,
-        guard_state,
-        cors,
         graphiql,
-        RateLimiter::graphql(),
-    )
+    );
+    build_application_with_limiter(ledgers, guard_state, cors, graphiql, RateLimiter::graphql())
 }
 
 /// Assemble the full application router.
@@ -484,6 +594,11 @@ pub(crate) fn build_application(
 /// request guard (H-01), the rate limiter and — on `/graphql` only — auth. The
 /// guard is outermost among those so a rejected Host, Content-Type or Origin
 /// never reaches the limiter or the schema.
+///
+/// 003: auth is each ledger's own, so it sits inside the ledger's router
+/// (`ledgers::ledger_router`), reached through the node's routes — `/graphql`
+/// and `/health` for the `default` ledger, `/ledgers/<name>/…` for the others
+/// — after the guard and the limiter, as before.
 ///
 /// `/health` is behind the guard and a limiter too (H-01 residual, L-42), and
 /// outside auth only (§2.9: it must answer an unauthenticated prober). Before
@@ -496,32 +611,29 @@ pub(crate) fn build_application(
 /// `limiter` carries the trusted-proxy set, so how a client is identified is a
 /// boot-time decision rather than a per-request one (M-04).
 pub(crate) fn build_application_with_limiter(
-    schema: AppSchema,
-    auth_state: AuthState,
-    health_state: HealthState,
+    ledgers: ledgers::Ledgers,
     guard_state: RequestGuardState,
     cors: CorsLayer,
     graphiql: bool,
     limiter: RateLimiter,
 ) -> Router {
-    // GraphQL routes — POST always; GraphiQL on GET only when enabled.
-    let graphql_router = if graphiql {
+    // GraphQL routes — POST always; GraphiQL on GET only when enabled (the
+    // `default` ledger's: its page posts to `/graphql`).
+    let default_graphql = if graphiql {
         info!("GraphiQL enabled on GET /graphql");
-        Router::new().route("/graphql", get(graphiql_handler).post(graphql_handler))
+        get(ledgers::default_graphql).post(ledgers::default_graphql)
     } else {
         info!("GraphiQL disabled — POST /graphql only");
-        Router::new().route("/graphql", post(graphql_handler))
+        post(ledgers::default_graphql)
     };
     let health_limiter = limiter.sibling(
         rate_limit::HEALTH_RATE_LIMIT,
         rate_limit::HEALTH_RATE_WINDOW,
     );
-    let graphql_routes = graphql_router
-        .with_state(schema)
-        .layer(middleware::from_fn_with_state(
-            auth_state,
-            auth::auth_middleware,
-        ))
+    let graphql_routes = Router::new()
+        .route("/graphql", default_graphql)
+        .route("/ledgers/{name}/graphql", post(ledgers::named_graphql))
+        .with_state(ledgers.clone())
         .layer(middleware::from_fn_with_state(
             limiter,
             rate_limit::rate_limit,
@@ -531,8 +643,9 @@ pub(crate) fn build_application_with_limiter(
             request_guard::request_guard,
         ));
     let health_routes = Router::new()
-        .route("/health", get(health_handler))
-        .with_state(health_state)
+        .route("/health", get(ledgers::default_health))
+        .route("/ledgers/{name}/health", get(ledgers::named_health))
+        .with_state(ledgers)
         .layer(middleware::from_fn_with_state(
             health_limiter,
             rate_limit::rate_limit,
@@ -563,11 +676,12 @@ fn build_signature_provider(
     config: &config::LedgerConfig,
     node_secret_key: Option<&p2p_service::NodeSecretKey>,
     mesh_id: &str,
-) -> Arc<dyn security::signing::SignatureProvider> {
+) -> Option<Arc<dyn security::signing::SignatureProvider>> {
     if config.signing.enabled {
         let Some(secret_key) = node_secret_key else {
-            error!("signing enabled but no secret key was loaded — aborting");
-            std::process::exit(1);
+            // 003: an error for this ledger, not an exit of the node.
+            error!("signing enabled but no secret key was loaded; this ledger is not served");
+            return None;
         };
         // Bind signatures to this node's mesh identity so they cannot be
         // replayed into another mesh (L2 / L-23).
@@ -581,11 +695,22 @@ fn build_signature_provider(
             config.format.record_format(),
         ));
         info!(public_key = %provider.public_key_hex(), "signing enabled");
-        Arc::new(provider)
+        Some(Arc::new(provider))
     } else {
         info!("signing disabled");
-        Arc::new(security::signing::NoopSignatureProvider)
+        Some(Arc::new(security::signing::NoopSignatureProvider))
     }
+}
+
+/// `tokio::spawn`, in the span of the caller (003): a ledger's background
+/// tasks log under its name.
+pub(crate) fn spawn_in_span<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    use tracing::Instrument;
+    tokio::spawn(future.in_current_span())
 }
 
 /// Wait for SIGTERM or SIGINT (§3.9 graceful shutdown).
@@ -926,7 +1051,7 @@ mod tests {
             key: &p2p_service::NodeSecretKey,
         ) -> Arc<dyn SignatureProvider> {
             let domain = config.p2p.signature_domain().to_owned();
-            build_signature_provider(&config.ledger_config(), Some(key), &domain)
+            build_signature_provider(&config.ledger_config(), Some(key), &domain).expect("a signer")
         }
 
         /// A signed transaction as it arrives over ALPN: economic body plus the

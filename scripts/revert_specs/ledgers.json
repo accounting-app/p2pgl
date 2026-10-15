@@ -1,0 +1,291 @@
+{
+  "L-R1-every-name-routes-to-default": {
+    "file": "crates/gl-node/src/ledgers.rs",
+    "old": "            self.get(name).await",
+    "new": "            self.get(DEFAULT_LEDGER).await",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "each_ledger_answers_with_its_own_books_and_keys"
+      ]
+    ]
+  },
+  "L-R2-unknown-ledger-told-to-anyone": {
+    "file": "crates/gl-node/src/ledgers.rs",
+    "old": "            None if operator => {",
+    "new": "            None => {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_ledger_not_served_is_told_only_to_the_operator"
+      ]
+    ]
+  },
+  "L-R3-failed-ledger-told-to-anyone": {
+    "file": "crates/gl-node/src/ledgers.rs",
+    "old": "            Some(Served::Failed(reason)) if operator => {",
+    "new": "            Some(Served::Failed(reason)) => {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_ledger_not_served_is_told_only_to_the_operator"
+      ]
+    ]
+  },
+  "L-R4-named-health-open": {
+    "file": "crates/gl-node/src/ledgers.rs",
+    "old": "        if health\n            && name != DEFAULT_LEDGER",
+    "new": "        if false\n            && name != DEFAULT_LEDGER",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_ledger_not_served_is_told_only_to_the_operator"
+      ]
+    ]
+  },
+  "L-R5-dots-in-ledger-names": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')",
+    "new": "            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.')",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "ledger_names_are_folder_and_url_safe"
+      ]
+    ]
+  },
+  "L-R6-folder-named-default": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "        let verdict = if name == DEFAULT_LEDGER {",
+    "new": "        let verdict = if false {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "ledger_folders_lists_ledgers_and_refuses_what_is_not_one"
+      ]
+    ]
+  },
+  "L-R7-folder-secret-key-path-honoured": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "        if value.pointer(\"/p2p/secretKeyPath\").is_some() {",
+    "new": "        if false {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_ledger_folder_holds_its_own_files_and_settings"
+      ]
+    ]
+  },
+  "L-R8-two-ledgers-one-mesh": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "            && domains.contains_key(config.p2p.signature_domain())",
+    "new": "            && domains.contains_key(\"never a mesh id\")",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "ledgers_in_conflict_refuses_a_second_copy_of_a_mesh_topic_or_port"
+      ]
+    ]
+  },
+  "L-R9-two-ledgers-one-topic": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "        } else if config.p2p.enabled && topics.contains_key(config.p2p.swarm_topic.as_str()) {",
+    "new": "        } else if config.p2p.enabled && topics.contains_key(\"never a topic\") {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "ledgers_in_conflict_refuses_a_second_copy_of_a_mesh_topic_or_port"
+      ]
+    ]
+  },
+  "L-R10-two-ledgers-one-port": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "            && ports.contains_key(&config.p2p.listen_port)",
+    "new": "            && ports.contains_key(&1)",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "ledgers_in_conflict_refuses_a_second_copy_of_a_mesh_topic_or_port"
+      ]
+    ]
+  },
+  "L-R11-max-ledgers-ignored": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "        } else if served >= max_ledgers {",
+    "new": "        } else if served >= usize::MAX {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "ledgers_in_conflict_refuses_a_second_copy_of_a_mesh_topic_or_port"
+      ]
+    ]
+  },
+  "L-R12-ledger-path-inside-ledgers-dir": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "            .starts_with(lexical_normalize(&cwd.join(&self.ledgers_dir)))",
+    "new": "            .starts_with(lexical_normalize(&cwd.join(&self.ledgers_dir)).join(\"never\"))",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "ledgers_dir_and_max_ledgers_are_checked"
+      ]
+    ]
+  },
+  "L-R13-something-touched-before-admin-nodes": {
+    "file": "crates/gl-node/src/ledger_runtime.rs",
+    "old": "    let admin_nodes = match config.admin_node_ids() {",
+    "new": "    let _ = crate::ensure_ledger_parent_directory(std::path::Path::new(&config.ledger_path));\n    let admin_nodes = match config.admin_node_ids() {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_ledger_that_cannot_start_leaves_nothing_behind"
+      ]
+    ]
+  },
+  "L-R14-one-broken-folder-stops-the-node": {
+    "file": "crates/gl-node/src/main.rs",
+    "old": "            error!(ledger = %name, %reason, \"ledger not served\");",
+    "new": "            error!(ledger = %name, %reason, \"ledger not served\");\n            std::process::exit(1);",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "several_ledgers_are_served_side_by_side"
+      ]
+    ]
+  },
+  "L-R15-cli-ignores-ledger": {
+    "file": "crates/gl-node/src/user_cli.rs",
+    "old": "        &graphql_path(&ledger),",
+    "new": "        &graphql_path(crate::config::DEFAULT_LEDGER),",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "several_ledgers_are_served_side_by_side"
+      ]
+    ]
+  },
+  "L-R16-node-id-ignores-ledger": {
+    "file": "crates/gl-node/src/main.rs",
+    "old": "    let config = if ledger == config::DEFAULT_LEDGER {",
+    "new": "    let config = if !ledger.is_empty() {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "several_ledgers_are_served_side_by_side"
+      ]
+    ]
+  },
+  "L-R17-a-refusal-replaces-a-served-ledger": {
+    "file": "crates/gl-node/src/ledgers.rs",
+    "old": "            .entry(name.to_owned())\n            .or_insert_with(|| Arc::new(Served::Failed(reason)));",
+    "new": "            .insert(name.to_owned(), Arc::new(Served::Failed(reason)));",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_refusal_never_replaces_a_served_ledger"
+      ]
+    ]
+  },
+  "L-R18-a-default-folder-orphans-the-default-ledger": {
+    "edits": [
+      {
+        "file": "crates/gl-node/src/main.rs",
+        "old": "                if name == config::DEFAULT_LEDGER {",
+        "new": "                if false {"
+      },
+      {
+        "file": "crates/gl-node/src/ledgers.rs",
+        "old": "            .entry(name.to_owned())\n            .or_insert_with(|| Arc::new(Served::Failed(reason)));",
+        "new": "            .insert(name.to_owned(), Arc::new(Served::Failed(reason)));"
+      }
+    ],
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "several_ledgers_are_served_side_by_side"
+      ]
+    ]
+  },
+  "L-R19-two-ledgers-one-node-key": {
+    "file": "crates/gl-node/src/ledger_runtime.rs",
+    "old": "        if let Some(other) = ids.get(&id) {",
+    "new": "        if let Some(other) = ids.get(\"never a node id\") {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_second_ledger_with_the_same_node_key_is_refused"
+      ]
+    ]
+  },
+  "L-R20-files-listed-as-ledgers": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "        if !path.is_dir() {\n            continue;\n        }\n",
+    "new": "",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "ledger_folders_lists_ledgers_and_refuses_what_is_not_one"
+      ]
+    ]
+  }
+}

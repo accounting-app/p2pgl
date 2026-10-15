@@ -211,6 +211,18 @@ pub struct NodeConfig {
     #[serde(default)]
     pub format: FormatConfig,
 
+    /// Where this node's other ledgers live (`docs/build-log/003-multi-ledger-node`):
+    /// one folder per ledger, named for it, holding its `ledger.json` beside
+    /// its files. Default `./data/ledgers`; a missing folder means none. The
+    /// config file's own ledger is the one named `default`.
+    #[serde(default = "default_ledgers_dir")]
+    pub ledgers_dir: String,
+
+    /// The most ledgers this node serves, its own included (003). Default and
+    /// ceiling [`MAX_LEDGERS`].
+    #[serde(default = "default_max_ledgers")]
+    pub max_ledgers: usize,
+
     /// Connection-level HTTP hardening knobs (M-13).
     ///
     /// Optional in full: an absent `http` section reproduces the hardcoded
@@ -362,15 +374,6 @@ pub struct AuthConfig {
     pub admin_nodes: Option<Vec<String>>,
 }
 
-impl AuthConfig {
-    /// `adminNodes` as the node ids access records carry in
-    /// `openledger-author` (one canonical spelling, whatever form the config
-    /// used), or `None` when unset.
-    pub fn admin_node_ids(&self) -> Result<Option<std::collections::HashSet<String>>, ConfigError> {
-        admin_node_ids(self.admin_nodes.as_deref())
-    }
-}
-
 /// `auth.adminNodes` as the node ids access records carry: each entry parsed
 /// as an `EndpointId` and written back in its canonical form.
 fn admin_node_ids(
@@ -410,7 +413,320 @@ pub struct LedgerConfig {
 }
 
 impl LedgerConfig {
-    /// See [`AuthConfig::admin_node_ids`].
+    /// Load and validate the ledger folder `folder` (003): its `ledger.json`,
+    /// read like the config file (L-73: bounded, a regular file), and its
+    /// files — `ledger.bean`, `iroh.secret` — always inside it.
+    pub fn load_folder(folder: &Path) -> Result<LedgerConfig, ConfigError> {
+        let path = folder.join(LEDGER_FILE);
+        let (_file, content) = read_config_file(&path)?;
+        reject_removed_config_keys(&content)?;
+        let value: serde_json::Value =
+            serde_json::from_str(&content).map_err(ConfigError::Parse)?;
+        if value.pointer("/p2p/secretKeyPath").is_some() {
+            return Err(ConfigError::Validation(format!(
+                "{}: p2p.secretKeyPath is not set in a ledger folder; the ledger's key is always {}",
+                path.display(),
+                folder.join("iroh.secret").display()
+            )));
+        }
+        let file: LedgerFile = serde_json::from_value(value).map_err(ConfigError::Parse)?;
+        let mut p2p = file.p2p;
+        p2p.secret_key_path = folder.join("iroh.secret").to_string_lossy().into_owned();
+        let config = LedgerConfig {
+            ledger_path: folder.join("ledger.bean").to_string_lossy().into_owned(),
+            watch_ledger_file: file.watch_ledger_file,
+            signing: file.signing,
+            format: file.format,
+            p2p,
+            admin_nodes: file.auth.admin_nodes,
+        };
+        config
+            .validate()
+            .map_err(|error| ConfigError::Validation(format!("{}: {error}", path.display())))?;
+        Ok(config)
+    }
+
+    /// Validate the ledger's own boot-time invariants (§3.11): the rules a node
+    /// applies to its config file's ledger, and to every ledger folder
+    /// (`docs/build-log/003-multi-ledger-node`).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        NodeConfig::validate_ledger_path(&self.ledger_path)?;
+
+        if self.p2p.enabled && self.p2p.secret_key_path.is_empty() {
+            return Err(ConfigError::Validation(
+                "p2p.secretKeyPath is required when p2p.enabled is true".to_owned(),
+            ));
+        }
+
+        if self.p2p.enabled {
+            let allowlist =
+                match p2p::allowlist::PeerAllowlist::parse(&self.p2p.bootstrap_endpoint_ids) {
+                    Ok(allowlist) => allowlist,
+                    Err(error) => return Err(ConfigError::Validation(error)),
+                };
+            // H-19: the join peer is trusted with this node's first history,
+            // so it must be a peer this node accepts at all.
+            if let Some(join_from) = &self.p2p.join_from {
+                let peer = p2p::allowlist::PeerAllowlist::parse(std::slice::from_ref(join_from))
+                    .map_err(|error| ConfigError::Validation(format!("p2p.joinFrom: {error}")))?
+                    .bootstrap_peers();
+                if !peer.first().is_some_and(|peer| allowlist.admits(*peer)) {
+                    return Err(ConfigError::Validation(
+                        "p2p.joinFrom must be one of p2p.bootstrapEndpointIds".to_owned(),
+                    ));
+                }
+            }
+            self.validate_peer_addresses(&allowlist)?;
+            if self.p2p.swarm_topic == default_swarm_topic() {
+                return Err(ConfigError::Validation(
+                    "p2p.swarmTopic must not be the public default \"openledger/transactions\" when p2p.enabled is true".to_owned(),
+                ));
+            }
+            // H3: with signing off, verify_remote_signature is a no-op and the only
+            // origin check is that openledger-author appears *somewhere* on the
+            // allowlist — never bound to the authenticated connection. A single
+            // compromised allowlisted peer could then forge directives attributed to
+            // any other peer. Require signing so remote directives carry a verifiable
+            // Ed25519 signature from the claimed author's key.
+            if !self.signing.enabled {
+                return Err(ConfigError::Validation(
+                    "signing.enabled must be true when p2p.enabled is true; unsigned remote directives allow author spoofing across the peer allowlist".to_owned(),
+                ));
+            }
+        }
+
+        // L-23 / M-31: the rules below are applied to whatever actually
+        // *resolves* as the signature domain, not merely to the field the rules
+        // were written for.
+        //
+        // L-23 shipped the four checks on `p2p.meshId` alone. `meshId` is
+        // opt-in and no shipped config sets one, so on every real deployment
+        // `P2pConfig::signature_domain` falls back to `p2p.swarmTopic` — which
+        // had exactly one check, and that one is about *uniqueness* (it forbids
+        // the public default topic), not well-formedness. The validated field
+        // was the one nobody sets; the field every node signs with was
+        // unvalidated. So both are checked here, and
+        // `signature_domain_is_validated` below pins that the resolved value
+        // went through this regardless of which field it came from.
+        //
+        // Both fields, always, rather than only the resolved one: the other is
+        // one config edit away from *becoming* the resolved one (delete
+        // `meshId` and the topic is the domain again), and a rule that only
+        // holds for the current shape of the file is a rule that fails on the
+        // day someone changes the file.
+        //
+        // Unconditional, not gated on `p2p.enabled`, for L-22's reason plus one
+        // of its own: the domain is consumed whenever `signing.enabled`, with
+        // or without p2p. A malformed value here is not a boot failure at the
+        // point of use — it is a silent mesh-wide verification failure that
+        // presents as "the other node's key is wrong".
+        NodeConfig::validate_signature_domain(
+            "p2p.swarmTopic",
+            &self.p2p.swarm_topic,
+            if self.p2p.mesh_id.is_some() {
+                "it is the gossip join credential, hashed byte-for-byte into the TopicId every \
+                 peer must agree on, and it becomes this node's signature domain again the \
+                 moment p2p.meshId is removed"
+            } else {
+                "with p2p.meshId unset it IS this node's signature domain, compared \
+                 byte-for-byte on both sides of every signature"
+            },
+        )?;
+        if let Some(mesh_id) = &self.p2p.mesh_id {
+            NodeConfig::validate_signature_domain(
+                "p2p.meshId",
+                mesh_id,
+                "the value is compared byte-for-byte on both sides of every signature",
+            )?;
+        } else if self.signing.enabled {
+            // L-23 (R-9's announced step): a signing node names its mesh. The
+            // swarm topic is the gossip join credential; signing under it made
+            // "can reach this mesh" and "is this mesh" one claim, so two meshes
+            // that picked the same topic accepted each other's records. The
+            // refusal leads with the one value that keeps an existing mesh's
+            // signatures verifying, and never prints the topic (M-32, L-56).
+            return Err(ConfigError::Validation(
+                "p2p.meshId is required when signing.enabled is true. For an existing mesh, \
+                 set it to your current p2p.swarmTopic, copied byte for byte on every node — \
+                 any other value invalidates every signature already in the mesh; after that \
+                 the topic can change without touching signatures. For a new mesh, use a \
+                 random value such as the output of uuidgen (L-23, R-9)"
+                    .to_owned(),
+            ));
+        }
+        debug_assert!(
+            NodeConfig::validate_signature_domain(
+                self.p2p.signature_domain_source(),
+                self.p2p.signature_domain(),
+                "resolved domain",
+            )
+            .is_ok(),
+            "the resolved signature domain must have been validated above (M-31)"
+        );
+
+        // L-22: validated unconditionally, not only when `p2p.enabled` — the
+        // value is a boot-time typo either way, and catching it before the
+        // operator flips `enabled` is the whole point of boot validation.
+        if self.p2p.anti_entropy_interval_milliseconds < MIN_ANTI_ENTROPY_INTERVAL_MILLISECONDS {
+            return Err(ConfigError::Validation(format!(
+                "p2p.antiEntropyIntervalMilliseconds must be at least {MIN_ANTI_ENTROPY_INTERVAL_MILLISECONDS} ms, got {}; \
+                 0 panics the replication task at runtime and sub-{MIN_ANTI_ENTROPY_INTERVAL_MILLISECONDS}ms cadences flood every allowlisted peer",
+                self.p2p.anti_entropy_interval_milliseconds
+            )));
+        }
+
+        // R-7: the anti-entropy session bounds, unconditionally for L-22's
+        // reason — a typo is a typo whether or not `p2p.enabled` is set yet.
+        self.validate_anti_entropy_bounds()?;
+
+        // 002-users-and-roles: an `adminNodes` entry that does not parse would
+        // be no node at all — every access record would then be ignored.
+        if let Some(nodes) = &self.admin_nodes {
+            if !self.signing.enabled {
+                return Err(ConfigError::Validation(
+                    "auth.adminNodes needs signing.enabled: without signatures a record's author is only what it says, and people's keys are not honoured".to_owned(),
+                ));
+            }
+            if nodes.is_empty() {
+                return Err(ConfigError::Validation(
+                    "auth.adminNodes is empty: leave it out to let every mesh node change access, or list the nodes that may".to_owned(),
+                ));
+            }
+            self.admin_node_ids()?;
+        }
+
+        match self.p2p.relay_mode.as_str() {
+            "n0" | "disabled" | "custom" => {}
+            other => {
+                return Err(ConfigError::Validation(format!(
+                    "p2p.relayMode must be \"n0\", \"disabled\" or \"custom\", got \"{other}\""
+                )));
+            }
+        }
+        // 001-peer-discovery: a relay URL means the mesh's own relay, which only
+        // "custom" uses — refused elsewhere rather than silently ignored — and
+        // "custom" with neither a relay nor an address reaches no peer.
+        if let Some(relay_url) = &self.p2p.relay_url {
+            if self.p2p.relay_mode != "custom" {
+                return Err(ConfigError::Validation(format!(
+                    "p2p.relayUrl is set but p2p.relayMode is \"{}\"; a relay URL is used only with relayMode \"custom\"",
+                    self.p2p.relay_mode
+                )));
+            }
+            crate::peer_addresses::parse_relay_url(relay_url).map_err(ConfigError::Validation)?;
+        }
+        if self.p2p.relay_mode == "custom"
+            && self.p2p.relay_url.is_none()
+            && self.p2p.peer_addresses.is_empty()
+        {
+            return Err(ConfigError::Validation(
+                "p2p.relayMode \"custom\" needs the mesh's own relay (p2p.relayUrl) or peers' addresses (p2p.peerAddresses), or both; with neither this node reaches no peer, and nothing goes to n0".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `p2p.peerAddresses` (`docs/build-log/001-peer-discovery`): every key is a
+    /// peer `bootstrapEndpointIds` admits — an address says where an admitted
+    /// peer is, it never admits one — and every value is 1 to
+    /// [`crate::peer_addresses::MAX_ADDRESSES_PER_PEER`] `host:port` addresses.
+    fn validate_peer_addresses(
+        &self,
+        allowlist: &p2p::allowlist::PeerAllowlist,
+    ) -> Result<(), ConfigError> {
+        let peers = crate::peer_addresses::PeerAddresses::from_config(&self.p2p.peer_addresses)
+            .map_err(ConfigError::Validation)?;
+        if let Some(stranger) = peers.peer_ids().find(|peer| !allowlist.admits(**peer)) {
+            return Err(ConfigError::Validation(format!(
+                "p2p.peerAddresses names {stranger}, which is not one of p2p.bootstrapEndpointIds — an address only says where an admitted peer is; add the peer to bootstrapEndpointIds first"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refuse any anti-entropy session bound outside its floor and ceiling
+    /// (R-7); see the `MIN_`/`MAX_ANTI_ENTROPY_*` constants for each pair.
+    fn validate_anti_entropy_bounds(&self) -> Result<(), ConfigError> {
+        let p2p = &self.p2p;
+        let bounds: [(&str, u64, u64, u64, &str); 8] = [
+            (
+                "p2p.antiEntropySessionSeconds",
+                p2p.anti_entropy_session_seconds,
+                MIN_ANTI_ENTROPY_SESSION_SECONDS,
+                MAX_ANTI_ENTROPY_SESSION_SECONDS,
+                "below the floor an honest catch-up is cut off every tick; above the \
+                 ceiling one peer may pin an inbound connection slot for that long",
+            ),
+            (
+                "p2p.antiEntropyMaxAdvertPages",
+                p2p.anti_entropy_max_advert_pages as u64,
+                MIN_ANTI_ENTROPY_MAX_ADVERT_PAGES as u64,
+                MAX_ANTI_ENTROPY_MAX_ADVERT_PAGES as u64,
+                "below the floor an honest advert at the id-count cap cannot finish; \
+                 above the ceiling a peer may stream pages for free",
+            ),
+            (
+                "p2p.antiEntropyMaxAdvertIdBytes",
+                p2p.anti_entropy_max_advert_id_bytes as u64,
+                MIN_ANTI_ENTROPY_MAX_ADVERT_ID_BYTES as u64,
+                MAX_ANTI_ENTROPY_MAX_ADVERT_ID_BYTES as u64,
+                "below the floor an honest advert of a full ledger is refused; above \
+                 the ceiling the id-count cap binds first and only memory grows",
+            ),
+            (
+                "p2p.antiEntropyMaxSessionFrames",
+                p2p.anti_entropy_max_session_frames as u64,
+                MIN_ANTI_ENTROPY_MAX_SESSION_FRAMES as u64,
+                MAX_ANTI_ENTROPY_MAX_SESSION_FRAMES as u64,
+                "below the floor an honest full catch-up runs out of frames; above the \
+                 ceiling one connection may do unbounded work",
+            ),
+            (
+                "p2p.antiEntropyAcceptBurst",
+                u64::from(p2p.anti_entropy_accept_burst),
+                u64::from(MIN_ANTI_ENTROPY_ACCEPT_BURST),
+                u64::from(MAX_ANTI_ENTROPY_ACCEPT_BURST),
+                "below the floor a pooled connection's re-dial is refused; above the \
+                 ceiling the burst exceeds every inbound slot and bounds nothing",
+            ),
+            (
+                "p2p.antiEntropyAcceptRefillMilliseconds",
+                p2p.anti_entropy_accept_refill_milliseconds,
+                MIN_ANTI_ENTROPY_ACCEPT_REFILL_MILLISECONDS,
+                MAX_ANTI_ENTROPY_ACCEPT_REFILL_MILLISECONDS,
+                "below the floor a reconnect loop is admitted at a rate no honest peer \
+                 needs; above the ceiling an honest peer's re-dials are rationed",
+            ),
+            (
+                "p2p.antiEntropyMaxConcurrentExchanges",
+                p2p.anti_entropy_max_concurrent_exchanges as u64,
+                MIN_ANTI_ENTROPY_MAX_CONCURRENT_EXCHANGES as u64,
+                MAX_ANTI_ENTROPY_MAX_CONCURRENT_EXCHANGES as u64,
+                "0 stops outbound replication; above the ceiling hostile peers may each \
+                 hold an exchange's worst-case memory at once",
+            ),
+            (
+                "p2p.antiEntropySupplyBackoffSeconds",
+                p2p.anti_entropy_supply_backoff_seconds,
+                MIN_ANTI_ENTROPY_SUPPLY_BACKOFF_SECONDS,
+                MAX_ANTI_ENTROPY_SUPPLY_BACKOFF_SECONDS,
+                "below the floor a node at its size cap re-pulls the same batch every \
+                 tick; above the ceiling it sits out a peer long after room was made",
+            ),
+        ];
+        for (field, value, min, max, why) in bounds {
+            if !(min..=max).contains(&value) {
+                return Err(ConfigError::Validation(format!(
+                    "{field} must be between {min} and {max}, got {value}; {why}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// `auth.adminNodes` as the node ids access records carry in
+    /// `openledger-author` (one canonical spelling, whatever form the config
+    /// used), or `None` when unset.
     pub fn admin_node_ids(&self) -> Result<Option<std::collections::HashSet<String>>, ConfigError> {
         admin_node_ids(self.admin_nodes.as_deref())
     }
@@ -835,6 +1151,162 @@ fn default_bind_address() -> String {
 
 fn default_port() -> u16 {
     4000
+}
+
+fn default_ledgers_dir() -> String {
+    "./data/ledgers".to_owned()
+}
+
+fn default_max_ledgers() -> usize {
+    MAX_LEDGERS
+}
+
+/// The most ledgers one node serves (003, decision 4: up to about 100 — the
+/// scale the design is measured at).
+pub const MAX_LEDGERS: usize = 100;
+
+/// The name of the config file's own ledger, served at `/graphql` as before.
+pub const DEFAULT_LEDGER: &str = "default";
+
+/// A ledger name (003): 1 to 40 of `a-z`, `0-9` and `-`, not starting with
+/// `-`. It is a folder name and a URL segment, so nothing else is accepted.
+pub fn is_valid_ledger_name(name: &str) -> bool {
+    (1..=40).contains(&name.len())
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// A ledger folder's `ledger.json` (003): the [`LedgerConfig`] fields a folder
+/// may set. Its file, key and lock are always in the folder, so `ledgerPath`
+/// is unknown here and `p2p.secretKeyPath` is refused.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct LedgerFile {
+    #[serde(default)]
+    watch_ledger_file: bool,
+    #[serde(default)]
+    signing: SigningConfig,
+    #[serde(default)]
+    format: FormatConfig,
+    #[serde(default)]
+    p2p: P2pConfig,
+    #[serde(default)]
+    auth: LedgerAuthFile,
+}
+
+/// The `auth` section of a `ledger.json`: whose access records count.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct LedgerAuthFile {
+    #[serde(default)]
+    admin_nodes: Option<Vec<String>>,
+}
+
+/// The file name of a ledger folder's settings.
+pub const LEDGER_FILE: &str = "ledger.json";
+
+/// A ledger folder: its name, and its path or why it is not a ledger.
+pub type LedgerFolder = (String, Result<PathBuf, String>);
+
+/// The ledger folders under `ledgers_dir`, by name, sorted: each a valid
+/// name, or the reason it is not served. Entries starting with `.` (such as
+/// `.removed`) and files (a stray note or backup) are not ledgers and are
+/// skipped; a missing directory holds none.
+pub fn ledger_folders(ledgers_dir: &Path) -> Result<Vec<LedgerFolder>, ConfigError> {
+    let entries = match std::fs::read_dir(ledgers_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(ConfigError::FileRead(error)),
+    };
+    let mut folders = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(ConfigError::FileRead)?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let verdict = if name == DEFAULT_LEDGER {
+            Err(
+                "\"default\" is the config file's own ledger; a folder may not take its name"
+                    .to_owned(),
+            )
+        } else if !is_valid_ledger_name(&name) {
+            Err("a ledger name is 1 to 40 of a-z, 0-9 and -, not starting with -".to_owned())
+        } else {
+            Ok(path)
+        };
+        folders.push((name, verdict));
+    }
+    folders.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(folders)
+}
+
+/// The ledgers in `ledgers` (in order, the config file's first) that cannot be
+/// served beside the ones before them, each with its reason (003): two ledgers
+/// in one mesh (the same signature domain), on one gossip topic, or on one
+/// P2P port; and any past `max_ledgers`.
+pub fn ledgers_in_conflict(
+    ledgers: &[(&str, &LedgerConfig)],
+    max_ledgers: usize,
+) -> Vec<(String, String)> {
+    let mut refused = Vec::new();
+    let mut domains = std::collections::HashMap::new();
+    let mut topics = std::collections::HashMap::new();
+    let mut ports = std::collections::HashMap::new();
+    let mut served = 0usize;
+    for (name, config) in ledgers {
+        let conflict = if config.signing.enabled
+            && domains.contains_key(config.p2p.signature_domain())
+        {
+            Some(format!(
+                "ledger \"{}\" is already in this mesh (the same p2p.meshId); one node serves a mesh once",
+                domains[config.p2p.signature_domain()]
+            ))
+        } else if config.p2p.enabled && topics.contains_key(config.p2p.swarm_topic.as_str()) {
+            Some(format!(
+                "ledger \"{}\" already uses this p2p.swarmTopic",
+                topics[config.p2p.swarm_topic.as_str()]
+            ))
+        } else if config.p2p.enabled
+            && config.p2p.listen_port != 0
+            && ports.contains_key(&config.p2p.listen_port)
+        {
+            Some(format!(
+                "ledger \"{}\" already listens on p2p.listenPort {}",
+                ports[&config.p2p.listen_port], config.p2p.listen_port
+            ))
+        } else if served >= max_ledgers {
+            Some(format!(
+                "this node serves at most maxLedgers ({max_ledgers}) ledgers"
+            ))
+        } else {
+            None
+        };
+        match conflict {
+            Some(reason) => refused.push(((*name).to_owned(), reason)),
+            None => {
+                served += 1;
+                if config.signing.enabled {
+                    domains.insert(config.p2p.signature_domain(), *name);
+                }
+                if config.p2p.enabled {
+                    topics.insert(config.p2p.swarm_topic.as_str(), *name);
+                    if config.p2p.listen_port != 0 {
+                        ports.insert(config.p2p.listen_port, *name);
+                    }
+                }
+            }
+        }
+    }
+    refused
 }
 
 fn default_graphiql() -> bool {
@@ -1322,7 +1794,25 @@ impl NodeConfig {
 
     /// Validate boot-time invariants per §3.11.
     fn validate(&self) -> Result<(), ConfigError> {
-        Self::validate_ledger_path(&self.ledger_path)?;
+        // 003: the ledger's own rules, shared with every ledger folder.
+        self.ledger_config().validate()?;
+        Self::validate_path_under_cwd("ledgersDir", &self.ledgers_dir)?;
+        if !(1..=MAX_LEDGERS).contains(&self.max_ledgers) {
+            return Err(ConfigError::Validation(format!(
+                "maxLedgers must be between 1 and {MAX_LEDGERS}, got {}",
+                self.max_ledgers
+            )));
+        }
+        let cwd = std::env::current_dir().map_err(|error| {
+            ConfigError::Validation(format!("failed to read working directory: {error}"))
+        })?;
+        if lexical_normalize(&cwd.join(&self.ledger_path))
+            .starts_with(lexical_normalize(&cwd.join(&self.ledgers_dir)))
+        {
+            return Err(ConfigError::Validation(
+                "ledgerPath must not be inside ledgersDir: that folder holds the node's other ledgers, one folder each".to_owned(),
+            ));
+        }
 
         if self.graphiql && self.binds_non_loopback() {
             return Err(ConfigError::Validation(
@@ -1353,49 +1843,6 @@ impl NodeConfig {
         // because today's listener is loopback.
         if self.auth.enabled && !self.uses_api_key_file() {
             check_api_key(&self.auth.api_key).map_err(ConfigError::Validation)?;
-        }
-
-        if self.p2p.enabled && self.p2p.secret_key_path.is_empty() {
-            return Err(ConfigError::Validation(
-                "p2p.secretKeyPath is required when p2p.enabled is true".to_owned(),
-            ));
-        }
-
-        if self.p2p.enabled {
-            let allowlist =
-                match p2p::allowlist::PeerAllowlist::parse(&self.p2p.bootstrap_endpoint_ids) {
-                    Ok(allowlist) => allowlist,
-                    Err(error) => return Err(ConfigError::Validation(error)),
-                };
-            // H-19: the join peer is trusted with this node's first history,
-            // so it must be a peer this node accepts at all.
-            if let Some(join_from) = &self.p2p.join_from {
-                let peer = p2p::allowlist::PeerAllowlist::parse(std::slice::from_ref(join_from))
-                    .map_err(|error| ConfigError::Validation(format!("p2p.joinFrom: {error}")))?
-                    .bootstrap_peers();
-                if !peer.first().is_some_and(|peer| allowlist.admits(*peer)) {
-                    return Err(ConfigError::Validation(
-                        "p2p.joinFrom must be one of p2p.bootstrapEndpointIds".to_owned(),
-                    ));
-                }
-            }
-            self.validate_peer_addresses(&allowlist)?;
-            if self.p2p.swarm_topic == default_swarm_topic() {
-                return Err(ConfigError::Validation(
-                    "p2p.swarmTopic must not be the public default \"openledger/transactions\" when p2p.enabled is true".to_owned(),
-                ));
-            }
-            // H3: with signing off, verify_remote_signature is a no-op and the only
-            // origin check is that openledger-author appears *somewhere* on the
-            // allowlist — never bound to the authenticated connection. A single
-            // compromised allowlisted peer could then forge directives attributed to
-            // any other peer. Require signing so remote directives carry a verifiable
-            // Ed25519 signature from the claimed author's key.
-            if !self.signing.enabled {
-                return Err(ConfigError::Validation(
-                    "signing.enabled must be true when p2p.enabled is true; unsigned remote directives allow author spoofing across the peer allowlist".to_owned(),
-                ));
-            }
         }
 
         for origin in &self.cors.allowed_origins {
@@ -1447,75 +1894,6 @@ impl NodeConfig {
             Self::validate_allowed_host_form(host)?;
         }
 
-        // L-23 / M-31: the rules below are applied to whatever actually
-        // *resolves* as the signature domain, not merely to the field the rules
-        // were written for.
-        //
-        // L-23 shipped the four checks on `p2p.meshId` alone. `meshId` is
-        // opt-in and no shipped config sets one, so on every real deployment
-        // `P2pConfig::signature_domain` falls back to `p2p.swarmTopic` — which
-        // had exactly one check, and that one is about *uniqueness* (it forbids
-        // the public default topic), not well-formedness. The validated field
-        // was the one nobody sets; the field every node signs with was
-        // unvalidated. So both are checked here, and
-        // `signature_domain_is_validated` below pins that the resolved value
-        // went through this regardless of which field it came from.
-        //
-        // Both fields, always, rather than only the resolved one: the other is
-        // one config edit away from *becoming* the resolved one (delete
-        // `meshId` and the topic is the domain again), and a rule that only
-        // holds for the current shape of the file is a rule that fails on the
-        // day someone changes the file.
-        //
-        // Unconditional, not gated on `p2p.enabled`, for L-22's reason plus one
-        // of its own: the domain is consumed whenever `signing.enabled`, with
-        // or without p2p. A malformed value here is not a boot failure at the
-        // point of use — it is a silent mesh-wide verification failure that
-        // presents as "the other node's key is wrong".
-        Self::validate_signature_domain(
-            "p2p.swarmTopic",
-            &self.p2p.swarm_topic,
-            if self.p2p.mesh_id.is_some() {
-                "it is the gossip join credential, hashed byte-for-byte into the TopicId every \
-                 peer must agree on, and it becomes this node's signature domain again the \
-                 moment p2p.meshId is removed"
-            } else {
-                "with p2p.meshId unset it IS this node's signature domain, compared \
-                 byte-for-byte on both sides of every signature"
-            },
-        )?;
-        if let Some(mesh_id) = &self.p2p.mesh_id {
-            Self::validate_signature_domain(
-                "p2p.meshId",
-                mesh_id,
-                "the value is compared byte-for-byte on both sides of every signature",
-            )?;
-        } else if self.signing.enabled {
-            // L-23 (R-9's announced step): a signing node names its mesh. The
-            // swarm topic is the gossip join credential; signing under it made
-            // "can reach this mesh" and "is this mesh" one claim, so two meshes
-            // that picked the same topic accepted each other's records. The
-            // refusal leads with the one value that keeps an existing mesh's
-            // signatures verifying, and never prints the topic (M-32, L-56).
-            return Err(ConfigError::Validation(
-                "p2p.meshId is required when signing.enabled is true. For an existing mesh, \
-                 set it to your current p2p.swarmTopic, copied byte for byte on every node — \
-                 any other value invalidates every signature already in the mesh; after that \
-                 the topic can change without touching signatures. For a new mesh, use a \
-                 random value such as the output of uuidgen (L-23, R-9)"
-                    .to_owned(),
-            ));
-        }
-        debug_assert!(
-            Self::validate_signature_domain(
-                self.p2p.signature_domain_source(),
-                self.p2p.signature_domain(),
-                "resolved domain",
-            )
-            .is_ok(),
-            "the resolved signature domain must have been validated above (M-31)"
-        );
-
         // M-13: bound the HTTP hardening knobs from both sides. A floor alone
         // is not enough here — unlike an interval, where only small values are
         // dangerous, a timeout or a connection cap is disabled just as
@@ -1556,37 +1934,6 @@ impl NodeConfig {
             )));
         }
 
-        // L-22: validated unconditionally, not only when `p2p.enabled` — the
-        // value is a boot-time typo either way, and catching it before the
-        // operator flips `enabled` is the whole point of boot validation.
-        if self.p2p.anti_entropy_interval_milliseconds < MIN_ANTI_ENTROPY_INTERVAL_MILLISECONDS {
-            return Err(ConfigError::Validation(format!(
-                "p2p.antiEntropyIntervalMilliseconds must be at least {MIN_ANTI_ENTROPY_INTERVAL_MILLISECONDS} ms, got {}; \
-                 0 panics the replication task at runtime and sub-{MIN_ANTI_ENTROPY_INTERVAL_MILLISECONDS}ms cadences flood every allowlisted peer",
-                self.p2p.anti_entropy_interval_milliseconds
-            )));
-        }
-
-        // R-7: the anti-entropy session bounds, unconditionally for L-22's
-        // reason — a typo is a typo whether or not `p2p.enabled` is set yet.
-        self.validate_anti_entropy_bounds()?;
-
-        // 002-users-and-roles: an `adminNodes` entry that does not parse would
-        // be no node at all — every access record would then be ignored.
-        if let Some(nodes) = &self.auth.admin_nodes {
-            if !self.signing.enabled {
-                return Err(ConfigError::Validation(
-                    "auth.adminNodes needs signing.enabled: without signatures a record's author is only what it says, and people's keys are not honoured".to_owned(),
-                ));
-            }
-            if nodes.is_empty() {
-                return Err(ConfigError::Validation(
-                    "auth.adminNodes is empty: leave it out to let every mesh node change access, or list the nodes that may".to_owned(),
-                ));
-            }
-            self.auth.admin_node_ids()?;
-        }
-
         // M-04: a trusted proxy entry that does not parse would be silently
         // dropped from the trust set, leaving the operator believing
         // `X-Forwarded-For` is honoured while every client still shares the
@@ -1597,35 +1944,6 @@ impl NodeConfig {
                     "trustedProxies entries must be IP literals without a port or prefix length, got \"{proxy}\""
                 )));
             }
-        }
-
-        match self.p2p.relay_mode.as_str() {
-            "n0" | "disabled" | "custom" => {}
-            other => {
-                return Err(ConfigError::Validation(format!(
-                    "p2p.relayMode must be \"n0\", \"disabled\" or \"custom\", got \"{other}\""
-                )));
-            }
-        }
-        // 001-peer-discovery: a relay URL means the mesh's own relay, which only
-        // "custom" uses — refused elsewhere rather than silently ignored — and
-        // "custom" with neither a relay nor an address reaches no peer.
-        if let Some(relay_url) = &self.p2p.relay_url {
-            if self.p2p.relay_mode != "custom" {
-                return Err(ConfigError::Validation(format!(
-                    "p2p.relayUrl is set but p2p.relayMode is \"{}\"; a relay URL is used only with relayMode \"custom\"",
-                    self.p2p.relay_mode
-                )));
-            }
-            crate::peer_addresses::parse_relay_url(relay_url).map_err(ConfigError::Validation)?;
-        }
-        if self.p2p.relay_mode == "custom"
-            && self.p2p.relay_url.is_none()
-            && self.p2p.peer_addresses.is_empty()
-        {
-            return Err(ConfigError::Validation(
-                "p2p.relayMode \"custom\" needs the mesh's own relay (p2p.relayUrl) or peers' addresses (p2p.peerAddresses), or both; with neither this node reaches no peer, and nothing goes to n0".to_owned(),
-            ));
         }
 
         match self.tls.mode.as_str() {
@@ -1787,105 +2105,7 @@ impl NodeConfig {
         Ok(())
     }
 
-    /// `p2p.peerAddresses` (`docs/build-log/001-peer-discovery`): every key is a
-    /// peer `bootstrapEndpointIds` admits — an address says where an admitted
-    /// peer is, it never admits one — and every value is 1 to
-    /// [`crate::peer_addresses::MAX_ADDRESSES_PER_PEER`] `host:port` addresses.
-    fn validate_peer_addresses(
-        &self,
-        allowlist: &p2p::allowlist::PeerAllowlist,
-    ) -> Result<(), ConfigError> {
-        let peers = crate::peer_addresses::PeerAddresses::from_config(&self.p2p.peer_addresses)
-            .map_err(ConfigError::Validation)?;
-        if let Some(stranger) = peers.peer_ids().find(|peer| !allowlist.admits(**peer)) {
-            return Err(ConfigError::Validation(format!(
-                "p2p.peerAddresses names {stranger}, which is not one of p2p.bootstrapEndpointIds — an address only says where an admitted peer is; add the peer to bootstrapEndpointIds first"
-            )));
-        }
-        Ok(())
-    }
-
     /// One bounds check for both `http` timeouts, so they cannot drift apart.
-    /// Refuse any anti-entropy session bound outside its floor and ceiling
-    /// (R-7); see the `MIN_`/`MAX_ANTI_ENTROPY_*` constants for each pair.
-    fn validate_anti_entropy_bounds(&self) -> Result<(), ConfigError> {
-        let p2p = &self.p2p;
-        let bounds: [(&str, u64, u64, u64, &str); 8] = [
-            (
-                "p2p.antiEntropySessionSeconds",
-                p2p.anti_entropy_session_seconds,
-                MIN_ANTI_ENTROPY_SESSION_SECONDS,
-                MAX_ANTI_ENTROPY_SESSION_SECONDS,
-                "below the floor an honest catch-up is cut off every tick; above the \
-                 ceiling one peer may pin an inbound connection slot for that long",
-            ),
-            (
-                "p2p.antiEntropyMaxAdvertPages",
-                p2p.anti_entropy_max_advert_pages as u64,
-                MIN_ANTI_ENTROPY_MAX_ADVERT_PAGES as u64,
-                MAX_ANTI_ENTROPY_MAX_ADVERT_PAGES as u64,
-                "below the floor an honest advert at the id-count cap cannot finish; \
-                 above the ceiling a peer may stream pages for free",
-            ),
-            (
-                "p2p.antiEntropyMaxAdvertIdBytes",
-                p2p.anti_entropy_max_advert_id_bytes as u64,
-                MIN_ANTI_ENTROPY_MAX_ADVERT_ID_BYTES as u64,
-                MAX_ANTI_ENTROPY_MAX_ADVERT_ID_BYTES as u64,
-                "below the floor an honest advert of a full ledger is refused; above \
-                 the ceiling the id-count cap binds first and only memory grows",
-            ),
-            (
-                "p2p.antiEntropyMaxSessionFrames",
-                p2p.anti_entropy_max_session_frames as u64,
-                MIN_ANTI_ENTROPY_MAX_SESSION_FRAMES as u64,
-                MAX_ANTI_ENTROPY_MAX_SESSION_FRAMES as u64,
-                "below the floor an honest full catch-up runs out of frames; above the \
-                 ceiling one connection may do unbounded work",
-            ),
-            (
-                "p2p.antiEntropyAcceptBurst",
-                u64::from(p2p.anti_entropy_accept_burst),
-                u64::from(MIN_ANTI_ENTROPY_ACCEPT_BURST),
-                u64::from(MAX_ANTI_ENTROPY_ACCEPT_BURST),
-                "below the floor a pooled connection's re-dial is refused; above the \
-                 ceiling the burst exceeds every inbound slot and bounds nothing",
-            ),
-            (
-                "p2p.antiEntropyAcceptRefillMilliseconds",
-                p2p.anti_entropy_accept_refill_milliseconds,
-                MIN_ANTI_ENTROPY_ACCEPT_REFILL_MILLISECONDS,
-                MAX_ANTI_ENTROPY_ACCEPT_REFILL_MILLISECONDS,
-                "below the floor a reconnect loop is admitted at a rate no honest peer \
-                 needs; above the ceiling an honest peer's re-dials are rationed",
-            ),
-            (
-                "p2p.antiEntropyMaxConcurrentExchanges",
-                p2p.anti_entropy_max_concurrent_exchanges as u64,
-                MIN_ANTI_ENTROPY_MAX_CONCURRENT_EXCHANGES as u64,
-                MAX_ANTI_ENTROPY_MAX_CONCURRENT_EXCHANGES as u64,
-                "0 stops outbound replication; above the ceiling hostile peers may each \
-                 hold an exchange's worst-case memory at once",
-            ),
-            (
-                "p2p.antiEntropySupplyBackoffSeconds",
-                p2p.anti_entropy_supply_backoff_seconds,
-                MIN_ANTI_ENTROPY_SUPPLY_BACKOFF_SECONDS,
-                MAX_ANTI_ENTROPY_SUPPLY_BACKOFF_SECONDS,
-                "below the floor a node at its size cap re-pulls the same batch every \
-                 tick; above the ceiling it sits out a peer long after room was made",
-            ),
-        ];
-        for (field, value, min, max, why) in bounds {
-            if !(min..=max).contains(&value) {
-                return Err(ConfigError::Validation(format!(
-                    "{field} must be between {min} and {max}, got {value}; {why}"
-                )));
-            }
-        }
-        Ok(())
-    }
-
     fn validate_http_timeout(field: &str, seconds: u64, why: &str) -> Result<(), ConfigError> {
         if !(MIN_HTTP_TIMEOUT_SECONDS..=MAX_HTTP_TIMEOUT_SECONDS).contains(&seconds) {
             return Err(ConfigError::Validation(format!(
@@ -1997,24 +2217,30 @@ impl NodeConfig {
     }
 
     fn validate_ledger_path(ledger_path: &str) -> Result<(), ConfigError> {
+        Self::validate_path_under_cwd("ledgerPath", ledger_path)
+    }
+
+    /// A path the node writes under (`ledgerPath`, `ledgersDir`): not empty, no
+    /// NUL, no `..`, and resolving under the process working directory.
+    fn validate_path_under_cwd(field: &str, ledger_path: &str) -> Result<(), ConfigError> {
         if ledger_path.is_empty() {
-            return Err(ConfigError::Validation(
-                "ledgerPath is required and must not be empty".to_owned(),
-            ));
+            return Err(ConfigError::Validation(format!(
+                "{field} is required and must not be empty"
+            )));
         }
         if ledger_path.contains('\0') {
-            return Err(ConfigError::Validation(
-                "ledgerPath must not contain NUL".to_owned(),
-            ));
+            return Err(ConfigError::Validation(format!(
+                "{field} must not contain NUL"
+            )));
         }
         let configured = Path::new(ledger_path);
         if configured
             .components()
             .any(|component| matches!(component, Component::ParentDir))
         {
-            return Err(ConfigError::Validation(
-                "ledgerPath must not contain \"..\"".to_owned(),
-            ));
+            return Err(ConfigError::Validation(format!(
+                "{field} must not contain \"..\""
+            )));
         }
         let cwd = std::env::current_dir().map_err(|error| {
             ConfigError::Validation(format!("failed to read working directory: {error}"))
@@ -2027,9 +2253,9 @@ impl NodeConfig {
         let cwd_normalized = lexical_normalize(&cwd);
         let resolved_normalized = lexical_normalize(&resolved);
         if !resolved_normalized.starts_with(&cwd_normalized) {
-            return Err(ConfigError::Validation(
-                "ledgerPath must resolve under the process working directory".to_owned(),
-            ));
+            return Err(ConfigError::Validation(format!(
+                "{field} must resolve under the process working directory"
+            )));
         }
         Ok(())
     }
@@ -2549,6 +2775,196 @@ mod tests {
         }
     }
 
+    /// 003: a ledger name is a folder and a URL segment, so only `a-z`, `0-9`
+    /// and `-`, 1 to 40 of them, not starting with `-`.
+    ///
+    /// Bug-catch: accept a `.` or a `/` and a name walks out of `ledgersDir`
+    /// or into another ledger's URL.
+    #[test]
+    fn ledger_names_are_folder_and_url_safe() {
+        for good in ["acme", "a-1", "0", &"x".repeat(40)] {
+            assert!(is_valid_ledger_name(good), "{good}");
+        }
+        for bad in [
+            "",
+            "-acme",
+            "Acme",
+            "a_b",
+            "a.b",
+            "a/b",
+            "..",
+            ".removed",
+            "a b",
+            &"x".repeat(41),
+        ] {
+            assert!(!is_valid_ledger_name(bad), "{bad:?}");
+        }
+    }
+
+    /// A temporary folder under the working directory, where a ledger's paths
+    /// must resolve (`ledgerPath` rule).
+    fn temp_dir_here() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(".test-ledgers-")
+            .tempdir_in(".")
+            .expect("temp dir")
+    }
+
+    /// 003: a ledger folder's `ledger.json` sets the ledger's own settings;
+    /// its file and key are always in the folder (`p2p.secretKeyPath` is
+    /// refused, `ledgerPath` is unknown), Format v2 is the default as for the
+    /// config file, and a ledger rule it breaks is refused naming the file.
+    ///
+    /// Bug-catch: honour a `secretKeyPath` and two folders can share one node
+    /// key — one identity in two meshes, which decision 1 rules out.
+    #[test]
+    fn a_ledger_folder_holds_its_own_files_and_settings() {
+        let dir = temp_dir_here();
+        let folder = dir.path().join("acme");
+        std::fs::create_dir(&folder).expect("folder");
+        let write = |json: &str| std::fs::write(folder.join(LEDGER_FILE), json).expect("write");
+
+        write(r#"{ "signing": { "enabled": true }, "p2p": { "meshId": "acme-mesh" } }"#);
+        let config = LedgerConfig::load_folder(&folder).expect("loads");
+        assert_eq!(Path::new(&config.ledger_path), folder.join("ledger.bean"));
+        assert_eq!(
+            Path::new(&config.p2p.secret_key_path),
+            folder.join("iroh.secret")
+        );
+        assert_eq!(
+            config.format.record_format(),
+            ledger::hash::RecordFormat::V2
+        );
+        assert!(config.signing.enabled && config.admin_nodes.is_none());
+
+        write(r#"{ "p2p": { "secretKeyPath": "./data/iroh.secret" } }"#);
+        let error = LedgerConfig::load_folder(&folder).expect_err("refused");
+        assert!(format!("{error}").contains("iroh.secret"), "{error}");
+        write(r#"{ "ledgerPath": "elsewhere.bean" }"#);
+        assert!(LedgerConfig::load_folder(&folder).is_err(), "unknown key");
+        write(r#"{ "signing": { "enabled": true } }"#);
+        let error = LedgerConfig::load_folder(&folder).expect_err("no meshId");
+        let text = format!("{error}");
+        assert!(
+            text.contains("ledger.json") && text.contains("meshId"),
+            "{text}"
+        );
+    }
+
+    /// 003: the folders in `ledgersDir` are ledgers by name, sorted; one named
+    /// `default`, or one whose name breaks the rule, is listed as not a
+    /// ledger; a dot entry (`.removed`) and a file are not listed; no
+    /// directory, none.
+    ///
+    /// Bug-catch: let a folder take the name `default` and it shadows the
+    /// config file's ledger at `/graphql`.
+    #[test]
+    fn ledger_folders_lists_ledgers_and_refuses_what_is_not_one() {
+        let dir = temp_dir_here();
+        for folder in ["acme", "default", "Bad_Name", ".removed"] {
+            std::fs::create_dir(dir.path().join(folder)).expect("folder");
+        }
+        std::fs::write(dir.path().join("notes.txt"), "").expect("file");
+        let listed = ledger_folders(dir.path()).expect("listed");
+        let verdicts: Vec<(&str, bool)> = listed
+            .iter()
+            .map(|(name, verdict)| (name.as_str(), verdict.is_ok()))
+            .collect();
+        assert_eq!(
+            verdicts,
+            vec![("Bad_Name", false), ("acme", true), ("default", false)]
+        );
+        assert!(ledger_folders(&dir.path().join("missing"))
+            .expect("none")
+            .is_empty());
+    }
+
+    fn ledger_with(mesh: &str, topic: &str, port: u16) -> LedgerConfig {
+        let mut config = NodeConfig::load_from_path(
+            &write_temp_config(&format!(
+                r#"{{ "ledgerPath": "./data/ledger.bean", "signing": {{ "enabled": true }},
+                "p2p": {{ "enabled": true, "meshId": "{mesh}", "swarmTopic": "{topic}",
+                "relayMode": "disabled" }} }}"#
+            ))
+            .path()
+            .to_path_buf(),
+        )
+        .expect("config")
+        .ledger_config();
+        config.p2p.listen_port = port;
+        config
+    }
+
+    /// 003: one node serves a mesh once — a second ledger with the same
+    /// `meshId`, the same gossip topic or the same fixed P2P port is refused,
+    /// the first kept — and at most `maxLedgers`; a refused ledger takes no
+    /// place in that count, and port 0 (a random port) is never a conflict.
+    ///
+    /// Bug-catch: let two ledgers share a `meshId` and the node is one member
+    /// of a mesh twice, under two keys.
+    #[test]
+    fn ledgers_in_conflict_refuses_a_second_copy_of_a_mesh_topic_or_port() {
+        let ledgers = [
+            ("a", ledger_with("mesh-a", "topic/a", 0)),
+            ("b", ledger_with("mesh-a", "topic/b", 0)),
+            ("c", ledger_with("mesh-c", "topic/a", 0)),
+            ("d", ledger_with("mesh-d", "topic/d", 7000)),
+            ("e", ledger_with("mesh-e", "topic/e", 7000)),
+            ("f", ledger_with("mesh-f", "topic/f", 0)),
+            ("g", ledger_with("mesh-g", "topic/g", 0)),
+        ];
+        let named: Vec<(&str, &LedgerConfig)> = ledgers
+            .iter()
+            .map(|(name, config)| (*name, config))
+            .collect();
+        let refused: Vec<String> = ledgers_in_conflict(&named, 3)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            refused,
+            ["b", "c", "e", "g"],
+            "a, d and f are served; g is the fourth"
+        );
+        assert!(ledgers_in_conflict(&named[..1], MAX_LEDGERS).is_empty());
+    }
+
+    /// 003: `ledgersDir` is held to the `ledgerPath` rule (no `..`, under the
+    /// working directory), the config file's ledger may not sit inside it,
+    /// and `maxLedgers` is 1 to [`MAX_LEDGERS`].
+    ///
+    /// Bug-catch: let `ledgerPath` sit in `ledgersDir` and a folder named for
+    /// its directory is the same ledger twice.
+    #[test]
+    fn ledgers_dir_and_max_ledgers_are_checked() {
+        for (fields, expected) in [
+            (
+                r#""ledgersDir": "../elsewhere""#,
+                "ledgersDir must not contain",
+            ),
+            (
+                r#""ledgersDir": "./data""#,
+                "ledgerPath must not be inside ledgersDir",
+            ),
+            (r#""maxLedgers": 0"#, "maxLedgers must be between"),
+            (r#""maxLedgers": 101"#, "maxLedgers must be between"),
+        ] {
+            let file = write_temp_config(&format!(
+                r#"{{ "ledgerPath": "./data/ledger.bean", {fields} }}"#
+            ));
+            let Err(error) = NodeConfig::load_from_path(&file.path().to_path_buf()) else {
+                panic!("{fields}: refused");
+            };
+            assert!(format!("{error}").contains(expected), "{fields}: {error}");
+        }
+        let file = write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean" }"#);
+        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("defaults");
+        assert_eq!(
+            (config.ledgers_dir.as_str(), config.max_ledgers),
+            ("./data/ledgers", 100)
+        );
+    }
+
     /// `auth.adminNodes` (002-users-and-roles): EndpointIds, loaded in the
     /// spelling access records carry; an entry that is not one, or an empty
     /// list (which would silently ignore every access record), is refused, and
@@ -2568,7 +2984,7 @@ mod tests {
         let file = write_temp_config(&config_with(&format!(r#"["{node}"]"#)));
         let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("loads");
         assert_eq!(
-            config.auth.admin_node_ids().expect("ids"),
+            config.ledger_config().admin_node_ids().expect("ids"),
             Some([node.clone()].into())
         );
         for (bad, expected) in [
@@ -3257,6 +3673,7 @@ mod tests {
                 );
                 // R-7: the anti-entropy bounds, the newest validation surface.
                 config
+                    .ledger_config()
                     .validate_anti_entropy_bounds()
                     .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
                 checked += 1;

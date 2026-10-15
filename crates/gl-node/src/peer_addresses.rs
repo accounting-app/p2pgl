@@ -329,7 +329,7 @@ impl PeerAddresses {
             relay = self.relay.is_some(),
             "keeping peers in the address lookup: their p2p.peerAddresses (resolved now, every 10 s until each has resolved, then every 5 min) and the mesh's relay if one is set"
         );
-        tokio::spawn(async move {
+        crate::spawn_in_span(async move {
             loop {
                 let all_known = self.refresh(&lookup, resolve_with_system_dns).await;
                 tokio::time::sleep(if all_known {

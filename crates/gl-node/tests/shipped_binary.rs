@@ -690,6 +690,151 @@ fn people_are_managed_with_gl_node_user() {
     assert_eq!(node.stop().code(), Some(0));
 }
 
+/// Several ledgers on the shipped binary (003 step 2): beside the config
+/// file's ledger, a folder `ledgers/acme` with its own mesh and a folder
+/// whose `ledger.json` does not parse. The node serves both good ledgers and
+/// refuses the broken one without stopping; acme has its own node id; a key
+/// issued in acme (`gl-node user --ledger acme`) works there and gets 401 on
+/// the default ledger; an account opened in acme is in acme's books only; the
+/// broken ledger is a 503 to the operator and a 401 to anyone else; and after
+/// a restart acme's key still works.
+///
+/// A folder named `default` in `ledgersDir` is ignored: the config file's
+/// ledger stays served (review I-1).
+///
+/// Bug-catch: stop the node when one ledger folder does not load and every
+/// company on it goes down with the one; let `--node-id` ignore `--ledger`
+/// and acme's peers are given the default ledger's id.
+#[test]
+fn several_ledgers_are_served_side_by_side() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = dir.path().canonicalize().expect("canonical tempdir");
+    let mut node = Node::new(this_binary(), &dir);
+    let acme = dir.join("data/ledgers/acme");
+    std::fs::create_dir_all(&acme).expect("acme folder");
+    std::fs::write(
+        acme.join("ledger.json"),
+        json!({
+            "signing": { "enabled": true },
+            "p2p": {
+                "enabled": true,
+                "relayMode": "disabled",
+                "bootstrapEndpointIds": [],
+                "swarmTopic": format!("shipped-binary/acme-{}", random_hex(8)),
+                "meshId": format!("acme-{}", random_hex(16)),
+            },
+        })
+        .to_string(),
+    )
+    .expect("acme ledger.json");
+    let broken = dir.join("data/ledgers/broken");
+    std::fs::create_dir_all(&broken).expect("broken folder");
+    std::fs::write(broken.join("ledger.json"), "{").expect("broken ledger.json");
+    std::fs::create_dir_all(dir.join("data/ledgers/default")).expect("a stray default folder");
+    node.start("ledgers")
+        .unwrap_or_else(|log| panic!("boot: {log}"));
+
+    let node_id = |ledger: Option<&str>| {
+        let mut command = node.command(&node.binary);
+        command.arg("--node-id");
+        if let Some(ledger) = ledger {
+            command.args(["--ledger", ledger]);
+        }
+        let output = command.output().expect("run --node-id");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    assert_ne!(node_id(None), node_id(Some("acme")), "a key per ledger");
+
+    let added = node
+        .command(&node.binary)
+        .args([
+            "user", "--ledger", "acme", "add", "--name", "Ana", "--role", "write",
+        ])
+        .output()
+        .expect("run gl-node user");
+    let stdout = String::from_utf8_lossy(&added.stdout).into_owned();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let key = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("key:"))
+        .map(|key| key.trim().to_owned())
+        .unwrap_or_else(|| panic!("a key in {stdout}"));
+
+    let port = node.port;
+    let at = |path: &str, key: Option<&str>, query: &str| {
+        let body = json!({ "query": query }).to_string();
+        let (status, text) = http(port, path, key, Some(&body)).expect("http");
+        (
+            status,
+            serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)),
+        )
+    };
+    for account in ["Assets:Acme", "Income:Acme"] {
+        let (status, body) = at(
+            "/ledgers/acme/graphql",
+            Some(&key),
+            &format!(r#"mutation {{ openAccount(name: "{account}", date: "2024-01-01") }}"#),
+        );
+        assert!(status == 200 && body.get("errors").is_none(), "{body}");
+    }
+    let (status, body) = at(
+        "/ledgers/acme/graphql",
+        Some(&key),
+        r#"mutation { appendTransaction(input: { date: "2024-01-02", narration: "acme only", postings: [
+            { account: "Assets:Acme", amount: { number: "5", currency: "USD" } },
+            { account: "Income:Acme" }] }) { txid } }"#,
+    );
+    assert!(status == 200 && body.get("errors").is_none(), "{body}");
+    let (status, _) = at("/graphql", Some(&key), "{ verify { ok } }");
+    assert_eq!(status, 401, "acme's key on the default ledger");
+    let operator = node.api_key.clone();
+    let narrations = |path: &str| {
+        let (status, body) = at(path, Some(&operator), "{ journal { narration } }");
+        assert!(
+            status == 200 && body.get("errors").is_none(),
+            "{path}: {body}"
+        );
+        body["data"]["journal"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| row["narration"].as_str().unwrap_or("").to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        !narrations("/graphql").contains(&"acme only".to_owned()),
+        "not in the default ledger"
+    );
+    assert_eq!(narrations("/ledgers/acme/graphql"), ["acme only"]);
+
+    let (status, body) = at(
+        "/ledgers/broken/graphql",
+        Some(&operator),
+        "{ verify { ok } }",
+    );
+    assert_eq!(status, 503, "{body}");
+    let (status, _) = at("/ledgers/broken/graphql", None, "{ verify { ok } }");
+    assert_eq!(status, 401);
+
+    assert_eq!(node.stop().code(), Some(0));
+    node.start("ledgers-restarted")
+        .unwrap_or_else(|log| panic!("restart: {log}"));
+    node.assert_verified("the default ledger after the restart");
+    let (status, body) = at("/ledgers/acme/graphql", Some(&key), "{ verify { ok } }");
+    assert_eq!(status, 200, "acme's key after the restart: {body}");
+    assert_eq!(narrations("/ledgers/acme/graphql"), ["acme only"]);
+    assert_eq!(node.stop().code(), Some(0));
+}
+
 /// The upgrade and rollback procedure of docs/OPERATIONS.md, from the previous
 /// release's binary (`GL_NODE_PREVIOUS_BINARY`) to this one: the previous
 /// version writes a ledger and a backup is taken; this version starts on those

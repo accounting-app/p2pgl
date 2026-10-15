@@ -513,6 +513,8 @@ signing node without it refuses to boot, and the refusal names that remedy.
 | Field | Default | Description |
 |-------|---------|-------------|
 | `ledgerPath` | **(required)** | Path to the `.bean` file |
+| `ledgersDir` | `./data/ledgers` | Folder of this node's other ledgers, one folder each (see [Several ledgers](#several-ledgers)); missing = none. Under the working directory, and `ledgerPath` may not be inside it |
+| `maxLedgers` | `100` | The most ledgers the node serves, its own included. `1`–`100` |
 | `bindAddress` | `"127.0.0.1"` | HTTP listen address |
 | `port` | `4000` | HTTP listen port |
 | `watchLedgerFile` | `false` | Poll the `.bean` every 250 ms and fold a hand edit in promptly. It does **not** control whether a hand edit is accepted — nothing does — see [Editing the `.bean` file](#editing-the-bean-file-by-hand) |
@@ -1086,6 +1088,68 @@ back with a code: `INVALID_INPUT` (someone not on the list, a blank name, a
 past expiry), `NO_ACCESS_LIST` (signing or auth is off) or `NOT_AN_ADMIN_NODE` (this
 node is outside `auth.adminNodes`). Names, roles, expiry dates and key hashes
 are part of the books: anyone given the `.bean` sees them, never a key.
+
+### Several ledgers
+
+One node can serve several companies' ledgers, each kept apart: its own
+`.bean`, its own mesh and node key, its own people and keys. The config file's
+ledger is the one named **`default`**, served at `/graphql` as before. Every
+other ledger is a folder in `ledgersDir`, named for the ledger (1 to 40 of
+`a-z`, `0-9` and `-`), holding a `ledger.json` beside its files:
+
+```
+data/ledgers/acme/ledger.json      the ledger's settings
+data/ledgers/acme/ledger.bean      its books (created on first boot)
+data/ledgers/acme/iroh.secret      its node key (created on first boot with P2P on)
+```
+
+`ledger.json` takes the ledger's own sections of the config file —
+`watchLedgerFile`, `signing`, `format`, `p2p` and `auth.adminNodes` — with the
+same defaults and the same checks; the ledger's file and key are always in its
+folder, so `ledgerPath` and `p2p.secretKeyPath` are not set there:
+
+```json
+{
+  "signing": { "enabled": true },
+  "p2p": {
+    "enabled": true,
+    "meshId": "<a fresh uuidgen for Acme's mesh>",
+    "swarmTopic": "openledger/<another uuid>",
+    "relayMode": "custom",
+    "relayUrl": "https://relay.example.com",
+    "bootstrapEndpointIds": ["<the other nodes of Acme's mesh>"]
+  }
+}
+```
+
+A client names the ledger in the path: **`/ledgers/acme/graphql`** (POST; the
+GraphiQL page is the `default` ledger's) and `/ledgers/acme/health`. A key is
+checked against that ledger's people only, so a key issued in one ledger gets
+`401` from every other; the operator key works on every ledger. A name the node
+does not serve answers like a wrong key (`401`, the same body), so a name's
+status says nothing about it; with the operator key it is `404`
+(`NO_SUCH_LEDGER`), or `503` (`LEDGER_NOT_SERVED`) for a ledger refused at
+boot. (The answer for a ledger that is served can take longer — its key check
+does more work — so names are not hidden from timing; the rate limit bounds
+how fast anyone can try.) A named ledger's `/health`
+needs a key that ledger accepts; `/health` stays the `default` ledger's and open.
+
+The command-line tools take `--ledger`:
+
+```bash
+gl-node --node-id --ledger acme            # acme's node id, for the other nodes' allowlists
+gl-node user --ledger acme add --name "Ana Ruiz" --role write
+```
+
+At boot the node starts the `default` ledger and then each folder. A folder
+whose `ledger.json` does not load, that repeats another ledger's `meshId`,
+`swarmTopic` or fixed `listenPort`, or whose node key is another ledger's (a
+copied folder: one node id in two meshes would tie them together), is logged
+and not served; the others are. A folder named `default` is ignored, and files
+in `ledgersDir` are not ledgers.
+The node stops only if it can serve no ledger at all. Each ledger's log lines
+carry its name (`ledger="acme"`). Adding or removing a ledger takes a restart
+for now.
 
 ### Editing the `.bean` file by hand
 

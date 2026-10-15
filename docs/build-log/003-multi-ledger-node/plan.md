@@ -58,8 +58,14 @@ signing, Format, the file watcher; its access list and `auth.adminNodes`.
    ordering comments move with the code.
 2. **Ledgers from `ledgersDir`, routed by path.** The registry, the routes,
    auth per ledger, the unknown-name rule, per-ledger failure, the cross-ledger
-   checks, per-ledger `/health` plus a node summary, `--ledger <name>` on
-   `gl-node user` and `--node-id`. README (*Several ledgers*), CHANGELOG.
+   checks, per-ledger `/health`, `--ledger <name>` on `gl-node user` and
+   `--node-id`. README (*Several ledgers*), CHANGELOG. (As built: `/health`
+   stays the `default` ledger's; a named ledger's `/health` needs a key it
+   accepts, so it cannot be used to probe names; GraphiQL is the `default`
+   ledger's only, since its page posts to `/graphql`; the node summary moves
+   to step 4's `ledgers` query.) Step 4 inherits from the step 2 review: a
+   full stop of one ledger must also end its address-refresh task, which a
+   ledger refused after building its endpoint leaves running.
    Once a failed ledger no longer ends the process, `start` must undo what it
    began: validate everything (`adminNodes`) before spawning a task, and on a
    later failure stop the P2P tasks, the watcher and the endpoint before

@@ -258,8 +258,8 @@
   },
   "U-R16-unparsable-admin-node-accepted": {
     "file": "crates/gl-node/src/config.rs",
-    "old": "            self.auth.admin_node_ids()?;",
-    "new": "            let _ = self.auth.admin_node_ids();",
+    "old": "            self.admin_node_ids()?;",
+    "new": "            let _ = self.admin_node_ids();",
     "runs": [
       [
         "-p",
@@ -632,8 +632,8 @@
   },
   "U-R41-cli-sends-no-host": {
     "file": "crates/gl-node/src/user_cli.rs",
-    "old": "        \"POST /graphql HTTP/1.1\\r\\nHost: {authority}\\r\\n",
-    "new": "        \"POST /graphql HTTP/1.1\\r\\nX-Host: {authority}\\r\\n",
+    "old": "        \"POST {path} HTTP/1.1\\r\\nHost: {authority}\\r\\n",
+    "new": "        \"POST {path} HTTP/1.1\\r\\nX-Host: {authority}\\r\\n",
     "runs": [
       [
         "-p",
