@@ -12,8 +12,16 @@ HTTP, iroh P2P, config), `security` (signing). Design and audit history live in
   "ready to commit". `--quick` skips the tests. Logs in `target/gate/`.
 - `cargo test -p ledger --lib -- <filter>`, `cargo test -p gl-node --bin gl-node -- <filter>`,
   `cargo test -p p2p --test <file> -- <filter>` — one test or area.
-- `scripts/revert_check.py scripts/revert_specs/<file>.json [NAME…]` — revert
-  checks (below). `--check` validates anchors without building.
+- `scripts/revert_check.sh scripts/revert_specs/<file>.json [NAME…]` — revert
+  checks (below; `cargo xtask revert-check`). `--check <file>` validates one
+  file's anchors without building, `--check-all` every file's (the gate runs it).
+- `scripts/measure_ledgers.sh` — boot, memory and mesh measurements of a node
+  with many ledgers (`cargo xtask measure-ledgers --help`).
+- The project's tools are Rust (`xtask/`) and shell — no Python. The git guard
+  is `.claude/hooks/guard_git.sh`; its cases are `guard_git_cases.jsonl`, run by
+  `test_guard_git.sh` in the gate. In a command, write text that mentions
+  `git add`/`commit`/`push` in single quotes: in double quotes the guard reads
+  it as a command and refuses it.
 - `crates/gl-node/tests/shipped_binary.rs` starts the built binary and drives
   it over loopback HTTP; with `GL_NODE_PREVIOUS_BINARY` it also rehearses an
   upgrade and rollback. `scripts/release.sh` builds and checks a release of the

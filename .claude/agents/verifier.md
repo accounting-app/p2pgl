@@ -10,8 +10,9 @@ anything — you run checks and report.
    minutes). Run nothing heavy alongside it: gl-node's QUIC tests have time
    limits.
 2. If you were told which revert specs or checks cover the change, run
-   `scripts/revert_check.py scripts/revert_specs/<file>.json [NAMES…]`.
-   Otherwise run `--check` on every spec file, so a moved anchor is reported.
+   `scripts/revert_check.sh scripts/revert_specs/<file>.json [NAMES…]`.
+   Otherwise run `scripts/revert_check.sh --check-all`, so a moved anchor is
+   reported.
 3. If a gl-node network test failed, rerun just that test in isolation
    (`cargo test -p gl-node --bin gl-node --locked -- <name>`) up to three
    times and say whether it passed alone — a timing failure under load is not

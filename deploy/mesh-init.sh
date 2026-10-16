@@ -42,7 +42,7 @@ elif command -v docker-compose >/dev/null 2>&1; then
 else
   fail "neither 'docker compose' nor 'docker-compose' is available"
 fi
-command -v python3 >/dev/null || fail "python3 is required"
+command -v jq >/dev/null || fail "jq is required (to write the mesh configs)"
 command -v openssl >/dev/null || fail "openssl is required (to generate the API keys)"
 
 if [[ -e mesh ]]; then
@@ -71,8 +71,17 @@ fi
 
 "${compose[@]}" build --quiet
 
-mesh_id=${MESH_ID:-$(python3 -c 'import uuid; print(uuid.uuid4())')}
-swarm_topic=${SWARM_TOPIC:-"openledger/$(python3 -c 'import uuid; print(uuid.uuid4())')"}
+# A random (version 4) UUID from openssl, which is already required: `uuidgen`
+# can fall back to a time-based UUID, and the swarm topic must not be guessed.
+new_uuid() {
+  local hex
+  hex=$(openssl rand -hex 16)
+  [[ "$hex" =~ ^[0-9a-f]{32}$ ]] || fail "openssl did not produce random bytes"
+  printf '%s-%s-4%s-%x%s-%s\n' "${hex:0:8}" "${hex:8:4}" "${hex:13:3}" \
+    $(( (0x${hex:16:1} & 3) | 8 )) "${hex:17:3}" "${hex:20:12}"
+}
+mesh_id=${MESH_ID:-$(new_uuid)}
+swarm_topic=${SWARM_TOPIC:-"openledger/$(new_uuid)"}
 
 # From here on files are written: a failure removes the partial mesh, so the
 # script can simply be run again.
@@ -81,28 +90,20 @@ trap '[[ $? -eq 0 ]] || rm -rf mesh' EXIT
 
 # One config per node from gl-node.docker.json: the identity first (no peers
 # yet — they are not known), then the full config once every id is.
-write_config() {  # node, peers-json ("{}" for none)
-  python3 - "$1" "$2" "$mesh_id" "$swarm_topic" <<'PY'
-import json, os, sys
-node, peers, mesh_id, topic = sys.argv[1], json.loads(sys.argv[2]), sys.argv[3], sys.argv[4]
-config = json.load(open("gl-node.docker.json"))
-p2p = config["p2p"]
-p2p.update({
-    "meshId": mesh_id,
-    "swarmTopic": topic,
-    # No peers yet (the identity step): nothing to reach, and "custom" with
-    # neither a relay nor an address is refused at boot.
-    "relayMode": "custom" if peers else "disabled",
-    "listenPort": 4433,
-    "bootstrapEndpointIds": sorted(peers),
-    "peerAddresses": {peer_id: [f"node-{peer_node}:4433"] for peer_id, peer_node in peers.items()},
-})
-path = f"mesh/node-{node}.json"
-with open(path, "w") as out:
-    json.dump(config, out, indent=4)
-    out.write("\n")
-os.chmod(path, 0o644)  # the container's user must read it (see the header)
-PY
+write_config() {  # node, peers-json: {"<EndpointId>": <node>, …} ("{}" for none)
+  local path="mesh/node-$1.json"
+  # No peers yet (the identity step): nothing to reach, and "custom" with
+  # neither a relay nor an address is refused at boot.
+  jq --indent 4 --argjson peers "$2" --arg mesh "$mesh_id" --arg topic "$swarm_topic" '
+    .p2p += {
+      meshId: $mesh,
+      swarmTopic: $topic,
+      relayMode: (if ($peers | length) > 0 then "custom" else "disabled" end),
+      listenPort: 4433,
+      bootstrapEndpointIds: ($peers | keys),
+      peerAddresses: ($peers | with_entries(.value = ["node-\(.value):4433"]))
+    }' gl-node.docker.json > "$path"
+  chmod 644 "$path"  # the container's user must read it (see the header)
 }
 
 # Identity configs first: every container below mounts deploy/mesh/node-N.json,
@@ -130,11 +131,9 @@ for node in 0 1 2; do
 done
 
 for node in 0 1 2; do
-  peers=$(python3 -c '
-import json, sys
-node, ids = int(sys.argv[1]), sys.argv[2:]
-print(json.dumps({ids[peer]: peer for peer in range(3) if peer != node}))
-' "$node" "${ids[@]}")
+  peers=$(for peer in 0 1 2; do
+    [[ $peer == "$node" ]] || printf '%s %s\n' "${ids[$peer]}" "$peer"
+  done | jq -cRn '[inputs | split(" ") | {(.[0]): (.[1] | tonumber)}] | add')
   write_config "$node" "$peers"
 done
 

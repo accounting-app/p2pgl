@@ -1,0 +1,128 @@
+{"expect": "deny", "command": "git add file.rs"}
+{"expect": "deny", "command": "git stage file.rs"}
+{"expect": "deny", "command": "git mv a b"}
+{"expect": "deny", "command": "git rm a"}
+{"expect": "deny", "command": "git rm --cached a"}
+{"expect": "deny", "command": "git commit -m 'unit 4'"}
+{"expect": "deny", "command": "git commit --amend --no-edit"}
+{"expect": "deny", "command": "git push"}
+{"expect": "deny", "command": "git push --force origin main"}
+{"expect": "deny", "command": "git  add x"}
+{"expect": "deny", "command": "git -C crates/ledger add x"}
+{"expect": "deny", "command": "git -c user.name=x commit -m y"}
+{"expect": "deny", "command": "git --no-pager commit -m x"}
+{"expect": "deny", "command": "cd a && git add x"}
+{"expect": "deny", "command": "cd a&&git add x"}
+{"expect": "deny", "command": "true;git push"}
+{"expect": "deny", "command": "false || git commit -m x"}
+{"expect": "deny", "command": "ls | git add --pathspec-from-file=-"}
+{"expect": "deny", "command": "git status & git push"}
+{"expect": "deny", "command": "git status\ngit add x"}
+{"expect": "deny", "command": "x=1; git add ."}
+{"expect": "deny", "command": "GIT_EDITOR=true git commit"}
+{"expect": "deny", "command": "env GIT_DIR=.git git commit"}
+{"expect": "deny", "command": "echo $(git commit -m x)"}
+{"expect": "deny", "command": "echo `git add x`"}
+{"expect": "deny", "command": "(git commit -m x)"}
+{"expect": "deny", "command": "{ git add x; }"}
+{"expect": "deny", "command": "! git push"}
+{"expect": "deny", "command": "(cd x); git commit -m x", "python": "allow"}
+{"expect": "deny", "command": "echo \"$(git commit -m x)\"", "python": "allow"}
+{"expect": "deny", "command": "bash -c \"git commit -m x\"", "python": "allow"}
+{"expect": "deny", "command": "sh -c 'git push'", "python": "allow"}
+{"expect": "deny", "command": "zsh -lc 'git add x'", "python": "allow"}
+{"expect": "deny", "command": "eval git add .", "python": "allow"}
+{"expect": "deny", "command": "eval 'git push'", "python": "allow"}
+{"expect": "deny", "command": "command git add x", "python": "allow"}
+{"expect": "deny", "command": "xargs git add < files", "python": "allow"}
+{"expect": "deny", "command": "find . -name '*.rs' -exec git add {} +", "python": "allow"}
+{"expect": "deny", "command": "/usr/bin/git add x", "python": "allow"}
+{"expect": "deny", "command": "time git push", "python": "allow"}
+{"expect": "deny", "command": "nohup git push &", "python": "allow"}
+{"expect": "deny", "command": "sudo git commit", "python": "allow"}
+{"expect": "deny", "command": "exec git commit", "python": "allow"}
+{"expect": "deny", "command": "if true; then git add x; fi", "python": "allow"}
+{"expect": "deny", "command": "for f in a; do git add $f; done", "python": "allow"}
+{"expect": "deny", "command": "while read f; do git rm \"$f\"; done < list", "python": "allow"}
+{"expect": "allow", "command": "cat > f <<EOF\ngit add x\nEOF"}
+{"expect": "allow", "command": "echo \"git add later\""}
+{"expect": "allow", "command": "git status --short"}
+{"expect": "allow", "command": "git log --oneline -3"}
+{"expect": "allow", "command": "git diff --stat"}
+{"expect": "allow", "command": "git show HEAD:README.md"}
+{"expect": "allow", "command": "git log -S'validate_transaction' -- crates"}
+{"expect": "allow", "command": "git status && git diff"}
+{"expect": "allow", "command": "git commit-tree HEAD^{tree}"}
+{"expect": "allow", "command": "git stash list"}
+{"expect": "allow", "command": "git ls-files '*.py'"}
+{"expect": "allow", "command": "legit add x"}
+{"expect": "allow", "command": "gitk --all"}
+{"expect": "allow", "command": "grep 'git add' file"}
+{"expect": "allow", "command": "echo 'git push'"}
+{"expect": "allow", "command": "git log --format='%s add'"}
+{"expect": "allow", "command": "cat > f <<'EOF'\ngit add x\ngit commit -m y\nEOF\ngit status"}
+{"expect": "allow", "command": "python3 - <<'EOF'\nimport subprocess\nsubprocess.run(['git','commit'])\nEOF"}
+{"expect": "allow", "command": "cat <<\"EOF\" > notes.md\nthen git push\nEOF"}
+{"expect": "allow", "command": "python3 -c 'print(1)' && git log"}
+{"expect": "allow", "command": "rm -f target/x && cargo build"}
+{"expect": "allow", "command": "cargo add serde"}
+{"expect": "allow", "command": "scripts/gate.sh"}
+{"expect": "allow", "command": ""}
+{"expect": "deny", "command": "g\\it commit -m x"}
+{"expect": "deny", "command": "gi\\t commit"}
+{"expect": "deny", "command": "git com\\mit"}
+{"expect": "deny", "command": "'g'it commit"}
+{"expect": "deny", "command": "\"g\"it commit"}
+{"expect": "deny", "command": "git co\"\"mmit"}
+{"expect": "deny", "command": "git 'commit' -m x"}
+{"expect": "deny", "command": "git -C \"$(pwd)\" commit -m x"}
+{"expect": "deny", "command": "git --git-dir=\"$(pwd)/.git\" commit"}
+{"expect": "deny", "command": "git -C `pwd` push", "python": "allow"}
+{"expect": "deny", "command": "cat <<EOF\nit's\nEOF\ngit push"}
+{"expect": "deny", "command": "cat <<EOF > f\nit's ok\nEOF\ngit add f"}
+{"expect": "deny", "command": "git \\\ncommit -m x", "python": "allow"}
+{"expect": "deny", "command": "GIT commit", "python": "allow"}
+{"expect": "deny", "command": "Git Push", "python": "allow"}
+{"expect": "deny", "command": "cargo test # won't\ngit push", "python": "allow"}
+{"expect": "deny", "command": "bash -ce 'git commit'", "python": "allow"}
+{"expect": "deny", "command": "bash -c -- 'git commit'", "python": "allow"}
+{"expect": "deny", "command": "bash -c -x 'git push'", "python": "allow"}
+{"expect": "deny", "command": "env -S 'git commit'", "python": "allow"}
+{"expect": "deny", "command": "trap 'git commit' EXIT", "python": "allow"}
+{"expect": "deny", "command": "bash -c 'cd x; git add y'", "python": "allow"}
+{"expect": "deny", "command": "echo '<<\"X\"'\ngit commit", "python": "allow"}
+{"expect": "deny", "command": "cat <<'E'OF\nx\nEOF\ngit commit", "python": "allow"}
+{"expect": "deny", "command": "cat <<\\EOF\nx\nEOF\ngit push"}
+{"expect": "deny", "command": "cat <<EOF\n$(git commit -m x)\nEOF", "python": "allow"}
+{"expect": "deny", "command": "cat <<EOF\n`git add x`\nEOF", "python": "allow"}
+{"expect": "deny", "command": "cat <<-EOF\n\tx\n\tEOF\ngit push"}
+{"expect": "deny", "command": "echo \"`git push`\"", "python": "allow"}
+{"expect": "deny", "command": "echo $(echo $(git add x))"}
+{"expect": "deny", "command": "git commit -m 'unclosed"}
+{"expect": "allow", "command": "git grep -n add crates"}
+{"expect": "allow", "command": "git grep \"fn add\""}
+{"expect": "allow", "command": "git log -S\"push\""}
+{"expect": "allow", "command": "git stash push"}
+{"expect": "allow", "command": "git remote add origin url"}
+{"expect": "allow", "command": "git worktree add ../w"}
+{"expect": "allow", "command": "git help commit"}
+{"expect": "allow", "command": "grep -c 'git add' f"}
+{"expect": "allow", "command": "rg -c 'git push' docs"}
+{"expect": "allow", "command": "cat > notes <<EOF\nit's fine\nEOF\ngit status"}
+{"expect": "allow", "command": "bash -c 'cd x; ls'"}
+{"expect": "allow", "command": "echo \"it's\" && git log"}
+{"expect": "allow", "command": "git log --format=%H -1"}
+{"expect": "allow", "command": "cat <<EOF\n$(git log -1)\nEOF"}
+{"expect": "allow", "command": "cargo test # it's fine"}
+{"expect": "allow", "command": "git ls-files | xargs grep -l 'git add'"}
+{"expect": "allow", "command": "env LC_ALL=C grep -rn \"git push\" docs"}
+{"expect": "allow", "command": "rg -l guard | xargs grep -n \"git commit\""}
+{"expect": "allow", "command": "find docs -name '*.md' | xargs grep -l \"don't\""}
+{"expect": "allow", "command": "env RUST_LOG=info cargo run -- \"it's\""}
+{"expect": "allow", "command": "xargs -I{} echo \"it's {}\" < list"}
+{"expect": "deny", "command": "env -S'git commit'", "python": "allow"}
+{"expect": "deny", "command": "env -S \"git push -f\"", "python": "allow"}
+{"expect": "deny", "command": "env -i PATH=/bin git add x", "python": "allow"}
+{"expect": "deny", "command": "git status \\", "python": "allow"}
+{"expect": "allow", "command": "printf -- '- a \u2014 b' >> notes.md && tail -2 notes.md"}
+{"expect": "deny", "command": "echo caf\u00e9 \u2014 done && git commit -m \u00e9t\u00e9"}
