@@ -448,5 +448,294 @@
         "the_rate_limit_is_per_client_and_ledger"
       ]
     ]
+  },
+  "L-R32-a-stop-ends-only-the-watcher": {
+    "file": "crates/gl-node/src/ledger_runtime.rs",
+    "old": "        for task in self.tasks.lock().expect(\"ledger tasks lock\").drain(..) {",
+    "new": "        for task in self.tasks.lock().expect(\"ledger tasks lock\").drain(..).filter(|_| false) {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_stopped_ledger_leaves_no_task_running"
+      ]
+    ]
+  },
+  "L-R33-tasks-of-tasks-untracked": {
+    "file": "crates/gl-node/src/main.rs",
+    "old": "                LEDGER_TASKS\n                    .scope(std::sync::Arc::clone(&tasks), future)\n                    .in_current_span(),",
+    "new": "                future.in_current_span(),",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_stopped_ledger_leaves_no_task_running"
+      ]
+    ]
+  },
+  "L-R34-an-added-ledger-not-served": {
+    "file": "crates/gl-node/src/ledger_admin.rs",
+    "old": "            Ok(running) => self.serve(name, running).await,\n            Err(ledger_runtime::StartFailed) => Err(self.set_aside_failed(",
+    "new": "            Ok(running) => { stop(name, running).await; Err(refused(\"START_FAILED\", \"not served\")) }\n            Err(ledger_runtime::StartFailed) => Err(self.set_aside_failed(",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "an_added_ledger_is_served_at_once_and_kept_for_the_next_boot"
+      ]
+    ]
+  },
+  "L-R35-a-refused-add-leaves-its-folder": {
+    "file": "crates/gl-node/src/ledger_admin.rs",
+    "old": "            if let Err(error) = std::fs::remove_dir_all(&staging) {",
+    "new": "            if let Err(error) = Ok::<(), std::io::Error>(()) {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_change_the_node_refuses_changes_nothing"
+      ]
+    ]
+  },
+  "L-R36-an-added-ledger-gets-no-key": {
+    "file": "crates/gl-node/src/ledger_admin.rs",
+    "old": "        if config.p2p.enabled || config.signing.enabled {\n            let key = Path::new(&config.p2p.secret_key_path);",
+    "new": "        if false {\n            let key = Path::new(&config.p2p.secret_key_path);",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "an_added_ledger_is_served_at_once_and_kept_for_the_next_boot"
+      ]
+    ]
+  },
+  "L-R37-an-add-skips-the-conflict-check": {
+    "file": "crates/gl-node/src/ledger_admin.rs",
+    "old": "        if let Some(reason) = self.conflict(name, &config).await {\n            return Err(discard(refused(\"LEDGER_CONFLICT\", reason)));",
+    "new": "        if let Some(reason) = None::<String> {\n            return Err(discard(refused(\"LEDGER_CONFLICT\", reason)));",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_change_the_node_refuses_changes_nothing"
+      ]
+    ]
+  },
+  "L-R38-removed-without-a-stop": {
+    "file": "crates/gl-node/src/ledger_admin.rs",
+    "old": "            Some(Taken::Running(Some(running))) => stop(name, *running).await,",
+    "new": "            Some(Taken::Running(Some(running))) => drop(running),",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_removed_ledger_is_stopped_and_its_folder_moved_aside"
+      ]
+    ]
+  },
+  "L-R39-removed-without-waiting-for-requests": {
+    "file": "crates/gl-node/src/ledgers.rs",
+    "old": "                if let Ok(drained) = slots.acquire_many(all).await {",
+    "new": "                if let Ok(drained) = slots.try_acquire_many(all) {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_removal_waits_for_requests_in_flight_and_no_one_else"
+      ]
+    ]
+  },
+  "L-R40-the-registry-held-while-waiting": {
+    "file": "crates/gl-node/src/ledgers.rs",
+    "old": "        let served = self.by_name.write().await.remove(name)?;",
+    "new": "        let mut by_name = self.by_name.write().await;\n        let served = by_name.remove(name)?;",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_removal_waits_for_requests_in_flight_and_no_one_else"
+      ]
+    ]
+  },
+  "L-R41-node-endpoint-open-to-anyone": {
+    "file": "crates/gl-node/src/ledger_admin.rs",
+    "old": "    if ledgers.is_operator(request.headers()).await {",
+    "new": "    if true || ledgers.is_operator(request.headers()).await {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_node_endpoint_is_the_operators_only"
+      ]
+    ]
+  },
+  "L-R42-a-restart-stops-before-loading": {
+    "edits": [
+      {
+        "file": "crates/gl-node/src/ledger_admin.rs",
+        "old": "        if let Some(Taken::Running(Some(running))) = self.ledgers.take(name).await {\n            stop(name, *running).await;\n        }",
+        "new": ""
+      },
+      {
+        "file": "crates/gl-node/src/ledger_admin.rs",
+        "old": "        let config = LedgerConfig::load_folder(&folder)\n            .map_err(|error| refused(\"INVALID_INPUT\", error.to_string()))?;",
+        "new": "        if let Some(Taken::Running(Some(running))) = self.ledgers.take(name).await {\n            stop(name, *running).await;\n        }\n        let config = LedgerConfig::load_folder(&folder)\n            .map_err(|error| refused(\"INVALID_INPUT\", error.to_string()))?;"
+      }
+    ],
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_restart_picks_up_the_folder_or_keeps_the_ledger_as_it_was"
+      ]
+    ]
+  },
+  "L-R43-cli-not-on-the-node-endpoint": {
+    "file": "crates/gl-node/src/ledger_cli.rs",
+    "old": "pub const NODE_PATH: &str = \"/node/graphql\";",
+    "new": "pub const NODE_PATH: &str = \"/graphql\";",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_cli_adds_lists_and_removes_ledgers_through_the_node"
+      ]
+    ]
+  },
+  "L-R44-a-removed-folder-left-in-place": {
+    "file": "crates/gl-node/src/ledger_admin.rs",
+    "old": "    std::fs::rename(ledgers_dir.join(name), &target)?;",
+    "new": "    std::fs::create_dir(&target)?;",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_removed_ledger_is_stopped_and_its_folder_moved_aside"
+      ]
+    ]
+  },
+  "L-R45-settings-flag-on-every-command": {
+    "file": "crates/gl-node/src/ledger_cli.rs",
+    "old": "    if settings.is_some() && command != \"add\" {",
+    "new": "    if false {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "ledger_commands_parse_as_the_usage_says"
+      ]
+    ]
+  },
+  "L-R46-gl-node-ledger-not-dispatched": {
+    "file": "crates/gl-node/src/main.rs",
+    "old": "        Some(\"ledger\") => CliAction::Ledger(args.collect()),",
+    "new": "",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "ledgers_are_added_and_removed_while_the_node_runs"
+      ]
+    ]
+  },
+  "L-R47-removed-folders-read-as-ledgers": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "        if name.starts_with('.') {",
+    "new": "        if false {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "ledgers_are_added_and_removed_while_the_node_runs"
+      ]
+    ]
+  },
+  "L-R48-a-stop-ignores-late-writers": {
+    "file": "crates/gl-node/src/ledger_runtime.rs",
+    "old": "        drop(crate::ledger_commit::acquire_write_permit(&self.ledger).await);",
+    "new": "",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_stop_waits_for_a_write_begun_after_its_compaction"
+      ]
+    ]
+  },
+  "L-R49-commits-among-a-ledgers-tasks": {
+    "file": "crates/gl-node/src/ledger_commit.rs",
+    "old": "    let commit = crate::spawn_detached_in_span(async move {",
+    "new": "    let commit = crate::spawn_in_span(async move {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_commit_is_never_among_a_ledgers_tasks"
+      ]
+    ]
+  },
+  "L-R50-a-refused-start-keeps-its-node-id": {
+    "file": "crates/gl-node/src/ledger_runtime.rs",
+    "old": "                .retain(|_, owner| owner != name);",
+    "new": "                .retain(|_, _| true);",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_refused_start_frees_its_node_id"
+      ]
+    ]
+  },
+  "L-R51-a-change-in-the-requests-own-future": {
+    "file": "crates/gl-node/src/ledger_admin.rs",
+    "old": "    match crate::spawn_detached_in_span(async move { schema.execute(request).await }).await {",
+    "new": "    match Ok::<_, tokio::task::JoinError>(schema.execute(request).await) {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_change_cut_short_still_runs_to_its_end"
+      ]
+    ]
   }
 }

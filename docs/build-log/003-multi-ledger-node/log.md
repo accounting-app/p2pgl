@@ -203,3 +203,81 @@ to commit. The commit hash is filled in once the maintainer has committed.
 - **Departures from the plan:** parallel boot is new (the plan had parallel
   stop only): sequential boot measured 17 s for 30 busy ledgers.
 - **Commit:** 156733d
+
+## 2026-10-16 — Step 4: add, remove and restart ledgers at runtime
+
+- **What changed:** a company's ledger is added, removed or restarted while
+  the node runs, the others untouched. `gl-node ledger add NAME [--settings
+  FILE] | list | restart NAME | remove NAME` (`ledger_cli.rs`) is a client of
+  the node endpoint `/node/graphql` (`ledger_admin.rs`: `ledgers`,
+  `addLedger`, `removeLedger`, `restartLedger`), which takes the operator key
+  only — a person's key from any ledger gets 401 — behind the request guard
+  and a GraphQL budget of its own. **Add** writes `.adding-<name>-…/ledger.json`
+  (0700/0600, synced), loads it with boot's rules, checks it against the
+  served ledgers (`ledgers_in_conflict`, `maxLedgers`), makes the node key
+  when the ledger signs or replicates, renames the folder into place, and
+  starts and serves it; refused, nothing is left; a start that fails moves the
+  folder to `.removed/<name>-<time>-failed`. **Remove** takes the ledger out
+  of the registry, waits until every request it was serving has finished (all
+  its slots back, then closed: one routed to it meanwhile gets 503
+  `LEDGER_BUSY`), stops it, and moves its folder to
+  `.removed/<name>-<UTC time>`; nothing is deleted. **Restart** loads the
+  folder and checks it before stopping anything, so refused settings leave
+  the ledger serving; it also serves a folder refused at boot, or made by
+  hand. One change at a time (`NodeAdmin::busy`, which the node's shutdown
+  also takes), each request on a task of its own so a timeout never leaves a
+  change half done. **A full stop** (`RunningLedger::stop`): every task a
+  ledger spawns while it starts, and every task those spawn, is listed
+  through a task-local (`LEDGER_TASKS`, in `spawn_in_span`) and aborted by its
+  stop; commits and recoveries run detached (`spawn_detached_in_span`, M-39),
+  so a stop never cuts a write short, and the stop takes the write permit
+  once more after the P2P shutdown, so none is still writing when the lock
+  is released; the stop frees the ledger's node id, and so does a refused
+  start. `user_cli`'s node-and-key lookup is shared (`OperatorTarget`). README
+  (*Adding and removing ledgers while the node runs*), OPERATIONS (*Adding a
+  company*, backups per folder, `.removed/`), CHANGELOG.
+- **Tests:** a stop leaves no task running, nested ones included; an added
+  ledger is served at once and its folder is in place for the next boot, a
+  signing ledger with its key; a removed ledger is stopped, its books whole in
+  the moved folder, and moved back under another name it is served again with
+  its node id; refused changes change nothing (bad names, `default`, settings
+  that are not a `ledger.json`, a used name, a shared mesh, removing or
+  restarting what is not there); a restart picks up an edit, keeps the ledger
+  serving through refused ones, and serves a fixed or hand-made folder; the
+  node endpoint is the operator's only; a removal waits for a request in
+  flight while the other ledgers answer; the CLI parses and drives the node;
+  and the shipped binary adds, lists, removes, re-adds and restarts.
+  Also: a stop waits for a write begun after its compaction; a commit is
+  never among a ledger's tasks; a refused start frees its node id; a change
+  whose request is cut short still runs to its end.
+- **Review round** (reviewer subagent). *Important:* a peer's `Supply` is
+  served on iroh's tasks, not the ledger's, so its commit could start after
+  the stop's compaction and, detached, still be writing after the router shut
+  down and the lock was released — during a restart's boot of the same files,
+  or a removal's move. The stop now takes the write permit once more after the
+  router shutdown (every writer holds it to its end), and the docs say a
+  record pushed in those last moments stays in the journal until the next
+  start. Also fixed: the commit detach and the node endpoint's own task had no
+  revert check (now L-R49, L-R51); a refused start kept its node id claimed,
+  so the folder could not be served under another name (now freed; L-R50);
+  the node's shutdown released `busy`, so a change queued behind it could
+  start a ledger nothing would stop (it stays held); OPERATIONS says a crash
+  mid-add can leave an `.adding-` folder that may be deleted; a stale comment
+  on the refused-start branch. Not changed: the key-creation log line names
+  the staging path.
+- **Gate:** `scripts/gate.sh` — 1,616 passed, 0 failed, 0 ignored (7 min 0 s), on the final tree.
+- **Revert checks:** `ledgers.json` — L-R32 to L-R51 (20) bite, two of them
+  (L-R46, L-R47) through the shipped binary. A first L-R38 (remove without a
+  stop) did not bite: a small ledger rewrites its `.bean` at every write, so
+  no test of that size sees a compaction skipped; the test now restores the
+  removed folder under another name, which works only if the stop freed its
+  node id. A planned check that a refused ledger can be replaced in the
+  registry did not bite either: nothing needs it (a restart takes the refused
+  ledger out first), so the change was undone. Not pinned: the recovery
+  reload's detach (`ledger_commit.rs`, the same mechanism as the commit's,
+  L-R49) — reaching a recovery needs a failing commit inside a ledger's task.
+- **Departures from the plan:** recorded in `plan.md` step 4 (*As built*):
+  `restartLedger`, the key made for a signing-only ledger, a failed add moved
+  aside, `default` fixed, the removal's wait, the full stop and the detached
+  writes.
+- **Commit:** <hash>

@@ -79,7 +79,21 @@ signing, Format, the file watcher; its access list and `auth.adminNodes`.
 4. **Add and remove at runtime.** The node endpoint, `gl-node ledger …`,
    atomic folder creation, stop-and-move on remove, restart picks up what was
    added and not what was removed. README, OPERATIONS (*Adding a company*,
-   backups per folder), CHANGELOG.
+   backups per folder), CHANGELOG. (As built: also `restartLedger` /
+   `gl-node ledger restart`, to pick up an edited `ledger.json` — refused
+   settings leave the ledger serving — and to serve a folder refused at boot
+   once fixed; `add` makes the node key whenever the ledger signs, not only
+   with P2P, since a signing-only ledger cannot start without one; an added
+   ledger that does not start has its folder moved to
+   `.removed/<name>-<time>-failed`, so an add is all or nothing; `default`
+   changes only with the node; a removal first waits for the ledger's
+   requests in flight (all its slots taken back), so none writes after the
+   stop; a stop ends every task the ledger spawned (listed through a
+   task-local), while commits and recoveries run detached, and the stop,
+   after its compaction and the P2P shutdown, waits for the write permit —
+   so a late commit (a peer's `Supply`, served on iroh's tasks) ends before
+   the lock is released; each node-endpoint request runs on a task of its
+   own, so a timeout never leaves a change half done.)
 5. **Packaging.** The production template and compose stack with `ledgersDir`;
    `deploy/mesh-init.sh` for a named ledger; OPERATIONS upgrade notes.
 

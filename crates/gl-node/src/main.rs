@@ -8,6 +8,8 @@ mod fetch_coordinator;
 mod graphql;
 mod health;
 mod http_server;
+mod ledger_admin;
+mod ledger_cli;
 mod ledger_commit;
 mod ledger_lock;
 mod ledger_runtime;
@@ -160,11 +162,13 @@ enum CliAction {
     NodeId(Vec<String>),
     /// `gl-node user …` and its arguments (`user_cli`).
     User(Vec<String>),
+    /// `gl-node ledger …` and its arguments (`ledger_cli`).
+    Ledger(Vec<String>),
     Usage(String),
 }
 
 const USAGE: &str =
-    "Usage: gl-node [--health-check | --node-id [--ledger NAME] | --version | user …]";
+    "Usage: gl-node [--health-check | --node-id [--ledger NAME] | --version | user … | ledger …]";
 
 fn parse_cli() -> CliAction {
     let mut args = std::env::args().skip(1);
@@ -174,7 +178,12 @@ fn parse_cli() -> CliAction {
         Some("--health-check") => CliAction::HealthCheck,
         Some("--node-id") => CliAction::NodeId(args.collect()),
         Some("user") => CliAction::User(args.collect()),
-        Some("--help") | Some("-h") => CliAction::Usage(format!("{USAGE}\n{}", user_cli::USAGE)),
+        Some("ledger") => CliAction::Ledger(args.collect()),
+        Some("--help") | Some("-h") => CliAction::Usage(format!(
+            "{USAGE}\n{}\n{}",
+            user_cli::USAGE,
+            ledger_cli::USAGE
+        )),
         Some(other) => CliAction::Usage(format!("unknown argument: {other}\n{USAGE}")),
     }
 }
@@ -331,6 +340,9 @@ async fn main() {
         CliAction::User(args) => {
             user_cli::run(&args);
         }
+        CliAction::Ledger(args) => {
+            ledger_cli::run(&args);
+        }
         CliAction::Usage(message) => {
             eprintln!("{message}");
             std::process::exit(2);
@@ -436,12 +448,24 @@ async fn main() {
         info!("TLS assumed terminated at the host or reverse proxy (in-process TLS is not implemented)");
     }
 
+    // 003 step 4: the node endpoint, for adding, removing and restarting
+    // ledgers while the node runs.
+    let node_admin = Arc::new(ledger_admin::NodeAdmin::new(
+        served_ledgers.clone(),
+        PathBuf::from(&config.ledgers_dir),
+        node_settings.clone(),
+        config.max_ledgers,
+    ));
     let application = build_application_with_limiter(
         served_ledgers.clone(),
         guard_state,
         config.cors_layer(),
         config.graphiql_enabled(),
         rate_limiter,
+        Some(ledger_admin::node_schema(
+            Arc::clone(&node_admin),
+            config.graphiql_enabled(),
+        )),
     );
 
     // Bind and serve.
@@ -487,7 +511,7 @@ async fn main() {
         std::process::exit(1);
     }
 
-    served_ledgers.stop_all().await;
+    node_admin.stop_all().await;
 
     info!("gl-node shut down gracefully");
 }
@@ -653,7 +677,14 @@ pub(crate) fn build_application(
         health_state,
         graphiql,
     );
-    build_application_with_limiter(ledgers, guard_state, cors, graphiql, RateLimiter::graphql())
+    build_application_with_limiter(
+        ledgers,
+        guard_state,
+        cors,
+        graphiql,
+        RateLimiter::graphql(),
+        None,
+    )
 }
 
 /// Assemble the full application router.
@@ -688,6 +719,7 @@ pub(crate) fn build_application_with_limiter(
     cors: CorsLayer,
     graphiql: bool,
     limiter: RateLimiter,
+    node: Option<ledger_admin::NodeSchema>,
 ) -> Router {
     // GraphQL routes — POST always; GraphiQL on GET only when enabled (the
     // `default` ledger's: its page posts to `/graphql`).
@@ -713,6 +745,26 @@ pub(crate) fn build_application_with_limiter(
             guard_state.clone(),
             request_guard::request_guard,
         ));
+    // 003 step 4: the node endpoint — the operator key only, behind the guard
+    // and a GraphQL budget of its own.
+    let node_routes = match node {
+        Some(schema) => Router::new()
+            .route("/node/graphql", post(ledger_admin::node_graphql))
+            .with_state(schema)
+            .layer(middleware::from_fn_with_state(
+                ledgers.clone(),
+                ledger_admin::operator_only,
+            ))
+            .layer(middleware::from_fn_with_state(
+                limiter.twin(),
+                rate_limit::rate_limit,
+            ))
+            .layer(middleware::from_fn_with_state(
+                guard_state.clone(),
+                request_guard::request_guard,
+            )),
+        None => Router::new(),
+    };
     let health_routes = Router::new()
         .route("/health", get(ledgers::default_health))
         .route("/ledgers/{name}/health", get(ledgers::named_health))
@@ -729,6 +781,7 @@ pub(crate) fn build_application_with_limiter(
     Router::new()
         .merge(health_routes)
         .merge(graphql_routes)
+        .merge(node_routes)
         .layer(RequestBodyLimitLayer::new(GRAPHQL_MAX_BODY_BYTES))
         .layer(cors)
 }
@@ -773,9 +826,42 @@ fn build_signature_provider(
     }
 }
 
+tokio::task_local! {
+    /// The tasks of the ledger being started (003 step 4): every task spawned
+    /// while it starts — and every task those spawn — is listed here, so that
+    /// stopping one ledger stops all of its work while the others run.
+    pub(crate) static LEDGER_TASKS: ledger_runtime::Tasks;
+}
+
 /// `tokio::spawn`, in the span of the caller (003): a ledger's background
-/// tasks log under its name.
+/// tasks log under its name, and are listed in its [`LEDGER_TASKS`] for its
+/// stop to end.
 pub(crate) fn spawn_in_span<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    use tracing::Instrument;
+    match LEDGER_TASKS.try_with(std::sync::Arc::clone) {
+        Ok(tasks) => {
+            let handle = tokio::spawn(
+                LEDGER_TASKS
+                    .scope(std::sync::Arc::clone(&tasks), future)
+                    .in_current_span(),
+            );
+            ledger_runtime::track(&tasks, handle.abort_handle());
+            handle
+        }
+        Err(_) => tokio::spawn(future.in_current_span()),
+    }
+}
+
+/// `tokio::spawn` in the caller's span, but never listed in a ledger's tasks:
+/// for work that must finish even when the task that started it is cancelled
+/// — a commit's write and fold-back, a recovery reload (M-39) — so a ledger's
+/// stop never cuts one short. The stop waits for it (it takes the write
+/// permit before releasing the ledger's lock).
+pub(crate) fn spawn_detached_in_span<F>(future: F) -> tokio::task::JoinHandle<F::Output>
 where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,

@@ -30,7 +30,7 @@ use tower::ServiceExt;
 use tracing::{warn, Instrument};
 
 use crate::auth::{self, AuthState};
-use crate::config::{is_valid_ledger_name, DEFAULT_LEDGER};
+use crate::config::{is_valid_ledger_name, LedgerConfig, DEFAULT_LEDGER};
 use crate::graphql::{graphiql_handler, graphql_handler, AppSchema};
 use crate::health::{health_handler, HealthState};
 use crate::ledger_runtime::RunningLedger;
@@ -44,9 +44,13 @@ enum Served {
     Running {
         router: Router,
         auth: AuthState,
-        /// The same slots the router's `/graphql` takes from.
-        #[cfg_attr(not(test), allow(dead_code))]
+        /// The same slots the router's `/graphql` takes from; all of them
+        /// taken back is every request it was serving finished (step 4).
         slots: Slots,
+        /// The settings it was started with and its node id (`None` for a
+        /// ledger built from parts): the node endpoint's checks and list.
+        config: Option<Box<LedgerConfig>>,
+        node_id: Option<String>,
         /// This ledger's own GraphQL rate limit: a client's budget is per
         /// ledger (003 step 3, the maintainer's choice).
         limiter: RateLimiter,
@@ -56,6 +60,22 @@ enum Served {
     },
     /// Refused at boot; the reason is the boot log's.
     Failed(String),
+}
+
+/// A ledger taken out of the registry ([`Ledgers::take`]).
+pub(crate) enum Taken {
+    /// It was served; here to stop (`None`: built from parts, or stopping).
+    Running(Option<Box<RunningLedger>>),
+    /// It was refused at boot: nothing runs.
+    Failed,
+}
+
+/// One ledger as the node endpoint lists it.
+pub(crate) struct LedgerState {
+    pub name: String,
+    /// Why it is not served; `None` when it is.
+    pub reason: Option<String>,
+    pub node_id: Option<String>,
 }
 
 /// The node's ledgers, by name.
@@ -188,6 +208,8 @@ impl Ledgers {
             router,
             auth: running.auth.clone(),
             slots,
+            config: Some(Box::new(running.config.clone())),
+            node_id: running.node_id.clone(),
             limiter: self.limiter_for(name),
             running: Mutex::new(Some(Box::new(running))),
         };
@@ -211,6 +233,8 @@ impl Ledgers {
             router: ledger_router(schema, auth.clone(), health, graphiql, slots.clone()),
             auth,
             slots,
+            config: None,
+            node_id: None,
             limiter: self.limiter_for(name),
             running: Mutex::new(None),
         };
@@ -272,6 +296,91 @@ impl Ledgers {
         }
     }
 
+    /// Stop serving `name` (003 step 4): no new request reaches it, and once
+    /// every request it was serving has finished — all its slots taken back,
+    /// so none is left to write after its stop, perhaps into a ledger added
+    /// later under the same name — it comes back for the caller to stop. A
+    /// request routed to it just before then answers 503 `LEDGER_BUSY`. The
+    /// wait is bounded by `http.requestTimeoutSeconds`, which ends any request.
+    /// `None` when `name` is not held.
+    pub(crate) async fn take(&self, name: &str) -> Option<Taken> {
+        let served = self.by_name.write().await.remove(name)?;
+        match &*served {
+            Served::Running { slots, running, .. } => {
+                let all = u32::try_from(self.max_requests).unwrap_or(u32::MAX);
+                // Never closed but here, after this ledger left the map.
+                if let Ok(drained) = slots.acquire_many(all).await {
+                    drained.forget();
+                }
+                slots.close();
+                Some(Taken::Running(running.lock().await.take()))
+            }
+            Served::Failed(_) => Some(Taken::Failed),
+        }
+    }
+
+    /// One of served ledger `name`'s request slots, as a request in flight
+    /// holds it (tests).
+    #[cfg(test)]
+    pub(crate) async fn slot_for_test(&self, name: &str) -> tokio::sync::OwnedSemaphorePermit {
+        match &*self.get(name).await.expect("served") {
+            Served::Running { slots, .. } => {
+                Arc::clone(slots).try_acquire_owned().expect("a free slot")
+            }
+            Served::Failed(_) => panic!("{name} is served"),
+        }
+    }
+
+    /// Whether `name` is held, served or refused.
+    pub(crate) async fn holds(&self, name: &str) -> bool {
+        self.by_name.read().await.contains_key(name)
+    }
+
+    /// Every ledger held, by name: served or refused, and why.
+    pub(crate) async fn states(&self) -> Vec<LedgerState> {
+        self.by_name
+            .read()
+            .await
+            .iter()
+            .map(|(name, served)| match &**served {
+                Served::Running { node_id, .. } => LedgerState {
+                    name: name.clone(),
+                    reason: None,
+                    node_id: node_id.clone(),
+                },
+                Served::Failed(reason) => LedgerState {
+                    name: name.clone(),
+                    reason: Some(reason.clone()),
+                    node_id: None,
+                },
+            })
+            .collect()
+    }
+
+    /// The settings of every served ledger but `except`, the config file's
+    /// first: what a ledger added or restarted must not conflict with.
+    pub(crate) async fn served_configs(&self, except: &str) -> Vec<(String, LedgerConfig)> {
+        let by_name = self.by_name.read().await;
+        let mut configs: Vec<(String, LedgerConfig)> = by_name
+            .iter()
+            .filter(|(name, _)| name.as_str() != except)
+            .filter_map(|(name, served)| match &**served {
+                Served::Running {
+                    config: Some(config),
+                    ..
+                } => Some((name.clone(), (**config).clone())),
+                _ => None,
+            })
+            .collect();
+        configs.sort_by_key(|(name, _)| name != DEFAULT_LEDGER);
+        configs
+    }
+
+    /// Whether `headers` carry the operator key (or auth is off).
+    pub(crate) async fn is_operator(&self, headers: &axum::http::HeaderMap) -> bool {
+        !self.operator.enabled || self.operator.authenticate(headers).await.is_some()
+    }
+
     async fn get(&self, name: &str) -> Option<Arc<Served>> {
         self.by_name.read().await.get(name).cloned()
     }
@@ -285,12 +394,7 @@ impl Ledgers {
         } else {
             None
         };
-        let operator = !self.operator.enabled
-            || self
-                .operator
-                .authenticate(request.headers())
-                .await
-                .is_some();
+        let operator = self.is_operator(request.headers()).await;
         // GraphQL's rate limit, per client and ledger — for callers the ledger
         // accepts (its people, the operator), whose requests are charged to
         // the ledger's own table. Everyone else — no key, a wrong key, a name
@@ -488,6 +592,7 @@ mod tests {
             CorsLayer::new(),
             false,
             RateLimiter::graphql(),
+            None,
         );
         let acme = shared.pop().expect("acme");
         let default = shared.pop().expect("default");
