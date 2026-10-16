@@ -10,7 +10,9 @@ config for the **Docker image**: its paths are under `/data` (the image's
 working directory — a node refuses a `ledgerPath` outside its working
 directory), and it binds `0.0.0.0` inside the container, which is safe only
 because the container's port is published on the host's loopback interface
-(`-p 127.0.0.1:4000:4000`, README *Docker*). For a node run directly on a host,
+(`-p 127.0.0.1:4000:4000`, README *Docker*). The node's other companies'
+ledgers go in `/data/ledgers` (`ledgersDir`), in the same volume
+(*Adding a company*). For a node run directly on a host,
 change `bindAddress` to `127.0.0.1`, put the HTTPS terminator on the same host,
 and make the paths relative to the directory the node runs in.
 
@@ -173,6 +175,25 @@ left on an older release may refuse records a newer one writes.
 Roll back every node of the mesh, as you upgraded every node.
 Every release rehearses this upgrade and rollback from the previous release's
 binary, on one machine (`docs/RELEASE.md`).
+
+### To the release with several ledgers (from 0.1.0)
+
+- **At the swap:** a `ledgerPath` inside `./data/ledgers` (the default of the
+  new `ledgersDir`) is refused at boot. Such a node sets `ledgersDir`
+  elsewhere in the same step (step 3 of *Upgrading*), or moves its ledger
+  first. The other new keys — `ledgersDir`, `maxLedgers`,
+  `http.maxRequestsPerLedger` — are each node's own and can be set at its
+  swap too; the production template sets `ledgersDir: "/data/ledgers"`.
+- **After:** nothing changes until a folder appears in `ledgersDir`; the
+  config file's ledger is `default`, at `/graphql` as before. Give a
+  container `stop_grace_period: 60s` (*Sizing a node with several ledgers*);
+  the compose stack has it. `gl-node ledger`, `gl-node user` and
+  `gl-node --node-id` are new in this release.
+- **Rolling back with companies added:** 0.1.0 serves the config file's ledger
+  only, and refuses a config with keys it does not know: remove the keys above.
+  The folders in `ledgersDir` are left as they are, not served, and served
+  again once the node is upgraded again; their other nodes keep their books
+  meanwhile.
 
 ## People and keys
 

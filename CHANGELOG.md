@@ -9,6 +9,18 @@ break compatibility.
 
 ### Changed
 
+- **The image's configs keep the other ledgers in `/data/ledgers`** (003 step
+  5): `deploy/gl-node.production.json` and `gl-node.docker.json` set
+  `ledgersDir`; the compose stack waits 60 s for a node to stop
+  (`stop_grace_period`) and gives its health check a 30 s start period.
+  `deploy/mesh-init.sh --ledger NAME` adds a company to the running stack in
+  a mesh of its own. OPERATIONS has the upgrade and rollback notes.
+- **A ledger's log lines no longer appear inside another ledger's P2P
+  endpoint span** (003 step 5): iroh 1.0.3 keeps its `endpoint` span entered
+  across an await while an endpoint binds, so on Linux the tasks a runtime
+  thread ran meanwhile — another ledger's start, its requests — logged under
+  that endpoint, and kept doing so. The node now binds each endpoint on a
+  thread of its own.
 - **`deploy/mesh-init.sh` needs `jq` instead of `python3`**
   (`docs/build-log/004-no-python`): the project's tools no longer use Python.
   The revert checks and the measurements are `scripts/revert_check.sh` and

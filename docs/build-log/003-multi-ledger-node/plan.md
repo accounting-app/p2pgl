@@ -95,7 +95,12 @@ signing, Format, the file watcher; its access list and `auth.adminNodes`.
    the lock is released; each node-endpoint request runs on a task of its
    own, so a timeout never leaves a change half done.)
 5. **Packaging.** The production template and compose stack with `ledgersDir`;
-   `deploy/mesh-init.sh` for a named ledger; OPERATIONS upgrade notes.
+   `deploy/mesh-init.sh` for a named ledger; OPERATIONS upgrade notes. (As
+   built: `mesh-init.sh --ledger NAME` works on the running stack, through
+   `gl-node ledger add` and `restart`, and takes the ledger off again if a
+   node refuses; the compose stack waits 60 s for a stop; and the rehearsal on
+   the stack found iroh's `bind` leaking its span into other ledgers' logs, so
+   endpoints are bound on a thread of their own.)
 
 ## Risks
 

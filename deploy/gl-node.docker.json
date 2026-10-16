@@ -1,5 +1,6 @@
 {
     "ledgerPath": "/data/ledger.bean",
+    "ledgersDir": "/data/ledgers",
     "port": 4000,
     "bindAddress": "0.0.0.0",
     "graphiql": false,

@@ -31,6 +31,44 @@ use p2p::node::{PeerNode, PeerNodeConfig};
 use p2p::orphan_buffer::{OrphanBuffer, ORPHAN_EVICTION_INTERVAL};
 use p2p::protocol::WireMessage;
 
+/// `builder.bind()`, on a thread of its own (003 step 5). iroh 1.0.3's `bind`
+/// holds its `endpoint` span entered across an `.await`
+/// (`iroh-1.0.3/src/endpoint.rs:237-286`): a runtime worker that polled it ran
+/// other tasks — other ledgers' — inside that span while it waited, and kept
+/// the span for good when the bind resumed on another worker, so every ledger
+/// started at runtime logged under another's endpoint. Polled here by
+/// `Handle::block_on` on a blocking thread, the span is entered and left on
+/// that one thread, with nothing else polled in between. The tasks `bind`
+/// spawns still go to the runtime, in the caller's span.
+pub(crate) async fn bind_endpoint(
+    builder: iroh::endpoint::Builder,
+) -> Result<iroh::Endpoint, iroh::endpoint::BindError> {
+    on_a_thread_of_its_own(move || builder.bind()).await
+}
+
+/// The future `make` gives, polled to its end on a blocking thread of its own
+/// (`Handle::block_on`), in the caller's span and under the caller's tracing
+/// subscriber: a span it holds entered across an `.await` is entered and left
+/// on that thread alone.
+pub(crate) async fn on_a_thread_of_its_own<M, F>(make: M) -> F::Output
+where
+    M: FnOnce() -> F + Send + 'static,
+    F: std::future::Future,
+    F::Output: Send + 'static,
+{
+    let runtime = tokio::runtime::Handle::current();
+    let span = tracing::Span::current();
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let alone = move || {
+        tracing::dispatcher::with_default(&dispatch, || runtime.block_on(make().instrument(span)))
+    };
+    match tokio::task::spawn_blocking(alone).await {
+        Ok(output) => output,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => panic!("work on a thread of its own was cancelled: {error}"),
+    }
+}
+
 /// Boot the P2P subsystem: create the Iroh endpoint from the node's key.
 ///
 /// The key material is loaded by `ledger_runtime::start` and handed in (L-04) rather than read
@@ -45,10 +83,7 @@ pub async fn boot_p2p(
 ) -> Result<PeerNode, Box<dyn std::error::Error + Send + Sync>> {
     let secret_key = node_secret_key.iroh_secret_key();
 
-    let endpoint = endpoint_builder(config)?
-        .secret_key(secret_key)
-        .bind()
-        .await?;
+    let endpoint = bind_endpoint(endpoint_builder(config)?.secret_key(secret_key)).await?;
 
     let node_id = endpoint.id();
     info!(
@@ -2918,5 +2953,72 @@ mod tests {
         assert_eq!(key.author_id(), secret.public().to_string());
         assert_eq!(key.author_id(), signer.public_key_hex());
         assert_ne!(key.author_id(), ledger::service::PLACEHOLDER_AUTHOR);
+    }
+
+    /// 003 step 5: a future that holds a span entered across an await — as
+    /// iroh 1.0.3's `Endpoint::bind` does with its `endpoint` span — leaves no
+    /// other task inside that span when it runs on a thread of its own, as
+    /// `bind_endpoint` runs the bind; real binds through `bind_endpoint` leave
+    /// none either. (On macOS iroh's bind may finish without yielding, so the
+    /// leaky future stands in for it; in the Linux image it yields, and every
+    /// ledger started while the node ran logged under another's endpoint.)
+    ///
+    /// Bug-catch: poll the future on the caller's thread and a task polled
+    /// while it waits runs inside its span; leave the caller's subscriber
+    /// behind and the bind's spans, and logs, are lost.
+    #[test]
+    fn a_span_held_across_an_await_leaks_into_no_other_task() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // Spans are recorded only under a subscriber; this thread's, so the
+        // runtime below — on this thread too — polls every task under it.
+        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            let done = Arc::new(AtomicBool::new(false));
+            let spy = {
+                let done = Arc::clone(&done);
+                tokio::spawn(async move {
+                    let mut inside = 0usize;
+                    while !done.load(Ordering::SeqCst) {
+                        if tracing::Span::current()
+                            .metadata()
+                            .is_some_and(|span| span.name() == "endpoint")
+                        {
+                            inside += 1;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    inside
+                })
+            };
+            // The leak, as iroh's bind has it.
+            on_a_thread_of_its_own(|| async {
+                let span = tracing::info_span!("endpoint");
+                // Recorded on that thread too, so its leak would show.
+                assert!(!span.is_disabled(), "the caller's subscriber came along");
+                let _entered = span.enter();
+                for _ in 0..4 {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            let mut endpoints = Vec::new();
+            for _ in 0..4 {
+                let builder = crate::anti_entropy_alpn::tests::loopback_endpoint_builder();
+                endpoints.push(bind_endpoint(builder).await.expect("bound"));
+            }
+            done.store(true, Ordering::SeqCst);
+            assert_eq!(
+                spy.await.expect("joined"),
+                0,
+                "the spy ran inside an endpoint's span"
+            );
+            for endpoint in endpoints {
+                endpoint.close().await;
+            }
+        });
     }
 }
