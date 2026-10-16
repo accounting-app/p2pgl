@@ -9,6 +9,10 @@ break compatibility.
 
 ### Changed
 
+- **`deploy/mesh-init.sh` needs `jq` instead of `python3`**
+  (`docs/build-log/004-no-python`): the project's tools no longer use Python.
+  The revert checks and the measurements are `scripts/revert_check.sh` and
+  `scripts/measure_ledgers.sh` (Rust, `cargo xtask …`).
 - **`ledgerPath` inside `ledgersDir` is refused at boot** (003): that folder
   holds the node's other ledgers, and the default `ledgersDir` is
   `./data/ledgers` — a `ledgerPath` such as `./data/ledgers/x.bean` must move.

@@ -1,0 +1,226 @@
+{
+  "G-R1-case-sensitive": {
+    "file": ".claude/hooks/guard_git.sh",
+    "old": "  word_raw = word; lw = tolower(word); word = \"\"; wlen = 0",
+    "new": "  word_raw = word; lw = word; word = \"\"; wlen = 0",
+    "runs": [
+      [
+        "-p",
+        "xtask",
+        "--test",
+        "guard",
+        "the_git_guard_decides_every_case"
+      ]
+    ]
+  },
+  "G-R2-backslash-splits-a-word": {
+    "file": ".claude/hooks/guard_git.sh",
+    "old": "\n    if (c == \"\\\\\") { if (i == len) { cont = 1; break }; i++; addc(ch[i]); continue }",
+    "new": "\n    if (c == \"\\\\\") { if (i == len) { cont = 1; break }; i++; endword(); addc(ch[i]); continue }",
+    "runs": [
+      [
+        "-p",
+        "xtask",
+        "--test",
+        "guard",
+        "the_git_guard_decides_every_case"
+      ]
+    ]
+  },
+  "G-R3-a-quote-ends-the-word": {
+    "file": ".claude/hooks/guard_git.sh",
+    "old": "      if (c == \"\\047\") { mode = \"n\"; continue }",
+    "new": "      if (c == \"\\047\") { mode = \"n\"; endword(); continue }",
+    "runs": [
+      [
+        "-p",
+        "xtask",
+        "--test",
+        "guard",
+        "the_git_guard_decides_every_case"
+      ]
+    ]
+  },
+  "G-R4-a-quoted-program-is-data": {
+    "file": ".claude/hooks/guard_git.sh",
+    "old": "    if ((c == \"\\047\" || c == \"\\\"\") && codeq == \"\" && (shellish || (envseen && word == \"-S\"))) {",
+    "new": "    if (0) {",
+    "runs": [
+      [
+        "-p",
+        "xtask",
+        "--test",
+        "guard",
+        "the_git_guard_decides_every_case"
+      ]
+    ]
+  },
+  "G-R5-heredoc-bodies-read-as-commands": {
+    "file": ".claude/hooks/guard_git.sh",
+    "old": "    mode = \"hd\"\n",
+    "new": "    mode = \"n\"\n",
+    "runs": [
+      [
+        "-p",
+        "xtask",
+        "--test",
+        "guard",
+        "the_git_guard_decides_every_case"
+      ]
+    ]
+  },
+  "G-R6-no-comments": {
+    "file": ".claude/hooks/guard_git.sh",
+    "old": "    if (c == \"#\" && wlen == 0 && codeq == \"\") break",
+    "new": "    if (0) break",
+    "runs": [
+      [
+        "-p",
+        "xtask",
+        "--test",
+        "guard",
+        "the_git_guard_decides_every_case"
+      ]
+    ]
+  },
+  "G-R7-git-options-not-skipped": {
+    "file": ".claude/hooks/guard_git.sh",
+    "old": "    if (lw ~ /^-/) { if ((lw in VALUED) && lw !~ /=/) expect = 2; return }",
+    "new": "    if (lw ~ /^-/) return",
+    "runs": [
+      [
+        "-p",
+        "xtask",
+        "--test",
+        "guard",
+        "the_git_guard_decides_every_case"
+      ]
+    ]
+  },
+  "G-R8-a-substitution-leaves-no-word": {
+    "file": ".claude/hooks/guard_git.sh",
+    "old": "  addc(\"x\")\n",
+    "new": "",
+    "runs": [
+      [
+        "-p",
+        "xtask",
+        "--test",
+        "guard",
+        "the_git_guard_decides_every_case"
+      ]
+    ]
+  },
+  "G-R9-refusal-needs-jq": {
+    "file": ".claude/hooks/guard_git.sh",
+    "old": "  printf '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"%s\"}}\\n' \"$1\"",
+    "new": "  jq -n --arg reason \"$1\" '{hookSpecificOutput: {hookEventName: \"PreToolUse\", permissionDecision: \"deny\", permissionDecisionReason: $reason}}'",
+    "runs": [
+      [
+        "-p",
+        "xtask",
+        "--test",
+        "guard",
+        "the_git_guard_decides_every_case"
+      ]
+    ]
+  },
+  "X-R1-spec-read-sorted": {
+    "file": "xtask/src/revert_check.rs",
+    "old": "        let ordered: Ordered = serde_json::from_str(text).map_err(|error| error.to_string())?;",
+    "new": "        let ordered = Ordered(\n            serde_json::from_str::<serde_json::Map<String, Value>>(text)\n                .map_err(|error| error.to_string())?\n                .into_iter()\n                .collect(),\n        );",
+    "runs": [
+      [
+        "-p",
+        "xtask",
+        "--bin",
+        "xtask",
+        "a_spec_is_read_in_file_order"
+      ]
+    ]
+  },
+  "X-R2-compile-error-missed": {
+    "file": "xtask/src/revert_check.rs",
+    "old": "    if lines.iter().any(|line| line.starts_with(\"error[\")) {",
+    "new": "    if lines.iter().any(|line| line.starts_with(\"never[\")) {",
+    "runs": [
+      [
+        "-p",
+        "xtask",
+        "--bin",
+        "xtask",
+        "test_output_gives_the_verdict"
+      ]
+    ]
+  },
+  "X-R3-anchor-at-least-once": {
+    "file": "xtask/src/revert_check.rs",
+    "old": "            if count != 1 {",
+    "new": "            if count == 0 {",
+    "runs": [
+      [
+        "-p",
+        "xtask",
+        "--bin",
+        "xtask",
+        "an_anchor_must_occur_exactly_once"
+      ]
+    ]
+  },
+  "X-R4-unknown-flag-accepted": {
+    "file": "xtask/src/measure.rs",
+    "old": "            other => return Err(format!(\"unknown argument {other}\\n\\n{USAGE}\")),",
+    "new": "            other => {\n                let _ = other;\n            }",
+    "runs": [
+      [
+        "-p",
+        "xtask",
+        "--bin",
+        "xtask",
+        "options_parse_as_the_usage_says"
+      ]
+    ]
+  },
+  "X-R5-a-port-handed-out-twice": {
+    "file": "xtask/src/measure.rs",
+    "old": "        if !ports.contains(&port) && claim(port) {",
+    "new": "        if claim(port) {",
+    "runs": [
+      [
+        "-p",
+        "xtask",
+        "--bin",
+        "xtask",
+        "clients_and_ports_are_distinct"
+      ]
+    ]
+  },
+  "X-R6-typed-book-without-opens": {
+    "file": "xtask/src/measure.rs",
+    "old": "        \"2025-01-01 open Assets:Bank USD\".to_owned(),\n",
+    "new": "",
+    "runs": [
+      [
+        "-p",
+        "xtask",
+        "--bin",
+        "xtask",
+        "the_typed_book_has_the_entries_asked_for"
+      ]
+    ]
+  },
+  "G-R10-awk-reads-characters": {
+    "file": ".claude/hooks/guard_git.sh",
+    "old": "verdict=$(printf '%s\\n' \"$command\" | LC_ALL=C awk '",
+    "new": "verdict=$(printf '%s\\n' \"$command\" | awk '",
+    "runs": [
+      [
+        "-p",
+        "xtask",
+        "--test",
+        "guard",
+        "the_git_guard_decides_every_case"
+      ]
+    ]
+  }
+}

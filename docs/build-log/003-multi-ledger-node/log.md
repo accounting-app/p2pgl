@@ -202,4 +202,4 @@ to commit. The commit hash is filled in once the maintainer has committed.
   test can make a boot panic without a fault-injection hook.
 - **Departures from the plan:** parallel boot is new (the plan had parallel
   stop only): sequential boot measured 17 s for 30 busy ledgers.
-- **Commit:** (pending)
+- **Commit:** 156733d

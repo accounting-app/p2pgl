@@ -1,0 +1,16 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+# The project's own tools (`docs/build-log/004-no-python`): `cargo xtask
+# revert-check …` and `cargo xtask measure-ledgers …`. Never part of a release
+# (`scripts/release.sh` builds `-p gl-node`).
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

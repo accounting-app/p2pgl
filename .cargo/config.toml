@@ -1,0 +1,3 @@
+# `cargo xtask …` runs the project's own tools (docs/build-log/004-no-python).
+[alias]
+xtask = "run -q --locked -p xtask --"

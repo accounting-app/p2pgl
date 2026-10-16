@@ -1,6 +1,7 @@
 # Measurements: many ledgers on one node (step 3, 2026-10-15)
 
-Taken with `scripts/measure_ledgers.py` on the release build, on the
+Taken with `scripts/measure_ledgers.py` (since 004 `scripts/measure_ledgers.sh`,
+the same tool in Rust) on the release build, on the
 maintainer's Mac (10 cores, 24 GiB), HTTP and every mesh on loopback. Rerun the
 script to check a later build; the numbers below are this build's. Memory is
 the process's resident size once every ledger answers (the script reads it

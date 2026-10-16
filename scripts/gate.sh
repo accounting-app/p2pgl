@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # The gate every change passes before it is ready to commit: formatting,
-# lints with warnings as errors, and every test in the workspace.
+# lints with warnings as errors, the revert specs' anchors, the git guard's
+# cases, and every test in the workspace.
 #
-#   scripts/gate.sh            # everything (~20 min)
-#   scripts/gate.sh --quick    # fmt + clippy only
+#   scripts/gate.sh            # everything (~7 min)
+#   scripts/gate.sh --quick    # fmt, clippy, anchors and the guard only
 #
 # Full logs go to target/gate/; the summary below is what to read. Exits
 # non-zero if any step fails. A full pass records the tree's fingerprint
@@ -32,6 +33,10 @@ step() {
 fingerprint_at_start=$(scripts/tree_fingerprint.sh)
 step fmt cargo fmt --all -- --check
 step clippy cargo clippy --workspace --all-targets --locked -- -D warnings
+# 004: every revert spec's anchors still occur exactly once (they went stale
+# unnoticed three times in 003), and the git guard decides every case right.
+step anchors cargo xtask revert-check --check-all
+step guard .claude/hooks/test_guard_git.sh
 if [ "${1:-}" != "--quick" ]; then
     step tests cargo test --workspace --locked --no-fail-fast
     passed=$(grep -E '^test result:' target/gate/tests.log | awk '{s += $4} END {print s + 0}')

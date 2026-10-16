@@ -64,7 +64,7 @@ The step-by-step procedure — backups, upgrade, rollback, what to watch — is 
 
 ## API Reference — curl Examples
 
-All examples assume the server is running at `http://127.0.0.1:4000`. Pipe through `| python3 -m json.tool` for pretty output. Every `/graphql` example sends the API key from `$GL_NODE_API_KEY`; on a local node with the default config, load it from the key file first:
+All examples assume the server is running at `http://127.0.0.1:4000`. Pipe through `| jq .` for pretty output. Every `/graphql` example sends the API key from `$GL_NODE_API_KEY`; on a local node with the default config, load it from the key file first:
 
 ```bash
 export GL_NODE_API_KEY="$(cat data/api.key)"
@@ -73,7 +73,7 @@ export GL_NODE_API_KEY="$(cat data/api.key)"
 ### Health Check
 
 ```bash
-curl -s http://127.0.0.1:4000/health | python3 -m json.tool
+curl -s http://127.0.0.1:4000/health | jq .
 ```
 
 Response (loopback bind, or any bind with a valid `X-Api-Key`):
@@ -1593,11 +1593,12 @@ a relay*).
 ## Running Tests
 
 ```bash
-# Everything a change must pass before it is committed: fmt, clippy, all tests
+# Everything a change must pass before it is committed: fmt, clippy, the revert
+# specs' anchors, the git guard's cases, all tests
 scripts/gate.sh
 
 # Prove a test catches the bug its fix closes (see CLAUDE.md, "Revert checks")
-scripts/revert_check.py scripts/revert_specs/h01_l23.json
+scripts/revert_check.sh scripts/revert_specs/h01_l23.json
 
 # The gl-node binary itself, end to end on loopback (part of the gate); with
 # GL_NODE_PREVIOUS_BINARY set, also an upgrade and rollback from that binary

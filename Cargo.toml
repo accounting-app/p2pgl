@@ -4,6 +4,7 @@ members = [
     "crates/ledger",
     "crates/p2p",
     "crates/security",
+    "xtask",
 ]
 resolver = "2"
 

@@ -30,8 +30,13 @@ COPY crates/gl-node/Cargo.toml crates/gl-node/Cargo.toml
 COPY crates/ledger/Cargo.toml crates/ledger/Cargo.toml
 COPY crates/p2p/Cargo.toml crates/p2p/Cargo.toml
 COPY crates/security/Cargo.toml crates/security/Cargo.toml
-RUN mkdir -p crates/gl-node/src crates/ledger/src crates/p2p/src crates/security/src \
+# xtask (the project's tools, never in the image) is a workspace member, so its
+# manifest and a stub are what cargo needs to load the workspace; it is never
+# built here (docs/build-log/004-no-python).
+COPY xtask/Cargo.toml xtask/Cargo.toml
+RUN mkdir -p crates/gl-node/src crates/ledger/src crates/p2p/src crates/security/src xtask/src \
     && echo 'fn main() {}' > crates/gl-node/src/main.rs \
+    && echo 'fn main() {}' > xtask/src/main.rs \
     && touch crates/ledger/src/lib.rs crates/p2p/src/lib.rs crates/security/src/lib.rs \
     && cargo build --release --locked --bin gl-node \
     && cargo clean --release -p gl-node -p ledger -p p2p -p security \

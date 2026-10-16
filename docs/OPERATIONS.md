@@ -237,7 +237,7 @@ to one per core, and each start uses about as much again as its ledger. On a
 2 GiB server holds about 35 ledgers of 10,000 entries. These are measurements
 of one build on one machine
 (`docs/build-log/003-multi-ledger-node/notes/measurements.md`); check yours
-with `scripts/measure_ledgers.py`.
+with `scripts/measure_ledgers.sh`.
 
 - **Open files:** allow at least 4,096 (`ulimit -n`; systemd `LimitNOFILE`).
   A ledger with P2P uses about 5, and every HTTP connection one more.
