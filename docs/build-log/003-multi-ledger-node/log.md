@@ -1,6 +1,6 @@
 # Log: several company ledgers on one node
 
-Status: in progress.
+Status: done (2026-10-16, last commit acbce10).
 
 One entry per commit-sized unit, newest last, written when the unit is ready
 to commit. The commit hash is filled in once the maintainer has committed.
@@ -280,4 +280,72 @@ to commit. The commit hash is filled in once the maintainer has committed.
   `restartLedger`, the key made for a signing-only ledger, a failed add moved
   aside, `default` fixed, the removal's wait, the full stop and the detached
   writes.
-- **Commit:** <hash>
+- **Commit:** df4cfb5
+
+## 2026-10-16 — Step 5: packaging
+
+- **What changed:** the image's configs (`deploy/gl-node.production.json`,
+  `gl-node.docker.json`) set `ledgersDir: "/data/ledgers"`, in the volume
+  beside the config file's ledger; the compose stack gives a node 60 s to
+  stop (`stop_grace_period`: every ledger compacts on the way out) and its
+  health check a 30 s start period. **`deploy/mesh-init.sh --ledger NAME`**
+  adds a company to the running stack in a mesh of its own: a fresh
+  `meshId` and topic, signing and P2P on, the next UDP port above the nodes'
+  ledgers' (the same on all three; `LEDGER_PORT=` to choose); each node adds it with
+  `gl-node ledger add` (its key made there, its id printed), then gets its
+  peers' ids and `node-N:<port>` addresses in `ledger.json` (written aside and
+  renamed) and `gl-node ledger restart`; a refusal part way takes the ledger
+  off the nodes it had reached. OPERATIONS: the template's `ledgersDir`, and
+  upgrade and rollback notes for this release (what is refused before, what to
+  add after, what 0.1.0 does with the folders). README (*Multi-node stack*),
+  CHANGELOG. **Found by the rehearsal and fixed:** on the stack, a ledger
+  added at runtime logged inside another ledger's endpoint span
+  (`ledger{ledger=acme}:endpoint{…}:ledger{ledger=beta}`). iroh 1.0.3's
+  `Endpoint::bind` holds its `endpoint` span entered across an `.await`
+  (`endpoint.rs:237-286`, around `netmon::Monitor::new().await`), so a worker
+  thread ran other tasks inside it while the bind waited, and kept it when the
+  bind resumed elsewhere. The node now binds on a blocking thread of its own
+  (`p2p_service::bind_endpoint`, `on_a_thread_of_its_own`), where the span is
+  entered and left with nothing else polled in between.
+- **Tests:** the image's configs keep their ledgers in the volume and
+  `ledgerPath` outside them; a future holding a span across an await (as
+  iroh's bind does) leaks it into no other task, and real binds through
+  `bind_endpoint` leave none. The production template test sets a local
+  `ledgersDir` beside its local `ledgerPath`.
+- **Rehearsal** (compose stack, built from this tree): `mesh-init.sh`, `up`,
+  `--ledger acme` (UDP 4434) and `--ledger beta` (4435); a transaction
+  written on node-0's acme is on node-1 and node-2 within 12 s, verifying,
+  and not in their default ledgers; `--ledger acme` again is refused
+  (`LEDGER_EXISTS`) and changes nothing; a bad name is refused; with a stray
+  `gamma` folder on node-1 only, `--ledger gamma` adds it on node-0, is
+  refused on node-1 and takes it off node-0 again (to `.removed/`); after a
+  stop (1 s) and start, both companies serve and replicate. Before the bind
+  fix several of node-0's lines sat under another ledger's endpoint; after it,
+  0 of 283 lines across the three nodes. `mesh-init.sh --ledger` has no
+  automated test: it needs Docker. After the review's changes, again on a
+  rebuilt stack: `--ledger acme` (4434), `LEDGER_PORT=4440 --ledger beta`, a
+  refused `LEDGER_PORT=010`, a transaction on node-1's beta on node-0 and
+  verifying, and 0 lines under another ledger or any endpoint span.
+- **Gate:** `scripts/gate.sh` — 1,618 passed, 0 failed, 0 ignored (7 min 2 s), on the final tree.
+- **Review round** (reviewer subagent; nothing Important): the span test's
+  fixed half could not fail — the blocking thread had no subscriber, so its
+  spans were never recorded; the caller's dispatcher now goes with the work
+  (also what keeps the bind's own logs), and the test checks its span is
+  recorded there (L-R54). OPERATIONS' upgrade notes set the new keys at each
+  node's swap, as the generic procedure does (a node whose `ledgerPath` is in
+  `./data/ledgers` must), and say `gl-node ledger`, `user` and `--node-id`
+  are new since 0.1.0. The script disarms its undo once every node is done,
+  says which node still holds the ledger if an undo fails, and takes the
+  port from `LEDGER_PORT` (not `PORT`, which other tools set), refusing a
+  leading zero (octal to bash, decimal to jq). The README names `.removed/`
+  in the node's own `ledgersDir`; L-R55 covers `gl-node.docker.json`.
+- **Revert checks:** `ledgers.json` — L-R52 and L-R55 (an image config's
+  `ledgersDir` outside `/data`), L-R53 (the future polled on the caller's
+  thread) and L-R54 (the bind thread without the caller's subscriber) bite.
+  A first L-R53 that called iroh's bind directly did not bite: on macOS the
+  bind finishes without yielding, so the test uses a future that leaks as
+  iroh's does.
+- **Departures from the plan:** recorded in `plan.md` step 5 (*As built*):
+  `--ledger` works on the running stack through the runtime commands; the
+  bind fix.
+- **Commit:** acbce10

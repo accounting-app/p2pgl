@@ -1622,6 +1622,19 @@ under `openledger/docker-dev`: run `MESH_ID=openledger/docker-dev
 deploy/mesh-init.sh`, keeping the volumes. Only for a new mesh with no history
 to keep: `down -v`, delete `deploy/mesh/`, run it again.
 
+**More companies on the stack.** With it up, `deploy/mesh-init.sh --ledger
+acme` adds ledger `acme` to all three nodes, in a mesh of its own: a fresh
+`meshId` and topic, signing and P2P on, a UDP port of its own (the next above
+the ports the nodes' ledgers use, the same on every node; `LEDGER_PORT=` to
+choose), and each other node's id and address. Each node makes the ledger's
+key as it adds it (`gl-node ledger add`); once every id is known, each node's
+`ledger.json` gets its peers and the ledger restarts with them. If a node
+refuses, the ledger is taken off the nodes it had reached (moved to
+`.removed/` in that node's `ledgersDir`). Clients use
+`http://127.0.0.1:4000/ledgers/acme/graphql`
+(and `:4001`, `:4002`); people are added with `docker compose -f
+deploy/docker-compose.yml exec node-0 gl-node user --ledger acme add …`.
+
 One shared API key would mean compromising any single node grants write access
 to all of them, and rotating it is an all-or-nothing outage; the placeholders in
 `deploy/.env.example` are too short to boot, so a stack started with them fails

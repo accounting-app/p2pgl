@@ -3731,6 +3731,7 @@ mod tests {
         // What the operator must choose anyway, plus a ledger path this test's
         // working directory holds (the template's are the Docker image's).
         template["ledgerPath"] = "./data/ledger.bean".into();
+        template["ledgersDir"] = "./data/ledgers".into();
         template["p2p"]["swarmTopic"] = "openledger/production-test".into();
         template["p2p"]["meshId"] = "8a4f2c1e-0d3b-4c5a-9e7f-1b2d3c4e5f60".into();
         let load = |template: &serde_json::Value| {
@@ -3752,6 +3753,32 @@ mod tests {
 
         template["p2p"]["relayUrl"] = "https://relay.example.com".into();
         load(&template).expect("with the mesh's relay the template boots");
+    }
+
+    /// 003 step 5: the image's configs keep the node's other ledgers in its
+    /// volume, beside the config file's ledger and not around it:
+    /// `ledgersDir` under `/data` (the image's working directory, which a
+    /// node's paths must stay under, and the volume), `ledgerPath` outside it.
+    ///
+    /// Bug-catch: point a template's `ledgersDir` outside `/data` and the
+    /// image refuses to boot — or, mounted elsewhere, a container rebuilt
+    /// loses every company but the first.
+    #[test]
+    fn the_image_configs_keep_their_ledgers_in_the_volume() {
+        for file in ["gl-node.production.json", "gl-node.docker.json"] {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../deploy")
+                .join(file);
+            let config: NodeConfig =
+                serde_json::from_str(&std::fs::read_to_string(&path).expect("shipped config"))
+                    .expect("shipped config parses");
+            let ledgers_dir = Path::new(&config.ledgers_dir);
+            assert_eq!(ledgers_dir, Path::new("/data/ledgers"), "{file}");
+            assert!(
+                !Path::new(&config.ledger_path).starts_with(ledgers_dir),
+                "{file}: ledgerPath inside ledgersDir"
+            );
+        }
     }
 
     /// R-9: the shipped docker config sets `meshId` to its own `swarmTopic`

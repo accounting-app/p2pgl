@@ -737,5 +737,61 @@
         "a_change_cut_short_still_runs_to_its_end"
       ]
     ]
+  },
+  "L-R52-the-template-keeps-ledgers-outside-the-volume": {
+    "file": "deploy/gl-node.production.json",
+    "old": "    \"ledgersDir\": \"/data/ledgers\",",
+    "new": "    \"ledgersDir\": \"/srv/ledgers\",",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_image_configs_keep_their_ledgers_in_the_volume"
+      ]
+    ]
+  },
+  "L-R53-polled-on-the-callers-thread": {
+    "file": "crates/gl-node/src/p2p_service.rs",
+    "old": "    let alone = move || {\n        tracing::dispatcher::with_default(&dispatch, || runtime.block_on(make().instrument(span)))\n    };\n    match tokio::task::spawn_blocking(alone).await {",
+    "new": "    let _ = (runtime, dispatch);\n    match Ok::<_, tokio::task::JoinError>(make().instrument(span).await) {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_span_held_across_an_await_leaks_into_no_other_task"
+      ]
+    ]
+  },
+  "L-R54-the-bind-thread-has-no-subscriber": {
+    "file": "crates/gl-node/src/p2p_service.rs",
+    "old": "        tracing::dispatcher::with_default(&dispatch, || runtime.block_on(make().instrument(span)))",
+    "new": "        { let _ = dispatch; runtime.block_on(make().instrument(span)) }",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_span_held_across_an_await_leaks_into_no_other_task"
+      ]
+    ]
+  },
+  "L-R55-the-stack-config-keeps-ledgers-outside-the-volume": {
+    "file": "deploy/gl-node.docker.json",
+    "old": "    \"ledgersDir\": \"/data/ledgers\",",
+    "new": "    \"ledgersDir\": \"/srv/ledgers\",",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_image_configs_keep_their_ledgers_in_the_volume"
+      ]
+    ]
   }
 }

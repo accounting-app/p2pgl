@@ -78,8 +78,12 @@
 # on different machines behind routers need a relay instead — see
 # docs/OPERATIONS.md, "Running a relay" (deploy/iroh-relay/).
 #
-# Each node gets its OWN volume and therefore its own .bean file. Pointing two
-# containers at one ledger volume now fails closed at startup on the
+# Each node gets its OWN volume and therefore its own .bean file, and its own
+# ledgersDir, /data/ledgers: `deploy/mesh-init.sh --ledger NAME` adds company
+# NAME to all three nodes in a mesh of its own, served at
+# http://127.0.0.1:400N/ledgers/NAME/graphql (README, *Several ledgers*).
+#
+# Pointing two containers at one ledger volume fails closed at startup on the
 # `<ledger>.lock` sidecar (M-17) — that is the exclusivity check working, not a
 # bug.
 
@@ -105,7 +109,9 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
-      start_period: 15s
+      start_period: 30s
+    # Every ledger folds its journal in on the way out (OPERATIONS, *Sizing*).
+    stop_grace_period: 60s
 
   node-1:
     build:
@@ -128,7 +134,9 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
-      start_period: 15s
+      start_period: 30s
+    # Every ledger folds its journal in on the way out (OPERATIONS, *Sizing*).
+    stop_grace_period: 60s
     depends_on:
       node-0:
         condition: service_healthy
@@ -154,7 +162,9 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
-      start_period: 15s
+      start_period: 30s
+    # Every ledger folds its journal in on the way out (OPERATIONS, *Sizing*).
+    stop_grace_period: 60s
     depends_on:
       node-0:
         condition: service_healthy
