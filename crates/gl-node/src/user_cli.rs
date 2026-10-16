@@ -256,7 +256,7 @@ pub fn graphql_path(ledger: &str) -> String {
 
 /// Send `body` to the node's `path` on `host:port` with `api_key`, and return
 /// the GraphQL response.
-fn exchange(
+pub(crate) fn exchange(
     host: &str,
     port: u16,
     path: &str,
@@ -362,7 +362,7 @@ fn split_response(raw: &[u8]) -> Result<(u16, Vec<u8>), String> {
 }
 
 /// The GraphQL errors in `answer`, as one message, if any.
-fn graphql_errors(answer: &Value) -> Option<String> {
+pub(crate) fn graphql_errors(answer: &Value) -> Option<String> {
     let errors = answer["errors"]
         .as_array()
         .filter(|errors| !errors.is_empty())?;
@@ -404,6 +404,49 @@ pub fn execute_on(
     Ok(render(command, &answer["data"]))
 }
 
+/// The node on this machine and its operator key, from its config
+/// (`GL_NODE_CONFIG`).
+pub(crate) struct OperatorTarget {
+    pub host: String,
+    pub port: u16,
+    api_key: Option<zeroize::Zeroizing<String>>,
+}
+
+impl OperatorTarget {
+    /// Read the node's config for its port and operator key — `auth.apiKey`,
+    /// `GL_NODE_API_KEY` or the key file, which is read and never created.
+    pub(crate) fn from_config() -> Result<Self, String> {
+        let config_path =
+            std::env::var("GL_NODE_CONFIG").unwrap_or_else(|_| "gl-node.config.json".to_owned());
+        let config = NodeConfig::load_from_path(&std::path::PathBuf::from(&config_path))
+            .map_err(|error| format!("failed to load config {config_path}: {error}"))?;
+        let api_key = if !config.auth.enabled {
+            None
+        } else if config.uses_api_key_file() {
+            Some(crate::auth::read_existing_api_key(std::path::Path::new(
+                &config.auth.api_key_path,
+            ))?)
+        } else {
+            Some(zeroize::Zeroizing::new(config.auth.api_key.clone()))
+        };
+        // A wildcard bind is reached on loopback, as `--health-check` does.
+        let host = match config.bind_address.as_str() {
+            "0.0.0.0" | "*" | "" => "127.0.0.1",
+            "::" => "::1",
+            other => other,
+        };
+        Ok(OperatorTarget {
+            host: host.to_owned(),
+            port: config.port,
+            api_key,
+        })
+    }
+
+    pub(crate) fn api_key(&self) -> Option<&str> {
+        self.api_key.as_ref().map(|key| key.as_str())
+    }
+}
+
 /// `gl-node user …`: parse, find the node and its operator key, run, exit.
 pub fn run(args: &[String]) -> ! {
     let (ledger, args) = match take_ledger(args) {
@@ -420,39 +463,18 @@ pub fn run(args: &[String]) -> ! {
             std::process::exit(2);
         }
     };
-    let config_path =
-        std::env::var("GL_NODE_CONFIG").unwrap_or_else(|_| "gl-node.config.json".to_owned());
-    let config = match NodeConfig::load_from_path(&std::path::PathBuf::from(&config_path)) {
-        Ok(config) => config,
+    let node = match OperatorTarget::from_config() {
+        Ok(node) => node,
         Err(error) => {
-            eprintln!("user: failed to load config {config_path}: {error}");
+            eprintln!("user: {error}");
             std::process::exit(1);
         }
     };
-    let api_key = if !config.auth.enabled {
-        None
-    } else if config.uses_api_key_file() {
-        match crate::auth::read_existing_api_key(std::path::Path::new(&config.auth.api_key_path)) {
-            Ok(key) => Some(key),
-            Err(error) => {
-                eprintln!("user: {error}");
-                std::process::exit(1);
-            }
-        }
-    } else {
-        Some(zeroize::Zeroizing::new(config.auth.api_key.clone()))
-    };
-    // A wildcard bind is reached on loopback, as `--health-check` does.
-    let host = match config.bind_address.as_str() {
-        "0.0.0.0" | "*" | "" => "127.0.0.1",
-        "::" => "::1",
-        other => other,
-    };
     match execute_on(
-        host,
-        config.port,
+        &node.host,
+        node.port,
         &graphql_path(&ledger),
-        api_key.as_ref().map(|key| key.as_str()),
+        node.api_key(),
         &command,
     ) {
         Ok(output) => {

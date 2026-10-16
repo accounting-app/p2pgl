@@ -66,6 +66,18 @@ break compatibility.
   many companies is not throttled by the total. OPERATIONS *Sizing a node with
   several ledgers* gives the memory budget. Nothing
   changes for a node with no ledger folders.
+- **Ledgers added, removed and restarted while the node runs** (003 step 4,
+  README *Adding and removing ledgers while the node runs*, OPERATIONS *Adding
+  a company*): `gl-node ledger add NAME [--settings FILE] | list | restart
+  NAME | remove NAME`, a client of the new operator-only node endpoint
+  **`/node/graphql`** (`ledgers`, `addLedger`, `removeLedger`,
+  `restartLedger`). `add` writes the folder under a temporary name and renames
+  it into place, makes the ledger's node key and prints its id; `remove` waits
+  for the ledger's requests in flight, stops it — every task it started, its
+  journal folded in — and moves its folder to `ledgersDir/.removed/`, deleting
+  nothing; `restart` picks up an edited `ledger.json`, or serves a folder that
+  was refused at boot once fixed. The `default` ledger changes only with the
+  node.
 - **People's keys, from the ledger** (`docs/build-log/002-users-and-roles`):
   besides the operator key, the node accepts each person's key from the
   ledger's access records — `event "openledger-access"` grants and

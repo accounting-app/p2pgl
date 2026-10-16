@@ -102,6 +102,8 @@ connecting node, so admitting or removing one needs no restart.
 | the config file | The node's settings | Yes |
 | the API key | Wherever `GL_NODE_API_KEY` comes from (or `data/api.key` on a loopback node) | Yes, as a secret |
 | `ledger.bean.lock` | A lock held while the node runs | No |
+| `ledgersDir/<name>/` (`data/ledgers/…`) | Each other ledger's folder: its `ledger.json`, `.bean`, journal and `iroh.secret`, the same files as above | **Yes**, every folder, its key apart like the node's |
+| `ledgersDir/.removed/` | Removed ledgers' folders, whole (*Adding a company*) | Yes, for as long as you must keep a former client's books |
 
 **The node key** is the node's identity on the mesh and the key its records are
 signed with. Lose it and the node must rejoin under a new identity (every peer's
@@ -112,7 +114,8 @@ is a private key. Keep its backup encrypted and apart from the ledger backups.
 
 1. Stop the node (`SIGTERM`, and wait for the process to exit; it exits 0).
 2. Copy `ledger.bean` and, if present, `ledger.bean.journal` together, plus the
-   config.
+   config. On a node with several ledgers, copy every folder in `ledgersDir`
+   too, `.removed/` included; each restores on its own, like a node of one.
 3. Start the node again.
 
 Back up while the node is stopped: a copy taken while it runs can pair a `.bean`
@@ -219,6 +222,40 @@ expiry dates and key hashes, never a key. Every transaction, `open` and
 `close` a person enters carries their user id (`entered-by`), and the journal
 shows who entered each entry by name. Writes made with the operator key carry
 none, and an entry typed into the `.bean` may not carry one (it is refused).
+
+## Adding a company
+
+Each company is a ledger of its own (README, *Several ledgers*), added and
+removed while the node runs, as the node's user:
+
+1. **Its settings.** Write the company's `ledger.json`: a fresh `meshId`
+   (`uuidgen`) and `swarmTopic`, the mesh's relay, and the other nodes of its
+   mesh in `bootstrapEndpointIds` (empty for the first node).
+2. **Add it:** `gl-node ledger add acme --settings acme.json`. It prints the
+   ledger's node id; give it to the other nodes of the company's mesh for their
+   `bootstrapEndpointIds`, and back up `data/ledgers/acme/iroh.secret` apart,
+   as you do the node's key.
+3. **Its people:** `gl-node user --ledger acme add --name "…" --role admin`.
+   Clients use `/ledgers/acme/graphql`.
+
+To change a company's settings, edit its `ledger.json` and run `gl-node
+ledger restart acme`; settings that are refused leave it serving as it was.
+`gl-node ledger list` shows every ledger, and why one is not served.
+
+**When a company leaves**, `gl-node ledger remove acme` stops its ledger —
+requests already running finish, the journal is folded in — and moves its
+folder to `data/ledgers/.removed/acme-<UTC time>/`. Its books and key stay
+there; nothing is deleted. Keep the folder (and its backups) for as long as
+your retention rules require, then delete it yourself. On the company's other
+nodes, take this node's id out of `bootstrapEndpointIds`. To bring a company
+back, move its folder back into `data/ledgers/` and run `gl-node ledger
+restart <name>`.
+
+If a command gives no answer (a timeout, `http.requestTimeoutSeconds`), the
+change still runs to the end on the node: run `gl-node ledger list` before
+trying again. A node that crashed in the middle of an add can leave a
+`data/ledgers/.adding-<name>-…` folder; it was never served, no boot reads
+it, and it can be deleted.
 
 ## Sizing a node with several ledgers
 

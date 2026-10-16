@@ -872,6 +872,150 @@ fn several_ledgers_are_served_side_by_side() {
     assert_eq!(node.stop().code(), Some(0));
 }
 
+/// Ledgers added and removed while the shipped binary runs (003 step 4):
+/// `gl-node ledger add` serves a new company at once, its own mesh and node
+/// key made with it — the id it prints is the one `--node-id --ledger` gives
+/// — and people are added to it with `gl-node user --ledger`; `gl-node
+/// ledger remove` stops it and moves its folder, books included, to
+/// `ledgersDir/.removed/`; a ledger added again under the name is a new one;
+/// and after a restart the node serves what was added, not what was removed.
+///
+/// Bug-catch: route `gl-node ledger` anywhere but the node endpoint and
+/// every command fails; leave a removed folder in `ledgersDir` and the
+/// restart serves the company that was removed.
+#[test]
+fn ledgers_are_added_and_removed_while_the_node_runs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = dir.path().canonicalize().expect("canonical tempdir");
+    let mut node = Node::new(this_binary(), &dir);
+    node.start("runtime")
+        .unwrap_or_else(|log| panic!("boot: {log}"));
+    let run = |node: &Node, args: &[&str]| {
+        let output = node
+            .command(&node.binary)
+            .args(args)
+            .output()
+            .expect("run gl-node");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "{args:?}: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout
+    };
+    let settings = dir.join("acme.json");
+    std::fs::write(
+        &settings,
+        json!({
+            "signing": { "enabled": true },
+            "p2p": {
+                "enabled": true,
+                "relayMode": "disabled",
+                "bootstrapEndpointIds": [],
+                "swarmTopic": format!("shipped-binary/acme-{}", random_hex(8)),
+                "meshId": format!("acme-{}", random_hex(16)),
+            },
+        })
+        .to_string(),
+    )
+    .expect("acme settings");
+    let added = run(
+        &node,
+        &[
+            "ledger",
+            "add",
+            "acme",
+            "--settings",
+            settings.to_str().expect("utf-8"),
+        ],
+    );
+    let printed = added
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("node id:"))
+        .map(|id| id.trim().to_owned())
+        .unwrap_or_else(|| panic!("a node id in {added}"));
+    let node_id = run(&node, &["--node-id", "--ledger", "acme"]);
+    assert_eq!(printed, node_id.trim(), "the id peers are given is acme's");
+
+    let granted = run(
+        &node,
+        &[
+            "user", "--ledger", "acme", "add", "--name", "Ana", "--role", "write",
+        ],
+    );
+    let key = granted
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("key:"))
+        .map(|key| key.trim().to_owned())
+        .unwrap_or_else(|| panic!("a key in {granted}"));
+    let port = node.port;
+    let at = |key: &str, query: &str| {
+        let body = json!({ "query": query }).to_string();
+        let (status, text) =
+            http(port, "/ledgers/acme/graphql", Some(key), Some(&body)).expect("http");
+        (
+            status,
+            serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)),
+        )
+    };
+    let (status, body) = at(
+        &key,
+        r#"mutation { openAccount(name: "Assets:Acme", date: "2024-01-01") }"#,
+    );
+    assert!(status == 200 && body.get("errors").is_none(), "{body}");
+    let listed = run(&node, &["ledger", "list"]);
+    assert!(
+        listed
+            .lines()
+            .any(|line| line.starts_with("acme ") && line.contains(&printed)),
+        "{listed}"
+    );
+
+    let removed = run(&node, &["ledger", "remove", "acme"]);
+    assert!(removed.contains(".removed/acme-"), "{removed}");
+    let ledgers_dir = dir.join("data/ledgers");
+    let moved: Vec<PathBuf> = std::fs::read_dir(ledgers_dir.join(".removed"))
+        .expect("the removed folders")
+        .map(|entry| entry.expect("entry").path())
+        .collect();
+    assert_eq!(moved.len(), 1, "{moved:?}");
+    let books = std::fs::read_to_string(moved[0].join("ledger.bean")).expect("acme's books");
+    assert!(
+        books.contains("Assets:Acme"),
+        "folded in and moved: {books}"
+    );
+    let operator = node.api_key.clone();
+    let (status, _) = at(&operator, "{ verify { ok } }");
+    assert_eq!(status, 404, "acme is no longer served");
+
+    run(&node, &["ledger", "add", "acme"]);
+    let (status, body) = at(
+        &operator,
+        r#"{ account(name: "Assets:Acme") { balances { number } } }"#,
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(body["data"]["account"].is_null(), "a new ledger: {body}");
+    let (status, _) = at(&key, "{ verify { ok } }");
+    assert_eq!(status, 401, "the old acme's people are not the new one's");
+
+    assert_eq!(node.stop().code(), Some(0));
+    node.start("runtime-restarted")
+        .unwrap_or_else(|log| panic!("restart: {log}"));
+    let listed = run(&node, &["ledger", "list"]);
+    let names: Vec<&str> = listed
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    assert_eq!(names, ["acme", "default"], "{listed}");
+    assert!(
+        !listed.contains(&printed),
+        "the removed acme is not back: {listed}"
+    );
+    assert_eq!(node.stop().code(), Some(0));
+}
+
 /// The upgrade and rollback procedure of docs/OPERATIONS.md, from the previous
 /// release's binary (`GL_NODE_PREVIOUS_BINARY`) to this one: the previous
 /// version writes a ledger and a backup is taken; this version starts on those

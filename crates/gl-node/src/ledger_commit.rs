@@ -204,7 +204,7 @@ where
     };
 
     let ledger = std::sync::Arc::clone(ledger);
-    let commit = crate::spawn_in_span(async move {
+    let commit = crate::spawn_detached_in_span(async move {
         // The blocking half: one write plus one fsync, on a blocking-pool
         // thread, with no ledger lock held. `PendingCommit` owns its bytes and
         // paths and borrows nothing from the service, which is what makes this
@@ -470,7 +470,7 @@ where
             // for it (and outlives a cancelled caller — see above).
             drop(service);
             let ledger = std::sync::Arc::clone(ledger);
-            let recovery = crate::spawn_in_span(async move {
+            let recovery = crate::spawn_detached_in_span(async move {
                 recover_off_lock(&ledger, load).await;
                 drop(permit);
             });

@@ -1149,8 +1149,51 @@ copied folder: one node id in two meshes would tie them together), is logged
 and not served; the others are. A folder named `default` is ignored, and files
 in `ledgersDir` are not ledgers.
 The node stops only if it can serve no ledger at all. Each ledger's log lines
-carry its name (`ledger="acme"`). Adding or removing a ledger takes a restart
-for now.
+carry its name (`ledger="acme"`).
+
+#### Adding and removing ledgers while the node runs
+
+`gl-node ledger` changes a running node's ledgers, with no restart and nothing
+interrupted on the others. Like `gl-node user`, it reads `GL_NODE_CONFIG` for
+the port and the operator key, so run it as the node's user on its machine:
+
+```bash
+gl-node ledger add acme --settings acme.json   # acme.json is the ledger.json above
+gl-node ledger add notes                       # no settings: a ledger of its own, no mesh
+gl-node ledger list                            # every ledger: served, or not and why
+gl-node ledger restart acme                    # picks up an edited ledger.json
+gl-node ledger remove acme                     # stops it; moves its folder aside
+```
+
+- **`add`** writes the folder and its `ledger.json` (0700 and 0600) under a
+  temporary name and renames it into place, so a node restarted at any moment
+  sees all of it or none of it. A ledger that signs or replicates gets its node
+  key with it; the node id printed goes in the other nodes'
+  `p2p.bootstrapEndpointIds`. The checks are boot's: settings that do not load,
+  or that share a mesh, topic or port with a served ledger, or a node past
+  `maxLedgers`, are refused and nothing is written. A ledger that cannot start
+  is refused too, its folder moved to `.removed/<name>-<time>-failed`.
+- **`remove`** stops the ledger: no new request reaches it, the ones it is
+  serving finish (at most `http.requestTimeoutSeconds`), its journal is folded
+  into its `.bean`, its P2P endpoint closes, and any write still under way
+  ends (a record a peer pushed in those last moments stays in the journal,
+  folded in when the ledger next starts). Then its folder moves, whole, to
+  **`ledgersDir/.removed/<name>-<UTC time>/`**. Nothing is deleted: to serve
+  it again, move the folder back and `restart` it.
+- **`restart`** stops a ledger and starts it again from its folder — after an
+  edit to `ledger.json`, or to retry one that was refused at boot once its
+  folder is fixed (or to serve a folder copied in by hand). Settings that do
+  not load or conflict are refused before anything stops: the ledger keeps
+  serving as it was.
+
+The `default` ledger is the config file's: it changes with the config file
+and a restart of the node. Behind the CLI is the node endpoint,
+**`/node/graphql`** (POST), for the operator key only — any other key, a
+company admin's included, gets `401`: `{ ledgers { name served reason nodeId
+} }`, `addLedger(name, settings)`, `removeLedger(name) { movedTo }` and
+`restartLedger(name)`, refusing with `INVALID_INPUT`, `LEDGER_EXISTS`,
+`NO_SUCH_LEDGER`, `LEDGER_CONFLICT`, `START_FAILED` or `MOVE_FAILED`. One
+change runs at a time, to the end even if the request is cut short.
 
 ### Editing the `.bean` file by hand
 

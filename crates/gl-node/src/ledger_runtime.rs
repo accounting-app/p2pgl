@@ -44,6 +44,20 @@ pub(crate) struct NodeSettings {
 /// See [`NodeSettings::node_ids`].
 pub(crate) type NodeIds = Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>;
 
+/// A ledger's background tasks (`crate::LEDGER_TASKS`): ended by its stop.
+pub(crate) type Tasks = Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>;
+
+/// List `task` among a ledger's tasks, dropping the ones already finished so
+/// the list stays as long as the work that is running (a fetch per gossip
+/// announce comes and goes).
+pub(crate) fn track(tasks: &Tasks, task: tokio::task::AbortHandle) {
+    let mut tasks = tasks.lock().expect("ledger tasks lock");
+    if tasks.len() >= 64 {
+        tasks.retain(|task| !task.is_finished());
+    }
+    tasks.push(task);
+}
+
 /// A ledger that could not start. The reason was logged where it was found.
 #[derive(Debug)]
 pub(crate) struct StartFailed;
@@ -96,6 +110,14 @@ pub(crate) struct RunningLedger {
     pub schema: AppSchema,
     pub auth: AuthState,
     pub health: HealthState,
+    /// The settings it was started with (conflict checks at runtime, 003).
+    pub config: LedgerConfig,
+    /// Its node id, when it has a key (signing or P2P).
+    pub node_id: Option<String>,
+    name: String,
+    node_ids: NodeIds,
+    /// Every task it spawned (step 4): its stop ends them.
+    tasks: Tasks,
     ledger: SharedLedger,
     file_watcher: Option<tokio::task::JoinHandle<()>>,
     p2p_router: Option<iroh::protocol::Router>,
@@ -112,9 +134,34 @@ pub(crate) async fn start(
     node: &NodeSettings,
 ) -> Result<RunningLedger, StartFailed> {
     use tracing::Instrument;
-    start_ledger(name, config, node)
-        .instrument(tracing::info_span!("ledger", ledger = %name))
-        .await
+    let tasks = Tasks::default();
+    let started = crate::LEDGER_TASKS
+        .scope(
+            Arc::clone(&tasks),
+            start_ledger(name, config, node)
+                .instrument(tracing::info_span!("ledger", ledger = %name)),
+        )
+        .await;
+    match started {
+        Ok(mut running) => {
+            running.tasks = tasks;
+            Ok(running)
+        }
+        // A refused start ends whatever it had spawned (a refusal after the
+        // P2P setup leaves its tasks), and frees the node id it claimed —
+        // here or in `settle_node_keys` — so the folder, moved or renamed,
+        // can start with its key (review, step 4).
+        Err(failed) => {
+            for task in tasks.lock().expect("ledger tasks lock").drain(..) {
+                task.abort();
+            }
+            node.node_ids
+                .lock()
+                .expect("node ids lock")
+                .retain(|_, owner| owner != name);
+            Err(failed)
+        }
+    }
 }
 
 async fn start_ledger(
@@ -302,6 +349,7 @@ async fn start_ledger(
     } else {
         None
     };
+    let node_id = node_secret_key.as_ref().map(|key| key.author_id());
 
     // 003, decision 1 (review M-2): a ledger's node key is its own. The same
     // key in two ledgers — a copied folder, or the config file pointed at a
@@ -823,6 +871,11 @@ async fn start_ledger(
         schema,
         auth: auth_state,
         health: health_state,
+        config: config.clone(),
+        node_id,
+        name: name.to_owned(),
+        node_ids: Arc::clone(&node.node_ids),
+        tasks: Tasks::default(),
         ledger: ledger_for_shutdown,
         file_watcher: file_watcher_handle,
         p2p_router,
@@ -837,6 +890,14 @@ impl RunningLedger {
         // Stop file watcher if running.
         if let Some(handle) = self.file_watcher {
             handle.abort();
+        }
+        // 003 step 4: and every other task it started — gossip, anti-entropy,
+        // orphan eviction, the address refresh — so a ledger stopped while the
+        // node runs on leaves nothing behind. Its commits are not among them
+        // (`spawn_detached_in_span`): the compaction and the permit taken at the
+        // end wait for them.
+        for task in self.tasks.lock().expect("ledger tasks lock").drain(..) {
+            task.abort();
         }
 
         // T44: fold the commit journal back into the canonical `.bean` on the way
@@ -854,6 +915,34 @@ impl RunningLedger {
                 warn!(%error, "P2P router shutdown error");
             }
         }
+
+        // Review (step 4): a commit started after the compaction — a peer's
+        // `Supply`, served on iroh's tasks rather than this ledger's — runs
+        // detached and can outlive the router. Every writer holds the write
+        // permit to its end, so taking it once waits for them all: nothing
+        // writes this ledger's files after its stop releases the lock (what
+        // such a commit wrote is in the journal, folded in at the next start).
+        drop(crate::ledger_commit::acquire_write_permit(&self.ledger).await);
+
+        // Its node id is free again (a ledger started later may have it).
+        if let Some(id) = &self.node_id {
+            let mut ids = self.node_ids.lock().expect("node ids lock");
+            if ids.get(id) == Some(&self.name) {
+                ids.remove(id);
+            }
+        }
+    }
+
+    /// Its books (tests).
+    #[cfg(test)]
+    pub(crate) fn ledger(&self) -> SharedLedger {
+        Arc::clone(&self.ledger)
+    }
+
+    /// Its tasks still running (tests: a stop leaves none).
+    #[cfg(test)]
+    pub(crate) fn tasks(&self) -> Tasks {
+        Arc::clone(&self.tasks)
     }
 }
 
@@ -912,6 +1001,151 @@ mod tests {
             .await
             .expect("the lock was released");
         running.stop().await;
+    }
+
+    /// 003 step 4: stopping a ledger ends every task it started — the file
+    /// watcher, and any task spawned while it started or by one of its tasks
+    /// (gossip, anti-entropy, the address refresh) — so one removed while
+    /// the node runs leaves nothing working on its behalf.
+    ///
+    /// Bug-catch: stop only the watcher, as a node exiting could, and a
+    /// removed ledger's tasks run on with the node.
+    #[tokio::test]
+    async fn a_stopped_ledger_leaves_no_task_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = ledger_at(&dir.path().join("acme.bean"));
+        config.watch_ledger_file = true;
+        let running = start("acme", &config, &settings()).await.expect("starts");
+        let tasks = running.tasks();
+        let (nested_tx, nested_rx) = tokio::sync::oneshot::channel();
+        crate::LEDGER_TASKS
+            .scope(Arc::clone(&tasks), async move {
+                crate::spawn_in_span(async move {
+                    let nested = crate::spawn_in_span(std::future::pending::<()>());
+                    let _ = nested_tx.send(nested.abort_handle());
+                    std::future::pending::<()>().await
+                });
+            })
+            .await;
+        let nested = nested_rx.await.expect("the nested task was spawned");
+        let all: Vec<tokio::task::AbortHandle> =
+            tasks.lock().expect("tasks").iter().cloned().collect();
+        assert_eq!(all.len(), 3, "the watcher, a task and the task it spawned");
+        running.stop().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !(all.iter().all(tokio::task::AbortHandle::is_finished) && nested.is_finished()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("every task ended");
+    }
+
+    /// Review (step 4): a stop waits for a write that began after its
+    /// compaction — a peer's `Supply` is served on iroh's tasks, not the
+    /// ledger's, and its commit runs detached — so nothing writes the
+    /// ledger's files once its lock is released (a restart booting them, a
+    /// removal moving them).
+    ///
+    /// Bug-catch: return from the stop once the router is down and the late
+    /// writer is still writing when the next start boots the same files.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_waits_for_a_write_begun_after_its_compaction() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let running = start(
+            "acme",
+            &ledger_at(&dir.path().join("acme.bean")),
+            &settings(),
+        )
+        .await
+        .expect("starts");
+        let ledger = running.ledger();
+        // The stop's compaction queues behind this permit…
+        let held = crate::ledger_commit::acquire_write_permit(&ledger).await;
+        let stopping = tokio::spawn(running.stop());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // …and a late writer behind the compaction (the gate is first come,
+        // first served).
+        let finished = Arc::new(AtomicBool::new(false));
+        let late = {
+            let (ledger, finished) = (Arc::clone(&ledger), Arc::clone(&finished));
+            tokio::spawn(async move {
+                let permit = crate::ledger_commit::acquire_write_permit(&ledger).await;
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                finished.store(true, Ordering::SeqCst);
+                drop(permit);
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(10), stopping)
+            .await
+            .expect("the stop finishes")
+            .expect("joined");
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the stop returned while a writer still held the ledger"
+        );
+        late.await.expect("joined");
+    }
+
+    /// Review (step 4): a commit — here the compaction a ledger's own task
+    /// asks for, as its watcher does — is never among the ledger's tasks, so
+    /// a stop aborting them never cuts a write short (M-39, H-11).
+    ///
+    /// Bug-catch: spawn the commit with `spawn_in_span` and a ledger's stop
+    /// aborts its writes halfway.
+    #[tokio::test]
+    async fn a_commit_is_never_among_a_ledgers_tasks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let running = start(
+            "acme",
+            &ledger_at(&dir.path().join("acme.bean")),
+            &settings(),
+        )
+        .await
+        .expect("starts");
+        let tasks = running.tasks();
+        let before = tasks.lock().expect("tasks").len();
+        let ledger = running.ledger();
+        crate::LEDGER_TASKS
+            .scope(Arc::clone(&tasks), async move {
+                crate::ledger_commit::compact(&ledger).await
+            })
+            .await
+            .expect("compacted");
+        assert_eq!(tasks.lock().expect("tasks").len(), before);
+        running.stop().await;
+    }
+
+    /// Review (step 4): a start that is refused frees the node id it was
+    /// given — by `settle_node_keys` at boot, or by itself — so the folder,
+    /// fixed and served under another name, starts with its own key.
+    ///
+    /// Bug-catch: keep the claim and the ledger is refused, under any other
+    /// name, as a copy of itself.
+    #[tokio::test]
+    async fn a_refused_start_frees_its_node_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = dir.path().join("beta.secret");
+        crate::p2p_service::load_or_create_secret_key(&key).expect("a key");
+        let mut config = ledger_at(&dir.path().join("beta.bean"));
+        config.signing.enabled = true;
+        config.p2p.mesh_id = Some("beta-books".to_owned());
+        config.p2p.secret_key_path = key.to_string_lossy().into_owned();
+        let node = settings();
+        assert!(
+            settle_node_keys(&[("beta".to_owned(), config.clone())], &node.node_ids).is_empty()
+        );
+        let mut refused = config.clone();
+        refused.admin_nodes = Some(vec!["not-an-endpoint-id".to_owned()]);
+        assert!(start("beta", &refused, &node).await.is_err());
+        assert!(node.node_ids.lock().expect("node ids").is_empty());
+        let gamma = start("gamma", &config, &node)
+            .await
+            .expect("the same key, served under another name");
+        gamma.stop().await;
     }
 
     /// 003, decision 1 (review M-2): two ledgers with the same node key — a
