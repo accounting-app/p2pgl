@@ -1016,6 +1016,63 @@ fn ledgers_are_added_and_removed_while_the_node_runs() {
     assert_eq!(node.stop().code(), Some(0));
 }
 
+/// The installer's node, on the shipped binary (005 step 2): `gl-node init`
+/// writes the config of a node behind an HTTPS proxy on the same host, and a
+/// second `init` is refused; the node boots from it, and though it binds
+/// loopback it is public — `/health` tells a caller without a key `ok` and
+/// nothing else (L-09), and its operator the version — and a request without
+/// the key gets 401.
+///
+/// Bug-catch: decide `/health`'s detail by the bind alone and the proxy hands
+/// every stranger the node's version, heads and peers.
+#[test]
+fn a_node_set_up_by_init_is_public_behind_its_proxy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = dir.path().canonicalize().expect("canonical tempdir");
+    let mut node = Node::new(this_binary(), &dir);
+    let config = dir.join("gl-node.config.json");
+    std::fs::remove_file(&config).expect("make room for init's config");
+    let init = |node: &Node| {
+        node.command(&node.binary)
+            .args(["init", "--domain", "ledger.example.com", "--data-dir"])
+            .arg(&dir)
+            .output()
+            .expect("run gl-node init")
+    };
+    let written = init(&node);
+    assert!(
+        written.status.success(),
+        "{}",
+        String::from_utf8_lossy(&written.stderr)
+    );
+    let again = init(&node);
+    assert_eq!(again.status.code(), Some(1), "a second init is refused");
+    // The test's own port: init writes the image's 4000.
+    let mut settings: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config).expect("init's config"))
+            .expect("JSON");
+    settings["port"] = node.port.into();
+    std::fs::write(&config, settings.to_string()).expect("the test's port");
+
+    node.start("init")
+        .unwrap_or_else(|log| panic!("boot: {log}"));
+    let (status, body) = http(node.port, "/health", None, None).expect("health");
+    assert_eq!(status, 200);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).expect("JSON"),
+        json!({ "status": "ok" }),
+        "a stranger learns nothing else"
+    );
+    let (_, body) = http(node.port, "/health", Some(&node.api_key), None).expect("health");
+    assert!(
+        body.contains(env!("CARGO_PKG_VERSION")),
+        "the operator sees it: {body}"
+    );
+    let (status, _) = node.graphql_with("{ verify { ok } }", None);
+    assert_eq!(status, 401);
+    assert_eq!(node.stop().code(), Some(0));
+}
+
 /// The upgrade and rollback procedure of docs/OPERATIONS.md, from the previous
 /// release's binary (`GL_NODE_PREVIOUS_BINARY`) to this one: the previous
 /// version writes a ledger and a backup is taken; this version starts on those

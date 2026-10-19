@@ -53,5 +53,5 @@ them (a typo, a one-line fix) gets no entry.
 | [002](002-users-and-roles/) | People, keys and roles: a key per person, admin / write / read, who entered each write | done (4 of 4, cd51455) |
 | [003](003-multi-ledger-node/) | Several company ledgers on one node, isolated, added at runtime | done (5 of 5, acbce10) |
 | [004](004-no-python/) | No Python in the repo: revert checks and measurements in Rust, the git guard in shell | done (aa0415b) |
-| [005](005-installer/) | A one-command production install on a Linux server (Docker, HTTPS, backups, upgrades) | step 1 of 7 (release 0.2.0) in progress |
+| [005](005-installer/) | A one-command production install on a Linux server (Docker, HTTPS, backups, upgrades) | step 2 of 7 (the node behind a proxy) in progress |
 | — | Relay with a company's own certificate authority (`relayCaCert`) | planned (decision C, 2026-10-09) |

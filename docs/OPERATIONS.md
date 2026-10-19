@@ -102,7 +102,7 @@ connecting node, so admitting or removing one needs no restart.
 | `ledger.bean.journal.torn-*` | A journal set aside after a crash cut a record short; no boot reads it | Keep it with the backup for diagnosis |
 | `iroh.secret` (`p2p.secretKeyPath`) | The node's key: its network identity **and** its signing key | **Yes**, separately and offline — see below |
 | the config file | The node's settings | Yes |
-| the API key | Wherever `GL_NODE_API_KEY` comes from (or `data/api.key` on a loopback node) | Yes, as a secret |
+| the API key | Wherever `GL_NODE_API_KEY` comes from (or `data/api.key` on a loopback node with no proxy in front) | Yes, as a secret |
 | `ledger.bean.lock` | A lock held while the node runs | No |
 | `ledgersDir/<name>/` (`data/ledgers/…`) | Each other ledger's folder: its `ledger.json`, `.bean`, journal and `iroh.secret`, the same files as above | **Yes**, every folder, its key apart like the node's |
 | `ledgersDir/.removed/` | Removed ledgers' folders, whole (*Adding a company*) | Yes, for as long as you must keep a former client's books |

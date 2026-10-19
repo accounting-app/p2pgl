@@ -34,7 +34,8 @@ pub(crate) struct NodeSettings {
     pub operator_key: String,
     /// Whether GraphiQL (and so introspection) is on.
     pub graphiql: bool,
-    /// Whether the node binds a non-loopback address (L-09, `/health`).
+    /// Whether strangers reach the node (L-09, `/health`): `NodeConfig::is_public`,
+    /// a non-loopback bind or a TLS terminator in front (005).
     pub public_bind: bool,
     /// The node ids of the ledgers started so far, by id, with their ledger's
     /// name (003, decision 1): no two ledgers share a node key.

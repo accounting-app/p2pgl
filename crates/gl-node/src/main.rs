@@ -14,6 +14,7 @@ mod ledger_commit;
 mod ledger_lock;
 mod ledger_runtime;
 mod ledgers;
+mod node_init;
 mod p2p_service;
 mod peer_addresses;
 mod peer_connections;
@@ -164,11 +165,13 @@ enum CliAction {
     User(Vec<String>),
     /// `gl-node ledger …` and its arguments (`ledger_cli`).
     Ledger(Vec<String>),
+    /// `gl-node init …` and its arguments (`node_init`).
+    Init(Vec<String>),
     Usage(String),
 }
 
 const USAGE: &str =
-    "Usage: gl-node [--health-check | --node-id [--ledger NAME] | --version | user … | ledger …]";
+    "Usage: gl-node [--health-check | --node-id [--ledger NAME] | --version | user … | ledger … | init …]";
 
 fn parse_cli() -> CliAction {
     let mut args = std::env::args().skip(1);
@@ -179,10 +182,12 @@ fn parse_cli() -> CliAction {
         Some("--node-id") => CliAction::NodeId(args.collect()),
         Some("user") => CliAction::User(args.collect()),
         Some("ledger") => CliAction::Ledger(args.collect()),
+        Some("init") => CliAction::Init(args.collect()),
         Some("--help") | Some("-h") => CliAction::Usage(format!(
-            "{USAGE}\n{}\n{}",
+            "{USAGE}\n{}\n{}\n{}",
             user_cli::USAGE,
-            ledger_cli::USAGE
+            ledger_cli::USAGE,
+            node_init::USAGE
         )),
         Some(other) => CliAction::Usage(format!("unknown argument: {other}\n{USAGE}")),
     }
@@ -343,6 +348,9 @@ async fn main() {
         CliAction::Ledger(args) => {
             ledger_cli::run(&args);
         }
+        CliAction::Init(args) => {
+            node_init::run(&args);
+        }
         CliAction::Usage(message) => {
             eprintln!("{message}");
             std::process::exit(2);
@@ -387,7 +395,7 @@ async fn main() {
         auth_enabled: config.auth.enabled,
         operator_key: config.auth.api_key.clone(),
         graphiql: config.graphiql_enabled(),
-        public_bind: config.binds_non_loopback(),
+        public_bind: config.is_public(),
         node_ids: ledger_runtime::NodeIds::default(),
     };
     // Rate limiter keyed on the real client (M-04). With no trusted proxy the
@@ -396,16 +404,16 @@ async fn main() {
     // rate-limiting the whole internet as a single caller.
     //
     // L-37: the boot-time half fires whenever the config says a proxy is (or
-    // must be) in front — `tls.mode: "terminated"` *or* a non-loopback bind —
-    // not on the terminated flag alone. (Validation makes the second imply the
-    // first today; keying on both keeps the warning honest if that rule ever
-    // moves.) A plain loopback dev node stays quiet. The case config cannot
-    // see — a loopback bind behind a same-host proxy — is caught at runtime by
-    // the limiter itself, the first time an untrusted peer sends
-    // X-Forwarded-For (`RateLimiter::note_untrusted_forwarder`).
+    // must be) in front — `is_public`: `tls.mode: "terminated"` or a
+    // non-loopback bind (with no trusted proxy listed, the third way to be
+    // public does not arise here). A plain loopback dev node stays quiet. The
+    // case config cannot see — a loopback bind behind a same-host proxy that
+    // the config does not declare — is caught at runtime by the limiter
+    // itself, the first time an untrusted peer sends X-Forwarded-For
+    // (`RateLimiter::note_untrusted_forwarder`).
     let trusted_proxies = config.trusted_proxy_set();
     if trusted_proxies.is_empty() {
-        if config.tls.mode == "terminated" || config.binds_non_loopback() {
+        if config.is_public() {
             warn!(
                 tls_mode = %config.tls.mode,
                 public_bind = config.binds_non_loopback(),

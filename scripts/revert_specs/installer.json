@@ -1,0 +1,212 @@
+{
+  "I-R1-health-detail-by-the-bind": {
+    "file": "crates/gl-node/src/main.rs",
+    "old": "        public_bind: config.is_public(),",
+    "new": "        public_bind: config.binds_non_loopback(),",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "a_node_set_up_by_init_is_public_behind_its_proxy"
+      ]
+    ]
+  },
+  "I-R2-a-proxy-does-not-make-a-node-public": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "            || self.tls.mode == \"terminated\"\n",
+    "new": "",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_loopback_node_behind_a_proxy_is_held_to_the_public_rules"
+      ]
+    ]
+  },
+  "I-R3-graphiql-by-the-bind": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "        if self.graphiql && self.is_public() {",
+    "new": "        if self.graphiql && self.binds_non_loopback() {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_loopback_node_behind_a_proxy_is_held_to_the_public_rules"
+      ]
+    ]
+  },
+  "I-R4-auth-off-by-the-bind": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "        if self.is_public() && !self.auth.enabled {",
+    "new": "        if self.binds_non_loopback() && !self.auth.enabled {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_loopback_node_behind_a_proxy_is_held_to_the_public_rules"
+      ]
+    ]
+  },
+  "I-R5-key-file-by-the-bind": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "        if self.is_public() && self.uses_api_key_file() {",
+    "new": "        if self.binds_non_loopback() && self.uses_api_key_file() {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_loopback_node_behind_a_proxy_is_held_to_the_public_rules"
+      ]
+    ]
+  },
+  "I-R6-allowed-hosts-by-the-bind": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "        if self.is_public() && self.allowed_hosts.is_empty() {",
+    "new": "        if self.binds_non_loopback() && self.allowed_hosts.is_empty() {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_loopback_node_behind_a_proxy_is_held_to_the_public_rules"
+      ]
+    ]
+  },
+  "I-R7-init-replaces-a-config": {
+    "file": "crates/gl-node/src/node_init.rs",
+    "old": "        .create_new(true)",
+    "new": "        .create(true)\n        .truncate(true)",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "init_never_replaces_a_config"
+      ]
+    ]
+  },
+  "I-R8-init-binds-every-interface": {
+    "file": "crates/gl-node/src/node_init.rs",
+    "old": "        \"bindAddress\": \"127.0.0.1\",",
+    "new": "        \"bindAddress\": \"0.0.0.0\",",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "init_writes_a_public_node_behind_its_proxy"
+      ]
+    ]
+  },
+  "I-R9-init-trusts-no-proxy": {
+    "file": "crates/gl-node/src/node_init.rs",
+    "old": "        \"trustedProxies\": [\"127.0.0.1\"],",
+    "new": "        \"trustedProxies\": [],",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "init_writes_a_public_node_behind_its_proxy"
+      ]
+    ]
+  },
+  "I-R10-init-takes-any-domain": {
+    "file": "crates/gl-node/src/node_init.rs",
+    "old": "    if domain.len() > 253 || labels.len() < 2 || !labels.iter().all(label_ok) || all_digits {",
+    "new": "    if domain.is_empty() {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "init_takes_a_domain_name_only"
+      ]
+    ]
+  },
+  "I-R11-init-keeps-a-config-that-does-not-load": {
+    "file": "crates/gl-node/src/node_init.rs",
+    "old": "        let _ = std::fs::remove_file(path);",
+    "new": "",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "init_leaves_no_config_that_does_not_load"
+      ]
+    ]
+  },
+  "I-R12-a-trusted-proxy-does-not-make-a-node-public": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "            || !self.trusted_proxies.is_empty()",
+    "new": "            || false",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_loopback_node_behind_a_proxy_is_held_to_the_public_rules"
+      ]
+    ]
+  },
+  "I-R13-init-writes-a-readable-config": {
+    "file": "crates/gl-node/src/node_init.rs",
+    "old": "        .mode(0o600)",
+    "new": "        .mode(0o644)",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "init_writes_a_public_node_behind_its_proxy"
+      ]
+    ]
+  },
+  "I-R14-init-turns-graphiql-on": {
+    "file": "crates/gl-node/src/node_init.rs",
+    "old": "        \"graphiql\": false,",
+    "new": "        \"graphiql\": true,",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "init_writes_a_public_node_behind_its_proxy"
+      ]
+    ]
+  },
+  "I-R15-init-turns-auth-off": {
+    "file": "crates/gl-node/src/node_init.rs",
+    "old": "        \"auth\": { \"enabled\": true, \"apiKey\": \"\" },",
+    "new": "        \"auth\": { \"enabled\": false, \"apiKey\": \"\" },",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "init_writes_a_public_node_behind_its_proxy"
+      ]
+    ]
+  }
+}

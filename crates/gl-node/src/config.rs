@@ -358,13 +358,14 @@ pub struct AuthConfig {
     /// (H-01): before, a loopback node served its mutations to anything that
     /// could reach the port — another program, another account on the
     /// machine, or a browser page past a hole in the request guard. Turning it
-    /// off is allowed on a loopback bind only, and WARNs at every boot.
+    /// off is allowed only on a node that is not public (`is_public`), and
+    /// WARNs at every boot.
     #[serde(default = "default_auth_enabled")]
     pub enabled: bool,
 
-    /// The API key value. Required on a non-loopback bind; on a loopback bind,
-    /// left empty, the key is read from `api_key_path` (generated there on
-    /// the first boot).
+    /// The API key value. Required on a public node (`is_public`); on any
+    /// other, left empty, the key is read from `api_key_path` (generated there
+    /// on the first boot).
     #[serde(default)]
     pub api_key: String,
 
@@ -1100,7 +1101,8 @@ impl P2pConfig {
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct TlsConfig {
-    /// `"disabled"` (loopback only) or `"terminated"` (TLS at the host/proxy).
+    /// `"disabled"` (loopback only) or `"terminated"` (TLS at the host/proxy,
+    /// which makes the node public whatever its bind: `NodeConfig::is_public`).
     #[serde(default = "default_tls_mode")]
     pub mode: String,
 }
@@ -1175,6 +1177,11 @@ pub const MAX_LEDGERS: usize = 100;
 
 /// The name of the config file's own ledger, served at `/graphql` as before.
 pub const DEFAULT_LEDGER: &str = "default";
+
+/// Where the public-node rules apply, as their refusals say it
+/// ([`NodeConfig::is_public`]).
+const ON_A_PUBLIC_NODE: &str =
+    "on a public node (a non-loopback bind, or behind a proxy: tls.mode \"terminated\" or trustedProxies set)";
 
 /// A ledger name (003): 1 to 40 of `a-z`, `0-9` and `-`, not starting with
 /// `-`. It is a folder name and a URL segment, so nothing else is accepted.
@@ -1750,8 +1757,9 @@ impl NodeConfig {
     /// this module at the same time. Passing the value in keeps the precedence
     /// rule deterministic to test; `load_from_path` is the one place that reads
     /// the process environment, and [`API_KEY_ENV_VAR`] is the one place the
-    /// name is spelled.
-    fn load_from_path_with_env_api_key(
+    /// name is spelled. `gl-node init` uses it too, to check the config it
+    /// wrote with a key of its own choosing (`node_init`).
+    pub(crate) fn load_from_path_with_env_api_key(
         config_path: &Path,
         env_api_key: Option<String>,
     ) -> Result<Self, ConfigError> {
@@ -1826,19 +1834,16 @@ impl NodeConfig {
             ));
         }
 
-        if self.graphiql && self.binds_non_loopback() {
-            return Err(ConfigError::Validation(
-                "graphiql must be false when binding a non-loopback address".to_owned(),
-            ));
+        if self.graphiql && self.is_public() {
+            return Err(ConfigError::Validation(format!(
+                "graphiql must be false {ON_A_PUBLIC_NODE}"
+            )));
         }
 
         // H-01: a loopback node with no key configured uses the key file
         // (`main` loads or generates it). A public bind is checked below,
         // after M-2.
-        if self.uses_api_key_file()
-            && !self.binds_non_loopback()
-            && self.auth.api_key_path.is_empty()
-        {
+        if self.uses_api_key_file() && !self.is_public() && self.auth.api_key_path.is_empty() {
             return Err(ConfigError::Validation(
                 "auth.apiKeyPath is required when auth is enabled and no auth.apiKey is set"
                     .to_owned(),
@@ -1985,29 +1990,28 @@ impl NodeConfig {
         // unauthenticated GraphQL — including the appendTransaction/openAccount/
         // closeAccount mutations — to the whole network. Refuse to boot rather
         // than only warning.
-        if self.binds_non_loopback() && !self.auth.enabled {
-            return Err(ConfigError::Validation(
-                "auth.enabled must be true when binding a non-loopback address; an unauthenticated public bind exposes writable GraphQL mutations".to_owned(),
-            ));
+        if self.is_public() && !self.auth.enabled {
+            return Err(ConfigError::Validation(format!(
+                "auth.enabled must be true {ON_A_PUBLIC_NODE}; an unauthenticated public node exposes writable GraphQL mutations"
+            )));
         }
 
-        // H-01: a public bind needs a key its clients were given on purpose,
+        // H-01: a public node needs a key its clients were given on purpose,
         // never one generated into a file on the server.
-        if self.binds_non_loopback() && self.uses_api_key_file() {
-            return Err(ConfigError::Validation(
-                "auth.apiKey (or GL_NODE_API_KEY) is required when binding a non-loopback address"
-                    .to_owned(),
-            ));
+        if self.is_public() && self.uses_api_key_file() {
+            return Err(ConfigError::Validation(format!(
+                "auth.apiKey (or GL_NODE_API_KEY) is required {ON_A_PUBLIC_NODE}"
+            )));
         }
 
         // H-01: fail closed. The request guard only admits the built-in loopback
         // hosts plus the bind address, so on a non-loopback bind the operator
         // must say which hostname(s)/IP(s) clients use — otherwise every request
         // through a proxy or DNS name is rejected with 403 at runtime.
-        if self.binds_non_loopback() && self.allowed_hosts.is_empty() {
-            return Err(ConfigError::Validation(
-                "allowedHosts must list the hostname(s) or IP(s) clients use to reach this node when binding a non-loopback address; otherwise the Host guard rejects every request".to_owned(),
-            ));
+        if self.is_public() && self.allowed_hosts.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "allowedHosts must list the hostname(s) or IP(s) clients use to reach this node {ON_A_PUBLIC_NODE}; otherwise the Host guard rejects every request"
+            )));
         }
 
         Ok(())
@@ -2151,19 +2155,36 @@ impl NodeConfig {
         }
     }
 
-    /// True when the HTTP bind address is not loopback (I-1 / H-5 warning).
     /// Whether the API key comes from `auth.apiKeyPath` (H-01): auth is on and
     /// neither the config file nor `GL_NODE_API_KEY` supplied one. Validation
-    /// admits that only on a loopback bind.
+    /// admits that only on a node that is not public (`is_public`).
     pub fn uses_api_key_file(&self) -> bool {
         self.auth.enabled && self.auth.api_key.is_empty()
     }
 
+    /// True when the HTTP bind address is not loopback (I-1 / H-5 warning).
     pub fn binds_non_loopback(&self) -> bool {
         !matches!(
             self.bind_address.as_str(),
             "127.0.0.1" | "::1" | "localhost"
         )
+    }
+
+    /// Whether strangers can reach this node's API (005): a non-loopback
+    /// bind, `tls.mode: "terminated"` — a TLS terminator in front, which on
+    /// the same host hands a loopback bind the whole internet — or a
+    /// `trustedProxies` entry, the operator's word that a proxy forwards to it
+    /// (review: with `tls.mode` left `"disabled"` it is a proxy all the same).
+    /// Every rule that
+    /// protects a node others reach keys on this (L-09's minimal `/health`, M-2
+    /// auth on, no GraphiQL, H-01's key given on purpose and `allowedHosts`),
+    /// so a loopback node behind a proxy is held to them as the public node it
+    /// is. Only the rule that a non-loopback bind must be terminated keys on
+    /// the bind itself.
+    pub fn is_public(&self) -> bool {
+        self.binds_non_loopback()
+            || self.tls.mode == "terminated"
+            || !self.trusted_proxies.is_empty()
     }
 
     /// This node's one ledger's settings, as the config file gives them.
@@ -2570,6 +2591,63 @@ mod tests {
         assert!(!config.binds_non_loopback());
         assert!(!config.auth.enabled);
         assert!(!config.uses_api_key_file());
+    }
+
+    /// 005 step 2: a loopback node behind a TLS proxy (`tls.mode:
+    /// "terminated"`, or a `trustedProxies` entry) is public — the proxy hands it the internet — so it is
+    /// held to every public-node rule: no GraphiQL, auth on, a key given on
+    /// purpose rather than a generated key file, and `allowedHosts`; with all
+    /// of them it loads. A loopback node without a proxy keeps its leeway.
+    ///
+    /// Bug-catch: key the rules on the bind alone and a node behind a proxy on
+    /// its own host serves GraphiQL, or no auth at all, to the internet.
+    #[test]
+    fn a_loopback_node_behind_a_proxy_is_held_to_the_public_rules() {
+        let load = |body: &str, key: Option<&str>| {
+            let file = write_temp_config(&format!(
+                r#"{{ "ledgerPath": "./data/ledger.bean", "tls": {{ "mode": "terminated" }}{body} }}"#
+            ));
+            NodeConfig::load_from_path_with_env_api_key(file.path(), key.map(str::to_owned))
+        };
+        let key = Some("unit-test-api-key-0123456789abcd");
+        let hosts = r#", "allowedHosts": ["ledger.example.com"]"#;
+        for (body, key, refused_for) in [
+            (format!(r#"{hosts}, "graphiql": true"#), key, "graphiql"),
+            (
+                format!(r#"{hosts}, "auth": {{ "enabled": false }}"#),
+                None,
+                "auth.enabled",
+            ),
+            (hosts.to_owned(), None, "auth.apiKey"),
+            (String::new(), key, "allowedHosts"),
+        ] {
+            let Err(error) = load(&body, key) else {
+                panic!("{refused_for}: a node behind a proxy loaded with {body}");
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains(refused_for) && message.contains("public node"),
+                "{refused_for}: {message}"
+            );
+        }
+        let config = load(hosts, key).expect("with every rule kept it loads");
+        assert!(config.is_public() && !config.binds_non_loopback());
+
+        // A proxy named in trustedProxies is a proxy, `tls.mode` or not.
+        let file = write_temp_config(
+            r#"{ "ledgerPath": "./data/ledger.bean", "trustedProxies": ["127.0.0.1"], "graphiql": true }"#,
+        );
+        let Err(error) =
+            NodeConfig::load_from_path_with_env_api_key(file.path(), key.map(str::to_owned))
+        else {
+            panic!("a node with a trusted proxy served GraphiQL");
+        };
+        assert!(error.to_string().contains("graphiql"), "{error}");
+
+        let file = write_temp_config(r#"{ "ledgerPath": "./data/ledger.bean", "graphiql": true }"#);
+        let local = NodeConfig::load_from_path_with_env_api_key(file.path(), None)
+            .expect("a loopback node without a proxy keeps GraphiQL and its key file");
+        assert!(!local.is_public());
     }
 
     #[test]
@@ -3532,9 +3610,14 @@ mod tests {
     #[test]
     fn test_trusted_proxies_accepted() {
         let file = write_temp_config(
-            r#"{ "ledgerPath": "./data/ledger.bean", "trustedProxies": ["10.0.0.1", "2001:db8::1"] }"#,
+            // A node with a proxy in front is public (005): its key and host.
+            r#"{ "ledgerPath": "./data/ledger.bean", "trustedProxies": ["10.0.0.1", "2001:db8::1"], "allowedHosts": ["ledger.example.com"] }"#,
         );
-        let config = NodeConfig::load_from_path(&file.path().to_path_buf()).expect("should load");
+        let config = NodeConfig::load_from_path_with_env_api_key(
+            file.path(),
+            Some("unit-test-api-key-0123456789abcd".to_owned()),
+        )
+        .expect("should load");
         assert_eq!(config.trusted_proxies, vec!["10.0.0.1", "2001:db8::1"]);
         let trusted = config.trusted_proxy_set();
         assert_eq!(trusted.len(), 2);

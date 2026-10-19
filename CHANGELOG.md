@@ -7,6 +7,34 @@ break compatibility.
 
 ## [Unreleased]
 
+### Breaking
+
+- **`tls.mode: "terminated"`, or a `trustedProxies` entry, makes a node public
+  whatever its bind**
+  (`docs/build-log/005-installer`, step 2). A loopback node behind a TLS proxy
+  on the same host — declared by `tls.mode: "terminated"` or by naming the
+  proxy in `trustedProxies` — is held to every rule a non-loopback node is: GraphiQL off,
+  auth on, an `auth.apiKey` (or `GL_NODE_API_KEY`) rather than the generated
+  key file, and a non-empty `allowedHosts`. Such a config that breaks one of
+  them is now refused at boot, naming the rule; set the key in the
+  environment and the proxy's host name in `allowedHosts`.
+
+### Security
+
+- **`/health` behind a proxy on the same host tells strangers `ok` and nothing
+  else** (L-09, 005 step 2): a loopback node decided its `/health` detail by
+  its bind, so a proxy on its own host served its version, heads and peer
+  count to the internet. The detail is now for keys only on every public
+  node (`NodeConfig::is_public`).
+
+### Added
+
+- **`gl-node init --domain DOMAIN`** (005 step 2, README *Behind an HTTPS
+  proxy on the same host*): writes the config of a node served through a TLS
+  proxy on its own host — loopback bind, the proxy and the domain trusted,
+  auth on with the key from the environment — never replacing an existing
+  file, and checks it loads.
+
 ## [0.2.0] — 2026-10-19
 
 Companies and accountants on one node: several company ledgers, each its own

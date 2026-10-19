@@ -835,7 +835,8 @@ mod tests {
 
     fn terminated_state() -> RequestGuardState {
         let config = load_config(
-            r#"{ "ledgerPath": "./data/ledger.bean", "tls": { "mode": "terminated" }, "allowedHosts": ["ledger.example.com"] }"#,
+            // A node behind a terminator is public (005): its key is given.
+            r#"{ "ledgerPath": "./data/ledger.bean", "tls": { "mode": "terminated" }, "allowedHosts": ["ledger.example.com"], "auth": { "apiKey": "unit-test-api-key-0123456789abcd" } }"#,
         );
         let state = guard_state(&config);
         assert!(state.tls_terminated);
