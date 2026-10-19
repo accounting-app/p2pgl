@@ -1,0 +1,57 @@
+# The release's Linux binary for the architecture the Docker host is not
+# (docs/RELEASE.md, *Platforms*): built natively on the host's architecture and
+# cross-compiled to TARGET, so an Apple Silicon Mac ships linux-amd64 in minutes
+# rather than the hours an emulated build takes. scripts/release.sh builds it
+# with the classic builder and copies the binary out:
+#
+#   DOCKER_BUILDKIT=0 docker build -f Dockerfile.cross \
+#     --build-arg TARGET=x86_64-unknown-linux-gnu --build-arg GCC_ARCH=x86-64 \
+#     --build-arg DEB_ARCH=amd64 -t openledger/gl-node-cross:amd64 .
+#
+# The same pinned Rust image as the Dockerfile (L-10), so both binaries come
+# from one toolchain. It is Debian trixie: the cross C compiler is its
+# `gcc-<arch>-linux-gnu`, with `libc6-dev-<arch>-cross` (glibc 2.41 headers,
+# which the compiler only recommends), for `ring`'s C — nothing else links C
+# (see the Dockerfile on OpenSSL). The packages come from Debian's signed
+# repository at build time, not pinned like the image. The binaries run on the
+# runtime image's base, bookworm (glibc 2.36): the build below refuses a binary
+# that asks for a newer glibc symbol than MAX_GLIBC, so nothing but an
+# emulated run would otherwise notice.
+FROM rust:1.91-slim@sha256:f75071363e7f4771769d4cf81b1b7b290e607f4d4459e8731f6abdcee9982dc8
+
+# x86_64-unknown-linux-gnu with GCC_ARCH x86-64 and DEB_ARCH amd64, or
+# aarch64-unknown-linux-gnu with GCC_ARCH aarch64 and DEB_ARCH arm64.
+ARG TARGET=x86_64-unknown-linux-gnu
+ARG GCC_ARCH=x86-64
+ARG DEB_ARCH=amd64
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        "gcc-${GCC_ARCH}-linux-gnu" "libc6-dev-${DEB_ARCH}-cross" \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup target add "$TARGET"
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock rustfmt.toml ./
+COPY crates/ crates/
+COPY testfixtures/ testfixtures/
+# xtask is a workspace member: its manifest and a stub load the workspace; it
+# is never built here.
+COPY xtask/Cargo.toml xtask/Cargo.toml
+RUN mkdir -p xtask/src && echo 'fn main() {}' > xtask/src/main.rs
+
+# The linker and C compiler for TARGET, by the names cargo and the `cc` crate
+# look for (`CARGO_TARGET_<TRIPLE>_LINKER`, `CC_<triple>`).
+RUN gcc="$(echo "$GCC_ARCH" | tr - _)-linux-gnu-gcc" \
+    && export "CARGO_TARGET_$(echo "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER=$gcc" \
+    && export "CC_$(echo "$TARGET" | tr - _)=$gcc" \
+    && cargo build --release --locked --bin gl-node --target "$TARGET" \
+    && cp "target/$TARGET/release/gl-node" /gl-node
+
+# Bookworm's glibc, the runtime image's base: 2.MAX_GLIBC at most. Declared
+# here, so another value reruns only this check.
+ARG MAX_GLIBC=36
+RUN needs="$("$(echo "$GCC_ARCH" | tr - _)-linux-gnu-objdump" -T /gl-node \
+        | grep -o 'GLIBC_2\.[0-9]*' | sed 's/GLIBC_2\.//' | sort -n | tail -1)" \
+    && echo "gl-node needs glibc 2.$needs (at most 2.$MAX_GLIBC)" \
+    && [ "$needs" -le "$MAX_GLIBC" ]

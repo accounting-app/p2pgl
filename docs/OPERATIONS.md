@@ -176,7 +176,7 @@ Roll back every node of the mesh, as you upgraded every node.
 Every release rehearses this upgrade and rollback from the previous release's
 binary, on one machine (`docs/RELEASE.md`).
 
-### To the release with several ledgers (from 0.1.0)
+### To 0.2.0, the release with several ledgers (from 0.1.0)
 
 - **At the swap:** a `ledgerPath` inside `./data/ledgers` (the default of the
   new `ledgersDir`) is refused at boot. Such a node sets `ledgersDir`
