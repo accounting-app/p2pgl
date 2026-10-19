@@ -47,7 +47,7 @@ You'll see:
 ```
 INFO  loading configuration path=gl-node.config.json
 INFO  generated a new API key; clients send the file's contents as the X-Api-Key header (H-01) path=./data/api.key
-INFO  gl-node starting address=127.0.0.1:4000 version=0.1.0 ledger=my-ledger.bean auth_enabled=true p2p_enabled=false graphiql=false
+INFO  gl-node starting address=127.0.0.1:4000 version=0.2.0 ledger=my-ledger.bean auth_enabled=true p2p_enabled=false graphiql=false
 ```
 
 Every `/graphql` request needs that key in an `X-Api-Key` header — see [Using Auth](#using-auth). The first boot writes it to `./data/api.key` (readable by your account only); later boots read it back.
@@ -82,7 +82,7 @@ Response (loopback bind, or any bind with a valid `X-Api-Key`):
   "status": "ok",
   "heads": 0,
   "peers": 0,
-  "version": "0.1.0"
+  "version": "0.2.0"
 }
 ```
 

@@ -18,7 +18,8 @@
 #      (crates/gl-node/tests/shipped_binary.rs: `cargo test --release`);
 #   6. with --previous, the same tests' upgrade rehearsal from OLD_BINARY;
 #   7. the Docker image openledger/gl-node:X.Y.Z, and the Linux binary copied
-#      out of it;
+#      out of it; the other Linux architecture cross-compiled (Dockerfile.cross)
+#      and, where the Docker host emulates it, booted to a passing health check;
 #   8. checksums and a RELEASE-INFO.txt, in target/release-dist/X.Y.Z/.
 #
 # It changes nothing in git. The tag is the maintainer's: the script ends by
@@ -27,6 +28,16 @@ set -euo pipefail
 
 step() { printf '\n== %s\n' "$*"; }
 fail() { printf 'RELEASE STOPPED: %s\n' "$*" >&2; exit 1; }
+# The architecture a Linux (ELF) binary is for, from its header — e_machine,
+# bytes 18–19 — whatever an image's metadata says.
+elf_arch() {
+  [[ "$(od -An -tx1 -N4 "$1" | tr -d ' \n')" == 7f454c46 ]] || { echo "not-elf"; return; }
+  case "$(od -An -tx1 -j18 -N2 "$1" | tr -d ' \n')" in
+    3e00) echo amd64 ;;
+    b700) echo arm64 ;;
+    *) echo unknown ;;
+  esac
+}
 
 usage="usage: scripts/release.sh [--previous OLD_BINARY] [--rerun-gate]"
 previous=""
@@ -95,12 +106,69 @@ if docker info >/dev/null 2>&1; then
   # BuildKit-only.
   DOCKER_BUILDKIT=0 docker build -t "openledger/gl-node:$version" . || fail "the Docker build failed"
   image_id=$(docker image inspect --format '{{.Id}}' "openledger/gl-node:$version")
-  linux_arch=$(docker image inspect --format '{{.Architecture}}' "openledger/gl-node:$version")
-  container=$(docker create "openledger/gl-node:$version")
+  image_arch=$(docker image inspect --format '{{.Architecture}}' "openledger/gl-node:$version")
+  container=$(docker create "openledger/gl-node:$version") || fail "could not create a container from the image"
   trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
-  docker cp "$container:/usr/local/bin/gl-node" "$dist/gl-node-$version-linux-$linux_arch"
+  docker cp "$container:/usr/local/bin/gl-node" "$dist/gl-node-linux" \
+    || fail "could not copy the binary out of the image"
+  # Named by what the binary is, and checked against the image: with Docker's
+  # classic image store, pulling another platform of the multi-arch base (the
+  # emulated check below) re-points its pinned digest, and the classic builder
+  # then builds the runtime stage on that platform without complaint — the
+  # image's metadata would name the binary after the wrong architecture.
+  linux_arch=$(elf_arch "$dist/gl-node-linux")
+  [[ "$linux_arch" == "$image_arch" ]] \
+    || fail "the image says linux/$image_arch but its gl-node is $linux_arch: the Dockerfile's runtime base on this Docker host is another platform's (classic image store). Pull it again for linux/$linux_arch, or use the containerd image store, and rerun."
+  mv "$dist/gl-node-linux" "$dist/gl-node-$version-linux-$linux_arch"
   image_version=$(docker run --rm --entrypoint gl-node "openledger/gl-node:$version" --version)
   [[ "$image_version" == *"$version"* ]] || fail "the image's binary reports '$image_version', not $version"
+
+  # The other Linux architecture, cross-compiled (Dockerfile.cross): servers are
+  # mostly amd64, an Apple Silicon Mac builds arm64.
+  case "$linux_arch" in
+    arm64) other=amd64 target=x86_64-unknown-linux-gnu gcc_arch=x86-64 ;;
+    amd64) other=arm64 target=aarch64-unknown-linux-gnu gcc_arch=aarch64 ;;
+    *) fail "no cross build from linux-$linux_arch" ;;
+  esac
+  step "linux-$other binary (cross-compiled)"
+  DOCKER_BUILDKIT=0 docker build -f Dockerfile.cross --build-arg "TARGET=$target" \
+    --build-arg "GCC_ARCH=$gcc_arch" --build-arg "DEB_ARCH=$other" -t "openledger/gl-node-cross:$version-$other" . \
+    || fail "the linux-$other cross build failed"
+  cross=$(docker create "openledger/gl-node-cross:$version-$other") \
+    || fail "could not create a container from the cross build"
+  trap 'docker rm -f "$container" "$cross" >/dev/null 2>&1 || true' EXIT
+  docker cp "$cross:/gl-node" "$dist/gl-node-$version-linux-$other" \
+    || fail "could not copy the cross-compiled binary out"
+  [[ "$(elf_arch "$dist/gl-node-$version-linux-$other")" == "$other" ]] \
+    || fail "the cross-compiled binary is not a linux-$other binary"
+  # Run it, emulated, on the image's own base: it boots from an empty
+  # directory and passes its own health check. Without emulation (binfmt) in
+  # the Docker host, say so: the binary ships unrun. (Dockerfile.cross has
+  # already refused a binary needing a glibc newer than that base's.)
+  base=$(sed -n 's/^FROM \(debian:[^ ]*\) AS runtime$/\1/p' Dockerfile)
+  [[ -n "$base" ]] || fail "the Dockerfile has no 'FROM debian:… AS runtime' line to run the binary on"
+  docker pull -q --platform "linux/$other" "$base" >/dev/null \
+    || fail "could not fetch the runtime base for linux/$other ($base)"
+  if docker run --rm --platform "linux/$other" "$base" true >/dev/null 2>&1; then
+    # A throwaway key for an empty node, through the environment (never on a
+    # command line).
+    GL_NODE_API_KEY=$(openssl rand -hex 32)
+    export GL_NODE_API_KEY
+    docker run --rm --platform "linux/$other" -e GL_NODE_API_KEY \
+      -v "$PWD/$dist/gl-node-$version-linux-$other:/usr/local/bin/gl-node:ro" "$base" sh -c '
+        cd /tmp && echo "{\"ledgerPath\": \"./data/ledger.bean\"}" > c.json
+        export GL_NODE_CONFIG=/tmp/c.json
+        gl-node --version
+        gl-node > node.log 2>&1 &
+        for i in $(seq 120); do gl-node --health-check >/dev/null 2>&1 && exit 0; sleep 1; done
+        cat node.log; exit 1' \
+      || fail "the linux-$other binary did not boot and pass its health check (emulated)"
+    unset GL_NODE_API_KEY
+    cross_run="booted and passed its health check, emulated"
+  else
+    cross_run="not run: no linux/$other emulation in this Docker host"
+  fi
+  echo "linux-$other: $cross_run"
 else
   image_id="(not built: Docker is not running)"
   echo "Docker is not running — image and Linux binary skipped"
@@ -114,6 +182,9 @@ step "checksums"
   echo "built:       $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "rustc:       $(rustc --version)"
   echo "docker image openledger/gl-node:$version $image_id"
+  if [[ -n "${other:-}" ]]; then
+    echo "linux-$other: cross-compiled (Dockerfile.cross), $cross_run"
+  fi
   echo
   cat "$dist/SHA256SUMS"
 } > "$dist/RELEASE-INFO.txt"

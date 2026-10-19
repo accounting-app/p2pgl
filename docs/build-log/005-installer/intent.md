@@ -1,6 +1,6 @@
 # Intent: a one-command production install
 
-Author: Claude, with the maintainer. Status: draft (2026-10-16).
+Author: Claude, with the maintainer. Status: **approved** (2026-10-19).
 
 ## Problem
 

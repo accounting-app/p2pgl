@@ -7,6 +7,63 @@ break compatibility.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-10-19
+
+Companies and accountants on one node: several company ledgers, each its own
+mesh, people and keys, added and removed while the node runs; a key and a role
+per person, and who entered each entry; nodes that find each other through the
+mesh's own relay or their addresses, with nothing going to n0
+(`p2p.relayMode: "custom"` or `"disabled"`; the default stays `"n0"`).
+
+**Status: pilot,** as 0.1.0: its tests run nodes on one machine (and three in
+Docker); it has not yet run across real networks. Run it beside your existing
+books before relying on it.
+
+**Upgrading from 0.1.0:** `docs/OPERATIONS.md`, *Upgrading* and *To 0.2.0*.
+
+**Known limits.**
+
+- No TLS in the node: on any non-loopback bind the API must sit behind an HTTPS
+  terminator (`tls.mode: "terminated"`).
+- `p2p.relayMode` still defaults to `"n0"`, so a config that does not set it
+  keeps using n0's public relays and discovery (n0 sees each node's IP
+  address, its peers and its traffic timing). The production template sets
+  `"custom"`.
+- A node built before Format v2 can neither read v2 records nor speak the v2
+  wire; every node of a mesh runs the same release (OPERATIONS, *Upgrading*).
+- Every ledger's history is held in memory: OPERATIONS *Sizing a node with
+  several ledgers* gives the budget (about 45 MiB per 10,000 entries); at most
+  100 ledgers a node.
+- A backup is taken with the node stopped (seconds; the mesh's other nodes
+  serve meanwhile).
+- Pad synthesis is not wired in: a `pad` directive is kept and replicated but
+  changes no balance.
+- Linux binaries for amd64 and arm64; the one not native to the release
+  machine is cross-compiled, and booted under emulation where the release's
+  Docker host emulates it (`RELEASE-INFO.txt` says).
+
+### Breaking
+
+What can stop a 0.1.0 deployment from starting, or change what it does;
+OPERATIONS *To 0.2.0* has the order to do it in.
+
+- **`deploy/mesh-init.sh` needs `jq` instead of `python3`**
+  (`docs/build-log/004-no-python`): the project's tools no longer use Python.
+  The revert checks and the measurements are `scripts/revert_check.sh` and
+  `scripts/measure_ledgers.sh` (Rust, `cargo xtask …`).
+- **`ledgerPath` inside `ledgersDir` is refused at boot** (003): that folder
+  holds the node's other ledgers, and the default `ledgersDir` is
+  `./data/ledgers` — a `ledgerPath` such as `./data/ledgers/x.bean` must move.
+- **`deploy/gl-node.production.json` uses `relayMode: "custom"`** and so
+  refuses to boot until the mesh's own relay (`p2p.relayUrl`) or the peers'
+  addresses (`p2p.peerAddresses`) are set; it no longer runs on n0's public
+  servers by default. The node's own default stays `"n0"`, so existing configs
+  are unchanged.
+- **The compose stack mounts `deploy/mesh/node-N.json`** (written by
+  `deploy/mesh-init.sh`) instead of the shared `gl-node.docker.json`. A stack
+  with history keeps its signatures by running
+  `MESH_ID=openledger/docker-dev deploy/mesh-init.sh`.
+
 ### Changed
 
 - **The image's configs keep the other ledgers in `/data/ledgers`** (003 step
@@ -21,28 +78,12 @@ break compatibility.
   thread ran meanwhile — another ledger's start, its requests — logged under
   that endpoint, and kept doing so. The node now binds each endpoint on a
   thread of its own.
-- **`deploy/mesh-init.sh` needs `jq` instead of `python3`**
-  (`docs/build-log/004-no-python`): the project's tools no longer use Python.
-  The revert checks and the measurements are `scripts/revert_check.sh` and
-  `scripts/measure_ledgers.sh` (Rust, `cargo xtask …`).
-- **`ledgerPath` inside `ledgersDir` is refused at boot** (003): that folder
-  holds the node's other ledgers, and the default `ledgersDir` is
-  `./data/ledgers` — a `ledgerPath` such as `./data/ledgers/x.bean` must move.
-- **`gl-node --node-id` refuses arguments it does not know** (exit 2); it
-  takes `--ledger NAME`.
-
-- **`deploy/gl-node.production.json` uses `relayMode: "custom"`** and so
-  refuses to boot until the mesh's own relay (`p2p.relayUrl`) or the peers'
-  addresses (`p2p.peerAddresses`) are set; it no longer runs on n0's public
-  servers by default. The node's own default stays `"n0"`, so existing configs
-  are unchanged.
-- **The compose stack mounts `deploy/mesh/node-N.json`** (written by
-  `deploy/mesh-init.sh`) instead of the shared `gl-node.docker.json`. A stack
-  with history keeps its signatures by running
-  `MESH_ID=openledger/docker-dev deploy/mesh-init.sh`.
 
 ### Security
 
+- **rustls 0.23.46** (from 0.23.45), the TLS library under the P2P transport,
+  relay and DNS clients: RUSTSEC-2026-0346 (`Debug` output of a client
+  session exposed TLS secrets — medium), 0347, 0348 and 0349 (low).
 - **Every GraphQL request passes a role check before anything runs**
   (`docs/build-log/002-users-and-roles`): queries need *read*, every mutation
   *write*, by operation type — so a mutation added later is closed to read-only

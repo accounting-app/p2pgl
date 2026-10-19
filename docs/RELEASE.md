@@ -48,8 +48,18 @@ compatibility, and the CHANGELOG's *Breaking* section says how.
 
 ## Platforms
 
-`release.sh` ships the binary for the machine it runs on, and a Linux binary
+`release.sh` ships the binary for the machine it runs on, a Linux binary
 copied out of the Docker image for the Docker host's architecture (on an Apple
-Silicon Mac, `linux-arm64`). A Linux `amd64` build comes from running the
-script on an `x86_64` machine, or from `docker build --platform linux/amd64`
-(emulated, much slower).
+Silicon Mac, `linux-arm64`), and the other Linux architecture (there,
+`linux-amd64`) cross-compiled by `Dockerfile.cross` from the same pinned Rust
+image: built on the host's own architecture in minutes, not emulated for
+hours. Where the Docker host emulates that architecture (binfmt; Colima and
+Docker Desktop do), the script boots the cross-compiled binary from an empty
+directory under emulation and waits for its own health check to pass;
+`RELEASE-INFO.txt` says whether it did. The build itself refuses a binary that
+needs a newer glibc than the runtime image's bookworm (2.36): the Rust image
+is Debian trixie, and only the symbols a binary uses decide where it runs. Each
+Linux binary is named by the architecture in its ELF header, which must match
+its image's. The shipped-binary tests run on the release machine's own binary
+only. (With Colima, run the release from under your home directory: only that
+is shared with the Docker VM, and a mount from elsewhere arrives empty.)
