@@ -56,7 +56,12 @@ node's data and backups), so a re-run and an uninstall know what is theirs.
    an emulated boot as its check; the installer needs the binary only. The
    upgrade rehearsal runs with the release, on the committed tree.)
 2. **The node behind a proxy:** `/health` public under `tls.mode:
-   "terminated"`; `gl-node init`. README, CHANGELOG.
+   "terminated"`; `gl-node init`. README, CHANGELOG. (As built: every
+   public-node rule, not only `/health`, keys on `is_public` — a loopback
+   bind behind a proxy also had GraphiQL, auth off, the key file and an empty
+   `allowedHosts` open to it; `init`'s own ledger has no mesh (signing and
+   P2P off) — companies bring theirs — so it writes no `meshId`, topic or
+   relay.)
 3. **The installer:** `deploy/install/install.sh` — checks the system,
    installs Docker from Docker's apt repository (key by fingerprint), fetches
    and verifies the release, builds the image, writes config, Caddyfile,

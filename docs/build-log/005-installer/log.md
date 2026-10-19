@@ -1,6 +1,6 @@
 # Log: a one-command production install
 
-Status: in progress (step 1 of 7).
+Status: in progress (step 2 of 7).
 
 One entry per commit-sized unit, newest last, written when the unit is ready
 to commit. The commit hash is filled in once the maintainer has committed.
@@ -68,4 +68,64 @@ to commit. The commit hash is filled in once the maintainer has committed.
 - **Gate:** `scripts/gate.sh` — 1,618 passed, 0 failed, 0 ignored (8 min 9 s).
 - **Revert checks:** none (a dependency update).
 - **Departures from the plan:** none; the release runs after this commit.
+- **Commit:** <hash>
+
+## 2026-10-19 — Step 2: the node behind a proxy
+
+- **Release 0.2.0** (step 1) was built and checked at d6a4abb after the
+  rustls commit: gate, audit, MSRV 1.91, the shipped-binary tests with the
+  upgrade and rollback from 0.1.0 (8 passed), the image, linux-arm64, and
+  linux-amd64 cross-compiled and booted to a passing health check under
+  emulation (`target/release-dist/0.2.0/`, kept beside 0.1.0's). Tag and
+  publish: the maintainer.
+- **What changed:** **`NodeConfig::is_public`** — a non-loopback bind, *or*
+  `tls.mode: "terminated"`, *or* a `trustedProxies` entry — is what every
+  public-node rule keys on: L-09's
+  minimal `/health`, M-2's auth on, no GraphiQL, H-01's key given on purpose
+  and a non-empty `allowedHosts` (one message for where they apply). Before,
+  they keyed on the bind, so a loopback node behind a proxy on its own host —
+  the installer's design — would have served GraphiQL, no auth, a generated
+  key or the full `/health` to the internet. Only "a non-loopback bind must
+  be terminated" keys on the bind. **`gl-node init --domain D [--data-dir]
+  [--output]`** (`node_init.rs`) writes that node's config: `127.0.0.1:4000`,
+  `trustedProxies: ["127.0.0.1"]`, `allowedHosts: [D]` (a DNS name, lower
+  cased; no scheme, port, path or IP), `tls.mode: "terminated"`, auth on with
+  no key in the file, GraphiQL off, `ledgersDir` under the data directory,
+  signing and P2P off for its own ledger — created 0600 and never replacing a
+  file, then loaded as the node loads it (with a throwaway key) and removed if
+  it does not. README (the *public node* wording throughout, *Behind an HTTPS
+  proxy on the same host*), CHANGELOG (*Breaking*, *Security*, *Added*).
+- **Tests:** a loopback node behind a proxy is refused for each public rule
+  and loads with all kept, a plain loopback node keeps its leeway; `init`
+  writes a public node behind its proxy (0600, no key, loads); never replaces
+  a config; leaves no config that does not load; takes a domain name only;
+  on the shipped binary, a node set up by `init` boots and is public behind
+  its proxy (`/health` is `{"status":"ok"}` without a key, the version with
+  it; GraphQL without a key 401), and a second `init` exits 1. The L-51
+  request-guard fixture (loopback, terminated, no key) now gives its key.
+- **Gate:** `scripts/gate.sh` — 1,624 passed, 0 failed, 0 ignored (6 min 55 s).
+- **Review round** (reviewer subagent; nothing Important). A loopback node
+  that names its proxy in `trustedProxies` but leaves `tls.mode` at
+  `"disabled"` has a proxy in front all the same, and escaped every public
+  rule; `is_public` now counts it (the maintainer's call to confirm; I-R12),
+  and the trusted-proxies fixture gives its key and host. `init` serializes
+  before the file exists (an early return would have left an empty file every
+  re-run refuses) and syncs the directory as well as the file; its refusal
+  says an international name goes in its `xn--` form. The README's Health
+  Check section, the handler's and the config fields' docs, and the L-37
+  comment said "the bind"; they say "public" now, and the README says to run
+  `init` where the node runs (its paths are checked from `init`'s working
+  directory). `init`'s 0600, GraphiQL off and auth on are pinned (I-R13–I-R15).
+  For step 3: the Caddyfile must pass `Host` through unchanged (L-51's port
+  match and `allowedHosts`), and `company add` must write `relayMode:
+  "custom"` (a folder's default is `"n0"`).
+- **Revert checks:** `installer.json` — 15 of 15 bite: `/health` by the bind
+  (I-R1, shipped binary), `tls.mode` not making a node public (I-R2), each
+  rule by the bind (I-R3–I-R6), `init` replacing a config (I-R7), binding every
+  interface (I-R8), trusting no proxy (I-R9), any domain (I-R10), keeping a
+  config that does not load (I-R11), a trusted proxy not making a node public
+  (I-R12), `init`'s file readable by others (I-R13), GraphiQL on (I-R14), auth
+  off (I-R15). `h01_l23.json` H01-R5 re-anchored on
+  `is_public` (still bites).
+- **Departures from the plan:** recorded in `plan.md` step 2 (*As built*).
 - **Commit:** <hash>

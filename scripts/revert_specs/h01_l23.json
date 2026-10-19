@@ -57,8 +57,8 @@
   },
   "H01-R5-public-bind-generates-a-key": {
     "file": "crates/gl-node/src/config.rs",
-    "old": "        if self.binds_non_loopback() && self.uses_api_key_file() {",
-    "new": "        if false && self.binds_non_loopback() && self.uses_api_key_file() {",
+    "old": "        if self.is_public() && self.uses_api_key_file() {",
+    "new": "        if false && self.is_public() && self.uses_api_key_file() {",
     "runs": [
       [
         "-p",

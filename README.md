@@ -54,7 +54,7 @@ Every `/graphql` request needs that key in an `X-Api-Key` header — see [Using 
 
 ### 4. Open GraphiQL
 
-The playground is **off** by default. Turn it on with `"graphiql": true` and visit **http://127.0.0.1:4000/graphql**. It is only available on a loopback bind — a non-loopback `bindAddress` with `graphiql` enabled is refused at boot, not silently downgraded. Its queries need the API key like any other client: open the **Headers** panel and paste `{"X-Api-Key": "<the contents of data/api.key>"}`. The node never puts the key into the page itself.
+The playground is **off** by default. Turn it on with `"graphiql": true` and visit **http://127.0.0.1:4000/graphql**. It is only available on a loopback node with no proxy in front — on a public node (a non-loopback `bindAddress`, or a proxy in front: `tls.mode: "terminated"` or `trustedProxies` set) `graphiql` enabled is refused at boot, not silently downgraded. Its queries need the API key like any other client: open the **Headers** panel and paste `{"X-Api-Key": "<the contents of data/api.key>"}`. The node never puts the key into the page itself.
 
 ### Upgrading
 
@@ -76,7 +76,7 @@ export GL_NODE_API_KEY="$(cat data/api.key)"
 curl -s http://127.0.0.1:4000/health | jq .
 ```
 
-Response (loopback bind, or any bind with a valid `X-Api-Key`):
+Response (a loopback node with no proxy in front, or any node with a valid `X-Api-Key`):
 ```json
 {
   "status": "ok",
@@ -94,8 +94,9 @@ limit — 120 requests per minute per client, separate from the GraphQL budget s
 a busy API client cannot fail your health probe — and answers `429` past it.
 Point monitors at a listed host name, not a raw IP that is not in `allowedHosts`.
 
-On a **non-loopback** `bindAddress`, an unauthenticated request gets the
-liveness answer and nothing else:
+On a **public node** — a non-loopback `bindAddress`, or a proxy in front
+(`tls.mode: "terminated"`, or `trustedProxies` set), even on the same host —
+an unauthenticated request gets the liveness answer and nothing else:
 ```json
 {
   "status": "ok"
@@ -109,12 +110,13 @@ container health check or load-balancer probe reads.
 **A bare `{"status":"ok"}` is a healthy node, not a broken one.** The three
 detail fields are *absent* rather than null or zero, precisely so an empty
 `peers` cannot be misread as "this node has lost its mesh" — if you need the
-detail from a public bind, send the `X-Api-Key` header. The split keys off the
-**bind address**, not the caller's: behind the TLS terminator a public bind
-requires, every request arrives from the proxy, so a caller-address rule would
-hand the loopback treatment to the whole internet. The shipped compose stack
-publishes on host loopback but still binds `0.0.0.0` inside the container, so
-its nodes answer with the minimal body.
+detail from a public node, send the `X-Api-Key` header. The split keys off the
+**config**, not the caller's address: behind the TLS terminator a public node
+sits behind, every request arrives from the proxy, so a caller-address rule
+would hand the loopback treatment to the whole internet — as the bind did,
+before this rule, for a loopback node behind a proxy on its own host. The
+shipped compose stack publishes on host loopback but still binds `0.0.0.0`
+inside the container, so its nodes answer with the minimal body.
 
 ---
 
@@ -457,6 +459,26 @@ The config file must be a regular file of at most 1 MiB. A symlink to one is fol
 }
 ```
 
+### Behind an HTTPS proxy on the same host (`gl-node init`)
+
+```bash
+gl-node init --domain ledger.example.com [--data-dir /data] [--output FILE]
+```
+
+writes the config of a node that serves `https://ledger.example.com` through
+a TLS proxy (Caddy, nginx) on its own host: it binds `127.0.0.1:4000`, trusts
+the proxy (`trustedProxies: ["127.0.0.1"]`) and the domain (`allowedHosts`),
+and declares the proxy (`tls.mode: "terminated"`), which makes it a **public
+node** whatever its bind: auth on, with the key from `GL_NODE_API_KEY` (never
+in the file), no GraphiQL, and `/health`'s detail for keys only. Its own
+ledger needs no mesh (signing and P2P off); companies are ledger folders in
+`<data-dir>/ledgers` (*Several ledgers*). An existing file is never replaced,
+and the config is checked to load before `init` reports success. The data
+directory defaults to the image's `/data`. Run `init` where the node will run,
+as the node's user — in the image, whose working directory is `/data` — since
+the config's paths must lie under the node's working directory and are checked
+from `init`'s.
+
 ### Full Config (All Options)
 
 This block is a **public-bind** example, so it carries everything a
@@ -518,13 +540,13 @@ signing node without it refuses to boot, and the refusal names that remedy.
 | `bindAddress` | `"127.0.0.1"` | HTTP listen address |
 | `port` | `4000` | HTTP listen port |
 | `watchLedgerFile` | `false` | Poll the `.bean` every 250 ms and fold a hand edit in promptly. It does **not** control whether a hand edit is accepted — nothing does — see [Editing the `.bean` file](#editing-the-bean-file-by-hand) |
-| `graphiql` | `false` | GraphiQL playground; refused outright on a non-loopback bind. The page loads GraphiQL 4.1.2 and React 18.3.1 production builds from `unpkg.com`, each pinned by a Subresource Integrity hash — see below |
+| `graphiql` | `false` | GraphiQL playground; refused outright on a public node (a non-loopback bind, or a proxy in front: `tls.mode: "terminated"` or `trustedProxies` set). The page loads GraphiQL 4.1.2 and React 18.3.1 production builds from `unpkg.com`, each pinned by a Subresource Integrity hash — see below |
 | `cors.allowedOrigins` | `[]` | Browser origin allowlist; `"*"` is rejected |
-| `allowedHosts` | `[]` | Extra `Host` header values accepted, beyond loopback and the bind address. **Required (non-empty) on a non-loopback bind** — see below |
+| `allowedHosts` | `[]` | Extra `Host` header values accepted, beyond loopback and the bind address. **Required (non-empty) on a public node** — see below |
 | `trustedProxies` | `[]` | Reverse-proxy IPs whose `X-Forwarded-For` the rate limiter believes — see below |
-| `tls.mode` | `"disabled"` | `"disabled"` (loopback only) or `"terminated"` (TLS at a host/proxy). A non-loopback bind must be `"terminated"`; in-process TLS is not implemented |
-| `auth.enabled` | `true` | Require `X-Api-Key` header on GraphQL. May be turned off only on a loopback bind, and boot then WARNs that anything on the machine can write the ledger |
-| `auth.apiKey` | `""` | The API key value. Required on a non-loopback bind; on a loopback bind, empty means the key file below. Minimum 16 bytes; published placeholders are refused — see [API keys](#api-keys) |
+| `tls.mode` | `"disabled"` | `"disabled"` (loopback only) or `"terminated"` (TLS at a host/proxy). A non-loopback bind must be `"terminated"`; in-process TLS is not implemented. `"terminated"` makes the node **public** whatever its bind — a proxy on the same host hands a loopback bind the internet — as does any `trustedProxies` entry, so every public-node rule here applies to it |
+| `auth.enabled` | `true` | Require `X-Api-Key` header on GraphQL. May be turned off only on a loopback node with no proxy (`tls.mode: "disabled"`), and boot then WARNs that anything on the machine can write the ledger |
+| `auth.apiKey` | `""` | The API key value. Required on a public node; on a loopback node with no proxy, empty means the key file below. Minimum 16 bytes; published placeholders are refused — see [API keys](#api-keys) |
 | `auth.adminNodes` | unset | EndpointIds of the nodes whose access records (people's keys, roles, revocations) count; unset, every node the mesh admits. Needs `signing.enabled` (people's keys are honoured only on a signing node); an empty list is refused |
 | `auth.apiKeyPath` | `"./data/api.key"` | Where a loopback node with no `apiKey` keeps the key it generates on its first boot (0600, owned by the node's user) — see [Using Auth](#using-auth) |
 | `http.headerReadTimeoutSeconds` | `30` | Time a client gets to send a complete request head; also bounds idle keep-alive. `1`–`300` |
@@ -562,7 +584,7 @@ GraphQL request, which is what stops a DNS-rebinding page in a browser from
 driving your node. Loopback names (`localhost`, `127.0.0.1`, `::1`) and a
 non-wildcard `bindAddress` are always accepted; everything else has to be
 listed. A wildcard bind such as `0.0.0.0` names no host a client could send,
-so on a non-loopback bind an **empty `allowedHosts` is refused at boot** rather
+so on a public node (a non-loopback bind, or one behind a proxy, which sends its domain) an **empty `allowedHosts` is refused at boot** rather
 than left to reject every request with a `403` at runtime. Entries are bare
 hostnames or IP literals — no scheme, no port, no path, no IPv6 brackets and no
 trailing dot. The guard strips the port and brackets from every `Host` header
@@ -626,7 +648,7 @@ production builds from `unpkg.com`. Each tag carries a SHA-384 `integrity`
 hash, so a CDN that serves anything else is refused by the browser and the page
 stays blank rather than running it. No other origin is contacted. The tab is
 still a same-origin session on the node, which is why GraphiQL is off by
-default and refused on any non-loopback bind.
+default and refused on any public node.
 
 ### Log volume on a public bind
 
@@ -1015,13 +1037,13 @@ export GL_NODE_API_KEY="$(cat data/api.key)"
 Before this release a loopback node served its mutations to anything that could
 reach the port, with no key: another program or another account on the machine,
 or a web page that got past the browser checks (H-01). To keep that, set
-`"auth": { "enabled": false }` — allowed on a loopback bind only, and the node
+`"auth": { "enabled": false }` — allowed only on a loopback node with no proxy in front, and the node
 WARNs about it at every boot. Such a node has no people: everything on the
 machine is its operator, so it accepts no people's keys and refuses the admin
 API (`NO_ACCESS_LIST`) — otherwise any local program could issue keys the
 whole mesh honours.
 
-**A public bind needs a key you set**, so its clients are given it on purpose:
+**A public node needs a key you set**, so its clients are given it on purpose:
 `auth.apiKey` or, better, the environment. Keep the key in the environment
 rather than pasting it into a shell history or a script:
 
@@ -1034,7 +1056,7 @@ curl -s -X POST http://127.0.0.1:4000/graphql \
   -d '{"query": "{ health { status } }"}'
 ```
 
-The `/health` endpoint never *requires* authentication. On a non-loopback bind it discloses its version/heads/peers detail only to a request carrying a valid `X-Api-Key`. It is not unconditional, though: like `/graphql`, it answers `403` to a request whose `Host` is not in `allowedHosts`, and `429` past its own rate limit — see [Health Check](#health-check).
+The `/health` endpoint never *requires* authentication. On a public node (a non-loopback bind, or a proxy in front) it discloses its version/heads/peers detail only to a request carrying a valid `X-Api-Key`. It is not unconditional, though: like `/graphql`, it answers `403` to a request whose `Host` is not in `allowedHosts`, and `429` past its own rate limit — see [Health Check](#health-check).
 
 ### People and keys
 
@@ -1585,7 +1607,7 @@ plaintext to anything that can route to the host. Put a real TLS terminator in
 front and point it at the loopback port; only the terminator gets a public
 listener, and its address then belongs in `trustedProxies`.
 
-GraphiQL is off: it is refused outright on a non-loopback bind. Query the node
+GraphiQL is off: it is refused outright on a public node. Query the node
 with `curl` and the `X-Api-Key` header as shown under [Using Auth](#using-auth),
 or run a second loopback-bound node for interactive exploration.
 

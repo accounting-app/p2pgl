@@ -31,14 +31,18 @@ pub struct HealthResponse {
 pub struct HealthState {
     pub ledger: Arc<RwLock<ledger::service::LedgerService>>,
     pub peer_registry: p2p::node::PeerRegistry,
-    /// True when the HTTP listener is bound to a non-loopback address (L-09).
+    /// True when strangers can reach the node (L-09): a non-loopback bind, or a
+    /// proxy in front (`tls.mode: "terminated"`, `trustedProxies`) —
+    /// `NodeConfig::is_public`.
     ///
-    /// Keyed on the **bind**, not on the client address, deliberately: behind
+    /// Keyed on the **config**, not on the client address, deliberately: behind
     /// the TLS terminator `tls.mode: "terminated"` assumes, the peer address is
     /// the proxy's and a client-address rule would hand every remote caller the
-    /// loopback treatment. `binds_non_loopback()` is the same predicate config
-    /// validation uses for the graphiql/auth/allowedHosts rules, so one
-    /// deployment cannot be "public" for one check and private for another.
+    /// loopback treatment — and so, until 005, did the bind: a loopback bind
+    /// behind a proxy on the same host served the full body to the internet.
+    /// `is_public()` is the same predicate config validation uses for the
+    /// graphiql/auth/allowedHosts rules, so one deployment cannot be "public"
+    /// for one check and private for another.
     pub public_bind: bool,
     /// The API-key state, so a public bind can still serve full detail to an
     /// authenticated operator (L-09).
@@ -49,21 +53,23 @@ pub struct HealthState {
 ///
 /// Exempt from auth even when `auth.enabled` (§2.9) — it must answer `200` to an
 /// unauthenticated prober, which is all the Docker `HEALTHCHECK` and
-/// [`probe_local_health`] read. What it answers *with* depends on the bind
-/// (L-09):
+/// [`probe_local_health`] read. What it answers *with* depends on whether
+/// the node is public (L-09, `NodeConfig::is_public`):
 ///
-/// * **loopback bind** — full detail, unauthenticated. This matches the
-///   loopback-trust precedent already in the config rules (GraphiQL is allowed
-///   only on a loopback bind, and auth may be off only there), and it keeps the
-///   endpoint useful for the operator running `curl localhost:3000/health`.
-/// * **non-loopback bind** — `{"status":"ok"}` and nothing else, unless the
+/// * **not public** (a loopback bind with no proxy in front) — full detail,
+///   unauthenticated. This matches the loopback-trust precedent already in the
+///   config rules (GraphiQL is allowed only there, and auth may be off only
+///   there), and it keeps the endpoint useful for the operator running
+///   `curl localhost:3000/health`.
+/// * **public** (a non-loopback bind, or a proxy in front, even on the same
+///   host) — `{"status":"ok"}` and nothing else, unless the
 ///   request carries a valid `X-Api-Key`. Version, head count and peer count are
 ///   reconnaissance: the version names the exact build to look up advisories
 ///   for, and heads/peers report mesh size and write activity to anyone who can
 ///   reach the port.
 ///
 /// The unauthenticated-public branch is the only one reachable with auth off on
-/// a public bind, because config validation (M-2) refuses that combination at
+/// a public node, because config validation (M-2) refuses that combination at
 /// boot — so there is no "public, auth disabled, full detail" case to handle.
 pub async fn health_handler(
     State(state): State<HealthState>,
