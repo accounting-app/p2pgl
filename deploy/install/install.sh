@@ -355,6 +355,95 @@ services:
       options: { max-size: "10m", max-file: "5" }
 EOF
 
+step "the openledger command"
+put "$ETC/settings" 0644 <<EOF
+# Written by the openledger installer: what the openledger command needs.
+DOMAIN=$domain
+TEST_TLS=$test_tls
+LEDGER_UDP_PORTS=${LEDGER_UDP_PORTS/:/-}
+EOF
+put /usr/local/sbin/openledger 0755 <<'COMMAND'
+#!/usr/bin/env bash
+# openledger: the day-to-day command of a node set up by the openledger
+# installer (docs/build-log/005-installer, step 4). Run it as root. Each
+# command is the node's own (`gl-node ledger`, `gl-node user`), run in its
+# container with its operator key; the node judges every change.
+set -euo pipefail
+settings=/opt/openledger/settings
+usage="usage:
+  openledger company add NAME        a company, in a mesh of its own (a free UDP port of the firewall's range)
+  openledger company list            every company: served or not and why, its port and node id
+  openledger company restart NAME    picks up an edited ledger.json
+  openledger company remove NAME     stops it; its folder moves to ledgers/.removed/ (nothing deleted)
+  openledger person add COMPANY --name NAME --role read|write|admin [--expires YYYY-MM-DD]
+  openledger person list COMPANY
+  openledger person rename COMPANY USER_ID --name NAME
+  openledger person revoke COMPANY USER_ID
+  openledger key                     the operator key
+  openledger status                  the services, the node and HTTPS as a client sees it"
+fail() { printf 'openledger: %s\n' "$*" >&2; exit 1; }
+[[ $(id -u) -eq 0 ]] || fail "run it as root (sudo openledger …)"
+[[ -r "$settings" ]] || fail "no $settings: is this server set up by the openledger installer?"
+# shellcheck disable=SC1090
+. "$settings"
+# No -i: nothing here reads stdin, and docker exec -i would swallow a
+# script's input (`while read …; do openledger …; done < list`).
+node() { docker exec openledger-node gl-node "$@"; }
+[[ $# -ge 1 ]] || { printf '%s\n' "$usage"; exit 2; }
+what=$1
+shift
+case "$what" in
+  company)
+    [[ $# -ge 1 ]] || fail "$usage"
+    action=$1
+    shift
+    case "$action" in
+      add) [[ $# -eq 1 ]] || fail "company add takes one NAME"
+           node ledger add "$1" --new-mesh "$LEDGER_UDP_PORTS" ;;
+      list) [[ $# -eq 0 ]] || fail "company list takes no arguments"
+            node ledger list ;;
+      restart|remove) [[ $# -eq 1 ]] || fail "company $action takes one NAME"
+                      node ledger "$action" "$1" ;;
+      *) fail "unknown company command $action
+$usage" ;;
+    esac ;;
+  person)
+    [[ $# -ge 2 ]] || fail "$usage"
+    action=$1 company=$2
+    shift 2
+    case "$action" in
+      add|list|rename|revoke) node user --ledger "$company" "$action" "$@" ;;
+      *) fail "unknown person command $action
+$usage" ;;
+    esac ;;
+  key)
+    key=$(sed -n 's/^GL_NODE_API_KEY=//p' /opt/openledger/env)
+    [[ -n "$key" ]] || fail "no GL_NODE_API_KEY in /opt/openledger/env"
+    printf '%s\n' "$key" ;;
+  status)
+    docker compose -f /opt/openledger/compose.yml ps --format '  {{.Name}}: {{.Status}}'
+    printf '  node: %s\n' "$(node --version)"
+    tls=()
+    if [[ -n "${TEST_TLS:-}" ]]; then
+      tls=(--cacert /var/lib/openledger/caddy/data/caddy/pki/authorities/local/root.crt
+           --resolve "$DOMAIN:443:127.0.0.1")
+    fi
+    if health=$(curl -fsS --max-time 10 "${tls[@]}" "https://$DOMAIN/health" 2>&1); then
+      printf '  https://%s/health: %s\n' "$DOMAIN" "$health"
+    else
+      printf '  https://%s/health: FAILED (%s)\n' "$DOMAIN" "$health"
+      status=1
+    fi
+    printf '  data: %s\n' "$(du -sh /var/lib/openledger/data | cut -f1)"
+    printf '\n'
+    node ledger list
+    exit "${status:-0}" ;;
+  -h|--help|help) printf '%s\n' "$usage" ;;
+  *) fail "unknown command $what
+$usage" ;;
+esac
+COMMAND
+
 # ── The firewall ──────────────────────────────────────────────────────────────
 step "firewall"
 if [[ -z "$firewall" ]]; then
@@ -469,6 +558,8 @@ else
 fi
 cat <<EOF
 
+  Manage:   sudo openledger company add NAME; sudo openledger person add NAME …;
+            sudo openledger status (sudo openledger help for the rest)
   Settings: $ETC   Data: $DATA (back it up; OPERATIONS, Backups)
   Logs:     docker logs openledger-node, docker logs openledger-caddy
 EOF

@@ -76,6 +76,13 @@ pub(crate) struct LedgerState {
     /// Why it is not served; `None` when it is.
     pub reason: Option<String>,
     pub node_id: Option<String>,
+    /// Its P2P endpoint's UDP port, when fixed.
+    pub listen_port: Option<u16>,
+}
+
+/// `config`'s fixed P2P port: none with P2P off, or a random port (`0`).
+pub(crate) fn fixed_listen_port(config: &LedgerConfig) -> Option<u16> {
+    (config.p2p.enabled && config.p2p.listen_port != 0).then_some(config.p2p.listen_port)
 }
 
 /// The node's ledgers, by name.
@@ -343,15 +350,19 @@ impl Ledgers {
             .await
             .iter()
             .map(|(name, served)| match &**served {
-                Served::Running { node_id, .. } => LedgerState {
+                Served::Running {
+                    node_id, config, ..
+                } => LedgerState {
                     name: name.clone(),
                     reason: None,
                     node_id: node_id.clone(),
+                    listen_port: config.as_deref().and_then(fixed_listen_port),
                 },
                 Served::Failed(reason) => LedgerState {
                     name: name.clone(),
                     reason: Some(reason.clone()),
                     node_id: None,
+                    listen_port: None,
                 },
             })
             .collect()

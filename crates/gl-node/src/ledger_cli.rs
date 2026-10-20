@@ -10,8 +10,10 @@ use crate::user_cli::{exchange, graphql_errors, OperatorTarget};
 
 /// The usage line for `gl-node ledger`.
 pub const USAGE: &str = "Usage:
-  gl-node ledger add NAME [--settings FILE]
-      (FILE is the ledger's ledger.json; none: a ledger of its own, with no mesh)
+  gl-node ledger add NAME [--settings FILE | --new-mesh FROM-TO]
+      (FILE is the ledger's ledger.json; --new-mesh: a mesh of its own, signing
+      and P2P on, on a free UDP port in FROM-TO; neither: a ledger of its own,
+      with no mesh)
   gl-node ledger list
   gl-node ledger restart NAME
       (picks up an edited ledger.json)
@@ -27,6 +29,8 @@ pub enum LedgerCommand {
     Add {
         name: String,
         settings: Option<String>,
+        /// `--new-mesh FROM-TO`: the node composes the settings.
+        new_mesh: Option<String>,
     },
     List,
     Remove {
@@ -46,6 +50,7 @@ pub fn parse(
     let (command, rest) = args.split_first().ok_or("no ledger command given")?;
     let mut positional = Vec::new();
     let mut settings = None;
+    let mut new_mesh = None;
     let mut rest = rest.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -55,12 +60,24 @@ pub fn parse(
                     return Err("--settings given twice".to_owned());
                 }
             }
+            "--new-mesh" => {
+                let ports = rest.next().ok_or("--new-mesh needs FROM-TO")?;
+                if new_mesh.replace(ports.clone()).is_some() {
+                    return Err("--new-mesh given twice".to_owned());
+                }
+            }
             other if other.starts_with("--") => return Err(format!("unknown option {other}")),
             other => positional.push(other.to_owned()),
         }
     }
     if settings.is_some() && command != "add" {
         return Err(format!("--settings does not apply to `ledger {command}`"));
+    }
+    if new_mesh.is_some() && command != "add" {
+        return Err(format!("--new-mesh does not apply to `ledger {command}`"));
+    }
+    if settings.is_some() && new_mesh.is_some() {
+        return Err("give --settings or --new-mesh, not both".to_owned());
     }
     let one_name = |positional: Vec<String>| -> Result<String, String> {
         match <[String; 1]>::try_from(positional) {
@@ -72,6 +89,7 @@ pub fn parse(
         "add" => Ok(LedgerCommand::Add {
             name: one_name(positional)?,
             settings: settings.map(|file| read(&file)).transpose()?,
+            new_mesh,
         }),
         "list" if positional.is_empty() => Ok(LedgerCommand::List),
         "list" => Err("`ledger list` takes no arguments".to_owned()),
@@ -87,12 +105,24 @@ pub fn parse(
 
 /// The GraphQL request body for `command`.
 fn request_body(command: &LedgerCommand) -> Value {
-    const LEDGER: &str = "name served reason nodeId";
+    const LEDGER: &str = "name served reason nodeId listenPort";
     match command {
-        LedgerCommand::Add { name, settings } => json!({
-            "query": format!("mutation($name: String!, $settings: String) {{ addLedger(name: $name, settings: $settings) {{ {LEDGER} }} }}"),
-            "variables": { "name": name, "settings": settings },
-        }),
+        LedgerCommand::Add {
+            name,
+            settings,
+            new_mesh,
+        } => match new_mesh {
+            // `newMeshPorts` only when asked for, so a plain add still works
+            // against a node from before it.
+            Some(ports) => json!({
+                "query": format!("mutation($name: String!, $newMesh: String) {{ addLedger(name: $name, newMeshPorts: $newMesh) {{ {LEDGER} }} }}"),
+                "variables": { "name": name, "newMesh": ports },
+            }),
+            None => json!({
+                "query": format!("mutation($name: String!, $settings: String) {{ addLedger(name: $name, settings: $settings) {{ {LEDGER} }} }}"),
+                "variables": { "name": name, "settings": settings },
+            }),
+        },
         LedgerCommand::List => json!({ "query": format!("{{ ledgers {{ {LEDGER} }} }}") }),
         LedgerCommand::Remove { name } => json!({
             "query": "mutation($name: String!) { removeLedger(name: $name) { name movedTo } }",
@@ -125,17 +155,19 @@ fn render(command: &LedgerCommand, data: &Value) -> String {
                 served_at(name),
                 node_id(added)
             );
+            if let Some(port) = added["listenPort"].as_u64() {
+                out.push_str(&format!("  UDP port: {port}\n"));
+            }
             if added["nodeId"].is_string() {
                 out.push_str(
                     "\nGive the node id to the other nodes of this ledger's mesh, for their \
-                     p2p.bootstrapEndpointIds. Add people with `gl-node user add --ledger ",
+                     p2p.bootstrapEndpointIds.",
                 );
-                out.push_str(&format!("{name} …`.\n"));
-            } else {
-                out.push_str(&format!(
-                    "\nAdd people with `gl-node user add --ledger {name} …`.\n"
-                ));
             }
+            out.push_str(&format!(
+                "\nAdd people with `gl-node user --ledger {name} add …` (on a server set up \
+                 by the installer: `openledger person add {name} …`).\n"
+            ));
             out
         }
         LedgerCommand::List => {
@@ -143,13 +175,17 @@ fn render(command: &LedgerCommand, data: &Value) -> String {
             if ledgers.is_empty() {
                 return "This node holds no ledgers.\n".to_owned();
             }
-            let mut out = format!("{:<40}  {:<10}  NODE ID\n", "NAME", "STATE");
+            let mut out = format!("{:<40}  {:<10}  {:<5}  NODE ID\n", "NAME", "STATE", "PORT");
             for ledger in &ledgers {
                 let served = ledger["served"].as_bool() == Some(true);
+                let port = ledger["listenPort"]
+                    .as_u64()
+                    .map_or("-".to_owned(), |port| port.to_string());
                 out.push_str(&format!(
-                    "{:<40}  {:<10}  {}\n",
+                    "{:<40}  {:<10}  {:<5}  {}\n",
                     text(&ledger["name"]),
                     if served { "served" } else { "not served" },
+                    port,
                     ledger["nodeId"].as_str().unwrap_or("-"),
                 ));
                 if !served {
@@ -241,6 +277,7 @@ mod tests {
             Ok(LedgerCommand::Add {
                 name: "acme".into(),
                 settings: Some("contents of acme.json".into()),
+                new_mesh: None,
             })
         );
         assert_eq!(
@@ -248,6 +285,15 @@ mod tests {
             Ok(LedgerCommand::Add {
                 name: "acme".into(),
                 settings: None,
+                new_mesh: None,
+            })
+        );
+        assert_eq!(
+            parse(&args("add acme --new-mesh 4433-4532"), no_file),
+            Ok(LedgerCommand::Add {
+                name: "acme".into(),
+                settings: None,
+                new_mesh: Some("4433-4532".into()),
             })
         );
         assert_eq!(parse(&args("list"), no_file), Ok(LedgerCommand::List));
@@ -274,6 +320,9 @@ mod tests {
             "remove",
             "remove acme --settings acme.json",
             "restart acme --force",
+            "add acme --new-mesh",
+            "add acme --new-mesh 1-2 --settings acme.json",
+            "remove acme --new-mesh 1-2",
             "rename acme",
         ] {
             assert!(parse(&args(refused), no_file).is_err(), "{refused:?}");

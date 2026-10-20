@@ -114,6 +114,26 @@ for template in "${templates[@]}"; do
   check "a second run shows no key (only where it is)" \
     sh -c "! grep -q 'Operator key: [0-9a-f]\{64\}' '$rerun' && grep -q 'Operator key: in /opt/openledger/env' '$rerun'"
 
+  verify='{"query":"{ verify { ok } }"}'
+  acme=$(in_vm sudo openledger company add acme) || fail "openledger company add acme failed"
+  check "openledger company add: acme in a mesh of its own, on UDP 4433" \
+    grep -q "UDP port: 4433" <(printf '%s\n' "$acme")
+  beta=$(in_vm sudo openledger company add beta) || fail "openledger company add beta failed"
+  check "a second company gets the next port (4434)" \
+    grep -q "UDP port: 4434" <(printf '%s\n' "$beta")
+  check "openledger company list: both served, on their ports" \
+    sh -c "limactl shell '$vm' sudo openledger company list | grep -Eq '^acme +served +4433 ' && limactl shell '$vm' sudo openledger company list | grep -Eq '^beta +served +4434 '"
+  person=$(in_vm sudo openledger person add acme --name Ana --role write) \
+    || fail "openledger person add failed"
+  ana=$(sed -n 's/^ *key: *//p' <<< "$person")
+  check "openledger person add gives Ana a key" test -n "$ana"
+  check "Ana's key works on acme over HTTPS" \
+    grep -q '"ok":true' <(body /ledgers/acme/graphql "$ana" "$verify")
+  check "and is refused on beta (401)" test "$(answer /ledgers/beta/graphql "$ana" "$verify")" = 401
+  check "openledger person list acme shows Ana" grep -q Ana <(in_vm sudo openledger person list acme)
+  check "openledger status: HTTPS ok" in_vm sudo openledger status
+  check "openledger key is the operator key" test "$(in_vm sudo openledger key)" = "$key"
+
   update="$PWD/target/rehearsal/$vm.update.log"
   install_it ops-2@ledger.test > "$update" 2>&1 || { tail -20 "$update"; fail "the run with a new e-mail failed"; }
   check "a run with a new e-mail updates the Caddyfile the installer wrote (no .new) and restarts Caddy" \
@@ -127,6 +147,8 @@ for template in "${templates[@]}"; do
     sleep 2
   done
   check "after a reboot it serves again" test -n "$ok_after"
+  check "and the companies with it: Ana's key works on acme" \
+    grep -q '"ok":true' <(body /ledgers/acme/graphql "$ana" "$verify")
 
   if [[ -z "$keep" ]]; then
     limactl delete -f "$vm" >/dev/null 2>&1

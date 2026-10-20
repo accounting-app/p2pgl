@@ -1,6 +1,6 @@
 # Log: a one-command production install
 
-Status: in progress (step 3 of 7).
+Status: in progress (step 4 of 7).
 
 One entry per commit-sized unit, newest last, written when the unit is ready
 to commit. The commit hash is filled in once the maintainer has committed.
@@ -215,4 +215,64 @@ to commit. The commit hash is filled in once the maintainer has committed.
   that way).
 - **Departures from the plan:** a rehearsal script beside the installer
   (the plan said Lima, not how); `release.sh`'s two checks.
+- **Commit:** 910b0b6
+
+## 2026-10-20 — Step 4: the day-to-day command
+
+- **What changed:** **`gl-node ledger add NAME --new-mesh FROM-TO`**
+  (`addLedger(newMeshPorts:)`, `ledger_admin::new_mesh_settings`): the node
+  composes a company's `ledger.json` — signing and P2P on, a fresh `meshId`
+  (a version 4 UUID from the CSPRNG the keys come from) and `swarmTopic`,
+  `relayMode: "disabled"` until it has peers (a folder's default is n0), no
+  peers yet, and the lowest UDP port of the range that no served ledger has
+  and nothing on the host holds (a bind of `0.0.0.0:port`); none free is
+  `LEDGER_CONFLICT`, settings and a new mesh together `INVALID_INPUT`. The
+  ledger list and an add report each ledger's fixed port (`listenPort`,
+  `gl-node ledger list`'s PORT column). **`openledger`**, written by the
+  installer to `/usr/local/sbin/openledger` (0755, root only by its check),
+  with `/opt/openledger/settings` (the domain, the test-TLS flag, the port
+  range): `company add | list | restart | remove`, `person add | list |
+  rename | revoke` (`gl-node user --ledger`), `key`, `status` (the services,
+  the node's version, `https://DOMAIN/health` through Caddy — non-zero exit
+  if it fails —, the data's size, the companies), each the node's own command
+  in its container. README, OPERATIONS (*Day to day*), CHANGELOG.
+- **Tests:** a new mesh is a company of its own on a free port (past a
+  ledger's port and a held one; fresh `meshId` and topic each time; none free
+  refused; it loads as a folder's `ledger.json`; port ranges parse); through
+  the endpoint, a new mesh with settings is refused and a range whose only
+  port the test holds is refused with nothing written (no P2P endpoint is
+  started in the tests: on this machine its port mapper would leave
+  loopback); a new mesh takes no port a ledger that is down has (a folder
+  copied in and never started, one whose `ledger.json` is refused);
+  `--new-mesh` parses and is refused with `--settings` and on other commands.
+- **Rehearsal** (`scripts/rehearse_install.sh`, fresh Ubuntu 24.04 and Debian
+  12 VMs, 28 checks each; 9.5 min after the review's changes — a first try
+  stopped in Lima, its boot scripts not done in 6 min, before the installer
+  ran): step 3's, and `openledger company add
+  acme` on UDP 4433 and `beta` on 4434, both served on their ports in
+  `company list`; `person add acme --name Ana --role write` gives a key that
+  works on acme over HTTPS and gets 401 on beta; `person list` shows Ana;
+  `status` passes (HTTPS ok); `key` is the operator key; after a reboot
+  Ana's key still works on acme.
+- **Review round** (reviewer subagent). *Important:* a new mesh counted
+  only the served ledgers' ports, so a company that was down — refused at
+  boot, stopped by a restart that could not start it again, or a folder
+  copied in — lost its port to the next `company add`; at the next boot the
+  two conflict and one or neither is served. `taken_ports()` now adds every
+  folder's `listenPort` in `ledgersDir`, from its `ledger.json` whether it
+  loads or not (I-R20). Also: the name is checked before the port (a used
+  name said "no free port"); `newMeshPorts` is sent only with `--new-mesh`,
+  so a plain add works against an older node; `openledger` runs
+  `docker exec` without `-i`, which swallowed a script's stdin; the add
+  output names `openledger person add` too; the README and module docs list
+  `newMeshPorts` and `listenPort`; the UUID's bytes are zeroized;
+  `openledger key` fails when there is no key line.
+- **Gate:** `scripts/gate.sh` — 1,627 passed, 0 failed, 0 ignored (6 min 57 s).
+- **Revert checks:** `installer.json` — I-R16 (a new mesh without its
+  `relayMode`), I-R17 (a ledger's port taken), I-R18 (a held port taken),
+  I-R19 (settings and a new mesh together), I-R20 (a down ledger's port given
+  away) bite. The `openledger` command is
+  shell, proved by the rehearsal.
+- **Departures from the plan:** the new mesh's settings are composed by the
+  node (Rust, tested) rather than the shell command; `openledger key`.
 - **Commit:** <hash>
