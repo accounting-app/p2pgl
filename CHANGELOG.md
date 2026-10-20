@@ -29,6 +29,16 @@ break compatibility.
 
 ### Added
 
+- **`deploy/install/install.sh`** (005 step 3, README and OPERATIONS
+  *Installing on a server*): one command on a fresh Ubuntu or Debian server
+  installs Docker (key checked by fingerprint), the release's `gl-node`
+  (checked against `SHA256SUMS`, or `--binary`) in an image on the project's
+  pinned base, its config (`gl-node init`) and operator key (root only), Caddy
+  (pinned) for HTTPS with automatic certificates as the only public listener,
+  a firewall (SSH, 80, 443, the companies' UDP ports), restarts and log
+  rotation; a second run changes nothing. `scripts/rehearse_install.sh` runs
+  it on fresh Lima VMs and checks the result from inside; `release.sh`
+  refuses a release whose installer names another version or base.
 - **`gl-node init --domain DOMAIN`** (005 step 2, README *Behind an HTTPS
   proxy on the same host*): writes the config of a node served through a TLS
   proxy on its own host — loopback bind, the proxy and the domain trusted,
