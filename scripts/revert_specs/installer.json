@@ -208,5 +208,75 @@
         "init_writes_a_public_node_behind_its_proxy"
       ]
     ]
+  },
+  "I-R16-a-new-mesh-takes-the-folder-default-relay": {
+    "file": "crates/gl-node/src/ledger_admin.rs",
+    "old": "            \"relayMode\": \"disabled\",\n",
+    "new": "",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_new_mesh_is_a_company_of_its_own_on_a_free_port"
+      ]
+    ]
+  },
+  "I-R17-a-new-mesh-takes-a-ledgers-port": {
+    "file": "crates/gl-node/src/ledger_admin.rs",
+    "old": "        .find(|port| !taken.contains(port) && free(*port))",
+    "new": "        .find(|port| free(*port))",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_new_mesh_is_a_company_of_its_own_on_a_free_port"
+      ]
+    ]
+  },
+  "I-R18-a-new-mesh-takes-a-port-in-use": {
+    "file": "crates/gl-node/src/ledger_admin.rs",
+    "old": "        .find(|port| !taken.contains(port) && free(*port))",
+    "new": "        .find(|port| !taken.contains(port))",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_new_mesh_takes_no_port_in_use"
+      ]
+    ]
+  },
+  "I-R19-settings-and-a-new-mesh-together": {
+    "file": "crates/gl-node/src/ledger_admin.rs",
+    "old": "            (Some(_), Some(_)) => {",
+    "new": "            (Some(given), Some(_)) if true => Some(given),\n            (Some(_), Some(_)) => {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_new_mesh_takes_no_port_in_use"
+      ]
+    ]
+  },
+  "I-R20-a-down-ledgers-port-given-away": {
+    "file": "crates/gl-node/src/ledger_admin.rs",
+    "old": "        if let Ok(folders) = crate::config::ledger_folders(&self.ledgers_dir) {",
+    "new": "        if let Ok(folders) = Err::<Vec<crate::config::LedgerFolder>, ()>(()) {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_new_mesh_takes_no_port_a_ledger_that_is_down_has"
+      ]
+    ]
   }
 }

@@ -18,10 +18,25 @@ reference for every config option; this page is the procedure.
 3. **Keep the operator key** it prints, somewhere safe. It is the node's own
    key, admin of every company: use it to add companies and people, and give
    each person a key of their own.
-4. **Add a company** (`docker exec openledger-node gl-node ledger add …`,
-   *Adding a company*), with `p2p.listenPort` set to a free port in
-   4433–4532, the range the firewall admits (the default, a random port at
-   each boot, is not).
+4. **Add a company and its people** with the `openledger` command, below.
+
+**Day to day**, as root on the server (`sudo openledger help`):
+
+| Task | Command |
+|---|---|
+| Add a company | `openledger company add acme` — a mesh of its own, signing and P2P on, the next free UDP port of the firewall's range; it prints the node id and port |
+| See the companies | `openledger company list` — served or not and why, port, node id |
+| Pick up an edited `ledger.json` | `openledger company restart acme` |
+| A company leaves | `openledger company remove acme` — its folder moves to `ledgers/.removed/`, nothing deleted |
+| Give someone access | `openledger person add acme --name "Ana Ruiz" --role write [--expires 2026-12-31]` — prints their key once |
+| See, rename, revoke | `openledger person list acme`, `… rename acme USER_ID --name …`, `… revoke acme USER_ID` |
+| The operator key | `openledger key` |
+| Is it all right? | `openledger status` — the services, the node's version, `https://DOMAIN/health` through Caddy, the companies; exits non-zero if HTTPS fails |
+
+Each runs the node's own command (`gl-node ledger`, `gl-node user`) in its
+container, with its key; the node judges every change, as *Adding a company*
+and *People and keys* describe. A company's clients use
+`https://DOMAIN/ledgers/acme/graphql` with their own keys.
 
 What it leaves on the server:
 

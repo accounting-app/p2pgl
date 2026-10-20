@@ -29,6 +29,17 @@ break compatibility.
 
 ### Added
 
+- **`openledger`, the server's day-to-day command** (005 step 4, OPERATIONS
+  *Installing on a server*), written by the installer to
+  `/usr/local/sbin/openledger`: `company add | list | restart | remove`,
+  `person add | list | rename | revoke`, `key`, `status` (the services, the
+  node's version, `https://DOMAIN/health` as a client sees it, the
+  companies). It runs the node's own commands in its container.
+- **`gl-node ledger add NAME --new-mesh FROM-TO`** (`addLedger(newMeshPorts:)`,
+  005 step 4): the node composes the company's `ledger.json` — signing and P2P
+  on, a fresh `meshId` and `swarmTopic`, `relayMode: "disabled"` until it has
+  peers (never n0), and the lowest UDP port in the range that no ledger has and
+  nothing on the host holds. `gl-node ledger list` shows each ledger's port.
 - **`deploy/install/install.sh`** (005 step 3, README and OPERATIONS
   *Installing on a server*): one command on a fresh Ubuntu or Debian server
   installs Docker (key checked by fingerprint), the release's `gl-node`

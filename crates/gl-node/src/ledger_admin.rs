@@ -3,8 +3,10 @@
 //! `/node/graphql`, for the operator key only.
 //!
 //! - `ledgers` lists every ledger the node holds: served, or refused and why,
-//!   with its node id.
-//! - `addLedger(name, settings)` writes the ledger's folder in `ledgersDir` —
+//!   with its node id and fixed UDP port.
+//! - `addLedger(name, settings)` — or `addLedger(name, newMeshPorts)`, the
+//!   settings composed here for a mesh of its own ([`new_mesh_settings`]) —
+//!   writes the ledger's folder in `ledgersDir` —
 //!   its `ledger.json` and, when it signs or replicates, its node key — under
 //!   a temporary name, renames it into place, and starts it. A restart in
 //!   between sees all of it or none of it.
@@ -88,6 +90,8 @@ pub(crate) struct LedgerInfo {
     /// Its node id, for the other nodes' `p2p.bootstrapEndpointIds`; none
     /// when it neither signs nor replicates.
     pub node_id: Option<String>,
+    /// The UDP port its P2P endpoint listens on, when fixed.
+    pub listen_port: Option<u16>,
 }
 
 impl From<LedgerState> for LedgerInfo {
@@ -97,6 +101,7 @@ impl From<LedgerState> for LedgerInfo {
             served: state.reason.is_none(),
             reason: state.reason,
             node_id: state.node_id,
+            listen_port: state.listen_port,
         }
     }
 }
@@ -173,11 +178,42 @@ impl NodeAdmin {
             .map(|(_, reason)| reason)
     }
 
-    /// Add ledger `name` with `settings` (a `ledger.json`; `{}` when none).
+    /// The UDP ports the node's ledgers have, served or not (review, step 4):
+    /// every served ledger's — the config file's included — and every
+    /// folder's in `ledgersDir`, whether it loads, was refused at boot or was
+    /// copied in and never started. A ledger that is down holds no port, but
+    /// it has one: giving it to a new company makes the two conflict at the
+    /// next boot, and one or neither is served.
+    pub(crate) async fn taken_ports(&self) -> std::collections::HashSet<u16> {
+        let mut taken: std::collections::HashSet<u16> = self
+            .ledgers
+            .served_configs("")
+            .await
+            .iter()
+            .filter_map(|(_, config)| crate::ledgers::fixed_listen_port(config))
+            .collect();
+        if let Ok(folders) = crate::config::ledger_folders(&self.ledgers_dir) {
+            for path in folders.into_iter().filter_map(|(_, path)| path.ok()) {
+                let port = std::fs::read_to_string(path.join(LEDGER_FILE))
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                    .and_then(|value| value.pointer("/p2p/listenPort")?.as_u64())
+                    .and_then(|port| u16::try_from(port).ok())
+                    .filter(|port| *port != 0);
+                taken.extend(port);
+            }
+        }
+        taken
+    }
+
+    /// Add ledger `name` with `settings` (a `ledger.json`; `{}` when none) —
+    /// or, with `new_mesh`, in a mesh of its own on a free UDP port in that
+    /// range ([`new_mesh_settings`]; 005 step 4).
     pub(crate) async fn add(
         &self,
         name: &str,
         settings: Option<&str>,
+        new_mesh: Option<&str>,
     ) -> Result<LedgerInfo, Refusal> {
         let _busy = self.busy.lock().await;
         Self::folder_name(name)?;
@@ -191,6 +227,22 @@ impl NodeAdmin {
                 ),
             ));
         }
+        let composed;
+        let settings = match (settings, new_mesh) {
+            (Some(_), Some(_)) => {
+                return Err(refused(
+                    "INVALID_INPUT",
+                    "give settings or a new mesh's ports, not both",
+                ))
+            }
+            (None, Some(ports)) => {
+                let range = PortRange::parse(ports)?;
+                let taken = self.taken_ports().await;
+                composed = new_mesh_settings(range, &taken, udp_port_is_free)?;
+                Some(composed.as_str())
+            }
+            (settings, None) => settings,
+        };
         let settings = settings.unwrap_or("{}\n");
         if settings.len() > MAX_SETTINGS_BYTES {
             return Err(refused(
@@ -297,6 +349,7 @@ impl NodeAdmin {
     /// Serve `running`, started as `name`, and say so.
     async fn serve(&self, name: &str, running: RunningLedger) -> Result<LedgerInfo, Refusal> {
         let node_id = running.node_id.clone();
+        let listen_port = crate::ledgers::fixed_listen_port(&running.config);
         if let Err(running) = self
             .ledgers
             .insert_running(name, running, self.node.graphiql)
@@ -314,6 +367,7 @@ impl NodeAdmin {
             served: true,
             reason: None,
             node_id,
+            listen_port,
         })
     }
 
@@ -409,6 +463,92 @@ async fn stop(name: &str, running: RunningLedger) {
         .await;
 }
 
+/// The UDP ports a new mesh may take, `FROM-TO` (inclusive): the range the
+/// server's firewall admits for its ledgers (the installer's 4433–4532).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PortRange {
+    from: u16,
+    to: u16,
+}
+
+impl PortRange {
+    pub(crate) fn parse(text: &str) -> Result<Self, Refusal> {
+        let bad = || {
+            refused(
+                "INVALID_INPUT",
+                format!("{text:?} is not a port range: FROM-TO, such as 4433-4532"),
+            )
+        };
+        let (from, to) = text.split_once('-').ok_or_else(bad)?;
+        let (from, to) = (
+            from.parse::<u16>().map_err(|_| bad())?,
+            to.parse::<u16>().map_err(|_| bad())?,
+        );
+        if from == 0 || from > to {
+            return Err(bad());
+        }
+        Ok(PortRange { from, to })
+    }
+}
+
+/// Whether nothing on this host holds UDP `port` (all addresses, IPv4): the
+/// one a new ledger's endpoint binds.
+fn udp_port_is_free(port: u16) -> bool {
+    std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).is_ok()
+}
+
+/// A random (version 4) UUID, from the CSPRNG the node's keys come from.
+fn uuid_v4() -> String {
+    let bytes = zeroize::Zeroizing::new(iroh::SecretKey::generate().to_bytes());
+    let mut b: [u8; 16] = bytes[..16].try_into().expect("16 bytes");
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex = hex::encode(b);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
+
+/// A company's `ledger.json` in a mesh of its own (005 step 4): signing and
+/// P2P on, a fresh `meshId` and `swarmTopic`, the lowest port in `range`
+/// that no served ledger has and nothing on the host holds (`free`), and
+/// `relayMode: "disabled"` — it has no peers yet, so nothing to reach, and
+/// never n0, a folder's default. Its peers come with a join (step 5).
+pub(crate) fn new_mesh_settings(
+    range: PortRange,
+    taken: &std::collections::HashSet<u16>,
+    free: impl Fn(u16) -> bool,
+) -> Result<String, Refusal> {
+    let port = (range.from..=range.to)
+        .find(|port| !taken.contains(port) && free(*port))
+        .ok_or_else(|| {
+            refused(
+                "LEDGER_CONFLICT",
+                format!(
+                    "no free UDP port in {}-{}: every one is a ledger's or in use",
+                    range.from, range.to
+                ),
+            )
+        })?;
+    let settings = serde_json::json!({
+        "signing": { "enabled": true },
+        "p2p": {
+            "enabled": true,
+            "meshId": uuid_v4(),
+            "swarmTopic": format!("openledger/{}", uuid_v4()),
+            "relayMode": "disabled",
+            "listenPort": port,
+            "bootstrapEndpointIds": [],
+        },
+    });
+    Ok(serde_json::to_string_pretty(&settings).expect("JSON") + "\n")
+}
+
 /// Write `<ledgers_dir>/.adding-<name>-…/ledger.json` (folder 0700, file
 /// 0600), synced, and return the folder.
 fn write_staging(ledgers_dir: &Path, name: &str, settings: &str) -> std::io::Result<PathBuf> {
@@ -500,16 +640,18 @@ pub(crate) struct NodeMutation;
 impl NodeMutation {
     /// Add and start ledger `name`, its folder made in `ledgersDir` with
     /// `settings` as its `ledger.json` (none: `{}`, a ledger of its own with
-    /// no mesh).
+    /// no mesh) — or, with `newMeshPorts` (`FROM-TO`), in a mesh of its own
+    /// on a free UDP port in that range.
     #[graphql(complexity = "CHANGE_COMPLEXITY")]
     async fn add_ledger(
         &self,
         ctx: &Context<'_>,
         name: String,
         settings: Option<String>,
+        new_mesh_ports: Option<String>,
     ) -> async_graphql::Result<LedgerInfo> {
         admin(ctx)
-            .add(&name, settings.as_deref())
+            .add(&name, settings.as_deref(), new_mesh_ports.as_deref())
             .await
             .map_err(Refusal::into_error)
     }
@@ -1140,6 +1282,135 @@ mod tests {
         .expect("acme is added though its caller left");
         let (_, body) = open_account(&node.app, "/ledgers/acme/graphql", "Assets:Bank").await;
         assert!(body["errors"].is_null(), "{body}");
+        node.admin.stop_all().await;
+    }
+
+    /// 005 step 4: a new mesh's settings are a company's own — signing and
+    /// P2P on, a fresh `meshId` (a UUID) and topic each time, `relayMode`
+    /// `"disabled"` (never a folder's default, n0), no peers yet — on the
+    /// lowest port of the range no served ledger has and nothing holds; none
+    /// free is refused. They load as a ledger folder's `ledger.json`.
+    ///
+    /// Bug-catch: leave `relayMode` out and the company's node talks to n0;
+    /// take a port another ledger has and the second never binds.
+    #[test]
+    fn a_new_mesh_is_a_company_of_its_own_on_a_free_port() {
+        use std::collections::HashSet;
+        let range = super::PortRange::parse("4433-4436").expect("a range");
+        let taken: HashSet<u16> = [4433].into();
+        let busy = |port: u16| port != 4434;
+        let first: Value =
+            serde_json::from_str(&super::new_mesh_settings(range, &taken, busy).expect("a port"))
+                .expect("JSON");
+        assert_eq!(
+            first["p2p"]["listenPort"], 4435,
+            "past the taken and the busy"
+        );
+        assert_eq!(first["p2p"]["relayMode"], "disabled");
+        assert_eq!(first["p2p"]["enabled"], true);
+        assert_eq!(first["signing"]["enabled"], true);
+        assert_eq!(first["p2p"]["bootstrapEndpointIds"], json!([]));
+        let mesh = first["p2p"]["meshId"].as_str().expect("meshId").to_owned();
+        assert!(
+            mesh.len() == 36 && mesh.as_bytes()[14] == b'4',
+            "a version 4 UUID: {mesh}"
+        );
+        let second: Value =
+            serde_json::from_str(&super::new_mesh_settings(range, &taken, busy).expect("a port"))
+                .expect("JSON");
+        assert_ne!(
+            second["p2p"]["meshId"], first["p2p"]["meshId"],
+            "fresh each time"
+        );
+        assert_ne!(second["p2p"]["swarmTopic"], first["p2p"]["swarmTopic"]);
+
+        let all: HashSet<u16> = (4433..=4436).collect();
+        let refused = super::new_mesh_settings(range, &all, |_| true).expect_err("none free");
+        assert_eq!(refused.code, "LEDGER_CONFLICT");
+
+        // As a ledger folder's ledger.json, it loads.
+        let dir = tempfile::Builder::new()
+            .prefix(".test-ledgers-")
+            .tempdir_in(".")
+            .expect("temp dir");
+        std::fs::write(
+            dir.path().join("ledger.json"),
+            super::new_mesh_settings(range, &taken, busy).expect("a port"),
+        )
+        .expect("write");
+        let config = LedgerConfig::load_folder(dir.path()).expect("loads");
+        assert_eq!(config.p2p.relay_mode, "disabled");
+        assert_eq!(config.p2p.listen_port, 4435);
+        for bad in ["", "4433", "a-b", "4436-4433", "0-10", "4433-70000"] {
+            assert!(super::PortRange::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// 005 step 4: through the node endpoint, a new mesh and settings
+    /// together are refused, and a range whose every port is held is refused
+    /// with nothing written — the port held here by the test.
+    ///
+    /// Bug-catch: skip the check that the port is free and the ledger is
+    /// added on a port something else holds, and never binds.
+    #[tokio::test]
+    async fn a_new_mesh_takes_no_port_in_use() {
+        let node = node().await;
+        let held = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).expect("a port");
+        let port = held.local_addr().expect("address").port();
+        let both = node_query(
+            &node.app,
+            "mutation($n: String!, $s: String, $m: String) { addLedger(name: $n, settings: $s, newMeshPorts: $m) { name } }",
+            json!({ "n": "acme", "s": "{}", "m": "4433-4532" }),
+        )
+        .await;
+        assert_eq!(code(&both), Some("INVALID_INPUT"), "{both}");
+        let full = node_query(
+            &node.app,
+            "mutation($n: String!, $m: String) { addLedger(name: $n, newMeshPorts: $m) { name } }",
+            json!({ "n": "acme", "m": format!("{port}-{port}") }),
+        )
+        .await;
+        assert_eq!(code(&full), Some("LEDGER_CONFLICT"), "{full}");
+        assert!(!node.ledgers_dir().join("acme").exists(), "nothing written");
+        drop(held);
+        node.admin.stop_all().await;
+    }
+
+    /// Review (005 step 4): a ledger that is down still has its port — one
+    /// copied in by hand and never started, one whose `ledger.json` the node
+    /// refuses — so a new mesh never takes it: they would conflict at the
+    /// next boot, and one or neither would be served.
+    ///
+    /// Bug-catch: count only the served ledgers' ports and a new company is
+    /// given the port of a company that is down.
+    #[tokio::test]
+    async fn a_new_mesh_takes_no_port_a_ledger_that_is_down_has() {
+        let node = node().await;
+        let folder = |name: &str, settings: &str| {
+            let dir = node.ledgers_dir().join(name);
+            std::fs::create_dir_all(&dir).expect("folder");
+            std::fs::write(dir.join("ledger.json"), settings).expect("ledger.json");
+        };
+        folder(
+            "copied",
+            r#"{ "signing": { "enabled": true }, "p2p": { "enabled": true, "meshId": "copied-books", "swarmTopic": "openledger/copied", "listenPort": 4500, "relayMode": "disabled" } }"#,
+        );
+        folder(
+            "refused",
+            r#"{ "p2p": { "listenPort": 4501, "notASetting": true } }"#,
+        );
+        let taken = node.admin.taken_ports().await;
+        assert!(
+            taken.contains(&4500) && taken.contains(&4501),
+            "every folder's port: {taken:?}"
+        );
+        let full = node_query(
+            &node.app,
+            "mutation($n: String!, $m: String) { addLedger(name: $n, newMeshPorts: $m) { name } }",
+            json!({ "n": "gamma", "m": "4500-4501" }),
+        )
+        .await;
+        assert_eq!(code(&full), Some("LEDGER_CONFLICT"), "{full}");
         node.admin.stop_all().await;
     }
 

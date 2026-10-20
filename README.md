@@ -91,7 +91,10 @@ Running it again changes nothing that is set up, and it never overwrites
 books, keys, the config or a file you edited (its version goes beside it as
 `FILE.new`). `--binary FILE` installs a binary you already have instead of
 downloading one; `--no-firewall` leaves the firewall to you.
-`docs/OPERATIONS.md`, *Installing on a server*, has the rest.
+Then, as root on the server, `openledger company add acme` adds a company
+in a mesh of its own, `openledger person add acme --name "Ana Ruiz" --role
+write` gives someone a key, and `openledger status` checks it all through
+HTTPS. `docs/OPERATIONS.md`, *Installing on a server*, has the rest.
 
 ---
 
@@ -1215,6 +1218,7 @@ the port and the operator key, so run it as the node's user on its machine:
 ```bash
 gl-node ledger add acme --settings acme.json   # acme.json is the ledger.json above
 gl-node ledger add notes                       # no settings: a ledger of its own, no mesh
+gl-node ledger add beta --new-mesh 4433-4532   # a mesh of its own on a free UDP port in that range
 gl-node ledger list                            # every ledger: served, or not and why
 gl-node ledger restart acme                    # picks up an edited ledger.json
 gl-node ledger remove acme                     # stops it; moves its folder aside
@@ -1245,7 +1249,9 @@ The `default` ledger is the config file's: it changes with the config file
 and a restart of the node. Behind the CLI is the node endpoint,
 **`/node/graphql`** (POST), for the operator key only — any other key, a
 company admin's included, gets `401`: `{ ledgers { name served reason nodeId
-} }`, `addLedger(name, settings)`, `removeLedger(name) { movedTo }` and
+listenPort } }`, `addLedger(name, settings)` or `addLedger(name, newMeshPorts:
+"4433-4532")` (a mesh of its own on a free UDP port of the range),
+`removeLedger(name) { movedTo }` and
 `restartLedger(name)`, refusing with `INVALID_INPUT`, `LEDGER_EXISTS`,
 `NO_SUCH_LEDGER`, `LEDGER_CONFLICT`, `START_FAILED` or `MOVE_FAILED`. One
 change runs at a time, to the end even if the request is cut short.
