@@ -65,6 +65,13 @@ step "preconditions for $version at ${commit:0:7}"
 [[ -z "$(git status --porcelain)" ]] || fail "the working tree has uncommitted changes — release a commit"
 grep -qE "^## \[$version\] — [0-9]{4}-[0-9]{2}-[0-9]{2}" CHANGELOG.md \
   || fail "CHANGELOG.md has no '## [$version] — YYYY-MM-DD' heading"
+# The installer installs this release by default, on the image's own base.
+installer=deploy/install/install.sh
+grep -qx "RELEASE_VERSION=\"$version\"" "$installer" \
+  || fail "$installer installs another version by default: set RELEASE_VERSION=\"$version\""
+runtime_base=$(sed -n 's/^FROM \(debian:[^ ]*\) AS runtime$/\1/p' Dockerfile)
+grep -qx "NODE_BASE=\"$runtime_base\"" "$installer" \
+  || fail "$installer builds the node's image on another base than the Dockerfile's runtime stage ($runtime_base)"
 if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
   fail "tag v$version already exists — bump the version first"
 fi
@@ -175,7 +182,9 @@ else
 fi
 
 step "checksums"
-(cd "$dist" && shasum -a 256 gl-node-* > SHA256SUMS && cat SHA256SUMS)
+# The installer goes with the release, so SHA256SUMS covers it too.
+install -m 0755 deploy/install/install.sh "$dist/install.sh"
+(cd "$dist" && shasum -a 256 gl-node-* install.sh > SHA256SUMS && cat SHA256SUMS)
 {
   echo "openledger gl-node $version"
   echo "commit:      $commit"
@@ -195,5 +204,6 @@ cat <<EOF
 To publish it (maintainer):
   git tag -a v$version -m "openledger $version" $commit
   git push origin v$version
-Then, optionally, attach the files in $dist to a GitHub release.
+Then attach the files in $dist to the v$version GitHub release: the installer
+downloads gl-node-$version-linux-*, install.sh and SHA256SUMS from there.
 EOF

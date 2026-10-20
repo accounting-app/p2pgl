@@ -73,7 +73,10 @@ node's data and backups), so a re-run and an uninstall know what is theirs.
 6. **Backups, restore, upgrade, rollback.**
 7. **The real-network rehearsal** (Phase 3): two VMs at a provider, real
    domains and certificates, the intent's checks; OPERATIONS *Installing*,
-   README.
+   README. It installs **0.3.0**, cut from the tree once step 6 is committed:
+   0.2.0 (d6a4abb) predates step 2, so it has no `gl-node init`, and steps
+   3–6 rehearse on Lima with binaries built from the working tree (the
+   maintainer, 2026-10-19).
 
 ## Risks
 
@@ -114,7 +117,17 @@ node's data and backups), so a re-run and an uninstall know what is theirs.
 - Docs: README (*Installing on a server*), OPERATIONS (*Installing*, the
   day-2 commands, backups off the machine), CHANGELOG per step.
 
-## Decisions for the maintainer
+## Decisions (the maintainer, 2026-10-19)
+
+- **Release first:** 0.2.0 tagged at d6a4abb (before step 2); the installer
+  installs 0.3.0, cut after step 6.
+- **The repository goes public**, so a server downloads the release from
+  `https://github.com/accounting-app/p2pgl/releases/download/vX.Y.Z/` with no
+  token; each release attaches its binaries and `SHA256SUMS` to its GitHub
+  release. (Checked first: no secret in any of the 154 commits.)
+- **Rehearsal machines** (step 7): still open.
+
+## Questions that were open
 
 1. **Release 0.2.0 as step 1** — or tag it apart, before this entry.
 2. **The rehearsal machines for step 7:** a provider and two small VMs (and

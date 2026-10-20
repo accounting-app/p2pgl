@@ -1,6 +1,6 @@
 # Log: a one-command production install
 
-Status: in progress (step 2 of 7).
+Status: in progress (step 3 of 7).
 
 One entry per commit-sized unit, newest last, written when the unit is ready
 to commit. The commit hash is filled in once the maintainer has committed.
@@ -55,7 +55,7 @@ to commit. The commit hash is filled in once the maintainer has committed.
   binary (`Dockerfile.cross`), not an emulated image build; the upgrade
   rehearsal from 0.1.0 runs with the release itself (`plan.md` step 1, *As
   built*).
-- **Commit:** <hash>
+- **Commit:** d6a4abb
 
 ## 2026-10-19 — Step 1, continued: rustls 0.23.46
 
@@ -68,7 +68,7 @@ to commit. The commit hash is filled in once the maintainer has committed.
 - **Gate:** `scripts/gate.sh` — 1,618 passed, 0 failed, 0 ignored (8 min 9 s).
 - **Revert checks:** none (a dependency update).
 - **Departures from the plan:** none; the release runs after this commit.
-- **Commit:** <hash>
+- **Commit:** d6a4abb
 
 ## 2026-10-19 — Step 2: the node behind a proxy
 
@@ -128,4 +128,91 @@ to commit. The commit hash is filled in once the maintainer has committed.
   off (I-R15). `h01_l23.json` H01-R5 re-anchored on
   `is_public` (still bites).
 - **Departures from the plan:** recorded in `plan.md` step 2 (*As built*).
+- **Commit:** a15d133
+
+## 2026-10-20 — Step 3: the installer
+
+- **What changed:** **`deploy/install/install.sh`** (shell, run as root on a
+  fresh Ubuntu ≥ 22.04 or Debian ≥ 12, amd64 or arm64). It installs Docker
+  from Docker's apt repository, its signing key checked by fingerprint
+  (`9DC8…CD88`); fetches the release's Linux `gl-node` and `SHA256SUMS` and
+  checks one against the other (or takes `--binary FILE`), and builds the
+  node's image from it on the Dockerfile's pinned runtime base, tagged by
+  version and the binary's hash; writes the config with `gl-node init`
+  (in the image, as uid 1000, under `/var/lib/openledger/data`) and the
+  operator key (32 bytes from `/dev/urandom`, `/opt/openledger/env`, 0600
+  root); the Caddyfile (HTTPS for the domain — Let's Encrypt, or `tls
+  internal` with `--test-tls` — forwarding `/graphql`, `/ledgers/*` and
+  `/health` with `Host` unchanged, 404 for anything else) and the compose
+  file (node and Caddy `caddy:2.10.2@sha256:c3d7…`, host network, restart
+  unless stopped, 60 s stop grace, rotated logs); the firewall (ufw: the port
+  `sshd -T` reports, 80, 443, 4433–4532/udp; `--no-firewall` to skip); checks
+  the domain resolves (and says so if not to this server); starts, waits for
+  the node's health check and then `https://DOMAIN/health` with a valid
+  certificate. Each part says changed or unchanged; a second run ends
+  "Nothing to change"; a file it wrote and you edited is kept and its
+  version written as `FILE.new`; a config for another domain stops it. The
+  key is printed on the run that makes it, and every run says where it is.
+  `scripts/release.sh` now refuses a release whose installer names another
+  default version (`RELEASE_VERSION`) or another node base. RELEASE.md,
+  README and OPERATIONS (*Installing on a server*), CHANGELOG.
+- **`scripts/rehearse_install.sh`** builds the node from the working tree and,
+  per template (default `ubuntu-24.04 debian-12`), installs it on a new Lima
+  VM with `--test-tls`, checks it from inside as a client, runs the installer
+  again and reboots the VM.
+- **Rehearsal:** both pass, from fresh VMs (10 min, after the review's
+  changes; 18 checks each). As first written (14 min): a stranger's `/health` is `{"status":"ok"}`, the
+  operator's has the version; GraphQL without a key 401, with it answers;
+  `/` 404; port 4000 unreachable on the VM's address; ufw active with 443 and
+  4433:4532/udp; the key file `600 root`; a second run "Nothing to change",
+  the key not shown again (where it is, shown); after a reboot it serves.
+  On Debian ufw is not installed by default: the installer installs it.
+  Added after the review: the key is not written into the log when output is
+  not a terminal; the VM has an address and the node answers on
+  127.0.0.1:4000 (a positive control) while the VM's address:4000 is refused
+  (curl exit 7, nothing else); Caddy's admin port 2019 is refused; the data
+  directory is `openledger 700` and `gl-node` runs as `openledger`; a run with
+  a new e-mail updates the Caddyfile (no `.new`), restarts Caddy, and it
+  serves after.
+- **Found by the rehearsals and fixed:** the firewall step ended the
+  installer silently — `sshd -T | awk '… exit'` stopped reading, `sshd` died
+  of SIGPIPE, and `pipefail` failed the assignment (exit 141); the awk
+  programs (this one and the key fingerprint's) now read to the end. And a
+  first run that failed after making the key never showed it, since later
+  runs found the key file: every run now says where the key is.
+- **Review round** (reviewer subagent). *Important:* (1) the DNS check died
+  silently — `getent` exits 2 for a name that does not resolve and `pipefail`
+  failed the assignment before its message (the rehearsal's `--test-tls`
+  skips it); `|| true`. (2) Files the installer wrote were never updated: any
+  difference read as "you edited it", so a re-run with another
+  `--version`/`--binary`/`--email` kept the old compose file and the old image
+  ran on; now the hash of what it last wrote is kept in
+  `/opt/openledger/.installed/`, its own files are updated (and Caddy
+  restarted — its folder, not the file, is mounted, so it sees the new one),
+  and only a file someone edited is kept with a `.new`. (3) Caddy's admin API
+  was open on the host's 127.0.0.1:2019 — anything on the machine could
+  reroute the API and collect every key: `admin off`. (4) The node ran as uid
+  1000, on most servers the first login account, which would own the books
+  and could read the key from `/proc/<pid>/environ`: it runs as a system user
+  `openledger` (no login), the image built with its uid. Also: Docker's key
+  must be exactly one key (`pub` count) with the fingerprint — an appended
+  second key would have been trusted; SSH's ports come from `sshd -T`, its
+  listening sockets and `ssh.socket`, `--ssh-port` names one, and it refuses
+  when it cannot tell (it guessed 22); a release before 0.3.0 (no `init`) is
+  refused up front, and `RELEASE_VERSION` is 0.3.0; the key is printed on a
+  terminal only; `release.sh` puts `install.sh` in the release and its
+  `SHA256SUMS`, and RELEASE.md makes attaching the files required; the docs
+  say what the checksum proves (a corrupted or substituted download, not the
+  release itself), that the `docker` group can read the key, and that a
+  company's `p2p.listenPort` must be set in 4433–4532; `buildx` installed;
+  443/udp (HTTP/3) admitted; downloads `--proto =https`; `install -m 0755`
+  for the binary; `grep -F` for the domain; `--binary` images tagged `local`;
+  clear failures for `docker run` and `ps`; the old rehearsal logs, which
+  held throwaway keys, removed (the script starts clean).
+- **Gate:** `scripts/gate.sh` — 1,624 passed, 0 failed, 0 ignored (6 min 38 s); the installer and the rehearsal are shell, outside it.
+- **Revert checks:** none: the installer is shell, proved by the rehearsal
+  (each check above fails on the fault it names; the SIGPIPE one was found
+  that way).
+- **Departures from the plan:** a rehearsal script beside the installer
+  (the plan said Lima, not how); `release.sh`'s two checks.
 - **Commit:** <hash>

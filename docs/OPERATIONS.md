@@ -3,6 +3,57 @@
 How to set up, back up, upgrade, roll back and watch a node. The README is the
 reference for every config option; this page is the procedure.
 
+## Installing on a server
+
+`deploy/install/install.sh` sets up a production node on a fresh Ubuntu
+(22.04 or later) or Debian (12 or later) server, amd64 or arm64 (README,
+*Installing on a server*):
+
+1. **Before:** a server you can reach over SSH, and a domain name whose A (or
+   AAAA) record points at it. Ports 80 and 443 must reach the server from the
+   internet: the certificate authority checks the domain through them.
+2. **Run** `sudo bash install.sh --domain ledger.example.com --email
+   you@example.com`. It says what it does, step by step, and stops at the
+   first problem with the reason.
+3. **Keep the operator key** it prints, somewhere safe. It is the node's own
+   key, admin of every company: use it to add companies and people, and give
+   each person a key of their own.
+4. **Add a company** (`docker exec openledger-node gl-node ledger add …`,
+   *Adding a company*), with `p2p.listenPort` set to a free port in
+   4433–4532, the range the firewall admits (the default, a random port at
+   each boot, is not).
+
+What it leaves on the server:
+
+| Path | What it is |
+|---|---|
+| `/opt/openledger/env` | The operator key (`GL_NODE_API_KEY`), root only |
+| `/opt/openledger/compose.yml` | The two services, `openledger-node` and `openledger-caddy` |
+| `/opt/openledger/caddy/Caddyfile` | HTTPS for the domain, forwarding `/graphql`, `/ledgers/*` and `/health` only; Caddy's admin API off |
+| `/opt/openledger/.installed/` | Hashes of the files the installer wrote, so a later run can tell its own from your edits |
+| `/opt/openledger/image/` | The node's image: the verified binary on the project's pinned Debian base |
+| `/var/lib/openledger/data` | The node's config, books, keys and companies, owned by the `openledger` system user (no login): **what you back up** |
+| `/var/lib/openledger/caddy` | Caddy's certificates |
+
+Both containers use the host's network: the node listens on `127.0.0.1:4000`
+only, and Caddy on 80 and 443; nothing is published through Docker (whose
+port rules would bypass the firewall). The firewall (`ufw`) admits the SSH
+ports SSH listens on (from `sshd -T`, its sockets and `ssh.socket`; it
+refuses to go on when it cannot tell, and `--ssh-port` names one), 80/tcp,
+443/tcp and udp (HTTP/3), and 4433–4532/udp, and refuses everything else it
+did not already admit; with `--no-firewall` it is left to you (a cloud
+provider's firewall, say), with the same ports. The operator key is readable
+by root alone — and by anyone in the `docker` group, which is root in all but
+name: add no one to it.
+
+Running the installer again is safe: it reports each part as unchanged, and
+"Nothing to change" when all are. With another `--binary`, `--version` or
+`--email` it updates the files it wrote and restarts what uses them. A file
+it wrote and you edited is kept, with its version beside it as `FILE.new` for
+you to compare. The operator key is printed once, on a terminal; into a log
+(cloud-init, a pipe) it says where the key is instead. To see the
+operator key again: `sudo sed -n 's/^GL_NODE_API_KEY=//p' /opt/openledger/env`.
+
 ## The production template
 
 [`deploy/gl-node.production.json`](../deploy/gl-node.production.json) is a

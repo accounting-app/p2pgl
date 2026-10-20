@@ -62,6 +62,39 @@ The step-by-step procedure — backups, upgrade, rollback, what to watch — is 
 
 ---
 
+## Installing on a server
+
+From 0.3.0, on a fresh Ubuntu (22.04 or later) or Debian (12 or later)
+server, with the domain's DNS already pointing at it:
+
+```bash
+release=https://github.com/accounting-app/p2pgl/releases/download/vX.Y.Z
+curl -fsSLO "$release/install.sh" -O "$release/SHA256SUMS"
+sha256sum -c --ignore-missing SHA256SUMS
+sudo bash install.sh --domain ledger.example.com --email you@example.com
+```
+
+It installs Docker (from Docker's repository, its key checked by
+fingerprint), the release's `gl-node` (matched against the release's
+`SHA256SUMS`), and Caddy as the only public listener, with automatic HTTPS
+certificates and its admin API off, in front of a node that binds
+`127.0.0.1` (`gl-node init`) and runs as the `openledger` system user. The
+checksums catch a corrupted or substituted download; they come from the same
+release, so they do not stand in for trusting the release itself — compare
+`SHA256SUMS` with the hashes the maintainer publishes elsewhere if you need
+that. It
+also turns on a firewall admitting only SSH, 80, 443 and the companies' UDP
+ports (4433–4532), and sets restarts and log rotation. It prints the operator
+key once and keeps it in `/opt/openledger/env`, readable by root only. Clients
+then use `https://ledger.example.com/ledgers/<company>/graphql`.
+Running it again changes nothing that is set up, and it never overwrites
+books, keys, the config or a file you edited (its version goes beside it as
+`FILE.new`). `--binary FILE` installs a binary you already have instead of
+downloading one; `--no-firewall` leaves the firewall to you.
+`docs/OPERATIONS.md`, *Installing on a server*, has the rest.
+
+---
+
 ## API Reference — curl Examples
 
 All examples assume the server is running at `http://127.0.0.1:4000`. Pipe through `| jq .` for pretty output. Every `/graphql` example sends the API key from `$GL_NODE_API_KEY`; on a local node with the default config, load it from the key file first:

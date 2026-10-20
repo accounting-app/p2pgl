@@ -8,7 +8,10 @@ compatibility, and the CHANGELOG's *Breaking* section says how.
 
 1. **Freeze.** Release work only from here to the tag.
 2. **Version.** Set `version` in `[workspace.package]` of `Cargo.toml` (every
-   crate inherits it) and run `cargo build` so `Cargo.lock` follows.
+   crate inherits it) and run `cargo build` so `Cargo.lock` follows. Set the
+   installer's `RELEASE_VERSION` (`deploy/install/install.sh`) to the same
+   version; `release.sh` refuses a mismatch, and an installer whose node image
+   is not on the Dockerfile's runtime base.
 3. **CHANGELOG.** Rename `## [Unreleased]` to `## [X.Y.Z] — YYYY-MM-DD`, start a
    new empty `## [Unreleased]` above it, and check the release's summary and
    *Known limits* still hold.
@@ -26,9 +29,11 @@ compatibility, and the CHANGELOG's *Breaking* section says how.
 7. **Tag and push** (maintainer) — the script prints the two commands:
    `git tag -a vX.Y.Z -m "openledger X.Y.Z" <commit>` and
    `git push origin vX.Y.Z`.
-8. **Publish** (optional, maintainer): attach the files in
-   `target/release-dist/X.Y.Z/` to a GitHub release, and push the Docker image
-   to the registry you deploy from.
+8. **Publish** (maintainer): attach the files in `target/release-dist/X.Y.Z/`
+   to the `vX.Y.Z` GitHub release — required: the installer
+   (`deploy/install/install.sh`) downloads `gl-node-X.Y.Z-linux-amd64`,
+   `-linux-arm64`, `install.sh` and `SHA256SUMS` from it, which also needs the
+   repository to be public. Pushing the Docker image to a registry is optional.
 9. **Keep the binary** of this release: the next release's step 6 upgrades from
    it.
 
