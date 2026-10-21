@@ -29,6 +29,14 @@ break compatibility.
 
 ### Added
 
+- **`accounts`, the chart of accounts over GraphQL** (`docs/build-log/006-list-accounts`,
+  README *List Accounts*): every account with an `open`, sorted by name,
+  whether or not it holds a posting, with `openedOn` (its earliest `open`),
+  `closedOn` (while its last `open` or `close` by date is a `close`) and
+  `currencies` (the union over its `open`s, which a transaction dated on or
+  after the latest one may use; empty means any). A read key may call it. It
+  carries the reports' complexity weight, so one request holds at most eight
+  copies, and `verify` plus the four reports already fill a request.
 - **`openledger`, the server's day-to-day command** (005 step 4, OPERATIONS
   *Installing on a server*), written by the installer to
   `/usr/local/sbin/openledger`: `company add | list | restart | remove`,

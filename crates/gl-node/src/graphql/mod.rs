@@ -1168,6 +1168,52 @@ mod tests {
         assert_eq!(ledger.read().await.directive_count(), before + 1);
     }
 
+    /// 006 (`docs/build-log/006-list-accounts`): `accounts` gives a **read**
+    /// caller every account with an `open`, sorted by name — the ones no
+    /// transaction has touched included — with its first `open` date, its
+    /// `close` date while closed, and its currencies. One hand-typed `open`
+    /// per account: boot refuses a second one of an open account (L-77), and
+    /// the union over several is the ledger tests' case.
+    ///
+    /// Bug-catch: build the list from the read model's balances (what
+    /// `trialBalance` lists) and `Expenses:Food` and `Liabilities:Card`,
+    /// which hold no posting, are missing.
+    #[tokio::test]
+    async fn accounts_lists_every_opened_account_to_a_read_caller() {
+        use crate::access_control::{Caller, CallerId, Role};
+        let (_dir, _ledger, schema) = schema_and_ledger_over(
+            "2024-01-01 open Assets:Cash USD\n\
+             2024-01-01 open Income:Salary\n\
+             2024-01-01 open Expenses:Food USD\n\
+             2024-01-01 open Liabilities:Card USD\n\
+             2024-06-30 close Liabilities:Card\n\
+             2024-02-01 * \"Salary\"\n  Assets:Cash 100 USD\n  Income:Salary -100 USD\n",
+        );
+        let response = schema
+            .execute(
+                async_graphql::Request::new("{ accounts { name openedOn closedOn currencies } }")
+                    .data(Caller {
+                        who: CallerId::Operator,
+                        role: Role::Read,
+                    }),
+            )
+            .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert_eq!(
+            response.data.into_json().unwrap(),
+            serde_json::json!({ "accounts": [
+                { "name": "Assets:Cash", "openedOn": "2024-01-01", "closedOn": null,
+                  "currencies": ["USD"] },
+                { "name": "Expenses:Food", "openedOn": "2024-01-01", "closedOn": null,
+                  "currencies": ["USD"] },
+                { "name": "Income:Salary", "openedOn": "2024-01-01", "closedOn": null,
+                  "currencies": [] },
+                { "name": "Liabilities:Card", "openedOn": "2024-01-01",
+                  "closedOn": "2024-06-30", "currencies": ["USD"] },
+            ]})
+        );
+    }
+
     /// A request that reaches the schema with no authenticated caller — only
     /// possible for a route that skipped the auth middleware — is refused, not
     /// run as anyone: the schema has no fallback.

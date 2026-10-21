@@ -443,6 +443,32 @@ curl -s -X POST http://127.0.0.1:4000/graphql \
   }'
 ```
 
+#### List Accounts
+
+Every account of the ledger, sorted by name — the ones no transaction has
+touched included, unlike the rows of `trialBalance`.
+
+```bash
+curl -s -X POST http://127.0.0.1:4000/graphql \
+  -H "X-Api-Key: $GL_NODE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "{ accounts { name openedOn closedOn currencies } }"
+  }'
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | The account, e.g. `Assets:Cash`. |
+| `openedOn` | The date of its earliest `open`. |
+| `closedOn` | The date of its `close` while its last `open` or `close` by date is a `close`; `null` while open. A posting dated after that `close` (a peer's, or one in the file) makes it inert for this node's writes, and it still shows here. |
+| `currencies` | What a transaction dated on or after the account's latest `open` may use: the union over every `open` of it. Empty means any currency. An earlier transaction is judged by the `open`s dated on or before it, and one dated before a future-dated `close` or `open` by the state on its own date. |
+
+An account whose only `open` is quarantined is not listed, and neither is a
+`close` with no `open`. The query weighs as much as the other reports, so one
+request holds at most eight copies of it, and `verify` plus the four reports
+already fill a request.
+
 ---
 
 #### Verify DAG Integrity
