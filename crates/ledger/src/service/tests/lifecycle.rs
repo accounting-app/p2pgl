@@ -458,3 +458,42 @@ fn test_remote_insert_rejects_oversized_narration() {
     assert_eq!(error.error_code(), "RESOURCE_LIMIT_EXCEEDED");
     std::fs::remove_file(path).ok();
 }
+
+/// 006 (`docs/build-log/006-list-accounts`): the chart of accounts lists
+/// only what the node serves. A signed `open` edited by hand fails its
+/// signature at boot and is quarantined; the list leaves its account out,
+/// at that boot and at the next one, after the compaction a starting node
+/// runs, while the untouched accounts stay.
+///
+/// Bug-catch: keep the old account state when the quarantine rebuilds the
+/// DAG (`rebuild_dag` without its `self.accounts = accounts`) and the
+/// quarantined `Expenses:Food` is listed.
+#[test]
+fn a_quarantined_open_is_not_in_the_chart_of_accounts() {
+    let (mut svc, path) = setup_with_signed_accounts();
+    svc.compact().unwrap();
+    drop(svc);
+    let content = std::fs::read_to_string(&path).unwrap();
+    let edited = content.replacen(
+        "2024-01-01 open Expenses:Food",
+        "2024-01-03 open Expenses:Food",
+        1,
+    );
+    assert_ne!(content, edited, "premise: the open line was found");
+    std::fs::write(&path, edited).unwrap();
+
+    for boot in ["first boot", "after a restart"] {
+        let mut svc = t85_boot(&path);
+        assert_eq!(svc.quarantined_count(), 1, "{boot}: the edited open");
+        let names: Vec<String> = svc
+            .accounts()
+            .summaries()
+            .into_iter()
+            .map(|summary| summary.name)
+            .collect();
+        assert_eq!(names, vec!["Assets:Cash", "Equity:Opening"], "{boot}");
+        svc.compact().unwrap();
+        drop(svc);
+    }
+    remove_ledger_and_journal(&path);
+}

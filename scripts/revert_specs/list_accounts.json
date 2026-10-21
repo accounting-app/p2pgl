@@ -1,0 +1,68 @@
+{
+  "LA-R1-chart-unsorted": {
+    "file": "crates/ledger/src/accounts.rs",
+    "old": "        summaries.sort_by(|a, b| a.name.cmp(&b.name));\n",
+    "new": "",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "summaries_list_every_opened_account_sorted_by_name"
+      ]
+    ]
+  },
+  "LA-R2-currencies-of-the-latest-open-only": {
+    "file": "crates/ledger/src/accounts.rs",
+    "old": "currencies: self.currencies(name).unwrap_or_default(),",
+    "new": "currencies: self.events.get(name).and_then(|events| events.values().rev().find_map(|event| match event { LifecycleEvent::Open { currencies } => Some(currencies.clone()), LifecycleEvent::Close => None })).unwrap_or_default(),",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "summaries_list_the_union_of_currencies"
+      ]
+    ]
+  },
+  "LA-R3-closed-on-from-any-close": {
+    "file": "crates/ledger/src/accounts.rs",
+    "old": "let closed_on = match self.deciding_overall(name) {",
+    "new": "let closed_on = match self.events.get(name).and_then(|events| events.iter().rev().find(|(_, event)| matches!(event, LifecycleEvent::Close))) {",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "summaries_show_a_reopened_account_open_and_a_closed_one_closed"
+      ]
+    ]
+  },
+  "LA-R4-accounts-unrationed": {
+    "file": "crates/gl-node/src/graphql/query.rs",
+    "old": "    #[graphql(complexity = \"HEAVY_RESOLVER_COMPLEXITY\")]\n    async fn accounts(",
+    "new": "    async fn accounts(",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "accounts_is_rationed_like_the_other_reports"
+      ]
+    ]
+  },
+  "LA-R5-quarantine-keeps-old-accounts": {
+    "file": "crates/ledger/src/service/quarantine.rs",
+    "old": "        self.accounts = accounts;\n",
+    "new": "        let _ = accounts;\n",
+    "runs": [
+      [
+        "-p",
+        "ledger",
+        "--lib",
+        "a_quarantined_open_is_not_in_the_chart_of_accounts"
+      ]
+    ]
+  }
+}

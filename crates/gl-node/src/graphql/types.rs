@@ -98,6 +98,28 @@ pub struct AppendedTransaction {
     pub already_existed: bool,
 }
 
+/// An account of the ledger, as `accounts` lists it
+/// (`docs/build-log/006-list-accounts`).
+#[derive(SimpleObject, Debug, Clone)]
+pub struct Account {
+    /// The account's name, e.g. `Assets:Cash`.
+    pub name: String,
+    /// The date of the account's earliest `open`.
+    pub opened_on: DateScalar,
+    /// The date of the account's `close` when its last `open` or `close` by
+    /// date is a `close`; null while it is open. The record as it stands: a
+    /// posting dated after this `close` (a peer's, or one in the file) makes
+    /// it inert for this node's writes in that stretch (T98), and it still
+    /// shows here. A transaction dated before a future-dated `open` or
+    /// `close` is judged at its own date.
+    pub closed_on: Option<DateScalar>,
+    /// The currencies a transaction dated on or after the account's latest
+    /// `open` may use: the union over every `open` of it. Empty means any
+    /// currency. An earlier transaction is judged by the `open`s dated on or
+    /// before it.
+    pub currencies: Vec<String>,
+}
+
 /// An account and its balances (one per currency).
 #[derive(SimpleObject, Debug, Clone)]
 pub struct AccountBalance {

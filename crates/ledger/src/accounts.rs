@@ -619,6 +619,61 @@ impl AccountState {
     pub fn is_open_at(&self, account: &str, date: NaiveDate) -> bool {
         self.check_account_open(account, date).is_ok()
     }
+
+    /// Every account with an `open`, sorted by name: the chart of accounts
+    /// the `accounts` query lists (`docs/build-log/006-list-accounts`).
+    ///
+    /// Each field is an answer the write rules already give: an account with
+    /// no `open` (a bare `close`) has no [`CurrencyIndex`] and is not listed
+    /// (decision 1); `closed_on` is set when the account's last lifecycle
+    /// event is a `close` ([`Self::is_open`] is false — what `openAccount`
+    /// and `closeAccount` judge), whatever T98 makes of that `close` for a
+    /// later posting (decision 3); `currencies` is [`Self::currencies`], the
+    /// union over every `open`. Both describe the account after its LAST
+    /// `open` or `close` by date: a transaction dated before a future-dated
+    /// one is judged at its own date, by [`Self::currencies_at`] and
+    /// [`Self::check_account_open`], and may get another answer.
+    ///
+    /// The state is rebuilt from the DAG whenever a record leaves it (boot's
+    /// passes, the signature quarantine, the H-23 served-set rule), so a
+    /// quarantined `open` is never listed. Like `journal`, it does include a
+    /// staged write not yet committed.
+    pub fn summaries(&self) -> Vec<AccountSummary> {
+        let mut summaries: Vec<AccountSummary> = self
+            .currency_index
+            .iter()
+            .filter_map(|(name, index)| {
+                let closed_on = match self.deciding_overall(name) {
+                    Some((key, LifecycleEvent::Close)) => Some(key.date),
+                    _ => None,
+                };
+                Some(AccountSummary {
+                    name: name.clone(),
+                    opened_on: index.first_open.as_ref()?.date,
+                    closed_on,
+                    currencies: self.currencies(name).unwrap_or_default(),
+                })
+            })
+            .collect();
+        summaries.sort_by(|a, b| a.name.cmp(&b.name));
+        summaries
+    }
+}
+
+/// One account as [`AccountState::summaries`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSummary {
+    /// The account's name, e.g. `Assets:Cash`.
+    pub name: String,
+    /// The date of the account's earliest `open`.
+    pub opened_on: NaiveDate,
+    /// The date of the account's last lifecycle event when that is a
+    /// `close`; `None` while the account is open.
+    pub closed_on: Option<NaiveDate>,
+    /// The currencies a transaction dated on or after the account's latest
+    /// `open` may use: the union over every `open` (T91). Empty means any
+    /// currency.
+    pub currencies: Vec<String>,
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -1197,6 +1252,139 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "{pairs} checks over {pairs} reopens took {elapsed:?}"
+        );
+    }
+
+    // ── 006: the chart of accounts (`docs/build-log/006-list-accounts`) ──
+
+    fn open_with(account: &str, on: NaiveDate, lamport: u64, currencies: &[&str]) -> Directive {
+        match open_directive(account, on, lamport) {
+            Directive::Open(mut open) => {
+                open.currencies = currencies.iter().map(|c| (*c).to_owned()).collect();
+                Directive::Open(open)
+            }
+            other => other,
+        }
+    }
+
+    fn summaries_of(directives: &[Directive]) -> Vec<AccountSummary> {
+        let mut state = AccountState::new();
+        apply(&mut state, directives);
+        state.summaries()
+    }
+
+    /// 006: every account with an `open` is listed, sorted by name, with the
+    /// date of its earliest `open` — an account no transaction has touched
+    /// included, since the list reads the lifecycle state and not balances.
+    ///
+    /// Bug-catch: drop the sort and the list comes out in `HashMap` order.
+    #[test]
+    fn summaries_list_every_opened_account_sorted_by_name() {
+        let names: Vec<String> = (0..12).rev().map(|i| format!("Assets:A{i:02}")).collect();
+        let mut directives: Vec<Directive> = names
+            .iter()
+            .enumerate()
+            .map(|(lamport, name)| open_directive(name, date(2024, 1, 1), lamport as u64))
+            .collect();
+        directives.push(open_directive("Assets:A03", date(2023, 6, 1), 99));
+        let listed = summaries_of(&directives);
+        let mut expected: Vec<String> = names.clone();
+        expected.sort();
+        assert_eq!(
+            listed.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+            expected
+        );
+        let a03 = listed.iter().find(|s| s.name == "Assets:A03").unwrap();
+        assert_eq!(a03.opened_on, date(2023, 6, 1), "the earliest open");
+        assert!(listed
+            .iter()
+            .all(|s| s.closed_on.is_none() && s.currencies.is_empty()));
+    }
+
+    /// 006, decision 3: `closed_on` is the date of the account's last
+    /// lifecycle event when that is a `close` — an account closed and opened
+    /// again is open — and the list is the same in every arrival order.
+    ///
+    /// Bug-catch: take `closed_on` from any `close` rather than the last
+    /// event and the reopened account lists as closed.
+    #[test]
+    fn summaries_show_a_reopened_account_open_and_a_closed_one_closed() {
+        let directives = vec![
+            open_directive("Assets:Reopened", date(2024, 1, 1), 1),
+            close_directive("Assets:Reopened", date(2024, 2, 1), 2),
+            open_directive("Assets:Reopened", date(2024, 3, 1), 3),
+            open_directive("Assets:Closed", date(2024, 1, 1), 4),
+            close_directive("Assets:Closed", date(2024, 5, 1), 5),
+        ];
+        let reference = summaries_of(&directives);
+        assert_eq!(
+            reference,
+            vec![
+                AccountSummary {
+                    name: "Assets:Closed".to_owned(),
+                    opened_on: date(2024, 1, 1),
+                    closed_on: Some(date(2024, 5, 1)),
+                    currencies: Vec::new(),
+                },
+                AccountSummary {
+                    name: "Assets:Reopened".to_owned(),
+                    opened_on: date(2024, 1, 1),
+                    closed_on: None,
+                    currencies: Vec::new(),
+                },
+            ]
+        );
+        let mut indices: Vec<usize> = (0..directives.len()).collect();
+        while next_permutation(&mut indices) {
+            let ordered: Vec<Directive> = indices.iter().map(|&i| directives[i].clone()).collect();
+            assert_eq!(summaries_of(&ordered), reference, "order {indices:?}");
+        }
+    }
+
+    /// 006: `currencies` is the union over every `open` (T91) — what
+    /// `appendTransaction` admits after the last of them — and empty, meaning
+    /// any currency, once one `open` lists none.
+    ///
+    /// Bug-catch: list the latest `open`'s currencies alone and USD, which
+    /// the first `open` admits, is missing.
+    #[test]
+    fn summaries_list_the_union_of_currencies() {
+        let listed = summaries_of(&[
+            open_with("Assets:Cash", date(2024, 1, 1), 1, &["USD"]),
+            open_with("Assets:Cash", date(2024, 3, 1), 2, &["EUR"]),
+            open_with("Assets:Bank", date(2024, 1, 1), 3, &["USD"]),
+            open_with("Assets:Bank", date(2024, 2, 1), 4, &[]),
+        ]);
+        let currencies = |name: &str| {
+            listed
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| s.currencies.clone())
+                .unwrap()
+        };
+        assert_eq!(
+            currencies("Assets:Cash"),
+            vec!["EUR".to_owned(), "USD".to_owned()]
+        );
+        assert_eq!(currencies("Assets:Bank"), Vec::<String>::new());
+    }
+
+    /// 006, decision 1: a `close` with no `open` names no account a
+    /// transaction can use, and is not listed.
+    ///
+    /// Bug-catch: list from every account with a lifecycle event (`events`)
+    /// instead of every account with an `open`, and the bare `close` is
+    /// listed. Held by construction — such an account has no currency index
+    /// — so no revert check undoes it; this test pins it.
+    #[test]
+    fn summaries_leave_out_a_bare_close() {
+        let listed = summaries_of(&[
+            close_directive("Assets:Ghost", date(2024, 1, 1), 1),
+            open_directive("Assets:Cash", date(2024, 1, 1), 2),
+        ]);
+        assert_eq!(
+            listed.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["Assets:Cash"]
         );
     }
 }

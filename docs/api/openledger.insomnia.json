@@ -1,0 +1,735 @@
+{
+  "_type": "export",
+  "__export_format": 4,
+  "__export_date": "2026-10-21T23:12:07Z",
+  "__export_source": "openledger",
+  "resources": [
+    {
+      "_id": "wrk_openledger",
+      "_type": "workspace",
+      "parentId": null,
+      "scope": "collection",
+      "name": "openledger",
+      "description": "The openledger GraphQL API (gl-node 0.3). Pick an environment: base_url, api_key (the operator key or a person's key), and graphql_path (/graphql for the config file's ledger, /ledgers/<name>/graphql for a company). The Node endpoint folder needs the operator key."
+    },
+    {
+      "_id": "env_base",
+      "_type": "environment",
+      "parentId": "wrk_openledger",
+      "name": "Base Environment",
+      "data": {
+        "base_url": "http://127.0.0.1:4000",
+        "api_key": "PASTE-A-KEY-HERE",
+        "graphql_path": "/graphql",
+        "ledger": "acme",
+        "today": "2026-01-01"
+      }
+    },
+    {
+      "_id": "env_local",
+      "_type": "environment",
+      "parentId": "env_base",
+      "name": "Local node (127.0.0.1:4000)",
+      "data": {
+        "base_url": "http://127.0.0.1:4000"
+      }
+    },
+    {
+      "_id": "env_server",
+      "_type": "environment",
+      "parentId": "env_base",
+      "name": "Installed server (https)",
+      "data": {
+        "base_url": "https://ledger.example.com"
+      }
+    },
+    {
+      "_id": "env_company",
+      "_type": "environment",
+      "parentId": "env_base",
+      "name": "A company (ledger acme)",
+      "data": {
+        "graphql_path": "/ledgers/acme/graphql",
+        "ledger": "acme"
+      }
+    },
+    {
+      "_id": "fld_reports",
+      "_type": "request_group",
+      "parentId": "wrk_openledger",
+      "name": "Books: reports",
+      "description": "Read-only: any key the ledger accepts (read role or above)."
+    },
+    {
+      "_id": "fld_entries",
+      "_type": "request_group",
+      "parentId": "wrk_openledger",
+      "name": "Books: entries",
+      "description": "Writes: a key with the write role (or the operator key)."
+    },
+    {
+      "_id": "fld_people",
+      "_type": "request_group",
+      "parentId": "wrk_openledger",
+      "name": "People and keys",
+      "description": "The ledger's access list. Needs an admin key or the operator key, on a ledger that signs (a company)."
+    },
+    {
+      "_id": "fld_health",
+      "_type": "request_group",
+      "parentId": "wrk_openledger",
+      "name": "Health",
+      "description": "GET /health answers anyone; the detail (version, heads, peers) needs a key on a public node."
+    },
+    {
+      "_id": "fld_node",
+      "_type": "request_group",
+      "parentId": "wrk_openledger",
+      "name": "Node endpoint (companies)",
+      "description": "POST /node/graphql — the operator key only. Add, list, restart and remove company ledgers."
+    },
+    {
+      "_id": "req_accounts",
+      "_type": "request",
+      "parentId": "fld_reports",
+      "name": "Accounts (chart of accounts)",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"{ accounts { name openedOn closedOn currencies } }\",\"variables\":{}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_trial",
+      "_type": "request",
+      "parentId": "fld_reports",
+      "name": "Trial balance",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"query($at: Date!) { trialBalance(at: $at) { at totalDebit totalCredit exact rows { account debit credit exact } } }\",\"variables\":{\"at\":\"2026-12-31\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_sheet",
+      "_type": "request",
+      "parentId": "fld_reports",
+      "name": "Balance sheet",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"query($at: Date!) { balanceSheet(at: $at) { at exact assets { account balances { number currency } exact } liabilities { account balances { number currency } exact } equity { account balances { number currency } exact } } }\",\"variables\":{\"at\":\"2026-12-31\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_income",
+      "_type": "request",
+      "parentId": "fld_reports",
+      "name": "Income statement",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"query($from: Date!, $to: Date!) { incomeStatement(from: $from, to: $to) { from to exact net { number currency } income { account balances { number currency } } expenses { account balances { number currency } } } }\",\"variables\":{\"from\":\"2026-01-01\",\"to\":\"2026-12-31\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_journal",
+      "_type": "request",
+      "parentId": "fld_reports",
+      "name": "Journal",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"query($account: String, $from: Date, $to: Date, $limit: Int!, $offset: Int!) { journal(account: $account, from: $from, to: $to, limit: $limit, offset: $offset) { txid date flag payee narration tags links enteredBy enteredByName postings { account amount { number currency } } } }\",\"variables\":{\"account\":null,\"from\":null,\"to\":null,\"limit\":100,\"offset\":0}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_transaction",
+      "_type": "request",
+      "parentId": "fld_reports",
+      "name": "Transaction by txid (paste one from the journal)",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"query($txid: TxId!) { transaction(txid: $txid) { txid date flag payee narration postings { account amount { number currency } } author signature parents enteredByName } }\",\"variables\":{\"txid\":\"0000000000000000000000000000000000000000000000000000000000000000\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_account",
+      "_type": "request",
+      "parentId": "fld_reports",
+      "name": "Account balance",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"query($name: String!, $at: Date) { account(name: $name, at: $at) { account exact balances { number currency } } }\",\"variables\":{\"name\":\"Assets:Bank:Checking\",\"at\":null}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_verify",
+      "_type": "request",
+      "parentId": "fld_reports",
+      "name": "Verify (DAG integrity)",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"{ verify { ok nodesChecked errors truncated quarantined quarantinedTotal unparsableBlocks balanceAssertions { evaluated passed failed ok failures { account date expected actual currency } } } }\",\"variables\":{}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_health_gql",
+      "_type": "request",
+      "parentId": "fld_reports",
+      "name": "Node health (GraphQL)",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"{ health { status heads peers version } peers { id } }\",\"variables\":{}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_open",
+      "_type": "request",
+      "parentId": "fld_entries",
+      "name": "Open an account",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($name: String!, $date: Date!, $currencies: String) { openAccount(name: $name, date: $date, currencies: $currencies) }\",\"variables\":{\"name\":\"Assets:Bank:Checking\",\"date\":\"2026-01-01\",\"currencies\":\"USD\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_open2",
+      "_type": "request",
+      "parentId": "fld_entries",
+      "name": "Open an account (any currency)",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($name: String!, $date: Date!) { openAccount(name: $name, date: $date) }\",\"variables\":{\"name\":\"Income:Sales\",\"date\":\"2026-01-01\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_append",
+      "_type": "request",
+      "parentId": "fld_entries",
+      "name": "Append a transaction",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($input: TransactionInput!) { appendTransaction(input: $input) { txid date narration alreadyExisted enteredByName postings { account amount { number currency } } } }\",\"variables\":{\"input\":{\"date\":\"2026-01-15\",\"flag\":\"*\",\"payee\":\"Acme Client\",\"narration\":\"Invoice 1001\",\"tags\":[],\"links\":[],\"postings\":[{\"account\":\"Assets:Bank:Checking\",\"amount\":{\"number\":\"1500.00\",\"currency\":\"USD\"}},{\"account\":\"Income:Sales\",\"amount\":{\"number\":\"-1500.00\",\"currency\":\"USD\"}}]}}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_append_elided",
+      "_type": "request",
+      "parentId": "fld_entries",
+      "name": "Append a transaction (one amount elided)",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($input: TransactionInput!) { appendTransaction(input: $input) { txid postings { account amount { number currency } } } }\",\"variables\":{\"input\":{\"date\":\"2026-01-16\",\"flag\":\"*\",\"narration\":\"Elided posting balances it\",\"postings\":[{\"account\":\"Assets:Bank:Checking\",\"amount\":{\"number\":\"250.00\",\"currency\":\"USD\"}},{\"account\":\"Income:Sales\"}]}}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_close",
+      "_type": "request",
+      "parentId": "fld_entries",
+      "name": "Close an account",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($name: String!, $date: Date!) { closeAccount(name: $name, date: $date) }\",\"variables\":{\"name\":\"Assets:Bank:Checking\",\"date\":\"2026-12-31\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_people",
+      "_type": "request",
+      "parentId": "fld_people",
+      "name": "Access list",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"{ accessList { userId name role expires expired } }\",\"variables\":{}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_grant",
+      "_type": "request",
+      "parentId": "fld_people",
+      "name": "Grant access (new person)",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($name: String, $role: AccessRole!, $expires: Date) { grantAccess(name: $name, role: $role, expires: $expires) { userId name role expires key } }\",\"variables\":{\"name\":\"Ana Ruiz\",\"role\":\"WRITE\",\"expires\":null}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_rotate",
+      "_type": "request",
+      "parentId": "fld_people",
+      "name": "Change a role / new key (existing person)",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($user: String!, $role: AccessRole!, $expires: Date) { grantAccess(userId: $user, role: $role, expires: $expires) { userId name role expires key } }\",\"variables\":{\"user\":\"PASTE-A-USER-ID\",\"role\":\"READ\",\"expires\":\"2026-12-31\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_rename",
+      "_type": "request",
+      "parentId": "fld_people",
+      "name": "Rename a person",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($user: String!, $name: String!) { renameUser(userId: $user, name: $name) }\",\"variables\":{\"user\":\"PASTE-A-USER-ID\",\"name\":\"Ana Ruiz Pérez\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_revoke",
+      "_type": "request",
+      "parentId": "fld_people",
+      "name": "Revoke access",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($user: String!) { revokeAccess(userId: $user) }\",\"variables\":{\"user\":\"PASTE-A-USER-ID\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_health",
+      "_type": "request",
+      "parentId": "fld_health",
+      "name": "Health (no key)",
+      "method": "GET",
+      "url": "{{ _.base_url }}/health",
+      "body": {},
+      "headers": [],
+      "authentication": {}
+    },
+    {
+      "_id": "req_health_key",
+      "_type": "request",
+      "parentId": "fld_health",
+      "name": "Health (with key: version, heads, peers)",
+      "method": "GET",
+      "url": "{{ _.base_url }}/health",
+      "body": {},
+      "headers": [
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {}
+    },
+    {
+      "_id": "req_health_company",
+      "_type": "request",
+      "parentId": "fld_health",
+      "name": "A company's health (needs a key it accepts)",
+      "method": "GET",
+      "url": "{{ _.base_url }}/ledgers/{{ _.ledger }}/health",
+      "body": {},
+      "headers": [
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {}
+    },
+    {
+      "_id": "req_ledgers",
+      "_type": "request",
+      "parentId": "fld_node",
+      "name": "List ledgers",
+      "method": "POST",
+      "url": "{{ _.base_url }}/node/graphql",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"{ ledgers { name served reason nodeId listenPort } }\",\"variables\":{}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_add_mesh",
+      "_type": "request",
+      "parentId": "fld_node",
+      "name": "Add a company (a mesh of its own)",
+      "method": "POST",
+      "url": "{{ _.base_url }}/node/graphql",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($name: String!, $ports: String) { addLedger(name: $name, newMeshPorts: $ports) { name served reason nodeId listenPort } }\",\"variables\":{\"name\":\"acme\",\"ports\":\"4433-4532\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_add_settings",
+      "_type": "request",
+      "parentId": "fld_node",
+      "name": "Add a ledger (own settings)",
+      "method": "POST",
+      "url": "{{ _.base_url }}/node/graphql",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($name: String!, $settings: String) { addLedger(name: $name, settings: $settings) { name served reason nodeId listenPort } }\",\"variables\":{\"name\":\"notes\",\"settings\":\"{}\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_restart",
+      "_type": "request",
+      "parentId": "fld_node",
+      "name": "Restart a ledger",
+      "method": "POST",
+      "url": "{{ _.base_url }}/node/graphql",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($name: String!) { restartLedger(name: $name) { name served reason nodeId listenPort } }\",\"variables\":{\"name\":\"acme\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_remove",
+      "_type": "request",
+      "parentId": "fld_node",
+      "name": "Remove a ledger (moved aside, not deleted)",
+      "method": "POST",
+      "url": "{{ _.base_url }}/node/graphql",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($name: String!) { removeLedger(name: $name) { name movedTo } }\",\"variables\":{\"name\":\"acme\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    }
+  ]
+}

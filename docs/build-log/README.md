@@ -54,4 +54,5 @@ them (a typo, a one-line fix) gets no entry.
 | [003](003-multi-ledger-node/) | Several company ledgers on one node, isolated, added at runtime | done (5 of 5, acbce10) |
 | [004](004-no-python/) | No Python in the repo: revert checks and measurements in Rust, the git guard in shell | done (aa0415b) |
 | [005](005-installer/) | A one-command production install on a Linux server (Docker, HTTPS, backups, upgrades) | step 4 of 7 (the day-to-day command) in progress |
+| [006](006-list-accounts/) | List a ledger's accounts over GraphQL, posted to or not | done, ready to commit |
 | — | Relay with a company's own certificate authority (`relayCaCert`) | planned (decision C, 2026-10-09) |

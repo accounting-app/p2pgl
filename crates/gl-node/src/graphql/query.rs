@@ -3,7 +3,7 @@ use rust_decimal::Decimal;
 
 use super::scalars::{DateScalar, DecimalScalar, TransactionId};
 use super::types::{
-    AccountBalance, Amount, BalanceAssertionFailure, BalanceAssertionReport, BalanceSheet,
+    Account, AccountBalance, Amount, BalanceAssertionFailure, BalanceAssertionReport, BalanceSheet,
     HealthStatus, IncomeStatement, Peer, Posting, Transaction, TrialBalance, TrialBalanceRow,
     VerifyResult,
 };
@@ -251,6 +251,34 @@ impl QueryRoot {
             return Ok(entry.as_ref().map(account_balance_to_graphql));
         }
         Ok(None)
+    }
+
+    /// Every account of the ledger with an `open`, sorted by name, whether or
+    /// not it holds a posting (`docs/build-log/006-list-accounts`).
+    ///
+    /// Read off the account state the write rules use, which is rebuilt
+    /// whenever a record is quarantined: an account whose only `open` is
+    /// quarantined is not listed, and a bare `close` (no `open`) is not
+    /// either. For one account's balances, see `account(name:)`.
+    ///
+    /// Carries the heavy weight like the other reports (M-45): it walks every
+    /// account, and the weight rations aliased copies of it per request.
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
+    async fn accounts(&self, ctx: &Context<'_>) -> Vec<Account> {
+        let Ok(ledger) = ctx.data::<SharedLedger>() else {
+            return Vec::new();
+        };
+        let svc = ledger.read().await;
+        svc.accounts()
+            .summaries()
+            .into_iter()
+            .map(|summary| Account {
+                name: summary.name,
+                opened_on: DateScalar(summary.opened_on),
+                closed_on: summary.closed_on.map(DateScalar),
+                currencies: summary.currencies,
+            })
+            .collect()
     }
 
     /// Everyone who has access to this mesh's API, by user id: name, role and
@@ -787,6 +815,27 @@ mod tests {
             refused_on_complexity(&refused),
             "eight aliased journal(limit: 10000) with postings must be refused \
              on complexity (M-45), got: {refused:?}"
+        );
+    }
+
+    /// 006 (`docs/build-log/006-list-accounts`): `accounts` walks every
+    /// account and returns all of them, so it carries the heavy weight and
+    /// the budget admits eight aliased copies per request, not the thousands
+    /// a weight of one would (M-45's class: one request buying a planted
+    /// chart of accounts many times over).
+    ///
+    /// Bug-catch: drop the complexity attribute and nine aliased `accounts`
+    /// are admitted.
+    #[tokio::test]
+    async fn accounts_is_rationed_like_the_other_reports() {
+        let per_request = GRAPHQL_MAX_COMPLEXITY / HEAVY_RESOLVER_COMPLEXITY;
+        let admitted = aliased(per_request, "accounts { name }").await;
+        assert!(admitted.is_empty(), "{per_request}: {admitted:?}");
+        let refused = aliased(per_request + 1, "accounts { name }").await;
+        assert!(
+            refused_on_complexity(&refused),
+            "{} aliased accounts must be refused on complexity, got: {refused:?}",
+            per_request + 1
         );
     }
 
