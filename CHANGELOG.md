@@ -29,6 +29,34 @@ break compatibility.
 
 ### Added
 
+- **Backups, restore, upgrade and rollback on an installed server** (005
+  step 6, OPERATIONS *Backups, restore, upgrade and rollback on an installed
+  server*). The installer sets a nightly backup (`openledger-backup.timer`):
+  the node stopped for seconds, its data archived with the server's settings
+  and operator key into `/var/lib/openledger/backups` (root only, the 14
+  newest kept), the node started again. `openledger backup` takes one now,
+  `openledger backups` lists them, `openledger restore FILE` puts one back
+  (the data it replaces moved aside, never deleted), `openledger upgrade
+  --version X.Y.Z` (or `--binary FILE`) backs up, then runs the release's
+  installer — checked against its `SHA256SUMS` — with the server's settings,
+  and `openledger rollback` restores the upgrade's backup and reinstalls the
+  previous binary — copied out of the node's container, its image reused —
+  which starts on the restored books: the newer release never boots on them.
+  An upgrade that fails can be run again and still rolls back to before the
+  first attempt, and the installer run by hand finishes it; a rollback that
+  fails goes on from where it stopped when run again, and a restore cut short
+  by a crash leaves the node stopped at boot, the installer refusing to start
+  it until the restore or rollback is run again. Upgrade and rollback are
+  refused while `compose.yml` is edited. Two of these, and the installer,
+  never run at once; `openledger-resume.service` starts at boot a node a
+  backup or restore had stopped when the server went down.
+  `openledger status` names the last backup and **exits non-zero once it is
+  two days old**, or while an upgrade or rollback is unfinished — a probe
+  that runs it starts failing then. The installer keeps a copy of itself in
+  `/opt/openledger` once it has run to the end, so it runs from a file, not a
+  pipe; images are tagged by binary, not by version.
+  `scripts/rehearse_backup.sh` rehearses it on a fresh VM, all but
+  `--version`'s download (which needs a release after 0.3.0).
 - **More servers for a company, by invitation** (005 step 5, OPERATIONS
   *Joining a second server*): `gl-node ledger invite NAME --address HOST`
   prints a one-line invitation — the company's mesh, this node's id and

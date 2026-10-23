@@ -94,7 +94,13 @@ downloading one; `--no-firewall` leaves the firewall to you.
 Then, as root on the server, `openledger company add acme` adds a company
 in a mesh of its own, `openledger person add acme --name "Ana Ruiz" --role
 write` gives someone a key, and `openledger status` checks it all through
-HTTPS. `docs/OPERATIONS.md`, *Installing on a server*, has the rest.
+HTTPS. It backs the books up every night into
+`/var/lib/openledger/backups` (copy them off the server, encrypted: they hold
+the node's keys); `openledger restore FILE` puts one back, `openledger upgrade
+--version X.Y.Z` backs up and moves to another release, and `openledger
+rollback` goes back to before it. `docs/OPERATIONS.md`, *Installing on a
+server* and *Backups, restore, upgrade and rollback on an installed server*,
+has the rest.
 
 ---
 

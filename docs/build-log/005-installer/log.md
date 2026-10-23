@@ -1,6 +1,6 @@
 # Log: a one-command production install
 
-Status: in progress (step 5 of 7).
+Status: in progress (step 6 of 7).
 
 One entry per commit-sized unit, newest last, written when the unit is ready
 to commit. The commit hash is filled in once the maintainer has committed.
@@ -368,4 +368,123 @@ to commit. The commit hash is filled in once the maintainer has committed.
   the first server, so a line given to the wrong command is refused by its
   prefix; direct addresses only (a relay for servers without a public address
   remains plan question 6).
-- **Commit:** <hash>
+- **Commit:** 77ea44d
+
+## 2026-10-23 — Step 6: backups, restore, upgrade and rollback
+
+- **What changed:** all shell, in **`deploy/install/install.sh`** and the
+  `openledger` command it writes.
+  - **`openledger backup`** (and nightly, `openledger-backup.timer`,
+    03:00–03:30, `Persistent`): a running (or restarting) node is stopped —
+    every ledger folds its journal in — its data (books and node keys)
+    archived with `/opt/openledger/settings` and `env` into
+    `/var/lib/openledger/backups/openledger-<UTC>.tar.gz` (0600 in a 0700
+    folder, written as `.partial` and renamed, `*.lock` left out), and started
+    again under a trap; a stopped node is archived as it is and left stopped.
+    The 14 newest are kept, and never the one a rollback needs (failing
+    closed if its record is unreadable). Refused while a restore is
+    unfinished. **`openledger backups`** lists them; **`openledger status`**
+    names the newest and exits non-zero past two days, while the node is
+    down, and while a restore, upgrade or rollback is unfinished.
+  - **`openledger restore FILE`**: checked to be an openledger backup, the
+    node stopped, its data moved aside to `data.before-restore-<UTC>` (never
+    deleted), the backup's unpacked, given to the `openledger` user, the node
+    started, OPERATIONS' checks and the mesh rule printed. A mark
+    (`.restore-in-progress`: the data from before, the backup being restored)
+    spans the swap: a boot leaves the node stopped, backups and upgrades are
+    refused, the installer will not start the node, and a second restore
+    neither puts the partial data back nor starts it if it fails.
+  - **`openledger upgrade --version X.Y.Z`** fetches the release's
+    `install.sh`, checks it against the release's `SHA256SUMS` (or `--binary
+    FILE`, with the installer on the server or `--installer FILE`), takes a
+    backup, keeps in `/opt/openledger/previous/` the backup's name, the binary
+    the node runs (`docker cp` out of its container), its image's name and
+    the installer that last ran to the end, and runs the installer with the
+    server's own options. `previous/pending` marks it until the installer
+    runs to the end (it clears the mark itself, so a hand run finishes it): a
+    retry keeps `previous/` from before the first attempt. The node need not
+    be running.
+  - **`openledger rollback`** (a typed `rollback` on a terminal) checks the
+    backup, writes `previous/rolling-back`, restores the backup with the node
+    kept stopped, writes `previous/restored`, and runs the previous installer
+    with the previous binary (`OPENLEDGER_ROLLBACK=1`), so the previous
+    release — never the newer one — boots on the restored books; it checks
+    the node runs the image from before the upgrade. While `rolling-back`
+    exists no backup, boot, restore, upgrade or hand-run installer starts the
+    node; a rerun goes on from there, redoing the restore unless it is whole.
+    A restore that fails before it changes the books leaves no mark.
+  - **The rest:** upgrade and rollback are refused while `compose.yml`
+    differs from what the installer wrote; the four, `resume` and the
+    installer share one lock (`flock /run/openledger.lock`, re-entered
+    through the inherited descriptor); `openledger-resume.service` at boot
+    starts a node a backup or a whole restore had stopped (waiting for the
+    lock; the backup unit is ordered after it). **The installer** writes and
+    enables the units; keeps a copy of itself in `/opt/openledger/install.sh`
+    only after its health checks pass, so it refuses to run from a pipe;
+    writes its options to the settings file, each quoted for the shell that
+    sources it (the e-mail check admits `$(…)`); and tags the image by the
+    binary's and base's digests, not the version, so a rollback reuses the
+    previous image rather than rebuilding it after the books are swapped.
+    OPERATIONS (*Backups, restore, upgrade and rollback on an installed
+    server*, the day-to-day table, what the installer leaves), README,
+    CHANGELOG.
+- **Rehearsal** (`scripts/rehearse_backup.sh`, one fresh Ubuntu 24.04 VM;
+  the "new release" is the working tree's binary with one byte appended —
+  another digest, so another image, the same behaviour): passes, 80 checks (4½ min), on the final tree (its files' checksums
+  compared after the run): the installer refuses a pipe, keeps itself and
+  enables the timer; a backup is root's, holds the config, acme's folder,
+  settings and key and no lock, and the node serves after it; `status` names
+  it; a backup and the installer are refused while the lock is held; a
+  stopped node's backup leaves it stopped, and the resume unit starts it; a
+  restore cut short (data swapped, a partial folder in place) stays stopped
+  at boot, is named by `status`, refuses a backup and the installer, and a
+  second restore completes, naming the data from before it; the restored
+  books are the backup's (before it present, after it gone), Ana's key works,
+  nothing quarantined, the replaced data aside; a file that is no backup is
+  refused; an upgrade is refused with `compose.yml` edited and for a bad
+  `--version`, one whose installer fails says so and leaves the node
+  serving, and the retry — the node stopped — completes on another image and
+  still rolls back to before the first attempt; 14 backups kept and the
+  rollback's beside them; a rollback whose installer fails leaves the node
+  stopped and refuses restore, upgrade and the installer, a backup and a boot
+  leave it stopped, a crash in its restore is reported as the rollback's and
+  the rerun redoes it — the image and books from before the upgrade, nothing
+  quarantined; no second rollback; a rollback whose backup is gone leaves no
+  mark; the installer run again changes nothing and finishes a pending
+  upgrade. `scripts/rehearse_install.sh` on the same tree: passes on fresh
+  Ubuntu 24.04 and Debian 12 (28 checks each, 10½ min).
+- **Review rounds** (reviewer subagent, five). Each round's Important
+  findings were paths where the newer release, or a half-restored folder,
+  came up on the books: (1) a retried upgrade recorded the newer binary
+  (taken from `image/gl-node`, written before the build) and installer as
+  "previous"; a rollback whose installer failed left the newer container to
+  be started by the next backup; an edited `compose.yml` kept the image from
+  changing. (2) The boot-time resume, added for a reboot during a backup,
+  would have started the node on a restore cut short mid-unpack. (3) A crash
+  during a rollback's own restore looked like a plain restore, whose
+  recovery started the newer release. (4) The nightly backup would archive a
+  half-restored folder as the newest backup. Each fixed as above; the fifth
+  round found nothing Important. Minor findings fixed: the boot race between
+  resume and a missed night's backup; messages claiming the node stopped
+  when the installer had failed after starting it; `pending` never cleared
+  by a hand run; upgrading a down node; stale `.partial` files; the aside
+  folders named wrong after a second restore. Found while writing it: `tar
+  -tzf | grep -q` under `pipefail` (the SIGPIPE of step 3); `set -e` off
+  inside `$(backup_now) || …`; the rollback record holding `VERSION=gl-node
+  0.2.0` unquoted, which sourcing runs; options passed through `mapfile <
+  <(…)`, where a refusal exits only the subshell; retention sorting by
+  locale. Earlier rehearsals (40 and 41 checks) passed on trees since
+  changed and are not counted.
+- **Gate:** `scripts/gate.sh` — 1,642 passed, 0 failed, 0 ignored (about 7 min), on the final tree, after the rehearsals.
+- **Revert checks:** none: shell, as steps 3–5, proved by the rehearsal,
+  which drives each mechanism and each failure path directly (the lock, the
+  marks, retention and the kept backup, the refusals, a failed upgrade and
+  its retry, a failed rollback and its rerun, both crash simulations).
+- **Departures from the plan:** the plan's risk list says upgrade and
+  restore are "rehearsed across two nodes"; here on one, the mesh rule after
+  a restore printed and documented, not rehearsed — step 7's two servers
+  rehearse it. `--version`'s download is not rehearsed: it needs a release
+  after 0.3.0. The settings and operator key in a backup are not restored (a
+  restore on the same server keeps its own); OPERATIONS says how to carry
+  the key to a new server.
+- **Commit:** —
