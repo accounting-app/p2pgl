@@ -83,3 +83,54 @@ curl -s -X POST "$OPENLEDGER_URL/node/graphql" \
 }
 JSON
 ```
+
+## Invite another server to a company
+
+```bash
+curl -s -X POST "$OPENLEDGER_URL/node/graphql" \
+  -H "Content-Type: application/json" \
+  -H "X-Api-Key: $OPENLEDGER_KEY" \
+  -d @- <<'JSON' | jq .
+{
+  "query": "mutation($name: String!, $address: String!) { inviteLedger(name: $name, address: $address) }",
+  "variables": {
+    "name": "acme",
+    "address": "ledger.example.com"
+  }
+}
+JSON
+```
+
+## Join a company (on the new server)
+
+```bash
+curl -s -X POST "$OPENLEDGER_URL/node/graphql" \
+  -H "Content-Type: application/json" \
+  -H "X-Api-Key: $OPENLEDGER_KEY" \
+  -d @- <<'JSON' | jq .
+{
+  "query": "mutation($invitation: String!, $address: String!, $ports: String!) { joinLedger(invitation: $invitation, address: $address, newMeshPorts: $ports) { reply trusts ledger { name served nodeId listenPort } } }",
+  "variables": {
+    "invitation": "PASTE-THE-INVITATION",
+    "address": "ledger2.example.com",
+    "ports": "4433-4532"
+  }
+}
+JSON
+```
+
+## Accept the new server's reply (on every server already in the mesh)
+
+```bash
+curl -s -X POST "$OPENLEDGER_URL/node/graphql" \
+  -H "Content-Type: application/json" \
+  -H "X-Api-Key: $OPENLEDGER_KEY" \
+  -d @- <<'JSON' | jq .
+{
+  "query": "mutation($reply: String!) { acceptLedger(reply: $reply) { nodeId address ledger { name served nodeId listenPort } } }",
+  "variables": {
+    "reply": "PASTE-THE-REPLY"
+  }
+}
+JSON
+```

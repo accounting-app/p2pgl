@@ -253,8 +253,8 @@
   },
   "I-R19-settings-and-a-new-mesh-together": {
     "file": "crates/gl-node/src/ledger_admin.rs",
-    "old": "            (Some(_), Some(_)) => {",
-    "new": "            (Some(given), Some(_)) if true => Some(given),\n            (Some(_), Some(_)) => {",
+    "old": "            (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {",
+    "new": "            (Some(given), Some(_), None) if true => Some(given),\n            (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {",
     "runs": [
       [
         "-p",

@@ -1,6 +1,6 @@
 # Log: a one-command production install
 
-Status: in progress (step 4 of 7).
+Status: in progress (step 5 of 7).
 
 One entry per commit-sized unit, newest last, written when the unit is ready
 to commit. The commit hash is filled in once the maintainer has committed.
@@ -275,4 +275,97 @@ to commit. The commit hash is filled in once the maintainer has committed.
   shell, proved by the rehearsal.
 - **Departures from the plan:** the new mesh's settings are composed by the
   node (Rust, tested) rather than the shell command; `openledger key`.
+- **Commit:** a81a03e
+
+## 2026-10-23 — Step 5: joining a second server
+
+- **What changed:** **`mesh_invite.rs`** — the one-line invitation and reply
+  (`openledger-invite-v1.` / `openledger-reply-v1.` and URL-safe base64 of a
+  small JSON: the company's ledger name, `meshId`, the invitation's
+  `swarmTopic`, the sender's node id and `host:port`), refused by prefix where
+  the other belongs, and when cut short, changed, over 4 KiB, or carrying a
+  name, node id or address a node would not take (`PeerAddresses`' own
+  rules); `joined_settings` (the invitation's mesh on this node's own port,
+  the inviter its one peer with its address, `joinFrom` it, signing and P2P
+  on, `relayMode: "disabled"`); `with_peer` (the replying node added once to
+  `bootstrapEndpointIds`, its address replacing an older one, nothing else
+  touched; a reply from another mesh `LEDGER_CONFLICT`, to a ledger without
+  P2P `INVALID_INPUT`). **The node endpoint:** `inviteLedger(name, address)`
+  (a served company that signs, on a fixed port), `joinLedger(invitation,
+  address, newMeshPorts)` (the company added under `busy` with its port
+  chosen as step 4's are; refused for a line this node wrote) returning the
+  ledger and the reply, and `acceptLedger(reply)` (its `ledger.json` written
+  aside and renamed, the company restarted under the same lock; settings the
+  restart refuses put the old file back). **The CLI:** `gl-node ledger invite
+  NAME --address HOST`, `join LINE --address HOST --new-mesh FROM-TO`,
+  `accept LINE`, each printing the next step. **`openledger invite | join |
+  accept`** pass the server's domain and port range. OPERATIONS (*Joining a
+  second server*), README, CHANGELOG; the Insomnia collection and curl pages
+  carry the three requests. Also the 005 step 4 and 006 commits recorded
+  (a81a03e, 54b4454).
+- **Tests:** an invitation and a reply are one line each and only what they
+  say; a joining node is in the mesh with the inviter as its peer (it loads as
+  a folder's `ledger.json`); accepting a reply adds its node and nothing else;
+  an address is a host and the ledger's port (IPv6 in brackets); through the
+  endpoint, invitations, joins and accepts the node refuses change nothing;
+  the CLI's new commands parse and refuse what does not apply; a third
+  server takes every server of the mesh and its rules; `accept` writes
+  through no link; **on the shipped binary, three nodes on loopback** — A adds
+  acme with `--new-mesh`, invites B, B joins, A accepts; B invites C, C joins,
+  A (its reply on stdin) and B accept — and an entry written on any reaches
+  the other two, all verifying (14 s).
+- **Rehearsal** (`scripts/rehearse_join.sh`, two fresh Ubuntu 24.04 VMs on
+  Lima's vzNAT network, each installed by `install.sh` with its own domain):
+  passes, 16 checks (22 min, Lima's first boot of each VM included): A writes
+  an invitation, B joins and writes a reply, A accepts it; Ana's key, issued on
+  A, works on B (the access list replicated); her entry on A reaches B and
+  hers on B reaches A; with A's node stopped B serves, takes an entry, and A,
+  back, catches up; both verify with nothing quarantined. Lima's boot scripts
+  outran its 10-min default twice on this Mac: both rehearsal scripts give it
+  20 (`--timeout=20m`). After the review's changes, again from fresh VMs (27 min): all
+  16, A's `accept` reading the reply from stdin and naming the node it admitted. The first run found that Apple's NAT network isolates
+  its VMs from each other (the host reaches both; neither resolves the
+  other: ARP incomplete), so every dial timed out; through the gateway — a
+  route per VM, in the script — they reach each other, and replication began
+  on its own, with no restart (Ana's grant on A reached B's access list).
+- **Review round** (reviewer subagent). *Important:* (1) a third server
+  would have split the replicas — an invitation named its inviter alone, so a
+  server invited by A knew only A, and a node takes records only from the
+  peers it lists (H-14): it refused every record B wrote, and B everything it
+  wrote, while OPERATIONS said the others "learn of it on their next accept".
+  The invitation now names every server of the mesh (with its addresses), the
+  joiner lists them all, and every server already in the mesh accepts the
+  reply — `join` says so and names them; the shipped test runs three nodes.
+  (2) A joiner dropped `auth.adminNodes` and `format`: its access list would
+  take grants the others refuse. The invitation carries them, and the mesh's
+  relay (a joiner of a relay mesh had only direct addresses). (3) The lines
+  were called "no secret", but an invitation carries the gossip topic, which
+  the node elsewhere treats as a credential (T41): the docs and the CLI now
+  say to keep it like a password; `-` reads a line from stdin, and
+  `openledger join | accept` take it from the terminal and hand it to the
+  node on stdin, out of `ps` and shell history. (4) `accept` read
+  `ledger.json` without the checked reader and wrote aside with `create` +
+  `truncate`, which a planted link would follow: it reads through
+  `read_config_file`, refuses a linked `ledger.json` (renaming over it would
+  cut the operator's link), and removes a stale aside file, then opens it
+  `create_new`. Also: join and accept print the node ids they now trust, for
+  the operators to compare; `serde_json`'s `preserve_order` is asked for,
+  not borrowed; the three test ports are held together; the J-R5
+  `Bug-catch:` says what the revert does. The first gate of this unit also
+  failed on a clippy lint in a test and a stale I-R19 anchor (step 4's match
+  arm, reshaped here): both fixed.
+- **Gate:** `scripts/gate.sh` — 1,642 passed, 0 failed, 0 ignored (6 min 57 s), on the final tree; the run before it failed on one more clippy lint in a new test (`get().is_none()`), fixed.
+- **Revert checks:** `join.json` — J-R1 (an accepted node not made a peer),
+  J-R2 (a join without `joinFrom`), J-R3 (a line decoded whatever its prefix),
+  J-R4 (a reply from another mesh accepted), J-R5 (a reply accepted for a
+  ledger without P2P), J-R6 (a joiner drops the admin nodes), J-R7 (the aside
+  file opened over a planted link — the removal and `create_new` together:
+  reverting `create_new` alone does not bite, the removal already clears the
+  link), J-R8 (a linked `ledger.json` accepted), J-R9 (an invitation without
+  the mesh's other servers, on the shipped binary's three nodes) bite;
+  `installer.json` I-R19 re-anchored (still bites).
+- **Departures from the plan:** the reply goes to `accept`, not to `join` on
+  the first server, so a line given to the wrong command is refused by its
+  prefix; direct addresses only (a relay for servers without a public address
+  remains plan question 6).
 - **Commit:** <hash>

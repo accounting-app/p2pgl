@@ -1,7 +1,7 @@
 {
   "_type": "export",
   "__export_format": 4,
-  "__export_date": "2026-10-21T23:12:07Z",
+  "__export_date": "2026-10-23T15:15:40Z",
   "__export_source": "openledger",
   "resources": [
     {
@@ -716,6 +716,81 @@
       "body": {
         "mimeType": "application/graphql",
         "text": "{\"query\":\"mutation($name: String!) { removeLedger(name: $name) { name movedTo } }\",\"variables\":{\"name\":\"acme\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_invite",
+      "_type": "request",
+      "parentId": "fld_node",
+      "name": "Invite another server to a company",
+      "method": "POST",
+      "url": "{{ _.base_url }}/node/graphql",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($name: String!, $address: String!) { inviteLedger(name: $name, address: $address) }\",\"variables\":{\"name\":\"acme\",\"address\":\"ledger.example.com\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_join",
+      "_type": "request",
+      "parentId": "fld_node",
+      "name": "Join a company (on the new server)",
+      "method": "POST",
+      "url": "{{ _.base_url }}/node/graphql",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($invitation: String!, $address: String!, $ports: String!) { joinLedger(invitation: $invitation, address: $address, newMeshPorts: $ports) { reply trusts ledger { name served nodeId listenPort } } }\",\"variables\":{\"invitation\":\"PASTE-THE-INVITATION\",\"address\":\"ledger2.example.com\",\"ports\":\"4433-4532\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_accept",
+      "_type": "request",
+      "parentId": "fld_node",
+      "name": "Accept the new server's reply (on every server already in the mesh)",
+      "method": "POST",
+      "url": "{{ _.base_url }}/node/graphql",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($reply: String!) { acceptLedger(reply: $reply) { nodeId address ledger { name served nodeId listenPort } } }\",\"variables\":{\"reply\":\"PASTE-THE-REPLY\"}}"
       },
       "headers": [
         {

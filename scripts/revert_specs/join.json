@@ -1,0 +1,128 @@
+{
+  "J-R1-an-accepted-node-is-no-peer": {
+    "file": "crates/gl-node/src/mesh_invite.rs",
+    "old": "        peers.push(json!(reply.node_id));",
+    "new": "",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "accepting_a_reply_adds_its_node_and_nothing_else"
+      ]
+    ]
+  },
+  "J-R2-a-join-without-join-from": {
+    "file": "crates/gl-node/src/mesh_invite.rs",
+    "old": "        \"joinFrom\": invitation.node_id,",
+    "new": "",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_joining_node_is_in_the_mesh_with_the_inviter_as_its_peer"
+      ]
+    ]
+  },
+  "J-R3-any-prefix-decoded": {
+    "file": "crates/gl-node/src/mesh_invite.rs",
+    "old": "    let Some(body) = text.strip_prefix(prefix) else {",
+    "new": "    let Some(body) = text.strip_prefix(INVITE_PREFIX).or_else(|| text.strip_prefix(REPLY_PREFIX)) else {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "an_invitation_and_a_reply_are_each_one_line_and_only_what_they_say"
+      ]
+    ]
+  },
+  "J-R4-a-reply-from-another-mesh-accepted": {
+    "file": "crates/gl-node/src/mesh_invite.rs",
+    "old": "    if p2p.get(\"meshId\").and_then(Value::as_str) != Some(reply.mesh_id.as_str()) {",
+    "new": "    if false {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "accepting_a_reply_adds_its_node_and_nothing_else"
+      ]
+    ]
+  },
+  "J-R5-a-reply-accepted-without-p2p": {
+    "file": "crates/gl-node/src/mesh_invite.rs",
+    "old": "        .filter(|p2p| p2p.get(\"enabled\") == Some(&Value::Bool(true)))",
+    "new": "",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "invitations_and_replies_the_node_refuses_change_nothing"
+      ]
+    ]
+  },
+  "J-R6-a-joiner-drops-the-admin-nodes": {
+    "file": "crates/gl-node/src/mesh_invite.rs",
+    "old": "        settings[\"auth\"] = json!({ \"adminNodes\": admins });",
+    "new": "        let _ = admins;",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_third_server_takes_every_server_of_the_mesh_and_its_rules"
+      ]
+    ]
+  },
+  "J-R7-the-aside-file-followed": {
+    "file": "crates/gl-node/src/ledger_admin.rs",
+    "old": "    match std::fs::remove_file(&aside) {\n        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),\n        _ => {}\n    }\n    let mut out = std::fs::OpenOptions::new()\n        .write(true)\n        .create_new(true)",
+    "new": "    let mut out = std::fs::OpenOptions::new()\n        .write(true)\n        .create(true)\n        .truncate(true)",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "accept_writes_through_no_link"
+      ]
+    ]
+  },
+  "J-R8-a-linked-ledger-json-accepted": {
+    "file": "crates/gl-node/src/ledger_admin.rs",
+    "old": "            Ok(meta) if meta.file_type().is_symlink() => {",
+    "new": "            Ok(meta) if false && meta.file_type().is_symlink() => {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "accept_writes_through_no_link"
+      ]
+    ]
+  },
+  "J-R9-an-invitation-without-the-mesh": {
+    "file": "crates/gl-node/src/ledger_admin.rs",
+    "old": "            peers,\n            relay_url,",
+    "new": "            peers: { let _: Vec<mesh_invite::MeshPeer> = peers; Vec::new() },\n            relay_url,",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "servers_join_a_company_and_all_of_them_replicate"
+      ]
+    ]
+  }
+}

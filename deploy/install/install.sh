@@ -379,6 +379,10 @@ usage="usage:
   openledger person list COMPANY
   openledger person rename COMPANY USER_ID --name NAME
   openledger person revoke COMPANY USER_ID
+  openledger invite COMPANY          an invitation to COMPANY's mesh (a credential: keep it safe)
+  openledger join [INVITATION]       on the new server: join the company; prints the reply
+  openledger accept [REPLY]          on every server already in the mesh: the new one joins
+                                     (join and accept read the line from stdin without one)
   openledger key                     the operator key
   openledger status                  the services, the node and HTTPS as a client sees it"
 fail() { printf 'openledger: %s\n' "$*" >&2; exit 1; }
@@ -389,6 +393,16 @@ fail() { printf 'openledger: %s\n' "$*" >&2; exit 1; }
 # No -i: nothing here reads stdin, and docker exec -i would swallow a
 # script's input (`while read …; do openledger …; done < list`).
 node() { docker exec openledger-node gl-node "$@"; }
+# A line handed to the node on its stdin, never on a command line (ps).
+node_line() { local line=$1; shift; printf '%s\n' "$line" | docker exec -i openledger-node gl-node "$@"; }
+# The line given, or read from stdin (asked for on a terminal).
+line_arg() {  # what [given]
+  if [[ $# -ge 2 ]]; then printf '%s' "$2"; return; fi
+  [[ -t 0 ]] && printf 'Paste the %s, then Enter: ' "$1" >&2
+  local line
+  IFS= read -r line || true
+  printf '%s' "$line"
+}
 [[ $# -ge 1 ]] || { printf '%s\n' "$usage"; exit 2; }
 what=$1
 shift
@@ -416,6 +430,19 @@ $usage" ;;
       *) fail "unknown person command $action
 $usage" ;;
     esac ;;
+  invite)
+    [[ $# -eq 1 ]] || fail "invite takes one COMPANY"
+    node ledger invite "$1" --address "$DOMAIN" ;;
+  join)
+    [[ $# -le 1 ]] || fail "join takes one INVITATION, or reads it from stdin"
+    line=$(line_arg invitation "$@")
+    [[ -n "$line" ]] || fail "no invitation given"
+    node_line "$line" ledger join - --address "$DOMAIN" --new-mesh "$LEDGER_UDP_PORTS" ;;
+  accept)
+    [[ $# -le 1 ]] || fail "accept takes one REPLY, or reads it from stdin"
+    line=$(line_arg reply "$@")
+    [[ -n "$line" ]] || fail "no reply given"
+    node_line "$line" ledger accept - ;;
   key)
     key=$(sed -n 's/^GL_NODE_API_KEY=//p' /opt/openledger/env)
     [[ -n "$key" ]] || fail "no GL_NODE_API_KEY in /opt/openledger/env"

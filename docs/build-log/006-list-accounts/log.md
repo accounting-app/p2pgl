@@ -1,6 +1,6 @@
 # Log: list a ledger's accounts
 
-Status: done (2026-10-21, ready to commit; commit pending).
+Status: done (2026-10-21, commit 54b4454).
 
 One entry per commit-sized unit, newest last, written when the unit is ready
 to commit. The commit hash is filled in once the maintainer has committed.
@@ -34,4 +34,4 @@ to commit. The commit hash is filled in once the maintainer has committed.
   the complexity weight and LA-R5 were added; there is no revert for the bare
   `close` (held by construction) or for reading balances (the design). All
   recorded in `plan.md`'s *Proof*.
-- **Commit:** pending.
+- **Commit:** 54b4454

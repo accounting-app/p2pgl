@@ -29,6 +29,23 @@ break compatibility.
 
 ### Added
 
+- **More servers for a company, by invitation** (005 step 5, OPERATIONS
+  *Joining a second server*): `gl-node ledger invite NAME --address HOST`
+  prints a one-line invitation — the company's mesh, this node's id and
+  address, every other server of the mesh and the mesh's relay, admin nodes
+  and format; it carries the mesh's join credential, to be kept like a
+  password. `gl-node ledger join LINE --address HOST --new-mesh FROM-TO` adds
+  the company on another server with every one of them as its peers and
+  `joinFrom` the inviter, prints the node ids it now trusts and a reply, which
+  `gl-node ledger accept LINE` on every server already in the mesh adds to the
+  company's peers (its `ledger.json` read through the checked reader, written
+  aside and renamed; the old one put back if the restart refuses it before
+  stopping; a linked `ledger.json` refused) and reports the node it admitted.
+  `-` reads the line from stdin. The node endpoint has them as
+  `inviteLedger`, `joinLedger` and `acceptLedger`; `openledger invite | join |
+  accept` wrap them with the server's domain, taking the line from the
+  terminal. `scripts/rehearse_join.sh` proves it on two VMs, and the shipped
+  binary's tests with three nodes.
 - **`accounts`, the chart of accounts over GraphQL** (`docs/build-log/006-list-accounts`,
   README *List Accounts*): every account with an `open`, sorted by name,
   whether or not it holds a posting, with `openedOn` (its earliest `open`),

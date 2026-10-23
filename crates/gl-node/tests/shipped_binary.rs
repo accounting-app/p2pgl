@@ -1073,6 +1073,181 @@ fn a_node_set_up_by_init_is_public_behind_its_proxy() {
     assert_eq!(node.stop().code(), Some(0));
 }
 
+/// `count` free UDP ports on loopback, distinct — held together while they
+/// are read, so no two are the same — for ledgers' fixed `p2p.listenPort`.
+fn free_udp_ports(count: usize) -> Vec<u16> {
+    let sockets: Vec<std::net::UdpSocket> = (0..count)
+        .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").expect("a free UDP port"))
+        .collect();
+    sockets
+        .iter()
+        .map(|socket| socket.local_addr().expect("address").port())
+        .collect()
+}
+
+/// More servers join a company's mesh with invitations (005 step 5), on the
+/// shipped binary: node A adds `acme` in a mesh of its own and invites B; B
+/// joins and A accepts its reply; then B invites C, C joins, and A and B both
+/// accept C's reply (A taking it on stdin). An entry written on any one
+/// reaches the other two, all verifying — three nodes, each with its own key,
+/// over loopback.
+///
+/// Bug-catch: accept a reply without adding its node to the company's
+/// `bootstrapEndpointIds` and the accepting node refuses everything the new
+/// one sends; invite without the mesh's other servers and C refuses every
+/// record A wrote (it only knows B).
+#[test]
+fn servers_join_a_company_and_all_of_them_replicate() {
+    let dirs: Vec<tempfile::TempDir> = (0..3)
+        .map(|_| tempfile::tempdir().expect("tempdir"))
+        .collect();
+    let mut nodes: Vec<Node> = dirs
+        .iter()
+        .map(|dir| {
+            Node::new(
+                this_binary(),
+                &dir.path().canonicalize().expect("canonical"),
+            )
+        })
+        .collect();
+    for (node, label) in nodes.iter_mut().zip(["a", "b", "c"]) {
+        node.start(label)
+            .unwrap_or_else(|log| panic!("boot {label}: {log}"));
+    }
+    let (a, b, c) = (&nodes[0], &nodes[1], &nodes[2]);
+    let run_with = |node: &Node, args: &[&str], stdin: Option<&str>| {
+        use std::io::Write as _;
+        let mut child = node
+            .command(&node.binary)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run gl-node");
+        if let Some(line) = stdin {
+            writeln!(child.stdin.take().expect("stdin"), "{line}").expect("write stdin");
+        }
+        let output = child.wait_with_output().expect("gl-node");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "{args:?}: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout
+    };
+    let run = |node: &Node, args: &[&str]| run_with(node, args, None);
+    let line_with = |text: &str, prefix: &str| {
+        text.lines()
+            .map(str::trim)
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("a {prefix} line in {text}"))
+            .to_owned()
+    };
+    let ports = free_udp_ports(3);
+    let range = |port: u16| format!("{port}-{port}");
+    let invite = |node: &Node| {
+        line_with(
+            &run(
+                node,
+                &["ledger", "invite", "acme", "--address", "127.0.0.1"],
+            ),
+            "openledger-invite-v1.",
+        )
+    };
+    let join = |node: &Node, invitation: &str, port: u16| {
+        line_with(
+            &run(
+                node,
+                &[
+                    "ledger",
+                    "join",
+                    invitation,
+                    "--address",
+                    "127.0.0.1",
+                    "--new-mesh",
+                    &range(port),
+                ],
+            ),
+            "openledger-reply-v1.",
+        )
+    };
+    run(
+        a,
+        &["ledger", "add", "acme", "--new-mesh", &range(ports[0])],
+    );
+    let reply_b = join(b, &invite(a), ports[1]);
+    run(a, &["ledger", "accept", &reply_b]);
+    let reply_c = join(c, &invite(b), ports[2]);
+    run_with(a, &["ledger", "accept", "-"], Some(&reply_c));
+    run(b, &["ledger", "accept", &reply_c]);
+
+    let at = |node: &Node, query: &str| {
+        let body = json!({ "query": query }).to_string();
+        let (status, text) = http(
+            node.port,
+            "/ledgers/acme/graphql",
+            Some(&node.api_key),
+            Some(&body),
+        )
+        .expect("http");
+        assert_eq!(status, 200, "{text}");
+        serde_json::from_str::<Value>(&text).expect("JSON")
+    };
+    let write = |node: &Node, date: &str, narration: &str| {
+        let body = at(
+            node,
+            &format!(
+                r#"mutation {{ appendTransaction(input: {{ date: "{date}", narration: "{narration}", postings: [
+                    {{ account: "Assets:Bank", amount: {{ number: "10", currency: "USD" }} }},
+                    {{ account: "Income:Sales" }}] }}) {{ txid }} }}"#
+            ),
+        );
+        assert!(body.get("errors").is_none(), "{body}");
+    };
+    let arrives = |node: &Node, narration: &str| {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while Instant::now() < deadline {
+            let journal = at(node, "{ journal { narration } }");
+            if journal["data"]["journal"]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|row| row["narration"] == narration))
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        panic!("{narration:?} never reached the node on port {}", node.port);
+    };
+    for account in ["Assets:Bank", "Income:Sales"] {
+        let body = at(
+            a,
+            &format!(r#"mutation {{ openAccount(name: "{account}", date: "2026-01-01") }}"#),
+        );
+        assert!(body.get("errors").is_none(), "{body}");
+    }
+    write(a, "2026-01-02", "written on A");
+    arrives(b, "written on A");
+    arrives(c, "written on A");
+    write(c, "2026-01-03", "written on C");
+    arrives(a, "written on C");
+    arrives(b, "written on C");
+    write(b, "2026-01-04", "written on B");
+    arrives(c, "written on B");
+    for node in [a, b, c] {
+        let verify = at(node, "{ verify { ok quarantined } }");
+        assert_eq!(
+            verify["data"]["verify"],
+            json!({ "ok": true, "quarantined": [] }),
+            "{verify}"
+        );
+    }
+    for node in nodes.iter_mut() {
+        assert_eq!(node.stop().code(), Some(0));
+    }
+}
+
 /// The upgrade and rollback procedure of docs/OPERATIONS.md, from the previous
 /// release's binary (`GL_NODE_PREVIOUS_BINARY`) to this one: the previous
 /// version writes a ledger and a backup is taken; this version starts on those
