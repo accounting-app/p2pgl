@@ -1,6 +1,6 @@
 # Log: a one-command production install
 
-Status: in progress (step 6 of 7).
+Status: in progress (step 7 of 7: 0.3.0 cut, then the real-network rehearsal).
 
 One entry per commit-sized unit, newest last, written when the unit is ready
 to commit. The commit hash is filled in once the maintainer has committed.
@@ -487,4 +487,30 @@ to commit. The commit hash is filled in once the maintainer has committed.
   after 0.3.0. The settings and operator key in a backup are not restored (a
   restore on the same server keeps its own); OPERATIONS says how to carry
   the key to a new server.
+- **Commit:** ea4de0c
+
+## 2026-10-23 — Step 7, unit 1: release 0.3.0 (the version and the notes)
+
+- **What changed:** the workspace is version 0.3.0 (`Cargo.lock` follows;
+  the installer's `RELEASE_VERSION` already says 0.3.0); the CHANGELOG's
+  `[Unreleased]` entries are `[0.3.0] — 2026-10-23`, with a summary, the
+  status (pilot: rehearsed on VMs on one machine, not yet at a provider) and
+  the known limits — the backups kept on the server, the mesh rule after a
+  restore printed rather than enforced, `upgrade --version` first usable with
+  the next release, direct addresses only for servers joined by invitation.
+  OPERATIONS *To 0.3.0*: the one *Breaking* change (a node behind a proxy on
+  its own host held to the public rules) to fix before the swap; no config
+  key is new, so a rollback needs no edit — a folder's `ledger.json` has the
+  same schema as in 0.2.0, and `join` and `--new-mesh` write only keys 0.2.0
+  knows; moving a company from a hand-built server onto an installed one,
+  by invitation, with its prerequisites (a folder ledger on a fixed port,
+  every server of the mesh accepting; not yet rehearsed). Reviewer: nothing
+  Important; that bullet first left out the prerequisites (Minor), fixed. Also the step 6 commit recorded
+  (ea4de0c).
+- **Gate:** `scripts/gate.sh` — 1,642 passed, 0 failed, 0 ignored, twice: the first run (held up by a LuLu prompt for the new binaries) had the two doc fixes above made while it ran, so it recorded no pass; the second, on the unchanged tree, passed (about 7 min). This line was written after it, so `release.sh` runs the gate once more on the committed tree.
+- **Next, after the commit:** `scripts/release.sh --previous
+  target/release-dist/0.2.0/gl-node-0.2.0-darwin-arm64`; the maintainer tags
+  and pushes `v0.3.0`, makes the repository public and attaches the files in
+  `target/release-dist/0.3.0/` to the release; then the real-network
+  rehearsal, on a provider's servers with real domains.
 - **Commit:** —

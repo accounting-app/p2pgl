@@ -384,6 +384,37 @@ Roll back every node of the mesh, as you upgraded every node.
 Every release rehearses this upgrade and rollback from the previous release's
 binary, on one machine (`docs/RELEASE.md`).
 
+### To 0.3.0, the release with the installer (from 0.2.0)
+
+- **Before the swap:** a node whose config has `tls.mode: "terminated"` or a
+  `trustedProxies` entry is now held to the public rules whatever its bind —
+  auth on, its key in `auth.apiKey` or `GL_NODE_API_KEY` (not the generated
+  `data/api.key`), a non-empty `allowedHosts`, GraphiQL off — and 0.3.0
+  refuses at boot a config that breaks one, naming it. Fix the config first:
+  0.2.0 accepts the fixed one too. Its `/health` then answers a caller
+  without a key `{"status":"ok"}` and nothing more.
+- **No config key is new,** so rolling back needs no config edit; a company
+  added with `ledger add --new-mesh` or joined by invitation has a
+  `ledger.json` 0.2.0 reads.
+- **A server set up by hand stays one:** the installer is for fresh servers.
+  To move a company onto one, by invitation (*Joining a second server*):
+  1. On the old node, upgrade to 0.3.0 (invitations are new in it). The
+     company must be a folder in `ledgersDir` (*Adding a company*), with
+     signing and P2P on and a fixed `p2p.listenPort`, reachable on that UDP
+     port from the new server: `invite` refuses the config file's own ledger
+     (`default`), and moving that one into a folder is not described here.
+  2. Install the new server, then `gl-node ledger invite NAME --address HOST`
+     on the old node (`HOST` how the new server reaches it), `openledger
+     join` on the new one, and `gl-node ledger accept -` on **every** server
+     already in the company's mesh — each on 0.3.0, or with the new node added
+     to its `bootstrapEndpointIds` and `peerAddresses` by hand.
+  3. A mesh without a relay of its own (`relayMode: "n0"`) passes none on:
+     the servers reach each other at their direct addresses only.
+  4. Retire the old node once the new one has caught up (`{ verify {
+     nodesChecked } }` the same on both).
+
+  Not yet rehearsed from a hand-built server.
+
 ### To 0.2.0, the release with several ledgers (from 0.1.0)
 
 - **At the swap:** a `ledgerPath` inside `./data/ledgers` (the default of the
