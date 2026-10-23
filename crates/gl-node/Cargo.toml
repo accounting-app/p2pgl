@@ -16,7 +16,8 @@ security = { path = "../security" }
 tokio = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# preserve_order: `accept` rewrites an operator's ledger.json, keeping its key order.
+serde_json = { workspace = true, features = ["preserve_order"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 async-graphql = { workspace = true }
@@ -36,6 +37,7 @@ hyper-util = { version = "0.1", features = [
 iroh = { workspace = true }
 iroh-gossip = { workspace = true }
 hex = "0.4"
+base64 = "0.22"
 subtle = "2"
 sha2 = { workspace = true }
 zeroize = { workspace = true }

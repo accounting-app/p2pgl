@@ -55,7 +55,8 @@ for template in "${templates[@]}"; do
   log="$PWD/target/rehearsal/$vm.log"
   step "$template ($vm)"
   limactl delete -f "$vm" >/dev/null 2>&1 || true
-  limactl start --name="$vm" --tty=false "template://$template" > "$log" 2>&1 \
+  # Its boot scripts can take more than Lima's default 10 min on a busy Mac.
+  limactl start --name="$vm" --tty=false --timeout=20m "template://$template" > "$log" 2>&1 \
     || fail "the VM did not start (see $log)"
   in_vm() { limactl shell "$vm" "$@"; }
   install_it() {  # [email]

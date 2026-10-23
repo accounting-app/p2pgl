@@ -36,6 +36,7 @@ use crate::config::{
 };
 use crate::ledger_runtime::{self, NodeSettings, RunningLedger};
 use crate::ledgers::{LedgerState, Ledgers, Taken};
+use crate::mesh_invite::{self, MeshLine, INVITE_PREFIX, REPLY_PREFIX};
 
 /// The longest `ledger.json` `addLedger` writes: settings are a few hundred
 /// bytes; a long allowlist fits many times over.
@@ -61,13 +62,13 @@ pub(crate) struct NodeAdmin {
 }
 
 /// A change refused, with its code.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Refusal {
     pub code: &'static str,
     pub message: String,
 }
 
-fn refused(code: &'static str, message: impl Into<String>) -> Refusal {
+pub(crate) fn refused(code: &'static str, message: impl Into<String>) -> Refusal {
     Refusal {
         code,
         message: message.into(),
@@ -112,6 +113,25 @@ pub(crate) struct RemovedLedger {
     pub name: String,
     /// The folder's new place; none when it had no folder left to move.
     pub moved_to: Option<String>,
+}
+
+/// A company joined from an invitation, and the reply for the inviting
+/// server's operator to accept (step 5).
+#[derive(SimpleObject, Debug, Clone)]
+pub(crate) struct JoinedLedger {
+    pub ledger: LedgerInfo,
+    pub reply: String,
+    /// The node ids this server now trusts for the company: every server the
+    /// invitation named, the inviter first. Each must accept the reply.
+    pub trusts: Vec<String>,
+}
+
+/// A reply accepted: the node now trusted, and where (step 5).
+#[derive(SimpleObject, Debug, Clone)]
+pub(crate) struct AcceptedLedger {
+    pub ledger: LedgerInfo,
+    pub node_id: String,
+    pub address: String,
 }
 
 impl NodeAdmin {
@@ -215,6 +235,19 @@ impl NodeAdmin {
         settings: Option<&str>,
         new_mesh: Option<&str>,
     ) -> Result<LedgerInfo, Refusal> {
+        self.add_joined(name, settings, new_mesh, None).await
+    }
+
+    /// [`Self::add`], or — with `join`, an invitation, and `new_mesh` the
+    /// ports — the company it invites to, its mesh joined on a free port of
+    /// that range ([`mesh_invite::joined_settings`]; step 5).
+    async fn add_joined(
+        &self,
+        name: &str,
+        settings: Option<&str>,
+        new_mesh: Option<&str>,
+        join: Option<&MeshLine>,
+    ) -> Result<LedgerInfo, Refusal> {
         let _busy = self.busy.lock().await;
         Self::folder_name(name)?;
         let folder = self.folder(name);
@@ -228,20 +261,32 @@ impl NodeAdmin {
             ));
         }
         let composed;
-        let settings = match (settings, new_mesh) {
-            (Some(_), Some(_)) => {
+        let settings = match (settings, new_mesh, join) {
+            (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
                 return Err(refused(
                     "INVALID_INPUT",
                     "give settings or a new mesh's ports, not both",
                 ))
             }
-            (None, Some(ports)) => {
+            (None, None, Some(_)) => {
+                return Err(refused(
+                    "INVALID_INPUT",
+                    "a join needs the ports it may take",
+                ))
+            }
+            (None, Some(ports), join) => {
                 let range = PortRange::parse(ports)?;
                 let taken = self.taken_ports().await;
-                composed = new_mesh_settings(range, &taken, udp_port_is_free)?;
+                composed = match join {
+                    Some(invitation) => mesh_invite::joined_settings(
+                        invitation,
+                        free_port(range, &taken, udp_port_is_free)?,
+                    ),
+                    None => new_mesh_settings(range, &taken, udp_port_is_free)?,
+                };
                 Some(composed.as_str())
             }
-            (settings, None) => settings,
+            (settings, None, None) => settings,
         };
         let settings = settings.unwrap_or("{}\n");
         if settings.len() > MAX_SETTINGS_BYTES {
@@ -422,6 +467,11 @@ impl NodeAdmin {
     /// stops: the ledger keeps serving as it was.
     pub(crate) async fn restart(&self, name: &str) -> Result<LedgerInfo, Refusal> {
         let _busy = self.busy.lock().await;
+        self.restart_locked(name).await
+    }
+
+    /// [`Self::restart`] for a caller that holds `busy`.
+    async fn restart_locked(&self, name: &str) -> Result<LedgerInfo, Refusal> {
         Self::folder_name(name)?;
         let folder = self.folder(name);
         if !folder.join(LEDGER_FILE).is_file() {
@@ -453,6 +503,230 @@ impl NodeAdmin {
             }
         }
     }
+    /// An invitation to company `name`'s mesh (step 5): its `meshId` and
+    /// topic, this node's id for it and `host` with its port — the address
+    /// other servers reach it by —, every other server of the mesh (its
+    /// `bootstrapEndpointIds`, with their `peerAddresses`), and the mesh's
+    /// relay, `auth.adminNodes` and format. The company must be served, sign,
+    /// and listen on a fixed port.
+    pub(crate) async fn invite(&self, name: &str, host: &str) -> Result<String, Refusal> {
+        Self::folder_name(name)?;
+        let config = self
+            .ledgers
+            .served_configs("")
+            .await
+            .into_iter()
+            .find(|(served, _)| served == name)
+            .map(|(_, config)| config)
+            .ok_or_else(|| {
+                refused(
+                    "NO_SUCH_LEDGER",
+                    format!("this node serves no ledger named \"{name}\""),
+                )
+            })?;
+        let node_id = self
+            .ledgers
+            .states()
+            .await
+            .into_iter()
+            .find(|state| state.name == name)
+            .and_then(|state| state.node_id);
+        let port = crate::ledgers::fixed_listen_port(&config);
+        let (Some(node_id), Some(port), true) = (node_id, port, config.signing.enabled) else {
+            return Err(refused(
+                "INVALID_INPUT",
+                format!(
+                    "ledger \"{name}\" cannot be joined: it needs signing and P2P on, on a fixed p2p.listenPort (a company added with --new-mesh has them)"
+                ),
+            ));
+        };
+        let peers = config
+            .p2p
+            .bootstrap_endpoint_ids
+            .iter()
+            .filter(|peer| **peer != node_id)
+            .map(|peer| mesh_invite::MeshPeer {
+                node_id: peer.clone(),
+                addresses: config
+                    .p2p
+                    .peer_addresses
+                    .get(peer)
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect();
+        let relay_url = (config.p2p.relay_mode == "custom")
+            .then(|| config.p2p.relay_url.clone())
+            .flatten();
+        let line = MeshLine {
+            swarm_topic: Some(config.p2p.swarm_topic.clone()),
+            peers,
+            relay_url,
+            admin_nodes: config.admin_nodes.clone(),
+            format: Some(mesh_invite::MeshFormat {
+                wire2: config.format.wire2,
+                idv2: config.format.idv2,
+            }),
+            ..MeshLine::reply(
+                name,
+                config.p2p.signature_domain(),
+                node_id,
+                mesh_invite::address(host, port)?,
+            )
+        };
+        Ok(mesh_invite::encode(INVITE_PREFIX, &line))
+    }
+
+    /// Join the company `invitation` invites to (step 5): added here in its
+    /// mesh on a free port of `ports`, every server it names a peer; the reply
+    /// is for each of those servers' operators to accept, `host` this node's
+    /// address. Also the node ids it now trusts, for the operators to compare.
+    pub(crate) async fn join(
+        &self,
+        invitation: &str,
+        host: &str,
+        ports: &str,
+    ) -> Result<(LedgerInfo, String, Vec<String>), Refusal> {
+        let invitation = mesh_invite::decode(INVITE_PREFIX, invitation)?;
+        // The address is checked before anything is added.
+        mesh_invite::address(host, 1)?;
+        if self
+            .ledgers
+            .states()
+            .await
+            .iter()
+            .any(|state| state.node_id.as_deref() == Some(invitation.node_id.as_str()))
+        {
+            return Err(refused(
+                "INVALID_INPUT",
+                "this node wrote that invitation: give it to the server that is to join",
+            ));
+        }
+        let joined = self
+            .add_joined(&invitation.ledger, None, Some(ports), Some(&invitation))
+            .await?;
+        let (Some(node_id), Some(port)) = (joined.node_id.clone(), joined.listen_port) else {
+            return Err(refused(
+                "START_FAILED",
+                format!(
+                    "ledger \"{}\" was added and is served, but without a node id or fixed port to reply with",
+                    joined.name
+                ),
+            ));
+        };
+        let reply = mesh_invite::encode(
+            REPLY_PREFIX,
+            &MeshLine::reply(
+                &invitation.ledger,
+                &invitation.mesh_id,
+                node_id,
+                mesh_invite::address(host, port)?,
+            ),
+        );
+        let trusts = invitation
+            .servers()
+            .into_iter()
+            .map(|peer| peer.node_id)
+            .collect();
+        Ok((joined, reply, trusts))
+    }
+
+    /// Accept a reply to an invitation (step 5), on every server already in
+    /// the company's mesh: the replying node joins the company's peers in its
+    /// `ledger.json` — read through the checked reader, written aside and
+    /// renamed over it — and the company restarts with it. Settings the
+    /// restart refuses before it stops the company put the old file back: it
+    /// serves on as it was. Also the node and address now trusted, for the
+    /// operator to compare with the other side's.
+    pub(crate) async fn accept(&self, reply: &str) -> Result<(LedgerInfo, MeshLine), Refusal> {
+        let _busy = self.busy.lock().await;
+        let reply = mesh_invite::decode(REPLY_PREFIX, reply)?;
+        let name = reply.ledger.clone();
+        Self::folder_name(&name)?;
+        let file = self.folder(&name).join(LEDGER_FILE);
+        match file.symlink_metadata() {
+            Err(_) => {
+                return Err(refused(
+                    "NO_SUCH_LEDGER",
+                    format!(
+                        "this node has no ledger named \"{name}\" (no {})",
+                        file.display()
+                    ),
+                ))
+            }
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(refused(
+                    "INVALID_INPUT",
+                    format!(
+                        "{} is a link: add the peer to the file it points at by hand, and restart \"{name}\"",
+                        file.display()
+                    ),
+                ))
+            }
+            Ok(_) => {}
+        }
+        let (_handle, old) = crate::config::read_config_file(&file)
+            .map_err(|error| refused("INVALID_INPUT", format!("{}: {error}", file.display())))?;
+        if self
+            .ledgers
+            .states()
+            .await
+            .iter()
+            .any(|state| state.node_id.as_deref() == Some(reply.node_id.as_str()))
+        {
+            return Err(refused(
+                "INVALID_INPUT",
+                "that reply is from this node itself: give it to the server that wrote the invitation",
+            ));
+        }
+        let new = mesh_invite::with_peer(&old, &reply)?;
+        write_settings(&file, &new).map_err(|error| {
+            refused(
+                "START_FAILED",
+                format!("could not write {}: {error}", file.display()),
+            )
+        })?;
+        match self.restart_locked(&name).await {
+            Ok(info) => Ok((info, reply)),
+            Err(refusal)
+                if refusal.code == "INVALID_INPUT" || refusal.code == "LEDGER_CONFLICT" =>
+            {
+                if let Err(error) = write_settings(&file, &old) {
+                    error!(%error, ledger = %name, "could not put the ledger's old ledger.json back");
+                }
+                Err(refusal)
+            }
+            // START_FAILED: stopped and not started again, its file with the
+            // new peer — which cannot itself stop a start; the log says why.
+            Err(refusal) => Err(refusal),
+        }
+    }
+}
+
+/// Write `text` over `file` — aside, synced, then renamed over it — so a
+/// crash leaves the old settings or the new, never half of them. The aside
+/// file is new: one left behind is removed first (a link included, never
+/// followed), and `create_new` refuses whatever appears there meanwhile.
+fn write_settings(file: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let aside = file.with_extension("json.writing");
+    match std::fs::remove_file(&aside) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&aside)?;
+    out.write_all(text.as_bytes())?;
+    out.sync_all()?;
+    std::fs::rename(&aside, file)?;
+    if let Some(parent) = file.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Stop `running`, logging under its name.
@@ -514,6 +788,26 @@ fn uuid_v4() -> String {
     )
 }
 
+/// The lowest port in `range` that is not `taken` and that nothing on the
+/// host holds (`free`); none is `LEDGER_CONFLICT`.
+fn free_port(
+    range: PortRange,
+    taken: &std::collections::HashSet<u16>,
+    free: impl Fn(u16) -> bool,
+) -> Result<u16, Refusal> {
+    (range.from..=range.to)
+        .find(|port| !taken.contains(port) && free(*port))
+        .ok_or_else(|| {
+            refused(
+                "LEDGER_CONFLICT",
+                format!(
+                    "no free UDP port in {}-{}: every one is a ledger's or in use",
+                    range.from, range.to
+                ),
+            )
+        })
+}
+
 /// A company's `ledger.json` in a mesh of its own (005 step 4): signing and
 /// P2P on, a fresh `meshId` and `swarmTopic`, the lowest port in `range`
 /// that no served ledger has and nothing on the host holds (`free`), and
@@ -524,17 +818,7 @@ pub(crate) fn new_mesh_settings(
     taken: &std::collections::HashSet<u16>,
     free: impl Fn(u16) -> bool,
 ) -> Result<String, Refusal> {
-    let port = (range.from..=range.to)
-        .find(|port| !taken.contains(port) && free(*port))
-        .ok_or_else(|| {
-            refused(
-                "LEDGER_CONFLICT",
-                format!(
-                    "no free UDP port in {}-{}: every one is a ledger's or in use",
-                    range.from, range.to
-                ),
-            )
-        })?;
+    let port = free_port(range, taken, free)?;
     let settings = serde_json::json!({
         "signing": { "enabled": true },
         "p2p": {
@@ -674,6 +958,64 @@ impl NodeMutation {
         name: String,
     ) -> async_graphql::Result<LedgerInfo> {
         admin(ctx).restart(&name).await.map_err(Refusal::into_error)
+    }
+
+    /// An invitation to company `name`'s mesh, for a second server: one line
+    /// with its mesh and this node's id, `address` the host other servers
+    /// reach this one by (its domain, or its IP address).
+    #[graphql(complexity = "CHANGE_COMPLEXITY")]
+    async fn invite_ledger(
+        &self,
+        ctx: &Context<'_>,
+        name: String,
+        address: String,
+    ) -> async_graphql::Result<String> {
+        admin(ctx)
+            .invite(&name, &address)
+            .await
+            .map_err(Refusal::into_error)
+    }
+
+    /// Join the company an invitation invites to: added here in its mesh on
+    /// a free UDP port of `newMeshPorts` (`FROM-TO`), the inviting server its
+    /// peer; `address` is this server's. The reply goes back to the inviting
+    /// server, for `acceptLedger`.
+    #[graphql(complexity = "CHANGE_COMPLEXITY")]
+    async fn join_ledger(
+        &self,
+        ctx: &Context<'_>,
+        invitation: String,
+        address: String,
+        new_mesh_ports: String,
+    ) -> async_graphql::Result<JoinedLedger> {
+        admin(ctx)
+            .join(&invitation, &address, &new_mesh_ports)
+            .await
+            .map(|(ledger, reply, trusts)| JoinedLedger {
+                ledger,
+                reply,
+                trusts,
+            })
+            .map_err(Refusal::into_error)
+    }
+
+    /// Accept a reply to this node's invitation: the replying server joins
+    /// the company's peers here, and the company restarts with it.
+    #[graphql(complexity = "CHANGE_COMPLEXITY")]
+    async fn accept_ledger(
+        &self,
+        ctx: &Context<'_>,
+        reply: String,
+    ) -> async_graphql::Result<AcceptedLedger> {
+        admin(ctx)
+            .accept(&reply)
+            .await
+            .map(|(ledger, reply)| AcceptedLedger {
+                ledger,
+                node_id: reply.node_id,
+                address: reply.address,
+            })
+            .map_err(Refusal::into_error)
     }
 }
 
@@ -1373,6 +1715,159 @@ mod tests {
         assert_eq!(code(&full), Some("LEDGER_CONFLICT"), "{full}");
         assert!(!node.ledgers_dir().join("acme").exists(), "nothing written");
         drop(held);
+        node.admin.stop_all().await;
+    }
+
+    /// 005 step 5: invitations, joins and accepts the node refuses change
+    /// nothing: no invitation to the config file's ledger, to one it does not
+    /// serve, or to one without P2P on a fixed port; no join from a line that
+    /// is not an invitation, or to a company whose name is taken here; no
+    /// accept of a reply for a ledger this node does not have, or one without
+    /// P2P, whose `ledger.json` is left as it was.
+    ///
+    /// Bug-catch: accept a reply for a ledger without P2P and the accept
+    /// goes through, rewriting its `ledger.json` with a peer it cannot use.
+    #[tokio::test]
+    async fn invitations_and_replies_the_node_refuses_change_nothing() {
+        let node = node().await;
+        let signing = r#"{ "signing": { "enabled": true }, "p2p": { "meshId": "acme-books" } }"#;
+        add(&node.app, "acme", Some(signing)).await;
+        let invite = |name: &str| {
+            node_query(
+                &node.app,
+                "mutation($n: String!, $a: String!) { inviteLedger(name: $n, address: $a) }",
+                json!({ "n": name, "a": "ledger.example.com" }),
+            )
+        };
+        assert_eq!(code(&invite("default").await), Some("INVALID_INPUT"));
+        assert_eq!(code(&invite("nobody").await), Some("NO_SUCH_LEDGER"));
+        let no_p2p = invite("acme").await;
+        assert_eq!(code(&no_p2p), Some("INVALID_INPUT"), "{no_p2p}");
+
+        let a_line = super::mesh_invite::encode(
+            super::INVITE_PREFIX,
+            &super::MeshLine {
+                swarm_topic: Some("openledger/another".into()),
+                format: Some(super::mesh_invite::MeshFormat {
+                    wire2: true,
+                    idv2: true,
+                }),
+                ..super::MeshLine::reply(
+                    "acme",
+                    "another-mesh",
+                    iroh::SecretKey::generate().public().to_string(),
+                    "a.ledger.example:4433".into(),
+                )
+            },
+        );
+        let join = |line: &str| {
+            node_query(
+                &node.app,
+                "mutation($l: String!) { joinLedger(invitation: $l, address: \"b.ledger.example\", newMeshPorts: \"4433-4532\") { reply } }",
+                json!({ "l": line }),
+            )
+        };
+        assert_eq!(
+            code(&join("not an invitation").await),
+            Some("INVALID_INPUT")
+        );
+        assert_eq!(
+            code(&join(&a_line).await),
+            Some("LEDGER_EXISTS"),
+            "acme is taken here"
+        );
+
+        let file = node.ledgers_dir().join("acme/ledger.json");
+        let before = std::fs::read_to_string(&file).expect("acme's settings");
+        let reply = |ledger: &str| {
+            super::mesh_invite::encode(
+                super::REPLY_PREFIX,
+                &super::MeshLine::reply(
+                    ledger,
+                    "acme-books",
+                    iroh::SecretKey::generate().public().to_string(),
+                    "b.ledger.example:4434".into(),
+                ),
+            )
+        };
+        let accept = |line: String| {
+            node_query(
+                &node.app,
+                "mutation($r: String!) { acceptLedger(reply: $r) { nodeId } }",
+                json!({ "r": line }),
+            )
+        };
+        assert_eq!(code(&accept(reply("nobody")).await), Some("NO_SUCH_LEDGER"));
+        assert_eq!(code(&accept(reply("acme")).await), Some("INVALID_INPUT"));
+        assert_eq!(code(&accept(a_line.clone()).await), Some("INVALID_INPUT"));
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("acme's settings"),
+            before
+        );
+        node.admin.stop_all().await;
+    }
+
+    /// Review (005 step 5): `accept` writes a ledger's settings only through
+    /// files it makes — a link planted where it writes aside is removed, not
+    /// followed, so the file it pointed at is untouched — and it refuses a
+    /// `ledger.json` that is itself a link, which renaming over it would
+    /// replace (the operator's link cut, its target never changed).
+    ///
+    /// Bug-catch: open the aside file with `create` and `truncate` and a
+    /// planted link overwrites whatever it points at with the node's rights.
+    #[tokio::test]
+    async fn accept_writes_through_no_link() {
+        let dir = tempfile::Builder::new()
+            .prefix(".test-ledgers-")
+            .tempdir_in(".")
+            .expect("temp dir");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "not to be touched").expect("victim");
+        let file = dir.path().join("ledger.json");
+        std::fs::write(&file, "{}").expect("settings");
+        std::os::unix::fs::symlink(&victim, dir.path().join("ledger.json.writing")).expect("link");
+        super::write_settings(&file, "{ \"new\": true }\n").expect("written");
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("victim"),
+            "not to be touched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("settings"),
+            "{ \"new\": true }\n"
+        );
+
+        let node = node().await;
+        let folder = node.ledgers_dir().join("linked");
+        std::fs::create_dir_all(&folder).expect("folder");
+        let target = node.dir.path().join("linked-settings.json");
+        // P2P on but signing off: a restart would refuse it before starting.
+        let settings = r#"{ "p2p": { "enabled": true, "meshId": "linked-books", "swarmTopic": "openledger/linked" } }"#;
+        std::fs::write(&target, settings).expect("target");
+        std::os::unix::fs::symlink(&target, folder.join("ledger.json")).expect("link");
+        let reply = super::mesh_invite::encode(
+            super::REPLY_PREFIX,
+            &super::MeshLine::reply(
+                "linked",
+                "linked-books",
+                iroh::SecretKey::generate().public().to_string(),
+                "b.ledger.example:4434".into(),
+            ),
+        );
+        let refused = node_query(
+            &node.app,
+            "mutation($r: String!) { acceptLedger(reply: $r) { nodeId } }",
+            json!({ "r": reply }),
+        )
+        .await;
+        assert_eq!(code(&refused), Some("INVALID_INPUT"), "{refused}");
+        assert!(
+            std::fs::symlink_metadata(folder.join("ledger.json"))
+                .expect("still there")
+                .file_type()
+                .is_symlink(),
+            "the operator's link is kept"
+        );
+        assert_eq!(std::fs::read_to_string(&target).expect("target"), settings);
         node.admin.stop_all().await;
     }
 

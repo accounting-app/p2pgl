@@ -14,6 +14,7 @@ mod ledger_commit;
 mod ledger_lock;
 mod ledger_runtime;
 mod ledgers;
+mod mesh_invite;
 mod node_init;
 mod p2p_service;
 mod peer_addresses;

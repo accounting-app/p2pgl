@@ -30,6 +30,7 @@ reference for every config option; this page is the procedure.
 | A company leaves | `openledger company remove acme` — its folder moves to `ledgers/.removed/`, nothing deleted |
 | Give someone access | `openledger person add acme --name "Ana Ruiz" --role write [--expires 2026-12-31]` — prints their key once |
 | See, rename, revoke | `openledger person list acme`, `… rename acme USER_ID --name …`, `… revoke acme USER_ID` |
+| Another server for a company | `openledger invite acme`, then `openledger join` there and `openledger accept` on every server already serving it — below |
 | The operator key | `openledger key` |
 | Is it all right? | `openledger status` — the services, the node's version, `https://DOMAIN/health` through Caddy, the companies; exits non-zero if HTTPS fails |
 
@@ -68,6 +69,51 @@ it wrote and you edited is kept, with its version beside it as `FILE.new` for
 you to compare. The operator key is printed once, on a terminal; into a log
 (cloud-init, a pipe) it says where the key is instead. To see the
 operator key again: `sudo sed -n 's/^GL_NODE_API_KEY=//p' /opt/openledger/env`.
+
+## Joining a second server
+
+A company served by two servers or more keeps working while one is down: each
+holds its books, takes writes and replicates them to the others. With every
+server set up by the installer, each with its own domain:
+
+1. **On a server already serving acme**, `sudo openledger invite acme` prints
+   one line, `openledger-invite-v1.…`: acme's mesh, this server's node id and
+   address (its domain and acme's UDP port), every other server already in the
+   mesh, and the mesh's relay, admin nodes and format.
+2. **On the new server**, `sudo openledger join` and paste the line (it is read
+   from the terminal, so it is in no shell history or process list). acme is
+   added there in the same mesh, on a free port of its own, with every server
+   of the invitation as its peers, and takes acme's history from the inviter.
+   It prints the node ids it now trusts and a reply, `openledger-reply-v1.…`.
+3. **On every server already serving acme** — not only the inviter —
+   `sudo openledger accept` and paste the reply: the new server joins acme's
+   peers there, and acme restarts with it. Each prints the node id it admitted;
+   compare it with the one the new server printed.
+
+A server that has not accepted the new one's reply takes no records from it —
+a node takes records only from the peers it lists — so with three servers or
+more, accept on each, or their books drift apart. From then on an entry
+written on any reaches the others in seconds, and the company's people —
+their keys are in its books — use any of them
+(`https://<any domain>/ledgers/acme/graphql`).
+
+**Keep the invitation like a password** until it has been used: it carries the
+mesh's join credential (its gossip topic, with a member's id and address).
+Neither line grants anything alone — a server joins only when the others'
+operators accept its reply — but a reply decides whom a server trusts: take
+it only from the server you invited, over a channel you trust, and compare
+the node ids.
+
+What it needs: each server reaches the others at their domains on the
+companies' UDP ports (4433–4532), which the installer's firewall admits; a
+mesh with its own relay passes the relay on in the invitation. Servers behind a
+home or office router without a public address need that relay (*Running a
+relay*).
+
+Without the installer: `gl-node ledger invite NAME --address HOST`, `gl-node
+ledger join - --address HOST --new-mesh FROM-TO` and `gl-node ledger accept
+-` do the same, the line on stdin (or as the argument), `HOST` being how the
+other servers reach this one.
 
 ## The production template
 

@@ -1608,6 +1608,7 @@ dependencies = [
  "async-graphql",
  "async-graphql-axum",
  "axum",
+ "base64",
  "chrono",
  "hex",
  "http-body-util",

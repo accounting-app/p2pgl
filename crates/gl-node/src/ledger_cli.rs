@@ -18,7 +18,15 @@ pub const USAGE: &str = "Usage:
   gl-node ledger restart NAME
       (picks up an edited ledger.json)
   gl-node ledger remove NAME
-      (stops it and moves its folder to ledgersDir/.removed/; nothing is deleted)";
+      (stops it and moves its folder to ledgersDir/.removed/; nothing is deleted)
+  gl-node ledger invite NAME --address HOST
+      (an invitation to NAME's mesh for a second server; HOST is how other
+      servers reach this one: its domain or IP address)
+  gl-node ledger join INVITATION --address HOST --new-mesh FROM-TO
+      (on the new server: joins the company, prints the reply to accept)
+  gl-node ledger accept REPLY
+      (on every server already in the company's mesh: the new one joins its peers)
+  INVITATION or REPLY as - is read from stdin, so it is on no command line";
 
 /// The node endpoint's path.
 pub const NODE_PATH: &str = "/node/graphql";
@@ -39,6 +47,18 @@ pub enum LedgerCommand {
     Restart {
         name: String,
     },
+    Invite {
+        name: String,
+        address: String,
+    },
+    Join {
+        invitation: String,
+        address: String,
+        new_mesh: String,
+    },
+    Accept {
+        reply: String,
+    },
 }
 
 /// Parse the arguments after `gl-node ledger`; `read` reads a `--settings`
@@ -51,6 +71,7 @@ pub fn parse(
     let mut positional = Vec::new();
     let mut settings = None;
     let mut new_mesh = None;
+    let mut address = None;
     let mut rest = rest.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -66,6 +87,12 @@ pub fn parse(
                     return Err("--new-mesh given twice".to_owned());
                 }
             }
+            "--address" => {
+                let host = rest.next().ok_or("--address needs a HOST")?;
+                if address.replace(host.clone()).is_some() {
+                    return Err("--address given twice".to_owned());
+                }
+            }
             other if other.starts_with("--") => return Err(format!("unknown option {other}")),
             other => positional.push(other.to_owned()),
         }
@@ -73,8 +100,11 @@ pub fn parse(
     if settings.is_some() && command != "add" {
         return Err(format!("--settings does not apply to `ledger {command}`"));
     }
-    if new_mesh.is_some() && command != "add" {
+    if new_mesh.is_some() && command != "add" && command != "join" {
         return Err(format!("--new-mesh does not apply to `ledger {command}`"));
+    }
+    if address.is_some() && command != "invite" && command != "join" {
+        return Err(format!("--address does not apply to `ledger {command}`"));
     }
     if settings.is_some() && new_mesh.is_some() {
         return Err("give --settings or --new-mesh, not both".to_owned());
@@ -98,6 +128,20 @@ pub fn parse(
         }),
         "restart" => Ok(LedgerCommand::Restart {
             name: one_name(positional)?,
+        }),
+        "invite" => Ok(LedgerCommand::Invite {
+            name: one_name(positional)?,
+            address: address.ok_or("`ledger invite` needs --address HOST")?,
+        }),
+        "join" => Ok(LedgerCommand::Join {
+            invitation: one_name(positional)
+                .map_err(|_| "`ledger join` takes one INVITATION".to_owned())?,
+            address: address.ok_or("`ledger join` needs --address HOST")?,
+            new_mesh: new_mesh.ok_or("`ledger join` needs --new-mesh FROM-TO")?,
+        }),
+        "accept" => Ok(LedgerCommand::Accept {
+            reply: one_name(positional)
+                .map_err(|_| "`ledger accept` takes one REPLY".to_owned())?,
         }),
         other => Err(format!("unknown ledger command {other:?}")),
     }
@@ -131,6 +175,22 @@ fn request_body(command: &LedgerCommand) -> Value {
         LedgerCommand::Restart { name } => json!({
             "query": format!("mutation($name: String!) {{ restartLedger(name: $name) {{ {LEDGER} }} }}"),
             "variables": { "name": name },
+        }),
+        LedgerCommand::Invite { name, address } => json!({
+            "query": "mutation($name: String!, $address: String!) { inviteLedger(name: $name, address: $address) }",
+            "variables": { "name": name, "address": address },
+        }),
+        LedgerCommand::Join {
+            invitation,
+            address,
+            new_mesh,
+        } => json!({
+            "query": format!("mutation($invitation: String!, $address: String!, $ports: String!) {{ joinLedger(invitation: $invitation, address: $address, newMeshPorts: $ports) {{ reply trusts ledger {{ {LEDGER} }} }} }}"),
+            "variables": { "invitation": invitation, "address": address, "ports": new_mesh },
+        }),
+        LedgerCommand::Accept { reply } => json!({
+            "query": format!("mutation($reply: String!) {{ acceptLedger(reply: $reply) {{ nodeId address ledger {{ {LEDGER} }} }} }}"),
+            "variables": { "reply": reply },
         }),
     }
 }
@@ -205,7 +265,76 @@ fn render(command: &LedgerCommand, data: &Value) -> String {
         LedgerCommand::Restart { name } => {
             format!("Restarted ledger {name}, served at {}.\n", served_at(name))
         }
+        LedgerCommand::Invite { name, .. } => format!(
+            "The invitation to {name}'s mesh (one line). It holds the mesh's join credential: \
+             keep it like a password, and hand it over on a channel you trust.\n\n{}\n\n\
+             On the new server: join with it (`gl-node ledger join - --address <that server> \
+             --new-mesh FROM-TO`, the line on stdin, or `openledger join`), then accept its reply \
+             here and on every other server already serving {name}.\n",
+            text(&data["inviteLedger"])
+        ),
+        LedgerCommand::Join { .. } => {
+            let joined = &data["joinLedger"];
+            let ledger = &joined["ledger"];
+            let name = text(&ledger["name"]);
+            let trusts: Vec<String> = joined["trusts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|id| id.as_str().map(|id| format!("  {id}\n")))
+                .collect();
+            format!(
+                "Joined {name}, served at {}.\n  node id:  {}\n  UDP port: {}\n\n\
+                 It trusts, for {name}, these servers' node ids (the inviter first) — compare \
+                 them with theirs (`gl-node ledger list` there):\n{}\n\
+                 The reply (one line), for EVERY one of those servers to accept:\n\n{}\n\n\
+                 On each: `gl-node ledger accept <reply>` (or `openledger accept`). A server that \
+                 has not accepted it takes no records from this one.\n",
+                served_at(&name),
+                node_id(ledger),
+                ledger["listenPort"]
+                    .as_u64()
+                    .map_or("-".to_owned(), |port| port.to_string()),
+                trusts.concat(),
+                text(&joined["reply"]),
+            )
+        }
+        LedgerCommand::Accept { .. } => {
+            let accepted = &data["acceptLedger"];
+            format!(
+                "Accepted: {} now replicates with node {} at {}, and restarted with it.\n\
+                 Compare that node id with the one the joining server printed.\n",
+                text(&accepted["ledger"]["name"]),
+                text(&accepted["nodeId"]),
+                text(&accepted["address"]),
+            )
+        }
     }
+}
+
+/// An invitation or a reply given as `-` read from stdin, one line: so it
+/// is on no command line (`ps`) and in no shell history.
+fn lines_from_stdin(command: LedgerCommand) -> Result<LedgerCommand, String> {
+    let line = || -> Result<String, String> {
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .map_err(|error| format!("reading the line from stdin: {error}"))?;
+        Ok(line.trim().to_owned())
+    };
+    Ok(match command {
+        LedgerCommand::Join {
+            invitation,
+            address,
+            new_mesh,
+        } if invitation == "-" => LedgerCommand::Join {
+            invitation: line()?,
+            address,
+            new_mesh,
+        },
+        LedgerCommand::Accept { reply } if reply == "-" => LedgerCommand::Accept { reply: line()? },
+        other => other,
+    })
 }
 
 /// Run `command` against the node at `host:port`: what to print, or why not.
@@ -227,7 +356,7 @@ pub fn run(args: &[String]) -> ! {
     let read = |file: &str| {
         std::fs::read_to_string(file).map_err(|error| format!("--settings {file}: {error}"))
     };
-    let command = match parse(args, read) {
+    let command = match parse(args, read).and_then(lines_from_stdin) {
         Ok(command) => command,
         Err(error) => {
             eprintln!("ledger: {error}\n{USAGE}");
@@ -289,6 +418,30 @@ mod tests {
             })
         );
         assert_eq!(
+            parse(&args("invite acme --address a.example"), no_file),
+            Ok(LedgerCommand::Invite {
+                name: "acme".into(),
+                address: "a.example".into(),
+            })
+        );
+        assert_eq!(
+            parse(
+                &args("join LINE --address b.example --new-mesh 4433-4532"),
+                no_file
+            ),
+            Ok(LedgerCommand::Join {
+                invitation: "LINE".into(),
+                address: "b.example".into(),
+                new_mesh: "4433-4532".into(),
+            })
+        );
+        assert_eq!(
+            parse(&args("accept REPLY"), no_file),
+            Ok(LedgerCommand::Accept {
+                reply: "REPLY".into()
+            })
+        );
+        assert_eq!(
             parse(&args("add acme --new-mesh 4433-4532"), no_file),
             Ok(LedgerCommand::Add {
                 name: "acme".into(),
@@ -323,6 +476,15 @@ mod tests {
             "add acme --new-mesh",
             "add acme --new-mesh 1-2 --settings acme.json",
             "remove acme --new-mesh 1-2",
+            "invite acme",
+            "invite acme --address",
+            "invite acme --address a.example --new-mesh 1-2",
+            "join LINE --address b.example",
+            "join LINE --new-mesh 1-2",
+            "join --address b.example --new-mesh 1-2",
+            "accept",
+            "accept REPLY --address b.example",
+            "list --address b.example",
             "rename acme",
         ] {
             assert!(parse(&args(refused), no_file).is_err(), "{refused:?}");

@@ -1245,6 +1245,9 @@ the port and the operator key, so run it as the node's user on its machine:
 gl-node ledger add acme --settings acme.json   # acme.json is the ledger.json above
 gl-node ledger add notes                       # no settings: a ledger of its own, no mesh
 gl-node ledger add beta --new-mesh 4433-4532   # a mesh of its own on a free UDP port in that range
+gl-node ledger invite beta --address a.example.com           # a one-line invitation for a second server …
+gl-node ledger join LINE --address b.example.com --new-mesh 4433-4532   # … which joins with it there,
+gl-node ledger accept REPLY                                   # … and its reply, accepted here
 gl-node ledger list                            # every ledger: served, or not and why
 gl-node ledger restart acme                    # picks up an edited ledger.json
 gl-node ledger remove acme                     # stops it; moves its folder aside

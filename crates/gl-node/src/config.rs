@@ -1689,7 +1689,7 @@ pub(crate) const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 ///
 /// Returns the handle as well as the text, so the permission check describes
 /// the inode whose bytes were read (the L-04 rule).
-fn read_config_file(config_path: &Path) -> Result<(File, String), ConfigError> {
+pub(crate) fn read_config_file(config_path: &Path) -> Result<(File, String), ConfigError> {
     let checked = ledger::journal::open_checked(
         config_path,
         std::fs::OpenOptions::new().read(true),
