@@ -1603,7 +1603,7 @@ dependencies = [
 
 [[package]]
 name = "gl-node"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -2477,7 +2477,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "ledger"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "libc",
@@ -3091,7 +3091,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "p2p"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4009,7 +4009,7 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "security"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "ed25519-dalek 2.2.0",
@@ -5588,7 +5588,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",

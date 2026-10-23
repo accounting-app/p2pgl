@@ -7,6 +7,51 @@ break compatibility.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-10-23
+
+One command to a production server: `deploy/install/install.sh` sets up a
+node on a fresh Ubuntu or Debian server behind HTTPS (Caddy, automatic
+certificates), with a firewall, nightly backups, and the `openledger`
+command for companies, people, more servers per company (by invitation),
+restore, upgrade and rollback. Also `accounts`, the chart of accounts over
+GraphQL.
+
+**Status: pilot,** as 0.2.0: its tests run nodes on one machine, and the
+installer is rehearsed on fresh VMs on one machine (Lima: one server, and two
+joined); it has not yet run on servers at a provider with real domains —
+that rehearsal installs this release. Run it beside your existing books
+before relying on it.
+
+**Upgrading from 0.2.0:** `docs/OPERATIONS.md`, *Upgrading* and *To 0.3.0*.
+
+**Known limits.**
+
+- No TLS in the node: on any non-loopback bind, or behind a proxy, the API
+  sits behind an HTTPS terminator; the installer puts Caddy there.
+- `p2p.relayMode` still defaults to `"n0"` for a config that does not set it;
+  `ledger add --new-mesh` and `ledger join` never use n0. Servers joined by
+  invitation reach each other at their direct addresses: each needs a public
+  address, or the mesh its own relay set by hand (OPERATIONS *Running a
+  relay*).
+- A node built before Format v2 can neither read v2 records nor speak the v2
+  wire; every node of a mesh runs the same release (OPERATIONS, *Upgrading*).
+- Every ledger's history is held in memory: OPERATIONS *Sizing a node with
+  several ledgers* gives the budget (about 45 MiB per 10,000 entries); at most
+  100 ledgers a node.
+- A backup is taken with the node stopped (seconds; the mesh's other nodes
+  serve meanwhile) and kept on the server: copying it off, encrypted, is up
+  to you. After a restore on a mesh, the rule — no write until the server has
+  caught up — is printed, not enforced.
+- `openledger upgrade --version` downloads a release's installer; that path
+  is first usable, and rehearsed, with the next release.
+- Pad synthesis is not wired in: a `pad` directive is kept and replicated but
+  changes no balance.
+- Linux binaries for amd64 and arm64; the one not native to the release
+  machine is cross-compiled, and booted under emulation where the release's
+  Docker host emulates it (`RELEASE-INFO.txt` says). The installer needs
+  Ubuntu 22.04 or later or Debian 12 or later, with systemd, and downloads
+  from the public repository's releases.
+
 ### Breaking
 
 - **`tls.mode: "terminated"`, or a `trustedProxies` entry, makes a node public
