@@ -31,8 +31,11 @@ reference for every config option; this page is the procedure.
 | Give someone access | `openledger person add acme --name "Ana Ruiz" --role write [--expires 2026-12-31]` — prints their key once |
 | See, rename, revoke | `openledger person list acme`, `… rename acme USER_ID --name …`, `… revoke acme USER_ID` |
 | Another server for a company | `openledger invite acme`, then `openledger join` there and `openledger accept` on every server already serving it — below |
+| Back up now | `openledger backup` — the node stops for seconds; one runs every night anyway; `openledger backups` lists them — below |
+| Put back a backup | `openledger restore FILE` — the current data moved aside, nothing deleted |
+| Upgrade, roll back | `openledger upgrade --version X.Y.Z` (a backup first), `openledger rollback` — below |
 | The operator key | `openledger key` |
-| Is it all right? | `openledger status` — the services, the node's version, `https://DOMAIN/health` through Caddy, the companies; exits non-zero if HTTPS fails |
+| Is it all right? | `openledger status` — the services, the node's version, `https://DOMAIN/health` through Caddy, the last backup, the companies; exits non-zero if HTTPS fails or the last backup is two days old |
 
 Each runs the node's own command (`gl-node ledger`, `gl-node user`) in its
 container, with its key; the node judges every change, as *Adding a company*
@@ -44,6 +47,11 @@ What it leaves on the server:
 | Path | What it is |
 |---|---|
 | `/opt/openledger/env` | The operator key (`GL_NODE_API_KEY`), root only |
+| `/opt/openledger/settings` | The domain and the installer's options, for the `openledger` command and for running the installer again on an upgrade |
+| `/opt/openledger/install.sh` | The installer that last ran to the end, root only (an upgrade keeps it for a rollback) |
+| `/opt/openledger/previous/` | After an upgrade: the backup, binary, image name and installer a rollback goes back to |
+| `/etc/systemd/system/openledger-backup.{service,timer}`, `openledger-resume.service` | The nightly backup; at boot, the node a backup or restore had stopped |
+| `/var/lib/openledger/backups` | The backups, root only: the 14 newest |
 | `/opt/openledger/compose.yml` | The two services, `openledger-node` and `openledger-caddy` |
 | `/opt/openledger/caddy/Caddyfile` | HTTPS for the domain, forwarding `/graphql`, `/ledgers/*` and `/health` only; Caddy's admin API off |
 | `/opt/openledger/.installed/` | Hashes of the files the installer wrote, so a later run can tell its own from your edits |
@@ -69,6 +77,10 @@ it wrote and you edited is kept, with its version beside it as `FILE.new` for
 you to compare. The operator key is printed once, on a terminal; into a log
 (cloud-init, a pipe) it says where the key is instead. To see the
 operator key again: `sudo sed -n 's/^GL_NODE_API_KEY=//p' /opt/openledger/env`.
+
+The installer runs from a file — download it, check it against `SHA256SUMS`,
+run it — not from a pipe (`curl … | bash`), which it refuses before changing
+anything: it keeps a copy of itself for upgrades and rollbacks.
 
 ## Joining a second server
 
@@ -114,6 +126,86 @@ Without the installer: `gl-node ledger invite NAME --address HOST`, `gl-node
 ledger join - --address HOST --new-mesh FROM-TO` and `gl-node ledger accept
 -` do the same, the line on stdin (or as the argument), `HOST` being how the
 other servers reach this one.
+
+## Backups, restore, upgrade and rollback on an installed server
+
+What *Backups*, *Restoring a backup*, *Upgrading* and *Rolling back* below
+describe by hand, the `openledger` command does on a server the installer set
+up, as root:
+
+- **Backups.** Every night (`openledger-backup.timer`, between 03:00 and
+  03:30 the server's time, or at the next boot after a missed night), and
+  whenever you run `openledger backup`: the node stops — every company folds
+  its journal in, and the other servers of each mesh keep serving — its data
+  is archived with the server's settings and operator key, and it starts
+  again, usually within seconds. A node that was already stopped is archived
+  as it is and left stopped. The archive is
+  `/var/lib/openledger/backups/openledger-<UTC time>.tar.gz`, readable by
+  root alone; the 14 newest are kept, and the one a rollback needs besides.
+  `openledger backups` lists them, and `openledger status` names the newest
+  and fails once it is two days old: a nightly backup that fails says so
+  nowhere else (`journalctl -u openledger-backup` says why). **Copy them off
+  the server, encrypted:** they hold the node's keys (*What a node keeps*),
+  and a backup on the server it backs up is lost with it. If the server goes
+  down while a backup has the node stopped, `openledger-resume.service`
+  starts it at the next boot.
+- **Restore.** `openledger restore FILE` stops the node, moves its data aside
+  to `/var/lib/openledger/data.before-restore-<time>` — never deleted: remove
+  it yourself once you are sure — puts the backup's data in its place and
+  starts the node. A company added since the backup is in the moved-aside
+  data, not in the restored books. A restore cut short (the server went
+  down halfway) leaves the node stopped at the next boot, and `openledger
+  status` says *RESTORE NOT FINISHED*, naming the backup it was restoring:
+  run the restore again. Until then backups are refused, so the half-restored
+  data never becomes the newest backup. Then check as
+  *Restoring a backup* says, step 3, and **on a mesh make no write until this server has caught
+  up**, step 4: the command prints both. The settings and operator key in the
+  archive are not put back: on a new server, install it with the same domain
+  first, restore, and copy the archive's `env` to `/opt/openledger/env` if the
+  old operator key is to keep working (then
+  `docker compose -f /opt/openledger/compose.yml up -d --force-recreate node`:
+  a restart alone keeps the old key).
+- **Upgrade.** `openledger upgrade --version X.Y.Z` fetches the release's
+  installer, checks it against the release's `SHA256SUMS`, takes a backup,
+  keeps what a rollback needs in `/opt/openledger/previous/` — that backup,
+  the binary the node runs (copied out of its container), its image's name
+  and the installer that set it up — and runs the new installer with this
+  server's settings: it fetches and checks the new binary and restarts the
+  node on it. `--binary FILE` installs a binary you have instead, with the
+  installer already on the server (or `--installer FILE`). Read the CHANGELOG
+  first, and upgrade every server of a mesh, one at a time, as *Upgrading*
+  says; then run its checks. An upgrade that fails says where the node is
+  — on the release it ran, or on the new one when the installer failed after
+  starting it (at its HTTPS check, say) — and `openledger status` says
+  *UPGRADE NOT FINISHED*: fix the cause and run the upgrade again, or the
+  installer by hand (either finishes it; a rollback then still goes back to
+  the release and the backup from before the first attempt), or roll back.
+  The node need not be running to be upgraded.
+- **Rollback.** `openledger rollback` goes back to before the last upgrade:
+  it restores the backup the upgrade took — **writes made since the upgrade
+  are lost**, so list them first; on a terminal it asks you to type
+  `rollback` — and reinstalls the previous binary with the previous
+  installer, which starts the node on the restored books: the newer release
+  never boots on them. The previous image is used again, not rebuilt. It goes
+  back one upgrade, once. Roll back every server of the mesh, as you
+  upgraded them. If the previous installer fails (`openledger status` says
+  *ROLLBACK NOT FINISHED*), the books stay restored, and the command says
+  where the node is: stopped, unless the installer failed after starting the
+  previous release. No backup, boot or restore starts it, and an upgrade is
+  refused, until `openledger rollback`, run again once the cause is fixed,
+  goes on from there. A crash during a rollback's own restore is the same:
+  run the rollback again, and it does the restore again. Meanwhile the
+  installer, run by hand, refuses to start the node, as it does after a
+  restore cut short.
+
+An upgrade and a rollback are refused while `/opt/openledger/compose.yml`
+differs from what the installer wrote: they change the node's image there,
+and an edited file is kept (*Installing on a server*). Undo the edit first.
+
+Two of these never run at once, nor the installer beside them: a nightly
+backup that starts during a restore or an upgrade is refused, and runs the
+next night. Rehearsed on a fresh VM by `scripts/rehearse_backup.sh`, all but
+`--version`'s download, which needs a published release after 0.3.0.
 
 ## The production template
 
@@ -225,6 +317,10 @@ signed with. Lose it and the node must rejoin under a new identity (every peer's
 is a private key. Keep its backup encrypted and apart from the ledger backups.
 
 ## Backups
+
+On a server the installer set up, `openledger backup` does what follows, and
+runs every night (*Backups, restore, upgrade and rollback on an installed
+server*, above).
 
 1. Stop the node (`SIGTERM`, and wait for the process to exit; it exits 0).
 2. Copy `ledger.bean` and, if present, `ledger.bean.journal` together, plus the

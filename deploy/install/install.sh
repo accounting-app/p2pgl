@@ -32,7 +32,9 @@
 #     API off;
 #   - the firewall (ufw): SSH, 80, 443 and the UDP ports companies' ledgers
 #     use (4433–4532), nothing else;
-#   - restarts on failure and on boot, and rotated logs.
+#   - restarts on failure and on boot, and rotated logs;
+#   - a backup every night (a systemd timer), and the `openledger` command:
+#     companies, people, invitations, backups, restore, upgrade, rollback.
 #
 # Running it again changes nothing that is set up and says so; with another
 # --version, --binary or --email it updates what it wrote before. It never
@@ -116,6 +118,23 @@ fi
 # ── The system ────────────────────────────────────────────────────────────────
 step "this server"
 [[ $(id -u) -eq 0 ]] || fail "run it as root (sudo bash install.sh …)"
+# It keeps a copy of itself, for `openledger upgrade` and `rollback`: a file,
+# not a pipe (curl … | bash).
+self=${BASH_SOURCE[0]:-}
+[[ -f "$self" ]] || fail "run it from a file: download install.sh, check it against SHA256SUMS, then sudo bash install.sh …"
+# One at a time with `openledger backup`, restore, upgrade and rollback (which
+# hold the lock already when they run it): a backup never stops the node in
+# the middle of an install, nor an install start it in the middle of a backup.
+[[ /proc/self/fd/9 -ef /run/openledger.lock ]] || exec 9>/run/openledger.lock
+flock -n 9 || fail "a backup, restore, upgrade or rollback is running: wait for it, then run this again"
+# Never the node started on half-restored books, nor the newer release on a
+# rollback's: only the rollback itself runs the installer then.
+if [[ -z "${OPENLEDGER_ROLLBACK:-}" ]]; then
+  [[ ! -e /var/lib/openledger/.restore-in-progress ]] \
+    || fail "a restore did not finish (the data may be partial): run openledger restore again first"
+  [[ ! -e /opt/openledger/previous/rolling-back ]] \
+    || fail "a rollback did not finish: run openledger rollback again first"
+fi
 [[ -r /etc/os-release ]] || fail "no /etc/os-release: not a Linux distribution this installer knows"
 # shellcheck disable=SC1091
 . /etc/os-release
@@ -190,7 +209,6 @@ trap 'rm -rf "$work"' EXIT
 if [[ -n "$binary" ]]; then
   install -m 0755 "$binary" "$work/gl-node"
   source_note="from $binary"
-  label=local
 else
   base="$REPO_URL/releases/download/v$version"
   command -v curl >/dev/null || apt_install ca-certificates curl
@@ -203,10 +221,12 @@ else
   (cd "$work" && sha256sum -c --quiet sum) || fail "$file does not match the release's SHA256SUMS: refusing it"
   install -m 0755 "$work/$file" "$work/gl-node"
   source_note="release $version, matching its SHA256SUMS"
-  label=$version
 fi
-digest=$(sha256sum "$work/gl-node" | cut -c1-12)
-tag="openledger/gl-node:$label-$digest-u$node_uid"
+# One tag per binary and base, however the binary came (a release, or
+# --binary): a rollback reinstalling the previous binary finds the image it
+# ran before, and builds nothing.
+digest=$({ sha256sum < "$work/gl-node"; printf '%s\n' "$NODE_BASE"; } | sha256sum | cut -c1-12)
+tag="openledger/gl-node:$digest-u$node_uid"
 if docker image inspect "$tag" >/dev/null 2>&1; then
   same "image $tag"
 else
@@ -357,9 +377,14 @@ EOF
 
 step "the openledger command"
 put "$ETC/settings" 0644 <<EOF
-# Written by the openledger installer: what the openledger command needs.
-DOMAIN=$domain
-TEST_TLS=$test_tls
+# Written by the openledger installer: what the openledger command needs,
+# and the options an upgrade or a rollback runs the installer with again.
+# The command sources it: every value is quoted for the shell.
+DOMAIN=$(printf %q "$domain")
+EMAIL=$(printf %q "$email")
+TEST_TLS=$(printf %q "$test_tls")
+NO_FIREWALL=$([[ -n "$firewall" ]] || printf 1)
+SSH_PORT=$(printf %q "$ssh_port_given")
 LEDGER_UDP_PORTS=${LEDGER_UDP_PORTS/:/-}
 EOF
 put /usr/local/sbin/openledger 0755 <<'COMMAND'
@@ -383,8 +408,13 @@ usage="usage:
   openledger join [INVITATION]       on the new server: join the company; prints the reply
   openledger accept [REPLY]          on every server already in the mesh: the new one joins
                                      (join and accept read the line from stdin without one)
+  openledger backup                  a backup now (the node stops for seconds); 14 are kept
+  openledger backups                 the backups on this server
+  openledger restore FILE            the books as FILE has them (the current data moved aside)
+  openledger upgrade --version X.Y.Z a backup, then release X.Y.Z (or --binary FILE [--installer FILE])
+  openledger rollback                back to before the last upgrade: its backup and its binary
   openledger key                     the operator key
-  openledger status                  the services, the node and HTTPS as a client sees it"
+  openledger status                  the services, the node, HTTPS as a client sees it, the last backup"
 fail() { printf 'openledger: %s\n' "$*" >&2; exit 1; }
 [[ $(id -u) -eq 0 ]] || fail "run it as root (sudo openledger …)"
 [[ -r "$settings" ]] || fail "no $settings: is this server set up by the openledger installer?"
@@ -395,6 +425,211 @@ fail() { printf 'openledger: %s\n' "$*" >&2; exit 1; }
 node() { docker exec openledger-node gl-node "$@"; }
 # A line handed to the node on its stdin, never on a command line (ps).
 node_line() { local line=$1; shift; printf '%s\n' "$line" | docker exec -i openledger-node gl-node "$@"; }
+backups=/var/lib/openledger/backups
+# What `openledger rollback` goes back to: the last upgrade's backup, and the
+# binary, image and installer that ran before it.
+previous=/opt/openledger/previous
+# Set while a backup or a restore has the node stopped: `openledger resume`,
+# at boot, starts it again if the server went down meanwhile.
+stopped_mark=/var/lib/openledger/.node-stopped-by-openledger
+# Set by a rollback before it touches the books, until the previous release
+# runs on them: no backup, boot, restore or upgrade starts the newer release
+# on them, nor the installer run by hand, and `openledger rollback` goes on
+# from there. `restored` beside it: the restore is done and whole.
+rolling_mark=$previous/rolling-back
+restored_mark=$previous/restored
+# Set while a restore swaps the data, until the backup's is whole: a boot
+# never starts the node on half-unpacked books.
+restoring_mark=/var/lib/openledger/.restore-in-progress
+# What the restoring mark says: the data from before it (line 1) and the
+# backup being restored (line 2).
+restoring_what() {
+  printf 'restoring %s; the data from before it is in %s' \
+    "$(sed -n 2p "$restoring_mark" 2>/dev/null)" "$(sed -n 1p "$restoring_mark" 2>/dev/null)"
+}
+# FILE an openledger backup? (listed whole, then searched: grep -q on tar's
+# pipe would cut tar short).
+check_backup() {
+  local listing
+  [[ -f "$1" ]] || fail "no backup at $1"
+  listing=$(tar -tzf "$1" 2>/dev/null) || fail "$1 is not a readable archive"
+  grep -qx 'data/gl-node.config.json' <<<"$listing" || fail "$1 is not an openledger backup"
+}
+# Running, or restarting after a crash (Docker would start it again
+# meanwhile): either way stopped for a backup, and started after it.
+running() {
+  case "$(docker inspect -f '{{.State.Status}}' openledger-node 2>/dev/null)" in
+    running|restarting) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+answers() { docker exec openledger-node gl-node --health-check >/dev/null 2>&1; }
+# The node answers its own health check (after a start).
+healthy() {
+  local _
+  for _ in $(seq 120); do
+    answers && return 0
+    sleep 1
+  done
+  return 1
+}
+image_now() { docker inspect -f '{{.Config.Image}}' openledger-node; }
+# The installer's compose.yml as it wrote it: edited, an upgrade or a rollback
+# would not change the image it names.
+compose_is_ours() {
+  [[ "$(sha256sum < /opt/openledger/compose.yml | cut -d' ' -f1)" \
+     == "$(cat /opt/openledger/.installed/compose.yml.sha256 2>/dev/null)" ]]
+}
+# Where the node is, in words, for a message.
+where_node() {
+  local s
+  s=$(docker inspect -f '{{.State.Status}}' openledger-node 2>/dev/null || printf 'missing')
+  printf '%s, image %s' "$s" "$(image_now 2>/dev/null || printf '?')"
+}
+unfinished_rollback() {
+  [[ ! -e "$rolling_mark" ]] \
+    || fail "a rollback did not finish (the node is $(where_node)): run openledger rollback again, it goes on from there"
+}
+unfinished_restore() {
+  [[ ! -e "$restoring_mark" ]] \
+    || fail "a restore did not finish ($(restoring_what)): the data may be partial; run openledger restore again"
+}
+# A backup now: a running node stopped — every ledger folds its journal in —
+# its data (books and node keys) and the server's settings and operator key
+# archived, and the node started again; a stopped node is left stopped. The
+# 14 newest are kept. Prints the archive's path. Each step checks its own
+# result: a caller's `$(backup_now) || …` turns set -e off in here.
+backup_now() {
+  local stamp file started old keep was_running="" was_answering=""
+  # Never a half-restored data folder archived as the newest backup.
+  unfinished_restore
+  install -d -m 0700 "$backups" || fail "cannot make $backups"
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  file="$backups/openledger-$stamp.tar.gz"
+  [[ ! -e "$file" ]] || fail "$file exists already: try again in a second"
+  # A backup cut short by a crash (the lock is held: none is being written).
+  rm -f "$backups"/openledger-*.tar.gz.partial
+  started=$(date +%s)
+  if running; then
+    was_running=1
+    answers && was_answering=1
+    : > "$stopped_mark" || fail "cannot write $stopped_mark"
+    trap 'docker start openledger-node >/dev/null 2>&1 && rm -f "$stopped_mark"' EXIT
+    docker stop -t 60 openledger-node >/dev/null || fail "the node did not stop"
+  fi
+  (umask 077 && tar -czf "$file.partial" --exclude='*.lock' \
+     -C /var/lib/openledger data -C /opt/openledger settings env) \
+    || { rm -f "$file.partial"; fail "the backup did not complete${was_running:+ (the node is started again)}"; }
+  mv "$file.partial" "$file" || fail "could not name the backup $file"
+  if [[ -n "$was_running" ]]; then
+    docker start openledger-node >/dev/null || fail "the node did not start again: docker start openledger-node"
+    rm -f "$stopped_mark"
+    trap - EXIT
+    if ! healthy; then
+      # A node that did not answer before the backup is not failed by it.
+      [[ -z "$was_answering" ]] || fail "the node did not become healthy after the backup: docker logs openledger-node"
+      printf 'note: the node does not answer its health check (it did not before the backup either)\n' >&2
+    fi
+  fi
+  printf 'Backup %s (%s)%s.\n' "$file" "$(du -h "$file" | cut -f1)" \
+    "${was_running:+; the node was stopped $(( $(date +%s) - started ))s}" >&2
+  # The 14 newest are kept; only the command's own archives are counted, and
+  # never the one an upgrade can roll back to.
+  keep=$(rollback_backup) || keep=""
+  if [[ -e "$previous/info" && -z "$keep" ]]; then
+    # Fail closed: an unreadable record deletes nothing.
+    printf 'note: %s/info names no backup: none deleted\n' "$previous" >&2
+  else
+    for old in $(ls -1 "$backups"/openledger-*.tar.gz | LC_ALL=C sort | head -n -14); do
+      [[ "$old" == "$keep" ]] || rm -f "$old"
+    done
+  fi
+  printf '%s\n' "$file"
+}
+# The backup the last upgrade can roll back to, if any.
+rollback_backup() {
+  [[ -r "$previous/info" ]] || return 0
+  (BACKUP=""; . "$previous/info"; printf '%s' "$BACKUP")
+}
+mesh_rule() {
+  cat >&2 <<EOM
+Check each company: { verify { ok quarantined } } — ok true, quarantined empty — and a balance you know.
+On a mesh, make NO write here until this server has caught up with its peers: compare
+{ verify { nodesChecked } } with a peer's (OPERATIONS, Restoring a backup) — a write before then
+can reissue sequence numbers this server already signed.
+EOM
+}
+# The books as backup FILE has them: the node stopped, its data moved aside
+# (never deleted) and the backup's put in its place. With "start", the node
+# is started on it; a rollback starts the previous release on it instead, so
+# the newer one never boots on the restored books.
+restore_from() {
+  local file=$1 start=${2:-} stamp aside had_data prior=""
+  check_backup "$file"
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  aside="/var/lib/openledger/data.before-restore-$stamp"
+  [[ ! -e "$aside" ]] || fail "$aside exists already: try again in a second"
+  # After a restore cut short, the data in place is what it left — not to be
+  # put back or started — and its mark keeps naming the data from before it.
+  if [[ -e "$restoring_mark" ]]; then
+    prior=$(sed -n 1p "$restoring_mark")
+    # The data in place is not the original already: a rollback whose restore
+    # fails from here on stays unfinished.
+    books_touched=1
+  fi
+  printf '%s\n%s\n' "${prior:-$aside}" "$file" > "$restoring_mark" || fail "cannot write $restoring_mark"
+  if ! docker stop -t 60 openledger-node >/dev/null; then
+    [[ -n "$prior" ]] || rm -f "$restoring_mark"
+    fail "the node did not stop"
+  fi
+  # No data at all after a restore cut short right after this move.
+  had_data=""
+  if [[ -e /var/lib/openledger/data ]]; then
+    books_touched=1
+    mv /var/lib/openledger/data "$aside"
+    had_data=1
+  fi
+  if ! tar -xzf "$file" -C /var/lib/openledger data; then
+    rm -rf /var/lib/openledger/data
+    [[ -n "$had_data" && -z "$prior" ]] \
+      || fail "$file did not unpack, after a restore cut short: the node stays stopped; restore another backup (the data from before is in ${prior:-$aside})"
+    mv "$aside" /var/lib/openledger/data
+    books_touched=""
+    rm -f "$restoring_mark"
+    docker start openledger-node >/dev/null 2>&1 || true
+    fail "$file did not unpack: the data is as it was"
+  fi
+  chown -R "$(id -u openledger):$(id -g openledger)" /var/lib/openledger/data
+  chmod 0700 /var/lib/openledger/data
+  # The books are whole: from here a boot may start the node on them.
+  [[ -z "$start" ]] || : > "$stopped_mark" || fail "cannot write $stopped_mark"
+  rm -f "$restoring_mark"
+  if [[ -n "$prior" ]]; then
+    printf 'Restored %s. The data from before the restore that was cut short is in %s\n' "$file" "$prior" >&2
+    printf '(nothing was deleted; %s holds what that restore left).\n' "${had_data:+$aside}${had_data:-nothing}" >&2
+  elif [[ -n "$had_data" ]]; then
+    printf 'Restored %s. The data it replaced is in %s (nothing was deleted;\n' "$file" "$aside" >&2
+    printf 'a company added since the backup is there, not in the restored books).\n' >&2
+  else
+    printf 'Restored %s (there was no data before it).\n' "$file" >&2
+  fi
+  if [[ -n "$start" ]]; then
+    docker start openledger-node >/dev/null || fail "the node did not start: docker logs openledger-node"
+    rm -f "$stopped_mark"
+    healthy || fail "the node did not become healthy on the restored data: docker logs openledger-node"
+    mesh_rule
+  fi
+}
+# The installer's own options, for running it again (upgrade, rollback),
+# into the array `args`.
+installer_args() {
+  [[ -n "${DOMAIN:-}" && -n "${EMAIL:-}" ]] \
+    || fail "$settings has no DOMAIN or EMAIL: run the installer once more by hand (it writes them)"
+  args=(--domain "$DOMAIN" --email "$EMAIL")
+  if [[ -n "${TEST_TLS:-}" ]]; then args+=(--test-tls); fi
+  if [[ -n "${NO_FIREWALL:-}" ]]; then args+=(--no-firewall); fi
+  if [[ -n "${SSH_PORT:-}" ]]; then args+=(--ssh-port "$SSH_PORT"); fi
+}
 # The line given, or read from stdin (asked for on a terminal).
 line_arg() {  # what [given]
   if [[ $# -ge 2 ]]; then printf '%s' "$2"; return; fi
@@ -406,6 +641,17 @@ line_arg() {  # what [given]
 [[ $# -ge 1 ]] || { printf '%s\n' "$usage"; exit 2; }
 what=$1
 shift
+# One at a time: the nightly backup never stops the node in the middle of a
+# restore or an upgrade (its own backup runs in the same lock).
+case "$what" in
+  resume)
+    # At boot it waits (a missed night's backup may start beside it).
+    exec 9>/run/openledger.lock
+    flock -w 900 9 || fail "the lock stayed held for 15 min: openledger status" ;;
+  backup|restore|upgrade|rollback)
+    exec 9>/run/openledger.lock
+    flock -n 9 || fail "another backup, restore, upgrade or rollback is running: wait for it" ;;
+esac
 case "$what" in
   company)
     [[ $# -ge 1 ]] || fail "$usage"
@@ -443,13 +689,155 @@ $usage" ;;
     line=$(line_arg reply "$@")
     [[ -n "$line" ]] || fail "no reply given"
     node_line "$line" ledger accept - ;;
+  backup)
+    [[ $# -eq 0 ]] || fail "backup takes no arguments"
+    backup_now >/dev/null ;;
+  backups)
+    ls -lh "$backups"/openledger-*.tar.gz 2>/dev/null || printf 'No backups yet in %s.\n' "$backups" ;;
+  restore)
+    [[ $# -eq 1 ]] || fail "restore takes one backup FILE (openledger backups lists them)"
+    unfinished_rollback
+    restore_from "$1" start ;;
+  resume)
+    # At boot (openledger-resume.service): the node started again if a backup
+    # or a restore had it stopped when the server went down — never in the
+    # middle of a rollback.
+    if [[ -e "$rolling_mark" ]]; then
+      printf 'openledger: a rollback did not finish: the node stays stopped; run openledger rollback again\n' >&2
+      exit 0
+    fi
+    if [[ -e "$restoring_mark" ]]; then
+      printf 'openledger: a restore did not finish (%s): the node stays stopped; run openledger restore again\n' "$(restoring_what)" >&2
+      exit 0
+    fi
+    [[ -e "$stopped_mark" ]] || exit 0
+    docker start openledger-node >/dev/null || fail "the node did not start: docker logs openledger-node"
+    rm -f "$stopped_mark"
+    printf 'openledger: started the node a backup or restore had stopped when the server went down\n' >&2 ;;
+  upgrade)
+    version="" binary="" installer=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --version|--binary|--installer)
+          [[ $# -ge 2 ]] || fail "$1 needs a value"
+          case "$1" in --version) version=$2 ;; --binary) binary=$2 ;; --installer) installer=$2 ;; esac
+          shift 2 ;;
+        *) fail "unknown upgrade option $1" ;;
+      esac
+    done
+    [[ -n "$version" || -n "$binary" ]] || fail "upgrade needs --version X.Y.Z or --binary FILE"
+    [[ -z "$version" || -z "$binary" ]] || fail "give --version or --binary, not both"
+    [[ -z "$version" || "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "--version must be X.Y.Z"
+    unfinished_rollback
+    unfinished_restore
+    compose_is_ours \
+      || fail "/opt/openledger/compose.yml differs from what the installer last wrote: an upgrade would not change the image it names; undo the edit (or, if you took compose.yml.new, run the installer once more), then try again"
+    installer_args
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT
+    if [[ -z "$installer" ]]; then
+      if [[ -n "$version" ]]; then
+        # The release's own installer, checked against its SHA256SUMS.
+        base="https://github.com/accounting-app/p2pgl/releases/download/v$version"
+        curl --proto '=https' --tlsv1.2 -fsSL "$base/SHA256SUMS" -o "$work/SHA256SUMS" \
+          || fail "could not fetch $base/SHA256SUMS: is $version released, with its files attached?"
+        curl --proto '=https' --tlsv1.2 -fsSL "$base/install.sh" -o "$work/install.sh" \
+          || fail "could not fetch $base/install.sh"
+        grep -E '^[0-9a-f]{64}  install\.sh$' "$work/SHA256SUMS" > "$work/sum" \
+          || fail "the release's SHA256SUMS lists no install.sh"
+        (cd "$work" && sha256sum -c --quiet sum) || fail "install.sh does not match the release's SHA256SUMS"
+        installer="$work/install.sh"
+      else
+        installer=/opt/openledger/install.sh
+      fi
+    fi
+    [[ -f "$installer" ]] || fail "no installer at $installer"
+    [[ -f /opt/openledger/install.sh ]] \
+      || fail "no /opt/openledger/install.sh (the installer never ran to the end here): run it once more by hand, then upgrade"
+    image=$(image_now) || fail "no openledger-node container: run the installer"
+    # The release in use, from its image: the node need not be running.
+    before=$(docker run --rm "$image" --version) || fail "the node's image does not run: $image"
+    backup=$(backup_now) || fail "the backup before the upgrade failed: nothing was changed"
+    if [[ -e "$previous/pending" ]]; then
+      # An upgrade that did not finish: a rollback still goes back to what ran
+      # before it, with its backup.
+      # shellcheck disable=SC1091
+      VERSION=""; . "$previous/info"
+      printf 'The last upgrade did not finish: a rollback still goes back to %s, and its backup\n' "$VERSION" >&2
+      printf '%s (writes since then would be lost by a rollback; this one is in %s).\n' "$(rollback_backup)" "$backup" >&2
+    else
+      # What a rollback needs: the backup, and the binary, image and installer
+      # in use — the binary from the node's own container, so it is the one
+      # that ran, whatever the installer last wrote.
+      rm -rf "$previous.new" && install -d -m 0700 "$previous.new"
+      docker cp openledger-node:/usr/local/bin/gl-node "$previous.new/gl-node" >/dev/null \
+        || fail "could not copy the node's binary out of its container: nothing was changed"
+      chmod 0755 "$previous.new/gl-node"
+      install -m 0700 /opt/openledger/install.sh "$previous.new/install.sh"
+      # Sourced by rollback: quoted for the shell.
+      printf 'BACKUP=%q\nVERSION=%q\nIMAGE=%q\n' "$backup" "$before" "$image" > "$previous.new/info"
+      : > "$previous.new/pending"
+      rm -rf "$previous" && mv "$previous.new" "$previous"
+    fi
+    if [[ -n "$version" ]]; then args+=(--version "$version"); else args+=(--binary "$binary"); fi
+    bash "$installer" "${args[@]}" \
+      || fail "the upgrade failed; the node is $(where_node) (before the upgrade: $image). Fix the cause above and run it again, or go back: openledger rollback"
+    rm -f "$previous/pending"
+    [[ "$(image_now)" != "$image" ]] \
+      || printf 'note: the node runs the image it ran before (%s): the same binary?\n' "$image" >&2
+    printf '\nUpgraded: %s → %s. The books were backed up first (%s); openledger rollback goes back.\n' \
+      "$before" "$(node --version)" "$(rollback_backup)" ;;
+  rollback)
+    [[ $# -eq 0 ]] || fail "rollback takes no arguments"
+    [[ -f "$previous/info" ]] || fail "no upgrade to roll back (nothing in $previous)"
+    compose_is_ours \
+      || fail "/opt/openledger/compose.yml differs from what the installer last wrote: a rollback would not change the image it names; undo the edit, then try again"
+    installer_args
+    # shellcheck disable=SC1091
+    BACKUP="" VERSION="" IMAGE=""; . "$previous/info"
+    if [[ -e "$restored_mark" && ! -e "$restoring_mark" ]]; then
+      printf 'Going on with the rollback to %s: the books are restored already (%s).\n' "$VERSION" "$BACKUP" >&2
+    else
+      if [[ -e "$rolling_mark" ]]; then
+        printf 'Going on with the rollback to %s: its restore did not finish, so it is done again (%s).\n' "$VERSION" "$BACKUP" >&2
+      else
+        printf 'Rolling back to %s: the books as the backup before the upgrade has them (%s).\n' "$VERSION" "$BACKUP" >&2
+        printf 'Writes made since the upgrade are not in it: list them before going on.\n' >&2
+        if [[ -t 0 ]]; then
+          read -r -p 'Type rollback to go on: ' answer
+          [[ "$answer" == rollback ]] || fail "not rolled back"
+        fi
+        check_backup "$BACKUP"
+        : > "$rolling_mark" || fail "cannot write $rolling_mark"
+        # A restore that fails before it changes the books (or that puts them
+        # back) leaves no rollback unfinished: the newer release runs on its
+        # own books, as before.
+        books_touched=""
+        trap '[[ -n "$books_touched" ]] || rm -f "$rolling_mark"' EXIT
+      fi
+      # Kept stopped: the previous release starts on the restored books, never
+      # the newer one, which may change them as it boots.
+      restore_from "$BACKUP"
+      : > "$restored_mark"
+      trap - EXIT
+    fi
+    OPENLEDGER_ROLLBACK=1 bash "$previous/install.sh" "${args[@]}" --binary "$previous/gl-node" \
+      || fail "the previous release did not install: the books are restored, the node is $(where_node) (no backup or boot starts it); fix the cause above, then run openledger rollback again — it goes on from here"
+    if [[ -n "$IMAGE" && "$(image_now)" != "$IMAGE" ]]; then
+      docker stop -t 60 openledger-node >/dev/null 2>&1 || true
+      fail "the node runs $(image_now), not $IMAGE as before the upgrade: it is stopped; see docker compose -f /opt/openledger/compose.yml config"
+    fi
+    mv "$previous" "$previous.rolled-back-$(date -u +%Y%m%dT%H%M%SZ)"
+    printf '\nRolled back to %s, on the books of %s.\n' "$(node --version)" "$BACKUP"
+    mesh_rule ;;
   key)
     key=$(sed -n 's/^GL_NODE_API_KEY=//p' /opt/openledger/env)
     [[ -n "$key" ]] || fail "no GL_NODE_API_KEY in /opt/openledger/env"
     printf '%s\n' "$key" ;;
   status)
     docker compose -f /opt/openledger/compose.yml ps --format '  {{.Name}}: {{.Status}}'
-    printf '  node: %s\n' "$(node --version)"
+    printf '  node: %s\n' "$(node --version 2>/dev/null || printf 'NOT RUNNING')"
+    running || status=1
     tls=()
     if [[ -n "${TEST_TLS:-}" ]]; then
       tls=(--cacert /var/lib/openledger/caddy/data/caddy/pki/authorities/local/root.crt
@@ -462,14 +850,97 @@ $usage" ;;
       status=1
     fi
     printf '  data: %s\n' "$(du -sh /var/lib/openledger/data | cut -f1)"
+    if [[ -e "$rolling_mark" ]]; then
+      printf '  ROLLBACK NOT FINISHED: the node %s; run openledger rollback again\n' "$(where_node)"
+      status=1
+    elif [[ -e "$restoring_mark" ]]; then
+      printf '  RESTORE NOT FINISHED (%s): the data may be partial; run openledger restore again\n' "$(restoring_what)"
+      status=1
+    elif [[ -e "$previous/pending" ]]; then
+      printf '  UPGRADE NOT FINISHED: the node %s; run openledger upgrade again (or the installer), or openledger rollback\n' "$(where_node)"
+      status=1
+    fi
+    # The newest backup, and a warning (and a non-zero exit) past two days:
+    # a nightly backup that fails says so nowhere else.
+    newest=$(ls -1 "$backups"/openledger-*.tar.gz 2>/dev/null | LC_ALL=C sort | tail -n 1 || true)
+    if [[ -z "$newest" ]]; then
+      printf '  last backup: none yet (openledger backup takes one)\n'
+    else
+      age=$(( ($(date +%s) - $(stat -c %Y "$newest")) / 3600 ))
+      if (( age >= 48 )); then
+        printf '  last backup: %s, %sh ago: OLD — journalctl -u openledger-backup\n' "$newest" "$age"
+        status=1
+      else
+        printf '  last backup: %s, %sh ago\n' "$newest" "$age"
+      fi
+    fi
     printf '\n'
-    node ledger list
+    node ledger list || status=1
     exit "${status:-0}" ;;
   -h|--help|help) printf '%s\n' "$usage" ;;
   *) fail "unknown command $what
 $usage" ;;
 esac
 COMMAND
+
+step "nightly backups"
+put /etc/systemd/system/openledger-backup.service 0644 <<'EOF'
+# Written by the openledger installer: `openledger backup`, run by its timer.
+[Unit]
+Description=openledger backup (the node stops for seconds)
+Requires=docker.service
+After=docker.service openledger-resume.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/openledger backup
+EOF
+units_changed=$put_changed
+put /etc/systemd/system/openledger-backup.timer 0644 <<'EOF'
+# Written by the openledger installer: a backup every night (a missed one runs
+# at the next boot); `openledger backups` lists them, 14 are kept.
+[Unit]
+Description=nightly openledger backup
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+units_changed=$units_changed$put_changed
+# At boot: the node started again when the server went down while a backup
+# or a restore had it stopped (Docker leaves a container it was told to stop).
+put /etc/systemd/system/openledger-resume.service 0644 <<'EOF'
+# Written by the openledger installer: at boot, `openledger resume` starts the
+# node if a backup or a restore had stopped it when the server went down.
+[Unit]
+Description=openledger: start the node a backup or restore left stopped
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/openledger resume
+
+[Install]
+WantedBy=multi-user.target
+EOF
+units_changed=$units_changed$put_changed
+[[ -z "$units_changed" ]] || systemctl daemon-reload
+systemctl is-enabled --quiet openledger-resume.service 2>/dev/null \
+  || { systemctl enable openledger-resume.service >/dev/null 2>&1 \
+         || fail "could not enable openledger-resume.service"; did "openledger-resume.service enabled (at boot)"; }
+if systemctl is-enabled --quiet openledger-backup.timer 2>/dev/null \
+    && systemctl is-active --quiet openledger-backup.timer; then
+  same "timer openledger-backup.timer (nightly, into /var/lib/openledger/backups)"
+else
+  systemctl enable --now openledger-backup.timer >/dev/null 2>&1 \
+    || fail "the backup timer did not start: systemctl status openledger-backup.timer"
+  did "timer openledger-backup.timer: a backup every night into /var/lib/openledger/backups"
+fi
 
 # ── The firewall ──────────────────────────────────────────────────────────────
 step "firewall"
@@ -561,6 +1032,13 @@ done
 [[ "$health" == '{"status":"ok"}' ]] \
   || fail "https://$domain/health did not answer with a valid certificate (got: ${health:-nothing}): docker logs openledger-caddy"
 say "  https://$domain/health: $health"
+# This installer, once it has run to the end: what `openledger upgrade
+# --binary` runs, and what an upgrade keeps for a rollback — never one that
+# failed halfway.
+put "$ETC/install.sh" 0700 < "$self"
+# An upgrade this run completes (`openledger upgrade`, or the installer run
+# again by hand after one failed) is finished.
+rm -f "$ETC/previous/pending"
 
 step "done"
 if [[ $changes -eq 0 ]]; then
@@ -587,6 +1065,8 @@ cat <<EOF
 
   Manage:   sudo openledger company add NAME; sudo openledger person add NAME …;
             sudo openledger status (sudo openledger help for the rest)
-  Settings: $ETC   Data: $DATA (back it up; OPERATIONS, Backups)
+  Settings: $ETC   Data: $DATA
+  Backups:  nightly into /var/lib/openledger/backups (14 kept): copy them off
+            the server, encrypted — they hold the node's keys (OPERATIONS)
   Logs:     docker logs openledger-node, docker logs openledger-caddy
 EOF
