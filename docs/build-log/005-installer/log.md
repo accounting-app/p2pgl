@@ -513,4 +513,31 @@ to commit. The commit hash is filled in once the maintainer has committed.
   and pushes `v0.3.0`, makes the repository public and attaches the files in
   `target/release-dist/0.3.0/` to the release; then the real-network
   rehearsal, on a provider's servers with real domains.
+- **Commit:** fbcb390
+
+## 2026-10-23 — Step 7, unit 2: 0.3.0's dependencies (cargo audit)
+
+- **What happened:** `scripts/release.sh` on the 0.3.0 commit (fbcb390)
+  passed the gate, then stopped at `cargo audit`: four advisories published
+  2026-10-19 to 10-23 — RUSTSEC-2026-0382 (`rustls-webpki` 0.103.15, under
+  rustls), 0381 (`webpki-roots` 1.0.9, under iroh-relay), 0385 (`ctutils`
+  0.4.2, under iroh), all compiled into the node, and 0383
+  (`webpki-root-certs` 1.0.9, in `Cargo.lock` through
+  `rustls-platform-verifier` for wasm32 and as a dev-dependency, not
+  compiled for the shipped targets) — and a new
+  *unsound* warning, 0386 (`tokio` 1.53.1, `AsyncFd`'s constructors; no code
+  of ours calls them).
+- **What changed:** `Cargo.lock` only — those five crates to the nearest
+  patched versions (`cargo update -p … `, tokio `--precise 1.53.3` to stay on
+  its minor): `rustls-webpki` 0.103.16, `webpki-roots` and
+  `webpki-root-certs` 1.0.11, `ctutils` 0.4.5, `tokio` 1.53.3. `cargo audit`
+  then finds no vulnerability; one allowed warning remains, `paste`
+  unmaintained (RUSTSEC-2024-0436, as in 0.2.0). The resolve also moved six
+  Windows-only edges from `windows-sys` 0.61.2 to 0.52.0 (both already in
+  the lock; nothing added or removed; no Linux or macOS binary changes).
+  CHANGELOG `[0.3.0]` *Security*. `webpki-root-certs` could have gone into
+  `.cargo/audit.toml` as not compiled; updating it was simpler and leaves
+  nothing to retire. Reviewer: nothing Important; the first wording called
+  every crate compiled in and missed the `windows-sys` edges (Minor), fixed.
+- **Gate:** `scripts/gate.sh` passed, 0 failed. The machine slept mid-run, and a second run started on wake overlapped the first, resumed: both passed (`cargo test` exit 0, no failing test), but they wrote one `tests.log`, so their test counts (1,642 and 1,672) are not reliable. `release.sh` runs the gate again on the committed tree, alone.
 - **Commit:** —
