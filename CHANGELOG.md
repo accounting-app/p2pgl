@@ -66,6 +66,15 @@ before relying on it.
 
 ### Security
 
+- **rustls-webpki 0.103.16, webpki-roots and webpki-root-certs 1.0.11,
+  ctutils 0.4.5, tokio 1.53.3** (from 0.103.15, 1.0.9, 0.4.2 and 1.53.1):
+  RUSTSEC-2026-0382 (certificate verification under the TLS library could
+  accept distrusted intermediates), 0381 (`webpki-roots`, used by iroh's
+  relay client, trusted distrusted emSign intermediates), 0385
+  (non-constant-time comparisons in a crate under iroh), and 0386 (`tokio`'s
+  `AsyncFd` constructors unsound; this workspace calls none of them itself).
+  0383 is the same fault in `webpki-root-certs`, which is in `Cargo.lock` but
+  not compiled for the shipped targets; it is updated anyway.
 - **`/health` behind a proxy on the same host tells strangers `ok` and nothing
   else** (L-09, 005 step 2): a loopback node decided its `/health` detail by
   its bind, so a proxy on its own host served its version, heads and peer
