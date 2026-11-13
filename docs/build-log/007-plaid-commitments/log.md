@@ -282,4 +282,39 @@ to commit. The commit hash is filled in once the maintainer has committed.
   the close check); the connect checks R2, R9, R16, R18, R22, R34 rerun
   after the change to `connect` — 6 of 6 bite.
 - **Departures from the plan:** none (step 6b added to `plan.md`).
+- **Commit:** e0bad7b
+
+## 2026-11-13 — Endpoints for a proof of concept (step 6c)
+
+- **What changed:** decision 11. A bank's stored description gains
+  `last_synced_at` and `last_error_code`; `PlaidService::note_health` sets
+  them (best effort) — `syncBank` clears the code and notes the time when it
+  finishes, and keeps Plaid's code when `/transactions/sync` refuses.
+  `connectedBanks` shows `lastSyncedAt` and `lastErrorCode`.
+  `refreshBankAccounts(itemId)` (`refresh_accounts`: the bank's token as for
+  update mode, `/accounts/get` again, new accounts added unmapped, known ones
+  renamed with their mappings kept, accounts Plaid no longer lists kept).
+  `unmapBankAccount(itemId, accountId)` (`unmap_account`: mapping and start
+  cleared, refused while the bank syncs). Sandbox only, refused with
+  `PLAID_SANDBOX_ONLY` and nothing sent elsewhere:
+  `connectSandboxBank(institutionId = "ins_109508")`
+  (`/sandbox/public_token/create`, then the usual `connect`) and
+  `resetSandboxLogin(itemId)` (`/sandbox/item/reset_login`). All four
+  mutations admin only. README *How each bank is doing*, *Accounts*, *A demo
+  in Plaid's sandbox*; CHANGELOG *Added*.
+- **Review:** one important finding, fixed: a refresh racing a disconnect
+  wrote a bare description back for a bank whose token was gone — listed,
+  uncountable down, blocking removal for good; the refresh now re-checks the
+  token under the store lock and writes nothing then (PL-R75). Also: only a
+  sync that read Plaid to the end clears the error code (`finished`); the
+  README no longer claims `PRODUCT_NOT_READY` from `/transactions/sync`;
+  revert checks for `a_banks_health_is_kept`, the sandbox connect and the
+  demo test (R76–R78); an error code kept to 64 characters, an empty one as
+  `UNKNOWN`; the sandbox connect refused once the ledger is closing; the
+  module and `closed` docs name the new operations. These fixes were not
+  reviewed again; each has its test and revert check.
+- **Gate:** `scripts/gate.sh` — 1714 passed, 0 failed, 0 ignored.
+- **Revert checks:** `scripts/revert_specs/plaid.json` PL-R65..R78 — 14 of 14
+  bite; PL-R49 re-anchored (its line now also in `unmap_account`) — bites.
+- **Departures from the plan:** none (step 6c added to `plan.md`).
 - **Commit:** —

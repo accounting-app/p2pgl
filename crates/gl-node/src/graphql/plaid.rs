@@ -32,6 +32,12 @@ pub struct ConnectedBank {
     /// The UTC date it was connected (`YYYY-MM-DD`); null when its
     /// description could not be stored or read.
     pub connected_on: Option<String>,
+    /// When a sync of it last finished (RFC 3339, UTC); null before the first.
+    pub last_synced_at: Option<String>,
+    /// Plaid's error code from the last sync Plaid refused — above all
+    /// `ITEM_LOGIN_REQUIRED`: open Link with `createPlaidLinkToken(itemId)`.
+    /// Null once a sync finishes.
+    pub last_error_code: Option<String>,
     pub accounts: Vec<BankAccount>,
 }
 
@@ -57,6 +63,8 @@ impl From<BankConnection> for ConnectedBank {
             item_id: connection.item_id,
             institution_name: connection.institution_name,
             connected_on: connection.connected_on,
+            last_synced_at: connection.last_synced_at,
+            last_error_code: connection.last_error_code,
             accounts: connection
                 .accounts
                 .into_iter()
@@ -131,6 +139,48 @@ pub(super) async fn create_link_token(
 pub(super) async fn connect_bank(ctx: &Context<'_>, public_token: String) -> Result<ConnectedBank> {
     let connection = service(ctx)?.connect(public_token).await.map_err(failed)?;
     Ok(connection.into())
+}
+
+pub(super) async fn refresh_bank_accounts(
+    ctx: &Context<'_>,
+    item_id: String,
+) -> Result<ConnectedBank> {
+    let connection = service(ctx)?
+        .refresh_accounts(&item_id)
+        .await
+        .map_err(failed)?;
+    Ok(connection.into())
+}
+
+pub(super) async fn unmap_bank_account(
+    ctx: &Context<'_>,
+    item_id: String,
+    account_id: String,
+) -> Result<ConnectedBank> {
+    let connection = service(ctx)?
+        .unmap_account(&item_id, &account_id)
+        .await
+        .map_err(failed)?;
+    Ok(connection.into())
+}
+
+pub(super) async fn connect_sandbox_bank(
+    ctx: &Context<'_>,
+    institution_id: String,
+) -> Result<ConnectedBank> {
+    let connection = service(ctx)?
+        .connect_sandbox(&institution_id)
+        .await
+        .map_err(failed)?;
+    Ok(connection.into())
+}
+
+pub(super) async fn reset_sandbox_login(ctx: &Context<'_>, item_id: String) -> Result<bool> {
+    service(ctx)?
+        .reset_sandbox_login(&item_id)
+        .await
+        .map_err(failed)?;
+    Ok(true)
 }
 
 pub(super) async fn disconnect_bank(ctx: &Context<'_>, item_id: String) -> Result<bool> {
@@ -331,11 +381,20 @@ pub(super) async fn sync_bank(ctx: &Context<'_>, item_id: String) -> Result<Bank
     let mut held = held_imports(ledger, &suspense).await;
     let mut sync = BankSync::default();
     let mut stored_a_page = false;
+    let mut finished = false;
     loop {
         let page = match plaid.next_page(&mut session).await {
             Ok(Some(page)) => page,
-            Ok(None) => break,
-            Err(error) => return stopped(sync, &item_id, stored_a_page, failed(error)),
+            Ok(None) => {
+                finished = true;
+                break;
+            }
+            Err(error) => {
+                if let Some(code) = error.plaid_code() {
+                    plaid.note_health(&item_id, Some(code)).await;
+                }
+                return stopped(sync, &item_id, stored_a_page, failed(error));
+            }
         };
         sync.skipped_pending += page.pending;
         for (id, reason) in &page.unreadable {
@@ -462,6 +521,11 @@ pub(super) async fn sync_bank(ctx: &Context<'_>, item_id: String) -> Result<Bank
             Ok(false) => break,
             Err(error) => return stopped(sync, &item_id, stored_a_page, failed(error)),
         }
+    }
+    // Only a sync that read Plaid to the end clears the bank's error code:
+    // one ended by a disconnect or a moved cursor says nothing of its health.
+    if finished {
+        plaid.note_health(&item_id, None).await;
     }
     tracing::info!(
         item_id = %item_id,
@@ -618,12 +682,23 @@ mod tests {
             r#"mutation {{ mapBankAccount(itemId: "{ITEM_ID}", accountId: "acc1", ledgerAccount: "Assets:Bank") {{ itemId }} }}"#
         );
         let sync = sync();
+        let refresh =
+            format!(r#"mutation {{ refreshBankAccounts(itemId: "{ITEM_ID}") {{ itemId }} }}"#);
+        let unmap = format!(
+            r#"mutation {{ unmapBankAccount(itemId: "{ITEM_ID}", accountId: "acc1") {{ itemId }} }}"#
+        );
+        let sandbox = "mutation { connectSandboxBank { itemId } }";
+        let reset = format!(r#"mutation {{ resetSandboxLogin(itemId: "{ITEM_ID}") }}"#);
         for query in [
             LINK,
             CONNECT,
             disconnect.as_str(),
             map.as_str(),
             sync.as_str(),
+            refresh.as_str(),
+            unmap.as_str(),
+            sandbox,
+            reset.as_str(),
         ] {
             let body = run(&fixture.schema, Role::Write, query).await;
             assert_eq!(code(&body), Some("FORBIDDEN"), "{query}: {body}");
@@ -1315,5 +1390,119 @@ mod tests {
             code(&operator(&fixture.schema, unknown).await),
             Some("NO_SUCH_BANK")
         );
+    }
+
+    const HEALTH: &str = "{ connectedBanks { itemId lastSyncedAt lastErrorCode } }";
+
+    /// `connectedBanks` shows when a bank last synced, and the code of a sync
+    /// Plaid refused until one finishes again.
+    ///
+    /// Bug-catch: a sync that does not record a refusal leaves the app
+    /// showing a bank as fine while its login has expired.
+    #[tokio::test]
+    async fn connected_banks_show_how_each_bank_synced() {
+        let fixture = mapped(true).await;
+        let banks = operator(&fixture.schema, HEALTH).await;
+        assert!(
+            banks["data"]["connectedBanks"][0]["lastSyncedAt"].is_null(),
+            "{banks}"
+        );
+
+        operator(&fixture.schema, &sync()).await;
+        let banks = operator(&fixture.schema, HEALTH).await;
+        assert!(
+            banks["data"]["connectedBanks"][0]["lastSyncedAt"].is_string(),
+            "{banks}"
+        );
+
+        fixture.mock.sync_error(400, "ITEM_LOGIN_REQUIRED");
+        let body = operator(&fixture.schema, &sync()).await;
+        assert_eq!(
+            body["errors"][0]["extensions"]["plaidCode"],
+            "ITEM_LOGIN_REQUIRED"
+        );
+        let banks = operator(&fixture.schema, HEALTH).await;
+        assert_eq!(
+            banks["data"]["connectedBanks"][0]["lastErrorCode"], "ITEM_LOGIN_REQUIRED",
+            "{banks}"
+        );
+
+        operator(&fixture.schema, &sync()).await;
+        let banks = operator(&fixture.schema, HEALTH).await;
+        assert!(
+            banks["data"]["connectedBanks"][0]["lastErrorCode"].is_null(),
+            "{banks}"
+        );
+    }
+
+    /// The whole demo over GraphQL: a sandbox bank connected without Link,
+    /// mapped, synced; its login reset and a login-again token made; its
+    /// accounts read again and one unmapped.
+    ///
+    /// Bug-catch: any field of the demo missing from the schema stops a demo
+    /// user at that step.
+    #[tokio::test]
+    async fn a_sandbox_demo_runs_end_to_end() {
+        let fixture = fixture(true).await;
+        for (account, date) in [
+            ("Assets:Bank:Checking", "2026-01-01"),
+            ("Expenses:Uncategorized", "2026-01-01"),
+        ] {
+            let open = format!(r#"mutation {{ openAccount(name: "{account}", date: "{date}") }}"#);
+            assert!(operator(&fixture.schema, &open).await["errors"].is_null());
+        }
+        let body = operator(
+            &fixture.schema,
+            "mutation { connectSandboxBank { itemId institutionName accounts { accountId } } }",
+        )
+        .await;
+        assert_eq!(
+            body["data"]["connectSandboxBank"]["itemId"], ITEM_ID,
+            "{body}"
+        );
+        let map = format!(
+            r#"mutation {{ mapBankAccount(itemId: "{ITEM_ID}", accountId: "acc1", ledgerAccount: "Assets:Bank:Checking") {{ itemId }} }}"#
+        );
+        assert!(operator(&fixture.schema, &map).await["errors"].is_null());
+        fixture.mock.sync_page(page(
+            vec![mock::sync_transaction(
+                "t1",
+                "acc1",
+                4.5,
+                "2026-11-01",
+                false,
+            )],
+            vec![],
+            vec![],
+        ));
+        let body = operator(&fixture.schema, &sync()).await;
+        assert_eq!(body["data"]["syncBank"]["imported"], 1, "{body}");
+
+        let reset = format!(r#"mutation {{ resetSandboxLogin(itemId: "{ITEM_ID}") }}"#);
+        assert_eq!(
+            operator(&fixture.schema, &reset).await["data"]["resetSandboxLogin"],
+            true
+        );
+        let relink =
+            format!(r#"mutation {{ createPlaidLinkToken(itemId: "{ITEM_ID}") {{ linkToken }} }}"#);
+        assert!(operator(&fixture.schema, &relink).await["errors"].is_null());
+        let refresh = format!(
+            r#"mutation {{ refreshBankAccounts(itemId: "{ITEM_ID}") {{ accounts {{ accountId ledgerAccount }} }} }}"#
+        );
+        let body = operator(&fixture.schema, &refresh).await;
+        assert_eq!(
+            body["data"]["refreshBankAccounts"]["accounts"][0]["ledgerAccount"],
+            "Assets:Bank:Checking",
+            "{body}"
+        );
+        let unmap = format!(
+            r#"mutation {{ unmapBankAccount(itemId: "{ITEM_ID}", accountId: "acc1") {{ accounts {{ ledgerAccount }} }} }}"#
+        );
+        let body = operator(&fixture.schema, &unmap).await;
+        assert!(
+            body["data"]["unmapBankAccount"]["accounts"][0]["ledgerAccount"].is_null(),
+            "{body}"
+        );
+        assert!(!body.to_string().contains(ACCESS_TOKEN));
     }
 }

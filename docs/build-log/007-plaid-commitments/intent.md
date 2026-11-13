@@ -108,3 +108,10 @@ may ask for evidence.
     ledger account was opened) and older transactions are skipped; an entry
     the ledger refuses for what it says is listed for review with its Plaid
     id and the reason, and the sync goes on.
+11. **A proof of concept with demo users** (2026-11-13): the maintainer asked
+    for "the integration and all the endpoints needed" for it. Read as: bank
+    health in `connectedBanks`, refreshing and unmapping accounts, and
+    sandbox-only helpers so demo users can connect a test bank and demo an
+    expired login without a client app's Link. Webhooks stay out (a public
+    route and Plaid's signed JWTs; on-demand sync suffices for a proof of
+    concept); MFA in the client app stays on hold.

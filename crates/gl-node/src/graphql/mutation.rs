@@ -282,6 +282,51 @@ impl MutationRoot {
         .await
     }
 
+    /// Read a connected bank's accounts from Plaid again: accounts the bank
+    /// added since it was connected appear (unmapped), known ones keep their
+    /// mappings (007 step 6c). Admin only.
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
+    async fn refresh_bank_accounts(
+        &self,
+        ctx: &Context<'_>,
+        item_id: String,
+    ) -> Result<super::plaid::ConnectedBank> {
+        super::plaid::refresh_bank_accounts(ctx, item_id).await
+    }
+
+    /// Stop importing a bank account: its mapping cleared (007 step 6c).
+    /// Refused while its bank syncs. Admin only.
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
+    async fn unmap_bank_account(
+        &self,
+        ctx: &Context<'_>,
+        item_id: String,
+        account_id: String,
+    ) -> Result<super::plaid::ConnectedBank> {
+        super::plaid::unmap_bank_account(ctx, item_id, account_id).await
+    }
+
+    /// Connect one of Plaid's sandbox test banks without Link, for demos
+    /// (007 step 6c); `ins_109508` is Plaid's "First Platypus Bank". Refused
+    /// (`PLAID_SANDBOX_ONLY`) unless `plaid.environment` is `sandbox`. Admin
+    /// only.
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
+    async fn connect_sandbox_bank(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = "ins_109508")] institution_id: String,
+    ) -> Result<super::plaid::ConnectedBank> {
+        super::plaid::connect_sandbox_bank(ctx, institution_id).await
+    }
+
+    /// Make a sandbox bank need a new login (`ITEM_LOGIN_REQUIRED` at its
+    /// next sync), to show logging in again (007 step 6c). Sandbox only.
+    /// Admin only.
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
+    async fn reset_sandbox_login(&self, ctx: &Context<'_>, item_id: String) -> Result<bool> {
+        super::plaid::reset_sandbox_login(ctx, item_id).await
+    }
+
     /// Import a bank's new posted transactions: one entry each, flagged `!`,
     /// against `plaid.suspenseAccount` (007 step 6). Run it again any time:
     /// what the books hold already is skipped. Admin only.

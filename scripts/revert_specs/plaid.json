@@ -344,8 +344,8 @@
   },
   "PL-R49-mapping-during-a-sync": {
     "file": "crates/gl-node/src/plaid.rs",
-    "old": "if self.is_syncing(item_id) {",
-    "new": "if false {",
+    "old": "        // seen, and would otherwise import with the old one.\n        if self.is_syncing(item_id) {",
+    "new": "        // seen, and would otherwise import with the old one.\n        if false {",
     "runs": [["-p", "gl-node", "--bin", "gl-node", "a_mapping_waits_for_no_sync"]]
   },
   "PL-R50-mapped-to-the-suspense-account": {
@@ -437,5 +437,89 @@
     "old": "    async fn token_for_update(&self, item_id: &str) -> Result<Secret, PlaidError> {\n        let closed = self.closed.read().await;\n        if *closed {",
     "new": "    async fn token_for_update(&self, item_id: &str) -> Result<Secret, PlaidError> {\n        let closed = self.closed.read().await;\n        if false && *closed {",
     "runs": [["-p", "gl-node", "--bin", "gl-node", "a_login_again_link_token_needs_a_bank_of_this_ledger"]]
+  },
+  "PL-R65-a-refusal-not-kept-on-the-bank": {
+    "file": "crates/gl-node/src/graphql/plaid.rs",
+    "old": "                    plaid.note_health(&item_id, Some(code)).await;\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "connected_banks_show_how_each_bank_synced"]]
+  },
+  "PL-R66-a-finished-sync-not-kept-on-the-bank": {
+    "file": "crates/gl-node/src/graphql/plaid.rs",
+    "old": "    plaid.note_health(&item_id, None).await;\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "connected_banks_show_how_each_bank_synced"]]
+  },
+  "PL-R67-refresh-replaces-the-accounts": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "        for account in fresh {",
+    "new": "        connection.accounts.clear();\n        for account in fresh {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "refreshing_accounts_adds_new_ones_and_keeps_mappings"]]
+  },
+  "PL-R68-unmapping-during-a-sync": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "        let mut store = self.store.lock().await;\n        if self.is_syncing(item_id) {",
+    "new": "        let mut store = self.store.lock().await;\n        if false {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "unmapping_stops_an_account"]]
+  },
+  "PL-R69-sandbox-connect-on-production": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "            return Err(PlaidError::SandboxOnly);\n        }\n        check_id(\"institution_id\", institution_id)?;",
+    "new": "        }\n        check_id(\"institution_id\", institution_id)?;",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "the_sandbox_helpers_stay_in_the_sandbox"]]
+  },
+  "PL-R70-sandbox-reset-on-production": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "            return Err(PlaidError::SandboxOnly);\n        }\n        let access_token = self.token_for_update(item_id).await?;\n        let _: Value",
+    "new": "        }\n        let access_token = self.token_for_update(item_id).await?;\n        let _: Value",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "the_sandbox_helpers_stay_in_the_sandbox"]]
+  },
+  "PL-R71-refresh-not-admin-only": {
+    "file": "crates/gl-node/src/access_control.rs",
+    "old": "    \"refreshBankAccounts\",\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "plaid_mutations_need_an_admin_key"]]
+  },
+  "PL-R72-unmap-not-admin-only": {
+    "file": "crates/gl-node/src/access_control.rs",
+    "old": "    \"unmapBankAccount\",\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "plaid_mutations_need_an_admin_key"]]
+  },
+  "PL-R73-sandbox-connect-not-admin-only": {
+    "file": "crates/gl-node/src/access_control.rs",
+    "old": "    \"connectSandboxBank\",\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "plaid_mutations_need_an_admin_key"]]
+  },
+  "PL-R74-sandbox-reset-not-admin-only": {
+    "file": "crates/gl-node/src/access_control.rs",
+    "old": "    \"resetSandboxLogin\",\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "plaid_mutations_need_an_admin_key"]]
+  },
+  "PL-R75-refresh-writes-back-a-disconnected-bank": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "        if store.get(&token_name(item_id))?.is_none() {\n            return Err(PlaidError::NoSuchBank(format!(\n                \"this ledger has no bank {item_id:?} (disconnected)\"",
+    "new": "        if false {\n            return Err(PlaidError::NoSuchBank(format!(\n                \"this ledger has no bank {item_id:?} (disconnected)\"",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_refresh_racing_a_disconnect_leaves_nothing"]]
+  },
+  "PL-R76-a-finished-sync-keeps-the-old-code": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "                connection.last_error_code = None;\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_banks_health_is_kept"]]
+  },
+  "PL-R77-sandbox-connect-skips-the-connect": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "        self.connect(created.public_token).await\n",
+    "new": "        Ok(BankConnection::bare(created.public_token))\n",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_sandbox_bank_connects_without_link"]]
+  },
+  "PL-R78-a-demo-field-missing": {
+    "file": "crates/gl-node/src/graphql/mutation.rs",
+    "old": "    async fn reset_sandbox_login(&self, ctx: &Context<'_>, item_id: String) -> Result<bool> {",
+    "new": "    async fn reset_sandbox_login_now(&self, ctx: &Context<'_>, item_id: String) -> Result<bool> {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_sandbox_demo_runs_end_to_end"]]
   }
 }

@@ -80,6 +80,10 @@ pub const ADMIN_FIELDS: &[&str] = &[
     "disconnectBank",
     "mapBankAccount",
     "syncBank",
+    "refreshBankAccounts",
+    "unmapBankAccount",
+    "connectSandboxBank",
+    "resetSandboxLogin",
 ];
 
 /// The schema extension that enforces [`Role`]s; see the module doc.

@@ -89,6 +89,16 @@ own root-only file, left out of backups; the importing node chosen by
    — so an expired login is fixed on the same item; nothing to exchange
    after. Refused for a bank this ledger does not hold or a token of another
    environment, before anything is sent.
+6c. **Endpoints for a proof of concept** (decision 11). `connectedBanks`
+   shows each bank's `lastSyncedAt` and `lastErrorCode` (recorded by
+   `syncBank`: a finished sync clears the code, a Plaid refusal sets it).
+   `refreshBankAccounts(itemId)` reads the bank's accounts again and adds new
+   ones, mappings kept. `unmapBankAccount(itemId, accountId)` stops an
+   account's import (refused while its bank syncs). Sandbox only (refused
+   with `PLAID_SANDBOX_ONLY` elsewhere, nothing sent):
+   `connectSandboxBank(institutionId)` (`/sandbox/public_token/create`, then
+   the usual connect) and `resetSandboxLogin(itemId)`
+   (`/sandbox/item/reset_login`). All admin only.
 7. **Operations checklist** (no code; the maintainer, dated records in a
    private folder): MFA on GitHub, hosting, registrar, email and the Plaid
    Dashboard; disk encryption on servers and workstations; first quarterly

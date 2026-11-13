@@ -1241,8 +1241,20 @@ connecting again instead makes a new connection, whose history would be
 imported a second time (*Importing transactions*). A bank this ledger does not
 hold is refused (`NO_SUCH_BANK`); its token must be of `plaid.environment`.
 
-`createPlaidLinkToken`, `connectBank`, `disconnectBank`, `mapBankAccount` and
-`syncBank` need an **admin** key. Refusals carry a code: `PLAID_NOT_ENABLED`,
+**How each bank is doing.** `connectedBanks { lastSyncedAt lastErrorCode }`
+gives when a sync of the bank last finished and the Plaid code of the last
+sync Plaid refused — `ITEM_LOGIN_REQUIRED` means log in again — cleared by the
+next sync that finishes.
+
+**Accounts.** `refreshBankAccounts(itemId)` reads the bank's accounts from
+Plaid again: one opened since the bank was connected appears, unmapped, and
+the accounts already known keep their mappings (one Plaid no longer lists is
+kept). `unmapBankAccount(itemId, accountId)` stops an account's import; it is
+refused while the bank syncs (`SYNC_IN_PROGRESS`).
+
+All the Plaid mutations — `createPlaidLinkToken`, `connectBank`,
+`disconnectBank`, `mapBankAccount`, `unmapBankAccount`, `refreshBankAccounts`,
+`syncBank` and the sandbox helpers below — need an **admin** key. Refusals carry a code: `PLAID_NOT_ENABLED`,
 `BANK_ALREADY_CONNECTED` (Link connected a bank this ledger holds already, the
 same institution and accounts: the new connection is removed at Plaid),
 `NO_SUCH_BANK`, `ACCOUNT_NOT_OPEN`, `SYNC_IN_PROGRESS` (one sync of a bank at
@@ -1328,6 +1340,31 @@ synced (none for the operator key) — and the token never is.
 
 Keep `plaid.enabled` on one node of the mesh: two importing nodes that sync
 before each other's entries reach them each write the same transaction.
+
+#### A demo in Plaid's sandbox
+
+For a proof of concept with demo users, a ledger with `"plaid": { "enabled":
+true, "environment": "sandbox" }` and sandbox credentials needs no client app
+and no Link. With an admin key:
+
+```graphql
+mutation { openAccount(name: "Assets:Bank:Checking", date: "2026-01-01") }
+mutation { openAccount(name: "Expenses:Uncategorized", date: "2026-01-01") }
+mutation { connectSandboxBank { itemId institutionName accounts { accountId name mask } } }
+mutation { mapBankAccount(itemId: "…", accountId: "…", ledgerAccount: "Assets:Bank:Checking") { itemId } }
+mutation { syncBank(itemId: "…") { imported needsReview { transactionId reason } stoppedBy } }
+mutation { resetSandboxLogin(itemId: "…") }
+```
+
+`connectSandboxBank(institutionId)` connects one of Plaid's test banks
+(default `ins_109508`, First Platypus Bank) through Plaid's
+`/sandbox/public_token/create` and the usual connect, so the token is kept as
+for a real bank. A new sandbox bank may take a minute before its transactions
+are ready: a sync before then imports nothing; sync again. `resetSandboxLogin(itemId)` makes the bank
+need a new login, so the next sync shows `ITEM_LOGIN_REQUIRED` and
+`createPlaidLinkToken(itemId)` can be shown. Both are refused with
+`PLAID_SANDBOX_ONLY`, nothing sent, unless `plaid.environment` is `sandbox`.
+Webhooks are not served: sync on demand.
 
 ### Several ledgers
 

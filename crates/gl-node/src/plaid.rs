@@ -1,6 +1,8 @@
 //! Bank connections through Plaid (`docs/build-log/007-plaid-commitments`,
-//! steps 5 and 6): open Link, connect a bank, list connected banks, disconnect
-//! one, map its accounts to ledger accounts and page its transactions in.
+//! steps 5 to 6c): open Link (a new bank, or logging in again to one), connect
+//! a bank, list connected banks and their health, disconnect one, read its
+//! accounts again, map and unmap them, page its transactions in, and — in
+//! Plaid's sandbox — connect a test bank or reset its login for demos.
 //!
 //! One node per company holds them (`plaid.enabled` in that ledger's config;
 //! [`crate::config::PlaidConfig`]). The access token Plaid issues for each
@@ -23,7 +25,8 @@
 //!   token Plaid has just issued;
 //! - the store lock is held for store work only, never across a call to Plaid;
 //! - [`PlaidService::close`] waits for every bank operation under way (a
-//!   connect, a disconnect, a mapping, a page fetched or stored) and refuses
+//!   connect, a disconnect, a mapping or unmapping, an accounts refresh, a
+//!   page fetched or stored, a health note) and refuses
 //!   new ones: a ledger stops, restarts or is removed only after it,
 //!   so a second store instance never opens beside a live one and a removal
 //!   judges the store when nothing more can be added to it.
@@ -167,6 +170,8 @@ pub(crate) enum PlaidError {
     NoSuchBank(String),
     /// The bank is being synced: a mapping changed under a sync would be lost.
     SyncInProgress,
+    /// A helper of Plaid's sandbox, asked of a ledger on another environment.
+    SandboxOnly,
 }
 
 impl fmt::Display for PlaidError {
@@ -202,6 +207,9 @@ impl fmt::Display for PlaidError {
             Self::SyncInProgress => f.write_str(
                 "this bank is being synced; try again once the sync ends",
             ),
+            Self::SandboxOnly => f.write_str(
+                "this is a helper of Plaid's sandbox, and this ledger is not on it (plaid.environment)",
+            ),
         }
     }
 }
@@ -227,6 +235,7 @@ impl PlaidError {
             Self::AlreadyConnected { .. } => "BANK_ALREADY_CONNECTED",
             Self::NoSuchBank(_) => "NO_SUCH_BANK",
             Self::SyncInProgress => "SYNC_IN_PROGRESS",
+            Self::SandboxOnly => "PLAID_SANDBOX_ONLY",
         }
     }
 
@@ -409,6 +418,11 @@ struct Institution {
 
 #[derive(Deserialize)]
 struct Removed {}
+
+#[derive(Deserialize)]
+struct SandboxPublicToken {
+    public_token: String,
+}
 
 /// The most `/transactions/sync` pages one sync reads: years of a
 /// busy account's history fit; a loop that never ends does not.
@@ -610,6 +624,13 @@ pub(crate) struct BankConnection {
     /// description could not be stored or read.
     pub connected_on: Option<String>,
     pub accounts: Vec<BankAccount>,
+    /// When a sync of it last finished (RFC 3339, UTC).
+    #[serde(default)]
+    pub last_synced_at: Option<String>,
+    /// Plaid's error code from its last sync that Plaid refused
+    /// (`ITEM_LOGIN_REQUIRED`: log in again), cleared by a sync that finishes.
+    #[serde(default)]
+    pub last_error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -640,6 +661,8 @@ impl BankConnection {
             institution_name: None,
             connected_on: None,
             accounts: Vec::new(),
+            last_synced_at: None,
+            last_error_code: None,
         }
     }
 }
@@ -712,8 +735,9 @@ pub(crate) struct PlaidService {
     /// The ledger's one store instance (`crate::secret_store`): every read and
     /// write goes through this lock, held for store work only.
     store: tokio::sync::Mutex<SecretStore>,
-    /// `true` once [`Self::close`] ran. Every connect and disconnect holds a
-    /// read guard from start to end; `close` takes the write side.
+    /// `true` once [`Self::close`] ran. Every bank operation holds a read guard
+    /// while it works with the store (a connect or disconnect from start to
+    /// end); `close` takes the write side.
     closed: tokio::sync::RwLock<bool>,
     /// The banks being synced now ([`Self::begin_sync`]).
     syncing: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -1330,6 +1354,190 @@ impl PlaidService {
         })
     }
 
+    /// Record how bank `item_id`'s sync went (step 6c), for `connectedBanks`:
+    /// `None` a sync that finished (its time noted, any error code cleared),
+    /// `Some(code)` Plaid's refusal. Best effort: a bank gone or a store that
+    /// cannot be written is logged, never a failed sync.
+    pub(crate) async fn note_health(&self, item_id: &str, error_code: Option<&str>) {
+        let closed = self.closed.read().await;
+        if *closed {
+            return;
+        }
+        let mut store = self.store.lock().await;
+        let described = match store.get(&info_name(item_id)) {
+            Ok(Some(text)) => serde_json::from_str::<BankConnection>(text.expose()).ok(),
+            _ => None,
+        };
+        let Some(mut connection) = described else {
+            return;
+        };
+        match error_code {
+            None => {
+                connection.last_synced_at = Some(chrono::Utc::now().to_rfc3339());
+                connection.last_error_code = None;
+            }
+            // Plaid's codes are short words; a missing one says so, and none is
+            // kept longer than a code.
+            Some(code) => {
+                let code: String = code.chars().take(64).collect();
+                connection.last_error_code = Some(if code.is_empty() {
+                    "UNKNOWN".to_owned()
+                } else {
+                    code
+                });
+            }
+        }
+        let stored = serde_json::to_string(&connection)
+            .map_err(|error| PlaidError::Unexpected(error.to_string()))
+            .and_then(|text| {
+                store
+                    .put(&info_name(item_id), &Secret::new(text))
+                    .map_err(PlaidError::from)
+            });
+        if let Err(error) = stored {
+            warn!(item_id = %item_id, %error, "a bank's sync health was not stored");
+        }
+    }
+
+    /// Read bank `item_id`'s accounts from Plaid again (step 6c): accounts it
+    /// added since it was connected join the list, unmapped; the accounts
+    /// already known keep their mappings, with Plaid's names and masks of now.
+    /// An account Plaid no longer lists is kept, so its mapping is not lost.
+    pub(crate) async fn refresh_accounts(
+        &self,
+        item_id: &str,
+    ) -> Result<BankConnection, PlaidError> {
+        let access_token = self.token_for_update(item_id).await?;
+        let closed = self.closed.read().await;
+        if *closed {
+            return Err(PlaidError::Closing);
+        }
+        let (institution_name, fresh) = self.describe(&access_token).await?;
+        let mut store = self.store.lock().await;
+        // Disconnected while Plaid was asked: nothing to write back, or a bank
+        // with no token would be listed for good.
+        if store.get(&token_name(item_id))?.is_none() {
+            return Err(PlaidError::NoSuchBank(format!(
+                "this ledger has no bank {item_id:?} (disconnected)"
+            )));
+        }
+        let mut connection = match store.get(&info_name(item_id))? {
+            Some(text) => serde_json::from_str(text.expose()).map_err(|error| {
+                PlaidError::Unexpected(format!("stored bank {item_id}: {error}"))
+            })?,
+            None => BankConnection::bare(item_id.to_owned()),
+        };
+        if institution_name.is_some() {
+            connection.institution_name = institution_name;
+        }
+        for account in fresh {
+            match connection
+                .accounts
+                .iter_mut()
+                .find(|known| known.account_id == account.account_id)
+            {
+                Some(known) => {
+                    known.name = account.name;
+                    known.mask = account.mask;
+                    known.kind = account.kind;
+                    known.subtype = account.subtype;
+                }
+                None => connection.accounts.push(account),
+            }
+        }
+        let text = serde_json::to_string(&connection)
+            .map_err(|error| PlaidError::Unexpected(error.to_string()))?;
+        store.put(&info_name(item_id), &Secret::new(text))?;
+        info!(item_id = %item_id, accounts = connection.accounts.len(), "bank accounts read again");
+        Ok(connection)
+    }
+
+    /// Stop importing `account_id` of bank `item_id` (step 6c): its mapping
+    /// and start date cleared. Refused while the bank syncs, as a mapping is.
+    pub(crate) async fn unmap_account(
+        &self,
+        item_id: &str,
+        account_id: &str,
+    ) -> Result<BankConnection, PlaidError> {
+        let closed = self.closed.read().await;
+        if *closed {
+            return Err(PlaidError::Closing);
+        }
+        let unknown = || {
+            PlaidError::NoSuchBank(format!(
+                "this ledger has no bank {item_id:?} with an account {account_id:?}"
+            ))
+        };
+        if check_id("item_id", item_id).is_err() {
+            return Err(unknown());
+        }
+        let mut store = self.store.lock().await;
+        if self.is_syncing(item_id) {
+            return Err(PlaidError::SyncInProgress);
+        }
+        let Some(text) = store.get(&info_name(item_id))? else {
+            return Err(unknown());
+        };
+        let mut connection: BankConnection = serde_json::from_str(text.expose())
+            .map_err(|error| PlaidError::Unexpected(format!("stored bank {item_id}: {error}")))?;
+        let account = connection
+            .accounts
+            .iter_mut()
+            .find(|account| account.account_id == account_id)
+            .ok_or_else(unknown)?;
+        account.ledger_account = None;
+        account.import_from = None;
+        let text = serde_json::to_string(&connection)
+            .map_err(|error| PlaidError::Unexpected(error.to_string()))?;
+        store.put(&info_name(item_id), &Secret::new(text))?;
+        Ok(connection)
+    }
+
+    /// Connect one of Plaid's sandbox test banks without Link (step 6c, for
+    /// demo users): `/sandbox/public_token/create`, then the usual connect.
+    /// Sandbox only: refused, with nothing sent, on any other environment.
+    pub(crate) async fn connect_sandbox(
+        self: &Arc<Self>,
+        institution_id: &str,
+    ) -> Result<BankConnection, PlaidError> {
+        if self.environment != PlaidEnvironment::Sandbox {
+            return Err(PlaidError::SandboxOnly);
+        }
+        check_id("institution_id", institution_id)?;
+        if *self.closed.read().await {
+            return Err(PlaidError::Closing);
+        }
+        let created: SandboxPublicToken = self
+            .client
+            .call(
+                "/sandbox/public_token/create",
+                json!({
+                    "institution_id": institution_id,
+                    "initial_products": ["transactions"],
+                }),
+            )
+            .await?;
+        self.connect(created.public_token).await
+    }
+
+    /// Put sandbox bank `item_id` into `ITEM_LOGIN_REQUIRED`
+    /// (`/sandbox/item/reset_login`), to show logging in again. Sandbox only.
+    pub(crate) async fn reset_sandbox_login(&self, item_id: &str) -> Result<(), PlaidError> {
+        if self.environment != PlaidEnvironment::Sandbox {
+            return Err(PlaidError::SandboxOnly);
+        }
+        let access_token = self.token_for_update(item_id).await?;
+        let _: Value = self
+            .client
+            .call(
+                "/sandbox/item/reset_login",
+                json!({ "access_token": access_token.expose() }),
+            )
+            .await?;
+        info!(item_id = %item_id, "sandbox bank set to need a new login");
+        Ok(())
+    }
+
     /// Every connected bank, by item id. A description that cannot be read is
     /// logged and the bank listed bare, so one bad entry hides no other bank.
     pub(crate) async fn connections(&self) -> Result<Vec<BankConnection>, PlaidError> {
@@ -1450,6 +1658,8 @@ pub(crate) mod tests {
         pub sync: Arc<Mutex<std::collections::VecDeque<SyncAnswer>>>,
         /// The item id the next exchange answers with, instead of [`ITEM_ID`].
         pub next_item: Arc<Mutex<Option<String>>>,
+        /// The accounts `/accounts/get` answers with, instead of the two.
+        pub accounts: Arc<Mutex<Option<Value>>>,
     }
 
     impl MockPlaid {
@@ -1553,12 +1763,12 @@ pub(crate) mod tests {
                         "request_id": "req-2",
                     }),
                     "/accounts/get" => json!({
-                        "accounts": [
+                        "accounts": mock.accounts.lock().unwrap().clone().unwrap_or_else(|| json!([
                             { "account_id": "acc1", "name": "Plaid Checking", "mask": "0000",
                               "type": "depository", "subtype": "checking", "balances": {} },
                             { "account_id": "acc2", "name": "Plaid Saving", "mask": "1111",
                               "type": "depository", "subtype": "savings", "balances": {} },
-                        ],
+                        ])),
                         "item": { "item_id": ITEM_ID, "institution_id": "ins_109508" },
                         "request_id": "req-3",
                     }),
@@ -1567,6 +1777,13 @@ pub(crate) mod tests {
                         "request_id": "req-4",
                     }),
                     "/item/remove" => json!({ "request_id": "req-5" }),
+                    "/sandbox/public_token/create" => json!({
+                        "public_token": "public-sandbox-from-the-sandbox",
+                        "request_id": "req-7",
+                    }),
+                    "/sandbox/item/reset_login" => {
+                        json!({ "reset_login": true, "request_id": "req-8" })
+                    }
                     "/transactions/sync" => page.unwrap_or_else(|| {
                         json!({
                             "added": [], "modified": [], "removed": [],
@@ -1589,6 +1806,8 @@ pub(crate) mod tests {
                 "/institutions/get_by_id",
                 "/item/remove",
                 "/transactions/sync",
+                "/sandbox/public_token/create",
+                "/sandbox/item/reset_login",
             ] {
                 app = app.route(path, post(answer).with_state((self.clone(), path)));
             }
@@ -2418,5 +2637,186 @@ pub(crate) mod tests {
         fetch_all(&plaid, ITEM_ID).await.unwrap();
         assert_eq!(mock.sync_bodies().last().unwrap()["cursor"], "c5");
         assert!(!mock.paths().contains(&"/item/remove".to_owned()));
+    }
+
+    /// A refused sync's Plaid code is kept on the bank, and a finished sync
+    /// clears it and notes the time.
+    ///
+    /// Bug-catch: without it the app cannot tell a bank that needs a new
+    /// login from one that is fine, short of syncing and failing.
+    #[tokio::test]
+    async fn a_banks_health_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = MockPlaid::default();
+        let plaid = service(&mock, dir.path(), &env()).await;
+        plaid.connect(connect_token()).await.unwrap();
+
+        plaid
+            .note_health(ITEM_ID, Some("ITEM_LOGIN_REQUIRED"))
+            .await;
+        let bank = &plaid.connections().await.unwrap()[0];
+        assert_eq!(bank.last_error_code.as_deref(), Some("ITEM_LOGIN_REQUIRED"));
+        assert!(bank.last_synced_at.is_none());
+
+        plaid.note_health(ITEM_ID, None).await;
+        let bank = &plaid.connections().await.unwrap()[0];
+        assert!(bank.last_error_code.is_none());
+        assert!(bank.last_synced_at.is_some());
+    }
+
+    /// Reading a bank's accounts again adds the ones it opened since, keeps
+    /// every mapping, and keeps an account Plaid no longer lists.
+    ///
+    /// Bug-catch: replacing the list loses every mapping; not reading it
+    /// again leaves a new account unmappable for good.
+    #[tokio::test]
+    async fn refreshing_accounts_adds_new_ones_and_keeps_mappings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = MockPlaid::default();
+        let plaid = service(&mock, dir.path(), &env()).await;
+        plaid.connect(connect_token()).await.unwrap();
+        plaid
+            .map_account(ITEM_ID, "acc1", "Assets:Bank:Checking", day("2026-01-01"))
+            .await
+            .unwrap();
+        *mock.accounts.lock().unwrap() = Some(json!([
+            { "account_id": "acc1", "name": "Plaid Checking (renamed)", "mask": "0000",
+              "type": "depository", "subtype": "checking" },
+            { "account_id": "acc3", "name": "Plaid CD", "mask": "2222",
+              "type": "depository", "subtype": "cd" },
+        ]));
+
+        let bank = plaid.refresh_accounts(ITEM_ID).await.unwrap();
+        let ids: Vec<&str> = bank
+            .accounts
+            .iter()
+            .map(|a| a.account_id.as_str())
+            .collect();
+        assert_eq!(ids, ["acc1", "acc2", "acc3"]);
+        assert_eq!(bank.accounts[0].name, "Plaid Checking (renamed)");
+        assert_eq!(
+            bank.accounts[0].ledger_account.as_deref(),
+            Some("Assets:Bank:Checking")
+        );
+        assert!(bank.accounts[2].ledger_account.is_none());
+        assert_eq!(
+            plaid.connections().await.unwrap()[0].accounts.len(),
+            3,
+            "stored"
+        );
+    }
+
+    /// Unmapping clears an account's mapping and start date; it waits for no
+    /// sync, as a mapping does not.
+    ///
+    /// Bug-catch: an unmapping under a sync is undone by the sync's view of
+    /// the old mapping, and the account goes on being imported.
+    #[tokio::test]
+    async fn unmapping_stops_an_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = MockPlaid::default();
+        let plaid = service(&mock, dir.path(), &env()).await;
+        plaid.connect(connect_token()).await.unwrap();
+        plaid
+            .map_account(ITEM_ID, "acc1", "Assets:Bank:Checking", day("2026-01-01"))
+            .await
+            .unwrap();
+
+        let syncing = plaid.begin_sync(ITEM_ID).expect("free");
+        let error = plaid.unmap_account(ITEM_ID, "acc1").await.unwrap_err();
+        assert!(matches!(error, PlaidError::SyncInProgress), "{error}");
+        drop(syncing);
+        let bank = plaid.unmap_account(ITEM_ID, "acc1").await.unwrap();
+        assert!(bank.accounts[0].ledger_account.is_none());
+        assert!(bank.accounts[0].import_from.is_none());
+        assert!(plaid.connections().await.unwrap()[0].accounts[0]
+            .ledger_account
+            .is_none());
+    }
+
+    /// In the sandbox a test bank connects without Link: Plaid makes the
+    /// public token, the usual connect keeps the access token.
+    ///
+    /// Bug-catch: a sandbox helper that skips the usual connect would keep no
+    /// token, or keep it outside the secret store.
+    #[tokio::test]
+    async fn a_sandbox_bank_connects_without_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = MockPlaid::default();
+        let plaid = service(&mock, dir.path(), &env()).await;
+
+        let bank = plaid.connect_sandbox("ins_109508").await.unwrap();
+        assert_eq!(bank.item_id, ITEM_ID);
+        let create = mock.body_of("/sandbox/public_token/create").unwrap();
+        assert_eq!(create["institution_id"], "ins_109508");
+        assert_eq!(create["initial_products"], json!(["transactions"]));
+        assert_eq!(
+            mock.body_of("/item/public_token/exchange").unwrap()["public_token"],
+            "public-sandbox-from-the-sandbox"
+        );
+        assert_eq!(connected_item_count(dir.path()).unwrap(), 1);
+
+        plaid.reset_sandbox_login(ITEM_ID).await.unwrap();
+        assert_eq!(
+            mock.body_of("/sandbox/item/reset_login").unwrap()["access_token"],
+            ACCESS_TOKEN
+        );
+    }
+
+    /// The sandbox helpers are refused, with nothing sent, on production.
+    ///
+    /// Bug-catch: a demo helper reaching production would ask the real Plaid
+    /// for a test bank, or reset a real customer's bank login.
+    #[tokio::test]
+    async fn the_sandbox_helpers_stay_in_the_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = MockPlaid::default();
+        let production = PlaidConfig {
+            environment: PlaidEnvironment::Production,
+            ..enabled()
+        };
+        let plaid = service_in(&mock, dir.path(), &env(), production).await;
+
+        let error = plaid.connect_sandbox("ins_109508").await.unwrap_err();
+        assert!(matches!(error, PlaidError::SandboxOnly), "{error}");
+        let error = plaid.reset_sandbox_login(ITEM_ID).await.unwrap_err();
+        assert!(matches!(error, PlaidError::SandboxOnly), "{error}");
+        assert!(mock.paths().is_empty(), "{:?}", mock.paths());
+    }
+
+    /// A refresh that finds its bank disconnected while Plaid was asked
+    /// writes nothing back: no bank without a token is left listed.
+    ///
+    /// Bug-catch: writing the description back leaves a bank that cannot be
+    /// disconnected, synced or cleared, and refuses the ledger's removal for
+    /// good (`BANKS_CONNECTED`).
+    #[tokio::test]
+    async fn a_refresh_racing_a_disconnect_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = MockPlaid::default();
+        let plaid = service(&mock, dir.path(), &env()).await;
+        plaid.connect(connect_token()).await.unwrap();
+        mock.delay("/accounts/get", Duration::from_millis(300));
+        let asked = || {
+            mock.paths()
+                .iter()
+                .filter(|path| path.as_str() == "/accounts/get")
+                .count()
+        };
+        let before = asked();
+
+        let refreshing = tokio::spawn({
+            let plaid = Arc::clone(&plaid);
+            async move { plaid.refresh_accounts(ITEM_ID).await }
+        });
+        while asked() == before {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(plaid.disconnect(ITEM_ID.to_owned()).await.unwrap());
+
+        let error = refreshing.await.unwrap().unwrap_err();
+        assert!(matches!(error, PlaidError::NoSuchBank(_)), "{error}");
+        assert_eq!(connected_item_count(dir.path()).unwrap(), 0);
+        assert!(plaid.connections().await.unwrap().is_empty());
     }
 }

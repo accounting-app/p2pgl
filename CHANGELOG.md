@@ -42,6 +42,12 @@ break compatibility.
   One sync of a bank at a time (`SYNC_IN_PROGRESS`). Connect refuses the same
   bank linked twice while it is connected (`BANK_ALREADY_CONNECTED`); after a
   reconnect, map with a later `importFrom` (README).
+- Endpoints for a proof of concept (007 step 6c): `connectedBanks` gives each
+  bank's `lastSyncedAt` and `lastErrorCode`; `refreshBankAccounts(itemId)`
+  picks up accounts a bank opened after it was connected, mappings kept;
+  `unmapBankAccount(itemId, accountId)`; and, on Plaid's sandbox only,
+  `connectSandboxBank(institutionId)` and `resetSandboxLogin(itemId)` for
+  demos without Link (README *A demo in Plaid's sandbox*).
 - Logging in again to a connected bank (007 step 6b): `createPlaidLinkToken(itemId)`
   gives a link token in Plaid's update mode for that bank, so an expired login
   (`ITEM_LOGIN_REQUIRED`) is fixed on the same connection, its history kept.
