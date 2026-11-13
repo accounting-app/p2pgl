@@ -21,6 +21,7 @@ mod peer_addresses;
 mod peer_connections;
 mod rate_limit;
 mod request_guard;
+mod secret_store;
 #[cfg(test)]
 mod test_support;
 mod user_cli;

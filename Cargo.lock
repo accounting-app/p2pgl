@@ -41,6 +41,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1605,6 +1606,7 @@ dependencies = [
 name = "gl-node"
 version = "0.3.0"
 dependencies = [
+ "aes-gcm",
  "async-graphql",
  "async-graphql-axum",
  "axum",

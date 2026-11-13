@@ -1,18 +1,18 @@
 # Plan: keep what we told Plaid (from intent.md, 2026-11-09)
 
-Draft: written with the intent, assuming the proposed answers to its open
-questions (Plaid in the node; the node checks TOTP; no raw responses kept).
-Revisit once the intent is approved.
+Updated 2026-11-10 for the decisions in intent.md: Plaid runs in the node; the
+client app does MFA (the node requires an admin key); no raw responses on disk.
 
 ## Files that change
 
 - `deploy/install/install.sh` — log retention, purge of `.removed/`, off-server
   backup copies; `docs/OPERATIONS.md`.
 - `crates/gl-node/src/` — new `secret_store.rs` (encrypted token store),
-  `plaid/` (client, link, sync, removal), `mfa.rs` (TOTP), GraphQL mutations in
-  `graphql/`; `config.rs` (`plaid.*`: environment, the designated import
-  node); `ledger_admin.rs` (removal calls Plaid first).
-- `README.md`, `CHANGELOG.md`, `scripts/revert_specs/plaid.json`.
+  `plaid/` (client, link, sync, removal), GraphQL mutations in `graphql/`;
+  `config.rs` (`plaid.*`: environment, the designated import node);
+  `ledger_admin.rs` (removal calls Plaid first).
+- `README.md`, `CHANGELOG.md`, `scripts/revert_specs/secret_store.json` (step
+  3), `scripts/revert_specs/plaid.json`.
 - The two policy docs (status column), outside the repo.
 
 ## Order of work
@@ -26,17 +26,20 @@ Revisit once the intent is approved.
    backup before it leaves (`age` to a recipient key not on the server), copy
    it, delete remote copies older than 30 days; `openledger status` fails when
    the newest remote copy is over two days old.
-3. **Secret store.** One file per ledger, owner-only (`0600`, the same checks
-   as `p2p.secretKeyPath`), each value encrypted with an AEAD under a key in
-   `/opt/openledger/env`, not in the data folder. A `Secret` type whose
+3. **Secret store.** `secrets.json` per ledger folder, opened as the node key
+   is (`open_checked`, `NodePrivate`: no symlink, owner, one link, 0600); each
+   value sealed with AES-256-GCM under `GL_NODE_SECRETS_KEY` (kept in
+   `/opt/openledger/env`, not the data folder), bound to its name by the
+   associated data (not to the ledger, so a removed ledger moved back under a
+   new name keeps its store); every value opened at `open`, so a wrong key is
+   refused then, and temp files a crashed write left are deleted there. Writes
+   refuse a file larger than `open` reads. A `Secret` type whose
    `Debug`/`Display` print `[redacted]`, so a token cannot reach a log by
-   formatting.
-4. **TOTP MFA.** An admin enrolls (`openledger person mfa NAME` prints a QR
-   code once); the secret lives in the Plaid node's secret store. Plaid
-   mutations take a `totp` argument; a wrong or missing code is refused, rate
-   limited, logged without the code.
+   formatting. Unused until step 5, which wires the key into boot and the
+   installer.
+4. **MFA** is the client app's, at login (decision 2); nothing in the node.
 5. **Plaid connect and disconnect.** `createPlaidLinkToken`,
-   `connectBank(publicToken, totp)`, `disconnectBank(itemId)`: admin role,
+   `connectBank(publicToken)`, `disconnectBank(itemId)`: admin role,
    designated node only. Exchange the public token, store the access token;
    disconnect calls `/item/remove`, then deletes it. Company removal does the
    same for each item.
@@ -50,8 +53,8 @@ Revisit once the intent is approved.
    access review, risk register, and restore test; incident tabletop; vendor
    file; policy acknowledgments. Flip each policy row to *In place* when done.
 
-Steps 1–2 and 7 can start now; 3 → 4 → 5 → 6 depend in order. Link ships to
-users only after 4.
+Steps 1–2 and 7 can start now; 3 → 5 → 6 depend in order. Link ships to
+users only once the client app's MFA is live.
 
 ## Risks
 
@@ -65,8 +68,14 @@ users only after 4.
   failure keep the token and retry.
 - **Pending and modified transactions:** Plaid revises them; a revision is
   posted as a reversing entry plus the new one, as the ledger cannot edit.
-- **Backups contain the secret store** (encrypted, key not in the backup) — a
-  restore on a new server needs the key from `/opt/openledger/env` too.
+- **One store instance per ledger:** each write replaces the whole file, so
+  two instances on one folder lose each other's writes (a token lost, its
+  item live at Plaid). Step 5 keeps one per ledger behind the ledger's lock.
+- **Backups hold the secret store and, today, the key with it**: a backup
+  archives `/opt/openledger/env` with the data. Step 5 decides: keep
+  `GL_NODE_SECRETS_KEY` out of the archive (then a restore on a new server
+  needs it supplied), or rely on step 2's encryption of every copy that
+  leaves the server.
 
 ## Alternatives rejected
 
@@ -75,20 +84,21 @@ users only after 4.
   the ledger.
 - **Tokens in access-style records**: replication would copy them to every
   node, desk machines included — the opposite of "server-side only".
-- **Trusting the client app for MFA**: any holder of an admin key could open
-  Link without MFA.
+- **TOTP checked by the node**: rejected by the maintainer (decision 2) for
+  simplicity; the accepted risk is in intent.md.
 
 ## Proof
 
 - Tests against a loopback Plaid mock: connect → sync → disconnect; a second
   node receives the entries; the token is searched for and absent in the
   `.bean` files, records, GraphQL responses and captured logs of both nodes.
-- Tests: missing/wrong TOTP refused; non-designated node refuses; duplicate
-  sync posts nothing; `/item/remove` failure keeps the token; purge after 30
-  days; secret file with group-read refused.
-- Revert checks in `scripts/revert_specs/plaid.json`: drop the `Secret`
-  redaction (log test fails); skip `/item/remove` (disconnect test fails);
-  drop the duplicate check (sync test fails); drop the TOTP check (MFA test
-  fails); drop the designated-node check (two-node test fails).
+- Tests: a read or write key refused on Plaid mutations; a non-designated
+  node refuses; a duplicate sync posts nothing; an `/item/remove` failure
+  keeps the token; purge after 30 days. The store's own tests are in
+  `secret_store.rs` (step 3).
+- Revert checks: `scripts/revert_specs/secret_store.json` (step 3: redaction,
+  ledger and name binding, fresh nonce, open-time check, mode check, removal
+  on disk); `plaid.json` (skip `/item/remove`, drop the duplicate check, drop
+  the admin-role check, drop the designated-node check).
 - Docs: README (Plaid section, MFA), OPERATIONS (purge, off-server backups,
   logs), CHANGELOG *Added* and *Security*.

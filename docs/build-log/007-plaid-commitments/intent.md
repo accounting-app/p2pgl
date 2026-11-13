@@ -1,6 +1,6 @@
 # Intent: keep what we told Plaid
 
-Author: Claude, with the maintainer. Status: draft.
+Author: Claude, with the maintainer. Status: **approved** (2026-11-10), with the decisions below.
 
 ## Problem
 
@@ -32,8 +32,8 @@ that do not exist yet:
 - **The access token never leaves that node's secret store**: encrypted with a
   key kept outside the data folder, never in a `.bean` file, a record, a
   GraphQL response or a log line.
-- **MFA guards Plaid Link.** Opening Link or connecting a bank needs an admin
-  key *and* a passed MFA check.
+- **MFA guards Plaid Link.** The client app requires MFA at login before it
+  shows Link; the node requires an admin key for every Plaid mutation.
 - **Disconnecting a bank or removing a company** calls Plaid's item removal
   and deletes the token; a removed company's folder is deleted after 30 days.
 - **The installer meets the retention schedule**: logs kept 90 days, backups
@@ -63,7 +63,7 @@ may ask for evidence.
   second node and the token appears in no file, record, log or response there
   or on the importing node (searched for in all of them).
 - Disconnect leaves no token on disk and the mock saw `/item/remove`.
-- Link without a passed MFA check is refused.
+- A read or write key cannot open Link or connect a bank; an admin key can.
 - A removed company's folder is gone 30 days later; a log line older than 90
   days is gone; an off-server copy older than 30 days is gone.
 - Every row of both evidence tables reads *In place*, each with a dated record.
@@ -82,3 +82,13 @@ may ask for evidence.
    inside it.
 5. **Raw Plaid responses**: keep none at all (simplest), or up to 7 days for
    troubleshooting as the retention policy allows?
+
+## Decisions (maintainer, 2026-11-10)
+
+1. **Plaid runs in the node** ("the backend side").
+2. **The client app does MFA**, at login, before it shows Plaid Link; the node
+   requires an admin key for Plaid mutations and does not check MFA itself.
+   Accepted risk: a holder of an admin key can reach Link without MFA.
+3. Off-server backup target: still open (plan step 2).
+4. The MFA date given to Plaid: still open.
+5. **No raw Plaid responses on disk** — in memory only.

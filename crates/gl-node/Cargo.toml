@@ -41,6 +41,10 @@ base64 = "0.22"
 subtle = "2"
 sha2 = { workspace = true }
 zeroize = { workspace = true }
+# AES-256-GCM for the secret store (build-log 007). Already compiled in through
+# iroh (noq-proto), so no new crate; default features off: nonces come from the
+# node's one random source (`access_list::random_bytes`).
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "zeroize"] }
 
 
 [dev-dependencies]

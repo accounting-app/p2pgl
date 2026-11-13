@@ -176,9 +176,11 @@ pub fn sha256_hex(key: &str) -> String {
     hex::encode(Sha256::digest(key.as_bytes()))
 }
 
-/// 32 bytes from the OS CSPRNG: the draw that makes the node's identity key
-/// and its operator key, so no second random source is needed.
-fn random_bytes() -> zeroize::Zeroizing<[u8; 32]> {
+/// 32 random bytes from the CSPRNG behind `iroh::SecretKey::generate` (`rand`'s
+/// thread generator, seeded from the OS): the draw that makes the node's
+/// identity key, its operator key, people's keys, and the secret store's nonces
+/// and temp-file names, so no second random source is needed.
+pub(crate) fn random_bytes() -> zeroize::Zeroizing<[u8; 32]> {
     zeroize::Zeroizing::new(iroh::SecretKey::generate().to_bytes())
 }
 
