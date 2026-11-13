@@ -114,9 +114,12 @@ fn client_user_id(ctx: &Context<'_>) -> String {
     }
 }
 
-pub(super) async fn create_link_token(ctx: &Context<'_>) -> Result<PlaidLinkToken> {
+pub(super) async fn create_link_token(
+    ctx: &Context<'_>,
+    item_id: Option<String>,
+) -> Result<PlaidLinkToken> {
     let token = service(ctx)?
-        .create_link_token(&client_user_id(ctx))
+        .create_link_token(&client_user_id(ctx), item_id.as_deref())
         .await
         .map_err(failed)?;
     Ok(PlaidLinkToken {
@@ -1283,6 +1286,34 @@ mod tests {
             bodies[n - 1]["cursor"],
             "c1",
             "restarted from the finished series"
+        );
+    }
+
+    /// `createPlaidLinkToken(itemId:)` answers with a link token and no
+    /// access token, and is admin only like the rest.
+    ///
+    /// Bug-catch: an update-mode token open to a write key lets anyone with
+    /// one re-authorise the company's bank.
+    #[tokio::test]
+    async fn a_login_again_link_token_over_graphql() {
+        let fixture = fixture(true).await;
+        assert!(operator(&fixture.schema, CONNECT).await["errors"].is_null());
+        let query = format!(
+            r#"mutation {{ createPlaidLinkToken(itemId: "{ITEM_ID}") {{ linkToken expiration }} }}"#
+        );
+
+        let body = run(&fixture.schema, Role::Write, &query).await;
+        assert_eq!(code(&body), Some("FORBIDDEN"), "{body}");
+        let body = operator(&fixture.schema, &query).await;
+        assert_eq!(
+            body["data"]["createPlaidLinkToken"]["linkToken"], "link-sandbox-abc",
+            "{body}"
+        );
+        assert!(!body.to_string().contains(ACCESS_TOKEN));
+        let unknown = r#"mutation { createPlaidLinkToken(itemId: "nope") { linkToken } }"#;
+        assert_eq!(
+            code(&operator(&fixture.schema, unknown).await),
+            Some("NO_SUCH_BANK")
         );
     }
 }

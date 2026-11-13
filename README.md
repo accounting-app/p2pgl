@@ -1229,6 +1229,18 @@ not in the node:
    another Plaid environment than `plaid.environment` is refused untouched
    (`PLAID_ENVIRONMENT`): set the environment it was connected in.
 
+**Logging in again.** When a bank's login expires or it asks for a new
+multi-factor step, Plaid answers a sync with `plaidCode: "ITEM_LOGIN_REQUIRED"`.
+Open Link with `createPlaidLinkToken(itemId: "…") { linkToken expiration }`:
+the person logs in again on the **same** connection (Plaid's update mode), and
+its ids and history carry on. Link's `onSuccess` still hands back a public
+token; there is no need to pass it to `connectBank` (passed anyway, it changes
+nothing: the bank is answered as stored, its mappings kept). Then sync as
+before. Disconnecting and
+connecting again instead makes a new connection, whose history would be
+imported a second time (*Importing transactions*). A bank this ledger does not
+hold is refused (`NO_SUCH_BANK`); its token must be of `plaid.environment`.
+
 `createPlaidLinkToken`, `connectBank`, `disconnectBank`, `mapBankAccount` and
 `syncBank` need an **admin** key. Refusals carry a code: `PLAID_NOT_ENABLED`,
 `BANK_ALREADY_CONNECTED` (Link connected a bank this ledger holds already, the
@@ -1292,8 +1304,9 @@ synced (none for the operator key) — and the token never is.
   `importFrom`, makes the next sync fetch the bank's whole history again, so
   its earlier transactions arrive. An account the bank adds after it was
   connected is not known to the node: disconnect and connect the bank again.
-- **Connected again** (a disconnect and a new Link, for an expired login or
-  a lost key): the new connection's transactions have new ids, so the links
+- **Connected again** (a disconnect and a new Link — for an expired login,
+  log in again instead, *Logging in again*; after a lost key there is no
+  other way): the new connection's transactions have new ids, so the links
   do not catch the old ones. Map its accounts with `importFrom` the day after
   the last imported entry, or the history is imported a second time.
 - **Already imported** (the books hold its `^plaid-…` link): skipped, so a

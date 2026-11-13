@@ -251,4 +251,35 @@ to commit. The commit hash is filled in once the maintainer has committed.
   correction is the accountant's call); the plan's two-node proof is not a
   test of its own — the entries are ordinary records, replicated as any.
   `plan.md` updated.
+- **Commit:** 315c3f6
+
+## 2026-11-13 — Logging in again to a connected bank (step 6b)
+
+- **What changed:** `createPlaidLinkToken` takes an optional `itemId`. With
+  it, `PlaidService::create_link_token` asks `/link/token/create` in Plaid's
+  update mode: the bank's access token (`token_for_update`: a bank this
+  ledger holds, a token of `plaid.environment`, read under the close gate;
+  the Plaid call itself changes nothing and runs outside it) and no
+  `products`. Link then logs the person in again on the same item — an
+  expired password, a new multi-factor step, `ITEM_LOGIN_REQUIRED`. Its
+  `onSuccess` still hands back a public token; `connectBank` given one for a
+  held item now answers with the bank as stored and changes nothing
+  (`held_connection`), where it used to store over its description and lose
+  its mappings. Without `itemId`,
+  as before. Admin only (already in `ADMIN_FIELDS`). README *Logging in
+  again* (and the *Connected again* bullet points to it); CHANGELOG *Added*.
+  The maintainer put the client app's MFA on hold.
+- **Review:** one important finding, fixed: the docs said Link returns no
+  public token in update mode — it does, and passed to `connectBank` it
+  reset the bank's mappings (now a no-op, PL-R63). Also: the update-mode
+  close check pinned (PL-R64); the update-mode body's required fields
+  asserted; this entry's close-gate wording. Left: the caller's `itemId` is
+  echoed in `NO_SUCH_BANK` unbounded (admin only, as `syncBank` does).
+- **Gate:** `scripts/gate.sh` — 1706 passed, 0 failed, 0 ignored.
+- **Revert checks:** `scripts/revert_specs/plaid.json` PL-R59..R64 — 6 of 6
+  bite (the token sent, no products in update mode, the environment check,
+  an unknown bank refused before Plaid is asked, a held bank left as it is,
+  the close check); the connect checks R2, R9, R16, R18, R22, R34 rerun
+  after the change to `connect` — 6 of 6 bite.
+- **Departures from the plan:** none (step 6b added to `plan.md`).
 - **Commit:** —

@@ -401,5 +401,41 @@
     "old": "            store.put(&complete_cursor_name(item_id), &Secret::new(cursor))?;\n",
     "new": "",
     "runs": [["-p", "gl-node", "--bin", "gl-node", "a_restart_goes_back_to_the_last_finished_series"]]
+  },
+  "PL-R59-update-mode-without-the-bank": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "            body[\"access_token\"] = json!(access_token.expose());\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_login_again_link_token_is_for_the_same_connection"]]
+  },
+  "PL-R60-update-mode-asks-for-products": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "            \"language\": \"en\",\n        });\n        let access_token = match item_id {",
+    "new": "            \"language\": \"en\",\n            \"products\": [\"transactions\"],\n        });\n        let access_token = match item_id {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_login_again_link_token_is_for_the_same_connection"]]
+  },
+  "PL-R61-update-mode-in-another-environment": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "            return Err(PlaidError::WrongEnvironment {\n                configured: self.environment,\n            });\n        }\n        Ok(access_token)\n",
+    "new": "            let _ = self.environment;\n        }\n        Ok(access_token)\n",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_login_again_link_token_needs_a_bank_of_this_ledger"]]
+  },
+  "PL-R62-update-mode-for-no-such-bank": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "        let Some(access_token) = self.store.lock().await.get(&token_name(item_id))? else {\n            return Err(unknown());\n        };\n",
+    "new": "        let Some(access_token) = Some(self.store.lock().await.get(&token_name(item_id))?.unwrap_or_else(|| Secret::new(\"access-sandbox-none\"))) else {\n            return Err(unknown());\n        };\n",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_login_again_link_token_needs_a_bank_of_this_ledger"]]
+  },
+  "PL-R63-a-held-bank-stored-over": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "if let Some(held) = self.held_connection(&item_id).await? {",
+    "new": "if let Some(held) = None::<BankConnection> {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "connecting_a_held_bank_again_changes_nothing"]]
+  },
+  "PL-R64-update-mode-past-the-close": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "    async fn token_for_update(&self, item_id: &str) -> Result<Secret, PlaidError> {\n        let closed = self.closed.read().await;\n        if *closed {",
+    "new": "    async fn token_for_update(&self, item_id: &str) -> Result<Secret, PlaidError> {\n        let closed = self.closed.read().await;\n        if false && *closed {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_login_again_link_token_needs_a_bank_of_this_ledger"]]
   }
 }

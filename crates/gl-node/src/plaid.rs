@@ -784,27 +784,79 @@ impl PlaidService {
 
     /// A link token for `client_user_id` (Plaid's stable, non-personal id for
     /// the person opening Link).
+    ///
+    /// With `item_id`, a link token in Plaid's **update mode** for that bank
+    /// (step 6b): Link logs the person in again — an expired password, a new
+    /// multi-factor prompt, `ITEM_LOGIN_REQUIRED` — on the same connection, so
+    /// its item, transaction ids and history carry on; the public token Link
+    /// hands back need not be exchanged (`connect` leaves a held item as it
+    /// is). Plaid wants the bank's access token and
+    /// no `products` then.
     pub(crate) async fn create_link_token(
         &self,
         client_user_id: &str,
+        item_id: Option<&str>,
     ) -> Result<LinkToken, PlaidError> {
-        let created: LinkTokenCreated = self
-            .client
-            .call(
-                "/link/token/create",
-                json!({
-                    "client_name": self.client_name,
-                    "user": { "client_user_id": client_user_id },
-                    "products": ["transactions"],
-                    "country_codes": ["US"],
-                    "language": "en",
-                }),
-            )
-            .await?;
+        let mut body = json!({
+            "client_name": self.client_name,
+            "user": { "client_user_id": client_user_id },
+            "country_codes": ["US"],
+            "language": "en",
+        });
+        let access_token = match item_id {
+            Some(item_id) => Some(self.token_for_update(item_id).await?),
+            None => {
+                body["products"] = json!(["transactions"]);
+                None
+            }
+        };
+        if let Some(access_token) = &access_token {
+            body["access_token"] = json!(access_token.expose());
+        }
+        let created: LinkTokenCreated = self.client.call("/link/token/create", body).await?;
         Ok(LinkToken {
             link_token: created.link_token,
             expiration: created.expiration,
         })
+    }
+
+    /// Bank `item_id` as stored, when this ledger holds its token.
+    async fn held_connection(&self, item_id: &str) -> Result<Option<BankConnection>, PlaidError> {
+        let store = self.store.lock().await;
+        if store.get(&token_name(item_id))?.is_none() {
+            return Ok(None);
+        }
+        let connection = store
+            .get(&info_name(item_id))?
+            .and_then(|text| serde_json::from_str(text.expose()).ok())
+            .unwrap_or_else(|| BankConnection::bare(item_id.to_owned()));
+        Ok(Some(connection))
+    }
+
+    /// The access token of bank `item_id`, for update mode: the bank must be
+    /// one this ledger holds, and its token of this node's Plaid environment
+    /// (sent to the other one, Plaid would only call it invalid).
+    async fn token_for_update(&self, item_id: &str) -> Result<Secret, PlaidError> {
+        let closed = self.closed.read().await;
+        if *closed {
+            return Err(PlaidError::Closing);
+        }
+        let unknown = || PlaidError::NoSuchBank(format!("this ledger has no bank {item_id:?}"));
+        if check_id("item_id", item_id).is_err() {
+            return Err(unknown());
+        }
+        let Some(access_token) = self.store.lock().await.get(&token_name(item_id))? else {
+            return Err(unknown());
+        };
+        if !access_token
+            .expose()
+            .starts_with(token_prefix(self.environment))
+        {
+            return Err(PlaidError::WrongEnvironment {
+                configured: self.environment,
+            });
+        }
+        Ok(access_token)
     }
 
     /// Connect the bank Link returned `public_token` for, on a task of its
@@ -839,6 +891,16 @@ impl PlaidService {
             .await?;
         let access_token = Secret::new(exchanged.access_token);
         let item_id = exchanged.item_id;
+        // An item this ledger holds already: Link's update mode (a login
+        // fixed on a connected bank) also hands back a public token, and one
+        // passed here exchanges to the same item. Nothing is stored over it —
+        // its token, its mappings and its sync cursor stay as they are.
+        if check_id("item_id", &item_id).is_ok() {
+            if let Some(held) = self.held_connection(&item_id).await? {
+                info!(item_id = %item_id, "a bank already connected was connected again; nothing changed");
+                return Ok(held);
+            }
+        }
         let refused = if let Err(error) = check_id("item_id", &item_id) {
             Some(error)
         } else if !access_token
@@ -1679,7 +1741,10 @@ pub(crate) mod tests {
         let mock = MockPlaid::default();
         let plaid = service(&mock, dir.path(), &env()).await;
 
-        let token = plaid.create_link_token("u_0123456789abcdef").await.unwrap();
+        let token = plaid
+            .create_link_token("u_0123456789abcdef", None)
+            .await
+            .unwrap();
         assert_eq!(token.link_token, "link-sandbox-abc");
         let body = mock.body_of("/link/token/create").unwrap();
         assert_eq!(body["client_id"], "client-id-test");
@@ -2243,5 +2308,115 @@ pub(crate) mod tests {
             "{:?}",
             fetched.unreadable
         );
+    }
+
+    /// A link token for a connected bank is one in Plaid's update mode: the
+    /// bank's access token, no products, nothing stored or changed here.
+    ///
+    /// Bug-catch: asking for a new connection instead makes Link create a
+    /// second item for the same login — new ids, the history imported again.
+    #[tokio::test]
+    async fn a_login_again_link_token_is_for_the_same_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = MockPlaid::default();
+        let plaid = service(&mock, dir.path(), &env()).await;
+        plaid.connect(connect_token()).await.unwrap();
+
+        plaid
+            .create_link_token("u_0123456789abcdef", Some(ITEM_ID))
+            .await
+            .unwrap();
+        let body = mock.body_of("/link/token/create").unwrap();
+        assert_eq!(body["access_token"], ACCESS_TOKEN);
+        assert!(body.get("products").is_none(), "{body}");
+        assert_eq!(body["user"]["client_user_id"], "u_0123456789abcdef");
+        assert_eq!(body["client_name"], "NewGL");
+        assert_eq!(body["country_codes"], json!(["US"]));
+        assert_eq!(body["language"], "en");
+        assert_eq!(connected_item_count(dir.path()).unwrap(), 1);
+
+        plaid
+            .create_link_token("u_0123456789abcdef", None)
+            .await
+            .unwrap();
+        let body = mock.body_of("/link/token/create").unwrap();
+        assert!(body.get("access_token").is_none(), "{body}");
+        assert_eq!(body["products"], json!(["transactions"]));
+    }
+
+    /// A login-again token is only for a bank this ledger holds, with a token
+    /// of this node's environment; nothing is sent to Plaid otherwise.
+    ///
+    /// Bug-catch: asking Plaid with no access token, or another environment's,
+    /// gets a refusal that names no remedy.
+    #[tokio::test]
+    async fn a_login_again_link_token_needs_a_bank_of_this_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = MockPlaid::default();
+        let env = env();
+        let plaid = service(&mock, dir.path(), &env).await;
+        plaid.connect(connect_token()).await.unwrap();
+        let calls = mock.paths().len();
+
+        let error = plaid
+            .create_link_token("operator", Some("no-such-item"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PlaidError::NoSuchBank(_)), "{error}");
+        plaid.close().await;
+        let error = plaid
+            .create_link_token("operator", Some(ITEM_ID))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PlaidError::Closing), "{error}");
+        drop(plaid);
+        let production = PlaidConfig {
+            environment: PlaidEnvironment::Production,
+            ..enabled()
+        };
+        let plaid = service_in(&mock, dir.path(), &env, production).await;
+        let error = plaid
+            .create_link_token("operator", Some(ITEM_ID))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, PlaidError::WrongEnvironment { .. }),
+            "{error}"
+        );
+        assert_eq!(mock.paths().len(), calls, "nothing sent to Plaid");
+    }
+
+    /// A public token for a bank this ledger holds already — Link's update
+    /// mode hands one back too — changes nothing: its mappings and its sync
+    /// cursor stay.
+    ///
+    /// Bug-catch: storing over it resets the bank to a bare description, and
+    /// every account's mapping is lost without a word.
+    #[tokio::test]
+    async fn connecting_a_held_bank_again_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = MockPlaid::default();
+        let plaid = service(&mock, dir.path(), &env()).await;
+        plaid.connect(connect_token()).await.unwrap();
+        plaid
+            .map_account(ITEM_ID, "acc1", "Assets:Bank:Checking", day("2026-01-01"))
+            .await
+            .unwrap();
+        set_cursor(&plaid, ITEM_ID, "c5").await;
+
+        let again = plaid.connect(connect_token()).await.unwrap();
+        assert_eq!(
+            again.accounts[0].ledger_account.as_deref(),
+            Some("Assets:Bank:Checking")
+        );
+        assert_eq!(
+            plaid.connections().await.unwrap()[0].accounts[0]
+                .ledger_account
+                .as_deref(),
+            Some("Assets:Bank:Checking")
+        );
+        fetch_all(&plaid, ITEM_ID).await.unwrap();
+        assert_eq!(mock.sync_bodies().last().unwrap()["cursor"], "c5");
+        assert!(!mock.paths().contains(&"/item/remove".to_owned()));
     }
 }

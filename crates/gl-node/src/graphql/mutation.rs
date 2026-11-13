@@ -225,14 +225,19 @@ impl MutationRoot {
     }
 
     /// A link token for Plaid Link, which the client app opens to connect a
-    /// bank (007). Only on the node holding this ledger's bank connections.
-    /// Admin only.
+    /// bank (007). With `itemId`, one that logs the person in again to that
+    /// connected bank instead (Plaid's update mode: an expired login,
+    /// `ITEM_LOGIN_REQUIRED`), keeping the connection and its history; the
+    /// public token Link hands back then need not go to `connectBank` (which
+    /// changes nothing for a bank it holds). Only on the node holding
+    /// this ledger's bank connections. Admin only.
     #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
     async fn create_plaid_link_token(
         &self,
         ctx: &Context<'_>,
+        item_id: Option<String>,
     ) -> Result<super::plaid::PlaidLinkToken> {
-        super::plaid::create_link_token(ctx).await
+        super::plaid::create_link_token(ctx, item_id).await
     }
 
     /// Connect the bank Plaid Link just linked: `publicToken` is what Link

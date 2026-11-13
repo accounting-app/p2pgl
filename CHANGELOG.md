@@ -42,6 +42,9 @@ break compatibility.
   One sync of a bank at a time (`SYNC_IN_PROGRESS`). Connect refuses the same
   bank linked twice while it is connected (`BANK_ALREADY_CONNECTED`); after a
   reconnect, map with a later `importFrom` (README).
+- Logging in again to a connected bank (007 step 6b): `createPlaidLinkToken(itemId)`
+  gives a link token in Plaid's update mode for that bank, so an expired login
+  (`ITEM_LOGIN_REQUIRED`) is fixed on the same connection, its history kept.
 - The installer writes `/opt/openledger/secrets.env` (root only): a generated
   `GL_NODE_SECRETS_KEY` and commented lines for the Plaid credentials, read by
   the node as a second environment file and left out of every backup

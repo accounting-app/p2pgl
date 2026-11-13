@@ -83,6 +83,12 @@ own root-only file, left out of backups; the importing node chosen by
    journaled, gossiped; `enteredBy` the admin). Connect refuses the same bank
    linked twice (`BANK_ALREADY_CONNECTED`; the new item removed at Plaid).
    Raw responses only in memory.
+6b. **Logging in again** (maintainer, 2026-11-13: the next Plaid endpoint;
+   MFA in the client app on hold). `createPlaidLinkToken(itemId)` asks Plaid
+   for a link token in update mode — the bank's access token, no `products`
+   — so an expired login is fixed on the same item; nothing to exchange
+   after. Refused for a bank this ledger does not hold or a token of another
+   environment, before anything is sent.
 7. **Operations checklist** (no code; the maintainer, dated records in a
    private folder): MFA on GitHub, hosting, registrar, email and the Plaid
    Dashboard; disk encryption on servers and workstations; first quarterly
