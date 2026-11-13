@@ -828,8 +828,8 @@
   },
   "U-R54-transaction-not-attributed": {
     "file": "crates/gl-node/src/graphql/mutation.rs",
-    "old": "            .append_transaction_staged_by(\n                domain_input,\n                entered_by.as_deref(),",
-    "new": "            .append_transaction_staged_by(\n                domain_input,\n                None,",
+    "old": "        .append_transaction_staged_by(\n            domain_input,\n            entered_by.as_deref(),",
+    "new": "        .append_transaction_staged_by(\n            domain_input,\n            None,",
     "runs": [
       [
         "-p",

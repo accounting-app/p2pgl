@@ -92,3 +92,19 @@ may ask for evidence.
 3. Off-server backup target: still open (plan step 2).
 4. The MFA date given to Plaid: still open.
 5. **No raw Plaid responses on disk** — in memory only.
+
+## Decisions for step 6 (maintainer, 2026-11-13)
+
+6. **Each Plaid account is mapped by an admin** to a ledger account the
+   company already opened; transactions of an unmapped account are not
+   imported.
+7. **The other side is one suspense account** (`Expenses:Uncategorized` by
+   default), and every imported entry is flagged `!` for review.
+8. **Pending transactions are skipped**; only posted ones are imported.
+9. **On demand only**: an admin calls `syncBank`; nothing runs in the
+   background.
+10. **A start date and a list, not a stop** (2026-11-13, after the step 6
+    review): each mapping has an `importFrom` date (default: the day the
+    ledger account was opened) and older transactions are skipped; an entry
+    the ledger refuses for what it says is listed for review with its Plaid
+    id and the reason, and the sync goes on.

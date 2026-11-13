@@ -623,6 +623,7 @@ signing node without it refuses to boot, and the refusal names that remedy.
 | `plaid.enabled` | `false` | Hold this ledger's bank connections on this node — on **one** node per company; see [Bank connections](#bank-connections-plaid). Needs `GL_NODE_PLAID_CLIENT_ID`, `GL_NODE_PLAID_SECRET` and `GL_NODE_SECRETS_KEY` in the environment, or the ledger is not served |
 | `plaid.environment` | `"sandbox"` | `"sandbox"` (Plaid's test banks) or `"production"`; never an address |
 | `plaid.clientName` | `"NewGL"` | The name Plaid Link shows, 1 to 30 characters |
+| `plaid.suspenseAccount` | `"Expenses:Uncategorized"` | The account on the other side of every imported bank transaction; must be open before a sync — see [Importing transactions](#importing-transactions) |
 | `http.headerReadTimeoutSeconds` | `30` | Time a client gets to send a complete request head; also bounds idle keep-alive. `1`–`300` |
 | `http.requestTimeoutSeconds` | `30` | Whole-request ceiling, body read and GraphQL execution included (`408` on expiry). `1`–`300` |
 | `http.maxConnections` | `1024` | Concurrently served connections; excess stays in the kernel backlog. `8`–`65536` |
@@ -1228,14 +1229,20 @@ not in the node:
    another Plaid environment than `plaid.environment` is refused untouched
    (`PLAID_ENVIRONMENT`): set the environment it was connected in.
 
-`createPlaidLinkToken`, `connectBank` and `disconnectBank` need an **admin**
-key. Refusals carry a code: `PLAID_NOT_ENABLED`, `PLAID_ERROR` (Plaid refused;
+`createPlaidLinkToken`, `connectBank`, `disconnectBank`, `mapBankAccount` and
+`syncBank` need an **admin** key. Refusals carry a code: `PLAID_NOT_ENABLED`,
+`BANK_ALREADY_CONNECTED` (Link connected a bank this ledger holds already, the
+same institution and accounts: the new connection is removed at Plaid),
+`NO_SUCH_BANK`, `ACCOUNT_NOT_OPEN`, `SYNC_IN_PROGRESS` (one sync of a bank at
+a time), `PLAID_ERROR` (Plaid refused;
 Plaid's own code is in `extensions.plaidCode`, its message is never passed
 on), `PLAID_UNREACHABLE`, `PLAID_UNEXPECTED` (an answer this node will not
 store), `PLAID_ENVIRONMENT`, `SECRET_STORE` (the details are in the node's log)
 or `LEDGER_BUSY` (the ledger is stopping, restarting or being removed). A stop
-or restart waits for a connect or disconnect under way — up to about 90 s when
-Plaid is slow.
+or restart waits for a bank operation under way — a connect or disconnect up
+to about 90 s when Plaid is slow; a sync is bounded by
+`http.requestTimeoutSeconds`, which ends one too long for it; the next sync
+goes on from its last page.
 Multi-factor sign-in before Link is the client app's job.
 
 **Where the tokens are.** In `secrets.json` in the ledger's folder, owner-only
@@ -1257,7 +1264,57 @@ for removed. Either way: remove the banks in the Plaid Dashboard (they stay
 live, and billed, until then), stop the ledger, move `secrets.json` out of its
 folder, start it again, and connect the banks anew through Link.
 
-Transactions are not imported yet.
+#### Importing transactions
+
+An admin maps each bank account to an account the ledger has opened, then
+syncs when the books should catch up — nothing runs in the background:
+
+```graphql
+mutation { mapBankAccount(itemId: "…", accountId: "…", ledgerAccount: "Assets:Bank:Checking", importFrom: "2026-11-01") { accounts { accountId name ledgerAccount importFrom } } }
+mutation { syncBank(itemId: "…") { imported alreadyImported skippedPending skippedUnmapped skippedBeforeStart needsReview { transactionId reason } stoppedBy } }
+```
+
+Each **posted** transaction of a mapped account becomes one entry, flagged `!`
+for review: the bank's posted date, Plaid's merchant as payee and its
+description as narration, the link `^plaid-<transaction id>`, the mapped
+account with the amount (a payment negative, a deposit positive) and
+`plaid.suspenseAccount` balancing it, for the accountant to reclassify. The
+entries are ordinary records — signed, replicated, `enteredBy` the person whose key
+synced (none for the operator key) — and the token never is.
+
+- **Pending** transactions are skipped, and imported once the bank posts them.
+- **Before `importFrom`** (by default the day the ledger account was opened),
+  or before `plaid.suspenseAccount` was opened (it is one side of every
+  entry): skipped. Plaid sends months of history; set `importFrom` earlier to
+  take it, with both accounts open by then. A bank account cannot be mapped
+  to the suspense account, nor while its bank is syncing (`SYNC_IN_PROGRESS`).
+- **Unmapped** accounts are skipped; mapping one later, or changing its
+  `importFrom`, makes the next sync fetch the bank's whole history again, so
+  its earlier transactions arrive. An account the bank adds after it was
+  connected is not known to the node: disconnect and connect the bank again.
+- **Connected again** (a disconnect and a new Link, for an expired login or
+  a lost key): the new connection's transactions have new ids, so the links
+  do not catch the old ones. Map its accounts with `importFrom` the day after
+  the last imported entry, or the history is imported a second time.
+- **Already imported** (the books hold its `^plaid-…` link): skipped, so a
+  sync can be run again any time, and one cut short writes nothing twice.
+- **For review** (`needsReview`, each with Plaid's transaction id and why):
+  an imported one Plaid changed or removed since (or sent again with another
+  date or amount), one the ledger refused for
+  what it says (a closed account, a currency the account does not take), one without a currency, a zero amount, one this
+  node cannot read. The sync goes on past them and they are not retried:
+  enter what is needed by hand. Nothing is ever reversed by the node. Each is
+  also logged on the node as it is found.
+- A sync goes page by page (100 transactions), storing where it stands after
+  each page is written. One cut short — the request timeout, Plaid, the node
+  itself (its disk, its journal, the ledger's size cap) — goes on from its
+  last page next time; what was written is skipped by its link. Once a page
+  is stored, a sync that stops answers with what it did and `stoppedBy`
+  instead of an error, so the notes of the pages it stored are not lost. A payee or
+  description longer than the ledger takes (1,000 and 10,000 bytes) is cut.
+
+Keep `plaid.enabled` on one node of the mesh: two importing nodes that sync
+before each other's entries reach them each write the same transaction.
 
 ### Several ledgers
 

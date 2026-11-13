@@ -17,8 +17,8 @@
   },
   "PL-R3-delete-whatever-plaid-answered": {
     "file": "crates/gl-node/src/plaid.rs",
-    "old": "            Err(error) => return Err(error),\n",
-    "new": "            Err(_) => {}\n",
+    "old": "            Err(error) => return Err(error),\n        }\n        // The description first:",
+    "new": "            Err(_) => {}\n        }\n        // The description first:",
     "runs": [
       ["-p", "gl-node", "--bin", "gl-node", "disconnect_keeps_the_token_when_plaid_refuses"]
     ]
@@ -130,8 +130,8 @@
   },
   "PL-R17-disconnect-sends-another-environments-token": {
     "file": "crates/gl-node/src/plaid.rs",
-    "old": "            return Err(PlaidError::WrongEnvironment {\n                configured: self.environment,\n            });\n",
-    "new": "            let _ = self.environment;\n",
+    "old": "            return Err(PlaidError::WrongEnvironment {\n                configured: self.environment,\n            });\n        }\n        let removed",
+    "new": "            let _ = self.environment;\n        }\n        let removed",
     "runs": [
       ["-p", "gl-node", "--bin", "gl-node", "a_token_of_another_environment_is_refused"]
     ]
@@ -215,5 +215,191 @@
     "runs": [
       ["-p", "gl-node", "--bin", "gl-node", "a_disconnect_cut_short_still_finishes"]
     ]
+  },
+  "PL-R28-plaid-sign-kept": {
+    "file": "crates/gl-node/src/graphql/plaid.rs",
+    "old": "number: -transaction.amount,",
+    "new": "number: transaction.amount,",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_sync_writes_one_entry_per_posted_transaction"]]
+  },
+  "PL-R29-no-link-check": {
+    "file": "crates/gl-node/src/graphql/plaid.rs",
+    "old": "if let Some(entry) = held.get(&link) {",
+    "new": "if let Some(entry) = None::<&HeldImport> {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_repeated_sync_imports_nothing_twice"]]
+  },
+  "PL-R30-every-refusal-stops-the-sync": {
+    "file": "crates/gl-node/src/graphql/plaid.rs",
+    "old": "if !ENTRY_REFUSALS.contains(&code.as_str()) {",
+    "new": "if true {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "an_entry_the_ledger_refuses_is_noted_and_the_sync_goes_on"]]
+  },
+  "PL-R31-first-page-only": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "session.done = !raw.has_more;",
+    "new": "session.done = true;",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_fetch_reads_every_page_and_stores_nothing"]]
+  },
+  "PL-R32-no-restart-on-mutation-during-pagination": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "&& session.restarts < 3 =>",
+    "new": "&& session.restarts > 3 =>",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_fetch_starts_again_when_plaid_says_so"]]
+  },
+  "PL-R33-mapping-keeps-the-cursor": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "        if changed {\n            store.remove(&cursor_name(item_id))?;\n            store.remove(&complete_cursor_name(item_id))?;\n        }\n",
+    "new": "        let _ = changed;\n",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "mapping_an_account_starts_its_bank_from_the_beginning"]]
+  },
+  "PL-R34-the-same-bank-twice": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "if let Some(existing) = self.same_bank_as(&connection).await {",
+    "new": "if let Some(existing) = None::<String> {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "the_same_bank_linked_twice_is_refused"]]
+  },
+  "PL-R35-every-change-for-review": {
+    "file": "crates/gl-node/src/graphql/plaid.rs",
+    "old": "            if held.contains_key(&import_link(id)) {",
+    "new": "            if true {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "changed_imported_transactions_are_counted_for_review"]]
+  },
+  "PL-R36-sync-without-a-suspense-account": {
+    "file": "crates/gl-node/src/graphql/plaid.rs",
+    "old": "let Some(suspense_opened) = opened_on(ledger, &suspense).await else {",
+    "new": "let Some(suspense_opened) = Some(opened_on(ledger, &suspense).await.unwrap_or(chrono::NaiveDate::MIN)) else {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_sync_and_a_mapping_need_open_accounts"]]
+  },
+  "PL-R37-pending-imported": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "if transaction.pending {",
+    "new": "if false && transaction.pending {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_fetch_reads_every_page_and_stores_nothing"], ["-p", "gl-node", "--bin", "gl-node", "a_sync_writes_one_entry_per_posted_transaction"]]
+  },
+  "PL-R38-map-bank-account-not-admin-only": {
+    "file": "crates/gl-node/src/access_control.rs",
+    "old": "    \"mapBankAccount\",\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "plaid_mutations_need_an_admin_key"]]
+  },
+  "PL-R39-sync-bank-not-admin-only": {
+    "file": "crates/gl-node/src/access_control.rs",
+    "old": "    \"syncBank\",\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "plaid_mutations_need_an_admin_key"]]
+  },
+  "PL-R40-disconnect-keeps-the-cursor": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "        store.remove(&cursor_name(item_id))?;\n        store.remove(&complete_cursor_name(item_id))?;\n        store.remove(&token_name(item_id))?;\n",
+    "new": "        store.remove(&token_name(item_id))?;\n",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_disconnected_bank_leaves_no_cursor"]]
+  },
+  "PL-R41-cursor-stored-over-a-mapping": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "if stored.as_ref().map(Secret::expose) != session.stored.as_deref() {",
+    "new": "if false {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_cursor_moved_under_a_sync_wins"]]
+  },
+  "PL-R42-two-syncs-at-once": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "syncing.insert(item_id.to_owned()).then(|| SyncGuard {",
+    "new": "{ syncing.insert(item_id.to_owned()); true }.then(|| SyncGuard {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "one_sync_of_a_bank_at_a_time"]]
+  },
+  "PL-R43-no-start-date": {
+    "file": "crates/gl-node/src/graphql/plaid.rs",
+    "old": "if transaction.date < *start {",
+    "new": "if false {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_transaction_before_the_start_date_is_skipped"]]
+  },
+  "PL-R44-changes-noted-twice": {
+    "file": "crates/gl-node/src/graphql/plaid.rs",
+    "old": ".any(|other| other.transaction_id == note.transaction_id && other.reason == note.reason)",
+    "new": ".any(|_| false)",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "changed_imported_transactions_are_counted_for_review"]]
+  },
+  "PL-R45-unreadable-fails-the-fetch": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "Err(error) => page.unreadable.push((id, error.to_string())),",
+    "new": "Err(error) => return Err(error),",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "an_unreadable_transaction_is_noted_not_fatal"]]
+  },
+  "PL-R46-zero-amount-written": {
+    "file": "crates/gl-node/src/graphql/plaid.rs",
+    "old": "if transaction.amount.is_zero() {",
+    "new": "if false {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_zero_amount_is_noted"]]
+  },
+  "PL-R47-cursor-only-at-the-end": {
+    "file": "crates/gl-node/src/graphql/plaid.rs",
+    "old": "match plaid.commit_page(&mut session, &page).await {",
+    "new": "match (if page.has_more { Ok(true) } else { plaid.commit_page(&mut session, &page).await }) {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_sync_cut_short_goes_on_from_its_last_page"]]
+  },
+  "PL-R48-start-ignores-the-suspense-account": {
+    "file": "crates/gl-node/src/graphql/plaid.rs",
+    "old": ".map_or(suspense_opened, |first| first.max(suspense_opened));",
+    "new": ".unwrap_or(suspense_opened);",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "nothing_is_imported_from_before_the_suspense_account_opened"]]
+  },
+  "PL-R49-mapping-during-a-sync": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "if self.is_syncing(item_id) {",
+    "new": "if false {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_mapping_waits_for_no_sync"]]
+  },
+  "PL-R50-mapped-to-the-suspense-account": {
+    "file": "crates/gl-node/src/graphql/plaid.rs",
+    "old": "if ledger_account == plaid.suspense_account() {",
+    "new": "if false {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_bank_account_is_not_mapped_to_the_suspense_account"]]
+  },
+  "PL-R51-description-passed-whole": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "name: cut(self.name, MAX_NARRATION_BYTES),",
+    "new": "name: self.name,",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "an_over_long_description_is_cut_and_imported"]]
+  },
+  "PL-R52-payee-passed-whole": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "merchant_name: cut(self.merchant_name, MAX_PAYEE_BYTES),",
+    "new": "merchant_name: self.merchant_name,",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "an_over_long_description_is_cut_and_imported"]]
+  },
+  "PL-R53-page-stored-unnoted": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "        session.stored = Some(cursor.to_owned());\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_sync_stores_every_page"]]
+  },
+  "PL-R54-a-stop-loses-the-notes": {
+    "file": "crates/gl-node/src/graphql/plaid.rs",
+    "old": "    if !stored_a_page {\n        return Err(error);\n    }\n",
+    "new": "    if !stored_a_page || stored_a_page {\n        return Err(error);\n    }\n",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_sync_cut_short_goes_on_from_its_last_page"]]
+  },
+  "PL-R55-a-change-under-a-restart-unnoted": {
+    "file": "crates/gl-node/src/graphql/plaid.rs",
+    "old": "                if entry.date != transaction.date\n                    || entry\n",
+    "new": "                if false && (entry.date != transaction.date)\n                    && entry\n",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_restart_notes_what_changed_under_it"]]
+  },
+  "PL-R56-restart-from-the-last-page": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "session.at = session.series_start.clone();",
+    "new": "session.at = session.stored.clone();",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_restart_goes_back_to_the_last_finished_series"]]
+  },
+  "PL-R57-cut-inside-a-character": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "while !text.is_char_boundary(end) {",
+    "new": "while false && !text.is_char_boundary(end) {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "an_over_long_description_is_cut_and_imported"]]
+  },
+  "PL-R58-finished-series-not-kept": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "            store.put(&complete_cursor_name(item_id), &Secret::new(cursor))?;\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_restart_goes_back_to_the_last_finished_series"]]
   }
 }

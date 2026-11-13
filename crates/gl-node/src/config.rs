@@ -378,6 +378,12 @@ pub struct PlaidConfig {
     /// characters, Plaid's limit. Default `NewGL`.
     #[serde(default = "default_plaid_client_name")]
     pub client_name: String,
+
+    /// The account on the other side of every imported bank transaction,
+    /// flagged `!` for review (007 step 6, decision 7). Must be open in the
+    /// ledger before a sync. Default `Expenses:Uncategorized`.
+    #[serde(default = "default_plaid_suspense_account")]
+    pub suspense_account: String,
 }
 
 impl Default for PlaidConfig {
@@ -386,12 +392,17 @@ impl Default for PlaidConfig {
             enabled: false,
             environment: PlaidEnvironment::default(),
             client_name: default_plaid_client_name(),
+            suspense_account: default_plaid_suspense_account(),
         }
     }
 }
 
 fn default_plaid_client_name() -> String {
     "NewGL".to_owned()
+}
+
+fn default_plaid_suspense_account() -> String {
+    "Expenses:Uncategorized".to_owned()
 }
 
 /// The Plaid environment a ledger's connections live in. Only Plaid's own
@@ -420,6 +431,13 @@ impl PlaidConfig {
         if !(1..=30).contains(&length) || self.client_name.chars().any(char::is_control) {
             return Err(ConfigError::Validation(
                 "plaid.clientName must be 1 to 30 characters, without control characters"
+                    .to_owned(),
+            ));
+        }
+        let account = &self.suspense_account;
+        if !account.contains(':') || account.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(ConfigError::Validation(
+                "plaid.suspenseAccount must be an account name, such as Expenses:Uncategorized"
                     .to_owned(),
             ));
         }

@@ -59,10 +59,30 @@ own root-only file, left out of backups; the importing node chosen by
    restore onto a new server without it means connecting the banks again.
    OPERATIONS documents it. Checked by the rehearsals (`rehearse_install`,
    `rehearse_backup`), not the gate.
-6. **Transaction sync.** `/transactions/sync` with a stored cursor, on a timer
-   and on demand; each Plaid transaction becomes one entry carrying its
-   Plaid `transaction_id` in metadata, skipped when already posted; posted to
-   a mapped bank account. Raw responses only in memory.
+6. **Transaction import** (decisions 6–9). `mapBankAccount(itemId, accountId,
+   ledgerAccount)` (admin) maps a Plaid account to an open ledger account and
+   resets the item's cursor, so its earlier transactions arrive at the next
+   sync. `syncBank(itemId)` (admin) pages `/transactions/sync` from the stored
+   cursor; each **posted** transaction of a mapped account becomes one entry:
+   its date, payee and narration from Plaid, flag `!`, link
+   `^plaid-<transaction_id>`, the mapped account `-amount` (Plaid counts money
+   out as positive) and `plaid.suspenseAccount` balancing it. An entry whose
+   link the ledger already holds is skipped, so a repeated sync imports
+   nothing twice; the cursor is stored page by page, once that page's
+   entries are written.
+   Modified and removed posted transactions, and entries the ledger refuses,
+   are listed for review, never reversed (a departure from the first plan,
+   which reversed them); `importFrom` on the mapping (default the account's
+   open date) skips the history before it, and is the remedy after a
+   reconnect, and nothing before the suspense account's open date is
+   imported. One sync of a bank at a time, and no mapping during one; a
+   page's cursor stored only over the one the sync last stored, the last
+   page's kept apart for restarts; a sync that stops after storing a page
+   answers with what it did and `stoppedBy`, and an already-imported
+   transaction sent again with another date or amount is noted. Entries go through `appendTransaction`'s own path (signed,
+   journaled, gossiped; `enteredBy` the admin). Connect refuses the same bank
+   linked twice (`BANK_ALREADY_CONNECTED`; the new item removed at Plaid).
+   Raw responses only in memory.
 7. **Operations checklist** (no code; the maintainer, dated records in a
    private folder): MFA on GitHub, hosting, registrar, email and the Plaid
    Dashboard; disk encryption on servers and workstations; first quarterly
@@ -88,8 +108,9 @@ users only once the client app's MFA is live.
 - **Removal order:** deleting the token before `/item/remove` succeeds leaves
   a live item at Plaid we can no longer remove. Remove at Plaid first; on
   failure keep the token and retry.
-- **Pending and modified transactions:** Plaid revises them; a revision is
-  posted as a reversing entry plus the new one, as the ledger cannot edit.
+- **Pending and modified transactions:** pending ones are skipped (decision
+  8); a posted one Plaid changes or removes after its import is counted in
+  `needsReview` for the accountant, never reversed by the node.
 - **One store instance per ledger:** each write replaces the whole file, so
   two instances on one folder lose each other's writes (a token lost, its
   item live at Plaid). Step 5 keeps one per ledger behind a mutex, opened
@@ -123,8 +144,12 @@ users only once the client app's MFA is live.
   disconnect cut short still finishes; a removal waits for a connect under way
   and reopens on a refusal; a restart waits for it too; a token of another
   environment is never sent there; Plaid's answers are capped.
-- Step 6: sync → a second node receives the entries; the token is absent from
-  the `.bean` files and records of both; a duplicate sync posts nothing.
+- Step 6: every page read, nothing stored at fetch; started again when Plaid
+  says the history moved; a mapping restarts the bank; the same bank linked
+  twice refused; one entry per posted mapped transaction, sign turned; a
+  repeated sync imports nothing twice; a sync cut short goes on from its
+  last page; changed imported ones counted; no sync without the suspense
+  account; the five admin fields refused to a write key.
 - Revert checks: `scripts/revert_specs/secret_store.json` (step 3);
   `plaid.json` (step 5: admin-only, token stored, delete only on success or
   "gone", no Plaid message, credentials sent and not printed, id check,

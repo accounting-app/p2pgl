@@ -28,7 +28,20 @@ break compatibility.
   `GL_NODE_PLAID_CLIENT_ID`, `GL_NODE_PLAID_SECRET`, `GL_NODE_SECRETS_KEY` in
   the environment): `createPlaidLinkToken`, `connectBank(publicToken)`,
   `disconnectBank(itemId)` and the query `connectedBanks` — README *Bank
-  connections (Plaid)*. Transactions are not imported yet.
+  connections (Plaid)*.
+- Importing bank transactions (007 step 6): `mapBankAccount(itemId,
+  accountId, ledgerAccount, importFrom)` maps a bank account to an open ledger
+  account from a date (default: the day it was opened), and `syncBank(itemId)`
+  writes one entry per posted transaction — flagged `!`, linked
+  `^plaid-<transaction id>`, against `plaid.suspenseAccount` (default
+  `Expenses:Uncategorized`). Pending, unmapped, earlier and already imported
+  transactions are skipped; changed or removed ones, and entries the ledger
+  refuses for what they say, are listed in `needsReview` with their ids and
+  the sync goes on; it stores its place page by page, and one that stops
+  once a page is stored answers with `stoppedBy` and what it did.
+  One sync of a bank at a time (`SYNC_IN_PROGRESS`). Connect refuses the same
+  bank linked twice while it is connected (`BANK_ALREADY_CONNECTED`); after a
+  reconnect, map with a later `importFrom` (README).
 - The installer writes `/opt/openledger/secrets.env` (root only): a generated
   `GL_NODE_SECRETS_KEY` and commented lines for the Plaid credentials, read by
   the node as a second environment file and left out of every backup

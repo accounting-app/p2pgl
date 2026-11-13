@@ -92,115 +92,7 @@ impl MutationRoot {
                 })
                 .collect(),
         };
-
-        // T44: single writer from here until the commit is finished.
-        let permit = acquire_write_permit(ledger).await;
-        let mut svc = ledger.write().await;
-        let signer = ctx.data::<Arc<dyn SignatureProvider>>().ok().cloned();
-        let entered_by = entered_by(ctx);
-        // T77 / L-71: at the size cap, refuse BEFORE staging — see
-        // `refuse_if_local_write_cannot_fit`.
-        if let Err(error) = refuse_if_local_write_cannot_fit(
-            &svc,
-            LocalWrite::Transaction(&domain_input),
-            entered_by.as_deref(),
-            signer.as_deref(),
-        ) {
-            drop(svc);
-            drop(permit);
-            return Err(service_error_to_graphql(error));
-        }
-        // M-10: the service tells us whether this body was already in the DAG.
-        // It is the only party that can — re-checking here would be a
-        // get-then-append race — and the answer rides out on `alreadyExisted`.
-        let outcome = svc
-            .append_transaction_staged_by(
-                domain_input,
-                entered_by.as_deref(),
-                |id, parents, lamport| {
-                    signer.as_ref().and_then(|provider| {
-                        provider.sign(&SignableMessage {
-                            content_id: id,
-                            is_transaction: true,
-                            parents,
-                            lamport,
-                        })
-                    })
-                },
-            )
-            .map_err(service_error_to_graphql)?;
-        let content_id = outcome.txid;
-        // M-39: a failed prepare releases the write lock BEFORE its L-13
-        // reload runs, so readers are not queued behind a full-ledger rebuild;
-        // the permit rides back out for the commit.
-        let (svc, pending, permit) = prepare_or_recover(ledger, svc, false, permit)
-            .await
-            .map_err(service_error_to_graphql)?;
-
-        // Look up the just-inserted transaction to return it.
-        let txn = svc
-            .get_directive(&content_id)
-            .and_then(|d| {
-                if let ledger::model::Directive::Transaction(t) = d {
-                    // M-45: `content_id` is this transaction's id; no re-hash.
-                    Some(txn_to_graphql(t, content_id.clone(), true))
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| {
-                async_graphql::Error::new("Transaction inserted but not found")
-                    .extend_with(|_, ext| ext.set("code", "INTERNAL"))
-            })?;
-
-        // T41: a duplicate append records nothing new, so it announces nothing.
-        //
-        // Both of these used to fire on a body the DAG already held. The
-        // broadcast published a "new transaction" event to every subscriber for
-        // a transaction that had been there for hours — indistinguishable from a
-        // real append, so a client counting the stream over-counts and a client
-        // reacting to it acts twice. The gossip send re-announced someone else's
-        // directive, envelope and all: under M-10 the stored envelope names
-        // whoever inserted the body FIRST, so a squatted transaction was
-        // re-broadcast by its victim, with its victim's node as the relay.
-        //
-        // The write itself is unchanged — `appendTransaction` is still
-        // idempotent by economic content (FR-1 AC4) and still returns the txid
-        // and `alreadyExisted: true`. Nothing is lost by staying quiet: the
-        // directive is already persisted here and already known to the mesh,
-        // which is precisely why it was a duplicate.
-        let to_gossip = if outcome.already_existed {
-            None
-        } else {
-            svc.get_directive(&content_id).cloned()
-        };
-        drop(svc);
-
-        // T44: the write and the fsync happen here — no ledger lock held, and
-        // on a blocking-pool thread rather than a runtime worker. The caller
-        // still awaits the outcome, so a mutation that returns success is still
-        // a mutation whose directive is on disk.
-        // T44/H-11: `commit_pending` owns the permit from here, so the
-        // single-writer slot is released by the commit itself rather than by
-        // this frame — which a dropped request future would not run.
-        commit_pending(ledger, pending, permit)
-            .await
-            .map_err(service_error_to_graphql)?;
-
-        if !outcome.already_existed {
-            // Publish to subscribers (local + remote appends) only once the
-            // write is durable: announcing a transaction that a failed commit
-            // then rolled out of memory would be a lie to every subscriber.
-            if let Ok(broadcast) = ctx.data::<TransactionBroadcast>() {
-                broadcast.publish(txn.clone());
-            }
-            gossip_after_unlock(ctx, to_gossip).await;
-        }
-
-        Ok(AppendedTransaction {
-            transaction: txn,
-            already_existed: outcome.already_existed,
-        })
+        append_transaction_input(ctx, ledger, domain_input).await
     }
 
     /// Open an account (FR-3 AC1).
@@ -362,6 +254,41 @@ impl MutationRoot {
         super::plaid::disconnect_bank(ctx, item_id).await
     }
 
+    /// Import a bank account's transactions to `ledgerAccount`, an open
+    /// account of this ledger, those dated `importFrom` or later (default: the
+    /// day the account was opened) (007 step 6). Its earlier transactions
+    /// arrive at the next `syncBank`. Admin only.
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
+    async fn map_bank_account(
+        &self,
+        ctx: &Context<'_>,
+        item_id: String,
+        account_id: String,
+        ledger_account: String,
+        import_from: Option<DateScalar>,
+    ) -> Result<super::plaid::ConnectedBank> {
+        super::plaid::map_bank_account(
+            ctx,
+            item_id,
+            account_id,
+            ledger_account,
+            import_from.map(|date| date.0),
+        )
+        .await
+    }
+
+    /// Import a bank's new posted transactions: one entry each, flagged `!`,
+    /// against `plaid.suspenseAccount` (007 step 6). Run it again any time:
+    /// what the books hold already is skipped. Admin only.
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
+    async fn sync_bank(
+        &self,
+        ctx: &Context<'_>,
+        item_id: String,
+    ) -> Result<super::plaid::BankSync> {
+        super::plaid::sync_bank(ctx, item_id).await
+    }
+
     /// Close an account (FR-3 AC2).
     // Each mutation costs a durable write and an fsync, so alias batching must
     // be budget-limited like the heavy read resolvers (M-1/M-03). T44 made that
@@ -488,6 +415,125 @@ pub(super) async fn gossip_after_unlock(
     if let (Some(directive), Ok(sender)) = (directive, ctx.data::<GossipSender>()) {
         let _ = sender.send(directive).await;
     }
+}
+
+/// `appendTransaction`'s write path, for an entry already in domain form: the
+/// API's own and the ones a bank import makes (`crate::graphql::plaid`, 007),
+/// so both are refused, signed, journaled, published and gossiped alike, and
+/// carry the caller as `enteredBy`.
+pub(super) async fn append_transaction_input(
+    ctx: &Context<'_>,
+    ledger: &SharedLedger,
+    domain_input: TransactionInput,
+) -> Result<AppendedTransaction> {
+    // T44: single writer from here until the commit is finished.
+    let permit = acquire_write_permit(ledger).await;
+    let mut svc = ledger.write().await;
+    let signer = ctx.data::<Arc<dyn SignatureProvider>>().ok().cloned();
+    let entered_by = entered_by(ctx);
+    // T77 / L-71: at the size cap, refuse BEFORE staging — see
+    // `refuse_if_local_write_cannot_fit`.
+    if let Err(error) = refuse_if_local_write_cannot_fit(
+        &svc,
+        LocalWrite::Transaction(&domain_input),
+        entered_by.as_deref(),
+        signer.as_deref(),
+    ) {
+        drop(svc);
+        drop(permit);
+        return Err(service_error_to_graphql(error));
+    }
+    // M-10: the service tells us whether this body was already in the DAG.
+    // It is the only party that can — re-checking here would be a
+    // get-then-append race — and the answer rides out on `alreadyExisted`.
+    let outcome = svc
+        .append_transaction_staged_by(
+            domain_input,
+            entered_by.as_deref(),
+            |id, parents, lamport| {
+                signer.as_ref().and_then(|provider| {
+                    provider.sign(&SignableMessage {
+                        content_id: id,
+                        is_transaction: true,
+                        parents,
+                        lamport,
+                    })
+                })
+            },
+        )
+        .map_err(service_error_to_graphql)?;
+    let content_id = outcome.txid;
+    // M-39: a failed prepare releases the write lock BEFORE its L-13
+    // reload runs, so readers are not queued behind a full-ledger rebuild;
+    // the permit rides back out for the commit.
+    let (svc, pending, permit) = prepare_or_recover(ledger, svc, false, permit)
+        .await
+        .map_err(service_error_to_graphql)?;
+
+    // Look up the just-inserted transaction to return it.
+    let txn = svc
+        .get_directive(&content_id)
+        .and_then(|d| {
+            if let ledger::model::Directive::Transaction(t) = d {
+                // M-45: `content_id` is this transaction's id; no re-hash.
+                Some(txn_to_graphql(t, content_id.clone(), true))
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            async_graphql::Error::new("Transaction inserted but not found")
+                .extend_with(|_, ext| ext.set("code", "INTERNAL"))
+        })?;
+
+    // T41: a duplicate append records nothing new, so it announces nothing.
+    //
+    // Both of these used to fire on a body the DAG already held. The
+    // broadcast published a "new transaction" event to every subscriber for
+    // a transaction that had been there for hours — indistinguishable from a
+    // real append, so a client counting the stream over-counts and a client
+    // reacting to it acts twice. The gossip send re-announced someone else's
+    // directive, envelope and all: under M-10 the stored envelope names
+    // whoever inserted the body FIRST, so a squatted transaction was
+    // re-broadcast by its victim, with its victim's node as the relay.
+    //
+    // The write itself is unchanged — `appendTransaction` is still
+    // idempotent by economic content (FR-1 AC4) and still returns the txid
+    // and `alreadyExisted: true`. Nothing is lost by staying quiet: the
+    // directive is already persisted here and already known to the mesh,
+    // which is precisely why it was a duplicate.
+    let to_gossip = if outcome.already_existed {
+        None
+    } else {
+        svc.get_directive(&content_id).cloned()
+    };
+    drop(svc);
+
+    // T44: the write and the fsync happen here — no ledger lock held, and
+    // on a blocking-pool thread rather than a runtime worker. The caller
+    // still awaits the outcome, so a mutation that returns success is still
+    // a mutation whose directive is on disk.
+    // T44/H-11: `commit_pending` owns the permit from here, so the
+    // single-writer slot is released by the commit itself rather than by
+    // this frame — which a dropped request future would not run.
+    commit_pending(ledger, pending, permit)
+        .await
+        .map_err(service_error_to_graphql)?;
+
+    if !outcome.already_existed {
+        // Publish to subscribers (local + remote appends) only once the
+        // write is durable: announcing a transaction that a failed commit
+        // then rolled out of memory would be a lie to every subscriber.
+        if let Ok(broadcast) = ctx.data::<TransactionBroadcast>() {
+            broadcast.publish(txn.clone());
+        }
+        gossip_after_unlock(ctx, to_gossip).await;
+    }
+
+    Ok(AppendedTransaction {
+        transaction: txn,
+        already_existed: outcome.already_existed,
+    })
 }
 
 #[cfg(test)]

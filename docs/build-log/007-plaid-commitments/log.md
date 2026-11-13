@@ -106,7 +106,7 @@ to commit. The commit hash is filled in once the maintainer has committed.
   `no_response_carries_the_access_token` is best effort (tracing's global
   interest cache under parallel tests), the response half strict. `plan.md`
   updated.
-- **Commit:** —
+- **Commit:** 357e6be
 
 ## 2026-11-13 — The store key on installed servers (step 5b)
 
@@ -145,4 +145,110 @@ to commit. The commit hash is filled in once the maintainer has committed.
   written anew.- **Gate:** `scripts/gate.sh --quick` — fmt, clippy, anchors, guard pass; no
   Rust changed since step 5's full gate (1679 passed, 0 failed, 0 ignored).
 - **Departures from the plan:** none.
+- **Commit:** 357e6be
+
+## 2026-11-13 — Importing bank transactions (step 6)
+
+- **What changed:** decisions 6–9 (intent.md). `plaid.suspenseAccount`
+  (default `Expenses:Uncategorized`) in a ledger's `plaid` section.
+  `crate::plaid`: a bank account's `ledger_account` in its stored
+  description; `map_account` (a new mapping forgets the item's cursor);
+  `fetch` pages `/transactions/sync` from the stored cursor (since the
+  second review `begin_fetch` / `next_page` / `commit_page`, 100 a page, up
+  to 1000 pages; started again on `TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION`, as
+  Plaid asks), skipping pending, collecting changed and removed ids, storing
+  nothing; `commit_page` (since the third review it also keeps a finished
+  series' cursor apart, for restarts); connect refuses the same bank linked twice (same
+  institution, same account names and masks: `BANK_ALREADY_CONNECTED`, the
+  new item removed at Plaid). `graphql/plaid.rs`: `mapBankAccount` (the
+  ledger account must be open) and `syncBank` (the suspense account must be
+  open; one entry per posted transaction of a mapped account, flag `!`, link
+  `^plaid-<id>`, the mapped account `-amount`, the suspense account
+  balancing; a link the books hold is skipped; the cursor stored page by page
+  once that page's entries are written; `needsReview` lists, with ids and
+  reasons, what the accountant should look at; `stoppedBy` once a stored page
+  precedes a stop). Both admin only. The entries go
+  through `append_transaction_input`, `appendTransaction`'s body moved out of
+  the resolver unchanged (re-indented), so they are refused, signed,
+  journaled, published and gossiped alike. README *Importing transactions*
+  and the config row; CHANGELOG *Added*.
+- **Review:** four important findings, all fixed. (1) A disconnect left the
+  cursor, so a bare bank stayed listed and `BANKS_CONNECTED` blocked removal
+  for good — the cursor goes too (PL-R40). (2) One refused entry stopped every
+  later sync of the bank, and the README's remedy could not work —
+  maintainer's choice: `mapBankAccount` takes `importFrom` (default the
+  ledger account's open date; earlier transactions skipped,
+  `skippedBeforeStart`), and an entry the ledger refuses for what it says
+  (`ENTRY_REFUSALS`) is noted in `needsReview` with its id and the reason
+  while the sync goes on; any other refusal stops it with the cursor kept;
+  unreadable transactions and zero amounts are noted too (PL-R30, R43, R45,
+  R46). (3) A reconnect imports the history again (new ids) — the README now
+  says so and gives the remedy, a later `importFrom`; `BANK_ALREADY_CONNECTED`
+  claims no more than "while it is connected". (4) Pages of 500 may pass the
+  1 MiB cap — 100 a page (Plaid's default), up to 1000 pages. Also fixed: a
+  mapping made during a sync is no longer overwritten (a page's cursor stored only
+  over the one the session last stored, PL-R41); one sync of a bank at a time
+  (`SYNC_IN_PROGRESS`, PL-R42); an append that found the entry already is
+  counted `alreadyImported`; `needsReview` lists ids and reasons and the log
+  names them; changed ids counted once (PL-R44); the deposit test checks the
+  sign; README on the close gate and the request timeout bounding a sync; an
+  account the bank adds after connect is documented as unknown to the node.
+  Not pinned by a test: a sync stopped by a node failure keeping its cursor
+  (no way to inject an I/O error here); `SYNC_PAGE_SIZE` (the mock's pages
+  are small). The `appendTransaction` move was checked byte-identical.
+- **Gate:** `scripts/gate.sh` — 1702 passed, 0 failed, 0 ignored.
+- **Revert checks:** `scripts/revert_specs/plaid.json` — 58 of 58 bite
+  (PL-R28..R58 for step 6; R55 rewritten after `false && a || b` left the
+  amount test standing, R44 moved to the per-note de-duplication, the
+  per-page one removed as redundant; PL-R3 and PL-R17 re-anchored; PL-R29 bites through
+  a second admin's sync, the content id catching the same caller alone); `users.json` U-R54
+  re-anchored on the moved append — 1 of 1 bite.
+- **Second review:** no new code bugs in the first round's fixes; two
+  important gaps, fixed. (1) A mapping made during a bank's first sync (no
+  cursor stored, so the compare-and-set saw `None` = `None`) was lost —
+  `mapBankAccount` is now refused while its bank syncs (`SYNC_IN_PROGRESS`,
+  judged under the store lock; PL-R49), the compare-and-set kept as a second
+  guard. (2) A fetch longer than `http.requestTimeoutSeconds` never got
+  anywhere, every page fetched before any was written — the sync now goes
+  page by page (`begin_fetch` / `next_page` / `commit_page`), each page's
+  cursor stored once its entries are written (PL-R47). Also: nothing imported
+  from before the suspense account was opened (PL-R48); a bank account cannot
+  be mapped to the suspense account (PL-R50); payee and narration cut to the
+  ledger's 1,000 and 10,000 bytes instead of refused for size (PL-R51); a
+  transaction with a field that does not read is noted, not a failed page
+  (PL-R45); docs: the README's timeout claim now true, CHANGELOG's refusal
+  wording, the plan's proof list, this log's page size.
+- **Third review:** two important findings from the page-by-page change,
+  fixed. (1) A sync failing after a page was stored lost that page's notes
+  for good — every note is now logged as it is made, and once a page is
+  stored a stopped sync answers `Ok` with `stoppedBy` (PL-R54). (2) After
+  Plaid restarts the pages, a transaction written before the restart comes
+  back in `added` with any change folded in — an already-imported
+  transaction whose date or bank amount differs from the books is now noted
+  (PL-R55). And a possible one: Plaid keeps only a finished series' cursor
+  valid for long, so the last page's cursor (`has_more` false) is stored
+  apart and a restart goes back to it, not to a page cursor a cut-short sync
+  stored (PL-R56, R58). Also: a test storing two pages in one sync
+  (PL-R53); the cut test now cuts inside a character (PL-R57) and the payee
+  cut has its check (PL-R52); changes read as id and pending only; an
+  unreadable transaction's note keeps its id when it is valid; notes kept
+  once each; the ledger's own text limits used; a poisoned sync lock counts
+  as syncing. Known and left: a request dropped mid-append frees the sync
+  mark while its commit may still run; a second sync could then skip that
+  entry by its staged link, and lose it if that commit is rolled back —
+  narrow, and the entry's absence would show at the next reconciliation.
+- **Final review:** nothing important. Left as follow-ups (none loses an
+  entry): another entry carrying the same `^plaid-…` link (a hand-linked
+  follow-up) can draw a false "changed" note on a resend — keep the first
+  entry per link; `stoppedBy` carries the message only, not the code or
+  `plaidCode`; a sync ended by a disconnect or a moved cursor answers with
+  `stoppedBy` null; `map_account` stores the mapping before removing the two
+  cursors, so a disk error between them can leave a stale finished-series
+  cursor — remove them first; two unreadable transactions without an id and
+  with the same fault share one note.
+- **Departures from the plan:** changed and removed posted transactions are
+  counted for review instead of reversed (a reversing entry for a bank's
+  correction is the accountant's call); the plan's two-node proof is not a
+  test of its own — the entries are ordinary records, replicated as any.
+  `plan.md` updated.
 - **Commit:** —
