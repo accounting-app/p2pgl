@@ -40,6 +40,9 @@ pub(crate) struct NodeSettings {
     /// The node ids of the ledgers started so far, by id, with their ledger's
     /// name (003, decision 1): no two ledgers share a node key.
     pub node_ids: NodeIds,
+    /// The Plaid credentials and secret-store key from the environment (007),
+    /// for the ledgers with `plaid.enabled`.
+    pub plaid: Arc<crate::plaid::PlaidEnv>,
 }
 
 /// See [`NodeSettings::node_ids`].
@@ -122,6 +125,9 @@ pub(crate) struct RunningLedger {
     ledger: SharedLedger,
     file_watcher: Option<tokio::task::JoinHandle<()>>,
     p2p_router: Option<iroh::protocol::Router>,
+    /// Its bank connections, when `plaid.enabled` (007): closed first by
+    /// [`Self::stop`], and by a removal before it judges the store.
+    pub plaid: Option<Arc<crate::plaid::PlaidService>>,
     /// M-17: held for the ledger's whole life; dropped by [`Self::stop`].
     _lock: crate::ledger_lock::LedgerLock,
 }
@@ -214,6 +220,29 @@ async fn start_ledger(
             error!(%error, "cannot use the configured ledger path; this ledger is not served");
             return Err(StartFailed);
         }
+    };
+
+    // 007: bank connections, on the one node of the mesh that holds them.
+    // Started under the ledger's lock, so the ledger's one secret-store
+    // instance is this one; a ledger whose connections cannot be kept is not
+    // served rather than served without them.
+    let plaid = if config.plaid.enabled {
+        let folder = match PathBuf::from(&config.ledger_path).parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        match crate::plaid::PlaidService::start(name, &folder, &config.plaid, &node.plaid) {
+            Ok(service) => {
+                info!(environment = ?config.plaid.environment, "Plaid bank connections on");
+                Some(Arc::new(service))
+            }
+            Err(error) => {
+                error!(%error, "plaid.enabled; this ledger is not served");
+                return Err(StartFailed);
+            }
+        }
+    } else {
+        None
     };
 
     // L-31: there is deliberately no `std::fs::write(&ledger_path, "")` here.
@@ -846,6 +875,7 @@ async fn start_ledger(
         node.graphiql,
         gossip_sender,
         access.clone(),
+        plaid.clone(),
     );
     let auth_state = AuthState {
         enabled: node.auth_enabled,
@@ -880,6 +910,7 @@ async fn start_ledger(
         ledger: ledger_for_shutdown,
         file_watcher: file_watcher_handle,
         p2p_router,
+        plaid,
         _lock: ledger_lock,
     })
 }
@@ -888,6 +919,12 @@ impl RunningLedger {
     /// The shutdown half: stop the watcher, compact, stop P2P — in that order,
     /// as `main` did. The ledger's lock is released last, when `self` drops.
     pub(crate) async fn stop(self) {
+        // 007: bank connections first — the connects and disconnects under way
+        // run to the end on tasks of their own, and none starts after; only
+        // then may a restart open the ledger's secret store again.
+        if let Some(plaid) = &self.plaid {
+            plaid.close().await;
+        }
         // Stop file watcher if running.
         if let Some(handle) = self.file_watcher {
             handle.abort();
@@ -958,6 +995,7 @@ mod tests {
             graphiql: false,
             public_bind: false,
             node_ids: NodeIds::default(),
+            plaid: Arc::default(),
         }
     }
 
@@ -1001,6 +1039,31 @@ mod tests {
         let running = start("acme", &ledger_at(&path), &settings())
             .await
             .expect("the lock was released");
+        running.stop().await;
+    }
+
+    /// 007: a ledger with `plaid.enabled` on a node without the Plaid
+    /// credentials and store key is not served, and releases its lock; with
+    /// them it starts, its secret store in the ledger's folder.
+    ///
+    /// Bug-catch: serving the ledger anyway, with bank connections it could
+    /// neither keep nor remove.
+    #[tokio::test]
+    async fn a_ledger_with_plaid_on_needs_the_credentials_and_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("acme").join("ledger.bean");
+        let mut plaid_on = ledger_at(&path);
+        plaid_on.plaid.enabled = true;
+
+        assert!(start("acme", &plaid_on, &settings()).await.is_err());
+
+        let with_env = NodeSettings {
+            plaid: Arc::new(crate::plaid::tests::env()),
+            ..settings()
+        };
+        let running = start("acme", &plaid_on, &with_env)
+            .await
+            .expect("starts with the credentials, the lock released before");
         running.stop().await;
     }
 

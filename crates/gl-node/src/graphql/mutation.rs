@@ -332,6 +332,36 @@ impl MutationRoot {
         Ok(true)
     }
 
+    /// A link token for Plaid Link, which the client app opens to connect a
+    /// bank (007). Only on the node holding this ledger's bank connections.
+    /// Admin only.
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
+    async fn create_plaid_link_token(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<super::plaid::PlaidLinkToken> {
+        super::plaid::create_link_token(ctx).await
+    }
+
+    /// Connect the bank Plaid Link just linked: `publicToken` is what Link
+    /// returned. The node keeps the access token Plaid exchanges it for; this
+    /// returns the bank's accounts, never the token. Admin only.
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
+    async fn connect_bank(
+        &self,
+        ctx: &Context<'_>,
+        public_token: String,
+    ) -> Result<super::plaid::ConnectedBank> {
+        super::plaid::connect_bank(ctx, public_token).await
+    }
+
+    /// Disconnect a bank: removed at Plaid first, then its token deleted
+    /// here. `false` when this ledger has no such bank. Admin only.
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
+    async fn disconnect_bank(&self, ctx: &Context<'_>, item_id: String) -> Result<bool> {
+        super::plaid::disconnect_bank(ctx, item_id).await
+    }
+
     /// Close an account (FR-3 AC2).
     // Each mutation costs a durable write and an fsync, so alias batching must
     // be budget-limited like the heavy read resolvers (M-1/M-03). T44 made that

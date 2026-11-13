@@ -338,6 +338,15 @@ impl Ledgers {
         }
     }
 
+    /// Served ledger `name`'s bank connections, when it holds them (007): what
+    /// a removal closes before it judges the store.
+    pub(crate) async fn plaid_of(&self, name: &str) -> Option<Arc<crate::plaid::PlaidService>> {
+        match &*self.get(name).await? {
+            Served::Running { running, .. } => running.lock().await.as_ref()?.plaid.clone(),
+            Served::Failed(_) => None,
+        }
+    }
+
     /// Whether `name` is held, served or refused.
     pub(crate) async fn holds(&self, name: &str) -> bool {
         self.by_name.read().await.contains_key(name)
@@ -572,6 +581,7 @@ mod tests {
                 false,
                 None,
                 Some(access.clone()),
+                None,
             );
             let auth = AuthState {
                 enabled: true,

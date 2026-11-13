@@ -45,6 +45,11 @@ zeroize = { workspace = true }
 # iroh (noq-proto), so no new crate; default features off: nonces come from the
 # node's one random source (`access_list::random_bytes`).
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "zeroize"] }
+# Plaid's HTTPS API (build-log 007). All three are already compiled in through
+# iroh, with these features: rustls on ring, Mozilla's roots, no new crate.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
 
 
 [dev-dependencies]

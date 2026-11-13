@@ -2,6 +2,7 @@ pub mod access;
 pub mod broadcast;
 pub mod inputs;
 pub mod mutation;
+pub mod plaid;
 pub mod query;
 pub mod scalars;
 pub mod subscription;
@@ -82,6 +83,7 @@ pub fn build_schema_with_service(
         enable_introspection,
         gossip_sender,
         None,
+        None,
     )
 }
 
@@ -94,6 +96,9 @@ pub fn build_schema_with_service(
 /// access list, and refuses the admin API.
 ///
 /// Introspection is enabled only when GraphiQL is on (loopback playground).
+// One parameter per piece of schema data, as the call sites read best;
+// eight since the Plaid service (007).
+#[allow(clippy::too_many_arguments)]
 pub fn build_schema_with_access(
     ledger: SharedLedger,
     broadcast: TransactionBroadcast,
@@ -102,6 +107,7 @@ pub fn build_schema_with_access(
     enable_introspection: bool,
     gossip_sender: Option<GossipSender>,
     access: Option<crate::auth::AccessSource>,
+    plaid: Option<std::sync::Arc<crate::plaid::PlaidService>>,
 ) -> AppSchema {
     let mut builder = schema_builder(enable_introspection)
         .data(ledger)
@@ -113,6 +119,9 @@ pub fn build_schema_with_access(
     }
     if let Some(access) = access {
         builder = builder.data(access);
+    }
+    if let Some(plaid) = plaid {
+        builder = builder.data(plaid);
     }
     builder.finish()
 }

@@ -464,8 +464,8 @@
   },
   "U-R30-grant-access-not-admin-only": {
     "file": "crates/gl-node/src/access_control.rs",
-    "old": "pub const ADMIN_FIELDS: &[&str] = &[\"grantAccess\", \"revokeAccess\", \"renameUser\", \"accessList\"];",
-    "new": "pub const ADMIN_FIELDS: &[&str] = &[\"revokeAccess\", \"renameUser\", \"accessList\"];",
+    "old": "    \"grantAccess\",\n",
+    "new": "",
     "runs": [
       [
         "-p",
@@ -478,8 +478,8 @@
   },
   "U-R31-access-list-not-admin-only": {
     "file": "crates/gl-node/src/access_control.rs",
-    "old": "pub const ADMIN_FIELDS: &[&str] = &[\"grantAccess\", \"revokeAccess\", \"renameUser\", \"accessList\"];",
-    "new": "pub const ADMIN_FIELDS: &[&str] = &[\"grantAccess\", \"revokeAccess\", \"renameUser\"];",
+    "old": "    \"accessList\",\n",
+    "new": "",
     "runs": [
       [
         "-p",

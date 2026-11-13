@@ -1,0 +1,219 @@
+{
+  "PL-R1-connect-bank-not-admin-only": {
+    "file": "crates/gl-node/src/access_control.rs",
+    "old": "    \"connectBank\",\n",
+    "new": "",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "plaid_mutations_need_an_admin_key"]
+    ]
+  },
+  "PL-R2-token-not-stored-on-connect": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "            self.store\n                .lock()\n                .await\n                .put(&token_name(&item_id), &access_token)\n                .err()\n                .map(PlaidError::from)\n",
+    "new": "            None\n",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "connect_keeps_the_token_and_describes_the_bank"]
+    ]
+  },
+  "PL-R3-delete-whatever-plaid-answered": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "            Err(error) => return Err(error),\n",
+    "new": "            Err(_) => {}\n",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "disconnect_keeps_the_token_when_plaid_refuses"]
+    ]
+  },
+  "PL-R4-invalid-token-taken-for-gone": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "self.plaid_code() == Some(\"ITEM_NOT_FOUND\")",
+    "new": "matches!(self.plaid_code(), Some(\"ITEM_NOT_FOUND\" | \"INVALID_ACCESS_TOKEN\"))",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "only_item_not_found_counts_as_already_removed"]
+    ]
+  },
+  "PL-R5-plaid-message-in-the-error": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "                error_code: error.error_code,\n",
+    "new": "                error_code: String::from_utf8_lossy(&bytes).into_owned(),\n",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "plaid_errors_name_the_code_not_the_message"],
+      ["-p", "gl-node", "--bin", "gl-node", "a_plaid_refusal_reaches_the_caller_as_its_code"]
+    ]
+  },
+  "PL-R6-no-secret-in-the-calls": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "            fields.insert(\"secret\".to_owned(), json!(self.credentials.secret.expose()));\n",
+    "new": "",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "calls_carry_the_credentials_and_the_link_settings"]
+    ]
+  },
+  "PL-R7-credentials-debug-prints-the-secret": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": ".field(\"secret\", &self.secret)",
+    "new": ".field(\"secret\", &self.secret.expose())",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "credentials_print_without_the_secret"]
+    ]
+  },
+  "PL-R8-ids-with-a-slash": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "b.is_ascii_alphanumeric() || b == b'-' || b == b'_'",
+    "new": "b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'/'",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "ids_are_checked"]
+    ]
+  },
+  "PL-R9-undescribed-bank-fails-the-connect": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "                    \"connected a bank, but Plaid did not describe its accounts\"\n                );\n",
+    "new": "                    \"connected a bank, but Plaid did not describe its accounts\"\n                );\n                return Err(error);\n",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "a_bank_plaid_cannot_describe_is_still_kept"]
+    ]
+  },
+  "PL-R10-removal-ignores-connected-banks": {
+    "file": "crates/gl-node/src/ledger_admin.rs",
+    "old": "match crate::plaid::connected_item_count(&folder) {",
+    "new": "match Ok::<usize, crate::secret_store::SecretStoreError>(0) {",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "a_ledger_with_connected_banks_is_not_removed"]
+    ]
+  },
+  "PL-R11-served-without-the-credentials": {
+    "file": "crates/gl-node/src/ledger_runtime.rs",
+    "old": "                error!(%error, \"plaid.enabled; this ledger is not served\");\n                return Err(StartFailed);\n",
+    "new": "                error!(%error, \"plaid.enabled; this ledger is not served\");\n                None\n",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "a_ledger_with_plaid_on_needs_the_credentials_and_key"]
+    ]
+  },
+  "PL-R12-client-name-unchecked": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "!(1..=30).contains(&length)",
+    "new": "false",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "a_ledgers_plaid_section_is_checked"]
+    ]
+  },
+  "PL-R13-link-token-not-admin-only": {
+    "file": "crates/gl-node/src/access_control.rs",
+    "old": "    \"createPlaidLinkToken\",\n",
+    "new": "",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "plaid_mutations_need_an_admin_key"]
+    ]
+  },
+  "PL-R14-disconnect-bank-not-admin-only": {
+    "file": "crates/gl-node/src/access_control.rs",
+    "old": "    \"disconnectBank\",\n",
+    "new": "",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "plaid_mutations_need_an_admin_key"]
+    ]
+  },
+  "PL-R15-disconnect-skips-item-remove": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "let removed: Result<Removed, PlaidError> = self.remove_at_plaid(&access_token).await;",
+    "new": "let removed: Result<Removed, PlaidError> = Ok(Removed {});",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "disconnect_removes_at_plaid_then_here"]
+    ]
+  },
+  "PL-R16-connect-on-the-requests-task": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "        let task = tokio::spawn(\n            async move { service.connect_to_the_end(&public_token).await }.in_current_span(),\n        );\n",
+    "new": "        let task = async move { Ok::<_, tokio::task::JoinError>(service.connect_to_the_end(&public_token).await) };\n",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "a_connect_cut_short_still_keeps_the_token"]
+    ]
+  },
+  "PL-R17-disconnect-sends-another-environments-token": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "            return Err(PlaidError::WrongEnvironment {\n                configured: self.environment,\n            });\n",
+    "new": "            let _ = self.environment;\n",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "a_token_of_another_environment_is_refused"]
+    ]
+  },
+  "PL-R18-connect-keeps-another-environments-token": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "            Some(PlaidError::WrongEnvironment {\n                configured: self.environment,\n            })\n",
+    "new": "            None\n",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "a_token_of_another_environment_is_refused"]
+    ]
+  },
+  "PL-R19-close-does-not-wait": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "        *self.closed.write().await = true;\n",
+    "new": "        if let Ok(mut closed) = self.closed.try_write() {\n            *closed = true;\n        }\n",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "close_waits_for_the_connect_under_way"]
+    ]
+  },
+  "PL-R20-answers-uncapped": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "const MAX_ANSWER_BYTES: usize = 1024 * 1024;",
+    "new": "const MAX_ANSWER_BYTES: usize = 64 * 1024 * 1024;",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "a_bank_plaid_cannot_describe_is_still_kept"]
+    ]
+  },
+  "PL-R21-banks-listed-where-plaid-is-off": {
+    "file": "crates/gl-node/src/graphql/plaid.rs",
+    "old": "    let connections = service(ctx)?.connections().await.map_err(failed)?;\n",
+    "new": "    let Ok(plaid) = service(ctx) else {\n        return Ok(Vec::new());\n    };\n    let connections = plaid.connections().await.map_err(failed)?;\n",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "plaid_fields_are_refused_where_plaid_is_off"]
+    ]
+  },
+  "PL-R22-token-in-the-description": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "connected_on: Some(chrono::Utc::now().date_naive().to_string()),",
+    "new": "connected_on: Some(access_token.expose().to_owned()),",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "no_response_carries_the_access_token"]
+    ]
+  },
+  "PL-R23-refusal-without-every-variable": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "\"plaid.enabled needs {CLIENT_ID_ENV_VAR}, {SECRET_ENV_VAR} and {} in the node's environment\",",
+    "new": "\"plaid.enabled needs {CLIENT_ID_ENV_VAR} and {} in the node's environment\",",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "start_needs_the_credentials_and_the_key"]
+    ]
+  },
+  "PL-R24-removal-does-not-close": {
+    "file": "crates/gl-node/src/ledger_admin.rs",
+    "old": "        if let Some(plaid) = &plaid {\n            plaid.close().await;\n        }\n        let banks = if on_disk {\n",
+    "new": "        let banks = if on_disk {\n",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "a_removal_waits_for_a_connect_and_reopens_on_refusal"]
+    ]
+  },
+  "PL-R25-refused-removal-does-not-reopen": {
+    "file": "crates/gl-node/src/ledger_admin.rs",
+    "old": "            if let Some(plaid) = &plaid {\n                plaid.reopen().await;\n            }\n            return Err(refusal);\n",
+    "new": "            return Err(refusal);\n",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "a_removal_waits_for_a_connect_and_reopens_on_refusal"]
+    ]
+  },
+  "PL-R26-stop-does-not-close": {
+    "file": "crates/gl-node/src/ledger_runtime.rs",
+    "old": "        if let Some(plaid) = &self.plaid {\n            plaid.close().await;\n        }\n",
+    "new": "",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "a_restart_waits_for_a_connect_under_way"]
+    ]
+  },
+  "PL-R27-disconnect-on-the-requests-task": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "        let task = tokio::spawn(\n            async move { service.disconnect_to_the_end(&item_id).await }.in_current_span(),\n        );\n",
+    "new": "        let task = async move { Ok::<_, tokio::task::JoinError>(service.disconnect_to_the_end(&item_id).await) };\n",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "a_disconnect_cut_short_still_finishes"]
+    ]
+  }
+}

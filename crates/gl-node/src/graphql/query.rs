@@ -291,6 +291,15 @@ impl QueryRoot {
         super::access::access_list(ctx).await
     }
 
+    /// The banks connected through Plaid (007), on the node that holds this
+    /// ledger's connections: institution, accounts, last digits. Never a token.
+    async fn connected_banks(
+        &self,
+        ctx: &Context<'_>,
+    ) -> async_graphql::Result<Vec<super::plaid::ConnectedBank>> {
+        super::plaid::connected_banks(ctx).await
+    }
+
     /// Verify DAG integrity and balance assertions (FR-5 AC1, §3.6).
     ///
     /// `ok`/`errors` cover the structural checks — content hashes (I5), parent

@@ -67,8 +67,17 @@ impl Caller {
 }
 
 /// Root fields only an admin may use: managing people and keys
-/// (`crate::graphql::access`). The one place the rule lives.
-pub const ADMIN_FIELDS: &[&str] = &["grantAccess", "revokeAccess", "renameUser", "accessList"];
+/// (`crate::graphql::access`), and opening Plaid Link, connecting and
+/// disconnecting banks (`crate::graphql::plaid`). The one place the rule lives.
+pub const ADMIN_FIELDS: &[&str] = &[
+    "grantAccess",
+    "revokeAccess",
+    "renameUser",
+    "accessList",
+    "createPlaidLinkToken",
+    "connectBank",
+    "disconnectBank",
+];
 
 /// The schema extension that enforces [`Role`]s; see the module doc.
 pub struct AccessControl;

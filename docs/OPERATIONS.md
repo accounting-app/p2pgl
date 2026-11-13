@@ -47,6 +47,7 @@ What it leaves on the server:
 | Path | What it is |
 |---|---|
 | `/opt/openledger/env` | The operator key (`GL_NODE_API_KEY`), root only |
+| `/opt/openledger/secrets.env` | The key the companies' bank tokens are encrypted under (`GL_NODE_SECRETS_KEY`) and the Plaid credentials you add, root only. **Not in any backup** — keep a copy off the server: *Bank connections (Plaid)* |
 | `/opt/openledger/settings` | The domain and the installer's options, for the `openledger` command and for running the installer again on an upgrade |
 | `/opt/openledger/install.sh` | The installer that last ran to the end, root only (an upgrade keeps it for a rollback) |
 | `/opt/openledger/previous/` | After an upgrade: the backup, binary, image name and installer a rollback goes back to |
@@ -153,18 +154,24 @@ up, as root:
   to `/var/lib/openledger/data.before-restore-<time>` — never deleted: remove
   it yourself once you are sure — puts the backup's data in its place and
   starts the node. A company added since the backup is in the moved-aside
-  data, not in the restored books. A restore cut short (the server went
+  data, not in the restored books. So is a bank connected since the backup
+  (its token, in the moved-aside `ledgers/<name>/secrets.json`): disconnect
+  such banks before restoring, or remove them in the Plaid Dashboard, before
+  you delete the moved-aside folder — *Bank connections (Plaid)*. A restore cut short (the server went
   down halfway) leaves the node stopped at the next boot, and `openledger
   status` says *RESTORE NOT FINISHED*, naming the backup it was restoring:
   run the restore again. Until then backups are refused, so the half-restored
   data never becomes the newest backup. Then check as
   *Restoring a backup* says, step 3, and **on a mesh make no write until this server has caught
   up**, step 4: the command prints both. The settings and operator key in the
-  archive are not put back: on a new server, install it with the same domain
-  first, restore, and copy the archive's `env` to `/opt/openledger/env` if the
-  old operator key is to keep working (then
+  archive are not put back: on a new server, copy the archive's `env` (if the
+  old operator key is to keep working) and your saved `secrets.env` (if a
+  company has banks connected) into `/opt/openledger/` (`sudo mkdir -p
+  /opt/openledger` first) **before** installing,
+  install with the same domain — it keeps both — and restore. Copied in after
+  installing, they take
   `docker compose -f /opt/openledger/compose.yml up -d --force-recreate node`:
-  a restart alone keeps the old key).
+  a restart alone keeps the old keys.
 - **Upgrade.** `openledger upgrade --version X.Y.Z` fetches the release's
   installer, checks it against the release's `SHA256SUMS`, takes a backup,
   keeps what a rollback needs in `/opt/openledger/previous/` — that backup,
@@ -183,8 +190,9 @@ up, as root:
   The node need not be running to be upgraded.
 - **Rollback.** `openledger rollback` goes back to before the last upgrade:
   it restores the backup the upgrade took — **writes made since the upgrade
-  are lost**, so list them first; on a terminal it asks you to type
-  `rollback` — and reinstalls the previous binary with the previous
+  are lost**, so list them first (banks connected since the upgrade too:
+  disconnect them first, or their tokens stay only in the moved-aside data);
+  on a terminal it asks you to type `rollback` — and reinstalls the previous binary with the previous
   installer, which starts the node on the restored books: the newer release
   never boots on them. The previous image is used again, not rebuilt. It goes
   back one upgrade, once. Roll back every server of the mesh, as you
@@ -310,6 +318,7 @@ connecting node, so admitting or removing one needs no restart.
 | `ledger.bean.lock` | A lock held while the node runs | No |
 | `ledgersDir/<name>/` (`data/ledgers/…`) | Each other ledger's folder: its `ledger.json`, `.bean`, journal and `iroh.secret`, the same files as above | **Yes**, every folder, its key apart like the node's |
 | `ledgersDir/.removed/` | Removed ledgers' folders, whole (*Adding a company*) | Yes, for as long as you must keep a former client's books |
+| `ledgersDir/<name>/secrets.json` | A company's bank tokens (Plaid), encrypted under `GL_NODE_SECRETS_KEY` | **Yes** (it is in `data/`); the key apart, in `/opt/openledger/secrets.env` — *Bank connections (Plaid)* |
 
 **The node key** is the node's identity on the mesh and the key its records are
 signed with. Lose it and the node must rejoin under a new identity (every peer's
@@ -516,6 +525,52 @@ change still runs to the end on the node: run `gl-node ledger list` before
 trying again. A node that crashed in the middle of an add can leave a
 `data/ledgers/.adding-<name>-…` folder; it was never served, no boot reads
 it, and it can be deleted.
+
+## Bank connections (Plaid)
+
+A company's banks are connected on **one** node of its mesh (README, *Bank
+connections (Plaid)*): the one that will hold their access tokens.
+
+1. **The credentials.** In `/opt/openledger/secrets.env` on that server, fill
+   in `GL_NODE_PLAID_CLIENT_ID` and `GL_NODE_PLAID_SECRET` (the sandbox secret
+   for `"environment": "sandbox"`, the production one for production), then
+   `docker compose -f /opt/openledger/compose.yml up -d` so the node reads
+   them. The installer wrote `GL_NODE_SECRETS_KEY` there already; never
+   change it while banks are connected. If you edited `compose.yml`, the
+   installer left its version as `compose.yml.new`: take its two `env_file`
+   lines into yours, or the node never reads `secrets.env`.
+2. **The company.** Add `"plaid": { "enabled": true, "environment":
+   "production" }` to its
+   `/var/lib/openledger/data/ledgers/<name>/ledger.json` on that server only, and `sudo
+   openledger company restart acme`. A company that does not start is listed
+   as not served; `docker logs openledger-node` says why (a missing variable, a
+   store the key does not open).
+3. **Disconnect before removing.** `openledger company remove` refuses a
+   company with banks connected (`BANKS_CONNECTED`): disconnect them first
+   through the client app (`disconnectBank`).
+
+**Keep a copy of `secrets.env` off the server**, as safe as the backups but
+apart from them. Backups leave it out on purpose: a stolen backup then holds
+the encrypted tokens and not the key. The cost is on a new server: a restore
+there brings the companies' `secrets.json` back but not the key, so copy the
+saved `secrets.env` into `/opt/openledger/` **before** installing (*Backups,
+restore, upgrade and rollback*, Restore). Without it, the companies with banks
+are not served: remove their banks in the Plaid
+Dashboard, move each `data/ledgers/<name>/secrets.json` aside, restart the
+company, and connect the banks again (README, *A lost key or another Plaid
+account*). A restore on the same server keeps the key it has.
+
+**Restores and rollbacks move the current data aside**, and with it the token
+of every bank connected since that backup or upgrade: the bank stays live at
+Plaid while the restored node does not list it. Disconnect such banks first,
+or remove them in the Plaid Dashboard, before deleting the moved-aside data.
+
+Stopping the node waits for a bank connect or disconnect under way, up to
+about 90 s when Plaid is slow; `docker stop` gives the node 60 s, then kills
+it. The journal keeps the books whole, but a bank connect killed between
+Plaid's answer and the store can leave a bank live at Plaid that this node
+does not list: after a forced stop, compare the Plaid Dashboard with
+`connectedBanks`.
 
 ## Sizing a node with several ledgers
 

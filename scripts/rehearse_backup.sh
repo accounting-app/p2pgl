@@ -119,6 +119,9 @@ done
 check "and no lock file" sh -c "! grep -q '\\.lock\$' <<'EOF'
 $listing
 EOF"
+check "and not secrets.env (007: the key is never beside the tokens)" sh -c "! grep -q secrets.env <<'EOF'
+$listing
+EOF"
 check "the node serves again after it" verified
 check "openledger status names it as the last backup" grep -q "last backup: $file, 0h ago" <(in_vm sudo openledger status)
 check "Ana writes after it" grep -q txid <(api "$ana" "$(txn 2026-01-03 'after the backup')")

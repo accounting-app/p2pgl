@@ -20,11 +20,8 @@
 //!
 //! One [`SecretStore`] per folder at a time: each write replaces the whole
 //! file with the instance's map, so two instances on one folder lose each
-//! other's writes. Step 5 keeps one per ledger behind the ledger's lock.
-
-// Called from 007 step 5 (Plaid connect and disconnect), which removes this
-// allow; until then only the tests below use the store.
-#![allow(dead_code)]
+//! other's writes. `crate::plaid::PlaidService` holds the one instance of a
+//! ledger, behind a mutex, for as long as the ledger runs.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -89,19 +86,8 @@ impl fmt::Display for Secret {
 pub(crate) struct StoreKey(Zeroizing<[u8; 32]>);
 
 impl StoreKey {
-    /// The key from [`SECRETS_KEY_ENV_VAR`]; `Ok(None)` when it is not set.
-    pub(crate) fn from_env() -> Result<Option<Self>, SecretStoreError> {
-        match std::env::var(SECRETS_KEY_ENV_VAR) {
-            Ok(value) => Self::from_hex(&Zeroizing::new(value)).map(Some),
-            Err(std::env::VarError::NotPresent) => Ok(None),
-            Err(std::env::VarError::NotUnicode(_)) => Err(SecretStoreError::Key(format!(
-                "{SECRETS_KEY_ENV_VAR} is not valid text; it must be 64 hex characters \
-                 (`openssl rand -hex 32`)"
-            ))),
-        }
-    }
-
-    /// Parse 64 hex characters, surrounding whitespace ignored. A refusal never
+    /// Parse the value of [`SECRETS_KEY_ENV_VAR`] (`crate::plaid::PlaidEnv`
+    /// reads it, an empty one as unset): 64 hex characters, surrounding whitespace ignored. A refusal never
     /// repeats the value.
     pub(crate) fn from_hex(text: &str) -> Result<Self, SecretStoreError> {
         let refused = || {
@@ -242,37 +228,25 @@ impl SecretStore {
         let path = folder.join(SECRET_STORE_FILE);
         let cipher = Aes256Gcm::new_from_slice(key.0.as_slice())
             .map_err(|_| SecretStoreError::Key("the store key is not 32 bytes".to_owned()))?;
-        let mut store = Self {
+        let store = Self {
+            entries: read_store_file(&path)?.unwrap_or_default(),
             path,
             ledger: ledger.to_owned(),
             cipher,
-            entries: BTreeMap::new(),
         };
-        let checked = match open_checked(
-            &store.path,
-            std::fs::OpenOptions::new().read(true),
-            FileTrust::NodePrivate,
-            "secret store",
-        ) {
-            Ok(checked) => checked,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(store),
-            Err(source) => return Err(store.io_error(source)),
-        };
-        let bytes = read_to_end_capped(checked.file, checked.metadata.len(), MAX_FILE_BYTES)
-            .map_err(|source| store.io_error(source))?;
-        let file: StoreFile =
-            serde_json::from_slice(&bytes).map_err(|error| store.corrupt(error.to_string()))?;
-        if file.version != FORMAT_VERSION {
-            return Err(store.corrupt(format!(
-                "format version {} (this build reads {FORMAT_VERSION})",
-                file.version
-            )));
-        }
-        store.entries = file.entries;
         for name in store.entries.keys() {
             store.unseal(name)?;
         }
         Ok(store)
+    }
+
+    /// The names stored in `folder`'s store, without the key: names are not
+    /// secret (`plaid/items/<item id>/…`), so a node can tell a store holds
+    /// bank connections even where it cannot open them (company removal, 007).
+    pub(crate) fn stored_names(folder: &Path) -> Result<Vec<String>, SecretStoreError> {
+        Ok(read_store_file(&folder.join(SECRET_STORE_FILE))?
+            .map(|entries| entries.into_keys().collect())
+            .unwrap_or_default())
     }
 
     pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
@@ -422,19 +396,46 @@ impl SecretStore {
         Ok(())
     }
 
-    fn io_error(&self, source: std::io::Error) -> SecretStoreError {
-        SecretStoreError::Io {
-            path: self.path.clone(),
-            source,
-        }
-    }
-
     fn corrupt(&self, detail: String) -> SecretStoreError {
         SecretStoreError::Corrupt {
             path: self.path.clone(),
             detail,
         }
     }
+}
+
+/// Read and parse the store file at `path`, node-private; `Ok(None)` when
+/// there is none. Nothing is decrypted here.
+fn read_store_file(path: &Path) -> Result<Option<BTreeMap<String, SealedEntry>>, SecretStoreError> {
+    let io_error = |source| SecretStoreError::Io {
+        path: path.to_owned(),
+        source,
+    };
+    let corrupt = |detail| SecretStoreError::Corrupt {
+        path: path.to_owned(),
+        detail,
+    };
+    let checked = match open_checked(
+        path,
+        std::fs::OpenOptions::new().read(true),
+        FileTrust::NodePrivate,
+        "secret store",
+    ) {
+        Ok(checked) => checked,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(io_error(source)),
+    };
+    let bytes = read_to_end_capped(checked.file, checked.metadata.len(), MAX_FILE_BYTES)
+        .map_err(io_error)?;
+    let file: StoreFile =
+        serde_json::from_slice(&bytes).map_err(|error| corrupt(error.to_string()))?;
+    if file.version != FORMAT_VERSION {
+        return Err(corrupt(format!(
+            "format version {} (this build reads {FORMAT_VERSION})",
+            file.version
+        )));
+    }
+    Ok(Some(file.entries))
 }
 
 /// The name of a temp file a crashed write left: `.secrets.json.<hex>.tmp`.

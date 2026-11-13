@@ -108,6 +108,8 @@ for template in "${templates[@]}"; do
     sh -c "limactl shell '$vm' sudo ufw status | grep -q 'Status: active' && limactl shell '$vm' sudo ufw status | grep -q '443/tcp' && limactl shell '$vm' sudo ufw status | grep -q '4433:4532/udp'"
   check "the key file is root's only (0600)" \
     test "$(in_vm sudo stat -c '%a %U' /opt/openledger/env)" = "600 root"
+  check "the secret-store key is root's only (0600), and the node has it" \
+    sh -c "test \"\$(limactl shell '$vm' sudo stat -c '%a %U' /opt/openledger/secrets.env)\" = '600 root' && limactl shell '$vm' sudo grep -Eq '^GL_NODE_SECRETS_KEY=[0-9a-f]{64}$' /opt/openledger/secrets.env && limactl shell '$vm' sudo docker exec openledger-node printenv GL_NODE_SECRETS_KEY | grep -Eq '^[0-9a-f]{64}$'"
 
   rerun="$PWD/target/rehearsal/$vm.rerun.log"
   install_it > "$rerun" 2>&1 || { tail -20 "$rerun"; fail "the second run failed"; }

@@ -7,6 +7,35 @@ break compatibility.
 
 ## [Unreleased]
 
+### Security
+
+- Bank access tokens from Plaid are kept only on the node that holds a
+  company's connections, in `secrets.json` in the ledger's folder: owner-only,
+  each value AES-256-GCM-encrypted under `GL_NODE_SECRETS_KEY` from the
+  environment and bound to its name. They are never in a record, the `.bean`,
+  a GraphQL response or a log line, and never replicate; Plaid's error
+  messages are never passed on, only its codes (build-log 007).
+- Connecting and disconnecting banks needs an admin key; a bank is removed at
+  Plaid before its token is deleted, and a ledger holding connections cannot
+  be removed (`BANKS_CONNECTED`), so removing a company never strands a bank
+  at Plaid. A connect or disconnect runs to the end even if its request is cut
+  short.
+
+### Added
+
+- Bank connections through Plaid, on one node per company (`plaid.enabled`,
+  `plaid.environment`, `plaid.clientName` in a ledger's config;
+  `GL_NODE_PLAID_CLIENT_ID`, `GL_NODE_PLAID_SECRET`, `GL_NODE_SECRETS_KEY` in
+  the environment): `createPlaidLinkToken`, `connectBank(publicToken)`,
+  `disconnectBank(itemId)` and the query `connectedBanks` — README *Bank
+  connections (Plaid)*. Transactions are not imported yet.
+- The installer writes `/opt/openledger/secrets.env` (root only): a generated
+  `GL_NODE_SECRETS_KEY` and commented lines for the Plaid credentials, read by
+  the node as a second environment file and left out of every backup
+  (OPERATIONS, *Bank connections (Plaid)*). An installed server gets one when
+  it is upgraded with `openledger upgrade --version` (or `--installer`), which
+  runs this release's installer; `--binary` alone reruns the old one.
+
 ## [0.3.0] — 2026-10-23
 
 One command to a production server: `deploy/install/install.sh` sets up a

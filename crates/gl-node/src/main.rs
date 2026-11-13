@@ -19,6 +19,7 @@ mod node_init;
 mod p2p_service;
 mod peer_addresses;
 mod peer_connections;
+mod plaid;
 mod rate_limit;
 mod request_guard;
 mod secret_store;
@@ -393,12 +394,22 @@ async fn main() {
     // key, author, signer, verifier, operator input, compaction, then P2P and
     // the watcher (H-13, L-04, T80) — in the same order: the config file's own
     // ledger (`default`), then every folder in `ledgersDir`.
+    // 007: the Plaid credentials and the secret-store key, read once; a ledger
+    // with `plaid.enabled` refuses to start without them.
+    let plaid_env = match plaid::PlaidEnv::from_env() {
+        Ok(env) => std::sync::Arc::new(env),
+        Err(error) => {
+            error!(%error, "the Plaid settings in the environment are unusable — aborting");
+            std::process::exit(1);
+        }
+    };
     let node_settings = ledger_runtime::NodeSettings {
         auth_enabled: config.auth.enabled,
         operator_key: config.auth.api_key.clone(),
         graphiql: config.graphiql_enabled(),
         public_bind: config.is_public(),
         node_ids: ledger_runtime::NodeIds::default(),
+        plaid: plaid_env,
     };
     // Rate limiter keyed on the real client (M-04). With no trusted proxy the
     // key is the TCP peer, which behind a terminator is the proxy itself — one

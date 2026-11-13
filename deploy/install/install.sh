@@ -281,6 +281,32 @@ else
   chmod 0600 "$env_file"
   did "operator key generated into $env_file (root only)"
 fi
+# The key the companies' bank tokens are encrypted under, and the Plaid
+# credentials the operator adds (build-log 007, step 5b). Left out of every
+# backup: a backup holds the encrypted tokens, never the key that opens them.
+secrets_file="$ETC/secrets.env"
+if [[ -s "$secrets_file" ]]; then
+  same "secret-store key in $secrets_file"
+else
+  # An empty file left there may be readable by others: written anew, 0600.
+  rm -f "$secrets_file"
+  # An empty file left there may be readable by others: written anew, 0600.
+  rm -f "$secrets_file"
+  secrets_key=$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
+  [[ "$secrets_key" =~ ^[0-9a-f]{64}$ ]] || fail "could not generate a key"
+  (umask 077 && cat > "$secrets_file" <<EOF
+# Secrets the node reads (root only). Never commit or share this file, and keep
+# a copy off this server: backups leave it out, and without it a restore on
+# another server has to connect every bank again (OPERATIONS, Bank connections).
+GL_NODE_SECRETS_KEY=$secrets_key
+# Plaid: both lines or neither, then \`docker compose -f $ETC/compose.yml up -d\`.
+#GL_NODE_PLAID_CLIENT_ID=
+#GL_NODE_PLAID_SECRET=
+EOF
+  ) || fail "could not write $secrets_file"
+  chmod 0600 "$secrets_file"
+  did "secret-store key generated into $secrets_file (root only, not backed up)"
+fi
 
 # ── Files the installer owns ──────────────────────────────────────────────────
 # A file is the installer's while it still has the content the installer last
@@ -352,7 +378,10 @@ services:
     container_name: openledger-node
     network_mode: host
     restart: unless-stopped
-    env_file: $env_file
+    # The operator key, then the secret-store key and Plaid credentials (007).
+    env_file:
+      - $env_file
+      - $secrets_file
     volumes:
       - $DATA:/data
     # Every ledger folds its journal in on the way out (OPERATIONS, Sizing).
@@ -517,6 +546,8 @@ backup_now() {
     trap 'docker start openledger-node >/dev/null 2>&1 && rm -f "$stopped_mark"' EXIT
     docker stop -t 60 openledger-node >/dev/null || fail "the node did not stop"
   fi
+  # Not secrets.env: the key that opens the bank tokens in data/ never sits in
+  # the same archive as them (007, step 5b).
   (umask 077 && tar -czf "$file.partial" --exclude='*.lock' \
      -C /var/lib/openledger data -C /opt/openledger settings env) \
     || { rm -f "$file.partial"; fail "the backup did not complete${was_running:+ (the node is started again)}"; }
@@ -1068,5 +1099,7 @@ cat <<EOF
   Settings: $ETC   Data: $DATA
   Backups:  nightly into /var/lib/openledger/backups (14 kept): copy them off
             the server, encrypted — they hold the node's keys (OPERATIONS)
+  Secrets:  $secrets_file (root only, NOT in backups): keep a copy off the
+            server — it opens the companies' bank connections (OPERATIONS)
   Logs:     docker logs openledger-node, docker logs openledger-caddy
 EOF

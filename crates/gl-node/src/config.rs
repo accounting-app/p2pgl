@@ -235,6 +235,10 @@ pub struct NodeConfig {
     /// Peer-to-peer replication configuration.
     #[serde(default)]
     pub p2p: P2pConfig,
+
+    /// Bank connections through Plaid for the config file's own ledger (007).
+    #[serde(default)]
+    pub plaid: PlaidConfig,
 }
 
 /// Connection-level HTTP limits (M-13), tunable per deployment.
@@ -349,6 +353,80 @@ impl FormatConfig {
     }
 }
 
+/// Bank connections through Plaid (`docs/build-log/007-plaid-commitments`), a
+/// ledger setting: on for **one** node of a company's mesh, the one that holds
+/// its banks' access tokens and imports their transactions. Every other node
+/// leaves it off and refuses the Plaid mutations, so no transaction is imported
+/// twice and no token is held twice. Never carried by an invitation.
+///
+/// The Plaid credentials and the secret-store key are the node's, from the
+/// environment (`crate::plaid::PlaidEnv`): never in a config file.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaidConfig {
+    /// Hold this ledger's bank connections on this node. Default `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Plaid's `sandbox` (test institutions, no real money) or `production`.
+    /// Default `sandbox`, so a ledger turned on by mistake reaches no bank.
+    #[serde(default)]
+    pub environment: PlaidEnvironment,
+
+    /// The name Plaid Link shows the person connecting a bank: 1 to 30
+    /// characters, Plaid's limit. Default `NewGL`.
+    #[serde(default = "default_plaid_client_name")]
+    pub client_name: String,
+}
+
+impl Default for PlaidConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            environment: PlaidEnvironment::default(),
+            client_name: default_plaid_client_name(),
+        }
+    }
+}
+
+fn default_plaid_client_name() -> String {
+    "NewGL".to_owned()
+}
+
+/// The Plaid environment a ledger's connections live in. Only Plaid's own
+/// hosts: the credentials are sent with every call, so the address is never
+/// configurable.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum PlaidEnvironment {
+    #[default]
+    Sandbox,
+    Production,
+}
+
+impl PlaidEnvironment {
+    pub fn base_url(self) -> &'static str {
+        match self {
+            Self::Sandbox => "https://sandbox.plaid.com",
+            Self::Production => "https://production.plaid.com",
+        }
+    }
+}
+
+impl PlaidConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let length = self.client_name.chars().count();
+        if !(1..=30).contains(&length) || self.client_name.chars().any(char::is_control) {
+            return Err(ConfigError::Validation(
+                "plaid.clientName must be 1 to 30 characters, without control characters"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Authentication settings (§3.8).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -419,6 +497,8 @@ pub struct LedgerConfig {
     pub p2p: P2pConfig,
     /// `auth.adminNodes`.
     pub admin_nodes: Option<Vec<String>>,
+    /// `plaid` (007).
+    pub plaid: PlaidConfig,
 }
 
 impl LedgerConfig {
@@ -448,6 +528,7 @@ impl LedgerConfig {
             format: file.format,
             p2p,
             admin_nodes: file.auth.admin_nodes,
+            plaid: file.plaid,
         };
         config
             .validate()
@@ -460,6 +541,7 @@ impl LedgerConfig {
     /// (`docs/build-log/003-multi-ledger-node`).
     pub fn validate(&self) -> Result<(), ConfigError> {
         NodeConfig::validate_ledger_path(&self.ledger_path)?;
+        self.plaid.validate()?;
 
         if self.p2p.enabled && self.p2p.secret_key_path.is_empty() {
             return Err(ConfigError::Validation(
@@ -1210,6 +1292,8 @@ struct LedgerFile {
     p2p: P2pConfig,
     #[serde(default)]
     auth: LedgerAuthFile,
+    #[serde(default)]
+    plaid: PlaidConfig,
 }
 
 /// The `auth` section of a `ledger.json`: whose access records count.
@@ -2196,6 +2280,7 @@ impl NodeConfig {
             format: self.format,
             p2p: self.p2p.clone(),
             admin_nodes: self.auth.admin_nodes.clone(),
+            plaid: self.plaid.clone(),
         }
     }
 
@@ -2906,6 +2991,47 @@ mod tests {
             .prefix(".test-ledgers-")
             .tempdir_in(".")
             .expect("temp dir")
+    }
+
+    /// 007: a ledger's `plaid` section is off and on Plaid's sandbox by
+    /// default, takes only Plaid's two environments (never an address the
+    /// credentials would be sent to), and holds `clientName` to Plaid's 30
+    /// characters.
+    ///
+    /// Bug-catch: dropping the `clientName` check lets a ledger start that
+    /// Plaid refuses at the first link token, long after boot said it was fine.
+    #[test]
+    fn a_ledgers_plaid_section_is_checked() {
+        let dir = temp_dir_here();
+        let folder = dir.path().join("acme");
+        std::fs::create_dir(&folder).expect("folder");
+        let write = |json: &str| std::fs::write(folder.join(LEDGER_FILE), json).expect("write");
+
+        write("{}");
+        let config = LedgerConfig::load_folder(&folder).expect("loads");
+        assert_eq!(config.plaid, PlaidConfig::default());
+        assert!(!config.plaid.enabled);
+        assert_eq!(config.plaid.environment, PlaidEnvironment::Sandbox);
+
+        write(
+            r#"{ "plaid": { "enabled": true, "environment": "production", "clientName": "Acme Books" } }"#,
+        );
+        let config = LedgerConfig::load_folder(&folder).expect("loads");
+        assert!(config.plaid.enabled);
+        assert_eq!(
+            config.plaid.environment.base_url(),
+            "https://production.plaid.com"
+        );
+        assert_eq!(config.plaid.client_name, "Acme Books");
+
+        write(r#"{ "plaid": { "environment": "https://example.com" } }"#);
+        assert!(LedgerConfig::load_folder(&folder).is_err(), "no address");
+        write(r#"{ "plaid": { "baseUrl": "https://example.com" } }"#);
+        assert!(LedgerConfig::load_folder(&folder).is_err(), "unknown key");
+        let long = "x".repeat(31);
+        write(&format!(r#"{{ "plaid": {{ "clientName": "{long}" }} }}"#));
+        let error = LedgerConfig::load_folder(&folder).expect_err("too long");
+        assert!(format!("{error}").contains("plaid.clientName"), "{error}");
     }
 
     /// 003: a ledger folder's `ledger.json` sets the ledger's own settings;

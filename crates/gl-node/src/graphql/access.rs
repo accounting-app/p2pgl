@@ -417,6 +417,7 @@ pub(crate) mod test_node {
             true,
             None,
             access.clone(),
+            None,
         );
         let auth = AuthState {
             enabled: true,
@@ -739,6 +740,7 @@ mod tests {
             true,
             None,
             Some(crate::auth::AccessSource::new(ledger.clone(), None)),
+            None,
         );
         let lamport = ledger.read().await.lamport_clock();
         let response = schema

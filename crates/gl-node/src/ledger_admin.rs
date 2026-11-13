@@ -422,6 +422,43 @@ impl NodeAdmin {
         Self::folder_name(name)?;
         let folder = self.folder(name);
         let on_disk = folder.symlink_metadata().is_ok();
+        // 007: a folder holding bank connections stays: moved aside, its
+        // items would stay live at Plaid with nothing left to remove them.
+        // Judged from the store's names (no key needed) once its connects and
+        // disconnects under way have finished and no new one can start; a
+        // refusal reopens them and the ledger serves on as before.
+        let plaid = self.ledgers.plaid_of(name).await;
+        if let Some(plaid) = &plaid {
+            plaid.close().await;
+        }
+        let banks = if on_disk {
+            match crate::plaid::connected_item_count(&folder) {
+                Ok(0) => None,
+                Ok(count) => Some(refused(
+                    "BANKS_CONNECTED",
+                    format!(
+                        "ledger \"{name}\" has {count} bank connection(s) through Plaid: \
+                         disconnect them first (disconnectBank), so none is left live at \
+                         Plaid; nothing was removed"
+                    ),
+                )),
+                Err(error) => Some(refused(
+                    "BANKS_UNKNOWN",
+                    format!(
+                        "ledger \"{name}\": its secret store cannot be read ({error}), so \
+                         whether banks are connected is unknown; nothing was removed"
+                    ),
+                )),
+            }
+        } else {
+            None
+        };
+        if let Some(refusal) = banks {
+            if let Some(plaid) = &plaid {
+                plaid.reopen().await;
+            }
+            return Err(refusal);
+        }
         match self.ledgers.take(name).await {
             Some(Taken::Running(Some(running))) => stop(name, *running).await,
             Some(_) => {}
@@ -1110,6 +1147,11 @@ pub(crate) mod test_node {
     /// A node serving its config file's ledger, with an empty `ledgersDir`
     /// and the node endpoint.
     pub(crate) async fn node() -> Node {
+        node_with(Arc::default()).await
+    }
+
+    /// [`node`], its ledgers started with `plaid` (007).
+    pub(crate) async fn node_with(plaid: Arc<crate::plaid::PlaidEnv>) -> Node {
         // Under the working directory, where a ledger's paths must resolve.
         let dir = tempfile::Builder::new()
             .prefix(".test-ledgers-")
@@ -1121,6 +1163,7 @@ pub(crate) mod test_node {
             graphiql: false,
             public_bind: false,
             node_ids: NodeIds::default(),
+            plaid,
         };
         let ledgers = Ledgers::new(true, OPERATOR.to_owned(), 64, RateLimiter::graphql());
         let default = ledger_runtime::start(
@@ -1173,7 +1216,9 @@ mod tests {
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
-    use super::test_node::{node, OPERATOR};
+    use std::sync::Arc;
+
+    use super::test_node::{node, node_with, Node, OPERATOR};
     use crate::config::{ledger_folders, LedgerConfig};
 
     async fn post(app: &Router, path: &str, key: Option<&str>, body: Value) -> (StatusCode, Value) {
@@ -1324,6 +1369,116 @@ mod tests {
             "{listed}"
         );
         node.admin.stop_all().await;
+    }
+
+    /// 007: a ledger whose folder holds bank connections is not removed (its
+    /// items would stay live at Plaid with nothing to remove them); once they
+    /// are gone it is.
+    ///
+    /// Bug-catch: without the guard, removing the company moves the tokens
+    /// aside and strands every connected bank at Plaid.
+    #[tokio::test]
+    async fn a_ledger_with_connected_banks_is_not_removed() {
+        use crate::secret_store::{Secret, SecretStore, StoreKey};
+        let node = node().await;
+        let added = add(&node.app, "acme", None).await;
+        assert!(added["errors"].is_null(), "{added}");
+        let folder = node.ledgers_dir().join("acme");
+        let key = StoreKey::generate();
+        let mut store = SecretStore::open(&folder, "acme", &key).unwrap();
+        store
+            .put("plaid/items/item1/access_token", &Secret::new("access-x"))
+            .unwrap();
+
+        let refused = remove(&node.app, "acme").await;
+        assert_eq!(code(&refused), Some("BANKS_CONNECTED"), "{refused}");
+        assert!(folder.join("ledger.json").exists());
+
+        store.remove("plaid/items/item1/access_token").unwrap();
+        let removed = remove(&node.app, "acme").await;
+        assert!(
+            removed["data"]["removeLedger"]["movedTo"].is_string(),
+            "{removed}"
+        );
+    }
+
+    /// A node whose Plaid-enabled ledgers call a mock that takes 300 ms to
+    /// exchange a public token, with ledger `acme` added (Plaid on), and a
+    /// connect to it under way.
+    async fn node_connecting() -> (
+        Node,
+        crate::plaid::tests::MockPlaid,
+        tokio::task::JoinHandle<Result<crate::plaid::BankConnection, crate::plaid::PlaidError>>,
+    ) {
+        let mock = crate::plaid::tests::MockPlaid::default();
+        mock.delay(
+            "/item/public_token/exchange",
+            std::time::Duration::from_millis(300),
+        );
+        let env = crate::plaid::PlaidEnv {
+            base_url: Some(mock.serve().await),
+            ..crate::plaid::tests::env()
+        };
+        let node = node_with(Arc::new(env)).await;
+        let added = add(
+            &node.app,
+            "acme",
+            Some(r#"{ "plaid": { "enabled": true } }"#),
+        )
+        .await;
+        assert!(added["errors"].is_null(), "{added}");
+        let plaid = node.ledgers.plaid_of("acme").await.expect("Plaid on");
+        let connecting =
+            tokio::spawn(async move { plaid.connect("public-sandbox-xyz".to_owned()).await });
+        while mock.paths().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        (node, mock, connecting)
+    }
+
+    /// 007: a removal waits for a connect under way before it judges the
+    /// store, so the token that connect stores is seen and the removal
+    /// refused; the ledger's bank connections then work as before, and once
+    /// the bank is disconnected the ledger is removed.
+    ///
+    /// Bug-catch: a removal that does not close the service first moves aside
+    /// the token a connect stores while it runs; one that does not reopen it
+    /// on a refusal leaves every later connect and disconnect refused.
+    #[tokio::test]
+    async fn a_removal_waits_for_a_connect_and_reopens_on_refusal() {
+        let (node, _mock, connecting) = node_connecting().await;
+
+        let refused = remove(&node.app, "acme").await;
+        assert_eq!(code(&refused), Some("BANKS_CONNECTED"), "{refused}");
+        assert!(connecting.await.unwrap().is_ok());
+        let plaid = node.ledgers.plaid_of("acme").await.expect("still served");
+        assert!(!plaid.is_closed().await, "reopened after the refusal");
+        assert!(plaid
+            .disconnect(crate::plaid::tests::ITEM_ID.to_owned())
+            .await
+            .unwrap());
+        let removed = remove(&node.app, "acme").await;
+        assert!(
+            removed["data"]["removeLedger"]["movedTo"].is_string(),
+            "{removed}"
+        );
+    }
+
+    /// 007: a restart waits for a connect under way before it opens the
+    /// ledger's secret store again, so the restarted ledger lists the bank.
+    ///
+    /// Bug-catch: a stop that does not close the service opens the new store
+    /// before the old instance's last write: the bank is missing from the
+    /// list, and from the file at the next write.
+    #[tokio::test]
+    async fn a_restart_waits_for_a_connect_under_way() {
+        let (node, _mock, connecting) = node_connecting().await;
+
+        let restarted = restart(&node.app, "acme").await;
+        assert!(restarted["errors"].is_null(), "{restarted}");
+        assert!(connecting.await.unwrap().is_ok());
+        let plaid = node.ledgers.plaid_of("acme").await.expect("Plaid on");
+        assert_eq!(plaid.connections().await.unwrap().len(), 1);
     }
 
     /// 003 step 4: a removed ledger is stopped — its requests answer as a

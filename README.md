@@ -85,7 +85,10 @@ release, so they do not stand in for trusting the release itself — compare
 that. It
 also turns on a firewall admitting only SSH, 80, 443 and the companies' UDP
 ports (4433–4532), and sets restarts and log rotation. It prints the operator
-key once and keeps it in `/opt/openledger/env`, readable by root only. Clients
+key once and keeps it in `/opt/openledger/env`, readable by root only, and
+generates the key the bank connections are encrypted under into
+`/opt/openledger/secrets.env` (root only, left out of backups: keep a copy
+off the server; [Bank connections](#bank-connections-plaid)). Clients
 then use `https://ledger.example.com/ledgers/<company>/graphql`.
 Running it again changes nothing that is set up, and it never overwrites
 books, keys, the config or a file you edited (its version goes beside it as
@@ -617,6 +620,9 @@ signing node without it refuses to boot, and the refusal names that remedy.
 | `auth.apiKey` | `""` | The API key value. Required on a public node; on a loopback node with no proxy, empty means the key file below. Minimum 16 bytes; published placeholders are refused — see [API keys](#api-keys) |
 | `auth.adminNodes` | unset | EndpointIds of the nodes whose access records (people's keys, roles, revocations) count; unset, every node the mesh admits. Needs `signing.enabled` (people's keys are honoured only on a signing node); an empty list is refused |
 | `auth.apiKeyPath` | `"./data/api.key"` | Where a loopback node with no `apiKey` keeps the key it generates on its first boot (0600, owned by the node's user) — see [Using Auth](#using-auth) |
+| `plaid.enabled` | `false` | Hold this ledger's bank connections on this node — on **one** node per company; see [Bank connections](#bank-connections-plaid). Needs `GL_NODE_PLAID_CLIENT_ID`, `GL_NODE_PLAID_SECRET` and `GL_NODE_SECRETS_KEY` in the environment, or the ledger is not served |
+| `plaid.environment` | `"sandbox"` | `"sandbox"` (Plaid's test banks) or `"production"`; never an address |
+| `plaid.clientName` | `"NewGL"` | The name Plaid Link shows, 1 to 30 characters |
 | `http.headerReadTimeoutSeconds` | `30` | Time a client gets to send a complete request head; also bounds idle keep-alive. `1`–`300` |
 | `http.requestTimeoutSeconds` | `30` | Whole-request ceiling, body read and GraphQL execution included (`408` on expiry). `1`–`300` |
 | `http.maxConnections` | `1024` | Concurrently served connections; excess stays in the kernel backlog. `8`–`65536` |
@@ -1180,6 +1186,79 @@ past expiry), `NO_ACCESS_LIST` (signing or auth is off) or `NOT_AN_ADMIN_NODE` (
 node is outside `auth.adminNodes`). Names, roles, expiry dates and key hashes
 are part of the books: anyone given the `.bean` sees them, never a key.
 
+### Bank connections (Plaid)
+
+A company can connect its bank accounts through [Plaid](https://plaid.com).
+**One node per company** holds the connections: set `plaid.enabled` in that
+ledger's config (its `ledger.json`, or the config file for `default`) on that
+node only. Every other node refuses the Plaid fields with `PLAID_NOT_ENABLED`,
+so no bank is held twice. An invitation never carries the setting.
+
+The node needs three values in its environment, never in a config file:
+
+| Variable | What |
+|---|---|
+| `GL_NODE_PLAID_CLIENT_ID` | The Plaid account's client id |
+| `GL_NODE_PLAID_SECRET` | Its secret for `plaid.environment` (sandbox and production secrets differ) |
+| `GL_NODE_SECRETS_KEY` | 64 hex characters (`openssl rand -hex 32`): the key the access tokens are encrypted under |
+
+A ledger with `plaid.enabled` on a node without all three is not served. A
+malformed key, or only one of the two Plaid values, stops the node at boot; an
+empty variable counts as unset.
+
+**The flow.** Plaid Link runs in the client app (Plaid's web or mobile SDK),
+not in the node:
+
+1. `createPlaidLinkToken { linkToken expiration }` — the app opens Link with it.
+2. Link returns a *public token*; the app sends it:
+   `connectBank(publicToken: "…") { itemId institutionName accounts { accountId name mask type subtype } }`.
+   The node exchanges it with Plaid for the bank's **access token** and keeps
+   that; the answer describes the bank, never the token. A connect runs to the
+   end even if the request is cut short, so a request cut short never drops a
+   token Plaid has issued (the bank then shows in `connectedBanks`). A token
+   that cannot be stored is removed at Plaid again; should that fail too, the
+   node's log says so, naming the item to remove in the Plaid Dashboard.
+3. `connectedBanks { itemId institutionName connectedOn accounts { name mask } }`
+   lists them (a read key is enough); `connectedOn` is null for a bank whose
+   description could not be stored.
+4. `disconnectBank(itemId: "…")` removes the bank **at Plaid first**, then
+   deletes its token here; `false` when there is no such bank. If Plaid
+   refuses, nothing is deleted and the call can be repeated; only a bank Plaid
+   does not find (`ITEM_NOT_FOUND`) counts as already removed. A token from
+   another Plaid environment than `plaid.environment` is refused untouched
+   (`PLAID_ENVIRONMENT`): set the environment it was connected in.
+
+`createPlaidLinkToken`, `connectBank` and `disconnectBank` need an **admin**
+key. Refusals carry a code: `PLAID_NOT_ENABLED`, `PLAID_ERROR` (Plaid refused;
+Plaid's own code is in `extensions.plaidCode`, its message is never passed
+on), `PLAID_UNREACHABLE`, `PLAID_UNEXPECTED` (an answer this node will not
+store), `PLAID_ENVIRONMENT`, `SECRET_STORE` (the details are in the node's log)
+or `LEDGER_BUSY` (the ledger is stopping, restarting or being removed). A stop
+or restart waits for a connect or disconnect under way — up to about 90 s when
+Plaid is slow.
+Multi-factor sign-in before Link is the client app's job.
+
+**Where the tokens are.** In `secrets.json` in the ledger's folder, owner-only
+(the node key's checks: no symlink, one link, mode 0600), each value
+AES-256-GCM-encrypted under `GL_NODE_SECRETS_KEY`. They are never in a record,
+the `.bean`, a response or a log line, and never replicate. Plaid's raw answers
+are not kept; only what `connectedBanks` shows is stored, encrypted beside the
+token. A wrong key is refused when the ledger starts, naming the variable. A
+ledger holding connections cannot be removed (`BANKS_CONNECTED`) until they are
+disconnected, so removing it strands no bank at Plaid: the removal first waits
+for any connect or disconnect under way. That holds with `plaid.enabled` since
+turned off, too: turn it back on to disconnect.
+
+**A lost key or another Plaid account.** Tokens sealed under a lost
+`GL_NODE_SECRETS_KEY` cannot be opened, and a ledger whose store does not open
+is not served; tokens of another Plaid account (`GL_NODE_PLAID_CLIENT_ID`
+changed) answer `INVALID_ACCESS_TOKEN`, which `disconnectBank` does not take
+for removed. Either way: remove the banks in the Plaid Dashboard (they stay
+live, and billed, until then), stop the ledger, move `secrets.json` out of its
+folder, start it again, and connect the banks anew through Link.
+
+Transactions are not imported yet.
+
 ### Several ledgers
 
 One node can serve several companies' ledgers, each kept apart: its own
@@ -1288,7 +1367,9 @@ listenPort } }`, `addLedger(name, settings)` or `addLedger(name, newMeshPorts:
 "4433-4532")` (a mesh of its own on a free UDP port of the range),
 `removeLedger(name) { movedTo }` and
 `restartLedger(name)`, refusing with `INVALID_INPUT`, `LEDGER_EXISTS`,
-`NO_SUCH_LEDGER`, `LEDGER_CONFLICT`, `START_FAILED` or `MOVE_FAILED`. One
+`NO_SUCH_LEDGER`, `LEDGER_CONFLICT`, `START_FAILED`, `MOVE_FAILED`,
+`BANKS_CONNECTED` (a ledger holding bank connections: disconnect them first,
+[Bank connections](#bank-connections-plaid)) or `BANKS_UNKNOWN`. One
 change runs at a time, to the end even if the request is cut short.
 
 ### Editing the `.bean` file by hand
