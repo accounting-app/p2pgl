@@ -347,6 +347,42 @@ impl Ledgers {
         }
     }
 
+    /// Answer a Plaid webhook for ledger `name` (007 step 6d): its Plaid
+    /// service and schema, when it is served with `plaid.enabled`; 401, as
+    /// for a call that is not Plaid's, otherwise. No API key:
+    /// [`crate::plaid_webhook`] verifies Plaid's signature instead.
+    pub(crate) async fn plaid_webhook(&self, name: &str, request: Request) -> Response {
+        let client = self.strangers.client_of(&request);
+        // The body first, for every name alike: a cap met only for a served
+        // ledger would tell one from a name not served.
+        let (parts, body) = request.into_parts();
+        let Ok(body) = axum::body::to_bytes(body, crate::plaid_webhook::MAX_WEBHOOK_BYTES).await
+        else {
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        };
+        let found = match self.get(name).await.as_deref() {
+            Some(Served::Running { running, .. }) => {
+                running.lock().await.as_ref().and_then(|running| {
+                    Some((
+                        running.plaid.clone()?,
+                        running.schema.clone(),
+                        running.tasks(),
+                    ))
+                })
+            }
+            _ => None,
+        };
+        // A name not served, or served without Plaid, is answered as a call
+        // that is not Plaid's: 401 for every name, so the route tells no
+        // stranger which companies this node serves (as `dispatch` does).
+        let Some((plaid, schema, tasks)) = found else {
+            return StatusCode::UNAUTHORIZED.into_response();
+        };
+        crate::plaid_webhook::handle(plaid, schema, tasks, client, &parts.headers, body)
+            .instrument(tracing::info_span!("ledger", ledger = %name))
+            .await
+    }
+
     /// Whether `name` is held, served or refused.
     pub(crate) async fn holds(&self, name: &str) -> bool {
         self.by_name.read().await.contains_key(name)
@@ -518,6 +554,26 @@ pub(crate) async fn named_graphql(
     request: Request<Body>,
 ) -> Response {
     ledgers.dispatch(&name, "/graphql", request, false).await
+}
+
+/// `/plaid/webhook`: the `default` ledger's Plaid webhooks.
+pub(crate) async fn default_plaid_webhook(
+    State(ledgers): State<Ledgers>,
+    request: Request,
+) -> Response {
+    ledgers.plaid_webhook(DEFAULT_LEDGER, request).await
+}
+
+/// `/ledgers/<name>/plaid/webhook`.
+pub(crate) async fn named_plaid_webhook(
+    State(ledgers): State<Ledgers>,
+    Path(name): Path<String>,
+    request: Request<Body>,
+) -> Response {
+    if !is_valid_ledger_name(&name) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    ledgers.plaid_webhook(&name, request).await
 }
 
 /// `/ledgers/<name>/health`.

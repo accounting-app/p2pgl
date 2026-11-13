@@ -384,6 +384,12 @@ pub struct PlaidConfig {
     /// ledger before a sync. Default `Expenses:Uncategorized`.
     #[serde(default = "default_plaid_suspense_account")]
     pub suspense_account: String,
+
+    /// Where Plaid sends this ledger's webhooks (007 step 6d): the public
+    /// address of `/ledgers/<name>/plaid/webhook` on this node, https only.
+    /// Unset, no webhooks are asked for and banks are synced on demand.
+    #[serde(default)]
+    pub webhook_url: Option<String>,
 }
 
 impl Default for PlaidConfig {
@@ -393,6 +399,7 @@ impl Default for PlaidConfig {
             environment: PlaidEnvironment::default(),
             client_name: default_plaid_client_name(),
             suspense_account: default_plaid_suspense_account(),
+            webhook_url: None,
         }
     }
 }
@@ -440,6 +447,18 @@ impl PlaidConfig {
                 "plaid.suspenseAccount must be an account name, such as Expenses:Uncategorized"
                     .to_owned(),
             ));
+        }
+        if let Some(url) = &self.webhook_url {
+            let fine = url.starts_with("https://")
+                && url.len() > "https://".len()
+                && url.len() <= 2_000
+                && !url.chars().any(|c| c.is_whitespace() || c.is_control());
+            if !fine {
+                return Err(ConfigError::Validation(
+                    "plaid.webhookUrl must be an https:// address of at most 2,000 characters"
+                        .to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -3050,6 +3069,16 @@ mod tests {
         write(&format!(r#"{{ "plaid": {{ "clientName": "{long}" }} }}"#));
         let error = LedgerConfig::load_folder(&folder).expect_err("too long");
         assert!(format!("{error}").contains("plaid.clientName"), "{error}");
+        write(
+            r#"{ "plaid": { "webhookUrl": "https://ledger.example.com/ledgers/acme/plaid/webhook" } }"#,
+        );
+        let config = LedgerConfig::load_folder(&folder).expect("loads");
+        assert!(config.plaid.webhook_url.is_some());
+        for bad in ["http://ledger.example.com/hook", "https://", "https://a b"] {
+            write(&format!(r#"{{ "plaid": {{ "webhookUrl": "{bad}" }} }}"#));
+            let error = LedgerConfig::load_folder(&folder).expect_err(bad);
+            assert!(format!("{error}").contains("plaid.webhookUrl"), "{error}");
+        }
     }
 
     /// 003: a ledger folder's `ledger.json` sets the ledger's own settings;

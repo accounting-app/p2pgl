@@ -1,6 +1,6 @@
 # Log: no Python in the repo
 
-Status: done (aa0415b).
+Status: done (5adc9a4).
 
 One entry per commit-sized unit, newest last, written when the unit is ready
 to commit. The commit hash is filled in once the maintainer has committed.
@@ -124,4 +124,4 @@ to commit. The commit hash is filled in once the maintainer has committed.
   rather than identical (above); `deploy/mesh-init.sh` and the README examples were Python too and
   are converted; the 003 log keeps its mentions of the Python tools, as a
   record of what was true then (its notes say where the tool is now).
-- **Commit:** aa0415b
+- **Commit:** 5adc9a4

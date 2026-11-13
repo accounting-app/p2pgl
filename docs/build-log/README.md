@@ -52,8 +52,8 @@ them (a typo, a one-line fix) gets no entry.
 | [001](001-peer-discovery/) | Peer discovery without a third party: own relay + direct addresses | done (d84083a) |
 | [002](002-users-and-roles/) | People, keys and roles: a key per person, admin / write / read, who entered each write | done (4 of 4, cd51455) |
 | [003](003-multi-ledger-node/) | Several company ledgers on one node, isolated, added at runtime | done (5 of 5, acbce10) |
-| [004](004-no-python/) | No Python in the repo: revert checks and measurements in Rust, the git guard in shell | done (aa0415b) |
+| [004](004-no-python/) | No Python in the repo: revert checks and measurements in Rust, the git guard in shell | done (5adc9a4) |
 | [005](005-installer/) | A one-command production install on a Linux server (Docker, HTTPS, backups, upgrades) | step 7 of 7 (0.3.0, then the real-network rehearsal) in progress |
 | [006](006-list-accounts/) | List a ledger's accounts over GraphQL, posted to or not | done (54b4454) |
-| [007](007-plaid-commitments/) | Keep what we told Plaid: bank connections, token secrecy, MFA before Link, retention in the installer | step 6c (endpoints for a proof of concept) ready to commit |
+| [007](007-plaid-commitments/) | Keep what we told Plaid: bank connections, token secrecy, MFA before Link, retention in the installer | step 6d (Plaid webhooks) in progress |
 | — | Relay with a company's own certificate authority (`relayCaCert`) | planned (decision C, 2026-10-09) |

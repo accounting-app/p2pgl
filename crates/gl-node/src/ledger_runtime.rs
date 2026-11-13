@@ -916,6 +916,12 @@ async fn start_ledger(
 }
 
 impl RunningLedger {
+    /// Its task list (007 step 6d): a webhook's work is one of its tasks, so
+    /// [`Self::stop`] ends it before the ledger is compacted and let go.
+    pub(crate) fn tasks(&self) -> Tasks {
+        Arc::clone(&self.tasks)
+    }
+
     /// The shutdown half: stop the watcher, compact, stop P2P — in that order,
     /// as `main` did. The ledger's lock is released last, when `self` drops.
     pub(crate) async fn stop(self) {
@@ -975,12 +981,6 @@ impl RunningLedger {
     #[cfg(test)]
     pub(crate) fn ledger(&self) -> SharedLedger {
         Arc::clone(&self.ledger)
-    }
-
-    /// Its tasks still running (tests: a stop leaves none).
-    #[cfg(test)]
-    pub(crate) fn tasks(&self) -> Tasks {
-        Arc::clone(&self.tasks)
     }
 }
 

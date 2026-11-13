@@ -210,6 +210,14 @@ impl RateLimiter {
         self.max_buckets
     }
 
+    /// The client a request comes from, as this limiter sees it: the peer, or
+    /// behind a trusted proxy the forwarded address (007 step 6d: the Plaid
+    /// webhook route's per-client budget of key fetches, which keys it with
+    /// [`bucket_key`]).
+    pub(crate) fn client_of(&self, request: &Request<Body>) -> IpAddr {
+        self.client_ip(peer_of(request), request.headers())
+    }
+
     /// A limiter with its own table and budget that identifies clients exactly
     /// as this one does (L-42).
     ///

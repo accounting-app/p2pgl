@@ -39,6 +39,13 @@ pub struct ConnectedBank {
     /// Null once a sync finishes.
     pub last_error_code: Option<String>,
     pub accounts: Vec<BankAccount>,
+    /// Plaid's last consent notice for it, from a webhook —
+    /// `PENDING_EXPIRATION`, `PENDING_DISCONNECT` (log in again before access
+    /// ends), `USER_PERMISSION_REVOKED`, `USER_ACCOUNT_REVOKED`. A sync leaves
+    /// it; a repaired login clears it.
+    pub last_notice: Option<String>,
+    /// When that notice came (RFC 3339, UTC).
+    pub last_notice_at: Option<String>,
 }
 
 #[derive(SimpleObject, Debug, Clone)]
@@ -65,6 +72,8 @@ impl From<BankConnection> for ConnectedBank {
             connected_on: connection.connected_on,
             last_synced_at: connection.last_synced_at,
             last_error_code: connection.last_error_code,
+            last_notice: connection.last_notice,
+            last_notice_at: connection.last_notice_at,
             accounts: connection
                 .accounts
                 .into_iter()
@@ -173,6 +182,23 @@ pub(super) async fn connect_sandbox_bank(
         .await
         .map_err(failed)?;
     Ok(connection.into())
+}
+
+pub(super) async fn update_bank_webhooks(ctx: &Context<'_>) -> Result<i32> {
+    let updated = service(ctx)?.update_webhooks().await.map_err(failed)?;
+    Ok(i32::try_from(updated).unwrap_or(i32::MAX))
+}
+
+pub(super) async fn fire_sandbox_webhook(
+    ctx: &Context<'_>,
+    item_id: String,
+    webhook_code: String,
+) -> Result<bool> {
+    service(ctx)?
+        .fire_sandbox_webhook(&item_id, &webhook_code)
+        .await
+        .map_err(failed)?;
+    Ok(true)
 }
 
 pub(super) async fn reset_sandbox_login(ctx: &Context<'_>, item_id: String) -> Result<bool> {
@@ -611,6 +637,9 @@ mod tests {
         _dir: tempfile::TempDir,
         schema: AppSchema,
         mock: MockPlaid,
+        plaid: Option<Arc<PlaidService>>,
+        /// The ledger's task list a webhook's work joins.
+        tasks: crate::ledger_runtime::Tasks,
     }
 
     /// A ledger's schema, with Plaid on (against a mock) or off.
@@ -640,12 +669,14 @@ mod tests {
             false,
             None,
             None,
-            plaid,
+            plaid.clone(),
         );
         Fixture {
             _dir: dir,
             schema,
             mock,
+            plaid,
+            tasks: crate::ledger_runtime::Tasks::default(),
         }
     }
 
@@ -689,6 +720,8 @@ mod tests {
         );
         let sandbox = "mutation { connectSandboxBank { itemId } }";
         let reset = format!(r#"mutation {{ resetSandboxLogin(itemId: "{ITEM_ID}") }}"#);
+        let webhooks = "mutation { updateBankWebhooks }";
+        let fire = format!(r#"mutation {{ fireSandboxWebhook(itemId: "{ITEM_ID}") }}"#);
         for query in [
             LINK,
             CONNECT,
@@ -699,6 +732,8 @@ mod tests {
             unmap.as_str(),
             sandbox,
             reset.as_str(),
+            webhooks,
+            fire.as_str(),
         ] {
             let body = run(&fixture.schema, Role::Write, query).await;
             assert_eq!(code(&body), Some("FORBIDDEN"), "{query}: {body}");
@@ -1504,5 +1539,291 @@ mod tests {
             "{body}"
         );
         assert!(!body.to_string().contains(ACCESS_TOKEN));
+    }
+
+    /// A signed webhook body for `item_id`, and its `Plaid-Verification`
+    /// header, the key set in the mock.
+    fn signed_webhook(
+        fixture: &Fixture,
+        kind: &str,
+        code: &str,
+        error: Option<&str>,
+    ) -> (axum::http::HeaderMap, axum::body::Bytes) {
+        // A key of its own each time: the node caches a key by its id, as it
+        // should, so a second key under one id would be refused.
+        static KEYS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = KEYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let signer = crate::plaid_webhook::tests::Signer::new(&format!("k{n}"));
+        *fixture.mock.webhook_key.lock().unwrap() = Some(signer.jwk(None));
+        let mut body = serde_json::json!({
+            "webhook_type": kind, "webhook_code": code, "item_id": ITEM_ID,
+            "environment": "sandbox",
+        });
+        if let Some(error) = error {
+            body["error"] = serde_json::json!({ "error_code": error });
+        }
+        let body = body.to_string().into_bytes();
+        let token = signer.token(&body, chrono::Utc::now().timestamp());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("plaid-verification", token.parse().unwrap());
+        (headers, axum::body::Bytes::from(body))
+    }
+
+    /// Deliver a webhook as Plaid does, once the node has its key: the first
+    /// delivery of a key the node has not fetched is refused while the key is
+    /// fetched, and Plaid redelivers.
+    async fn deliver(
+        fixture: &Fixture,
+        headers: &axum::http::HeaderMap,
+        body: axum::body::Bytes,
+    ) -> axum::http::StatusCode {
+        let plaid = Arc::clone(fixture.plaid.as_ref().expect("Plaid on"));
+        let client = std::net::IpAddr::from([192, 0, 2, 1]);
+        let token = headers
+            .get("plaid-verification")
+            .and_then(|token| token.to_str().ok());
+        let _ = crate::plaid_webhook::tests::verify_settled(
+            &plaid,
+            token,
+            &body,
+            chrono::Utc::now().timestamp(),
+            client,
+        )
+        .await;
+        crate::plaid_webhook::handle(
+            plaid,
+            fixture.schema.clone(),
+            fixture.tasks.clone(),
+            client,
+            headers,
+            body,
+        )
+        .await
+        .status()
+    }
+
+    /// Wait (up to two seconds) for `done` to hold.
+    async fn eventually(mut done: impl AsyncFnMut() -> bool) -> bool {
+        for _ in 0..100 {
+            if done().await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    /// Plaid's "new transactions" webhook syncs the bank on its own; its
+    /// entries carry no `enteredBy`, as no person made them.
+    ///
+    /// Bug-catch: a webhook that only answers 200 imports nothing until an
+    /// admin syncs, which is what webhooks were added to end.
+    #[tokio::test]
+    async fn a_webhook_syncs_the_bank_on_its_own() {
+        let fixture = mapped(true).await;
+        fixture.mock.sync_page(page(
+            vec![mock::sync_transaction(
+                "t1",
+                "acc1",
+                3.0,
+                "2026-11-01",
+                false,
+            )],
+            vec![],
+            vec![],
+        ));
+        let (headers, body) =
+            signed_webhook(&fixture, "TRANSACTIONS", "SYNC_UPDATES_AVAILABLE", None);
+
+        assert_eq!(
+            deliver(&fixture, &headers, body).await,
+            axum::http::StatusCode::OK
+        );
+        let journal = "{ journal { links enteredBy } }";
+        let imported = eventually(async || {
+            operator(&fixture.schema, journal)
+                .await
+                .to_string()
+                .contains("plaid-t1")
+        })
+        .await;
+        assert!(imported, "the webhook's sync imported t1");
+        let body = operator(&fixture.schema, journal).await;
+        let entry = body["data"]["journal"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["links"] == serde_json::json!(["plaid-t1"]))
+            .unwrap()
+            .clone();
+        assert!(entry["enteredBy"].is_null(), "{entry}");
+    }
+
+    /// Plaid's error webhook keeps its code on the bank, for the app.
+    ///
+    /// Bug-catch: a broken login Plaid reported stays invisible until the
+    /// next sync fails.
+    #[tokio::test]
+    async fn an_error_webhook_marks_the_bank() {
+        let fixture = mapped(true).await;
+        let (headers, body) =
+            signed_webhook(&fixture, "ITEM", "ERROR", Some("ITEM_LOGIN_REQUIRED"));
+
+        assert_eq!(
+            deliver(&fixture, &headers, body).await,
+            axum::http::StatusCode::OK
+        );
+        let marked = eventually(async || {
+            operator(&fixture.schema, HEALTH).await["data"]["connectedBanks"][0]["lastErrorCode"]
+                == "ITEM_LOGIN_REQUIRED"
+        })
+        .await;
+        assert!(marked);
+    }
+
+    /// A webhook that is not Plaid's — unsigned, or its body changed — is
+    /// refused with 401 and does nothing.
+    ///
+    /// Bug-catch: acting before verifying lets anyone start syncs and mark
+    /// banks broken.
+    #[tokio::test]
+    async fn an_unverified_webhook_does_nothing() {
+        let fixture = mapped(true).await;
+        let (headers, _) = signed_webhook(&fixture, "ITEM", "ERROR", Some("ITEM_LOGIN_REQUIRED"));
+        let forged = axum::body::Bytes::from(
+            serde_json::json!({
+                "webhook_type": "ITEM", "webhook_code": "ERROR", "item_id": ITEM_ID,
+                "error": { "error_code": "FORGED" },
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            deliver(&fixture, &headers, forged.clone()).await,
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            deliver(&fixture, &axum::http::HeaderMap::new(), forged).await,
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let banks = operator(&fixture.schema, HEALTH).await;
+        assert!(
+            banks["data"]["connectedBanks"][0]["lastErrorCode"].is_null(),
+            "{banks}"
+        );
+    }
+
+    const NOTICE: &str = "{ connectedBanks { lastNotice lastNoticeAt lastErrorCode } }";
+
+    /// A consent notice from a webhook is kept apart from the error code: a
+    /// sync that finishes leaves it, a repaired login clears it. The webhook's
+    /// work is one of the ledger's tasks.
+    ///
+    /// Bug-catch: a notice kept as the error code is wiped by the next sync,
+    /// days before the bank's access ends; work outside the ledger's tasks
+    /// goes on writing after the ledger stops.
+    #[tokio::test]
+    async fn a_consent_notice_outlives_a_sync() {
+        let fixture = mapped(true).await;
+        let (headers, body) = signed_webhook(&fixture, "ITEM", "PENDING_EXPIRATION", None);
+        assert_eq!(
+            deliver(&fixture, &headers, body).await,
+            axum::http::StatusCode::OK
+        );
+        assert_eq!(
+            fixture.tasks.lock().unwrap().len(),
+            1,
+            "one of the ledger's tasks"
+        );
+        let noted = eventually(async || {
+            operator(&fixture.schema, NOTICE).await["data"]["connectedBanks"][0]["lastNotice"]
+                == "PENDING_EXPIRATION"
+        })
+        .await;
+        assert!(noted);
+
+        operator(&fixture.schema, &sync()).await;
+        let banks = operator(&fixture.schema, NOTICE).await;
+        assert_eq!(
+            banks["data"]["connectedBanks"][0]["lastNotice"], "PENDING_EXPIRATION",
+            "{banks}"
+        );
+        assert!(banks["data"]["connectedBanks"][0]["lastNoticeAt"].is_string());
+
+        let (headers, body) = signed_webhook(&fixture, "ITEM", "LOGIN_REPAIRED", None);
+        assert_eq!(
+            deliver(&fixture, &headers, body).await,
+            axum::http::StatusCode::OK
+        );
+        let cleared = eventually(async || {
+            operator(&fixture.schema, NOTICE).await["data"]["connectedBanks"][0]["lastNotice"]
+                .is_null()
+        })
+        .await;
+        assert!(cleared);
+    }
+
+    /// A bank with a consent notice, the notice kept by a webhook.
+    async fn noticed() -> Fixture {
+        let fixture = mapped(true).await;
+        let (headers, body) = signed_webhook(&fixture, "ITEM", "PENDING_EXPIRATION", None);
+        assert_eq!(
+            deliver(&fixture, &headers, body).await,
+            axum::http::StatusCode::OK
+        );
+        let noted = eventually(async || {
+            operator(&fixture.schema, NOTICE).await["data"]["connectedBanks"][0]["lastNotice"]
+                == "PENDING_EXPIRATION"
+        })
+        .await;
+        assert!(noted);
+        fixture
+    }
+
+    /// The public token of a login done again in Link's update mode, passed
+    /// to `connectBank`, clears the bank's consent notice: Plaid sends no
+    /// webhook for a renewal made that way.
+    ///
+    /// Bug-catch: a notice not cleared there stays on the bank after the
+    /// person renewed it, and the app asks them to renew it forever.
+    #[tokio::test]
+    async fn a_login_done_again_clears_the_notice() {
+        let fixture = noticed().await;
+        let again = r#"mutation { connectBank(publicToken: "public-sandbox-xyz") { itemId lastNotice lastNoticeAt } }"#;
+        let body = operator(&fixture.schema, again).await;
+        assert!(body["errors"].is_null(), "{body}");
+        assert!(
+            body["data"]["connectBank"]["lastNotice"].is_null(),
+            "{body}"
+        );
+        let banks = operator(&fixture.schema, NOTICE).await;
+        assert!(
+            banks["data"]["connectedBanks"][0]["lastNotice"].is_null(),
+            "{banks}"
+        );
+        assert!(banks["data"]["connectedBanks"][0]["lastNoticeAt"].is_null());
+    }
+
+    /// `LOGIN_REPAIRED` clears the notice even with a webhook sync of the
+    /// bank queued already, and has that sync go once more.
+    ///
+    /// Bug-catch: the clearing done only with a sync of its own is lost
+    /// whenever a sync is queued, and the notice stays.
+    #[tokio::test]
+    async fn a_repaired_login_clears_the_notice_with_a_sync_queued() {
+        let fixture = noticed().await;
+        let plaid = Arc::clone(fixture.plaid.as_ref().unwrap());
+        let mut queued = plaid.queue_webhook_sync(ITEM_ID).expect("free");
+        let (headers, body) = signed_webhook(&fixture, "ITEM", "LOGIN_REPAIRED", None);
+        assert_eq!(
+            deliver(&fixture, &headers, body).await,
+            axum::http::StatusCode::OK
+        );
+        let banks = operator(&fixture.schema, NOTICE).await;
+        assert!(
+            banks["data"]["connectedBanks"][0]["lastNotice"].is_null(),
+            "{banks}"
+        );
+        assert!(queued.go_again(), "the queued sync goes once more");
     }
 }

@@ -55,7 +55,7 @@ to commit. The commit hash is filled in once the maintainer has committed.
   binary (`Dockerfile.cross`), not an emulated image build; the upgrade
   rehearsal from 0.1.0 runs with the release itself (`plan.md` step 1, *As
   built*).
-- **Commit:** d6a4abb
+- **Commit:** f06d847
 
 ## 2026-10-19 — Step 1, continued: rustls 0.23.46
 
@@ -68,11 +68,11 @@ to commit. The commit hash is filled in once the maintainer has committed.
 - **Gate:** `scripts/gate.sh` — 1,618 passed, 0 failed, 0 ignored (8 min 9 s).
 - **Revert checks:** none (a dependency update).
 - **Departures from the plan:** none; the release runs after this commit.
-- **Commit:** d6a4abb
+- **Commit:** f06d847
 
 ## 2026-10-19 — Step 2: the node behind a proxy
 
-- **Release 0.2.0** (step 1) was built and checked at d6a4abb after the
+- **Release 0.2.0** (step 1) was built and checked at f06d847 after the
   rustls commit: gate, audit, MSRV 1.91, the shipped-binary tests with the
   upgrade and rollback from 0.1.0 (8 passed), the image, linux-arm64, and
   linux-amd64 cross-compiled and booted to a passing health check under
@@ -128,7 +128,7 @@ to commit. The commit hash is filled in once the maintainer has committed.
   off (I-R15). `h01_l23.json` H01-R5 re-anchored on
   `is_public` (still bites).
 - **Departures from the plan:** recorded in `plan.md` step 2 (*As built*).
-- **Commit:** a15d133
+- **Commit:** 101cb30
 
 ## 2026-10-20 — Step 3: the installer
 
@@ -215,7 +215,7 @@ to commit. The commit hash is filled in once the maintainer has committed.
   that way).
 - **Departures from the plan:** a rehearsal script beside the installer
   (the plan said Lima, not how); `release.sh`'s two checks.
-- **Commit:** 910b0b6
+- **Commit:** f6c9bf3
 
 ## 2026-10-20 — Step 4: the day-to-day command
 
@@ -275,7 +275,7 @@ to commit. The commit hash is filled in once the maintainer has committed.
   shell, proved by the rehearsal.
 - **Departures from the plan:** the new mesh's settings are composed by the
   node (Rust, tested) rather than the shell command; `openledger key`.
-- **Commit:** a81a03e
+- **Commit:** 67b4e67
 
 ## 2026-10-23 — Step 5: joining a second server
 
@@ -302,7 +302,7 @@ to commit. The commit hash is filled in once the maintainer has committed.
   accept`** pass the server's domain and port range. OPERATIONS (*Joining a
   second server*), README, CHANGELOG; the Insomnia collection and curl pages
   carry the three requests. Also the 005 step 4 and 006 commits recorded
-  (a81a03e, 54b4454).
+  (67b4e67, 54b4454).
 - **Tests:** an invitation and a reply are one line each and only what they
   say; a joining node is in the mesh with the inviter as its peer (it loads as
   a folder's `ledger.json`); accepting a reply adds its node and nothing else;

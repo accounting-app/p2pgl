@@ -9,6 +9,19 @@ break compatibility.
 
 ### Security
 
+- Plaid's webhooks (007 step 6d) are answered at `/ledgers/<name>/plaid/webhook`
+  without an API key, so each call must prove it is Plaid's: an ES256
+  `Plaid-Verification` JWT, by a key Plaid publishes (its id checked, asked
+  about again hourly, dropped once Plaid refuses it or sets it to expire,
+  refused after a day unconfirmed), at most five minutes old, carrying the
+  SHA-256 of the exact body; anything else is 401 and does nothing, as is a
+  signed call about no bank the ledger holds. Bodies are capped at 64 KiB,
+  the route sits behind the Host guard and a rate limit of its own, answers
+  401 alike for a company not served or served without Plaid, and never
+  waits on Plaid for a key: one not cached is fetched in the background
+  while the call is answered 401 (Plaid redelivers), one at a time, at most
+  ten a minute for one address (an IPv6 /64) and sixty in all, a refused key
+  id not again for five minutes.
 - Bank access tokens from Plaid are kept only on the node that holds a
   company's connections, in `secrets.json` in the ledger's folder: owner-only,
   each value AES-256-GCM-encrypted under `GL_NODE_SECRETS_KEY` from the
@@ -42,6 +55,13 @@ break compatibility.
   One sync of a bank at a time (`SYNC_IN_PROGRESS`). Connect refuses the same
   bank linked twice while it is connected (`BANK_ALREADY_CONNECTED`); after a
   reconnect, map with a later `importFrom` (README).
+- Plaid webhooks (007 step 6d): with `plaid.webhookUrl`, new transactions
+  sync a bank on its own (entries without `enteredBy`, one of the ledger's
+  tasks), a broken login is kept as its `lastErrorCode` and an expiring
+  consent as its `lastNotice` (cleared by a repaired login, or by passing the
+  update-mode public token to `connectBank`), new accounts are read;
+  `updateBankWebhooks` gives the address to banks already connected, and
+  `fireSandboxWebhook(itemId)` sends one in the sandbox (README *Webhooks*).
 - Endpoints for a proof of concept (007 step 6c): `connectedBanks` gives each
   bank's `lastSyncedAt` and `lastErrorCode`; `refreshBankAccounts(itemId)`
   picks up accounts a bank opened after it was connected, mappings kept;

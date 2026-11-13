@@ -115,3 +115,8 @@ may ask for evidence.
     expired login without a client app's Link. Webhooks stay out (a public
     route and Plaid's signed JWTs; on-demand sync suffices for a proof of
     concept); MFA in the client app stays on hold.
+12. **Webhooks** (2026-11-13): Plaid's `SYNC_UPDATES_AVAILABLE` starts a
+    sync of that bank on its own, its entries with no `enteredBy` (no person
+    made them, as operator writes); the address is `plaid.webhookUrl` in the
+    ledger's config (https only), carried by new link tokens and set on banks
+    already connected by an admin mutation.

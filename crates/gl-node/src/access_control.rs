@@ -84,6 +84,8 @@ pub const ADMIN_FIELDS: &[&str] = &[
     "unmapBankAccount",
     "connectSandboxBank",
     "resetSandboxLogin",
+    "updateBankWebhooks",
+    "fireSandboxWebhook",
 ];
 
 /// The schema extension that enforces [`Role`]s; see the module doc.

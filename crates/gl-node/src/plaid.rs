@@ -172,6 +172,8 @@ pub(crate) enum PlaidError {
     SyncInProgress,
     /// A helper of Plaid's sandbox, asked of a ledger on another environment.
     SandboxOnly,
+    /// A webhook mutation on a ledger with no `plaid.webhookUrl`.
+    NoWebhookUrl,
 }
 
 impl fmt::Display for PlaidError {
@@ -210,6 +212,9 @@ impl fmt::Display for PlaidError {
             Self::SandboxOnly => f.write_str(
                 "this is a helper of Plaid's sandbox, and this ledger is not on it (plaid.environment)",
             ),
+            Self::NoWebhookUrl => f.write_str(
+                "this ledger has no plaid.webhookUrl: set it in its config and restart it",
+            ),
         }
     }
 }
@@ -236,6 +241,7 @@ impl PlaidError {
             Self::NoSuchBank(_) => "NO_SUCH_BANK",
             Self::SyncInProgress => "SYNC_IN_PROGRESS",
             Self::SandboxOnly => "PLAID_SANDBOX_ONLY",
+            Self::NoWebhookUrl => "PLAID_NO_WEBHOOK_URL",
         }
     }
 
@@ -244,6 +250,16 @@ impl PlaidError {
         match self {
             Self::Api { error_code, .. } => Some(error_code),
             _ => None,
+        }
+    }
+
+    /// Plaid refused for good (a 4xx other than 429), or answered with
+    /// something unusable: not worth asking again soon.
+    fn is_definite_refusal(&self) -> bool {
+        match self {
+            Self::Api { status, .. } => (400..500).contains(status) && *status != 429,
+            Self::Unexpected(_) => true,
+            _ => false,
         }
     }
 
@@ -424,6 +440,24 @@ struct SandboxPublicToken {
     public_token: String,
 }
 
+#[derive(Deserialize)]
+struct VerificationKeyGot {
+    key: VerificationKey,
+}
+
+/// A JWK as Plaid gives its webhook verification keys.
+#[derive(Deserialize)]
+struct VerificationKey {
+    alg: String,
+    kid: String,
+    crv: String,
+    kty: String,
+    x: String,
+    y: String,
+    #[serde(default)]
+    expired_at: Option<i64>,
+}
+
 /// The most `/transactions/sync` pages one sync reads: years of a
 /// busy account's history fit; a loop that never ends does not.
 const MAX_SYNC_PAGES: usize = 1000;
@@ -591,6 +625,102 @@ impl SyncSession {
         self.series_start.as_deref()
     }
 }
+/// The most webhook verification keys asked of Plaid a minute, in all (step
+/// 6d): a guard on the company's Plaid account.
+const MAX_KEY_FETCHES_A_MINUTE: u32 = 60;
+
+/// The most a minute one client's calls may have the node ask Plaid for:
+/// Plaid sends from a handful of addresses, so a stranger's made-up key ids
+/// spend that stranger's budget, not Plaid's.
+const MAX_KEY_FETCHES_A_CLIENT_A_MINUTE: u32 = 10;
+
+/// How long a cached webhook key is used before Plaid is asked about it
+/// again (at most once a minute while it is stale): a key Plaid has since set
+/// to expire is dropped at the next answer, and never trusted past
+/// [`KEY_TRUSTED_UNCONFIRMED`].
+const KEY_FRESH_FOR: Duration = Duration::from_secs(60 * 60);
+
+/// How long a cached webhook key is used without Plaid confirming it — while
+/// asking keeps failing, or cannot be done: past it the key is refused until
+/// Plaid answers, so a key Plaid has rotated out is never trusted for long.
+const KEY_TRUSTED_UNCONFIRMED: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A webhook key Plaid gave, as an uncompressed P-256 point.
+#[derive(Clone)]
+struct CachedKey {
+    /// When Plaid last gave it.
+    fetched: std::time::Instant,
+    /// When Plaid was last asked about it: once a minute at most.
+    asked: std::time::Instant,
+    point: Vec<u8>,
+}
+
+/// What [`PlaidService::cached_key`] has for a key id.
+enum Cached {
+    Fresh(Vec<u8>),
+    /// Older than [`KEY_FRESH_FOR`]: the point while still usable, and
+    /// whether this call is the one to ask Plaid about it again.
+    Stale {
+        point: Option<Vec<u8>>,
+        ask_again: bool,
+    },
+    /// Refused by Plaid lately.
+    Refused,
+}
+
+/// What [`PlaidService::verification_key`] has for a key id.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum KeyLookup {
+    Found(Vec<u8>),
+    /// Being fetched (or just set to be): the call is refused, Plaid's
+    /// redelivery finds it.
+    Pending,
+    /// Refused by Plaid lately, unusable, or past the budget.
+    Refused,
+}
+
+/// A bank with a webhook sync queued ([`PlaidService::queue_webhook_sync`]);
+/// the mark is dropped with it, unless [`Self::go_again`] dropped it first.
+pub(crate) struct QueuedSync {
+    service: Arc<PlaidService>,
+    item_id: String,
+    /// The mark is dropped already: a later webhook's mark is not this one's.
+    ended: bool,
+}
+
+impl QueuedSync {
+    /// Whether the sync is to go once more (a webhook came while it ran);
+    /// when not, the mark is dropped here, under the lock, so a webhook after
+    /// this queues a sync of its own and this guard leaves that one's mark.
+    pub(crate) fn go_again(&mut self) -> bool {
+        let Ok(mut queued) = self.service.webhook_syncs.lock() else {
+            return false;
+        };
+        match queued.get_mut(&self.item_id) {
+            Some(again) if *again => {
+                *again = false;
+                true
+            }
+            _ => {
+                queued.remove(&self.item_id);
+                self.ended = true;
+                false
+            }
+        }
+    }
+}
+
+impl Drop for QueuedSync {
+    fn drop(&mut self) {
+        if self.ended {
+            return;
+        }
+        if let Ok(mut queued) = self.service.webhook_syncs.lock() {
+            queued.remove(&self.item_id);
+        }
+    }
+}
+
 /// A bank marked as syncing ([`PlaidService::begin_sync`]); the mark is
 /// dropped with it.
 pub(crate) struct SyncGuard {
@@ -631,6 +761,14 @@ pub(crate) struct BankConnection {
     /// (`ITEM_LOGIN_REQUIRED`: log in again), cleared by a sync that finishes.
     #[serde(default)]
     pub last_error_code: Option<String>,
+    /// Plaid's last consent notice for it (`PENDING_EXPIRATION`,
+    /// `PENDING_DISCONNECT`, `USER_PERMISSION_REVOKED`,
+    /// `USER_ACCOUNT_REVOKED`, from a webhook), and when it came: unlike the
+    /// error code, a finished sync leaves it; logging in again clears it.
+    #[serde(default)]
+    pub last_notice: Option<String>,
+    #[serde(default)]
+    pub last_notice_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -663,6 +801,8 @@ impl BankConnection {
             accounts: Vec::new(),
             last_synced_at: None,
             last_error_code: None,
+            last_notice: None,
+            last_notice_at: None,
         }
     }
 }
@@ -731,6 +871,25 @@ pub(crate) struct PlaidService {
     client: PlaidClient,
     client_name: String,
     suspense_account: String,
+    /// `plaid.webhookUrl`: carried by new link tokens (step 6d).
+    webhook_url: Option<String>,
+    /// Plaid's webhook verification keys by key id ([`Self::verification_key`]).
+    webhook_keys: std::sync::Mutex<std::collections::HashMap<String, CachedKey>>,
+    /// Key ids Plaid would not give, and when: not asked again for five
+    /// minutes, so a stranger's made-up key ids do not each cost a call.
+    refused_keys: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// Key fetches in the current minute: at most [`MAX_KEY_FETCHES_A_MINUTE`].
+    key_fetches: std::sync::Mutex<(std::time::Instant, u32)>,
+    /// Key fetches by client in its current minute.
+    key_fetches_by_client:
+        std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (std::time::Instant, u32)>>,
+    /// Key ids being fetched now.
+    fetching_keys: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// One key fetch at a time.
+    key_fetch: tokio::sync::Mutex<()>,
+    /// The banks with a webhook sync queued or running
+    /// ([`Self::queue_webhook_sync`]), each with whether it is to go once more.
+    webhook_syncs: std::sync::Mutex<std::collections::HashMap<String, bool>>,
     environment: PlaidEnvironment,
     /// The ledger's one store instance (`crate::secret_store`): every read and
     /// write goes through this lock, held for store work only.
@@ -780,6 +939,14 @@ impl PlaidService {
             client,
             client_name: config.client_name.clone(),
             suspense_account: config.suspense_account.clone(),
+            webhook_url: config.webhook_url.clone(),
+            webhook_keys: std::sync::Mutex::default(),
+            refused_keys: std::sync::Mutex::default(),
+            key_fetches: std::sync::Mutex::new((std::time::Instant::now(), 0)),
+            key_fetches_by_client: std::sync::Mutex::default(),
+            fetching_keys: std::sync::Mutex::default(),
+            key_fetch: tokio::sync::Mutex::new(()),
+            webhook_syncs: std::sync::Mutex::default(),
             environment: config.environment,
             store: tokio::sync::Mutex::new(store),
             closed: tokio::sync::RwLock::new(false),
@@ -836,6 +1003,9 @@ impl PlaidService {
         };
         if let Some(access_token) = &access_token {
             body["access_token"] = json!(access_token.expose());
+        }
+        if let Some(url) = &self.webhook_url {
+            body["webhook"] = json!(url);
         }
         let created: LinkTokenCreated = self.client.call("/link/token/create", body).await?;
         Ok(LinkToken {
@@ -920,8 +1090,19 @@ impl PlaidService {
         // passed here exchanges to the same item. Nothing is stored over it —
         // its token, its mappings and its sync cursor stay as they are.
         if check_id("item_id", &item_id).is_ok() {
-            if let Some(held) = self.held_connection(&item_id).await? {
+            if let Some(mut held) = self.held_connection(&item_id).await? {
                 info!(item_id = %item_id, "a bank already connected was connected again; nothing changed");
+                // The person went through Link for this bank again: a consent
+                // notice (an expiring connection) is answered, as Plaid sends
+                // no webhook for a renewal made in update mode. The gate is
+                // held open here already.
+                self.change_info_open(&item_id, |connection| {
+                    connection.last_notice = None;
+                    connection.last_notice_at = None;
+                })
+                .await;
+                held.last_notice = None;
+                held.last_notice_at = None;
                 return Ok(held);
             }
         }
@@ -1538,6 +1719,381 @@ impl PlaidService {
         Ok(())
     }
 
+    /// Whether this ledger holds bank `item_id` (a webhook about another is
+    /// refused).
+    pub(crate) async fn holds(&self, item_id: &str) -> bool {
+        check_id("item_id", item_id).is_ok()
+            && matches!(
+                self.store.lock().await.get(&token_name(item_id)),
+                Ok(Some(_))
+            )
+    }
+
+    /// Tell Plaid `plaid.webhookUrl` for every bank this ledger holds
+    /// (`/item/webhook/update`, step 6d): banks connected before it was set,
+    /// or since it changed. The number updated.
+    pub(crate) async fn update_webhooks(&self) -> Result<usize, PlaidError> {
+        let Some(url) = self.webhook_url.clone() else {
+            return Err(PlaidError::NoWebhookUrl);
+        };
+        let item_ids = item_ids(self.store.lock().await.names());
+        let mut updated = 0;
+        for item_id in item_ids {
+            let access_token = match self.token_for_update(&item_id).await {
+                Ok(token) => token,
+                Err(PlaidError::NoSuchBank(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            let _: Value = self
+                .client
+                .call(
+                    "/item/webhook/update",
+                    json!({ "access_token": access_token.expose(), "webhook": url }),
+                )
+                .await?;
+            updated += 1;
+        }
+        info!(updated, "banks told where to send their webhooks");
+        Ok(updated)
+    }
+
+    /// Have Plaid's sandbox send bank `item_id` a webhook
+    /// (`/sandbox/item/fire_webhook`), `SYNC_UPDATES_AVAILABLE` by default: to
+    /// show a webhook-started sync. Sandbox only.
+    pub(crate) async fn fire_sandbox_webhook(
+        &self,
+        item_id: &str,
+        webhook_code: &str,
+    ) -> Result<(), PlaidError> {
+        if self.environment != PlaidEnvironment::Sandbox {
+            return Err(PlaidError::SandboxOnly);
+        }
+        check_id("webhook_code", webhook_code)?;
+        let access_token = self.token_for_update(item_id).await?;
+        let _: Value = self
+            .client
+            .call(
+                "/sandbox/item/fire_webhook",
+                json!({ "access_token": access_token.expose(), "webhook_code": webhook_code }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Plaid's webhook verification key `key_id`, as an uncompressed P-256
+    /// point (`0x04 || x || y`), when this node has it.
+    ///
+    /// The route that asks is open to anyone, so a key not cached is never
+    /// fetched while the caller waits: the answer is [`KeyLookup::Pending`]
+    /// (the webhook is refused, and Plaid redelivers it about 30 s later),
+    /// and the key is fetched in the background — one fetch of a key id at a
+    /// time, at most [`MAX_KEY_FETCHES_A_CLIENT_A_MINUTE`] for `client` and
+    /// [`MAX_KEY_FETCHES_A_MINUTE`] in all. So a call never waits on Plaid,
+    /// and a stranger's made-up key ids spend only that stranger's budget. A
+    /// key id Plaid refused is not asked again for five minutes; a key Plaid
+    /// has set to expire is refused.
+    ///
+    /// A key Plaid gave is asked about again once [`KEY_FRESH_FOR`] old: in
+    /// the background, at most once a minute, outside both budgets (only keys
+    /// Plaid gave are cached, so strangers cannot add to these), and used
+    /// meanwhile — up to [`KEY_TRUSTED_UNCONFIRMED`], after which it is
+    /// refused until Plaid confirms it. One Plaid refuses or has since set to
+    /// expire is dropped.
+    pub(crate) fn verification_key(
+        self: &Arc<Self>,
+        key_id: &str,
+        client: std::net::IpAddr,
+    ) -> KeyLookup {
+        if check_id("key_id", key_id).is_err() {
+            return KeyLookup::Refused;
+        }
+        match self.cached_key(key_id) {
+            Some(Cached::Fresh(point)) => return KeyLookup::Found(point),
+            Some(Cached::Stale { point, ask_again }) => {
+                if ask_again {
+                    self.start_key_fetch(key_id);
+                }
+                return point.map_or(KeyLookup::Pending, KeyLookup::Found);
+            }
+            Some(Cached::Refused) => return KeyLookup::Refused,
+            None => {}
+        }
+        if !self.key_fetch_free(key_id) {
+            return KeyLookup::Pending;
+        }
+        if !self.spend_key_fetch(client) {
+            return KeyLookup::Refused;
+        }
+        self.start_key_fetch(key_id);
+        KeyLookup::Pending
+    }
+
+    /// Whether a fetch of `key_id` could start now: none of it under way, and
+    /// fewer than 64 of any.
+    fn key_fetch_free(&self, key_id: &str) -> bool {
+        self.fetching_keys
+            .lock()
+            .is_ok_and(|fetching| !fetching.contains(key_id) && fetching.len() < 64)
+    }
+
+    /// Fetch key `key_id` in the background, unless one is under way: cached
+    /// when Plaid gives it, dropped and remembered as refused when Plaid
+    /// refuses it, kept as it was after a passing failure.
+    fn start_key_fetch(self: &Arc<Self>, key_id: &str) {
+        let Ok(mut fetching) = self.fetching_keys.lock() else {
+            return;
+        };
+        if fetching.contains(key_id) || fetching.len() >= 64 {
+            return;
+        }
+        fetching.insert(key_id.to_owned());
+        drop(fetching);
+        let service = Arc::clone(self);
+        let key_id = key_id.to_owned();
+        tokio::spawn(
+            async move {
+                let _one_at_a_time = service.key_fetch.lock().await;
+                // A stopped ledger asks Plaid nothing more.
+                let fetched = if *service.closed.read().await {
+                    Err(PlaidError::Closing)
+                } else {
+                    service.fetch_key(&key_id).await
+                };
+                match fetched {
+                    Ok(point) => {
+                        if let Ok(mut keys) = service.webhook_keys.lock() {
+                            if keys.len() >= 64 {
+                                keys.clear();
+                            }
+                            let now = std::time::Instant::now();
+                            keys.insert(
+                                key_id.clone(),
+                                CachedKey {
+                                    fetched: now,
+                                    asked: now,
+                                    point,
+                                },
+                            );
+                        }
+                    }
+                    // Only Plaid's own refusal, or a key it gave that is not
+                    // usable, is remembered: a timeout or a 5xx is tried again
+                    // later, a stale key kept meanwhile.
+                    Err(error) if error.is_definite_refusal() => {
+                        if let Ok(mut keys) = service.webhook_keys.lock() {
+                            keys.remove(&key_id);
+                        }
+                        if let Ok(mut refused) = service.refused_keys.lock() {
+                            if refused.len() >= 256 {
+                                refused.clear();
+                            }
+                            refused.insert(key_id.clone(), std::time::Instant::now());
+                        }
+                    }
+                    Err(PlaidError::Closing) => {}
+                    Err(error) => {
+                        warn!(key_id = %key_id, %error, "a Plaid webhook key could not be fetched; asked again later");
+                    }
+                }
+                if let Ok(mut fetching) = service.fetching_keys.lock() {
+                    fetching.remove(&key_id);
+                }
+            }
+            .in_current_span(),
+        );
+    }
+
+    /// Spend one key fetch from `client`'s budget and the node's: `false`
+    /// when either is spent this minute. A client is keyed as the rate limit
+    /// keys it (M-04b): an IPv6 /64 is one client, so rotating addresses inside
+    /// it gets no fresh budget.
+    fn spend_key_fetch(&self, client: std::net::IpAddr) -> bool {
+        let client = crate::rate_limit::bucket_key(client);
+        let minute = Duration::from_secs(60);
+        let (Ok(mut all), Ok(mut clients)) =
+            (self.key_fetches.lock(), self.key_fetches_by_client.lock())
+        else {
+            return false;
+        };
+        if all.0.elapsed() >= minute {
+            *all = (std::time::Instant::now(), 0);
+        }
+        if clients.len() >= 1024 {
+            clients.retain(|_, (since, _)| since.elapsed() < minute);
+            if clients.len() >= 1024 {
+                clients.clear();
+            }
+        }
+        let mine = clients
+            .entry(client)
+            .or_insert_with(|| (std::time::Instant::now(), 0));
+        if mine.0.elapsed() >= minute {
+            *mine = (std::time::Instant::now(), 0);
+        }
+        if all.1 >= MAX_KEY_FETCHES_A_MINUTE || mine.1 >= MAX_KEY_FETCHES_A_CLIENT_A_MINUTE {
+            return false;
+        }
+        all.1 += 1;
+        mine.1 += 1;
+        true
+    }
+
+    /// What is cached for key `key_id`, `None` when nothing is. A stale key
+    /// due to be asked about again is marked asked here, under the lock, so
+    /// one call a minute starts the asking.
+    fn cached_key(&self, key_id: &str) -> Option<Cached> {
+        if let Ok(mut keys) = self.webhook_keys.lock() {
+            if let Some(key) = keys.get_mut(key_id) {
+                if key.fetched.elapsed() < KEY_FRESH_FOR {
+                    return Some(Cached::Fresh(key.point.clone()));
+                }
+                let ask_again = key.asked.elapsed() >= Duration::from_secs(60);
+                if ask_again {
+                    key.asked = std::time::Instant::now();
+                }
+                let usable = key.fetched.elapsed() < KEY_TRUSTED_UNCONFIRMED;
+                return Some(Cached::Stale {
+                    point: usable.then(|| key.point.clone()),
+                    ask_again,
+                });
+            }
+        }
+        let refused_lately = self.refused_keys.lock().ok().is_some_and(|refused| {
+            refused
+                .get(key_id)
+                .is_some_and(|when| when.elapsed() < Duration::from_secs(5 * 60))
+        });
+        refused_lately.then_some(Cached::Refused)
+    }
+
+    /// Whether a key fetch is under way (tests).
+    #[cfg(test)]
+    pub(crate) fn key_fetch_under_way(&self) -> bool {
+        self.fetching_keys
+            .lock()
+            .is_ok_and(|fetching| !fetching.is_empty())
+    }
+
+    /// Have cached key `key_id` fetched, and last asked about, `by` earlier
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn age_webhook_key(&self, key_id: &str, by: Duration) {
+        if let Some(key) = self.webhook_keys.lock().unwrap().get_mut(key_id) {
+            let back = |when: std::time::Instant| {
+                when.checked_sub(by)
+                    .expect("a monotonic clock that far back")
+            };
+            key.fetched = back(key.fetched);
+            key.asked = back(key.asked);
+        }
+    }
+
+    async fn fetch_key(&self, key_id: &str) -> Result<Vec<u8>, PlaidError> {
+        let got: VerificationKeyGot = self
+            .client
+            .call("/webhook_verification_key/get", json!({ "key_id": key_id }))
+            .await?;
+        let key = got.key;
+        let unusable = |what: &str| PlaidError::Unexpected(format!("webhook key {key_id}: {what}"));
+        if key.kid != key_id {
+            return Err(unusable("another key than the one asked for"));
+        }
+        if key.alg != "ES256" || key.crv != "P-256" || key.kty != "EC" {
+            return Err(unusable("not an ES256 P-256 key"));
+        }
+        if key.expired_at.is_some() {
+            return Err(unusable("set to expire"));
+        }
+        use base64::Engine as _;
+        let decode = |part: &str| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(part)
+                .ok()
+                .filter(|bytes| bytes.len() == 32)
+        };
+        let (Some(x), Some(y)) = (decode(&key.x), decode(&key.y)) else {
+            return Err(unusable("a point that does not read"));
+        };
+        let mut point = Vec::with_capacity(65);
+        point.push(0x04);
+        point.extend_from_slice(&x);
+        point.extend_from_slice(&y);
+        Ok(point)
+    }
+
+    /// Mark bank `item_id` as having a webhook sync queued, or `None` when one
+    /// is queued or running already. The mark goes with the guard, a task
+    /// aborted at a stop included.
+    pub(crate) fn queue_webhook_sync(self: &Arc<Self>, item_id: &str) -> Option<QueuedSync> {
+        let Ok(mut queued) = self.webhook_syncs.lock() else {
+            return None;
+        };
+        if let Some(again) = queued.get_mut(item_id) {
+            *again = true;
+            return None;
+        }
+        queued.insert(item_id.to_owned(), false);
+        Some(QueuedSync {
+            service: Arc::clone(self),
+            item_id: item_id.to_owned(),
+            ended: false,
+        })
+    }
+
+    /// Keep consent notice `code` on bank `item_id`, with its time.
+    pub(crate) async fn note_notice(&self, item_id: &str, code: &str) {
+        let code: String = code.chars().take(64).collect();
+        self.change_info(item_id, |connection| {
+            connection.last_notice = Some(code);
+            connection.last_notice_at = Some(chrono::Utc::now().to_rfc3339());
+        })
+        .await;
+    }
+
+    /// Clear bank `item_id`'s consent notice (its login works again).
+    pub(crate) async fn clear_notice(&self, item_id: &str) {
+        self.change_info(item_id, |connection| {
+            connection.last_notice = None;
+            connection.last_notice_at = None;
+        })
+        .await;
+    }
+
+    /// Change bank `item_id`'s stored description, best effort, as
+    /// [`Self::note_health`] does: nothing for a bank gone or a ledger closing.
+    async fn change_info(&self, item_id: &str, change: impl FnOnce(&mut BankConnection)) {
+        let closed = self.closed.read().await;
+        if *closed {
+            return;
+        }
+        self.change_info_open(item_id, change).await;
+    }
+
+    /// [`Self::change_info`] for a caller that holds the `closed` gate open
+    /// already: a second read of it would wait behind a stop waiting for the
+    /// first, and neither would end.
+    async fn change_info_open(&self, item_id: &str, change: impl FnOnce(&mut BankConnection)) {
+        let mut store = self.store.lock().await;
+        let described = match store.get(&info_name(item_id)) {
+            Ok(Some(text)) => serde_json::from_str::<BankConnection>(text.expose()).ok(),
+            _ => None,
+        };
+        let Some(mut connection) = described else {
+            return;
+        };
+        change(&mut connection);
+        let stored = serde_json::to_string(&connection)
+            .map_err(|error| PlaidError::Unexpected(error.to_string()))
+            .and_then(|text| {
+                store
+                    .put(&info_name(item_id), &Secret::new(text))
+                    .map_err(PlaidError::from)
+            });
+        if let Err(error) = stored {
+            warn!(item_id = %item_id, %error, "a bank's description was not stored");
+        }
+    }
+
     /// Every connected bank, by item id. A description that cannot be read is
     /// logged and the bank listed bare, so one bad entry hides no other bank.
     pub(crate) async fn connections(&self) -> Result<Vec<BankConnection>, PlaidError> {
@@ -1660,6 +2216,11 @@ pub(crate) mod tests {
         pub next_item: Arc<Mutex<Option<String>>>,
         /// The accounts `/accounts/get` answers with, instead of the two.
         pub accounts: Arc<Mutex<Option<Value>>>,
+        /// The JWK `/webhook_verification_key/get` answers with; none, a refusal.
+        pub webhook_key: Arc<Mutex<Option<Value>>>,
+        /// Answer with `webhook_key` whatever key id was asked for (a Plaid
+        /// that sends the wrong key).
+        pub webhook_key_any_id: Arc<Mutex<bool>>,
     }
 
     impl MockPlaid {
@@ -1732,6 +2293,27 @@ pub(crate) mod tests {
                 }
                 let mut failure = mock.fail.lock().unwrap().get(path).cloned();
                 let mut page = None;
+                if path == "/webhook_verification_key/get" && failure.is_none() {
+                    let asked = mock
+                        .body_of("/webhook_verification_key/get")
+                        .and_then(|body| body["key_id"].as_str().map(str::to_owned));
+                    let key = mock.webhook_key.lock().unwrap().clone().filter(|key| {
+                        *mock.webhook_key_any_id.lock().unwrap()
+                            || key["kid"].as_str() == asked.as_deref()
+                    });
+                    return match key {
+                        Some(key) => (
+                            StatusCode::OK,
+                            Json(json!({ "key": key, "request_id": "req-11" })),
+                        ),
+                        None => (
+                            StatusCode::BAD_REQUEST,
+                            Json(
+                                json!({ "error_type": "INVALID_INPUT", "error_code": "INVALID_FIELD", "request_id": "req-mock" }),
+                            ),
+                        ),
+                    };
+                }
                 if path == "/transactions/sync" {
                     match mock.sync.lock().unwrap().pop_front() {
                         Some(Ok(next)) => page = Some(next),
@@ -1808,6 +2390,9 @@ pub(crate) mod tests {
                 "/transactions/sync",
                 "/sandbox/public_token/create",
                 "/sandbox/item/reset_login",
+                "/item/webhook/update",
+                "/sandbox/item/fire_webhook",
+                "/webhook_verification_key/get",
             ] {
                 app = app.route(path, post(answer).with_state((self.clone(), path)));
             }
@@ -1838,7 +2423,7 @@ pub(crate) mod tests {
         }
     }
 
-    async fn service(
+    pub(crate) async fn service(
         mock: &MockPlaid,
         folder: &std::path::Path,
         env: &PlaidEnv,
@@ -1846,7 +2431,7 @@ pub(crate) mod tests {
         service_in(mock, folder, env, enabled()).await
     }
 
-    async fn service_in(
+    pub(crate) async fn service_in(
         mock: &MockPlaid,
         folder: &std::path::Path,
         env: &PlaidEnv,
@@ -1858,7 +2443,7 @@ pub(crate) mod tests {
         )
     }
 
-    fn connect_token() -> String {
+    pub(crate) fn connect_token() -> String {
         "public-sandbox-xyz".to_owned()
     }
 
@@ -2818,5 +3403,121 @@ pub(crate) mod tests {
         assert!(matches!(error, PlaidError::NoSuchBank(_)), "{error}");
         assert_eq!(connected_item_count(dir.path()).unwrap(), 0);
         assert!(plaid.connections().await.unwrap().is_empty());
+    }
+
+    /// With `plaid.webhookUrl`, new link tokens carry it and
+    /// `update_webhooks` gives it to every bank already connected; without
+    /// it, the update is refused and nothing sent.
+    ///
+    /// Bug-catch: a link token without the address leaves new banks without
+    /// webhooks; banks connected earlier keep none until told.
+    #[tokio::test]
+    async fn the_webhook_address_reaches_every_bank() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = MockPlaid::default();
+        let env = env();
+        let plaid = service(&mock, dir.path(), &env).await;
+        plaid.connect(connect_token()).await.unwrap();
+        let error = plaid.update_webhooks().await.unwrap_err();
+        assert!(matches!(error, PlaidError::NoWebhookUrl), "{error}");
+        assert!(mock.body_of("/item/webhook/update").is_none());
+        plaid.close().await;
+        drop(plaid);
+
+        let url = "https://ledger.example.com/ledgers/acme/plaid/webhook";
+        let with_url = PlaidConfig {
+            webhook_url: Some(url.to_owned()),
+            ..enabled()
+        };
+        let plaid = service_in(&mock, dir.path(), &env, with_url).await;
+        plaid.create_link_token("operator", None).await.unwrap();
+        assert_eq!(mock.body_of("/link/token/create").unwrap()["webhook"], url);
+        assert_eq!(plaid.update_webhooks().await.unwrap(), 1);
+        let update = mock.body_of("/item/webhook/update").unwrap();
+        assert_eq!(update["webhook"], url);
+        assert_eq!(update["access_token"], ACCESS_TOKEN);
+    }
+
+    /// The sandbox can be asked to send a webhook; never elsewhere.
+    ///
+    /// Bug-catch: a demo helper reaching production asks the real Plaid to
+    /// fire webhooks at a customer's bank.
+    #[tokio::test]
+    async fn a_sandbox_webhook_can_be_fired() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = MockPlaid::default();
+        let env = env();
+        let plaid = service(&mock, dir.path(), &env).await;
+        plaid.connect(connect_token()).await.unwrap();
+        plaid
+            .fire_sandbox_webhook(ITEM_ID, "SYNC_UPDATES_AVAILABLE")
+            .await
+            .unwrap();
+        let fired = mock.body_of("/sandbox/item/fire_webhook").unwrap();
+        assert_eq!(fired["webhook_code"], "SYNC_UPDATES_AVAILABLE");
+        assert_eq!(fired["access_token"], ACCESS_TOKEN);
+
+        let production = PlaidConfig {
+            environment: PlaidEnvironment::Production,
+            ..enabled()
+        };
+        let calls = mock.paths().len();
+        plaid.close().await;
+        drop(plaid);
+        let plaid = service_in(&mock, dir.path(), &env, production).await;
+        let error = plaid
+            .fire_sandbox_webhook(ITEM_ID, "SYNC_UPDATES_AVAILABLE")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PlaidError::SandboxOnly), "{error}");
+        assert_eq!(mock.paths().len(), calls);
+    }
+
+    /// One webhook sync of a bank queued at a time; the next may queue once
+    /// it ends.
+    ///
+    /// Bug-catch: every webhook queuing its own sync piles up tasks, each
+    /// waiting 30 s at a time behind the one running.
+    #[tokio::test]
+    async fn one_webhook_sync_of_a_bank_queued_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = MockPlaid::default();
+        let plaid = service(&mock, dir.path(), &env()).await;
+        let queued = plaid.queue_webhook_sync(ITEM_ID).expect("free");
+        assert!(plaid.queue_webhook_sync(ITEM_ID).is_none());
+        assert!(plaid.queue_webhook_sync("another").is_some());
+        drop(queued);
+        assert!(plaid.queue_webhook_sync(ITEM_ID).is_some());
+    }
+
+    /// A webhook that comes while a bank's webhook sync runs has it go once
+    /// more, once however many came; when it is done, the next webhook
+    /// queues a sync of its own, and the ended guard leaves that one's mark.
+    ///
+    /// Bug-catch: a webhook during a sync dropped leaves what Plaid has since
+    /// at Plaid until the next webhook, maybe days; an ended guard dropping
+    /// the next sync's mark lets a third sync queue beside it.
+    #[tokio::test]
+    async fn a_webhook_during_a_sync_has_it_go_once_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = MockPlaid::default();
+        let plaid = service(&mock, dir.path(), &env()).await;
+        let mut queued = plaid.queue_webhook_sync(ITEM_ID).expect("free");
+        assert!(!queued.go_again(), "nothing came: done");
+        let mut queued = plaid.queue_webhook_sync(ITEM_ID).expect("free again");
+        assert!(plaid.queue_webhook_sync(ITEM_ID).is_none());
+        assert!(plaid.queue_webhook_sync(ITEM_ID).is_none());
+        assert!(queued.go_again(), "two came: once more");
+        assert!(!queued.go_again(), "and once only");
+
+        let next = plaid
+            .queue_webhook_sync(ITEM_ID)
+            .expect("a sync of its own");
+        drop(queued);
+        assert!(
+            plaid.queue_webhook_sync(ITEM_ID).is_none(),
+            "the next sync's mark is kept"
+        );
+        drop(next);
     }
 }

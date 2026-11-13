@@ -20,6 +20,7 @@ mod p2p_service;
 mod peer_addresses;
 mod peer_connections;
 mod plaid;
+mod plaid_webhook;
 mod rate_limit;
 mod request_guard;
 mod secret_store;
@@ -786,6 +787,27 @@ pub(crate) fn build_application_with_limiter(
             )),
         None => Router::new(),
     };
+    // 007 step 6d: Plaid's webhooks. No API key — Plaid has none; each call
+    // proves itself with Plaid's signature (`plaid_webhook`) — behind the guard
+    // and a budget of their own, like `/health`.
+    let webhook_routes = Router::new()
+        .route("/plaid/webhook", post(ledgers::default_plaid_webhook))
+        .route(
+            "/ledgers/{name}/plaid/webhook",
+            post(ledgers::named_plaid_webhook),
+        )
+        .with_state(ledgers.clone())
+        .layer(middleware::from_fn_with_state(
+            health_limiter.sibling(
+                rate_limit::HEALTH_RATE_LIMIT,
+                rate_limit::HEALTH_RATE_WINDOW,
+            ),
+            rate_limit::rate_limit,
+        ))
+        .layer(middleware::from_fn_with_state(
+            guard_state.clone(),
+            request_guard::request_guard,
+        ));
     let health_routes = Router::new()
         .route("/health", get(ledgers::default_health))
         .route("/ledgers/{name}/health", get(ledgers::named_health))
@@ -801,6 +823,7 @@ pub(crate) fn build_application_with_limiter(
 
     Router::new()
         .merge(health_routes)
+        .merge(webhook_routes)
         .merge(graphql_routes)
         .merge(node_routes)
         .layer(RequestBodyLimitLayer::new(GRAPHQL_MAX_BODY_BYTES))

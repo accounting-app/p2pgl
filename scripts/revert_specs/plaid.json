@@ -428,8 +428,8 @@
   },
   "PL-R63-a-held-bank-stored-over": {
     "file": "crates/gl-node/src/plaid.rs",
-    "old": "if let Some(held) = self.held_connection(&item_id).await? {",
-    "new": "if let Some(held) = None::<BankConnection> {",
+    "old": "if let Some(mut held) = self.held_connection(&item_id).await? {",
+    "new": "if let Some(mut held) = None::<BankConnection> {",
     "runs": [["-p", "gl-node", "--bin", "gl-node", "connecting_a_held_bank_again_changes_nothing"]]
   },
   "PL-R64-update-mode-past-the-close": {
@@ -521,5 +521,254 @@
     "old": "    async fn reset_sandbox_login(&self, ctx: &Context<'_>, item_id: String) -> Result<bool> {",
     "new": "    async fn reset_sandbox_login_now(&self, ctx: &Context<'_>, item_id: String) -> Result<bool> {",
     "runs": [["-p", "gl-node", "--bin", "gl-node", "a_sandbox_demo_runs_end_to_end"]]
+  },
+  "PL-R79-webhook-any-algorithm": {
+    "file": "crates/gl-node/src/plaid_webhook.rs",
+    "old": "if parsed.alg != \"ES256\" {",
+    "new": "if false {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "anything_but_plaids_signature_is_refused"]]
+  },
+  "PL-R80-webhook-signature-unchecked": {
+    "file": "crates/gl-node/src/plaid_webhook.rs",
+    "old": "        .map_err(|_| Unverified::Signature)?;\n",
+    "new": "        .ok();\n",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "anything_but_plaids_signature_is_refused"]]
+  },
+  "PL-R81-webhook-any-age": {
+    "file": "crates/gl-node/src/plaid_webhook.rs",
+    "old": "if (now - claims.iat).abs() > MAX_AGE_SECONDS {",
+    "new": "if false {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "anything_but_plaids_signature_is_refused"]]
+  },
+  "PL-R82-webhook-body-unchecked": {
+    "file": "crates/gl-node/src/plaid_webhook.rs",
+    "old": "    if !bool::from(\n",
+    "new": "    if false && !bool::from(\n",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "anything_but_plaids_signature_is_refused"]]
+  },
+  "PL-R83-webhook-expired-key-used": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "if key.expired_at.is_some() {",
+    "new": "if false {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "anything_but_plaids_signature_is_refused"]]
+  },
+  "PL-R84-webhook-acted-on-unverified": {
+    "file": "crates/gl-node/src/plaid_webhook.rs",
+    "old": "        warn!(?why, \"a Plaid webhook that is not Plaid's was refused\");\n        return StatusCode::UNAUTHORIZED.into_response();\n",
+    "new": "        warn!(?why, \"a Plaid webhook that is not Plaid's was refused\");\n",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "an_unverified_webhook_does_nothing"]]
+  },
+  "PL-R85-webhook-starts-no-sync": {
+    "file": "crates/gl-node/src/plaid_webhook.rs",
+    "old": "(\"TRANSACTIONS\", \"SYNC_UPDATES_AVAILABLE\") => Action::Sync,",
+    "new": "(\"TRANSACTIONS\", \"SYNC_UPDATES_AVAILABLE\") => Action::Nothing,",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_webhook_syncs_the_bank_on_its_own"], ["-p", "gl-node", "--bin", "gl-node", "each_webhook_maps_to_its_action"]]
+  },
+  "PL-R86-webhook-error-not-kept": {
+    "file": "crates/gl-node/src/plaid_webhook.rs",
+    "old": "Action::Note(code) => plaid.note_health(&item_id, Some(&code)).await,",
+    "new": "Action::Note(_) => {}",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "an_error_webhook_marks_the_bank"]]
+  },
+  "PL-R87-webhook-route-missing": {
+    "file": "crates/gl-node/src/main.rs",
+    "old": "            \"/ledgers/{name}/plaid/webhook\",\n",
+    "new": "            \"/ledgers/{name}/plaid/webhook-off\",\n",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "the_plaid_webhook_route_takes_plaids_signature_not_a_key"]]
+  },
+  "PL-R88-link-token-without-the-webhook": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "            body[\"webhook\"] = json!(url);\n",
+    "new": "            let _ = url;\n",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "the_webhook_address_reaches_every_bank"]]
+  },
+  "PL-R89-webhook-url-not-https": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "let fine = url.starts_with(\"https://\")",
+    "new": "let fine = !url.is_empty()",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_ledgers_plaid_section_is_checked"]]
+  },
+  "PL-R90-webhook-sync-as-a-person": {
+    "file": "crates/gl-node/src/plaid_webhook.rs",
+    "old": "            .data(Caller::operator());",
+    "new": "            .data(Caller { who: crate::access_control::CallerId::User(\"u_0000000000000001\".to_owned()), role: crate::access_control::Role::Admin });",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_webhook_syncs_the_bank_on_its_own"]]
+  },
+  "PL-R91-update-webhooks-not-admin-only": {
+    "file": "crates/gl-node/src/access_control.rs",
+    "old": "    \"updateBankWebhooks\",\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "plaid_mutations_need_an_admin_key"]]
+  },
+  "PL-R92-fire-webhook-not-admin-only": {
+    "file": "crates/gl-node/src/access_control.rs",
+    "old": "    \"fireSandboxWebhook\",\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "plaid_mutations_need_an_admin_key"]]
+  },
+  "PL-R93-fire-webhook-on-production": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "            return Err(PlaidError::SandboxOnly);\n        }\n        check_id(\"webhook_code\", webhook_code)?;",
+    "new": "        }\n        check_id(\"webhook_code\", webhook_code)?;",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_sandbox_webhook_can_be_fired"]]
+  },
+  "PL-R94-key-of-another-id-taken": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "        if key.kid != key_id {",
+    "new": "        if false {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "anything_but_plaids_signature_is_refused"]]
+  },
+  "PL-R95-refused-key-asked-again": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "                            refused.insert(key_id.clone(), std::time::Instant::now());\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "made_up_key_ids_cost_little"]]
+  },
+  "PL-R96-key-fetches-unbounded-for-a-client": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "|| mine.1 >= MAX_KEY_FETCHES_A_CLIENT_A_MINUTE {",
+    "new": "|| false {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "made_up_key_ids_cost_little"]]
+  },
+  "PL-R97-webhook-route-tells-names": {
+    "file": "crates/gl-node/src/ledgers.rs",
+    "old": "            return StatusCode::UNAUTHORIZED.into_response();\n        };\n        crate::plaid_webhook::handle",
+    "new": "            return StatusCode::NOT_FOUND.into_response();\n        };\n        crate::plaid_webhook::handle",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "the_plaid_webhook_route_takes_plaids_signature_not_a_key"]]
+  },
+  "PL-R98-webhook-work-outside-the-ledger": {
+    "file": "crates/gl-node/src/plaid_webhook.rs",
+    "old": "    crate::ledger_runtime::track(&tasks, task.abort_handle());\n",
+    "new": "    let _ = (&tasks, task);\n",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_consent_notice_outlives_a_sync"]]
+  },
+  "PL-R99-webhook-syncs-pile-up": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "            *again = true;\n            return None;\n",
+    "new": "            *again = true;\n",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "one_webhook_sync_of_a_bank_queued_at_a_time"]]
+  },
+  "PL-R100-notice-kept-as-the-error": {
+    "file": "crates/gl-node/src/plaid_webhook.rs",
+    "old": "Action::Notice(code) => plaid.note_notice(&item_id, &code).await,",
+    "new": "Action::Notice(code) => plaid.note_health(&item_id, Some(&code)).await,",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_consent_notice_outlives_a_sync"]]
+  },
+  "PL-R101-repaired-login-keeps-the-notice": {
+    "file": "crates/gl-node/src/plaid_webhook.rs",
+    "old": "        plaid.clear_notice(&item_id).await;\n",
+    "new": "",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "a_consent_notice_outlives_a_sync"],
+      ["-p", "gl-node", "--bin", "gl-node", "a_repaired_login_clears_the_notice_with_a_sync_queued"]
+    ]
+  },
+  "PL-R102-old-update-codes-sync-again": {
+    "file": "crates/gl-node/src/plaid_webhook.rs",
+    "old": "(\"TRANSACTIONS\", \"SYNC_UPDATES_AVAILABLE\") => Action::Sync,",
+    "new": "(\"TRANSACTIONS\", \"SYNC_UPDATES_AVAILABLE\" | \"DEFAULT_UPDATE\") => Action::Sync,",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "each_webhook_maps_to_its_action"]]
+  },
+  "PL-R103-webhook-body-uncapped": {
+    "file": "crates/gl-node/src/ledgers.rs",
+    "old": "axum::body::to_bytes(body, crate::plaid_webhook::MAX_WEBHOOK_BYTES)",
+    "new": "axum::body::to_bytes(body, usize::MAX)",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "the_plaid_webhook_route_takes_plaids_signature_not_a_key"]]
+  },
+  "PL-R104-key-fetches-unbounded-in-all": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "if all.1 >= MAX_KEY_FETCHES_A_MINUTE ||",
+    "new": "if false ||",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "made_up_key_ids_cost_little"]]
+  },
+  "PL-R105-a-passing-key-failure-remembered": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "Err(error) if error.is_definite_refusal() => {",
+    "new": "Err(error) if true || error.is_definite_refusal() => {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_passing_key_failure_is_not_remembered"]]
+  },
+  "PL-R106-the-key-fetched-while-the-caller-waits": {
+    "file": "crates/gl-node/src/plaid_webhook.rs",
+    "old": "        KeyLookup::Pending => return Err(Unverified::KeyPending),\n",
+    "new": "        KeyLookup::Pending => loop {\n            tokio::time::sleep(std::time::Duration::from_millis(10)).await;\n            match plaid.verification_key(&parsed.kid, client) {\n                KeyLookup::Found(key) => break key,\n                KeyLookup::Pending => continue,\n                KeyLookup::Refused => return Err(Unverified::Key(parsed.kid)),\n            }\n        },\n",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "a_body_plaid_signed_is_verified"],
+      ["-p", "gl-node", "--bin", "gl-node", "the_plaid_webhook_route_takes_plaids_signature_not_a_key"]
+    ]
+  },
+  "PL-R107-a-webhook-during-a-sync-dropped": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "            Some(again) if *again => {",
+    "new": "            Some(again) if false && *again => {",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "a_webhook_during_a_sync_has_it_go_once_more"],
+      ["-p", "gl-node", "--bin", "gl-node", "a_repaired_login_clears_the_notice_with_a_sync_queued"]
+    ]
+  },
+  "PL-R108-an-ended-guard-drops-the-next-mark": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "        if self.ended {\n            return;\n        }\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_webhook_during_a_sync_has_it_go_once_more"]]
+  },
+  "PL-R109-a-login-done-again-keeps-the-notice": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "                self.change_info_open(&item_id, |connection| {\n                    connection.last_notice = None;\n                    connection.last_notice_at = None;\n                })\n                .await;\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_login_done_again_clears_the_notice"]]
+  },
+  "PL-R110-key-budget-for-each-ipv6-address": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "        let client = crate::rate_limit::bucket_key(client);\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "made_up_key_ids_cost_little"]]
+  },
+  "PL-R111-a-stray-webhook-tells-plaid-is-on": {
+    "file": "crates/gl-node/src/plaid_webhook.rs",
+    "old": "does not hold was refused\");\n        return StatusCode::UNAUTHORIZED.into_response();",
+    "new": "does not hold was refused\");\n        return StatusCode::OK.into_response();",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "the_plaid_webhook_route_takes_plaids_signature_not_a_key"]]
+  },
+  "PL-R112-a-cached-key-never-asked-again": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "if key.fetched.elapsed() < KEY_FRESH_FOR {",
+    "new": "if true || key.fetched.elapsed() < KEY_FRESH_FOR {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_cached_key_is_asked_about_again"]]
+  },
+  "PL-R113-a-key-plaid-refuses-kept": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "                        if let Ok(mut keys) = service.webhook_keys.lock() {\n                            keys.remove(&key_id);\n                        }\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_cached_key_is_asked_about_again"]]
+  },
+  "PL-R114-a-stopped-ledger-fetches-keys": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "                let fetched = if *service.closed.read().await {",
+    "new": "                let fetched = if false && *service.closed.read().await {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_stopped_ledger_fetches_no_key"]]
+  },
+  "PL-R115-a-webhook-about-no-bank-tells-plaid-is-on": {
+    "file": "crates/gl-node/src/plaid_webhook.rs",
+    "old": "\"a Plaid webhook about no bank was refused\");\n        return StatusCode::UNAUTHORIZED.into_response();",
+    "new": "\"a Plaid webhook about no bank was refused\");\n        return StatusCode::OK.into_response();",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "the_plaid_webhook_route_takes_plaids_signature_not_a_key"]]
+  },
+  "PL-R116-a-stale-key-asked-from-the-budgets": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "                if ask_again {\n                    self.start_key_fetch(key_id);",
+    "new": "                if ask_again && self.spend_key_fetch(client) {\n                    self.start_key_fetch(key_id);",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_stale_key_is_asked_about_whatever_was_spent"]]
+  },
+  "PL-R117-a-stale-key-asked-at-every-call": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "let ask_again = key.asked.elapsed() >= Duration::from_secs(60);",
+    "new": "let ask_again = true || key.asked.elapsed() >= Duration::from_secs(60);",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_stale_key_is_asked_about_whatever_was_spent"]]
+  },
+  "PL-R118-an-unconfirmed-key-trusted-forever": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "let usable = key.fetched.elapsed() < KEY_TRUSTED_UNCONFIRMED;",
+    "new": "let usable = true || key.fetched.elapsed() < KEY_TRUSTED_UNCONFIRMED;",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_stale_key_is_asked_about_whatever_was_spent"]]
   }
 }

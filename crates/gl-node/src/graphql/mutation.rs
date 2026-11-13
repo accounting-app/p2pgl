@@ -319,6 +319,28 @@ impl MutationRoot {
         super::plaid::connect_sandbox_bank(ctx, institution_id).await
     }
 
+    /// Tell Plaid where to send webhooks (`plaid.webhookUrl`) for every bank
+    /// this ledger holds: those connected before it was set or since it
+    /// changed (007 step 6d). New banks get it through their link token. The
+    /// number of banks updated. Admin only.
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
+    async fn update_bank_webhooks(&self, ctx: &Context<'_>) -> Result<i32> {
+        super::plaid::update_bank_webhooks(ctx).await
+    }
+
+    /// Have Plaid's sandbox send a bank a webhook (007 step 6d), by default
+    /// `SYNC_UPDATES_AVAILABLE`, which starts a sync of it. Sandbox only.
+    /// Admin only.
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
+    async fn fire_sandbox_webhook(
+        &self,
+        ctx: &Context<'_>,
+        item_id: String,
+        #[graphql(default = "SYNC_UPDATES_AVAILABLE")] webhook_code: String,
+    ) -> Result<bool> {
+        super::plaid::fire_sandbox_webhook(ctx, item_id, webhook_code).await
+    }
+
     /// Make a sandbox bank need a new login (`ITEM_LOGIN_REQUIRED` at its
     /// next sync), to show logging in again (007 step 6c). Sandbox only.
     /// Admin only.

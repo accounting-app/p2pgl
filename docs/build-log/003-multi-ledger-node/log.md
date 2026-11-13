@@ -50,7 +50,7 @@ to commit. The commit hash is filled in once the maintainer has committed.
   comment fixes (6 min 37 s; rerun 2026-10-15, 6 min 26 s).
 - **Departures from the plan:** `LedgerConfig` is built from `NodeConfig`
   rather than parsed; step 2 parses it from `ledger.json`.
-- **Commit:** 5369a8a
+- **Commit:** 2218456
 
 ## 2026-10-15 — Step 2: ledgers from `ledgersDir`, routed by path
 
@@ -120,7 +120,7 @@ to commit. The commit hash is filled in once the maintainer has committed.
 - **Departures from the plan:** `/health` stays the `default` ledger's, a
   named ledger's `/health` needs its key, GraphiQL is `default`'s only, and
   the node summary moves to step 4 (plan.md updated).
-- **Commit:** 958255c
+- **Commit:** c7dd4dc
 
 ## 2026-10-15 — Step 3: fairness and scale
 
@@ -202,7 +202,7 @@ to commit. The commit hash is filled in once the maintainer has committed.
   test can make a boot panic without a fault-injection hook.
 - **Departures from the plan:** parallel boot is new (the plan had parallel
   stop only): sequential boot measured 17 s for 30 busy ledgers.
-- **Commit:** 156733d
+- **Commit:** 8b5b46c
 
 ## 2026-10-16 — Step 4: add, remove and restart ledgers at runtime
 
@@ -280,7 +280,7 @@ to commit. The commit hash is filled in once the maintainer has committed.
   `restartLedger`, the key made for a signing-only ledger, a failed add moved
   aside, `default` fixed, the removal's wait, the full stop and the detached
   writes.
-- **Commit:** df4cfb5
+- **Commit:** f103452
 
 ## 2026-10-16 — Step 5: packaging
 

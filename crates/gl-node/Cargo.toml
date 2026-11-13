@@ -50,6 +50,9 @@ aes-gcm = { version = "0.10", default-features = false, features = ["aes", "allo
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "1"
+# Plaid's webhook signatures (ES256, build-log 007 step 6d): already compiled in
+# through rustls, with these features.
+ring = { version = "0.17", default-features = false, features = ["alloc", "std"] }
 
 
 [dev-dependencies]

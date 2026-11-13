@@ -38,7 +38,7 @@ own root-only file, left out of backups; the importing node chosen by
    refused then, and temp files a crashed write left are deleted there. Writes
    refuse a file larger than `open` reads. A `Secret` type whose
    `Debug`/`Display` print `[redacted]`, so a token cannot reach a log by
-   formatting. Done (c24b376).
+   formatting. Done (e331ebd).
 4. **MFA** is the client app's, at login (decision 2); nothing in the node.
 5. **Plaid connect and disconnect (node).** `plaid.enabled` (one node per
    company; others refuse with `PLAID_NOT_ENABLED`), `plaid.environment`
@@ -99,6 +99,25 @@ own root-only file, left out of backups; the importing node chosen by
    `connectSandboxBank(institutionId)` (`/sandbox/public_token/create`, then
    the usual connect) and `resetSandboxLogin(itemId)`
    (`/sandbox/item/reset_login`). All admin only.
+6d. **Webhooks** (decision 12). `POST /ledgers/<name>/plaid/webhook` (and
+   `/plaid/webhook`), no API key, behind the Host guard and a rate limit,
+   body capped at 64 KiB, 401 alike for every name not served with Plaid
+   and for a signed webhook about a bank the ledger does not hold;
+   `plaid_webhook::verify` checks Plaid's ES256 JWT (key by id from
+   `/webhook_verification_key/get`, fetched in the background — never while
+   the call waits — at most ten a minute for one address (an IPv6 /64) and
+   sixty in all, cached and asked about again hourly, its id and expiry
+   checked; five minutes; the body's SHA-256) before anything is done. Then,
+   for a bank the ledger holds, as one of the ledger's tasks: a sync
+   (through the ledger's schema as the operator) for new transactions or a
+   repaired login, one queued at a time, going once more for a webhook that
+   came meanwhile; `lastErrorCode` for an error; `lastNotice` for an
+   expiring consent, cleared by a repaired login or an update-mode
+   `connectBank`; an accounts refresh for new accounts.
+   `plaid.webhookUrl` (https only) in new link tokens;
+   `updateBankWebhooks` (`/item/webhook/update`); sandbox
+   `fireSandboxWebhook` (`/sandbox/item/fire_webhook`). `ring` (already in
+   the build) verifies.
 7. **Operations checklist** (no code; the maintainer, dated records in a
    private folder): MFA on GitHub, hosting, registrar, email and the Plaid
    Dashboard; disk encryption on servers and workstations; first quarterly

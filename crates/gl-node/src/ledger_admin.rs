@@ -1481,6 +1481,119 @@ mod tests {
         assert_eq!(plaid.connections().await.unwrap().len(), 1);
     }
 
+    /// 007 step 6d: `/ledgers/<name>/plaid/webhook` takes no API key and is
+    /// answered by Plaid's signature alone: a signed call about a bank the
+    /// ledger holds is taken (200), an unsigned one refused (401); a signed
+    /// call about a bank it does not hold, a ledger without Plaid and a name
+    /// not served answer 401 too, and a body past the cap is not read (413)
+    /// for any name alike.
+    ///
+    /// Bug-catch: putting the route behind the API key refuses every webhook
+    /// (Plaid has no key); leaving it off the router answers them all 404; a
+    /// 404 for a name not served, or a 200 for a webhook Plaid sent someone
+    /// else, tells strangers which companies the node serves with Plaid.
+    #[tokio::test]
+    async fn the_plaid_webhook_route_takes_plaids_signature_not_a_key() {
+        let mock = crate::plaid::tests::MockPlaid::default();
+        let signer = crate::plaid_webhook::tests::Signer::new("k1");
+        *mock.webhook_key.lock().unwrap() = Some(signer.jwk(None));
+        let env = crate::plaid::PlaidEnv {
+            base_url: Some(mock.serve().await),
+            ..crate::plaid::tests::env()
+        };
+        let node = node_with(Arc::new(env)).await;
+        let added = add(
+            &node.app,
+            "acme",
+            Some(r#"{ "plaid": { "enabled": true } }"#),
+        )
+        .await;
+        assert!(added["errors"].is_null(), "{added}");
+        let send = |path: &str, token: Option<String>, body: Vec<u8>| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("host", "127.0.0.1")
+                .header("content-type", "application/json");
+            if let Some(token) = token {
+                request = request.header("plaid-verification", token);
+            }
+            let request = request.body(Body::from(body)).expect("request");
+            let app = node.app.clone();
+            async move { app.oneshot(request).await.expect("response").status() }
+        };
+        let plaid = node.ledgers.plaid_of("acme").await.expect("Plaid on");
+        plaid
+            .connect("public-sandbox-xyz".to_owned())
+            .await
+            .expect("connected");
+        let signed = |item_id: &str| {
+            let body = format!(
+                r#"{{"webhook_type":"ITEM","webhook_code":"WEBHOOK_UPDATE_ACKNOWLEDGED","item_id":"{item_id}"}}"#
+            )
+            .into_bytes();
+            let token = signer.token(&body, chrono::Utc::now().timestamp());
+            (body, token)
+        };
+        let (body, token) = signed(crate::plaid::tests::ITEM_ID);
+
+        let path = "/ledgers/acme/plaid/webhook";
+        // The first delivery is refused at once while the key is fetched in
+        // the background; Plaid redelivers, and that one is taken.
+        assert_eq!(
+            send(path, Some(token.clone()), body.clone()).await,
+            StatusCode::UNAUTHORIZED
+        );
+        let mut taken = false;
+        for _ in 0..200 {
+            if send(path, Some(token.clone()), body.clone()).await == StatusCode::OK {
+                taken = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(taken, "the redelivery is taken once the key is fetched");
+        assert_eq!(
+            send(path, None, body.clone()).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // A webhook Plaid signed about a bank acme does not hold — one Plaid
+        // sent someone else, replayed — answers as an unverified call does.
+        let (stray, stray_token) = signed("other");
+        assert_eq!(
+            send(path, Some(stray_token), stray).await,
+            StatusCode::UNAUTHORIZED,
+            "a bank not held"
+        );
+        let about_no_bank =
+            br#"{"webhook_type":"TRANSFER","webhook_code":"TRANSFER_EVENTS_UPDATE"}"#.to_vec();
+        let no_bank_token = signer.token(&about_no_bank, chrono::Utc::now().timestamp());
+        assert_eq!(
+            send(path, Some(no_bank_token), about_no_bank).await,
+            StatusCode::UNAUTHORIZED,
+            "about no bank"
+        );
+        // A ledger without Plaid, and a name not served, answer as an
+        // unverified call does: nothing tells a stranger which exist.
+        for other in ["/plaid/webhook", "/ledgers/nobody/plaid/webhook"] {
+            assert_eq!(
+                send(other, Some(token.clone()), body.clone()).await,
+                StatusCode::UNAUTHORIZED,
+                "{other}"
+            );
+        }
+        let big = vec![b' '; crate::plaid_webhook::MAX_WEBHOOK_BYTES + 1];
+        assert_eq!(
+            send(path, None, big.clone()).await,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            send("/ledgers/nobody/plaid/webhook", None, big).await,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the cap is met before the name is looked up"
+        );
+    }
+
     /// 003 step 4: a removed ledger is stopped — its requests answer as a
     /// name not served, its books are whole in its `.bean` — and its folder
     /// is moved to `.removed/<name>-<UTC time>`; the next boot does not serve

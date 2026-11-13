@@ -38,7 +38,7 @@ to commit. The commit hash is filled in once the maintainer has committed.
   version and name checks. Noted for step 5 in `plan.md` Risks: one store
   instance per ledger.
 - **Departures from the plan:** the ledger binding above (`plan.md` updated).
-- **Commit:** c24b376
+- **Commit:** e331ebd
 
 ## 2026-11-13 — Plaid connect and disconnect, in the node (step 5)
 
@@ -106,7 +106,7 @@ to commit. The commit hash is filled in once the maintainer has committed.
   `no_response_carries_the_access_token` is best effort (tracing's global
   interest cache under parallel tests), the response half strict. `plan.md`
   updated.
-- **Commit:** 357e6be
+- **Commit:** baf7068
 
 ## 2026-11-13 — The store key on installed servers (step 5b)
 
@@ -145,7 +145,7 @@ to commit. The commit hash is filled in once the maintainer has committed.
   written anew.- **Gate:** `scripts/gate.sh --quick` — fmt, clippy, anchors, guard pass; no
   Rust changed since step 5's full gate (1679 passed, 0 failed, 0 ignored).
 - **Departures from the plan:** none.
-- **Commit:** 357e6be
+- **Commit:** baf7068
 
 ## 2026-11-13 — Importing bank transactions (step 6)
 
@@ -251,7 +251,7 @@ to commit. The commit hash is filled in once the maintainer has committed.
   correction is the accountant's call); the plan's two-node proof is not a
   test of its own — the entries are ordinary records, replicated as any.
   `plan.md` updated.
-- **Commit:** 315c3f6
+- **Commit:** 44c7d16
 
 ## 2026-11-13 — Logging in again to a connected bank (step 6b)
 
@@ -282,7 +282,7 @@ to commit. The commit hash is filled in once the maintainer has committed.
   the close check); the connect checks R2, R9, R16, R18, R22, R34 rerun
   after the change to `connect` — 6 of 6 bite.
 - **Departures from the plan:** none (step 6b added to `plan.md`).
-- **Commit:** e0bad7b
+- **Commit:** fe12038
 
 ## 2026-11-13 — Endpoints for a proof of concept (step 6c)
 
@@ -317,4 +317,109 @@ to commit. The commit hash is filled in once the maintainer has committed.
 - **Revert checks:** `scripts/revert_specs/plaid.json` PL-R65..R78 — 14 of 14
   bite; PL-R49 re-anchored (its line now also in `unmap_account`) — bites.
 - **Departures from the plan:** none (step 6c added to `plan.md`).
-- **Commit:** —
+- **Commit:** 866868e
+
+## 2026-11-13 — Plaid webhooks (step 6d)
+
+- **What changed:** decision 12. New module `crates/gl-node/src/plaid_webhook.rs`:
+  `verify` (the `Plaid-Verification` JWT: ES256 only, the key by its id from
+  `PlaidService::verification_key` — `/webhook_verification_key/get`, its
+  `kid`, `alg`, `crv`, `kty` and expiry checked, fetched in the background
+  and never while the call waits, cached and asked about again hourly — the
+  signature with `ring`, issued within five minutes either way, the body's
+  SHA-256 compared in constant time) and `handle` (verify first, 401
+  otherwise, and 401 for a webhook about no bank the ledger holds; then act
+  as one of the ledger's tasks and answer 200 at once: a `syncBank` through
+  the ledger's schema as the operator for `SYNC_UPDATES_AVAILABLE` and
+  `LOGIN_REPAIRED`, one queued a bank at a time, retried three times 30 s
+  apart when one already runs; `note_health` for `ERROR`; `note_notice`
+  (`lastNotice`, `lastNoticeAt`) for the consent codes; `refresh_accounts`
+  for `NEW_ACCOUNTS_AVAILABLE`; nothing for the older update codes). Routes
+  `POST /ledgers/{name}/plaid/webhook` and `/plaid/webhook`
+  (`Ledgers::plaid_webhook`: 401 for a name not served or without Plaid,
+  413 past 64 KiB for any name), behind the request guard and a rate limit
+  of their own, no API key. `plaid.webhookUrl` (https only, 2,000
+  characters) carried by new link tokens; `updateBankWebhooks`
+  (`/item/webhook/update` for each bank; `PLAID_NO_WEBHOOK_URL` while
+  unset); sandbox `fireSandboxWebhook` (`/sandbox/item/fire_webhook`). Both
+  admin only. An update-mode public token passed to `connectBank` clears
+  the notice. `ring` 0.17 a direct dependency (already compiled in through
+  rustls, these features). README *Webhooks*, *Logging in again* and the
+  config row; CHANGELOG *Security* and *Added*.
+- **Review:** the verification itself sound; four important findings, fixed.
+  (1) The webhook's work ran outside the ledger's tasks, so a restart could
+  leave the stopped ledger's sync appending beside the new one — it is now
+  one of the ledger's tasks (`RunningLedger::tasks`, `track`), which `stop`
+  aborts before compacting, and one webhook sync of a bank is queued at a
+  time (`queue_webhook_sync`). (2) 404 for a name not served or without
+  Plaid told strangers which companies the node serves — 401 for every name,
+  the body cap met before the lookup. (3) A made-up key id cost a Plaid call
+  each — key fetches are one at a time, ten a minute, a refused id remembered
+  five minutes. (4) Consent codes were kept as `lastErrorCode`, which the
+  next sync clears — kept as `lastNotice` / `lastNoticeAt`, cleared by
+  `LOGIN_REPAIRED`. Nits: a key with any `expired_at` refused (as Plaid's
+  samples); the older update codes ignored; a doc comment moved back; the
+  body cap pinned. Left: `update_webhooks` stops at the first Plaid refusal
+  without a count; no replay cache inside the five minutes (a replayed call
+  only repeats an idempotent action); the route's rate limit has no test of
+  its own.
+- **Second review:** five findings, fixed. (1) A consent notice was never
+  cleared by a login renewed in update mode (Plaid sends no webhook for it) —
+  the update-mode public token passed to `connectBank` clears it (README
+  *Logging in again* now says to pass it); it is cleared under the `closed`
+  gate connect already holds (`change_info_open`), as a second read of the
+  gate would wait behind a queued stop forever. (2) `LOGIN_REPAIRED` with a
+  sync already queued was dropped, notice and all — the notice is cleared
+  before the queue is asked. (3) One key-fetch budget for everyone let a
+  stranger's made-up key ids block real fetches — ten a minute for each
+  caller's address (`RateLimiter::client_of` on `Ledgers::strangers`), under
+  sixty in all. (4) A call for a key not cached waited on Plaid, so timing
+  told which companies have Plaid — `verification_key` answers at once
+  (`KeyLookup::Pending`, 401) and fetches in the background; Plaid's
+  redelivery is taken. Only Plaid's own refusal of a key id is remembered; a
+  timeout or a 5xx is asked again. (5) A webhook arriving while a bank's
+  sync ran was dropped, leaving what Plaid had since at Plaid — it marks the
+  sync to go once more (`QueuedSync::go_again`). Found while testing (5): the
+  ended guard's `Drop` removed the next sync's mark; it no longer does. Nit:
+  `DEFAULT_UPDATE` and the other older codes do nothing (as Plaid asks of
+  `/transactions/sync` clients). Left: the two-reads deadlock in (1) has no
+  test (it needs a stop queued between connect's two reads); PL-R109 pins
+  the clearing, not where it is done.
+- **Third review:** two important findings, fixed. (1) The per-client key
+  budget counted each IPv6 address apart, so one /64 rotating addresses could
+  spend the sixty — keyed with `rate_limit::bucket_key` (M-04b), the /64 one
+  client. (2) A webhook Plaid sent another customer, replayed, verified and
+  was answered 200 by any ledger with Plaid — so it told which names have
+  Plaid on (as L-R31 closed for names) — one about no bank the ledger holds,
+  or that does not read, is 401 now. Should-fix: a cached key was never
+  checked for expiry again — each key keeps its fetch time and is asked
+  about again after an hour, in the background, used meanwhile and dropped
+  once Plaid refuses it or sets it to expire; the dead second run of PL-R83
+  removed; this entry's *What changed* brought up to date. Nits: `client_of`
+  moved out of `sibling`'s doc comment; the passing-failure test waits for
+  the fetch (`key_fetch_under_way`) rather than starting another; a key
+  fetch of a stopped ledger asks Plaid nothing. Left: a caller with several
+  addresses can still spend the sixty a minute (README says so); a consent
+  notice redelivered after `LOGIN_REPAIRED` sets a notice already answered
+  (Plaid's order is not kept; the JWT's `iat` could order them later); a
+  cached key's signature check takes some tens of µs a ledger without Plaid
+  does not spend — not measurable across the internet under the route's
+  rate limit, and the README no longer says "as fast".
+- **Fourth review:** nothing important. Medium, fixed: a stale key's
+  re-check was paid from the callers' budgets, so made-up key ids spending
+  the sixty kept it from ever being asked, and a key Plaid rotated out was
+  trusted without end — a stale key is asked about outside both budgets, at
+  most once a minute (`CachedKey::asked`; only keys Plaid gave are cached),
+  and one not confirmed for a day (`KEY_TRUSTED_UNCONFIRMED`) is refused
+  until Plaid answers. Minor, fixed: the 401 for a signed body about no bank
+  had no test — the route test sends one (PL-R115). Nits: "ignored" comments
+  now say refused; long comment lines wrapped; the README says a key is
+  dropped on any refusal Plaid gives, not only an expiry.
+- **Gate:** `scripts/gate.sh` — passed (fmt, clippy, anchors, guard; 1733
+  tests passed, 0 failed).
+- **Revert checks:** `scripts/revert_specs/plaid.json` PL-R79..R118 and the
+  re-anchored PL-R63 — 41 of 41 bite (PL-R63, R83, R85, R95, R96, R99, R101
+  re-anchored through the reviews; PL-R83's dead second run removed; 385
+  anchors in 16 files, each once).
+- **Departures from the plan:** none (step 6d added to `plan.md`).
+- **Commit:** 65371da

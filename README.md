@@ -624,6 +624,7 @@ signing node without it refuses to boot, and the refusal names that remedy.
 | `plaid.environment` | `"sandbox"` | `"sandbox"` (Plaid's test banks) or `"production"`; never an address |
 | `plaid.clientName` | `"NewGL"` | The name Plaid Link shows, 1 to 30 characters |
 | `plaid.suspenseAccount` | `"Expenses:Uncategorized"` | The account on the other side of every imported bank transaction; must be open before a sync — see [Importing transactions](#importing-transactions) |
+| `plaid.webhookUrl` | unset | Where Plaid sends this ledger's webhooks: the public `https://` address of `/ledgers/<name>/plaid/webhook` on this node — see [Webhooks](#webhooks). Unset, banks are synced on demand only |
 | `http.headerReadTimeoutSeconds` | `30` | Time a client gets to send a complete request head; also bounds idle keep-alive. `1`–`300` |
 | `http.requestTimeoutSeconds` | `30` | Whole-request ceiling, body read and GraphQL execution included (`408` on expiry). `1`–`300` |
 | `http.maxConnections` | `1024` | Concurrently served connections; excess stays in the kernel backlog. `8`–`65536` |
@@ -1233,18 +1234,20 @@ not in the node:
 multi-factor step, Plaid answers a sync with `plaidCode: "ITEM_LOGIN_REQUIRED"`.
 Open Link with `createPlaidLinkToken(itemId: "…") { linkToken expiration }`:
 the person logs in again on the **same** connection (Plaid's update mode), and
-its ids and history carry on. Link's `onSuccess` still hands back a public
-token; there is no need to pass it to `connectBank` (passed anyway, it changes
-nothing: the bank is answered as stored, its mappings kept). Then sync as
-before. Disconnecting and
-connecting again instead makes a new connection, whose history would be
+its ids and history carry on. Pass the public token Link's `onSuccess` hands
+back to `connectBank` as for a new bank: it is answered as stored, its token,
+mappings and sync cursor kept, and its `lastNotice` cleared — Plaid sends no
+webhook for a connection renewed this way. Then sync as before. Disconnecting
+and connecting again instead makes a new connection, whose history would be
 imported a second time (*Importing transactions*). A bank this ledger does not
 hold is refused (`NO_SUCH_BANK`); its token must be of `plaid.environment`.
 
-**How each bank is doing.** `connectedBanks { lastSyncedAt lastErrorCode }`
-gives when a sync of the bank last finished and the Plaid code of the last
-sync Plaid refused — `ITEM_LOGIN_REQUIRED` means log in again — cleared by the
-next sync that finishes.
+**How each bank is doing.** `connectedBanks { lastSyncedAt lastErrorCode
+lastNotice lastNoticeAt }` gives when a sync of the bank last finished, the
+Plaid code of the last sync Plaid refused — `ITEM_LOGIN_REQUIRED` means log in
+again — cleared by the next sync that finishes, and Plaid's last consent
+notice from a webhook (`PENDING_EXPIRATION` and the like, *Webhooks*), which a
+sync leaves and a repaired login clears.
 
 **Accounts.** `refreshBankAccounts(itemId)` reads the bank's accounts from
 Plaid again: one opened since the bank was connected appears, unmapped, and
@@ -1254,7 +1257,8 @@ refused while the bank syncs (`SYNC_IN_PROGRESS`).
 
 All the Plaid mutations — `createPlaidLinkToken`, `connectBank`,
 `disconnectBank`, `mapBankAccount`, `unmapBankAccount`, `refreshBankAccounts`,
-`syncBank` and the sandbox helpers below — need an **admin** key. Refusals carry a code: `PLAID_NOT_ENABLED`,
+`syncBank`, `updateBankWebhooks` and the sandbox helpers below — need an
+**admin** key. Refusals carry a code: `PLAID_NOT_ENABLED`,
 `BANK_ALREADY_CONNECTED` (Link connected a bank this ledger holds already, the
 same institution and accounts: the new connection is removed at Plaid),
 `NO_SUCH_BANK`, `ACCOUNT_NOT_OPEN`, `SYNC_IN_PROGRESS` (one sync of a bank at
@@ -1364,7 +1368,58 @@ are ready: a sync before then imports nothing; sync again. `resetSandboxLogin(it
 need a new login, so the next sync shows `ITEM_LOGIN_REQUIRED` and
 `createPlaidLinkToken(itemId)` can be shown. Both are refused with
 `PLAID_SANDBOX_ONLY`, nothing sent, unless `plaid.environment` is `sandbox`.
-Webhooks are not served: sync on demand.
+With `plaid.webhookUrl` set, `fireSandboxWebhook(itemId)` has the sandbox send
+the bank a `SYNC_UPDATES_AVAILABLE` webhook, which syncs it on its own
+([Webhooks](#webhooks)).
+
+#### Webhooks
+
+With `plaid.webhookUrl` set, Plaid tells the node about a bank instead of
+waiting to be asked. Set it to this node's public address of the ledger's
+route — `https://ledger.example.com/ledgers/acme/plaid/webhook` (the
+installer's Caddy already forwards `/ledgers/*`; the config file's own ledger
+is `/plaid/webhook`, which it does not) — on the one node that holds the
+company's banks, and restart the ledger. New link tokens carry it; run
+`mutation { updateBankWebhooks }` (admin) once to give it to banks connected
+before (`PLAID_NO_WEBHOOK_URL` while it is unset). A node behind a home router
+cannot be reached by Plaid, so webhooks are for servers.
+
+The route takes no API key — Plaid has none. Each call must carry Plaid's
+`Plaid-Verification` JWT: ES256 only, signed by a key Plaid publishes (fetched
+by its key id, refused once Plaid sets it to expire), issued within five
+minutes, carrying the SHA-256 of the exact body. Anything else is answered
+401 and does nothing — as is a call Plaid signed about a bank the ledger does
+not hold (one Plaid sent another customer, replayed), any call to a company
+the node does not serve, or serves without Plaid, so the route tells no
+stranger which companies are here; a body over 64 KiB is 413, for any name.
+
+A call never waits on Plaid for a key: one not cached is fetched in the
+background while the call is answered 401, and Plaid's redelivery (about
+30 s later) is taken. So the first webhook after a restart, or after Plaid
+rotates its key, arrives one redelivery late. Asking Plaid for keys is
+bounded: one fetch at a time, at most ten a minute for one caller (an IPv6 /64
+is one caller, as for the rate limit) and sixty a minute in all, a key id
+Plaid would not give not asked again for five minutes (a timeout or a 5xx
+from Plaid is asked again later). A caller with several addresses can still
+spend the sixty, and a webhook with a key not cached then waits for a later
+redelivery. A cached key is asked about again after an hour — in the
+background, at most once a minute, outside those budgets — and used
+meanwhile; one Plaid refuses or has since set to expire is dropped, and one
+Plaid has not confirmed for a day (its key endpoint failing all that time) is
+refused until it does. A verified call is answered at once, and then:
+
+| Plaid sends | The node |
+|---|---|
+| `TRANSACTIONS` `SYNC_UPDATES_AVAILABLE` | syncs the bank, as `syncBank` does; its entries carry no `enteredBy`, as no person made them. One such sync of a bank is queued at a time, and a webhook that comes while it is queued or running has it go once more; a sync already running is waited for (tried three more times, 30 s apart). It is one of the ledger's tasks, so a stop or restart ends it first |
+| `ITEM` `LOGIN_REPAIRED` | clears the bank's `lastNotice` at once, then syncs it as above |
+| `ITEM` `ERROR` | keeps Plaid's error code as the bank's `lastErrorCode` (`ITEM_LOGIN_REQUIRED`: log in again) |
+| `ITEM` `PENDING_EXPIRATION`, `PENDING_DISCONNECT`, `USER_PERMISSION_REVOKED`, `USER_ACCOUNT_REVOKED` | keeps that code as the bank's `lastNotice` (and `lastNoticeAt`), for the app to act on — a sync leaves it; logging in again clears it |
+| `ITEM` `NEW_ACCOUNTS_AVAILABLE` | reads the bank's accounts again (`refreshBankAccounts`) |
+| `TRANSACTIONS` `DEFAULT_UPDATE`, `INITIAL_UPDATE`, `HISTORICAL_UPDATE` | nothing: Plaid sends them beside `SYNC_UPDATES_AVAILABLE` and asks `/transactions/sync` clients to ignore them |
+| anything else about a bank this ledger holds | logs it (a webhook about no bank it holds is refused, above) |
+
+What a webhook-started sync imported or noted is in the node's log, as is
+anything it could not do; `connectedBanks` shows its `lastSyncedAt`.
 
 ### Several ledgers
 
