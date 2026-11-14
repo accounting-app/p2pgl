@@ -192,10 +192,60 @@ impl NodeAdmin {
             .map(|(name, config)| (name.as_str(), config))
             .collect();
         all.push((name, config));
-        ledgers_in_conflict(&all, self.max_ledgers)
+        if let Some(reason) = ledgers_in_conflict(&all, self.max_ledgers)
             .into_iter()
             .find(|(refused, _)| refused == name)
             .map(|(_, reason)| reason)
+        {
+            return Some(reason);
+        }
+        // 007 step 6e: a ledger that is down still has its Plaid environment,
+        // as it has its port (`taken_ports`): a ledger in the other one would
+        // be accepted now and refused — the whole company not served — at the
+        // next boot.
+        if config.plaid.enabled {
+            let served: std::collections::HashSet<&str> =
+                others.iter().map(|(other, _)| other.as_str()).collect();
+            for (other, environment) in self.plaid_environments_on_disk() {
+                if other != name
+                    && !served.contains(other.as_str())
+                    && environment != config.plaid.environment
+                {
+                    return Some(format!(
+                        "ledger \"{other}\" (not served now) uses Plaid's {} environment; the node holds one Plaid secret, so its Plaid ledgers share one plaid.environment",
+                        environment.name()
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// The Plaid environment of every folder in `ledgersDir` whose
+    /// `ledger.json` turns Plaid on, served or not (a file that does not read
+    /// is skipped: that ledger cannot start).
+    fn plaid_environments_on_disk(&self) -> Vec<(String, crate::config::PlaidEnvironment)> {
+        let Ok(folders) = crate::config::ledger_folders(&self.ledgers_dir) else {
+            return Vec::new();
+        };
+        folders
+            .into_iter()
+            .filter_map(|(name, path)| {
+                let text = std::fs::read_to_string(path.ok()?.join(LEDGER_FILE)).ok()?;
+                let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+                let plaid = value.get("plaid")?;
+                if plaid.get("enabled")?.as_bool()? {
+                    let environment = match plaid.get("environment").and_then(|e| e.as_str()) {
+                        None | Some("sandbox") => crate::config::PlaidEnvironment::Sandbox,
+                        Some("production") => crate::config::PlaidEnvironment::Production,
+                        Some(_) => return None,
+                    };
+                    Some((name, environment))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// The UDP ports the node's ledgers have, served or not (review, step 4):
@@ -1592,6 +1642,56 @@ mod tests {
             StatusCode::PAYLOAD_TOO_LARGE,
             "the cap is met before the name is looked up"
         );
+    }
+
+    /// 007 step 6e: `addLedger` refuses a Plaid ledger in the other Plaid
+    /// environment than the node's Plaid ledgers — one served, or one whose
+    /// folder is there but not served now — naming it; a ledger without Plaid
+    /// is added whatever its environment.
+    ///
+    /// Bug-catch: a check of the served ledgers alone takes a production
+    /// company beside a sandbox one that is down, and the next boot, serving
+    /// the folders by name, refuses the production company whole.
+    #[tokio::test]
+    async fn plaid_ledgers_in_another_environment_are_refused() {
+        let node = node_with(Arc::new(crate::plaid::tests::env())).await;
+        let plaid = |environment: &str| {
+            format!(r#"{{ "plaid": {{ "enabled": true, "environment": "{environment}" }} }}"#)
+        };
+        let added = add(&node.app, "alpha", Some(&plaid("sandbox"))).await;
+        assert!(added["errors"].is_null(), "{added}");
+        let refused = add(&node.app, "beta", Some(&plaid("production"))).await;
+        assert_eq!(code(&refused), Some("LEDGER_CONFLICT"), "{refused}");
+        assert!(
+            refused
+                .to_string()
+                .contains("ledger \\\"alpha\\\" uses Plaid's sandbox"),
+            "{refused}"
+        );
+        let unplaid = add(
+            &node.app,
+            "beta",
+            Some(r#"{ "plaid": { "enabled": false, "environment": "production" } }"#),
+        )
+        .await;
+        assert!(unplaid["errors"].is_null(), "{unplaid}");
+
+        // Only a folder in sandbox, not served now.
+        let removed = remove(&node.app, "alpha").await;
+        assert!(removed["errors"].is_null(), "{removed}");
+        let down = node.ledgers_dir().join("gamma");
+        std::fs::create_dir_all(&down).unwrap();
+        std::fs::write(down.join(super::LEDGER_FILE), plaid("sandbox")).unwrap();
+        let refused = add(&node.app, "delta", Some(&plaid("production"))).await;
+        assert_eq!(code(&refused), Some("LEDGER_CONFLICT"), "{refused}");
+        assert!(
+            refused
+                .to_string()
+                .contains("ledger \\\"gamma\\\" (not served now)"),
+            "{refused}"
+        );
+        let same = add(&node.app, "delta", Some(&plaid("sandbox"))).await;
+        assert!(same["errors"].is_null(), "{same}");
     }
 
     /// 003 step 4: a removed ledger is stopped — its requests answer as a

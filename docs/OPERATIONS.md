@@ -531,6 +531,32 @@ it, and it can be deleted.
 A company's banks are connected on **one** node of its mesh (README, *Bank
 connections (Plaid)*): the one that will hold their access tokens.
 
+**Whose Plaid account.** The Plaid credentials belong to a Plaid account,
+and whoever holds it answers to Plaid for every bank connected with it. The
+hosted service's account goes only on the hosted service's own servers:
+companies and accountants apply to it, and it turns bank feeds on for them
+there; their other nodes — a self-hosted server, a desk machine — get the
+imported entries through the mesh and never hold the credentials or a bank
+token. An operator with a Plaid account of their own may put it on their own
+node instead. Any other node leaves both Plaid lines out. A node holds one
+account, in one environment: its Plaid companies all use the same
+`plaid.environment`. `openledger company add` and `restart` refuse a company
+set to the other one, naming the company it clashes with — one whose folder
+is there but is not served counts too. At boot the config file's company comes
+first, then the folders by name; a later one in the other environment is not
+served, and the node's log says why. Demo companies in Plaid's sandbox
+therefore need a node of their own, apart from real ones.
+
+**Moving a node from sandbox to production.** Set `"environment":
+"production"` in every Plaid company's `ledger.json`, put the production
+secret in `secrets.env`, then `docker compose -f /opt/openledger/compose.yml
+up -d` so the node restarts and reads both: a company restarted on its own is
+refused while the others are still sandbox, and the secret is read only at
+start. Disconnect the sandbox banks first (`disconnectBank`): a production
+node refuses a sandbox token untouched (`PLAID_ENVIRONMENT`), so it could no
+longer remove them, and the company could not be removed while they are
+listed. Then connect the real banks.
+
 1. **The credentials.** In `/opt/openledger/secrets.env` on that server, fill
    in `GL_NODE_PLAID_CLIENT_ID` and `GL_NODE_PLAID_SECRET` (the sandbox secret
    for `"environment": "sandbox"`, the production one for production), then

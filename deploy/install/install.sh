@@ -299,7 +299,10 @@ else
 # a copy off this server: backups leave it out, and without it a restore on
 # another server has to connect every bank again (OPERATIONS, Bank connections).
 GL_NODE_SECRETS_KEY=$secrets_key
-# Plaid: both lines or neither, then \`docker compose -f $ETC/compose.yml up -d\`.
+# Plaid: only with an account that is yours to put here — the hosted service's
+# on its own servers, or one you hold with Plaid yourself; otherwise leave both
+# lines out (OPERATIONS, Bank connections). Both lines or neither, then
+# \`docker compose -f $ETC/compose.yml up -d\`.
 #GL_NODE_PLAID_CLIENT_ID=
 #GL_NODE_PLAID_SECRET=
 EOF

@@ -669,6 +669,120 @@ pub(crate) mod tests {
         );
     }
 
+    /// Two companies on one node share Plaid's webhook keys and what asking
+    /// for them may cost (step 6e): a key fetched for one verifies the other's
+    /// webhooks at once, and a client's ten fetches a minute are ten for the
+    /// node, not ten for each company.
+    ///
+    /// Bug-catch: a cache and budget for each ledger fetches the one key once
+    /// per company, and lets a stranger spend sixty fetches a minute of the
+    /// one Plaid account for every company the node serves.
+    #[tokio::test]
+    async fn companies_on_one_node_share_the_keys_and_the_budget() {
+        let signer = Signer::new("k1");
+        let mock = MockPlaid::default();
+        *mock.webhook_key.lock().unwrap() = Some(signer.jwk(None));
+        let env = mock::env();
+        let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let acme = mock::service(&mock, first.path(), &env).await;
+        let globex = mock::service(&mock, second.path(), &env).await;
+        let token = signer.token(BODY, NOW);
+        verify_settled(&acme, Some(&token), BODY, NOW, CLIENT)
+            .await
+            .unwrap();
+        assert_eq!(
+            verify(&globex, Some(&token), BODY, NOW, CLIENT).await,
+            Ok(()),
+            "the key acme fetched"
+        );
+        assert_eq!(key_fetches(&mock), 1);
+
+        for n in 0..9 {
+            let made_up = Signer::new(&format!("made-up-{n}")).token(BODY, NOW);
+            let _ = verify_settled(&acme, Some(&made_up), BODY, NOW, CLIENT).await;
+        }
+        assert_eq!(key_fetches(&mock), 10);
+        let made_up = Signer::new("made-up-at-globex").token(BODY, NOW);
+        assert!(matches!(
+            verify_settled(&globex, Some(&made_up), BODY, NOW, CLIENT).await,
+            Err(Unverified::Key(_))
+        ));
+        assert_eq!(key_fetches(&mock), 10, "the client's ten are spent");
+
+        // A production ledger on the node has keys of its own: a sandbox key
+        // never verifies its webhooks.
+        let third = tempfile::tempdir().unwrap();
+        let live = mock::service_in(
+            &mock,
+            third.path(),
+            &env,
+            crate::config::PlaidConfig {
+                environment: crate::config::PlaidEnvironment::Production,
+                ..mock::enabled()
+            },
+        )
+        .await;
+        assert_eq!(
+            verify(&live, Some(&token), BODY, NOW, OTHER_CLIENT).await,
+            Err(Unverified::KeyPending),
+            "not the sandbox key"
+        );
+        settle(&live).await;
+    }
+
+    /// A company being stopped holds up no other company's key fetch: its
+    /// own fetch ends at once, without waiting for the stop — which waits for
+    /// a connect under way, up to 90 s — while holding the node's one-fetch
+    /// lock.
+    ///
+    /// Bug-catch: a fetch that waits on the stopping ledger's gate holds the
+    /// node's lock, and every company's webhooks with a key not cached are
+    /// refused until the connect ends.
+    #[tokio::test]
+    async fn a_company_being_stopped_holds_up_no_other_companys_keys() {
+        let signer = Signer::new("k1");
+        let mock = MockPlaid::default();
+        *mock.webhook_key.lock().unwrap() = Some(signer.jwk(None));
+        mock.delay("/item/public_token/exchange", Duration::from_secs(3));
+        let env = mock::env();
+        let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let stopping = mock::service(&mock, first.path(), &env).await;
+        let other = mock::service(&mock, second.path(), &env).await;
+
+        let connecting = {
+            let stopping = Arc::clone(&stopping);
+            tokio::spawn(async move { stopping.connect(mock::connect_token()).await })
+        };
+        while !mock
+            .paths()
+            .iter()
+            .any(|path| path == "/item/public_token/exchange")
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let closing = {
+            let stopping = Arc::clone(&stopping);
+            tokio::spawn(async move { stopping.close().await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let theirs = Signer::new("k-stopping").token(BODY, NOW);
+        let _ = verify(&stopping, Some(&theirs), BODY, NOW, CLIENT).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let token = signer.token(BODY, NOW);
+        let mut verified = false;
+        for _ in 0..100 {
+            if verify(&other, Some(&token), BODY, NOW, OTHER_CLIENT).await == Ok(()) {
+                verified = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(verified, "the other company's key is fetched meanwhile");
+        let _ = connecting.await;
+        closing.await.unwrap();
+    }
+
     /// A stopped ledger asks Plaid for no key: a fetch set going before the
     /// stop ends without a call.
     ///

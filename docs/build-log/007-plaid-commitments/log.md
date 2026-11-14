@@ -423,3 +423,53 @@ to commit. The commit hash is filled in once the maintainer has committed.
   anchors in 16 files, each once).
 - **Departures from the plan:** none (step 6d added to `plan.md`).
 - **Commit:** 65371da
+
+## 2026-11-14 — One Plaid account, many companies (step 6e)
+
+- **What changed:** decision 13 (the maintainer is the Plaid customer;
+  companies and accountants apply to the maintainer, who turns bank feeds on
+  for them on the maintainer's servers; an operator with an account of their
+  own may use it on their own node). (a) `plaid::WebhookKeys`: the webhook
+  key cache, the refused key ids, the key-fetch budgets and the one-fetch
+  lock, once per node in `PlaidEnv::webhook_keys` and shared by every
+  ledger's `PlaidService` (`keys`), so a key is fetched once for every
+  company and a stranger spends at most sixty fetches a minute of the
+  account however many companies are served. (b) `ledgers_in_conflict`
+  (config.rs): a Plaid-enabled ledger in another `plaid.environment` than
+  the first Plaid ledger's is refused — at boot (not served), `addLedger`
+  and `restartLedger` — naming that ledger (`PlaidEnvironment::name`).
+  (c) OPERATIONS *Bank connections (Plaid)* (whose account goes where, one
+  environment per node), README (*One Plaid account per node*; the
+  *Webhooks* budgets are the node's), the installer's `secrets.env`
+  comment; CHANGELOG *Breaking* and *Security*.
+- **Tests:** `companies_on_one_node_share_the_keys_and_the_budget`,
+  `a_company_being_stopped_holds_up_no_other_companys_keys`,
+  `a_nodes_plaid_ledgers_share_one_environment`,
+  `plaid_ledgers_in_another_environment_are_refused`.
+- **Review:** nothing important; two medium findings, fixed. (1) A stopping
+  company's key fetch took the node's one-fetch lock, then waited on its
+  `closed` gate — behind a connect under way, up to 90 s — holding up every
+  other company's key fetches: `PlaidService::closing`, set by `close` before
+  it waits, is read instead, before and after taking the lock. (2) Only the
+  served ledgers were checked: a production company was taken beside a
+  sandbox one that was down, and refused whole at the next boot —
+  `LedgerAdmin::conflict` also reads the folders not served
+  (`plaid_environments_on_disk`, as `taken_ports` does). Low, fixed: one key
+  cache for both environments let sandbox keys verify a production ledger's
+  webhooks for up to an hour after a switch — `NodeWebhookKeys`, one set per
+  environment. Nits: an `addLedger` test end to end; the plan says the
+  refusal names the ledger it clashes with; README, OPERATIONS and the
+  CHANGELOG say which ledger wins at boot; OPERATIONS says how to move a node
+  to production (every Plaid company and the secret, then restart the node;
+  sandbox banks disconnected first). Left: at boot a Plaid ledger that passes
+  the check claims the environment even if it then fails to start, as a mesh
+  or a topic does.
+- **Gate:** `scripts/gate.sh` — passed (fmt, clippy, anchors, guard; 1737
+  tests passed, 0 failed).
+- **Revert checks:** `scripts/revert_specs/plaid.json` PL-R79..R124 — 46 of
+  46 bite (PL-R119..R124 new; PL-R113, R114 re-anchored; PL-R121 first
+  reverted only the check after the lock, which the check before it still
+  covered, and did not bite — it now restores the old wait whole). 391
+  anchors in 16 files, each once.
+- **Departures from the plan:** none.
+- **Commit:** —

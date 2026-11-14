@@ -1208,6 +1208,18 @@ A ledger with `plaid.enabled` on a node without all three is not served. A
 malformed key, or only one of the two Plaid values, stops the node at boot; an
 empty variable counts as unset.
 
+**One Plaid account per node.** The two Plaid values are one Plaid account's,
+and the node's ledgers share it. Its Plaid ledgers must all use the same
+`plaid.environment`: `addLedger` and `restartLedger` refuse one set to the
+other (`LEDGER_CONFLICT`), naming the ledger it clashes with — one whose
+folder is there but not served counts too — and at boot, where the config
+file's ledger comes first and then the folders by name, a later one is not
+served. Plaid's webhook keys and the limits on asking for them are the
+node's, not each ledger's (*Webhooks*), and kept apart for each environment.
+Put an account's credentials only on nodes its holder runs: the hosted
+service's on its own servers, your own account on yours (OPERATIONS, *Bank
+connections (Plaid)*, which also says how to move a node to production).
+
 **The flow.** Plaid Link runs in the client app (Plaid's web or mobile SDK),
 not in the node:
 
@@ -1397,10 +1409,11 @@ A call never waits on Plaid for a key: one not cached is fetched in the
 background while the call is answered 401, and Plaid's redelivery (about
 30 s later) is taken. So the first webhook after a restart, or after Plaid
 rotates its key, arrives one redelivery late. Asking Plaid for keys is
-bounded: one fetch at a time, at most ten a minute for one caller (an IPv6 /64
-is one caller, as for the rate limit) and sixty a minute in all, a key id
-Plaid would not give not asked again for five minutes (a timeout or a 5xx
-from Plaid is asked again later). A caller with several addresses can still
+bounded, for the whole node however many companies it serves (they share one
+Plaid account): one fetch at a time, at most ten a minute for one caller (an
+IPv6 /64 is one caller, as for the rate limit) and sixty a minute in all, a
+key id Plaid would not give not asked again for five minutes (a timeout or a
+5xx from Plaid is asked again later). A caller with several addresses can still
 spend the sixty, and a webhook with a key not cached then waits for a later
 redelivery. A cached key is asked about again after an hour — in the
 background, at most once a minute, outside those budgets — and used

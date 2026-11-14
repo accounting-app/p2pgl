@@ -424,6 +424,14 @@ pub enum PlaidEnvironment {
 }
 
 impl PlaidEnvironment {
+    /// As `plaid.environment` spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Sandbox => "sandbox",
+            Self::Production => "production",
+        }
+    }
+
     pub fn base_url(self) -> &'static str {
         match self {
             Self::Sandbox => "https://sandbox.plaid.com",
@@ -1388,7 +1396,9 @@ pub fn ledger_folders(ledgers_dir: &Path) -> Result<Vec<LedgerFolder>, ConfigErr
 /// The ledgers in `ledgers` (in order, the config file's first) that cannot be
 /// served beside the ones before them, each with its reason (003): two ledgers
 /// in one mesh (the same signature domain), on one gossip topic, or on one
-/// P2P port; and any past `max_ledgers`.
+/// P2P port; a Plaid ledger in another Plaid environment than the first
+/// one's (007 step 6e: the node holds one Plaid secret, and a secret is one
+/// environment's); and any past `max_ledgers`.
 pub fn ledgers_in_conflict(
     ledgers: &[(&str, &LedgerConfig)],
     max_ledgers: usize,
@@ -1397,6 +1407,7 @@ pub fn ledgers_in_conflict(
     let mut domains = std::collections::HashMap::new();
     let mut topics = std::collections::HashMap::new();
     let mut ports = std::collections::HashMap::new();
+    let mut plaid: Option<(PlaidEnvironment, &str)> = None;
     let mut served = 0usize;
     for (name, config) in ledgers {
         let conflict = if config.signing.enabled
@@ -1419,6 +1430,13 @@ pub fn ledgers_in_conflict(
                 "ledger \"{}\" already listens on p2p.listenPort {}",
                 ports[&config.p2p.listen_port], config.p2p.listen_port
             ))
+        } else if let Some((environment, first)) = plaid.filter(|(environment, _)| {
+            config.plaid.enabled && *environment != config.plaid.environment
+        }) {
+            Some(format!(
+                "ledger \"{first}\" uses Plaid's {} environment; the node holds one Plaid secret, so its Plaid ledgers share one plaid.environment",
+                environment.name()
+            ))
         } else if served >= max_ledgers {
             Some(format!(
                 "this node serves at most maxLedgers ({max_ledgers}) ledgers"
@@ -1432,6 +1450,9 @@ pub fn ledgers_in_conflict(
                 served += 1;
                 if config.signing.enabled {
                     domains.insert(config.p2p.signature_domain(), *name);
+                }
+                if config.plaid.enabled && plaid.is_none() {
+                    plaid = Some((config.plaid.environment, *name));
                 }
                 if config.p2p.enabled {
                     topics.insert(config.p2p.swarm_topic.as_str(), *name);
@@ -3198,6 +3219,44 @@ mod tests {
             "a, d and f are served; g is the fourth"
         );
         assert!(ledgers_in_conflict(&named[..1], MAX_LEDGERS).is_empty());
+    }
+
+    /// 007 step 6e: a node's Plaid ledgers share one Plaid environment — the
+    /// first one's — as the node holds one secret; a ledger without Plaid is
+    /// no conflict whatever its `plaid.environment`.
+    ///
+    /// Bug-catch: let a production ledger start beside sandbox ones and its
+    /// every Plaid call is refused with the sandbox secret, at the company's
+    /// first bank connection rather than at boot.
+    #[test]
+    fn a_nodes_plaid_ledgers_share_one_environment() {
+        let with = |mesh: &str, enabled: bool, environment: PlaidEnvironment| {
+            let mut config = ledger_with(mesh, &format!("topic/{mesh}"), 0);
+            config.plaid.enabled = enabled;
+            config.plaid.environment = environment;
+            config
+        };
+        let ledgers = [
+            ("a", with("a", false, PlaidEnvironment::Production)),
+            ("b", with("b", true, PlaidEnvironment::Sandbox)),
+            ("c", with("c", true, PlaidEnvironment::Production)),
+            ("d", with("d", false, PlaidEnvironment::Production)),
+            ("e", with("e", true, PlaidEnvironment::Sandbox)),
+        ];
+        let named: Vec<(&str, &LedgerConfig)> = ledgers
+            .iter()
+            .map(|(name, config)| (*name, config))
+            .collect();
+        let refused = ledgers_in_conflict(&named, MAX_LEDGERS);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0].0, "c");
+        assert!(
+            refused[0]
+                .1
+                .contains("ledger \"b\" uses Plaid's sandbox environment"),
+            "{}",
+            refused[0].1
+        );
     }
 
     /// 003: `ledgersDir` is held to the `ledgerPath` rule (no `..`, under the

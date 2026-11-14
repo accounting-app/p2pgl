@@ -7,8 +7,21 @@ break compatibility.
 
 ## [Unreleased]
 
+### Breaking
+
+- A node's Plaid-enabled ledgers share one `plaid.environment` (007 step
+  6e): the node holds one Plaid account's secret, which is one environment's.
+  `addLedger` and `restartLedger` refuse a ledger set to the other environment
+  (`LEDGER_CONFLICT`), naming the ledger it clashes with, served or not; at
+  boot (the config file's ledger first, then the folders by name) a later one
+  is not served. Moving a node to production: OPERATIONS.
+
 ### Security
 
+- Plaid's webhook keys and the limits on asking Plaid for them are kept once
+  for the node rather than once for each ledger (007 step 6e): every company
+  shares the one Plaid account, so a stranger's made-up key ids spend at most
+  sixty fetches a minute of it however many companies the node serves.
 - Plaid's webhooks (007 step 6d) are answered at `/ledgers/<name>/plaid/webhook`
   without an API key, so each call must prove it is Plaid's: an ES256
   `Plaid-Verification` JWT, by a key Plaid publishes (its id checked, asked

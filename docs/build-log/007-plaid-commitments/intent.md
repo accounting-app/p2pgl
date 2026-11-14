@@ -120,3 +120,20 @@ may ask for evidence.
     made them, as operator writes); the address is `plaid.webhookUrl` in the
     ledger's config (https only), carried by new link tokens and set on banks
     already connected by an admin mutation.
+13. **Bank feeds as the maintainer's service** (2026-11-13/14): the
+    maintainer is the Plaid customer. Companies and accountants apply to the
+    maintainer, who turns bank feeds on for them (`plaid.enabled`) on servers
+    the maintainer runs, under the one Plaid account; its client id and
+    secret go on no other machine. Each company's banks are held by one of
+    those nodes; every other node of its mesh — a self-hosted server, an
+    accountant's desk machine — gets the imported entries by replication and
+    never holds the secret or a bank token. An operator with a Plaid account
+    of their own may put its credentials on their own node instead (they
+    answer to Plaid for it); a node serves one account. Rejected: the
+    maintainer's secret on other machines (one stolen machine exposes the
+    account for every company); a central service holding every company's
+    tokens. Kept for later: a gateway that holds only the secret, so a
+    company's own nodes import with the maintainer's account (when desk or
+    self-hosted companies want feeds). It follows that a node shares what one
+    account shares: Plaid's rate limits, its environment and its webhook
+    keys.

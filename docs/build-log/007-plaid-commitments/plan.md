@@ -118,6 +118,20 @@ own root-only file, left out of backups; the importing node chosen by
    `updateBankWebhooks` (`/item/webhook/update`); sandbox
    `fireSandboxWebhook` (`/sandbox/item/fire_webhook`). `ring` (already in
    the build) verifies.
+6e. **One Plaid account, many companies** (decision 13). (a) The webhook key
+   cache, the refused key ids and the key-fetch budgets move from each
+   ledger's `PlaidService` to one per node (through `PlaidEnv`): a key is
+   fetched once for every company, and a stranger cannot spend sixty fetches
+   a minute of the account's rate limit for each company served. (b) One
+   Plaid environment per node: the node holds one secret, which is one
+   environment's, so a ledger whose `plaid.environment` differs from another
+   Plaid-enabled ledger on the node is refused at boot, `addLedger` and
+   `restartLedger`, naming the ledger it clashes with (one not served now
+   counts too, as its port does). (c) OPERATIONS *Bank connections (Plaid)*,
+   README and the installer's `secrets.env` comment: the maintainer's
+   credentials go only on servers the maintainer runs; an operator with a
+   Plaid account of their own may put theirs on their own node; any other
+   node leaves `plaid` off and the Plaid lines empty.
 7. **Operations checklist** (no code; the maintainer, dated records in a
    private folder): MFA on GitHub, hosting, registrar, email and the Plaid
    Dashboard; disk encryption on servers and workstations; first quarterly

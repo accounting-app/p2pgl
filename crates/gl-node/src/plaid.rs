@@ -94,6 +94,9 @@ pub(crate) struct PlaidEnv {
     /// Where Plaid is, for tests' loopback mock; [`Self::from_env`] never sets
     /// it, so a running node only ever calls `plaid.environment`'s host.
     pub base_url: Option<String>,
+    /// Plaid's webhook keys, one set for every ledger on the node in each
+    /// Plaid environment (step 6e).
+    pub webhook_keys: NodeWebhookKeys,
 }
 
 impl PlaidEnv {
@@ -131,6 +134,7 @@ impl PlaidEnv {
             credentials,
             store_key,
             base_url: None,
+            webhook_keys: NodeWebhookKeys::default(),
         })
     }
 }
@@ -668,6 +672,56 @@ enum Cached {
     Refused,
 }
 
+/// Plaid's webhook verification keys as a node knows them, and what asking
+/// Plaid for them may cost (007 step 6e): one for the node, shared by every
+/// ledger on it through [`PlaidEnv`], as the node holds one Plaid account —
+/// a key is fetched once for every company, and the budgets bound what a
+/// stranger can spend of the account however many companies are served.
+#[derive(Default)]
+pub(crate) struct WebhookKeys {
+    /// The keys Plaid gave, by key id ([`PlaidService::verification_key`]).
+    webhook_keys: std::sync::Mutex<std::collections::HashMap<String, CachedKey>>,
+    /// Key ids Plaid would not give, and when: not asked again for five
+    /// minutes, so a stranger's made-up key ids do not each cost a call.
+    refused_keys: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// Key fetches in the current minute (when it started, how many): at most
+    /// [`MAX_KEY_FETCHES_A_MINUTE`]. `None` before the first.
+    key_fetches: std::sync::Mutex<Option<(std::time::Instant, u32)>>,
+    /// Key fetches by client in its current minute.
+    key_fetches_by_client:
+        std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (std::time::Instant, u32)>>,
+    /// Key ids being fetched now.
+    fetching_keys: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// One key fetch at a time.
+    key_fetch: tokio::sync::Mutex<()>,
+}
+
+impl std::fmt::Debug for WebhookKeys {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("WebhookKeys { .. }")
+    }
+}
+
+/// A node's [`WebhookKeys`], one set for each Plaid environment: a node serves
+/// one environment at a time (`config::ledgers_in_conflict`), but it can move
+/// from one to the other while it runs, and a sandbox key is never to verify
+/// a production ledger's webhooks.
+#[derive(Debug, Default)]
+pub(crate) struct NodeWebhookKeys {
+    sandbox: Arc<WebhookKeys>,
+    production: Arc<WebhookKeys>,
+}
+
+impl NodeWebhookKeys {
+    /// The keys of Plaid's `environment`.
+    pub(crate) fn of(&self, environment: PlaidEnvironment) -> &Arc<WebhookKeys> {
+        match environment {
+            PlaidEnvironment::Sandbox => &self.sandbox,
+            PlaidEnvironment::Production => &self.production,
+        }
+    }
+}
+
 /// What [`PlaidService::verification_key`] has for a key id.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum KeyLookup {
@@ -873,20 +927,9 @@ pub(crate) struct PlaidService {
     suspense_account: String,
     /// `plaid.webhookUrl`: carried by new link tokens (step 6d).
     webhook_url: Option<String>,
-    /// Plaid's webhook verification keys by key id ([`Self::verification_key`]).
-    webhook_keys: std::sync::Mutex<std::collections::HashMap<String, CachedKey>>,
-    /// Key ids Plaid would not give, and when: not asked again for five
-    /// minutes, so a stranger's made-up key ids do not each cost a call.
-    refused_keys: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
-    /// Key fetches in the current minute: at most [`MAX_KEY_FETCHES_A_MINUTE`].
-    key_fetches: std::sync::Mutex<(std::time::Instant, u32)>,
-    /// Key fetches by client in its current minute.
-    key_fetches_by_client:
-        std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (std::time::Instant, u32)>>,
-    /// Key ids being fetched now.
-    fetching_keys: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// One key fetch at a time.
-    key_fetch: tokio::sync::Mutex<()>,
+    /// Plaid's webhook keys as this node knows them: one for every ledger on
+    /// it, as they are one Plaid account's ([`PlaidEnv::webhook_keys`]).
+    keys: Arc<WebhookKeys>,
     /// The banks with a webhook sync queued or running
     /// ([`Self::queue_webhook_sync`]), each with whether it is to go once more.
     webhook_syncs: std::sync::Mutex<std::collections::HashMap<String, bool>>,
@@ -898,6 +941,10 @@ pub(crate) struct PlaidService {
     /// while it works with the store (a connect or disconnect from start to
     /// end); `close` takes the write side.
     closed: tokio::sync::RwLock<bool>,
+    /// Set by [`Self::close`] before it waits for the `closed` gate, so work
+    /// that must not wait for a stop (a webhook key fetch, step 6e) sees it at
+    /// once.
+    closing: std::sync::atomic::AtomicBool,
     /// The banks being synced now ([`Self::begin_sync`]).
     syncing: std::sync::Mutex<std::collections::HashSet<String>>,
 }
@@ -940,16 +987,12 @@ impl PlaidService {
             client_name: config.client_name.clone(),
             suspense_account: config.suspense_account.clone(),
             webhook_url: config.webhook_url.clone(),
-            webhook_keys: std::sync::Mutex::default(),
-            refused_keys: std::sync::Mutex::default(),
-            key_fetches: std::sync::Mutex::new((std::time::Instant::now(), 0)),
-            key_fetches_by_client: std::sync::Mutex::default(),
-            fetching_keys: std::sync::Mutex::default(),
-            key_fetch: tokio::sync::Mutex::new(()),
+            keys: Arc::clone(env.webhook_keys.of(config.environment)),
             webhook_syncs: std::sync::Mutex::default(),
             environment: config.environment,
             store: tokio::sync::Mutex::new(store),
             closed: tokio::sync::RwLock::new(false),
+            closing: std::sync::atomic::AtomicBool::new(false),
             syncing: std::sync::Mutex::default(),
         })
     }
@@ -958,6 +1001,8 @@ impl PlaidService {
     /// ([`PlaidError::Closing`]). Bounded by Plaid's timeouts: a connect
     /// makes at most three calls of [`REQUEST_TIMEOUT`] each, about 90 s.
     pub(crate) async fn close(&self) {
+        self.closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         *self.closed.write().await = true;
     }
 
@@ -971,6 +1016,8 @@ impl PlaidService {
     /// serving as before.
     pub(crate) async fn reopen(&self) {
         *self.closed.write().await = false;
+        self.closing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// A link token for `client_user_id` (Plaid's stable, non-personal id for
@@ -1831,7 +1878,8 @@ impl PlaidService {
     /// Whether a fetch of `key_id` could start now: none of it under way, and
     /// fewer than 64 of any.
     fn key_fetch_free(&self, key_id: &str) -> bool {
-        self.fetching_keys
+        self.keys
+            .fetching_keys
             .lock()
             .is_ok_and(|fetching| !fetching.contains(key_id) && fetching.len() < 64)
     }
@@ -1840,7 +1888,7 @@ impl PlaidService {
     /// when Plaid gives it, dropped and remembered as refused when Plaid
     /// refuses it, kept as it was after a passing failure.
     fn start_key_fetch(self: &Arc<Self>, key_id: &str) {
-        let Ok(mut fetching) = self.fetching_keys.lock() else {
+        let Ok(mut fetching) = self.keys.fetching_keys.lock() else {
             return;
         };
         if fetching.contains(key_id) || fetching.len() >= 64 {
@@ -1852,16 +1900,24 @@ impl PlaidService {
         let key_id = key_id.to_owned();
         tokio::spawn(
             async move {
-                let _one_at_a_time = service.key_fetch.lock().await;
-                // A stopped ledger asks Plaid nothing more.
-                let fetched = if *service.closed.read().await {
+                // A stopping ledger asks Plaid nothing more, and never waits for
+                // its stop: the one-fetch lock is the node's, so a wait here
+                // would hold up every other company's keys (`closing`, not the
+                // `closed` gate a connect under way holds for up to 90 s). Its
+                // key id is left uncached; the next call asks again.
+                let fetched = if service.closing.load(std::sync::atomic::Ordering::SeqCst) {
                     Err(PlaidError::Closing)
                 } else {
-                    service.fetch_key(&key_id).await
+                    let _one_at_a_time = service.keys.key_fetch.lock().await;
+                    if service.closing.load(std::sync::atomic::Ordering::SeqCst) {
+                        Err(PlaidError::Closing)
+                    } else {
+                        service.fetch_key(&key_id).await
+                    }
                 };
                 match fetched {
                     Ok(point) => {
-                        if let Ok(mut keys) = service.webhook_keys.lock() {
+                        if let Ok(mut keys) = service.keys.webhook_keys.lock() {
                             if keys.len() >= 64 {
                                 keys.clear();
                             }
@@ -1880,10 +1936,10 @@ impl PlaidService {
                     // usable, is remembered: a timeout or a 5xx is tried again
                     // later, a stale key kept meanwhile.
                     Err(error) if error.is_definite_refusal() => {
-                        if let Ok(mut keys) = service.webhook_keys.lock() {
+                        if let Ok(mut keys) = service.keys.webhook_keys.lock() {
                             keys.remove(&key_id);
                         }
-                        if let Ok(mut refused) = service.refused_keys.lock() {
+                        if let Ok(mut refused) = service.keys.refused_keys.lock() {
                             if refused.len() >= 256 {
                                 refused.clear();
                             }
@@ -1895,7 +1951,7 @@ impl PlaidService {
                         warn!(key_id = %key_id, %error, "a Plaid webhook key could not be fetched; asked again later");
                     }
                 }
-                if let Ok(mut fetching) = service.fetching_keys.lock() {
+                if let Ok(mut fetching) = service.keys.fetching_keys.lock() {
                     fetching.remove(&key_id);
                 }
             }
@@ -1910,11 +1966,13 @@ impl PlaidService {
     fn spend_key_fetch(&self, client: std::net::IpAddr) -> bool {
         let client = crate::rate_limit::bucket_key(client);
         let minute = Duration::from_secs(60);
-        let (Ok(mut all), Ok(mut clients)) =
-            (self.key_fetches.lock(), self.key_fetches_by_client.lock())
-        else {
+        let (Ok(mut node), Ok(mut clients)) = (
+            self.keys.key_fetches.lock(),
+            self.keys.key_fetches_by_client.lock(),
+        ) else {
             return false;
         };
+        let all = node.get_or_insert_with(|| (std::time::Instant::now(), 0));
         if all.0.elapsed() >= minute {
             *all = (std::time::Instant::now(), 0);
         }
@@ -1942,7 +2000,7 @@ impl PlaidService {
     /// due to be asked about again is marked asked here, under the lock, so
     /// one call a minute starts the asking.
     fn cached_key(&self, key_id: &str) -> Option<Cached> {
-        if let Ok(mut keys) = self.webhook_keys.lock() {
+        if let Ok(mut keys) = self.keys.webhook_keys.lock() {
             if let Some(key) = keys.get_mut(key_id) {
                 if key.fetched.elapsed() < KEY_FRESH_FOR {
                     return Some(Cached::Fresh(key.point.clone()));
@@ -1958,7 +2016,7 @@ impl PlaidService {
                 });
             }
         }
-        let refused_lately = self.refused_keys.lock().ok().is_some_and(|refused| {
+        let refused_lately = self.keys.refused_keys.lock().ok().is_some_and(|refused| {
             refused
                 .get(key_id)
                 .is_some_and(|when| when.elapsed() < Duration::from_secs(5 * 60))
@@ -1969,7 +2027,8 @@ impl PlaidService {
     /// Whether a key fetch is under way (tests).
     #[cfg(test)]
     pub(crate) fn key_fetch_under_way(&self) -> bool {
-        self.fetching_keys
+        self.keys
+            .fetching_keys
             .lock()
             .is_ok_and(|fetching| !fetching.is_empty())
     }
@@ -1978,7 +2037,7 @@ impl PlaidService {
     /// (tests).
     #[cfg(test)]
     pub(crate) fn age_webhook_key(&self, key_id: &str, by: Duration) {
-        if let Some(key) = self.webhook_keys.lock().unwrap().get_mut(key_id) {
+        if let Some(key) = self.keys.webhook_keys.lock().unwrap().get_mut(key_id) {
             let back = |when: std::time::Instant| {
                 when.checked_sub(by)
                     .expect("a monotonic clock that far back")
@@ -2413,6 +2472,7 @@ pub(crate) mod tests {
             ))),
             store_key: Some(Arc::new(StoreKey::generate())),
             base_url: None,
+            webhook_keys: NodeWebhookKeys::default(),
         }
     }
 
@@ -2754,11 +2814,13 @@ pub(crate) mod tests {
                 credentials: full.credentials.clone(),
                 store_key: None,
                 base_url: None,
+                webhook_keys: NodeWebhookKeys::default(),
             },
             PlaidEnv {
                 credentials: None,
                 store_key: full.store_key.clone(),
                 base_url: None,
+                webhook_keys: NodeWebhookKeys::default(),
             },
         ] {
             let error =

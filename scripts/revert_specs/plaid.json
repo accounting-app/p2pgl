@@ -737,14 +737,14 @@
   },
   "PL-R113-a-key-plaid-refuses-kept": {
     "file": "crates/gl-node/src/plaid.rs",
-    "old": "                        if let Ok(mut keys) = service.webhook_keys.lock() {\n                            keys.remove(&key_id);\n                        }\n",
+    "old": "                        if let Ok(mut keys) = service.keys.webhook_keys.lock() {\n                            keys.remove(&key_id);\n                        }\n",
     "new": "",
     "runs": [["-p", "gl-node", "--bin", "gl-node", "a_cached_key_is_asked_about_again"]]
   },
   "PL-R114-a-stopped-ledger-fetches-keys": {
     "file": "crates/gl-node/src/plaid.rs",
-    "old": "                let fetched = if *service.closed.read().await {",
-    "new": "                let fetched = if false && *service.closed.read().await {",
+    "old": "        self.closing\n            .store(true, std::sync::atomic::Ordering::SeqCst);\n        *self.closed.write().await = true;",
+    "new": "        *self.closed.write().await = true;",
     "runs": [["-p", "gl-node", "--bin", "gl-node", "a_stopped_ledger_fetches_no_key"]]
   },
   "PL-R115-a-webhook-about-no-bank-tells-plaid-is-on": {
@@ -770,5 +770,41 @@
     "old": "let usable = key.fetched.elapsed() < KEY_TRUSTED_UNCONFIRMED;",
     "new": "let usable = true || key.fetched.elapsed() < KEY_TRUSTED_UNCONFIRMED;",
     "runs": [["-p", "gl-node", "--bin", "gl-node", "a_stale_key_is_asked_about_whatever_was_spent"]]
+  },
+  "PL-R119-webhook-keys-for-each-company": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "            keys: Arc::clone(env.webhook_keys.of(config.environment)),",
+    "new": "            keys: Arc::default(),",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "companies_on_one_node_share_the_keys_and_the_budget"]]
+  },
+  "PL-R120-plaid-ledgers-in-two-environments": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "                if config.plaid.enabled && plaid.is_none() {",
+    "new": "                if false && config.plaid.enabled && plaid.is_none() {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_nodes_plaid_ledgers_share_one_environment"]]
+  },
+  "PL-R121-a-stopping-company-holds-the-nodes-key-lock": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "                let fetched = if service.closing.load(std::sync::atomic::Ordering::SeqCst) {\n                    Err(PlaidError::Closing)\n                } else {\n                    let _one_at_a_time = service.keys.key_fetch.lock().await;\n                    if service.closing.load(std::sync::atomic::Ordering::SeqCst) {",
+    "new": "                let fetched = if false {\n                    Err(PlaidError::Closing)\n                } else {\n                    let _one_at_a_time = service.keys.key_fetch.lock().await;\n                    if *service.closed.read().await {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_company_being_stopped_holds_up_no_other_companys_keys"]]
+  },
+  "PL-R122-one-key-cache-for-both-environments": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "            keys: Arc::clone(env.webhook_keys.of(config.environment)),",
+    "new": "            keys: Arc::clone(env.webhook_keys.of(crate::config::PlaidEnvironment::Sandbox)),",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "companies_on_one_node_share_the_keys_and_the_budget"]]
+  },
+  "PL-R123-a-down-ledgers-environment-unchecked": {
+    "file": "crates/gl-node/src/ledger_admin.rs",
+    "old": "                if other != name\n",
+    "new": "                if false && other != name\n",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "plaid_ledgers_in_another_environment_are_refused"]]
+  },
+  "PL-R124-addledger-takes-another-environment": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "                if config.plaid.enabled && plaid.is_none() {",
+    "new": "                if false && config.plaid.enabled && plaid.is_none() {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "plaid_ledgers_in_another_environment_are_refused"]]
   }
 }
