@@ -473,3 +473,32 @@ to commit. The commit hash is filled in once the maintainer has committed.
   anchors in 16 files, each once.
 - **Departures from the plan:** none.
 - **Commit:** abaf31d
+
+## 2026-11-15 — Banks that log in on their own site (step 6f)
+
+- **What changed:** `plaid.redirectUri` (`config.rs`): `https://` of at most
+  2,000 bytes, no whitespace, `?`, `#` or `@`; in the sandbox
+  `http://localhost` too (exactly that host, a port or path after it), for a
+  client app run locally. `PlaidService` keeps it and puts it in every
+  `/link/token/create` body — a new bank's and a login again's — as
+  `redirect_uri`. README (*Banks that log in on their own site*: list it in
+  the Plaid Dashboard's *Allowed redirect URIs*; the page re-opens Link with
+  `receivedRedirectUri`; the sandbox's First Platypus Bank needs none), the
+  config row, CHANGELOG *Added*. Android's `android_package_name` is left
+  for when there is an Android app.
+- **Tests:** `the_redirect_uri_rides_on_every_link_token`;
+  `a_ledgers_plaid_section_is_checked` takes good and bad addresses.
+- **Review:** nothing important. Fixed: a query string passed the check,
+  though Plaid refuses one (every link token would fail at run time, not at
+  boot) — `?` and `#` refused; `http://localhost:@evil.example.com` passed the
+  sandbox's localhost rule — `@` refused; `http://127.0.0.1` dropped (the plan
+  said localhost, and Plaid's sandbox exception names localhost); the README
+  says the client app keeps the link token before opening Link (coming back
+  is a fresh page load), names *Platypus OAuth Bank* for testing the path,
+  and that an address not in the Dashboard fails every link token.
+- **Gate:** `scripts/gate.sh` — passed (fmt, clippy, anchors, guard; 1756
+  tests passed, 0 failed).
+- **Revert checks:** `scripts/revert_specs/plaid.json` PL-R125, R126 — 2 of 2
+  bite.
+- **Departures from the plan:** none (step 6f added to `plan.md`).
+- **Commit:** —

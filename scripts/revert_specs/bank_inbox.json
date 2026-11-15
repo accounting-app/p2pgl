@@ -160,5 +160,17 @@
     "old": "                    reason.chars().count() > MAX_REASON_CHARS",
     "new": "                    false && reason.chars().count() > MAX_REASON_CHARS",
     "runs": [["-p", "gl-node", "--bin", "gl-node", "booking_checks_the_mapping_and_the_text"]]
+  },
+  "BI-R27-a-webhook-writes-entries-by-default": {
+    "file": "crates/gl-node/src/plaid_webhook.rs",
+    "old": "        crate::config::WebhookImport::Inbox => FETCH,",
+    "new": "        crate::config::WebhookImport::Inbox => SYNC,",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_webhook_fills_the_inbox_by_default"]]
+  },
+  "BI-R28-webhook-import-entries-ignored": {
+    "file": "crates/gl-node/src/plaid_webhook.rs",
+    "old": "        crate::config::WebhookImport::Entries => SYNC,",
+    "new": "        crate::config::WebhookImport::Entries => FETCH,",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_webhook_syncs_the_bank_on_its_own"]]
   }
 }

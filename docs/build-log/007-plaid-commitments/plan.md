@@ -132,6 +132,11 @@ own root-only file, left out of backups; the importing node chosen by
    credentials go only on servers the maintainer runs; an operator with a
    Plaid account of their own may put theirs on their own node; any other
    node leaves `plaid` off and the Plaid lines empty.
+6f. **OAuth banks** (maintainer, 2026-11-15, before the UI and a release).
+   `plaid.redirectUri` (https; `http://localhost` in the sandbox), carried by
+   every link token, new and update mode; listed by the maintainer in the
+   Plaid Dashboard's *Allowed redirect URIs*. Android's package name later,
+   when there is an Android app.
 7. **Operations checklist** (no code; the maintainer, dated records in a
    private folder): MFA on GitHub, hosting, registrar, email and the Plaid
    Dashboard; disk encryption on servers and workstations; first quarterly

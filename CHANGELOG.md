@@ -49,6 +49,13 @@ break compatibility.
 
 ### Added
 
+- `plaid.redirectUri` (007 step 6f): every link token carries it, so banks
+  that log in on their own site (OAuth: many large US banks) send the person
+  back to the client app; `https://` only, no query string or fragment,
+  `http://localhost` also in the sandbox (README *Banks that log in on their own site*).
+- `plaid.webhookImport` (008, unit 3): `"inbox"` (the default) has Plaid's
+  "new transactions" webhook fetch into the bank-feed inbox; `"entries"` has
+  it import straight into the books (README *Webhooks*).
 - Booking from the bank-feed inbox (008, unit 2): `classifyBankTransactions`
   books up to 200 waiting transactions a call, each to the account the
   bookkeeper chooses — one `*` entry, entered by them, linked to the Plaid
@@ -82,9 +89,10 @@ break compatibility.
   One sync of a bank at a time (`SYNC_IN_PROGRESS`). Connect refuses the same
   bank linked twice while it is connected (`BANK_ALREADY_CONNECTED`); after a
   reconnect, map with a later `importFrom` (README).
-- Plaid webhooks (007 step 6d): with `plaid.webhookUrl`, new transactions
-  sync a bank on its own (entries without `enteredBy`, one of the ledger's
-  tasks), a broken login is kept as its `lastErrorCode` and an expiring
+- Plaid webhooks (007 step 6d, 008 unit 3): with `plaid.webhookUrl`, new
+  transactions are fetched on their own, as one of the ledger's tasks — into
+  the bank-feed inbox, or with `plaid.webhookImport: "entries"` straight into
+  the books (entries without `enteredBy`) — a broken login is kept as its `lastErrorCode` and an expiring
   consent as its `lastNotice` (cleared by a repaired login, or by passing the
   update-mode public token to `connectBank`), new accounts are read;
   `updateBankWebhooks` gives the address to banks already connected, and

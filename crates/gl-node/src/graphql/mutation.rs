@@ -227,9 +227,9 @@ impl MutationRoot {
     /// A link token for Plaid Link, which the client app opens to connect a
     /// bank (007). With `itemId`, one that logs the person in again to that
     /// connected bank instead (Plaid's update mode: an expired login,
-    /// `ITEM_LOGIN_REQUIRED`), keeping the connection and its history; the
-    /// public token Link hands back then need not go to `connectBank` (which
-    /// changes nothing for a bank it holds). Only on the node holding
+    /// `ITEM_LOGIN_REQUIRED`), keeping the connection and its history; pass the
+    /// public token Link hands back to `connectBank`, which keeps the bank as
+    /// it is and clears its `lastNotice`. Only on the node holding
     /// this ledger's bank connections. Admin only.
     #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
     async fn create_plaid_link_token(
@@ -329,8 +329,8 @@ impl MutationRoot {
     }
 
     /// Have Plaid's sandbox send a bank a webhook (007 step 6d), by default
-    /// `SYNC_UPDATES_AVAILABLE`, which starts a sync of it. Sandbox only.
-    /// Admin only.
+    /// `SYNC_UPDATES_AVAILABLE`, which has the node fetch it (`plaid.webhookImport`).
+    /// Sandbox only. Admin only.
     #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
     async fn fire_sandbox_webhook(
         &self,

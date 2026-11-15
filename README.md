@@ -625,6 +625,8 @@ signing node without it refuses to boot, and the refusal names that remedy.
 | `plaid.clientName` | `"NewGL"` | The name Plaid Link shows, 1 to 30 characters |
 | `plaid.suspenseAccount` | `"Expenses:Uncategorized"` | The account on the other side of every imported bank transaction; must be open before a sync — see [Importing transactions](#importing-transactions) |
 | `plaid.webhookUrl` | unset | Where Plaid sends this ledger's webhooks: the public `https://` address of `/ledgers/<name>/plaid/webhook` on this node — see [Webhooks](#webhooks). Unset, banks are synced on demand only |
+| `plaid.webhookImport` | `"inbox"` | What a webhook's "new transactions" does: `"inbox"` fetches them into the bank-feed inbox for a bookkeeper to book (`fetchBankTransactions`); `"entries"` imports them straight into the books, flagged `!` (`syncBank`) — see [Webhooks](#webhooks) |
+| `plaid.redirectUri` | unset | Where Plaid Link comes back to after a bank's own login page (OAuth): a page of the client app, also listed in the Plaid Dashboard under *Allowed redirect URIs*; `https://` only, no query string (in the sandbox also `http://localhost`) — see *Banks that log in on their own site* under [Bank connections](#bank-connections-plaid) |
 | `http.headerReadTimeoutSeconds` | `30` | Time a client gets to send a complete request head; also bounds idle keep-alive. `1`–`300` |
 | `http.requestTimeoutSeconds` | `30` | Whole-request ceiling, body read and GraphQL execution included (`408` on expiry). `1`–`300` |
 | `http.maxConnections` | `1024` | Concurrently served connections; excess stays in the kernel backlog. `8`–`65536` |
@@ -1243,6 +1245,23 @@ not in the node:
    another Plaid environment than `plaid.environment` is refused untouched
    (`PLAID_ENVIRONMENT`): set the environment it was connected in.
 
+**Banks that log in on their own site (OAuth).** Many large US banks send
+the person to the bank's own login page instead of logging in inside Link,
+then back to the client app. Set `plaid.redirectUri` to the page of the
+client app Link comes back to — `https://…`, without a query string, fragment
+or `@` (in the sandbox, `http://localhost…` too, for an app run locally) —
+and list the same address in the Plaid Dashboard under *Allowed redirect
+URIs*; an address not listed there makes every link token fail. Every link
+token then carries it, including the token for logging in again. Coming back
+from the bank is a fresh page load, so the client app keeps the link token
+before it opens Link (`sessionStorage`, say), and the page it comes back to
+opens Link again with that token and `receivedRedirectUri:
+window.location.href` (Plaid's web SDK). In the sandbox, *First Platypus Bank*
+does not use OAuth, so local tests work without it; *Platypus OAuth Bank*
+does, to test this path. In production some OAuth banks also want the
+company's details registered in the Plaid Dashboard first (Plaid's OAuth
+guide says which).
+
 **Logging in again.** When a bank's login expires or it asks for a new
 multi-factor step, Plaid answers a sync with `plaidCode: "ITEM_LOGIN_REQUIRED"`.
 Open Link with `createPlaidLinkToken(itemId: "…") { linkToken expiration }`:
@@ -1285,8 +1304,11 @@ bookkeeper's — and a read key is refused. `fetchBankTransactions` and
 `syncBank` share the bank's place at Plaid and run one at a time
 (`SYNC_IN_PROGRESS`): each transaction goes to whichever runs first, never
 both, and `syncBank` leaves what the inbox holds to the bookkeeper (its
-`inInbox`). The inbox is kept in `bank-inbox.json` in the company's folder on
-the bank node only, owner-only, and backed up with it; it never replicates.
+`inInbox`). With `plaid.webhookUrl` set, Plaid's "new transactions" webhook
+runs the fetch on its own (*Webhooks*; `plaid.webhookImport: "entries"` makes
+it import into the books instead). The inbox is kept in `bank-inbox.json` in
+the company's folder on the bank node only, owner-only, and backed up with it;
+it never replicates.
 A full inbox (20,000 waiting) stops a fetch before the page that would pass
 it, whose place at Plaid is not stored: refused with `BANK_INBOX_FULL`, or —
 once an earlier page was stored — answered with what it did and `stoppedBy`
@@ -1442,7 +1464,7 @@ need a new login, so the next sync shows `ITEM_LOGIN_REQUIRED` and
 `createPlaidLinkToken(itemId)` can be shown. Both are refused with
 `PLAID_SANDBOX_ONLY`, nothing sent, unless `plaid.environment` is `sandbox`.
 With `plaid.webhookUrl` set, `fireSandboxWebhook(itemId)` has the sandbox send
-the bank a `SYNC_UPDATES_AVAILABLE` webhook, which syncs it on its own
+the bank a `SYNC_UPDATES_AVAILABLE` webhook, which fetches it on its own
 ([Webhooks](#webhooks)).
 
 #### Webhooks
@@ -1484,7 +1506,7 @@ refused until it does. A verified call is answered at once, and then:
 
 | Plaid sends | The node |
 |---|---|
-| `TRANSACTIONS` `SYNC_UPDATES_AVAILABLE` | syncs the bank, as `syncBank` does; its entries carry no `enteredBy`, as no person made them. One such sync of a bank is queued at a time, and a webhook that comes while it is queued or running has it go once more; a sync already running is waited for (tried three more times, 30 s apart). It is one of the ledger's tasks, so a stop or restart ends it first |
+| `TRANSACTIONS` `SYNC_UPDATES_AVAILABLE` | fetches the bank's new transactions into the bank-feed inbox, as `fetchBankTransactions` does — or, with `plaid.webhookImport: "entries"`, imports them as `syncBank` does, entries carrying no `enteredBy` as no person made them. One such sync of a bank is queued at a time, and a webhook that comes while it is queued or running has it go once more; a sync already running is waited for (tried three more times, 30 s apart). It is one of the ledger's tasks, so a stop or restart ends it first |
 | `ITEM` `LOGIN_REPAIRED` | clears the bank's `lastNotice` at once, then syncs it as above |
 | `ITEM` `ERROR` | keeps Plaid's error code as the bank's `lastErrorCode` (`ITEM_LOGIN_REQUIRED`: log in again) |
 | `ITEM` `PENDING_EXPIRATION`, `PENDING_DISCONNECT`, `USER_PERMISSION_REVOKED`, `USER_ACCOUNT_REVOKED` | keeps that code as the bank's `lastNotice` (and `lastNoticeAt`), for the app to act on — a sync leaves it; logging in again clears it |
@@ -1492,8 +1514,11 @@ refused until it does. A verified call is answered at once, and then:
 | `TRANSACTIONS` `DEFAULT_UPDATE`, `INITIAL_UPDATE`, `HISTORICAL_UPDATE` | nothing: Plaid sends them beside `SYNC_UPDATES_AVAILABLE` and asks `/transactions/sync` clients to ignore them |
 | anything else about a bank this ledger holds | logs it (a webhook about no bank it holds is refused, above) |
 
-What a webhook-started sync imported or noted is in the node's log, as is
-anything it could not do; `connectedBanks` shows its `lastSyncedAt`.
+What a webhook-started fetch put in the inbox, imported or noted is in the
+node's log, as is anything it could not do; `connectedBanks` shows its
+`lastSyncedAt`. A full inbox (20,000 waiting) stops webhook fetches quietly —
+only the log says so, and `lastSyncedAt` stops moving — so watch
+`bankInbox { total }` where nobody books for a while.
 
 ### Several ledgers
 

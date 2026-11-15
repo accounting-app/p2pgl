@@ -1,6 +1,6 @@
 # Log: Bank-feed inbox
 
-Status: in progress.
+Status: done (2026-11-15, last commit e1a7812).
 
 One entry per commit-sized unit, newest last, written when the unit is ready
 to commit. The commit hash is filled in once the maintainer has committed.
@@ -124,4 +124,35 @@ to commit. The commit hash is filled in once the maintainer has committed.
   new).
 - **Departures from the plan:** the inbox is held for a whole call rather
   than per item (the review's finding); `plan.md` updated.
-- **Commit:** —
+- **Commit:** 58901f0
+
+## 2026-11-15 — Webhooks fill the inbox (unit 3)
+
+- **What changed:** `plaid.webhookImport` (`config.rs`, `WebhookImport`:
+  `"inbox"` the default, `"entries"`), kept by `PlaidService`
+  (`webhook_import`). `plaid_webhook::sync` runs `fetchBankTransactions` for
+  `inbox` and `syncBank` for `entries`, as the operator through the ledger's
+  schema as before (same queueing, same retry while one runs). Test
+  fixtures take a Plaid config (`fixture_with`, `mapped_with`). The
+  descriptions of `createPlaidLinkToken` and `lastNotice` say to pass the
+  update-mode public token to `connectBank` (left from 007 step 6d). README
+  (config row, *Webhooks* table, the inbox section), CHANGELOG *Added*.
+- **Tests:** `a_webhook_fills_the_inbox_by_default`;
+  `a_webhook_syncs_the_bank_on_its_own` now runs with `"entries"`;
+  `a_ledgers_plaid_section_is_checked` takes `webhookImport`.
+- **Review:** nothing important. The CHANGELOG had a *Breaking* entry for
+  the webhook default, but webhooks were never released (they came after
+  v0.3.0): the 007 step 6d entry now says what the webhook does, and the
+  *Breaking* entry is gone. The README says a full inbox stops webhook
+  fetches quietly (watch `bankInbox { total }`); `fireSandboxWebhook` and
+  the webhook log line say "fetch". OPERATIONS has no webhook text, so the
+  plan's mention of it needed nothing. Left: a full inbox shows in the log
+  only, not in `connectedBanks`.
+- **Gate:** `scripts/gate.sh` — passed (fmt, clippy, anchors, guard; 1755
+  tests passed, 0 failed); a first run failed fmt on an unformatted test
+  edit, fixed.
+- **Revert checks:** `scripts/revert_specs/bank_inbox.json` BI-R27, R28 — 2 of
+  2 bite; `plaid.json` PL-R85 and PL-R90 (on the `"entries"` test) still
+  bite.
+- **Departures from the plan:** none.
+- **Commit:** e1a7812

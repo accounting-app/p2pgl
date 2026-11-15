@@ -55,6 +55,6 @@ them (a typo, a one-line fix) gets no entry.
 | [004](004-no-python/) | No Python in the repo: revert checks and measurements in Rust, the git guard in shell | done (5adc9a4) |
 | [005](005-installer/) | A one-command production install on a Linux server (Docker, HTTPS, backups, upgrades) | step 7 of 7 (0.3.0, then the real-network rehearsal) in progress |
 | [006](006-list-accounts/) | List a ledger's accounts over GraphQL, posted to or not | done (54b4454) |
-| [007](007-plaid-commitments/) | Keep what we told Plaid: bank connections, token secrecy, MFA before Link, retention in the installer | step 6e (one Plaid account, many companies) done; steps 1–2, 7 open |
-| [008](008-bank-feed-inbox/) | Bank-feed inbox: fetched bank transactions wait for a bookkeeper to classify them before any entry is written | unit 2 of 3 (booking and ignoring) in progress |
+| [007](007-plaid-commitments/) | Keep what we told Plaid: bank connections, token secrecy, MFA before Link, retention in the installer | step 6f (OAuth redirect URI) done; steps 1–2, 7 on hold |
+| [008](008-bank-feed-inbox/) | Bank-feed inbox: fetched bank transactions wait for a bookkeeper to classify them before any entry is written | done (3 of 3, e1a7812) |
 | — | Relay with a company's own certificate authority (`relayCaCert`) | planned (decision C, 2026-10-09) |

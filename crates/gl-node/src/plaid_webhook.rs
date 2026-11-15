@@ -13,9 +13,11 @@
 //! bank it holds is refused, 401, as an unverified call is):
 //!
 //! - `TRANSACTIONS` `SYNC_UPDATES_AVAILABLE`, `ITEM` `LOGIN_REPAIRED` (which
-//!   also clears the bank's consent notice): a `syncBank` of the bank, in the
+//!   also clears the bank's consent notice): a fetch of the bank, in the
 //!   background, as one of the ledger's tasks, run as the node's operator —
-//!   its entries carry no `enteredBy` (decision 12);
+//!   into the bank-feed inbox (`fetchBankTransactions`, 008), or with
+//!   `plaid.webhookImport: "entries"` a `syncBank`, whose entries carry no
+//!   `enteredBy` (decision 12);
 //! - `ITEM` `ERROR`: Plaid's error code kept on the bank (`lastErrorCode`);
 //! - `ITEM` `PENDING_EXPIRATION`, `PENDING_DISCONNECT`,
 //!   `USER_PERMISSION_REVOKED`, `USER_ACCOUNT_REVOKED`: that code kept as the
@@ -244,7 +246,7 @@ pub(crate) async fn handle(
     let work = async move {
         if let Some(mut queued) = queued {
             loop {
-                sync(&schema, &item_id).await;
+                sync(&schema, &item_id, plaid.webhook_import()).await;
                 if !queued.go_again() {
                     break;
                 }
@@ -271,12 +273,20 @@ pub(crate) async fn handle(
 
 const SYNC: &str = "mutation($item: String!) { syncBank(itemId: $item) { imported alreadyImported needsReview { transactionId } stoppedBy } }";
 
-/// A `syncBank` of `item_id` as the operator, through the ledger's own
-/// schema, so it is the same sync an admin runs. One already running is
-/// waited for: tried again up to three times, 30 seconds apart.
-async fn sync(schema: &AppSchema, item_id: &str) {
+const FETCH: &str = "mutation($item: String!) { fetchBankTransactions(itemId: $item) { added updated dropped needsReview { transactionId } stoppedBy } }";
+
+/// A webhook's fetch of `item_id` as the operator, through the ledger's own
+/// schema, so it is the same one an admin runs: into the bank-feed inbox
+/// (`fetchBankTransactions`, 008), or with `plaid.webhookImport: "entries"`
+/// straight into the books (`syncBank`). One already running is waited for:
+/// tried again up to three times, 30 seconds apart.
+async fn sync(schema: &AppSchema, item_id: &str, import: crate::config::WebhookImport) {
+    let query = match import {
+        crate::config::WebhookImport::Inbox => FETCH,
+        crate::config::WebhookImport::Entries => SYNC,
+    };
     for attempt in 0..4 {
-        let request = async_graphql::Request::new(SYNC)
+        let request = async_graphql::Request::new(query)
             .variables(async_graphql::Variables::from_json(
                 serde_json::json!({ "item": item_id }),
             ))
@@ -295,9 +305,9 @@ async fn sync(schema: &AppSchema, item_id: &str) {
             continue;
         }
         match response.errors.first() {
-            None => info!(item_id = %item_id, "a webhook's sync ran"),
+            None => info!(item_id = %item_id, ?import, "a webhook's fetch ran"),
             Some(error) => {
-                warn!(item_id = %item_id, error = %error.message, "a webhook's sync failed")
+                warn!(item_id = %item_id, ?import, error = %error.message, "a webhook's fetch failed")
             }
         }
         return;

@@ -390,6 +390,35 @@ pub struct PlaidConfig {
     /// Unset, no webhooks are asked for and banks are synced on demand.
     #[serde(default)]
     pub webhook_url: Option<String>,
+
+    /// What a webhook's "new transactions" does (008 unit 3): `inbox` (the
+    /// default) fetches them into the bank-feed inbox for a bookkeeper to book;
+    /// `entries` imports them as `syncBank` does, flagged `!` against
+    /// `suspenseAccount`.
+    #[serde(default)]
+    pub webhook_import: WebhookImport,
+
+    /// Where Plaid Link comes back to after a bank's own login page (OAuth:
+    /// many large US banks), 007 step 6f: a page of the client app, also listed
+    /// in the Plaid Dashboard under *Allowed redirect URIs*. `https://` only; in
+    /// the sandbox also `http://localhost`, for a client app run locally. No
+    /// query string, fragment or `@` (Plaid adds its own query). Unset, link
+    /// tokens carry none, and banks that log in through their own site may not
+    /// connect, on mobile above all.
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
+}
+
+/// What a webhook's "new transactions" does: `plaid.webhookImport` (008).
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum WebhookImport {
+    /// Into the bank-feed inbox (`fetchBankTransactions`): nothing reaches
+    /// the books until a bookkeeper books it.
+    #[default]
+    Inbox,
+    /// Straight into the books (`syncBank`).
+    Entries,
 }
 
 impl Default for PlaidConfig {
@@ -400,6 +429,8 @@ impl Default for PlaidConfig {
             client_name: default_plaid_client_name(),
             suspense_account: default_plaid_suspense_account(),
             webhook_url: None,
+            webhook_import: WebhookImport::default(),
+            redirect_uri: None,
         }
     }
 }
@@ -464,6 +495,25 @@ impl PlaidConfig {
             if !fine {
                 return Err(ConfigError::Validation(
                     "plaid.webhookUrl must be an https:// address of at most 2,000 characters"
+                        .to_owned(),
+                ));
+            }
+        }
+        if let Some(uri) = &self.redirect_uri {
+            // Plaid takes no query string (it adds its own), and a fragment
+            // would swallow it; `@` would put a user name before the host.
+            let local = self.environment == PlaidEnvironment::Sandbox
+                && uri
+                    .strip_prefix("http://localhost")
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with([':', '/']));
+            let fine = (local || (uri.starts_with("https://") && uri.len() > "https://".len()))
+                && uri.len() <= 2_000
+                && !uri
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '?' | '#' | '@'));
+            if !fine {
+                return Err(ConfigError::Validation(
+                    "plaid.redirectUri must be an https:// address of at most 2,000 bytes, without ?, # or @ (in the sandbox, http://localhost also)"
                         .to_owned(),
                 ));
             }
@@ -3099,6 +3149,41 @@ mod tests {
             write(&format!(r#"{{ "plaid": {{ "webhookUrl": "{bad}" }} }}"#));
             let error = LedgerConfig::load_folder(&folder).expect_err(bad);
             assert!(format!("{error}").contains("plaid.webhookUrl"), "{error}");
+        }
+        assert_eq!(
+            config.plaid.webhook_import,
+            WebhookImport::Inbox,
+            "the default"
+        );
+        write(r#"{ "plaid": { "webhookImport": "entries" } }"#);
+        let config = LedgerConfig::load_folder(&folder).expect("loads");
+        assert_eq!(config.plaid.webhook_import, WebhookImport::Entries);
+        write(r#"{ "plaid": { "webhookImport": "books" } }"#);
+        assert!(
+            LedgerConfig::load_folder(&folder).is_err(),
+            "inbox or entries only"
+        );
+        for good in [
+            r#"{ "plaid": { "redirectUri": "https://app.example.com/plaid/oauth" } }"#,
+            r#"{ "plaid": { "redirectUri": "http://localhost:3000/oauth" } }"#,
+        ] {
+            write(good);
+            let config = LedgerConfig::load_folder(&folder).expect(good);
+            assert!(config.plaid.redirect_uri.is_some());
+        }
+        for bad in [
+            r#"{ "plaid": { "redirectUri": "http://app.example.com/oauth" } }"#,
+            r#"{ "plaid": { "redirectUri": "http://localhost.example.com" } }"#,
+            r#"{ "plaid": { "environment": "production", "redirectUri": "http://localhost:3000" } }"#,
+            r#"{ "plaid": { "redirectUri": "https://" } }"#,
+            r#"{ "plaid": { "redirectUri": "https://app.example.com/oauth?from=plaid" } }"#,
+            r#"{ "plaid": { "redirectUri": "https://app.example.com/oauth#done" } }"#,
+            r#"{ "plaid": { "redirectUri": "http://localhost:@evil.example.com/cb" } }"#,
+            r#"{ "plaid": { "redirectUri": "http://127.0.0.1:3000" } }"#,
+        ] {
+            write(bad);
+            let error = LedgerConfig::load_folder(&folder).expect_err(bad);
+            assert!(format!("{error}").contains("plaid.redirectUri"), "{error}");
         }
     }
 

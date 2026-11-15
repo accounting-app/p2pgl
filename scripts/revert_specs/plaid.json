@@ -806,5 +806,17 @@
     "old": "                if config.plaid.enabled && plaid.is_none() {",
     "new": "                if false && config.plaid.enabled && plaid.is_none() {",
     "runs": [["-p", "gl-node", "--bin", "gl-node", "plaid_ledgers_in_another_environment_are_refused"]]
+  },
+  "PL-R125-link-token-without-the-redirect-uri": {
+    "file": "crates/gl-node/src/plaid.rs",
+    "old": "            body[\"redirect_uri\"] = json!(uri);\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "the_redirect_uri_rides_on_every_link_token"]]
+  },
+  "PL-R126-redirect-uri-any-http": {
+    "file": "crates/gl-node/src/config.rs",
+    "old": "let local = self.environment == PlaidEnvironment::Sandbox",
+    "new": "let local = true || self.environment == PlaidEnvironment::Sandbox",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_ledgers_plaid_section_is_checked"]]
   }
 }

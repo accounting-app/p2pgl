@@ -965,6 +965,11 @@ pub(crate) struct PlaidService {
     suspense_account: String,
     /// `plaid.webhookUrl`: carried by new link tokens (step 6d).
     webhook_url: Option<String>,
+    /// `plaid.webhookImport`: what a webhook's "new transactions" does (008).
+    webhook_import: crate::config::WebhookImport,
+    /// `plaid.redirectUri`: where Link comes back to after a bank's own login
+    /// (OAuth), carried by every link token (step 6f).
+    redirect_uri: Option<String>,
     /// Plaid's webhook keys as this node knows them: one for every ledger on
     /// it, as they are one Plaid account's ([`PlaidEnv::webhook_keys`]).
     keys: Arc<WebhookKeys>,
@@ -1031,6 +1036,8 @@ impl PlaidService {
             client_name: config.client_name.clone(),
             suspense_account: config.suspense_account.clone(),
             webhook_url: config.webhook_url.clone(),
+            webhook_import: config.webhook_import,
+            redirect_uri: config.redirect_uri.clone(),
             keys: Arc::clone(env.webhook_keys.of(config.environment)),
             webhook_syncs: std::sync::Mutex::default(),
             environment: config.environment,
@@ -1098,6 +1105,11 @@ impl PlaidService {
         }
         if let Some(url) = &self.webhook_url {
             body["webhook"] = json!(url);
+        }
+        // Banks that log in through their own site (OAuth) send the person back
+        // here — for a login again too.
+        if let Some(uri) = &self.redirect_uri {
+            body["redirect_uri"] = json!(uri);
         }
         let created: LinkTokenCreated = self.client.call("/link/token/create", body).await?;
         Ok(LinkToken {
@@ -1339,6 +1351,11 @@ impl PlaidService {
     /// The account on the other side of every imported transaction.
     pub(crate) fn suspense_account(&self) -> &str {
         &self.suspense_account
+    }
+
+    /// What a webhook's "new transactions" does (`plaid.webhookImport`, 008).
+    pub(crate) fn webhook_import(&self) -> crate::config::WebhookImport {
+        self.webhook_import
     }
 
     /// The item already connected that `connection` is the same bank as: the
@@ -3532,6 +3549,45 @@ pub(crate) mod tests {
         assert!(matches!(error, PlaidError::NoSuchBank(_)), "{error}");
         assert_eq!(connected_item_count(dir.path()).unwrap(), 0);
         assert!(plaid.connections().await.unwrap().is_empty());
+    }
+
+    /// 007 step 6f: with `plaid.redirectUri`, every link token carries it —
+    /// a new bank's and a login again's — so a bank that logs in through its
+    /// own site (OAuth) sends the person back to the client app; without
+    /// it, none is sent.
+    ///
+    /// Bug-catch: a link token without the address leaves Link unable to
+    /// finish at the large banks that log in through their own site.
+    #[tokio::test]
+    async fn the_redirect_uri_rides_on_every_link_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = MockPlaid::default();
+        let env = env();
+        let plaid = service(&mock, dir.path(), &env).await;
+        plaid.create_link_token("operator", None).await.unwrap();
+        assert!(mock.body_of("/link/token/create").unwrap()["redirect_uri"].is_null());
+        plaid.close().await;
+        drop(plaid);
+
+        let uri = "https://app.example.com/plaid/oauth";
+        let with_uri = PlaidConfig {
+            redirect_uri: Some(uri.to_owned()),
+            ..enabled()
+        };
+        let plaid = service_in(&mock, dir.path(), &env, with_uri).await;
+        plaid.create_link_token("operator", None).await.unwrap();
+        assert_eq!(
+            mock.body_of("/link/token/create").unwrap()["redirect_uri"],
+            uri
+        );
+        plaid.connect(connect_token()).await.unwrap();
+        plaid
+            .create_link_token("operator", Some(ITEM_ID))
+            .await
+            .unwrap();
+        let again = mock.body_of("/link/token/create").unwrap();
+        assert_eq!(again["redirect_uri"], uri, "a login again too");
+        assert_eq!(again["access_token"], ACCESS_TOKEN);
     }
 
     /// With `plaid.webhookUrl`, new link tokens carry it and

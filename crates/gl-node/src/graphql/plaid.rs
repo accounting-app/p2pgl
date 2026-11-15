@@ -42,7 +42,8 @@ pub struct ConnectedBank {
     /// Plaid's last consent notice for it, from a webhook —
     /// `PENDING_EXPIRATION`, `PENDING_DISCONNECT` (log in again before access
     /// ends), `USER_PERMISSION_REVOKED`, `USER_ACCOUNT_REVOKED`. A sync leaves
-    /// it; a repaired login clears it.
+    /// it; a repaired login clears it, as does logging in again through Link
+    /// with the public token passed to `connectBank`.
     pub last_notice: Option<String>,
     /// When that notice came (RFC 3339, UTC).
     pub last_notice_at: Option<String>,
@@ -719,6 +720,13 @@ pub(super) mod tests {
 
     /// A ledger's schema, with Plaid on (against a mock) or off.
     pub(in crate::graphql) async fn fixture(plaid_on: bool) -> Fixture {
+        fixture_with(plaid_on.then(mock::enabled)).await
+    }
+
+    /// [`fixture`] with Plaid on under `config`, or off.
+    pub(in crate::graphql) async fn fixture_with(
+        config: Option<crate::config::PlaidConfig>,
+    ) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let service = ledger::service::LedgerService::boot(
             dir.path().join("ledger.bean"),
@@ -727,11 +735,10 @@ pub(super) mod tests {
         .unwrap();
         let ledger: SharedLedger = Arc::new(RwLock::new(service));
         let mock = MockPlaid::default();
-        let plaid = if plaid_on {
+        let plaid = if let Some(config) = config {
             let url = mock.serve().await;
             let service =
-                PlaidService::start_at("acme", dir.path(), &mock::enabled(), &mock::env(), &url)
-                    .unwrap();
+                PlaidService::start_at("acme", dir.path(), &config, &mock::env(), &url).unwrap();
             Some(Arc::new(service))
         } else {
             None
@@ -932,7 +939,15 @@ pub(super) mod tests {
     /// (and, when `suspense`, `Expenses:Uncategorized`) open since 2026-01-01,
     /// and the bank's checking account mapped to it.
     pub(in crate::graphql) async fn mapped(suspense: bool) -> Fixture {
-        let fixture = fixture(true).await;
+        mapped_with(suspense, mock::enabled()).await
+    }
+
+    /// [`mapped`] with Plaid on under `config`.
+    pub(in crate::graphql) async fn mapped_with(
+        suspense: bool,
+        config: crate::config::PlaidConfig,
+    ) -> Fixture {
+        let fixture = fixture_with(Some(config)).await;
         let mut accounts = vec!["Assets:Bank:Checking"];
         if suspense {
             accounts.push("Expenses:Uncategorized");
@@ -1692,14 +1707,62 @@ pub(super) mod tests {
         false
     }
 
-    /// Plaid's "new transactions" webhook syncs the bank on its own; its
-    /// entries carry no `enteredBy`, as no person made them.
+    /// By default (`plaid.webhookImport` left out), Plaid's "new
+    /// transactions" webhook fetches into the bank-feed inbox on its own (008
+    /// unit 3): the transaction waits there for a bookkeeper, and the books
+    /// are unchanged.
+    ///
+    /// Bug-catch: a webhook that still runs `syncBank` writes `!` entries
+    /// for a company that chose to have every transaction booked by a person.
+    #[tokio::test]
+    async fn a_webhook_fills_the_inbox_by_default() {
+        let fixture = mapped(true).await;
+        fixture.mock.sync_page(page(
+            vec![mock::sync_transaction(
+                "t1",
+                "acc1",
+                3.0,
+                "2026-11-01",
+                false,
+            )],
+            vec![],
+            vec![],
+        ));
+        let (headers, body) =
+            signed_webhook(&fixture, "TRANSACTIONS", "SYNC_UPDATES_AVAILABLE", None);
+        assert_eq!(
+            deliver(&fixture, &headers, body).await,
+            axum::http::StatusCode::OK
+        );
+        let plaid = Arc::clone(fixture.plaid.as_ref().unwrap());
+        let waiting = eventually(async || {
+            plaid
+                .open_inbox()
+                .await
+                .is_ok_and(|open| open.inbox.contents().waiting.contains_key("t1"))
+        })
+        .await;
+        assert!(waiting, "the webhook fetched t1 into the inbox");
+        let journal = operator(&fixture.schema, "{ journal { links } }").await;
+        assert!(!journal.to_string().contains("plaid-t1"), "{journal}");
+    }
+
+    /// With `plaid.webhookImport: "entries"`, Plaid's "new transactions"
+    /// webhook syncs the bank on its own; its entries carry no `enteredBy`, as
+    /// no person made them.
     ///
     /// Bug-catch: a webhook that only answers 200 imports nothing until an
     /// admin syncs, which is what webhooks were added to end.
     #[tokio::test]
     async fn a_webhook_syncs_the_bank_on_its_own() {
-        let fixture = mapped(true).await;
+        let fixture = mapped_with(
+            true,
+            crate::config::PlaidConfig {
+                webhook_import: crate::config::WebhookImport::Entries,
+                ..mock::enabled()
+            },
+        )
+        .await;
         fixture.mock.sync_page(page(
             vec![mock::sync_transaction(
                 "t1",
