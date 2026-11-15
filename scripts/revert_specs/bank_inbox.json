@@ -1,0 +1,104 @@
+{
+  "BI-R1-inbox-kept-in-memory-only": {
+    "file": "crates/gl-node/src/bank_inbox.rs",
+    "old": "        self.persist(&next)?;\n",
+    "new": "",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "the_inbox_survives_a_reopen"],
+      ["-p", "gl-node", "--bin", "gl-node", "a_fetch_fills_the_inbox_and_writes_nothing"]
+    ]
+  },
+  "BI-R2-a-foreign-inbox-file-read": {
+    "file": "crates/gl-node/src/bank_inbox.rs",
+    "old": "    if file.version != FORMAT_VERSION {",
+    "new": "    if false && file.version != FORMAT_VERSION {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_foreign_file_or_a_full_inbox_is_refused"]]
+  },
+  "BI-R3-inbox-uncapped": {
+    "file": "crates/gl-node/src/bank_inbox.rs",
+    "old": "        if next.waiting.len() > MAX_WAITING && next.waiting.len() > self.contents.waiting.len() {",
+    "new": "        if false && next.waiting.len() > MAX_WAITING && next.waiting.len() > self.contents.waiting.len() {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_foreign_file_or_a_full_inbox_is_refused"]]
+  },
+  "BI-R4-inbox-keeps-plaids-sign": {
+    "file": "crates/gl-node/src/graphql/bank_inbox.rs",
+    "old": "                            amount: -transaction.amount,",
+    "new": "                            amount: transaction.amount,",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_fetch_fills_the_inbox_and_writes_nothing"]]
+  },
+  "BI-R5-plaids-change-not-taken": {
+    "file": "crates/gl-node/src/bank_inbox.rs",
+    "old": "            if *waiting != now {",
+    "new": "            if false && *waiting != now {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "plaids_changes_reach_what_still_waits"]]
+  },
+  "BI-R6-a-removed-transaction-kept-waiting": {
+    "file": "crates/gl-node/src/bank_inbox.rs",
+    "old": "            if self.waiting.remove(id).is_some() {",
+    "new": "            if self.waiting.get(id).is_some() {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "plaids_changes_reach_what_still_waits"]]
+  },
+  "BI-R7-a-waiting-transaction-added-again": {
+    "file": "crates/gl-node/src/graphql/bank_inbox.rs",
+    "old": "if contents.holds(id) {",
+    "new": "if false && contents.holds(id) {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "plaids_changes_reach_what_still_waits"]]
+  },
+  "BI-R8-inbox-open-to-read-keys": {
+    "file": "crates/gl-node/src/access_control.rs",
+    "old": "pub const WRITE_QUERY_FIELDS: &[&str] = &[\"bankInbox\"];",
+    "new": "pub const WRITE_QUERY_FIELDS: &[&str] = &[];",
+    "runs": [
+      ["-p", "gl-node", "--bin", "gl-node", "the_inbox_is_a_bookkeepers_and_fetching_an_admins"],
+      ["-p", "gl-node", "--bin", "gl-node", "the_bank_inbox_needs_a_write_key"]
+    ]
+  },
+  "BI-R9-fetch-open-to-write-keys": {
+    "file": "crates/gl-node/src/access_control.rs",
+    "old": "    \"fetchBankTransactions\",\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "the_inbox_is_a_bookkeepers_and_fetching_an_admins"]]
+  },
+  "BI-R10-sync-books-what-the-inbox-holds": {
+    "file": "crates/gl-node/src/graphql/plaid.rs",
+    "old": "if open.inbox.contents().holds(id) {",
+    "new": "if false && open.inbox.contents().holds(id) {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "sync_bank_leaves_the_inbox_alone"]]
+  },
+  "BI-R11-sync-drops-plaids-changes-to-what-waits": {
+    "file": "crates/gl-node/src/graphql/plaid.rs",
+    "old": "                        .take_plaid_changes(page.added.iter().chain(&page.modified), &page.removed)",
+    "new": "                        .take_plaid_changes(std::iter::empty(), &[])",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "sync_bank_takes_plaids_changes_to_what_waits"]]
+  },
+  "BI-R12-a-transaction-sent-again-kept-as-it-was": {
+    "file": "crates/gl-node/src/graphql/bank_inbox.rs",
+    "old": "                    .take_plaid_changes(page.added.iter().chain(&page.modified), &page.removed);",
+    "new": "                    .take_plaid_changes(page.modified.iter(), &page.removed);",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_transaction_sent_again_is_taken_as_it_is_now"]]
+  },
+  "BI-R13-a-booked-transaction-sent-again-unreported": {
+    "file": "crates/gl-node/src/graphql/bank_inbox.rs",
+    "old": "                        if entry.date != transaction.date\n                            || entry",
+    "new": "                        if false\n                            && entry",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_transaction_sent_again_is_taken_as_it_is_now"]]
+  },
+  "BI-R14-fetch-takes-what-the-books-hold": {
+    "file": "crates/gl-node/src/graphql/bank_inbox.rs",
+    "old": "                    if let Some(entry) = held.get(&import_link(id)) {",
+    "new": "                    if let Some(entry) = held.get(\"no-such-link\") {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_transaction_sent_again_is_taken_as_it_is_now"]]
+  },
+  "BI-R15-page-passed-though-the-inbox-failed": {
+    "file": "crates/gl-node/src/graphql/bank_inbox.rs",
+    "old": "            Err(error) => return stopped(fetch, &item_id, stored_a_page, failed(error.into())),",
+    "new": "            Err(_) => {}",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_page_is_not_passed_until_the_inbox_holds_it"]]
+  },
+  "BI-R16-a-disconnected-banks-transactions-kept-waiting": {
+    "file": "crates/gl-node/src/graphql/plaid.rs",
+    "old": "                    .retain(|_, transaction| transaction.item_id != item_id);",
+    "new": "                    .retain(|_, _| true);",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "sync_bank_takes_plaids_changes_to_what_waits"]]
+  }
+}

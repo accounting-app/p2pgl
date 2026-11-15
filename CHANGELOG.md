@@ -49,6 +49,14 @@ break compatibility.
 
 ### Added
 
+- The bank-feed inbox (008, unit 1): `fetchBankTransactions(itemId)` (admin)
+  fetches a bank's new posted transactions into the company's inbox without
+  writing to the books; `bankInbox` (a **write** key; a read key is refused)
+  lists them with their amount, payee, description and Plaid's category as a
+  hint. `syncBank` shares the bank's place at Plaid with it, leaves what the
+  inbox holds (`inInbox`), and is otherwise unchanged. The inbox is
+  `bank-inbox.json` in the company's folder on the bank node (README *The
+  bank-feed inbox*).
 - Bank connections through Plaid, on one node per company (`plaid.enabled`,
   `plaid.environment`, `plaid.clientName` in a ledger's config;
   `GL_NODE_PLAID_CLIENT_ID`, `GL_NODE_PLAID_SECRET`, `GL_NODE_SECRETS_KEY` in

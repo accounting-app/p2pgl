@@ -1085,15 +1085,16 @@ Each request is checked against the caller's role **before anything runs**:
 
 | Role | May |
 |---|---|
-| `read` | Every query: reports, balances, the journal, `verify` |
-| `write` | Also every mutation: transactions, opening and closing accounts |
-| `admin` | Also manage people: `grantAccess`, `revokeAccess`, `renameUser`, `accessList` |
+| `read` | Every query but the bank inbox: reports, balances, the journal, `verify` |
+| `write` | Also every mutation: transactions, opening and closing accounts; and the bank inbox (`bankInbox`, 008) |
+| `admin` | Also manage people: `grantAccess`, `revokeAccess`, `renameUser`, `accessList`; and banks (*Bank connections (Plaid)*) |
 
 The rule goes by operation type, so a mutation added later needs `write`
-without anyone guarding it. A request mixing several operations, aliases or
-fragments is held to the strictest thing in it. A missing or unknown key gets
-**HTTP 401**; a known key whose role is too low gets HTTP 200 with a GraphQL
-error coded **`FORBIDDEN`**, and nothing runs.
+without anyone guarding it; the few queries that need more are listed in
+one place (`WRITE_QUERY_FIELDS`, `ADMIN_FIELDS`). A request mixing several
+operations, aliases or fragments is held to the strictest thing in it. A
+missing or unknown key gets **HTTP 401**; a known key whose role is too low
+gets HTTP 200 with a GraphQL error coded **`FORBIDDEN`**, and nothing runs.
 
 **A local node needs no setup.** With a loopback `bindAddress` and no
 `auth.apiKey` (and no `GL_NODE_API_KEY`), the first boot generates a random
@@ -1267,20 +1268,47 @@ the accounts already known keep their mappings (one Plaid no longer lists is
 kept). `unmapBankAccount(itemId, accountId)` stops an account's import; it is
 refused while the bank syncs (`SYNC_IN_PROGRESS`).
 
+**The bank-feed inbox** (build-log 008). Instead of writing entries,
+`fetchBankTransactions(itemId)` (admin) puts a bank's new posted transactions
+in the company's **inbox**, writing nothing to the books, and answers with
+what it did: `added`, `updated` and `dropped` (Plaid changed or removed a
+transaction still waiting), `alreadyBooked`, `alreadyInInbox`, the skipped
+counts, `needsReview` and `stoppedBy`, as `syncBank` does. Only mapped
+accounts' transactions from their `importFrom` on are fetched; pending ones
+wait until the bank posts them. `bankInbox(itemId, first, offset) { total
+transactions { transactionId institutionName accountName accountMask
+ledgerAccount date amount { number currency } payee description category } }`
+lists what waits, oldest first: the amount as the bank account's posting will
+carry it (money out negative), Plaid's merchant as `payee`, the bank's text as
+`description`, Plaid's `category` as a hint. It needs a **write** key — the
+bookkeeper's — and a read key is refused. `fetchBankTransactions` and
+`syncBank` share the bank's place at Plaid and run one at a time
+(`SYNC_IN_PROGRESS`): each transaction goes to whichever runs first, never
+both, and `syncBank` leaves what the inbox holds to the bookkeeper (its
+`inInbox`). The inbox is kept in `bank-inbox.json` in the company's folder on
+the bank node only, owner-only, and backed up with it; it never replicates.
+A full inbox (20,000 waiting) stops a fetch before the page that would pass
+it, whose place at Plaid is not stored: refused with `BANK_INBOX_FULL`, or —
+once an earlier page was stored — answered with what it did and `stoppedBy`
+saying the inbox is full. `syncBank` also takes Plaid's changes to what waits
+(a corrected amount, a removal), and `disconnectBank` drops the bank's
+waiting transactions.
+
 All the Plaid mutations — `createPlaidLinkToken`, `connectBank`,
 `disconnectBank`, `mapBankAccount`, `unmapBankAccount`, `refreshBankAccounts`,
-`syncBank`, `updateBankWebhooks` and the sandbox helpers below — need an
-**admin** key. Refusals carry a code: `PLAID_NOT_ENABLED`,
+`syncBank`, `fetchBankTransactions`, `updateBankWebhooks` and the sandbox
+helpers below — need an **admin** key. Refusals carry a code: `PLAID_NOT_ENABLED`,
 `BANK_ALREADY_CONNECTED` (Link connected a bank this ledger holds already, the
 same institution and accounts: the new connection is removed at Plaid),
 `NO_SUCH_BANK`, `ACCOUNT_NOT_OPEN`, `SYNC_IN_PROGRESS` (one sync of a bank at
 a time), `PLAID_ERROR` (Plaid refused;
 Plaid's own code is in `extensions.plaidCode`, its message is never passed
 on), `PLAID_UNREACHABLE`, `PLAID_UNEXPECTED` (an answer this node will not
-store), `PLAID_ENVIRONMENT`, `SECRET_STORE` (the details are in the node's log)
-or `LEDGER_BUSY` (the ledger is stopping, restarting or being removed). A stop
-or restart waits for a bank operation under way — a connect or disconnect up
-to about 90 s when Plaid is slow; a sync is bounded by
+store), `PLAID_ENVIRONMENT`, `SECRET_STORE` and `BANK_INBOX` (the details are in
+the node's log), `BANK_INBOX_FULL` or `LEDGER_BUSY` (the ledger is stopping,
+restarting or being removed). A stop or restart waits for a bank operation
+under way — a connect or disconnect up to about 90 s when Plaid is slow; a
+sync is bounded by
 `http.requestTimeoutSeconds`, which ends one too long for it; the next sync
 goes on from its last page.
 Multi-factor sign-in before Link is the client app's job.

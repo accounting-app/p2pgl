@@ -300,6 +300,20 @@ impl QueryRoot {
         super::plaid::connected_banks(ctx).await
     }
 
+    /// The bank transactions waiting in this ledger's bank inbox (008), to be
+    /// booked by a bookkeeper: of bank `itemId`, or of every bank; oldest
+    /// first, `first` of them (at most 1000) from `offset`. A write key.
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
+    async fn bank_inbox(
+        &self,
+        ctx: &Context<'_>,
+        item_id: Option<String>,
+        #[graphql(default = 200)] first: u32,
+        #[graphql(default = 0)] offset: u32,
+    ) -> async_graphql::Result<super::bank_inbox::BankInboxPage> {
+        super::bank_inbox::bank_inbox(ctx, item_id, first as usize, offset as usize).await
+    }
+
     /// Verify DAG integrity and balance assertions (FR-5 AC1, §3.6).
     ///
     /// `ok`/`errors` cover the structural checks — content hashes (I5), parent

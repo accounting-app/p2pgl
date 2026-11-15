@@ -93,7 +93,7 @@ impl From<BankConnection> for ConnectedBank {
 
 /// This ledger's Plaid service on this node, or the refusal every other node
 /// gives.
-fn service<'a>(ctx: &Context<'a>) -> Result<&'a Arc<PlaidService>> {
+pub(super) fn service<'a>(ctx: &Context<'a>) -> Result<&'a Arc<PlaidService>> {
     ctx.data_opt::<Arc<PlaidService>>().ok_or_else(|| {
         async_graphql::Error::new(
             "Plaid is not enabled for this ledger on this node: one node per company holds its \
@@ -103,7 +103,7 @@ fn service<'a>(ctx: &Context<'a>) -> Result<&'a Arc<PlaidService>> {
     })
 }
 
-fn failed(error: PlaidError) -> async_graphql::Error {
+pub(super) fn failed(error: PlaidError) -> async_graphql::Error {
     let code = error.code();
     let plaid_code = error.plaid_code().map(str::to_owned);
     // A store failure names files on the node: logged here, not handed to a
@@ -112,6 +112,13 @@ fn failed(error: PlaidError) -> async_graphql::Error {
         PlaidError::Store(detail) => {
             tracing::warn!(error = %detail, "the secret store failed a Plaid request");
             "the node's secret store failed; its log says why".to_owned()
+        }
+        PlaidError::Inbox(
+            detail @ (crate::bank_inbox::InboxError::Io { .. }
+            | crate::bank_inbox::InboxError::Corrupt { .. }),
+        ) => {
+            tracing::warn!(error = %detail, "the bank inbox failed a request");
+            "the node's bank inbox failed; its log says why".to_owned()
         }
         _ => error.to_string(),
     };
@@ -124,7 +131,7 @@ fn failed(error: PlaidError) -> async_graphql::Error {
 }
 
 /// Plaid's `client_user_id` for the caller: their user id, or `operator`.
-fn client_user_id(ctx: &Context<'_>) -> String {
+pub(super) fn client_user_id(ctx: &Context<'_>) -> String {
     match ctx.data_opt::<Caller>().map(|caller| &caller.who) {
         Some(CallerId::User(id)) => id.clone(),
         _ => "operator".to_owned(),
@@ -210,7 +217,34 @@ pub(super) async fn reset_sandbox_login(ctx: &Context<'_>, item_id: String) -> R
 }
 
 pub(super) async fn disconnect_bank(ctx: &Context<'_>, item_id: String) -> Result<bool> {
-    service(ctx)?.disconnect(item_id).await.map_err(failed)
+    let plaid = service(ctx)?;
+    let disconnected = plaid.disconnect(item_id.clone()).await.map_err(failed)?;
+    if disconnected {
+        // Its transactions still waiting in the bank inbox (008) can no longer
+        // be booked — the bank's accounts and mappings are gone — and would
+        // count against the inbox's cap for good. Best effort: the bank is
+        // disconnected whatever this does.
+        let dropped = match plaid.open_inbox().await {
+            Ok(mut open) => open.inbox.update(|contents| {
+                let before = contents.waiting.len();
+                contents
+                    .waiting
+                    .retain(|_, transaction| transaction.item_id != item_id);
+                before - contents.waiting.len()
+            }),
+            Err(_) => Ok(0),
+        };
+        match dropped {
+            Ok(0) => {}
+            Ok(dropped) => {
+                tracing::info!(item_id = %item_id, dropped, "a disconnected bank's waiting transactions were dropped from the bank inbox")
+            }
+            Err(error) => {
+                tracing::warn!(item_id = %item_id, %error, "a disconnected bank's waiting transactions stay in the bank inbox")
+            }
+        }
+    }
+    Ok(disconnected)
 }
 
 pub(super) async fn connected_banks(ctx: &Context<'_>) -> Result<Vec<ConnectedBank>> {
@@ -226,6 +260,9 @@ pub struct BankSync {
     /// Transactions whose entry (`^plaid-<transaction id>`) the books already
     /// hold: skipped.
     pub already_imported: usize,
+    /// Transactions the bank inbox holds (008), waiting or ignored: left to the
+    /// bookkeeper, not imported.
+    pub in_inbox: usize,
     /// Pending transactions, skipped: imported once the bank posts them.
     pub skipped_pending: usize,
     /// Transactions of accounts not mapped to a ledger account: imported once
@@ -296,11 +333,11 @@ const ENTRY_REFUSALS: &[&str] = &[
     "DATE_OUT_OF_RANGE",
 ];
 
-fn refused(code: &'static str, message: String) -> async_graphql::Error {
+pub(super) fn refused(code: &'static str, message: String) -> async_graphql::Error {
     async_graphql::Error::new(message).extend_with(|_, ext| ext.set("code", code))
 }
 
-fn ledger<'a>(ctx: &Context<'a>) -> Result<&'a SharedLedger> {
+pub(super) fn ledger<'a>(ctx: &Context<'a>) -> Result<&'a SharedLedger> {
     ctx.data::<SharedLedger>().map_err(|_| {
         async_graphql::Error::new("Ledger service not initialized")
             .extend_with(|_, ext| ext.set("code", "INTERNAL"))
@@ -351,7 +388,7 @@ pub(super) async fn map_bank_account(
 }
 
 /// The link an imported transaction carries: how a repeated sync knows it.
-fn import_link(transaction_id: &str) -> String {
+pub(super) fn import_link(transaction_id: &str) -> String {
     format!("plaid-{transaction_id}")
 }
 
@@ -383,7 +420,7 @@ pub(super) async fn sync_bank(ctx: &Context<'_>, item_id: String) -> Result<Bank
     let Some(_syncing) = plaid.begin_sync(&item_id) else {
         return Err(refused(
             "SYNC_IN_PROGRESS",
-            format!("bank {item_id} is being synced already; try again once that ends"),
+            format!("bank {item_id} is being synced or fetched already; try again once that ends"),
         ));
     };
     let mut session = plaid.begin_fetch(&item_id).await.map_err(failed)?;
@@ -474,6 +511,21 @@ pub(super) async fn sync_bank(ctx: &Context<'_>, item_id: String) -> Result<Bank
                 );
                 continue;
             }
+            // The bank inbox (008), held until the entry is written: a
+            // transaction it holds is the bookkeeper's, and one booked from
+            // it since this sync read the books is not imported again.
+            let open = match plaid.open_inbox().await {
+                Ok(open) => open,
+                Err(error) => return stopped(sync, &item_id, stored_a_page, failed(error)),
+            };
+            if open.inbox.contents().holds(id) {
+                sync.in_inbox += 1;
+                continue;
+            }
+            if open.inbox.booked_lately(id) {
+                sync.already_imported += 1;
+                continue;
+            }
             let entry = TransactionInput {
                 date: transaction.date,
                 flag: Flag::Incomplete,
@@ -542,6 +594,26 @@ pub(super) async fn sync_bank(ctx: &Context<'_>, item_id: String) -> Result<Bank
                 );
             }
         }
+        // What waits in the bank inbox is the bookkeeper's, but Plaid's changes
+        // to it come to whichever fetch runs (008): taken here too, before the
+        // page's place at Plaid is stored, or they would never come again.
+        let taken = match plaid.open_inbox().await {
+            Ok(mut open) => open
+                .inbox
+                .update(|contents| {
+                    contents
+                        .take_plaid_changes(page.added.iter().chain(&page.modified), &page.removed)
+                })
+                .map_err(PlaidError::from),
+            Err(error) => Err(error),
+        };
+        match taken {
+            Ok((0, 0)) => {}
+            Ok((updated, dropped)) => {
+                tracing::info!(item_id = %item_id, updated, dropped, "Plaid's changes taken in the bank inbox")
+            }
+            Err(error) => return stopped(sync, &item_id, stored_a_page, failed(error)),
+        }
         match plaid.commit_page(&mut session, &page).await {
             Ok(true) => stored_a_page = true,
             Ok(false) => break,
@@ -568,14 +640,17 @@ pub(super) async fn sync_bank(ctx: &Context<'_>, item_id: String) -> Result<Bank
 }
 
 /// An imported entry as the books hold it: its date and the bank leg.
-struct HeldImport {
-    date: chrono::NaiveDate,
-    amount: Option<rust_decimal::Decimal>,
+pub(super) struct HeldImport {
+    pub(super) date: chrono::NaiveDate,
+    pub(super) amount: Option<rust_decimal::Decimal>,
 }
 
 /// Every entry in the books carrying an import link, by link: what a sync
 /// skips, and compares what Plaid sends again with.
-async fn held_imports(ledger: &SharedLedger, suspense: &str) -> HashMap<String, HeldImport> {
+pub(super) async fn held_imports(
+    ledger: &SharedLedger,
+    suspense: &str,
+) -> HashMap<String, HeldImport> {
     let ledger = ledger.read().await;
     let mut held = HashMap::new();
     for transaction in ledger.dag().transactions() {
@@ -619,7 +694,7 @@ fn stopped(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::sync::{Arc, Mutex};
 
     use serde_json::Value;
@@ -633,17 +708,17 @@ mod tests {
     };
     use crate::plaid::PlaidService;
 
-    struct Fixture {
-        _dir: tempfile::TempDir,
-        schema: AppSchema,
-        mock: MockPlaid,
-        plaid: Option<Arc<PlaidService>>,
+    pub(in crate::graphql) struct Fixture {
+        pub(in crate::graphql) _dir: tempfile::TempDir,
+        pub(in crate::graphql) schema: AppSchema,
+        pub(in crate::graphql) mock: MockPlaid,
+        pub(in crate::graphql) plaid: Option<Arc<PlaidService>>,
         /// The ledger's task list a webhook's work joins.
         tasks: crate::ledger_runtime::Tasks,
     }
 
     /// A ledger's schema, with Plaid on (against a mock) or off.
-    async fn fixture(plaid_on: bool) -> Fixture {
+    pub(in crate::graphql) async fn fixture(plaid_on: bool) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let service = ledger::service::LedgerService::boot(
             dir.path().join("ledger.bean"),
@@ -680,7 +755,7 @@ mod tests {
         }
     }
 
-    async fn run(schema: &AppSchema, role: Role, query: &str) -> Value {
+    pub(in crate::graphql) async fn run(schema: &AppSchema, role: Role, query: &str) -> Value {
         let caller = Caller {
             who: CallerId::User("u_0123456789abcdef".to_owned()),
             role,
@@ -691,7 +766,7 @@ mod tests {
         serde_json::to_value(&response).unwrap()
     }
 
-    fn code(body: &Value) -> Option<&str> {
+    pub(in crate::graphql) fn code(body: &Value) -> Option<&str> {
         body["errors"][0]["extensions"]["code"].as_str()
     }
 
@@ -846,7 +921,7 @@ mod tests {
         assert!(!body.to_string().contains(ERROR_MESSAGE_MARKER), "{body}");
     }
 
-    async fn operator(schema: &AppSchema, query: &str) -> Value {
+    pub(in crate::graphql) async fn operator(schema: &AppSchema, query: &str) -> Value {
         let response = schema
             .execute(async_graphql::Request::new(query).data(Caller::operator()))
             .await;
@@ -856,7 +931,7 @@ mod tests {
     /// A ledger with Plaid on, its bank connected, `Assets:Bank:Checking`
     /// (and, when `suspense`, `Expenses:Uncategorized`) open since 2026-01-01,
     /// and the bank's checking account mapped to it.
-    async fn mapped(suspense: bool) -> Fixture {
+    pub(in crate::graphql) async fn mapped(suspense: bool) -> Fixture {
         let fixture = fixture(true).await;
         let mut accounts = vec!["Assets:Bank:Checking"];
         if suspense {
@@ -890,10 +965,14 @@ mod tests {
         )
     }
 
-    const JOURNAL: &str =
+    pub(in crate::graphql) const JOURNAL: &str =
         "{ journal { date flag payee narration links postings { account amount { number currency } } } }";
 
-    fn page(added: Vec<Value>, changed: Vec<Value>, removed: Vec<&str>) -> Value {
+    pub(in crate::graphql) fn page(
+        added: Vec<Value>,
+        changed: Vec<Value>,
+        removed: Vec<&str>,
+    ) -> Value {
         serde_json::json!({
             "added": added, "modified": changed,
             "removed": removed.iter().map(|id| serde_json::json!({ "transaction_id": id })).collect::<Vec<_>>(),

@@ -3,8 +3,9 @@
 //! The auth middleware turns the request's key into a [`Caller`] and attaches
 //! it to the GraphQL request. [`AccessControl`], a schema extension, then judges
 //! the parsed request **before anything runs**: every query and subscription
-//! needs [`Role::Read`], every mutation [`Role::Write`], and the access-management
-//! fields in [`ADMIN_FIELDS`] [`Role::Admin`]. The rule is by operation type, so a
+//! needs [`Role::Read`], every mutation [`Role::Write`] — and so do the query
+//! fields in [`WRITE_QUERY_FIELDS`] (the bank inbox, 008) — and the fields in
+//! [`ADMIN_FIELDS`] [`Role::Admin`]. The rule is by operation type, so a
 //! mutation added later is closed to read keys without anyone remembering to
 //! guard it — deny by default. A document with several operations, aliases or
 //! fragments is held to the strictest thing anywhere in it.
@@ -86,7 +87,13 @@ pub const ADMIN_FIELDS: &[&str] = &[
     "resetSandboxLogin",
     "updateBankWebhooks",
     "fireSandboxWebhook",
+    "fetchBankTransactions",
 ];
+
+/// Query root fields that need a write key, not a read one: the bank-feed
+/// inbox (build-log 008) holds bank transactions not yet booked, which only
+/// a bookkeeper — who can book them — may see.
+pub const WRITE_QUERY_FIELDS: &[&str] = &["bankInbox"];
 
 /// The schema extension that enforces [`Role`]s; see the module doc.
 pub struct AccessControl;
@@ -139,16 +146,28 @@ fn forbidden(message: String) -> ServerError {
 }
 
 /// The strictest role anything in `document` needs: [`Role::Write`] for any
-/// mutation, [`Role::Admin`] for any root field in [`ADMIN_FIELDS`] (through
-/// fragments too), [`Role::Read`] otherwise.
+/// mutation or any root field in [`WRITE_QUERY_FIELDS`], [`Role::Admin`] for any
+/// root field in [`ADMIN_FIELDS`] (through fragments too), [`Role::Read`]
+/// otherwise.
 pub fn required_role(document: &ExecutableDocument) -> Role {
-    required_role_with(document, ADMIN_FIELDS)
+    required_role_with(document, ADMIN_FIELDS, WRITE_QUERY_FIELDS)
 }
 
-fn required_role_with(document: &ExecutableDocument, admin_fields: &[&str]) -> Role {
+fn required_role_with(
+    document: &ExecutableDocument,
+    admin_fields: &[&str],
+    write_fields: &[&str],
+) -> Role {
     let mut needed = Role::Read;
     for (_, operation) in document.operations.iter() {
-        if operation.node.ty == OperationType::Mutation {
+        if operation.node.ty == OperationType::Mutation
+            || root_fields_include_admin(
+                document,
+                write_fields,
+                &operation.node.selection_set.node,
+                &mut HashSet::new(),
+            )
+        {
             needed = needed.max(Role::Write);
         }
         if root_fields_include_admin(
@@ -202,7 +221,7 @@ mod tests {
 
     fn role_of(query: &str, admin_fields: &[&str]) -> Role {
         let document = async_graphql::parser::parse_query(query).expect("parses");
-        required_role_with(&document, admin_fields)
+        required_role_with(&document, admin_fields, &["bankInbox"])
     }
 
     /// The role a request needs (002-users-and-roles): read for queries, write
@@ -249,5 +268,26 @@ mod tests {
             Role::Read,
             "a fragment cycle ends"
         );
+    }
+
+    /// 008: the bank inbox is a query a read key may not make — directly,
+    /// aliased or through a fragment — and the real rule lists it.
+    ///
+    /// Bug-catch: the inbox left to the read rule shows a company's
+    /// unbooked bank transactions to every read key, viewers included.
+    #[test]
+    fn the_bank_inbox_needs_a_write_key() {
+        let admin = &["secretField"];
+        assert_eq!(role_of("{ bankInbox { total } }", admin), Role::Write);
+        assert_eq!(role_of("{ i: bankInbox { total } }", admin), Role::Write);
+        assert_eq!(
+            role_of(
+                "{ ...F } fragment F on QueryRoot { bankInbox { total } }",
+                admin
+            ),
+            Role::Write
+        );
+        assert!(WRITE_QUERY_FIELDS.contains(&"bankInbox"));
+        assert!(ADMIN_FIELDS.contains(&"fetchBankTransactions"));
     }
 }

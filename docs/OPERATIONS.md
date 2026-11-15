@@ -319,6 +319,7 @@ connecting node, so admitting or removing one needs no restart.
 | `ledgersDir/<name>/` (`data/ledgers/…`) | Each other ledger's folder: its `ledger.json`, `.bean`, journal and `iroh.secret`, the same files as above | **Yes**, every folder, its key apart like the node's |
 | `ledgersDir/.removed/` | Removed ledgers' folders, whole (*Adding a company*) | Yes, for as long as you must keep a former client's books |
 | `ledgersDir/<name>/secrets.json` | A company's bank tokens (Plaid), encrypted under `GL_NODE_SECRETS_KEY` | **Yes** (it is in `data/`); the key apart, in `/opt/openledger/secrets.env` — *Bank connections (Plaid)* |
+| `ledgersDir/<name>/bank-inbox.json` | A company's bank-feed inbox (008): bank transactions fetched and not yet booked, and the ignored ones; plain, owner-only, on the bank node only | **Yes** (it is in `data/`): Plaid does not send a transaction again once fetched, so one lost with the inbox before it was booked must be entered by hand from the bank statement. If the file cannot be read the company is not served (`docker logs openledger-node` names it): restore it from the last backup, or move it aside — the company is served again, and what it held must be entered by hand |
 
 **The node key** is the node's identity on the mesh and the key its records are
 signed with. Lose it and the node must rejoin under a new identity (every peer's

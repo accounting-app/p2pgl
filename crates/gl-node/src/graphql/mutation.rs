@@ -349,9 +349,23 @@ impl MutationRoot {
         super::plaid::reset_sandbox_login(ctx, item_id).await
     }
 
+    /// Fetch a bank's new posted transactions into the ledger's bank inbox,
+    /// writing nothing to the books (008): a bookkeeper books each from there.
+    /// Shares the bank's place at Plaid with `syncBank`: each transaction goes
+    /// to whichever runs first, never both. Admin only.
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
+    async fn fetch_bank_transactions(
+        &self,
+        ctx: &Context<'_>,
+        item_id: String,
+    ) -> Result<super::bank_inbox::BankFetch> {
+        super::bank_inbox::fetch_bank_transactions(ctx, item_id).await
+    }
+
     /// Import a bank's new posted transactions: one entry each, flagged `!`,
     /// against `plaid.suspenseAccount` (007 step 6). Run it again any time:
-    /// what the books hold already is skipped. Admin only.
+    /// what the books hold already is skipped, and so is what the bank inbox
+    /// holds (008). Admin only.
     #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
     async fn sync_bank(
         &self,

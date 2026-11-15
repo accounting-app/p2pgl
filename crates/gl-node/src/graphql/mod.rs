@@ -1,4 +1,5 @@
 pub mod access;
+pub mod bank_inbox;
 pub mod broadcast;
 pub mod inputs;
 pub mod mutation;

@@ -2,6 +2,7 @@ mod access_control;
 mod access_list;
 mod anti_entropy_alpn;
 mod auth;
+mod bank_inbox;
 mod config;
 mod connection_limiter;
 mod fetch_coordinator;

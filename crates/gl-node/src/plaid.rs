@@ -178,6 +178,8 @@ pub(crate) enum PlaidError {
     SandboxOnly,
     /// A webhook mutation on a ledger with no `plaid.webhookUrl`.
     NoWebhookUrl,
+    /// The ledger's bank inbox (008) could not be read or written, or is full.
+    Inbox(crate::bank_inbox::InboxError),
 }
 
 impl fmt::Display for PlaidError {
@@ -219,6 +221,7 @@ impl fmt::Display for PlaidError {
             Self::NoWebhookUrl => f.write_str(
                 "this ledger has no plaid.webhookUrl: set it in its config and restart it",
             ),
+            Self::Inbox(error) => write!(f, "{error}"),
         }
     }
 }
@@ -228,6 +231,12 @@ impl std::error::Error for PlaidError {}
 impl From<SecretStoreError> for PlaidError {
     fn from(error: SecretStoreError) -> Self {
         Self::Store(error)
+    }
+}
+
+impl From<crate::bank_inbox::InboxError> for PlaidError {
+    fn from(error: crate::bank_inbox::InboxError) -> Self {
+        Self::Inbox(error)
     }
 }
 
@@ -246,6 +255,8 @@ impl PlaidError {
             Self::SyncInProgress => "SYNC_IN_PROGRESS",
             Self::SandboxOnly => "PLAID_SANDBOX_ONLY",
             Self::NoWebhookUrl => "PLAID_NO_WEBHOOK_URL",
+            Self::Inbox(crate::bank_inbox::InboxError::Full(_)) => "BANK_INBOX_FULL",
+            Self::Inbox(_) => "BANK_INBOX",
         }
     }
 
@@ -504,6 +515,15 @@ struct SyncTransaction {
     merchant_name: Option<String>,
     #[serde(default)]
     pending: bool,
+    /// Plaid's category, read as a hint for the bookkeeper (008).
+    #[serde(default)]
+    personal_finance_category: Option<SyncCategory>,
+}
+
+#[derive(Deserialize)]
+struct SyncCategory {
+    #[serde(default)]
+    primary: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -556,6 +576,10 @@ impl SyncTransaction {
             date: self.date,
             name: cut(self.name, MAX_NARRATION_BYTES),
             merchant_name: cut(self.merchant_name, MAX_PAYEE_BYTES),
+            category: self
+                .personal_finance_category
+                .and_then(|category| category.primary)
+                .filter(|primary| check_id("category", primary).is_ok()),
         })
     }
 }
@@ -571,6 +595,8 @@ pub(crate) struct PostedTransaction {
     pub date: chrono::NaiveDate,
     pub name: Option<String>,
     pub merchant_name: Option<String>,
+    /// Plaid's category (`FOOD_AND_DRINK`, …), a hint for the bookkeeper.
+    pub category: Option<String>,
 }
 
 /// One page of a bank's transactions ([`PlaidService::next_page`]).
@@ -584,6 +610,11 @@ pub(crate) struct Page {
     /// reversed here. One id may come twice (changed, then removed); the
     /// sync notes each once.
     pub changed: Vec<String>,
+    /// Posted transactions Plaid changed since, as they are now: the bank
+    /// inbox updates one still waiting (008).
+    pub modified: Vec<PostedTransaction>,
+    /// Transactions Plaid removed: the bank inbox drops one still waiting.
+    pub removed: Vec<String>,
     /// Transactions Plaid sent that this node cannot read (a field missing or
     /// of the wrong kind, an id or amount it will not store): Plaid's id when
     /// it is one this node can repeat, and what is wrong. Noted, not imported.
@@ -775,6 +806,13 @@ impl Drop for QueuedSync {
     }
 }
 
+/// A ledger's bank inbox, locked, its ledger held open
+/// ([`PlaidService::open_inbox`]).
+pub(crate) struct OpenInbox<'a> {
+    _open: tokio::sync::RwLockReadGuard<'a, bool>,
+    pub inbox: tokio::sync::MutexGuard<'a, crate::bank_inbox::BankInbox>,
+}
+
 /// A bank marked as syncing ([`PlaidService::begin_sync`]); the mark is
 /// dropped with it.
 pub(crate) struct SyncGuard {
@@ -947,6 +985,10 @@ pub(crate) struct PlaidService {
     closing: std::sync::atomic::AtomicBool,
     /// The banks being synced now ([`Self::begin_sync`]).
     syncing: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The ledger's one bank inbox (008): transactions fetched and not yet
+    /// booked, and the ignored ones. Held from a check of the books to the
+    /// write that follows it, so no transaction is booked twice.
+    inbox: tokio::sync::Mutex<crate::bank_inbox::BankInbox>,
 }
 
 impl PlaidService {
@@ -981,6 +1023,8 @@ impl PlaidService {
             ));
         };
         let store = SecretStore::open(folder, ledger, key).map_err(|error| error.to_string())?;
+        let inbox =
+            crate::bank_inbox::BankInbox::open(folder).map_err(|error| error.to_string())?;
         let client = PlaidClient::new(base_url, Arc::clone(credentials))?;
         Ok(Self {
             client,
@@ -994,6 +1038,7 @@ impl PlaidService {
             closed: tokio::sync::RwLock::new(false),
             closing: std::sync::atomic::AtomicBool::new(false),
             syncing: std::sync::Mutex::default(),
+            inbox: tokio::sync::Mutex::new(inbox),
         })
     }
 
@@ -1508,15 +1553,24 @@ impl PlaidService {
             }
         }
         for value in raw.modified {
-            if let Ok(transaction) = serde_json::from_value::<SyncChanged>(value) {
+            if let Ok(transaction) = serde_json::from_value::<SyncChanged>(value.clone()) {
                 if !transaction.pending {
                     page.changed.push(transaction.transaction_id);
+                    // As it is now, for the bank inbox (008); one that does
+                    // not read is only noted as changed.
+                    if let Ok(posted) = serde_json::from_value::<SyncTransaction>(value)
+                        .map_err(|error| PlaidError::Unexpected(error.to_string()))
+                        .and_then(SyncTransaction::posted)
+                    {
+                        page.modified.push(posted);
+                    }
                 }
             }
         }
         for value in raw.removed {
             if let Ok(removed) = serde_json::from_value::<SyncRemoved>(value) {
-                page.changed.push(removed.transaction_id);
+                page.changed.push(removed.transaction_id.clone());
+                page.removed.push(removed.transaction_id);
             }
         }
         session.at = Some(raw.next_cursor);
@@ -1565,6 +1619,19 @@ impl PlaidService {
             .lock()
             .map(|syncing| syncing.contains(item_id))
             .unwrap_or(true)
+    }
+
+    /// The ledger's bank inbox (008), locked, with the `closed` gate held
+    /// open: a stopping ledger's inbox is not changed. While it is held, call
+    /// nothing of this service that reads the gate again (a second read waits
+    /// behind a queued stop, which waits for the first: neither ends).
+    pub(crate) async fn open_inbox(&self) -> Result<OpenInbox<'_>, PlaidError> {
+        let open = self.closed.read().await;
+        if *open {
+            return Err(PlaidError::Closing);
+        }
+        let inbox = self.inbox.lock().await;
+        Ok(OpenInbox { _open: open, inbox })
     }
 
     /// Mark bank `item_id` as syncing, or `None` when a sync of it already
