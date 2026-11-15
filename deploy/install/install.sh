@@ -47,7 +47,7 @@ umask 077
 
 # The release this script installs by default; scripts/release.sh checks it
 # is the version being released.
-RELEASE_VERSION="0.3.0"
+RELEASE_VERSION="0.4.0"
 REPO_URL="https://github.com/accounting-app/p2pgl"
 # The project image's runtime base (Dockerfile, `AS runtime`) — release.sh
 # checks they are the same — and Caddy, both pinned by digest (L-10).
@@ -288,8 +288,6 @@ secrets_file="$ETC/secrets.env"
 if [[ -s "$secrets_file" ]]; then
   same "secret-store key in $secrets_file"
 else
-  # An empty file left there may be readable by others: written anew, 0600.
-  rm -f "$secrets_file"
   # An empty file left there may be readable by others: written anew, 0600.
   rm -f "$secrets_file"
   secrets_key=$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')

@@ -394,6 +394,24 @@ Roll back every node of the mesh, as you upgraded every node.
 Every release rehearses this upgrade and rollback from the previous release's
 binary, on one machine (`docs/RELEASE.md`).
 
+### To 0.4.0, the release with bank feeds (from 0.3.0)
+
+- **An installed server:** `openledger upgrade --version 0.4.0`. It runs
+  0.4.0's installer, which writes `/opt/openledger/secrets.env` (the key bank
+  tokens are encrypted under, and commented lines for the Plaid credentials)
+  and gives the node it as a second environment file. An upgrade is refused
+  while `compose.yml` differs from what the installer wrote: undo an edit
+  first. `--binary` alone runs the old installer and writes neither.
+- **Nothing changes until a company turns Plaid on:** no config key is
+  required, and records are written as before, so the mesh's other nodes
+  read what an upgraded node writes. *Bank connections (Plaid)* says how to
+  turn it on, and on which node.
+- **Rolling back:** 0.3.0 refuses a config with a `plaid` section, so remove
+  it first. Disconnect the company's banks before, or remove them in the
+  Plaid Dashboard: 0.3.0 does not know them, and they stay live at Plaid.
+  The bank-feed inbox (`bank-inbox.json`) and the tokens (`secrets.json`) are
+  left in the company's folder, unread.
+
 ### To 0.3.0, the release with the installer (from 0.2.0)
 
 - **Before the swap:** a node whose config has `tls.mode: "terminated"` or a

@@ -1,6 +1,6 @@
 # Log: Bank-feed inbox
 
-Status: done (2026-11-15, last commit e1a7812).
+Status: done (2026-11-15, last commit fcec9e2).
 
 One entry per commit-sized unit, newest last, written when the unit is ready
 to commit. The commit hash is filled in once the maintainer has committed.
@@ -155,4 +155,4 @@ to commit. The commit hash is filled in once the maintainer has committed.
   2 bite; `plaid.json` PL-R85 and PL-R90 (on the `"entries"` test) still
   bite.
 - **Departures from the plan:** none.
-- **Commit:** e1a7812
+- **Commit:** fcec9e2 (with 007 step 6f)
