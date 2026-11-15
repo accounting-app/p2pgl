@@ -221,7 +221,6 @@ impl BankInbox {
     }
 
     /// Remember that `transaction_id` was just booked (see [`Self::booked_lately`]).
-    #[allow(dead_code)] // booking comes with 008 unit 2
     pub(crate) fn note_booked(&mut self, transaction_id: &str) {
         if self.booked.insert(transaction_id.to_owned()) {
             self.booked_order.push_back(transaction_id.to_owned());

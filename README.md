@@ -1294,6 +1294,39 @@ saying the inbox is full. `syncBank` also takes Plaid's changes to what waits
 (a corrected amount, a removal), and `disconnectBank` drops the bank's
 waiting transactions.
 
+**Booking from the inbox.** A bookkeeper (a write key) decides how each
+transaction is booked:
+
+```graphql
+mutation {
+  classifyBankTransactions(items: [
+    { transactionId: "t1", account: "Expenses:Office", narration: "Printer paper" }
+    { transactionId: "t2", account: "Income:Sales" }
+  ]) { transactionId ok txid code message }
+}
+```
+
+Each becomes one entry, as if entered by that person: the bank account's
+ledger account (its mapping now) with the amount, `account` balancing it,
+flag `*`, link `^plaid-<transaction id>`, Plaid's payee and the bank's
+description unless `payee` or `narration` is given (an empty one leaves it
+out). The transaction then leaves the inbox. `ignoreBankTransactions(items:
+[{ transactionId, reason }])` dismisses one instead — a transfer already
+entered by hand, a duplicate: it leaves the inbox, nothing is written, it is
+not fetched again, and the inbox keeps who ignored it, when and why. Up to
+200 a call; each is done or refused on its own, with a `code`:
+`NOT_IN_INBOX`, `ALREADY_BOOKED` (the books hold it: classifying it again,
+or an entry carrying its link — it then leaves the inbox),
+`BANK_TRANSACTION_IGNORED`, `ALREADY_IGNORED`, `ACCOUNT_NOT_MAPPED` (its bank
+account is no longer mapped), `INVALID_INPUT` (the bank's own account; a
+reason over 500 characters or with a control character), `LEDGER_BUSY` (the
+ledger is stopping), or the ledger's refusal of the entry
+(`ACCOUNT_NOT_OPEN`, …), which leaves it waiting. A list of more than 200 is
+refused whole (`INVALID_INPUT`). A call holds the inbox while it runs, so
+bookkeepers' calls, fetches and syncs take turns; a call cut short (the
+request timeout) may have booked some of its list, which the next call finds
+in the books.
+
 All the Plaid mutations — `createPlaidLinkToken`, `connectBank`,
 `disconnectBank`, `mapBankAccount`, `unmapBankAccount`, `refreshBankAccounts`,
 `syncBank`, `fetchBankTransactions`, `updateBankWebhooks` and the sandbox

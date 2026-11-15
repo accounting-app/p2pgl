@@ -49,6 +49,12 @@ break compatibility.
 
 ### Added
 
+- Booking from the bank-feed inbox (008, unit 2): `classifyBankTransactions`
+  books up to 200 waiting transactions a call, each to the account the
+  bookkeeper chooses — one `*` entry, entered by them, linked to the Plaid
+  transaction — and `ignoreBankTransactions` dismisses them with a reason;
+  a write key, each transaction done or refused on its own (README *Booking
+  from the inbox*).
 - The bank-feed inbox (008, unit 1): `fetchBankTransactions(itemId)` (admin)
   fetches a bank's new posted transactions into the company's inbox without
   writing to the books; `bankInbox` (a **write** key; a read key is refused)

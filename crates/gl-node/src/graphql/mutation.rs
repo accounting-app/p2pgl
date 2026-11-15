@@ -349,6 +349,33 @@ impl MutationRoot {
         super::plaid::reset_sandbox_login(ctx, item_id).await
     }
 
+    /// Book transactions waiting in the bank inbox (008), up to 200 a call:
+    /// each one entry — the bank's mapped account with its amount, `account`
+    /// balancing it — flag `*`, link `^plaid-<id>`, entered by you; it then
+    /// leaves the inbox. Each is booked or refused on its own (`ok`, `code`).
+    /// A write key.
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
+    async fn classify_bank_transactions(
+        &self,
+        ctx: &Context<'_>,
+        items: Vec<super::bank_inbox::ClassifyInput>,
+    ) -> Result<Vec<super::bank_inbox::BankBooking>> {
+        super::bank_inbox::classify_bank_transactions(ctx, items).await
+    }
+
+    /// Ignore transactions waiting in the bank inbox (008), up to 200 a call
+    /// — a transfer already entered by hand, a duplicate: each leaves the
+    /// inbox with the reason, is never booked and never fetched again. A
+    /// write key.
+    #[graphql(complexity = "HEAVY_RESOLVER_COMPLEXITY")]
+    async fn ignore_bank_transactions(
+        &self,
+        ctx: &Context<'_>,
+        items: Vec<super::bank_inbox::IgnoreInput>,
+    ) -> Result<Vec<super::bank_inbox::BankBooking>> {
+        super::bank_inbox::ignore_bank_transactions(ctx, items).await
+    }
+
     /// Fetch a bank's new posted transactions into the ledger's bank inbox,
     /// writing nothing to the books (008): a bookkeeper books each from there.
     /// Shares the bank's place at Plaid with `syncBank`: each transaction goes

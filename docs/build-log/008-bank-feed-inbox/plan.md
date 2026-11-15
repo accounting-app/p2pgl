@@ -29,8 +29,8 @@
    counts, `needsReview`, `stoppedBy`; `bankInbox(itemId)` (write);
    `WRITE_QUERY_FIELDS`; `syncBank` skips inbox and ignored transactions.
 2. **Booking and ignoring.** `classifyBankTransactions([{transactionId,
-   account, payee, narration}])`: per item, under the inbox lock — refused
-   if not in the inbox, if the books hold its `^plaid-<id>` already (then
+   account, payee, narration}])`: under the inbox lock for the whole call,
+   the books and mappings read once it is held — refused if not in the inbox, if the books hold its `^plaid-<id>` already (then
    dropped from the inbox), or if its bank account is no longer mapped; else
    one `*` entry (the account's mapping now vs `account`, the inbox's date
    and amount) through `appendTransaction`'s path, `enteredBy` the caller,

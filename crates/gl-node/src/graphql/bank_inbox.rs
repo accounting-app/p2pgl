@@ -5,12 +5,18 @@
 
 use std::collections::HashMap;
 
-use async_graphql::{Context, Result, SimpleObject};
+use async_graphql::{Context, InputObject, Result, SimpleObject};
+use ledger::model::{Amount as LedgerAmount, Flag};
+use ledger::service::{PostingInput, TransactionInput};
 
-use super::plaid::{failed, held_imports, import_link, ledger, refused, service, BankSyncNote};
-use super::scalars::{DateScalar, DecimalScalar};
+use super::plaid::{
+    client_user_id, failed, held_imports, import_link, ledger, refused, service, BankSyncNote,
+    HeldImport,
+};
+use super::scalars::{DateScalar, DecimalScalar, TransactionId};
 use super::types::Amount;
-use crate::bank_inbox::InboxTransaction;
+use super::SharedLedger;
+use crate::bank_inbox::{IgnoredTransaction, InboxTransaction};
 
 /// What one `fetchBankTransactions` did.
 #[derive(SimpleObject, Debug, Clone, Default)]
@@ -370,6 +376,335 @@ pub(super) async fn bank_inbox(
         total,
         transactions,
     })
+}
+
+/// One transaction to book: the account it goes to (the other side of the
+/// bank's), and the payee and narration when not Plaid's (an empty one
+/// leaves it out).
+#[derive(InputObject, Debug, Clone)]
+pub struct ClassifyInput {
+    pub transaction_id: String,
+    pub account: String,
+    pub payee: Option<String>,
+    pub narration: Option<String>,
+}
+
+/// One transaction to ignore, and why.
+#[derive(InputObject, Debug, Clone)]
+pub struct IgnoreInput {
+    pub transaction_id: String,
+    pub reason: Option<String>,
+}
+
+/// What became of one transaction of a `classifyBankTransactions` or
+/// `ignoreBankTransactions`: done, or refused with a code — the others of
+/// the call are done or refused on their own.
+#[derive(SimpleObject, Debug, Clone)]
+pub struct BankBooking {
+    pub transaction_id: String,
+    pub ok: bool,
+    /// The entry written, when booked.
+    pub txid: Option<TransactionId>,
+    /// Why not: `NOT_IN_INBOX`, `ALREADY_BOOKED`, `BANK_TRANSACTION_IGNORED`,
+    /// `ALREADY_IGNORED`, `ACCOUNT_NOT_MAPPED`, `INVALID_INPUT`, or the
+    /// ledger's refusal of the entry (`ACCOUNT_NOT_OPEN`, …).
+    pub code: Option<String>,
+    pub message: Option<String>,
+}
+
+/// The most transactions one call books or ignores.
+const MAX_BOOKINGS: usize = 200;
+
+/// The longest reason an ignored transaction keeps.
+const MAX_REASON_CHARS: usize = 500;
+
+impl BankBooking {
+    fn done(transaction_id: &str, txid: Option<TransactionId>) -> Self {
+        Self {
+            transaction_id: transaction_id.to_owned(),
+            ok: true,
+            txid,
+            code: None,
+            message: None,
+        }
+    }
+
+    fn refused(transaction_id: &str, code: &str, message: impl Into<String>) -> Self {
+        Self {
+            transaction_id: transaction_id.to_owned(),
+            ok: false,
+            txid: None,
+            code: Some(code.to_owned()),
+            message: Some(message.into()),
+        }
+    }
+
+    fn failed(transaction_id: &str, error: &async_graphql::Error) -> Self {
+        let code = error
+            .extensions
+            .as_ref()
+            .and_then(|ext| ext.get("code"))
+            .and_then(|code| match code {
+                async_graphql::Value::String(code) => Some(code.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "INTERNAL".to_owned());
+        Self::refused(transaction_id, &code, error.message.clone())
+    }
+}
+
+fn too_many(count: usize) -> Result<()> {
+    if count > MAX_BOOKINGS {
+        return Err(refused(
+            "INVALID_INPUT",
+            format!("at most {MAX_BOOKINGS} transactions a call; this one has {count}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Book transactions from the inbox (008): each one entry — the bank's
+/// mapped ledger account with the amount, `account` balancing it — flag `*`,
+/// link `^plaid-<transaction id>`, entered by the caller, through
+/// `appendTransaction`'s path; then it leaves the inbox. Each transaction is
+/// booked or refused on its own.
+///
+/// The inbox is held for the whole call, and the books and the accounts'
+/// mappings are read only once it is. A call cut short — the request timeout
+/// drops it while an entry it staged still commits — leaves that transaction
+/// waiting though booked; the next call, reading the books after it, finds
+/// the entry and drops the transaction instead of booking it again. The
+/// transactions booked are removed from the inbox in one write at the end.
+pub(super) async fn classify_bank_transactions(
+    ctx: &Context<'_>,
+    items: Vec<ClassifyInput>,
+) -> Result<Vec<BankBooking>> {
+    let plaid = service(ctx)?;
+    let ledger = ledger(ctx)?;
+    too_many(items.len())?;
+    let mut open = plaid.open_inbox().await.map_err(failed)?;
+    // The bank side is the account's mapping now, not when it was fetched.
+    // (`connections` takes the store's lock, never the `closed` gate.)
+    let mapping: HashMap<(String, String), String> = plaid
+        .connections()
+        .await
+        .map_err(failed)?
+        .into_iter()
+        .flat_map(|connection| {
+            let item_id = connection.item_id;
+            connection.accounts.into_iter().filter_map(move |account| {
+                Some((
+                    (item_id.clone(), account.account_id),
+                    account.ledger_account?,
+                ))
+            })
+        })
+        .collect();
+    let held = held_imports(ledger, plaid.suspense_account()).await;
+    let mut leaving = Vec::new();
+    let mut bookings = Vec::with_capacity(items.len());
+    for item in items {
+        bookings.push(
+            classify_one(
+                ctx,
+                ledger,
+                &mut open.inbox,
+                &mapping,
+                &held,
+                &mut leaving,
+                item,
+            )
+            .await,
+        );
+    }
+    if !leaving.is_empty() {
+        if let Err(error) = open.inbox.update(|contents| {
+            for id in &leaving {
+                contents.waiting.remove(id);
+            }
+        }) {
+            // Booked all the same; the next call finds them in the books and
+            // drops them.
+            tracing::warn!(%error, booked = leaving.len(), "booked transactions stay in the bank inbox for now");
+        }
+    }
+    Ok(bookings)
+}
+
+async fn classify_one(
+    ctx: &Context<'_>,
+    ledger: &SharedLedger,
+    inbox: &mut crate::bank_inbox::BankInbox,
+    mapping: &HashMap<(String, String), String>,
+    held: &HashMap<String, HeldImport>,
+    leaving: &mut Vec<String>,
+    item: ClassifyInput,
+) -> BankBooking {
+    let id = item.transaction_id.as_str();
+    let mut leave = |id: &str| {
+        if !leaving.iter().any(|left| left == id) {
+            leaving.push(id.to_owned());
+        }
+    };
+    // Booked before this call read the books, or by it since.
+    let in_books = held.contains_key(&import_link(id)) || inbox.booked_lately(id);
+    let Some(waiting) = inbox.contents().waiting.get(id).cloned() else {
+        if inbox.contents().ignored.contains_key(id) {
+            return BankBooking::refused(
+                id,
+                "BANK_TRANSACTION_IGNORED",
+                "this transaction was ignored; it is not booked",
+            );
+        }
+        if in_books {
+            return BankBooking::refused(
+                id,
+                "ALREADY_BOOKED",
+                "this transaction is booked already",
+            );
+        }
+        return BankBooking::refused(
+            id,
+            "NOT_IN_INBOX",
+            "no such transaction waits in the bank inbox",
+        );
+    };
+    if in_books {
+        // The books hold it — some other way (`syncBank` before it was
+        // fetched), or by a call cut short — so it leaves the inbox, and
+        // nothing is written.
+        leave(id);
+        return BankBooking::refused(id, "ALREADY_BOOKED", "this transaction is booked already");
+    }
+    let Some(bank_account) = mapping.get(&(waiting.item_id.clone(), waiting.account_id.clone()))
+    else {
+        return BankBooking::refused(
+            id,
+            "ACCOUNT_NOT_MAPPED",
+            "its bank account is not mapped to a ledger account now (mapBankAccount)",
+        );
+    };
+    if item.account == *bank_account {
+        return BankBooking::refused(
+            id,
+            "INVALID_INPUT",
+            format!("{bank_account} is the bank's own account: book it to another"),
+        );
+    }
+    let given = |text: Option<String>, plaid: Option<String>| match text {
+        Some(text) if text.trim().is_empty() => None,
+        Some(text) => Some(text),
+        None => plaid,
+    };
+    let entry = TransactionInput {
+        date: waiting.date,
+        flag: Flag::Complete,
+        payee: given(item.payee, waiting.payee),
+        narration: given(item.narration, waiting.description),
+        tags: Vec::new(),
+        links: vec![import_link(id)],
+        postings: vec![
+            PostingInput {
+                account: bank_account.clone(),
+                amount: Some(LedgerAmount {
+                    number: waiting.amount,
+                    currency: waiting.currency.clone(),
+                }),
+                cost: None,
+                price: None,
+            },
+            PostingInput {
+                account: item.account,
+                amount: None,
+                cost: None,
+                price: None,
+            },
+        ],
+    };
+    match super::mutation::append_transaction_input(ctx, ledger, entry).await {
+        Ok(appended) => {
+            inbox.note_booked(id);
+            leave(id);
+            if appended.already_existed {
+                // The very same entry was in the books already: nothing new
+                // was written, and it is said so.
+                return BankBooking {
+                    txid: Some(appended.transaction.txid),
+                    ..BankBooking::refused(
+                        id,
+                        "ALREADY_BOOKED",
+                        "this very entry is in the books already",
+                    )
+                };
+            }
+            BankBooking::done(id, Some(appended.transaction.txid))
+        }
+        Err(error) => BankBooking::failed(id, &error),
+    }
+}
+
+/// Ignore transactions waiting in the inbox (008): each leaves it with the
+/// caller, the time and the reason, is never booked and never fetched again;
+/// nothing is written to the books. One write of the inbox for the call.
+pub(super) async fn ignore_bank_transactions(
+    ctx: &Context<'_>,
+    items: Vec<IgnoreInput>,
+) -> Result<Vec<BankBooking>> {
+    let plaid = service(ctx)?;
+    too_many(items.len())?;
+    let by = client_user_id(ctx);
+    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut open = plaid.open_inbox().await.map_err(failed)?;
+    let outcome = open.inbox.update(|contents| {
+        items
+            .iter()
+            .map(|item| {
+                let id = item.transaction_id.as_str();
+                let reason = item
+                    .reason
+                    .clone()
+                    .filter(|reason| !reason.trim().is_empty());
+                if reason.as_ref().is_some_and(|reason| {
+                    reason.chars().count() > MAX_REASON_CHARS
+                        || reason.chars().any(char::is_control)
+                }) {
+                    return BankBooking::refused(
+                        id,
+                        "INVALID_INPUT",
+                        format!(
+                            "a reason is at most {MAX_REASON_CHARS} characters, without control characters"
+                        ),
+                    );
+                }
+                if let Some(waiting) = contents.waiting.remove(id) {
+                    contents.ignored.insert(
+                        id.to_owned(),
+                        IgnoredTransaction {
+                            item_id: waiting.item_id,
+                            at: at.clone(),
+                            by: by.clone(),
+                            reason,
+                        },
+                    );
+                    BankBooking::done(id, None)
+                } else if contents.ignored.contains_key(id) {
+                    BankBooking::refused(id, "ALREADY_IGNORED", "this transaction was ignored already")
+                } else {
+                    BankBooking::refused(id, "NOT_IN_INBOX", "no such transaction waits in the bank inbox")
+                }
+            })
+            .collect::<Vec<_>>()
+    });
+    match outcome {
+        Ok(bookings) => Ok(bookings),
+        Err(error) => {
+            let error = failed(error.into());
+            Ok(items
+                .iter()
+                .map(|item| BankBooking::failed(&item.transaction_id, &error))
+                .collect())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -744,6 +1079,417 @@ mod tests {
             bodies[bodies.len() - 1]["cursor"],
             "c1",
             "asked from where the last stored page left it: {bodies:?}"
+        );
+    }
+
+    /// A ledger with Plaid on, its checking account mapped, `Expenses:Office`
+    /// open, and t1 (-12.34) and t4 (+200) waiting in the inbox.
+    async fn waiting() -> crate::graphql::plaid::tests::Fixture {
+        let fixture = mapped(true).await;
+        let body = operator(
+            &fixture.schema,
+            r#"mutation { openAccount(name: "Expenses:Office", date: "2026-01-01") }"#,
+        )
+        .await;
+        assert!(body["errors"].is_null(), "{body}");
+        fixture.mock.sync_page(page(
+            vec![
+                mock::sync_transaction("t1", "acc1", 12.34, "2026-11-01", false),
+                mock::sync_transaction("t4", "acc1", -200.0, "2026-11-03", false),
+            ],
+            vec![],
+            vec![],
+        ));
+        let body = operator(&fixture.schema, &fetch()).await;
+        assert_eq!(body["data"]["fetchBankTransactions"]["added"], 2, "{body}");
+        fixture
+    }
+
+    fn classify(items: &str) -> String {
+        format!(
+            "mutation {{ classifyBankTransactions(items: [{items}]) {{ transactionId ok txid code message }} }}"
+        )
+    }
+
+    fn ignore(items: &str) -> String {
+        format!(
+            "mutation {{ ignoreBankTransactions(items: [{items}]) {{ transactionId ok code message }} }}"
+        )
+    }
+
+    const BOOKED: &str =
+        "{ journal { flag payee narration links enteredBy postings { account amount { number currency } } } }";
+
+    fn booked(journal: &Value, transaction_id: &str) -> Vec<Value> {
+        journal["data"]["journal"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["links"] == json!([format!("plaid-{transaction_id}")]))
+            .cloned()
+            .collect()
+    }
+
+    /// 008: classifying books one entry — the bank's mapped account with the
+    /// amount, the chosen account balancing it — flag `*`, Plaid's payee or
+    /// the bookkeeper's, entered by the bookkeeper; the transaction leaves
+    /// the inbox, and classifying it again is refused, nothing written twice.
+    ///
+    /// Bug-catch: a booking that leaves the transaction waiting lets a second
+    /// bookkeeper book it again — two entries for one payment.
+    #[tokio::test]
+    async fn classifying_books_one_entry_and_empties_its_slot() {
+        let fixture = waiting().await;
+        let body = run(
+            &fixture.schema,
+            Role::Write,
+            &classify(r#"{ transactionId: "t1", account: "Expenses:Office", narration: "Printer paper" }"#),
+        )
+        .await;
+        assert!(body["errors"].is_null(), "{body}");
+        let result = &body["data"]["classifyBankTransactions"][0];
+        assert_eq!(result["ok"], true, "{body}");
+        assert!(result["txid"].is_string());
+
+        let journal = operator(&fixture.schema, BOOKED).await;
+        let entries = booked(&journal, "t1");
+        assert_eq!(entries.len(), 1, "{journal}");
+        let entry = &entries[0];
+        assert_eq!(entry["flag"], "*");
+        assert_eq!(entry["payee"], "Corner Shop");
+        assert_eq!(entry["narration"], "Printer paper");
+        assert_eq!(entry["enteredBy"], "u_0123456789abcdef");
+        let amount = |account: &str| {
+            entry["postings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|posting| posting["account"] == account)
+                .map(|posting| posting["amount"]["number"].as_str().unwrap().to_owned())
+        };
+        assert_eq!(amount("Assets:Bank:Checking").as_deref(), Some("-12.34"));
+        assert_eq!(amount("Expenses:Office").as_deref(), Some("12.34"));
+        let inbox = run(&fixture.schema, Role::Write, INBOX).await;
+        assert_eq!(inbox["data"]["bankInbox"]["total"], 1, "{inbox}");
+
+        let again = run(
+            &fixture.schema,
+            Role::Write,
+            &classify(r#"{ transactionId: "t1", account: "Expenses:Uncategorized" }"#),
+        )
+        .await;
+        assert_eq!(
+            again["data"]["classifyBankTransactions"][0]["code"], "ALREADY_BOOKED",
+            "{again}"
+        );
+        assert_eq!(
+            booked(&operator(&fixture.schema, BOOKED).await, "t1").len(),
+            1
+        );
+    }
+
+    /// 008: one call books several, each on its own: an account not open,
+    /// the bank's own account, and a transaction not in the inbox are each
+    /// refused with their code, and the rest are booked.
+    ///
+    /// Bug-catch: one bad line refusing the whole list makes a bookkeeper
+    /// working through a month start over at every typo; booking to the
+    /// bank's own account writes an entry that moves no money.
+    #[tokio::test]
+    async fn a_bad_item_does_not_stop_the_others() {
+        let fixture = waiting().await;
+        let body = run(
+            &fixture.schema,
+            Role::Write,
+            &classify(
+                r#"{ transactionId: "t1", account: "Expenses:Nowhere" },
+                   { transactionId: "t1", account: "Assets:Bank:Checking" },
+                   { transactionId: "zz", account: "Expenses:Office" },
+                   { transactionId: "t4", account: "Expenses:Office" }"#,
+            ),
+        )
+        .await;
+        assert!(body["errors"].is_null(), "{body}");
+        let results = body["data"]["classifyBankTransactions"].as_array().unwrap();
+        assert_eq!(results[0]["code"], "ACCOUNT_NOT_OPEN", "{body}");
+        assert_eq!(results[1]["code"], "INVALID_INPUT");
+        assert_eq!(results[2]["code"], "NOT_IN_INBOX");
+        assert_eq!(results[3]["ok"], true);
+        let inbox = run(&fixture.schema, Role::Write, INBOX).await;
+        assert_eq!(
+            inbox["data"]["bankInbox"]["total"], 1,
+            "t1 still waits: {inbox}"
+        );
+        assert_eq!(
+            inbox["data"]["bankInbox"]["transactions"][0]["transactionId"],
+            "t1"
+        );
+    }
+
+    /// 008: an ignored transaction leaves the inbox with its reason, writes
+    /// nothing, is not fetched again, and cannot be booked or ignored again.
+    ///
+    /// Bug-catch: an ignore that only hides a transaction has it fetched back
+    /// at the next restart of Plaid's pages, and the bookkeeper sees it again
+    /// for good.
+    #[tokio::test]
+    async fn an_ignored_transaction_is_gone_for_good() {
+        let fixture = waiting().await;
+        let body = run(
+            &fixture.schema,
+            Role::Write,
+            &ignore(r#"{ transactionId: "t1", reason: "a transfer entered by hand" }"#),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["ignoreBankTransactions"][0]["ok"], true,
+            "{body}"
+        );
+        assert!(booked(&operator(&fixture.schema, BOOKED).await, "t1").is_empty());
+        let on_disk = crate::bank_inbox::BankInbox::open(fixture._dir.path()).unwrap();
+        let ignored = &on_disk.contents().ignored["t1"];
+        assert_eq!(
+            ignored.reason.as_deref(),
+            Some("a transfer entered by hand")
+        );
+        assert_eq!(ignored.by, "u_0123456789abcdef");
+
+        fixture.mock.sync_page(page(
+            vec![mock::sync_transaction(
+                "t1",
+                "acc1",
+                12.34,
+                "2026-11-01",
+                false,
+            )],
+            vec![],
+            vec![],
+        ));
+        let body = operator(&fixture.schema, &fetch()).await;
+        assert_eq!(
+            body["data"]["fetchBankTransactions"]["alreadyInInbox"], 1,
+            "{body}"
+        );
+        let inbox = run(&fixture.schema, Role::Write, INBOX).await;
+        assert_eq!(inbox["data"]["bankInbox"]["total"], 1, "only t4: {inbox}");
+
+        let again = run(
+            &fixture.schema,
+            Role::Write,
+            &ignore(r#"{ transactionId: "t1" }"#),
+        )
+        .await;
+        assert_eq!(
+            again["data"]["ignoreBankTransactions"][0]["code"],
+            "ALREADY_IGNORED"
+        );
+        let book = run(
+            &fixture.schema,
+            Role::Write,
+            &classify(r#"{ transactionId: "t1", account: "Expenses:Office" }"#),
+        )
+        .await;
+        assert_eq!(
+            book["data"]["classifyBankTransactions"][0]["code"],
+            "BANK_TRANSACTION_IGNORED"
+        );
+    }
+
+    /// 008: a waiting transaction the books hold some other way — an entry
+    /// carrying its link — is refused and leaves the inbox; booking needs a
+    /// write key.
+    ///
+    /// Bug-catch: booking without a look at the books writes a second entry
+    /// for a payment already there.
+    #[tokio::test]
+    async fn what_the_books_hold_is_not_booked_again() {
+        let fixture = waiting().await;
+        let by_hand = r#"mutation { appendTransaction(input: { date: "2026-11-01", flag: "*", narration: "by hand", links: ["plaid-t1"], postings: [{ account: "Assets:Bank:Checking", amount: { number: "-12.34", currency: "USD" } }, { account: "Expenses:Office" }] }) { txid } }"#;
+        let body = operator(&fixture.schema, by_hand).await;
+        assert!(body["errors"].is_null(), "{body}");
+
+        let body = run(
+            &fixture.schema,
+            Role::Write,
+            &classify(r#"{ transactionId: "t1", account: "Expenses:Office" }"#),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["classifyBankTransactions"][0]["code"], "ALREADY_BOOKED",
+            "{body}"
+        );
+        assert_eq!(
+            booked(&operator(&fixture.schema, BOOKED).await, "t1").len(),
+            1
+        );
+        let inbox = run(&fixture.schema, Role::Write, INBOX).await;
+        assert_eq!(
+            inbox["data"]["bankInbox"]["total"], 1,
+            "t1 left the inbox: {inbox}"
+        );
+
+        let read = run(
+            &fixture.schema,
+            Role::Read,
+            &classify(r#"{ transactionId: "t4", account: "Expenses:Office" }"#),
+        )
+        .await;
+        assert_eq!(code(&read), Some("FORBIDDEN"), "{read}");
+    }
+
+    /// 008: one transaction listed twice in a call is booked once — the
+    /// second refused as booked, though the call read the books before the
+    /// first — and a call of more than 200 is refused whole.
+    ///
+    /// Bug-catch: a booking not remembered until the books are read again
+    /// lets the same list book it a second time (the call read the books
+    /// before its first booking); no cap lets one call hold the inbox for
+    /// thousands of writes.
+    #[tokio::test]
+    async fn one_transaction_twice_in_a_call_is_booked_once() {
+        let fixture = waiting().await;
+        let body = run(
+            &fixture.schema,
+            Role::Write,
+            &classify(
+                r#"{ transactionId: "t1", account: "Expenses:Office" },
+                   { transactionId: "t1", account: "Expenses:Uncategorized" }"#,
+            ),
+        )
+        .await;
+        let results = body["data"]["classifyBankTransactions"].as_array().unwrap();
+        assert_eq!(results[0]["ok"], true, "{body}");
+        assert_eq!(results[1]["code"], "ALREADY_BOOKED");
+        assert_eq!(
+            booked(&operator(&fixture.schema, BOOKED).await, "t1").len(),
+            1
+        );
+
+        let many = vec![r#"{ transactionId: "t4", account: "Expenses:Office" }"#; 201].join(",");
+        let body = run(&fixture.schema, Role::Write, &classify(&many)).await;
+        assert_eq!(code(&body), Some("INVALID_INPUT"), "{body}");
+        assert_eq!(
+            run(&fixture.schema, Role::Write, INBOX).await["data"]["bankInbox"]["total"],
+            1
+        );
+    }
+
+    /// 008: a transaction booked while a fetch runs — the fetch read the
+    /// books before it was booked — is not fetched back into the inbox when
+    /// Plaid sends it again.
+    ///
+    /// Bug-catch: a fetch that knows only the books as they were at its
+    /// start puts the transaction back in the inbox, and the bookkeeper books
+    /// it a second time.
+    #[tokio::test]
+    async fn a_transaction_booked_while_a_fetch_runs_is_not_fetched_back() {
+        let fixture = waiting().await;
+        let syncs = || {
+            fixture
+                .mock
+                .paths()
+                .iter()
+                .filter(|path| path.as_str() == "/transactions/sync")
+                .count()
+        };
+        let before = syncs();
+        fixture
+            .mock
+            .delay("/transactions/sync", std::time::Duration::from_millis(500));
+        fixture.mock.sync_page(page(
+            vec![mock::sync_transaction(
+                "t1",
+                "acc1",
+                12.34,
+                "2026-11-01",
+                false,
+            )],
+            vec![],
+            vec![],
+        ));
+        let schema = fixture.schema.clone();
+        let fetching = tokio::spawn(async move { operator(&schema, &fetch()).await });
+        while syncs() == before {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let body = run(
+            &fixture.schema,
+            Role::Write,
+            &classify(r#"{ transactionId: "t1", account: "Expenses:Office" }"#),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["classifyBankTransactions"][0]["ok"], true,
+            "{body}"
+        );
+
+        let fetched = fetching.await.unwrap();
+        let counts = &fetched["data"]["fetchBankTransactions"];
+        assert_eq!(counts["added"], 0, "{fetched}");
+        assert_eq!(counts["alreadyBooked"], 1);
+        let inbox = run(&fixture.schema, Role::Write, INBOX).await;
+        assert_eq!(inbox["data"]["bankInbox"]["total"], 1, "only t4: {inbox}");
+    }
+
+    /// 008: what booking checks besides the books — a bank account no longer
+    /// mapped is refused and left waiting; an empty narration leaves it out
+    /// rather than taking the bank's; a reason too long or with a control
+    /// character is refused, the others of the call ignored.
+    ///
+    /// Bug-catch: booking to the mapping kept at fetch time posts to an
+    /// account the operator has since taken off the bank; a bad reason
+    /// refusing the whole call loses the bookkeeper's other lines.
+    #[tokio::test]
+    async fn booking_checks_the_mapping_and_the_text() {
+        let fixture = waiting().await;
+        let body = run(
+            &fixture.schema,
+            Role::Write,
+            &classify(r#"{ transactionId: "t1", account: "Expenses:Office", narration: " " }"#),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["classifyBankTransactions"][0]["ok"], true,
+            "{body}"
+        );
+        let entry = &booked(&operator(&fixture.schema, BOOKED).await, "t1")[0];
+        assert!(
+            entry["narration"].is_null() || entry["narration"] == "",
+            "{entry}"
+        );
+
+        let long = "x".repeat(501);
+        let body = run(
+            &fixture.schema,
+            Role::Write,
+            &ignore(&format!(
+                r#"{{ transactionId: "t4", reason: "{long}" }}, {{ transactionId: "t4", reason: "bell\u0007" }}, {{ transactionId: "zz" }}"#
+            )),
+        )
+        .await;
+        let results = body["data"]["ignoreBankTransactions"].as_array().unwrap();
+        assert_eq!(results[0]["code"], "INVALID_INPUT", "{body}");
+        assert_eq!(results[1]["code"], "INVALID_INPUT");
+        assert_eq!(results[2]["code"], "NOT_IN_INBOX");
+
+        let unmap = format!(
+            r#"mutation {{ unmapBankAccount(itemId: "{ITEM_ID}", accountId: "acc1") {{ itemId }} }}"#
+        );
+        let body = operator(&fixture.schema, &unmap).await;
+        assert!(body["errors"].is_null(), "{body}");
+        let body = run(
+            &fixture.schema,
+            Role::Write,
+            &classify(r#"{ transactionId: "t4", account: "Expenses:Office" }"#),
+        )
+        .await;
+        assert_eq!(
+            body["data"]["classifyBankTransactions"][0]["code"], "ACCOUNT_NOT_MAPPED",
+            "{body}"
+        );
+        assert_eq!(
+            run(&fixture.schema, Role::Write, INBOX).await["data"]["bankInbox"]["total"],
+            1
         );
     }
 }

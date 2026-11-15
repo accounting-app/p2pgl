@@ -100,5 +100,65 @@
     "old": "                    .retain(|_, transaction| transaction.item_id != item_id);",
     "new": "                    .retain(|_, _| true);",
     "runs": [["-p", "gl-node", "--bin", "gl-node", "sync_bank_takes_plaids_changes_to_what_waits"]]
+  },
+  "BI-R17-a-booked-transaction-left-waiting": {
+    "file": "crates/gl-node/src/graphql/bank_inbox.rs",
+    "old": "            for id in &leaving {\n                contents.waiting.remove(id);\n            }",
+    "new": "            for _id in &leaving {}",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "classifying_books_one_entry_and_empties_its_slot"]]
+  },
+  "BI-R18-a-booking-not-remembered": {
+    "file": "crates/gl-node/src/graphql/bank_inbox.rs",
+    "old": "            inbox.note_booked(id);\n",
+    "new": "",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "one_transaction_twice_in_a_call_is_booked_once"]]
+  },
+  "BI-R19-booked-without-a-look-at-the-books": {
+    "file": "crates/gl-node/src/graphql/bank_inbox.rs",
+    "old": "    let in_books = held.contains_key(&import_link(id)) || inbox.booked_lately(id);",
+    "new": "    let in_books = inbox.booked_lately(id);",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "what_the_books_hold_is_not_booked_again"]]
+  },
+  "BI-R20-booked-to-the-banks-own-account": {
+    "file": "crates/gl-node/src/graphql/bank_inbox.rs",
+    "old": "    if item.account == *bank_account {",
+    "new": "    if false && item.account == *bank_account {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_bad_item_does_not_stop_the_others"]]
+  },
+  "BI-R21-an-ignored-transaction-left-waiting": {
+    "file": "crates/gl-node/src/graphql/bank_inbox.rs",
+    "old": "            if let Some(waiting) = contents.waiting.remove(id) {",
+    "new": "            if let Some(waiting) = contents.waiting.get(id).cloned() {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "an_ignored_transaction_is_gone_for_good"]]
+  },
+  "BI-R22-a-booking-flagged-for-review": {
+    "file": "crates/gl-node/src/graphql/bank_inbox.rs",
+    "old": "        flag: Flag::Complete,",
+    "new": "        flag: Flag::Incomplete,",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "classifying_books_one_entry_and_empties_its_slot"]]
+  },
+  "BI-R23-bookings-uncapped": {
+    "file": "crates/gl-node/src/graphql/bank_inbox.rs",
+    "old": "    if count > MAX_BOOKINGS {",
+    "new": "    if false && count > MAX_BOOKINGS {",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "one_transaction_twice_in_a_call_is_booked_once"]]
+  },
+  "BI-R24-a-transaction-in-the-books-left-waiting": {
+    "file": "crates/gl-node/src/graphql/bank_inbox.rs",
+    "old": "        leave(id);\n        return BankBooking::refused(id, \"ALREADY_BOOKED\", \"this transaction is booked already\");\n    }",
+    "new": "        return BankBooking::refused(id, \"ALREADY_BOOKED\", \"this transaction is booked already\");\n    }",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "what_the_books_hold_is_not_booked_again"]]
+  },
+  "BI-R25-fetch-takes-what-was-booked-meanwhile": {
+    "file": "crates/gl-node/src/graphql/bank_inbox.rs",
+    "old": "                .filter(|id| inbox.booked_lately(id))",
+    "new": "                .filter(|_| false)",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "a_transaction_booked_while_a_fetch_runs_is_not_fetched_back"]]
+  },
+  "BI-R26-an-ignore-reason-unbounded": {
+    "file": "crates/gl-node/src/graphql/bank_inbox.rs",
+    "old": "                    reason.chars().count() > MAX_REASON_CHARS",
+    "new": "                    false && reason.chars().count() > MAX_REASON_CHARS",
+    "runs": [["-p", "gl-node", "--bin", "gl-node", "booking_checks_the_mapping_and_the_text"]]
   }
 }

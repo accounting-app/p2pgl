@@ -69,4 +69,59 @@ to commit. The commit hash is filled in once the maintainer has committed.
   the inbox while it runs, and sent again by Plaid, would otherwise be taken
   a second time. `note_booked` waits for unit 2 (booking), with a dead-code
   allowance until then.
+- **Commit:** 25bfc1d
+
+## 2026-11-15 — Booking and ignoring (unit 2)
+
+- **What changed:** `graphql/bank_inbox.rs`: `classifyBankTransactions(items:
+  [{transactionId, account, payee, narration}])` and
+  `ignoreBankTransactions(items: [{transactionId, reason}])`, a write key
+  (mutations' default), up to 200 a call, each item done or refused on its
+  own (`BankBooking { transactionId ok txid code message }`). Classifying,
+  under the inbox lock from the check to the removal: refused when not
+  waiting (`NOT_IN_INBOX`; ignored: `BANK_TRANSACTION_IGNORED`), when the
+  books hold its link — read once a call, plus the bookings since (`booked_lately`)
+  — (`ALREADY_BOOKED`, and it leaves the inbox), when its bank account is
+  not mapped now (`ACCOUNT_NOT_MAPPED`), or for the bank's own account
+  (`INVALID_INPUT`); else one entry through `appendTransaction`'s path —
+  the mapping now with the inbox's amount, `account` elided, flag `*`, link
+  `^plaid-<id>`, the caller's `enteredBy`, Plaid's payee and description
+  unless given (empty leaves out) — then `note_booked` and removal; a ledger
+  refusal leaves it waiting. Ignoring moves it to `ignored` with the caller,
+  time and reason (500 characters, no control characters). The unit-1
+  dead-code allowance on `note_booked` is gone. README *Booking from the
+  inbox*, CHANGELOG *Added*.
+- **Tests:** `classifying_books_one_entry_and_empties_its_slot`,
+  `a_bad_item_does_not_stop_the_others`,
+  `an_ignored_transaction_is_gone_for_good`,
+  `what_the_books_hold_is_not_booked_again`,
+  `one_transaction_twice_in_a_call_is_booked_once`,
+  `a_transaction_booked_while_a_fetch_runs_is_not_fetched_back`,
+  `booking_checks_the_mapping_and_the_text`.
+- **Review:** one important finding, fixed. A classify call took the inbox
+  per item but read the books once, before it: a call cut short by the
+  request timeout after its entry was staged (H-11 commits it detached) left
+  the transaction booked and still waiting, unknown to `booked_lately`, and
+  a second bookkeeper's call that had read the books earlier would book it
+  again under another account. Now a call holds the inbox for its whole list
+  and reads the books and the mappings only once it does, so a call after a
+  cut-short one finds the entry and drops the transaction; the transactions
+  booked leave the inbox in one write at the end, and an ignore call writes
+  the inbox once (it rewrote the file per item). Also: an append that finds
+  the very entry in the books answers `ALREADY_BOOKED` with its txid, not a
+  new booking; README lists `LEDGER_BUSY`, the reason's control characters,
+  the 200 cap refused whole, and that calls take turns on the inbox; a test
+  pins `booked_lately` against a fetch running while a booking is made (the
+  mock delays Plaid's answer), and one the mapping and text checks. Left:
+  an `unmapBankAccount` during a call still books to the mapping read at the
+  call's start; the inbox writes are blocking file I/O on the async runtime,
+  as the secret store's are; `syncBank`'s own `booked_lately` check has no
+  test.
+- **Gate:** `scripts/gate.sh` — passed (fmt, clippy, anchors, guard; 1754
+  tests passed, 0 failed).
+- **Revert checks:** `scripts/revert_specs/bank_inbox.json` BI-R17..R26 — 10
+  of 10 bite (R17, R18, R19, R24 re-anchored after the rewrite; R25, R26
+  new).
+- **Departures from the plan:** the inbox is held for a whole call rather
+  than per item (the review's finding); `plan.md` updated.
 - **Commit:** —
