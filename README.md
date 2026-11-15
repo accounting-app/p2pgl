@@ -1467,6 +1467,15 @@ With `plaid.webhookUrl` set, `fireSandboxWebhook(itemId)` has the sandbox send
 the bank a `SYNC_UPDATES_AVAILABLE` webhook, which fetches it on its own
 ([Webhooks](#webhooks)).
 
+To run one on your own machine, put the three secrets in `.env` at the
+repository's root (one `NAME=value` a line: `GL_NODE_PLAID_CLIENT_ID`,
+`GL_NODE_PLAID_SECRET`, `GL_NODE_SECRETS_KEY`; `.gitignore` keeps it out of
+git; `chmod 600 .env`), that config in `gl-node.local.json`, and run
+`scripts/run_local_node.sh`. It refuses an env file others can read or git
+tracks, passes the secrets to the node only, and runs the newest release in
+`releases/` (or a binary you name). `docs/api/openledger.insomnia.json` has
+the requests, in order.
+
 #### Webhooks
 
 With `plaid.webhookUrl` set, Plaid tells the node about a bank instead of
