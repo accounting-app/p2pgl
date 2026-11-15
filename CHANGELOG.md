@@ -7,17 +7,53 @@ break compatibility.
 
 ## [Unreleased]
 
-### Breaking
+## [0.4.0] — 2026-11-15
 
-- A node's Plaid-enabled ledgers share one `plaid.environment` (007 step
-  6e): the node holds one Plaid account's secret, which is one environment's.
-  `addLedger` and `restartLedger` refuse a ledger set to the other environment
-  (`LEDGER_CONFLICT`), naming the ledger it clashes with, served or not; at
-  boot (the config file's ledger first, then the folders by name) a later one
-  is not served. Moving a node to production: OPERATIONS.
+Bank feeds through Plaid. A company's banks are connected on the one node
+that holds them (`plaid.enabled`; the operator's Plaid credentials and a
+store key in the environment): Plaid Link in the client app, the access
+tokens kept encrypted on the node, accounts mapped to ledger accounts, and
+new transactions fetched — by an admin or by Plaid's webhooks — into a
+**bank-feed inbox**, where a bookkeeper books each to the account they
+choose, or ignores it. `syncBank` still imports straight into the books for
+those who want that. Logging in again, banks that log in on their own site
+(OAuth), consent notices and bank health over GraphQL.
+
+**Status: pilot,** as 0.3.0. The Plaid integration is tested against a mock
+of Plaid's API; it has not yet run against Plaid's own sandbox. The installer
+has not yet run on servers at a provider with real domains — that rehearsal
+installs this release. Run it beside your existing books before relying on
+it.
+
+**Upgrading from 0.3.0:** `docs/OPERATIONS.md`, *Upgrading* and *To 0.4.0*.
+
+**Known limits.**
+
+- The 0.3.0 limits stand (below): no TLS in the node, Format v2 on every node
+  of a mesh, histories in memory, backups kept on the server, `pad` not
+  synthesized, Linux amd64 and arm64 binaries.
+- One Plaid account and one Plaid environment per node; a company's banks on
+  one node of its mesh. The bank-feed inbox is that node's file, not
+  replicated: other nodes see a transaction once it is booked.
+- Webhooks need the node reachable by Plaid over HTTPS; without them banks
+  are fetched on demand. A full inbox (20,000 waiting) stops webhook fetches,
+  shown in the node's log only.
+- Multi-factor sign-in before Link is the client app's; nothing in the node.
+  No Android package name for Link yet.
+- A booking is one account per transaction; splitting one, or matching it to
+  an entry already in the books, is not in this release.
 
 ### Security
 
+- Dependencies (`Cargo.lock` only): `hickory-proto`, `hickory-net` and
+  `hickory-resolver` 0.26.1 to 0.26.3, compiled in through iroh's DNS, for
+  twenty advisories published since 0.3.0 (RUSTSEC-2026-0487 to 0491, 0506
+  to 0509, 0513 to 0520, 0539 to 0541: DNSSEC validation, malformed records
+  and resolver loops). `cargo audit` then finds no vulnerability; two
+  allowed warnings remain, `paste` unmaintained (RUSTSEC-2024-0436, as
+  before) and `rustix` 1.1.4 unsound in its xattr functions
+  (RUSTSEC-2026-0486; no code of ours calls them, it comes through
+  `async-io`).
 - Plaid's webhook keys and the limits on asking Plaid for them are kept once
   for the node rather than once for each ledger (007 step 6e): every company
   shares the one Plaid account, so a stranger's made-up key ids spend at most
@@ -76,6 +112,12 @@ break compatibility.
   the environment): `createPlaidLinkToken`, `connectBank(publicToken)`,
   `disconnectBank(itemId)` and the query `connectedBanks` — README *Bank
   connections (Plaid)*.
+  A node's Plaid ledgers share one `plaid.environment` (007 step 6e): the
+  node holds one Plaid account's secret, which is one environment's, so
+  `addLedger` and `restartLedger` refuse a ledger set to the other one
+  (`LEDGER_CONFLICT`), naming the ledger it clashes with, served or not; at
+  boot (the config file's ledger first, then the folders by name) a later one
+  is not served. Moving a node to production: OPERATIONS.
 - Importing bank transactions (007 step 6): `mapBankAccount(itemId,
   accountId, ledgerAccount, importFrom)` maps a bank account to an open ledger
   account from a date (default: the day it was opened), and `syncBank(itemId)`

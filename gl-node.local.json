@@ -1,0 +1,1 @@
+{ "ledgerPath": "data/plaid-demo.bean", "plaid": { "enabled": true, "environment": "sandbox" } }

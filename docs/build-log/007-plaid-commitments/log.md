@@ -501,4 +501,4 @@ to commit. The commit hash is filled in once the maintainer has committed.
 - **Revert checks:** `scripts/revert_specs/plaid.json` PL-R125, R126 — 2 of 2
   bite.
 - **Departures from the plan:** none (step 6f added to `plan.md`).
-- **Commit:** —
+- **Commit:** fcec9e2 (with 008 unit 3)

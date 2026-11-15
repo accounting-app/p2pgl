@@ -1,7 +1,7 @@
 {
   "_type": "export",
   "__export_format": 4,
-  "__export_date": "2026-10-23T15:15:40Z",
+  "__export_date": "2026-11-15T21:00:00Z",
   "__export_source": "openledger",
   "resources": [
     {
@@ -10,7 +10,7 @@
       "parentId": null,
       "scope": "collection",
       "name": "openledger",
-      "description": "The openledger GraphQL API (gl-node 0.3). Pick an environment: base_url, api_key (the operator key or a person's key), and graphql_path (/graphql for the config file's ledger, /ledgers/<name>/graphql for a company). The Node endpoint folder needs the operator key."
+      "description": "The openledger GraphQL API (gl-node 0.4). Pick an environment: base_url, api_key (the operator key or a person's key), and graphql_path (/graphql for the config file's ledger, /ledgers/<name>/graphql for a company). The Node endpoint folder needs the operator key. Banks (Plaid) and Bank-feed inbox (new in 0.4) need a node with plaid.enabled for that ledger: paste item_id, account_id and transaction_id into the environment as you go."
     },
     {
       "_id": "env_base",
@@ -19,10 +19,16 @@
       "name": "Base Environment",
       "data": {
         "base_url": "http://127.0.0.1:4000",
+        "base_url2": "http://127.0.0.1:5000",
         "api_key": "PASTE-A-KEY-HERE",
+        "real_api_key": "PASTE-A-KEY-HERE",
         "graphql_path": "/graphql",
         "ledger": "acme",
-        "today": "2026-01-01"
+        "today": "2026-01-01",
+        "item_id": "PASTE-ITEM-ID",
+        "account_id": "PASTE-ACCOUNT-ID",
+        "ledger_account": "Assets:Bank:Checking",
+        "transaction_id": "PASTE-TRANSACTION-ID"
       }
     },
     {
@@ -31,7 +37,8 @@
       "parentId": "env_base",
       "name": "Local node (127.0.0.1:4000)",
       "data": {
-        "base_url": "http://127.0.0.1:4000"
+        "base_url": "http://127.0.0.1:4000",
+        "api_key": ""
       }
     },
     {
@@ -51,6 +58,17 @@
       "data": {
         "graphql_path": "/ledgers/acme/graphql",
         "ledger": "acme"
+      }
+    },
+    {
+      "_id": "env_servers",
+      "_type": "environment",
+      "parentId": "env_base",
+      "name": "Servers (ledger-node-a, ledger-node-b)",
+      "data": {
+        "ledgerNa": "https://ledger-node-a.p2pgl.com",
+        "ledgerNb": "https://ledger-node-b.p2pgl.com",
+        "xAPIKey": "PASTE-A-KEY-HERE"
       }
     },
     {
@@ -791,6 +809,514 @@
       "body": {
         "mimeType": "application/graphql",
         "text": "{\"query\":\"mutation($reply: String!) { acceptLedger(reply: $reply) { nodeId address ledger { name served nodeId listenPort } } }\",\"variables\":{\"reply\":\"PASTE-THE-REPLY\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "fld_banks",
+      "_type": "request_group",
+      "parentId": "wrk_openledger",
+      "name": "Banks (Plaid)",
+      "description": "0.4: bank connections, on the node that holds the company's banks (plaid.enabled in its config). An admin key (the operator key or an admin person's), except Connected banks (a read key is enough). Use the company's environment (graphql_path /ledgers/<name>/graphql) or /graphql for the config file's ledger. Paste item_id and account_id into the environment after connecting. Sandbox only: the two Sandbox requests. Start with: Open the bank demo's accounts, Connect a sandbox test bank, Map a bank account."
+    },
+    {
+      "_id": "req_bank_accounts",
+      "_type": "request",
+      "parentId": "fld_banks",
+      "name": "1. Open the bank demo's accounts",
+      "description": "The bank's ledger account, an expense account to book to, and the suspense account syncBank needs. A write key.",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($date: Date!) { bank: openAccount(name: \\\"Assets:Bank:Checking\\\", date: $date) office: openAccount(name: \\\"Expenses:Office\\\", date: $date) suspense: openAccount(name: \\\"Expenses:Uncategorized\\\", date: $date) }\",\"variables\":{\"date\":\"2020-01-01\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_bank_sandbox",
+      "_type": "request",
+      "parentId": "fld_banks",
+      "name": "2. Sandbox: connect a test bank (no Link)",
+      "description": "Plaid's First Platypus Bank, without Plaid Link. Copy itemId and an accountId into the environment.",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation { connectSandboxBank { itemId institutionName connectedOn lastSyncedAt lastErrorCode lastNotice lastNoticeAt accounts { accountId name mask type subtype ledgerAccount importFrom } } }\",\"variables\":{}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_bank_link",
+      "_type": "request",
+      "parentId": "fld_banks",
+      "name": "Create a Link token (a new bank)",
+      "description": "For the client app: open Plaid Link with linkToken; Link's onSuccess gives a publicToken for Connect a bank.",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation { createPlaidLinkToken { linkToken expiration } }\",\"variables\":{}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_bank_connect",
+      "_type": "request",
+      "parentId": "fld_banks",
+      "name": "Connect a bank (Link's public token)",
+      "description": "The public token Link's onSuccess gave. Passed after logging in again (update mode), it clears the bank's lastNotice.",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($publicToken: String!) { connectBank(publicToken: $publicToken) { itemId institutionName connectedOn lastSyncedAt lastErrorCode lastNotice lastNoticeAt accounts { accountId name mask type subtype ledgerAccount importFrom } } }\",\"variables\":{\"publicToken\":\"public-sandbox-PASTE-FROM-LINK\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_bank_list",
+      "_type": "request",
+      "parentId": "fld_banks",
+      "name": "Connected banks",
+      "description": "Each bank, its accounts (last digits only, never a token), where each is mapped, and its health. A read key is enough.",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"{ connectedBanks { itemId institutionName connectedOn lastSyncedAt lastErrorCode lastNotice lastNoticeAt accounts { accountId name mask type subtype ledgerAccount importFrom } } }\",\"variables\":{}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_bank_map",
+      "_type": "request",
+      "parentId": "fld_banks",
+      "name": "3. Map a bank account",
+      "description": "Nothing of an account is fetched until it is mapped. importFrom: the first date taken (null: the ledger account's open date).",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($item: String!, $account: String!, $ledgerAccount: String!, $importFrom: Date) { mapBankAccount(itemId: $item, accountId: $account, ledgerAccount: $ledgerAccount, importFrom: $importFrom) { itemId institutionName connectedOn lastSyncedAt lastErrorCode lastNotice lastNoticeAt accounts { accountId name mask type subtype ledgerAccount importFrom } } }\",\"variables\":{\"item\":\"{{ _.item_id }}\",\"account\":\"{{ _.account_id }}\",\"ledgerAccount\":\"{{ _.ledger_account }}\",\"importFrom\":null}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_bank_unmap",
+      "_type": "request",
+      "parentId": "fld_banks",
+      "name": "Unmap a bank account",
+      "description": "Stops taking that account's transactions.",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($item: String!, $account: String!) { unmapBankAccount(itemId: $item, accountId: $account) { itemId institutionName connectedOn lastSyncedAt lastErrorCode lastNotice lastNoticeAt accounts { accountId name mask type subtype ledgerAccount importFrom } } }\",\"variables\":{\"item\":\"{{ _.item_id }}\",\"account\":\"{{ _.account_id }}\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_bank_refresh",
+      "_type": "request",
+      "parentId": "fld_banks",
+      "name": "Refresh a bank's accounts",
+      "description": "Reads the bank's accounts again: one opened since appears, unmapped; mappings are kept.",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($item: String!) { refreshBankAccounts(itemId: $item) { itemId institutionName connectedOn lastSyncedAt lastErrorCode lastNotice lastNoticeAt accounts { accountId name mask type subtype ledgerAccount importFrom } } }\",\"variables\":{\"item\":\"{{ _.item_id }}\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_bank_relink",
+      "_type": "request",
+      "parentId": "fld_banks",
+      "name": "Create a Link token to log in again (update mode)",
+      "description": "When a bank shows lastErrorCode ITEM_LOGIN_REQUIRED or a lastNotice: Link logs in again on the same connection; pass its public token to Connect a bank.",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($item: String!) { createPlaidLinkToken(itemId: $item) { linkToken expiration } }\",\"variables\":{\"item\":\"{{ _.item_id }}\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_bank_reset",
+      "_type": "request",
+      "parentId": "fld_banks",
+      "name": "Sandbox: make a bank need a new login",
+      "description": "Its next fetch or sync is refused with ITEM_LOGIN_REQUIRED, to try logging in again.",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($item: String!) { resetSandboxLogin(itemId: $item) }\",\"variables\":{\"item\":\"{{ _.item_id }}\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_bank_fire",
+      "_type": "request",
+      "parentId": "fld_banks",
+      "name": "Sandbox: have Plaid send a webhook",
+      "description": "Needs plaid.webhookUrl and a node Plaid can reach over HTTPS (not a laptop).",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($item: String!, $code: String!) { fireSandboxWebhook(itemId: $item, webhookCode: $code) }\",\"variables\":{\"item\":\"{{ _.item_id }}\",\"code\":\"SYNC_UPDATES_AVAILABLE\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_bank_webhooks",
+      "_type": "request",
+      "parentId": "fld_banks",
+      "name": "Give the webhook address to connected banks",
+      "description": "Once, after setting plaid.webhookUrl, for banks connected before it. Answers how many banks were updated.",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation { updateBankWebhooks }\",\"variables\":{}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_bank_sync",
+      "_type": "request",
+      "parentId": "fld_banks",
+      "name": "Import straight into the books (syncBank)",
+      "description": "The old way: one entry per transaction, flagged !, against Expenses:Uncategorized. Shares the bank's place at Plaid with Fetch into the inbox: each transaction goes to whichever runs first.",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($item: String!) { syncBank(itemId: $item) { imported alreadyImported inInbox skippedPending skippedUnmapped skippedBeforeStart needsReview { transactionId reason } stoppedBy } }\",\"variables\":{\"item\":\"{{ _.item_id }}\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_bank_disconnect",
+      "_type": "request",
+      "parentId": "fld_banks",
+      "name": "Disconnect a bank",
+      "description": "Removed at Plaid first, then its token here; its transactions waiting in the inbox are dropped.",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($item: String!) { disconnectBank(itemId: $item) }\",\"variables\":{\"item\":\"{{ _.item_id }}\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "fld_inbox",
+      "_type": "request_group",
+      "parentId": "wrk_openledger",
+      "name": "Bank-feed inbox",
+      "description": "0.4: fetched bank transactions wait here until a bookkeeper books or ignores them. Fetching: an admin key (or Plaid's webhooks, on a server). Listing, booking, ignoring: a write key; a read key is refused. Paste a transactionId from List the inbox into the environment's transaction_id."
+    },
+    {
+      "_id": "req_inbox_fetch",
+      "_type": "request",
+      "parentId": "fld_inbox",
+      "name": "4. Fetch new transactions into the inbox",
+      "description": "Writes nothing to the books. A new sandbox bank's transactions may take a minute to appear at Plaid: run it again if added is 0.",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($item: String!) { fetchBankTransactions(itemId: $item) { added updated dropped alreadyBooked alreadyInInbox skippedPending skippedUnmapped skippedBeforeStart needsReview { transactionId reason } stoppedBy } }\",\"variables\":{\"item\":\"{{ _.item_id }}\"}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_inbox_list",
+      "_type": "request",
+      "parentId": "fld_inbox",
+      "name": "5. List the inbox",
+      "description": "Oldest first. item null: every bank. Amounts as the bank account's posting carries them: money out negative.",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"query($item: String, $first: Int!, $offset: Int!) { bankInbox(itemId: $item, first: $first, offset: $offset) { total transactions { transactionId itemId institutionName accountId accountName accountMask ledgerAccount date amount { number currency } payee description category fetchedAt } } }\",\"variables\":{\"item\":null,\"first\":50,\"offset\":0}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_inbox_review",
+      "_type": "request",
+      "parentId": "fld_inbox",
+      "name": "Review screen (inbox, banks, accounts in one request)",
+      "description": "What a review screen needs at once: what waits, the banks' health, and the accounts to book to.",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"{ bankInbox(first: 50) { total transactions { transactionId date amount { number currency } payee description category accountName ledgerAccount } } connectedBanks { itemId institutionName lastSyncedAt lastErrorCode lastNotice } accounts { name closedOn } }\",\"variables\":{}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_inbox_classify",
+      "_type": "request",
+      "parentId": "fld_inbox",
+      "name": "6. Book transactions",
+      "description": "Up to 200 a call, each booked or refused on its own: one * entry, the bank's account against account, entered by you. payee/narration null: Plaid's; empty: left out.",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($items: [ClassifyInput!]!) { classifyBankTransactions(items: $items) { transactionId ok txid code message } }\",\"variables\":{\"items\":[{\"transactionId\":\"{{ _.transaction_id }}\",\"account\":\"Expenses:Office\",\"payee\":null,\"narration\":\"Printer paper\"}]}}"
+      },
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "name": "X-Api-Key",
+          "value": "{{ _.api_key }}"
+        }
+      ],
+      "authentication": {},
+      "settingStoreCookies": false,
+      "settingSendCookies": false
+    },
+    {
+      "_id": "req_inbox_ignore",
+      "_type": "request",
+      "parentId": "fld_inbox",
+      "name": "Ignore transactions",
+      "description": "Leaves the inbox, nothing written, never fetched again; who, when and why are kept.",
+      "method": "POST",
+      "url": "{{ _.base_url }}{{ _.graphql_path }}",
+      "body": {
+        "mimeType": "application/graphql",
+        "text": "{\"query\":\"mutation($items: [IgnoreInput!]!) { ignoreBankTransactions(items: $items) { transactionId ok code message } }\",\"variables\":{\"items\":[{\"transactionId\":\"{{ _.transaction_id }}\",\"reason\":\"a transfer entered by hand\"}]}}"
       },
       "headers": [
         {
