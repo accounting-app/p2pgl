@@ -28,7 +28,7 @@ use async_graphql::{Context, EmptySubscription, ErrorExtensions, Object, Schema,
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::extract::{Request, State};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use tracing::{error, info, Instrument};
 
 use crate::config::{
@@ -37,6 +37,7 @@ use crate::config::{
 use crate::ledger_runtime::{self, NodeSettings, RunningLedger};
 use crate::ledgers::{LedgerState, Ledgers, Taken};
 use crate::mesh_invite::{self, MeshLine, INVITE_PREFIX, REPLY_PREFIX};
+use crate::request_log::RequestNote;
 
 /// The longest `ledger.json` `addLedger` writes: settings are a few hundred
 /// bytes; a long allowlist fits many times over.
@@ -1123,17 +1124,28 @@ pub(crate) fn node_schema(admin: Arc<NodeAdmin>, introspection: bool) -> NodeSch
 pub(crate) async fn node_graphql(
     State(schema): State<NodeSchema>,
     request: GraphQLRequest,
-) -> GraphQLResponse {
+) -> Response {
     let request = request.into_inner();
-    match crate::spawn_detached_in_span(async move { schema.execute(request).await }).await {
-        Ok(response) => response.into(),
+    let operation_name = request.operation_name.clone();
+    let response = match crate::spawn_detached_in_span(async move { schema.execute(request).await })
+        .await
+    {
+        Ok(response) => response,
         Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
         Err(error) => async_graphql::Response::from_errors(vec![async_graphql::ServerError::new(
             format!("the request did not finish: {error}"),
             None,
-        )])
-        .into(),
-    }
+        )]),
+    };
+    // 009: behind `operator_only`, so the operator's: a line of its own.
+    let errors = response.errors.len();
+    let response = GraphQLResponse::from(response).into_response();
+    RequestNote::new(
+        Some(&crate::access_control::Caller::operator()),
+        operation_name.as_deref(),
+        errors,
+    )
+    .attach(response)
 }
 
 /// The operator key, or 401 — exactly a wrong key's answer anywhere else. A

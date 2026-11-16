@@ -411,11 +411,11 @@ mod tests {
     use crate::graphql::broadcast::TransactionBroadcast;
     use crate::graphql::{build_schema_with_service, SharedLedger};
     use crate::health::HealthState;
+    use crate::test_support::capture_warnings;
     use axum::http::request::Builder;
     use axum::Router;
     use http_body_util::BodyExt;
     use std::io::Write;
-    use std::sync::Mutex;
     use tempfile::NamedTempFile;
     use tokio::sync::RwLock;
     use tower::ServiceExt;
@@ -1103,39 +1103,6 @@ mod tests {
         assert!(cut.starts_with(&"é".repeat(MAX_ECHOED_HEADER_CHARS)));
         assert!(cut.ends_with(&format!("…({} bytes)", long.len())), "{cut}");
         assert!(cut.len() < 512, "{}", cut.len());
-    }
-
-    /// Capture every `warn!` emitted while `body` runs on this thread.
-    fn capture_warnings<T>(body: impl FnOnce() -> T) -> (T, String) {
-        #[derive(Clone, Default)]
-        struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
-
-        impl std::io::Write for SharedBuffer {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuffer {
-            type Writer = SharedBuffer;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let buffer = SharedBuffer::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buffer.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        let value = tracing::subscriber::with_default(subscriber, body);
-        let logged = String::from_utf8_lossy(&buffer.0.lock().unwrap()).into_owned();
-        (value, logged)
     }
 
     /// M-41: N = 200 foreign-Host requests, each carrying a 100 KiB `Host`,

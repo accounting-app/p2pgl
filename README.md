@@ -734,9 +734,60 @@ A node bound to a public address accepts QUIC handshakes from anyone. Refusals a
 
 - one line per 10 s for every peer not on the allowlist, taken together;
 - one per 10 s per allowlisted peer and reason;
-- one per 10 s per HTTP client for requests the Host/Origin/Content-Type guard refuses.
+- one per 10 s per HTTP client for requests the Host/Origin/Content-Type guard refuses;
+- one request line per 10 s per HTTP client for every request no key let
+  through to a handler (below).
 
 Each window's suppressed count is logged when the window closes. iroh's own per-handshake warnings (unknown ALPN, a handshake aborted by the peer) are silenced by the default filter, `info,iroh::protocol=error`. **If you set `RUST_LOG`, it replaces that default: keep `iroh::protocol=error` in it**, or any dialer can write ~300–700 bytes of log per handshake. Put the same log-volume controls (rotation, rate limits in your log shipper) on the QUIC port as on the HTTP edge.
+
+### Request log
+
+The node writes one line per HTTP request, with target `http`:
+
+```
+INFO http: ledger=acme method=POST path=/ledgers/acme/graphql operation=AddTransaction user=u_7f3a09c1d2e4b5a6 status=200 errors=0 ms=12 client=203.0.113.9
+WARN http: ledger=acme method=POST path=/ledgers/acme/graphql operation=- user=- status=401 errors=0 ms=0 client=198.51.100.4 suppressed=0
+```
+
+- `ledger` is the company (`default` for `/graphql` and `/health`, `-` for
+  none); `/ledgers/acm%65/graphql`, which serves `acme`, says `acme`.
+- `operation` is the `operationName` the client sent: `-` when it sent none,
+  `?` when it is not a GraphQL name of at most 64 characters.
+- `user` is the person's user id, `operator`, or `-` when no key let the
+  request through to a handler. On a loopback node with `auth.enabled:
+  false` every caller is the operator, and every request gets a line of its
+  own.
+- `errors` counts the GraphQL errors in the answer, never their messages.
+- `client` is the caller's address as the rate limiter works it out: behind a
+  proxy listed in `trustedProxies` (the installer's Caddy) the address it
+  forwarded, otherwise the TCP peer, whatever `X-Forwarded-For` says.
+- `path` is the path only, never the query string, escaped, and cut to 128
+  bytes and marked `…` when longer; a non-standard `method` is `?`.
+  `cut_short=true` (with `status=-`) marks a request whose answer was never
+  sent: the 408 timeout, or a client that hung up. A write may still have
+  landed — a mutation runs to its end once it starts — so look in the books
+  before telling a client their posting failed.
+
+**Level:** `INFO` for an answer below 400; `WARN` for 4xx, 5xx and a request
+cut short — a refused or failed request, not a fault of the node; `DEBUG` for
+a `/health` that answers 200. **Never logged:** the key, any header, the body,
+the query text, its variables, the URL's query string.
+
+**Bounded like a refusal.** Only a request a key let through — a GraphQL
+request, or its ledger's 503 `LEDGER_BUSY` — gets a line of its own. Every
+other answer (strangers' 401s, 429s, guard refusals, preflights, 413s, 404s,
+`/health`) gets one line per client per 10 s, ending `suppressed=N`, and a
+summary of the rest when the window closes: about 13 lines a second at most,
+whatever a stranger sends. A key holder's lines are bounded by the request
+rate the node already accepts from them (60 GraphQL requests a minute per
+client per ledger): one who rotates through many addresses (an IPv6 /48) can
+write as many lines as requests it gets through. Each line names their user
+id, and revoking the key stops it. A node-wide cap would hide honest traffic
+exactly when it is needed, so there is none.
+
+The request line is on by default; `RUST_LOG=info,iroh::protocol=error,http=off`
+turns it off. The node's log is plain text, without colour codes, whenever its
+output is not a terminal (`docker logs`, a file, a log shipper).
 
 ### API keys
 
@@ -1588,7 +1639,9 @@ copied folder: one node id in two meshes would tie them together), is logged
 and not served; the others are. A folder named `default` is ignored, and files
 in `ledgersDir` are not ledgers.
 The node stops only if it can serve no ledger at all. Each ledger's log lines
-carry its name (`ledger="acme"`).
+carry its name (`ledger{ledger=acme}`). A request for a name no ledger could
+have (not a valid ledger name) shows `ledger{ledger=-}` instead, so a caller
+cannot put its own text, a newline say, into a log line through the name.
 
 #### Adding and removing ledgers while the node runs
 

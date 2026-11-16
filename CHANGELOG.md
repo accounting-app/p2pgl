@@ -7,6 +7,40 @@ break compatibility.
 
 ## [Unreleased]
 
+### Added
+
+- **A request log** (009 unit 1): the node writes one line per HTTP request,
+  target `http`, like a Heroku router line — `ledger method path operation
+  user status errors ms client`. `INFO` below 400, `WARN` for 4xx, 5xx and a
+  request cut short (a refused or failed request, not a fault of the node),
+  `DEBUG` for a passing `/health`. On by default; `RUST_LOG=…,http=off` turns
+  it off. README *Request log*.
+- **Plain text off a terminal:** the node's log has no colour codes when its
+  output is not a terminal (`docker logs`, a file, a log shipper). This
+  changes the log's bytes for anyone who parsed the escape codes.
+
+### Security
+
+- The request log never carries the key, a header, the body, the query
+  text, its variables or the URL's query string, and every value a caller
+  chose is checked or escaped (CR and LF included, which tracing does not
+  escape), so no value can start a line; every line is under 512 bytes.
+  Only a request a key let through gets a line of its own; every other
+  answer gets one line per client per 10 s with the count it stood for
+  (M-41, T77). A key holder rotating through many addresses can write as
+  many lines as requests the node accepts from them, each naming their user
+  id — an accepted residual (README *Request log*).
+- A folder in `ledgersDir` whose name is not a valid ledger name is logged
+  escaped, so a newline in it cannot start a line.
+- A request to `/ledgers/NAME/graphql` can no longer forge a line in the
+  node's log through the ledger name (L-158, 009 unit 0). The rate limiter's
+  warnings (an untrusted peer sending `X-Forwarded-For`, L-37; a full client
+  table, M-21) are written inside a span naming the ledger, and that span
+  took the name as the caller sent it, percent-decoded and unchecked:
+  `/ledgers/x%0A…/graphql` put a newline in the line and started a forged
+  one, up to about 64 KiB long. The span now shows a name only when it is a
+  valid ledger name, and `-` otherwise (M-41's rule).
+
 ## [0.4.0] — 2026-11-15
 
 Bank feeds through Plaid. A company's banks are connected on the one node

@@ -183,8 +183,8 @@
   },
   "L-R14-one-broken-folder-stops-the-node": {
     "file": "crates/gl-node/src/main.rs",
-    "old": "            (Some(reason), _) => {\n                error!(ledger = %name, %reason, \"ledger not served\");",
-    "new": "            (Some(reason), _) => {\n                error!(ledger = %name, %reason, \"ledger not served\");\n                std::process::exit(1);",
+    "old": "                    \"ledger not served\"\n                );\n                served.insert_failed(&name, reason).await;",
+    "new": "                    \"ledger not served\"\n                );\n                std::process::exit(1);",
     "runs": [
       [
         "-p",
@@ -726,8 +726,8 @@
   },
   "L-R51-a-change-in-the-requests-own-future": {
     "file": "crates/gl-node/src/ledger_admin.rs",
-    "old": "    match crate::spawn_detached_in_span(async move { schema.execute(request).await }).await {",
-    "new": "    match Ok::<_, tokio::task::JoinError>(schema.execute(request).await) {",
+    "old": "    let response = match crate::spawn_detached_in_span(async move { schema.execute(request).await })\n        .await",
+    "new": "    let response = match Ok::<_, tokio::task::JoinError>(schema.execute(request).await)",
     "runs": [
       [
         "-p",

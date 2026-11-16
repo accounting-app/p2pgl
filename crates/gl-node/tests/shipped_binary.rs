@@ -587,6 +587,33 @@ fn with_auth_off_a_loopback_node_still_serves_its_operator() {
     assert_eq!(node.stop().code(), Some(0));
 }
 
+/// 009: the shipped binary, its stdout a file as under `docker logs`, writes
+/// one line for a keyed request — the ledger, the operator, the status, no
+/// key — and its log is plain text: no colour codes anywhere.
+///
+/// Bug-catch: turn colour on whatever stdout is (NL-R7) and every line of
+/// `docker logs` carries escape codes around its field names.
+#[test]
+fn the_shipped_binary_logs_each_request_in_plain_text() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = dir.path().canonicalize().expect("canonical tempdir");
+    let mut node = Node::new(this_binary(), &dir);
+    node.start("request-log")
+        .unwrap_or_else(|log| panic!("boot: {log}"));
+    node.graphql("{ verify { ok } }");
+    assert_eq!(node.stop().code(), Some(0));
+    let log = node.log("request-log");
+    assert!(
+        log.lines().any(|line| line.contains(
+            " INFO http: ledger=default method=POST path=/graphql operation=- user=operator \
+             status=200 errors=0 ms="
+        )),
+        "{log}"
+    );
+    assert!(!log.contains('\u{1b}'), "colour codes in {log}");
+    assert!(!log.contains(&node.api_key), "the key in {log}");
+}
+
 /// `gl-node user` against the shipped binary (002-users-and-roles step 3):
 /// with the operator key from the node's own environment, `user add` prints a
 /// key that works at once with the role given — reads, but not writes, for

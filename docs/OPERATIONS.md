@@ -691,3 +691,18 @@ answers `/health` and serves its own writes:
 Any `ERROR` line, and a node that restarts repeatedly, need a person too. Set
 `RUST_LOG` only if you keep `iroh::protocol=error` in it (README, *Log volume on
 a public bind*), and rotate logs.
+
+**Requests** — the node writes one line per HTTP request, target `http`
+(README, *Request log*): who asked, for which company, what it answered and
+how long it took. A request line at `WARN` is a **refused or failed request**
+(a wrong key, a 429, a busy ledger's 503), **not a fault of the node**: an
+alert on warnings should leave out target `http` (in a log shipper, the text
+` WARN http: `), or every stranger's wrong key pages someone. Watch instead
+for many `status=503` lines for one ledger (it is busy: raise
+`http.maxRequestsPerLedger` or find the caller) and `status=5xx` lines from
+key holders. A line with `cut_short=true` is a request whose answer was
+never sent (the timeout, or a client that hung up); a posting may still have
+landed, so check the books before telling a client it failed. The lines
+carry client addresses and user ids, and stay as long
+as the log's rotation keeps them (on an installed server, Docker's: 10 MB × 5
+files), readable by root.

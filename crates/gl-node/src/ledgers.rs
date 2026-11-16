@@ -35,6 +35,7 @@ use crate::graphql::{graphiql_handler, graphql_handler, AppSchema};
 use crate::health::{health_handler, HealthState};
 use crate::ledger_runtime::RunningLedger;
 use crate::rate_limit::{peer_of, too_many_requests, RateLimiter, LEDGER_MAX_BUCKETS};
+use crate::request_log::RequestNote;
 
 /// A ledger's request slots (003, step 3): GraphQL requests it serves at once.
 type Slots = Arc<tokio::sync::Semaphore>;
@@ -131,12 +132,16 @@ pub(crate) fn ledger_router(
 /// Serve the request in one of the ledger's slots, or answer 503
 /// `LEDGER_BUSY` when all are in use (003, step 3): a ledger flooded by its
 /// own callers slows only itself.
+///
+/// 009: the 503 is a key holder's (auth runs first), so it carries a
+/// [`RequestNote`] and gets a line of its own: "the app is slow".
 async fn take_a_slot(
     State(slots): State<Slots>,
     request: Request,
     next: middleware::Next,
 ) -> Response {
     let Ok(_slot) = slots.try_acquire_owned() else {
+        let caller = request.extensions().get::<crate::access_control::Caller>();
         let mut response = refusal(
             StatusCode::SERVICE_UNAVAILABLE,
             "LEDGER_BUSY",
@@ -147,7 +152,12 @@ async fn take_a_slot(
             axum::http::header::RETRY_AFTER,
             axum::http::HeaderValue::from_static("1"),
         );
-        return response;
+        // Only with a caller: without one (never, behind auth) the 503 is
+        // throttled like any answer nobody behind a key made.
+        return match caller {
+            Some(caller) => RequestNote::new(Some(caller), None, 0).attach(response),
+            None => response,
+        };
     };
     next.run(request).await
 }
@@ -467,7 +477,16 @@ impl Ledgers {
                 _ => None,
             };
             let limiter = accepted.unwrap_or(&self.strangers);
-            let allowed = tracing::info_span!("ledger", ledger = %name)
+            // L-158 (T104, 009 unit 0): `name` is the caller's, percent-decoded
+            // and not yet checked, and the limiter's warnings (L-37, M-21) are
+            // written inside this span: a `%0A` in the name would start a
+            // forged line (M-41). Only a name the node could serve is shown.
+            let logged_name = if is_valid_ledger_name(name) {
+                name
+            } else {
+                "-"
+            };
+            let allowed = tracing::info_span!("ledger", ledger = %logged_name)
                 .in_scope(|| limiter.allow_request(peer_of(&request), request.headers()));
             if !allowed {
                 return too_many_requests();
@@ -585,32 +604,74 @@ pub(crate) async fn named_health(
     ledgers.dispatch(&name, "/health", request, true).await
 }
 
+/// A node serving `default` and `acme`, for tests here and in `request_log`.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_node {
     use std::collections::HashSet;
     use std::sync::Arc;
 
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
     use axum::Router;
-    use http_body_util::BodyExt;
-    use serde_json::{json, Value};
-    use tower::ServiceExt;
     use tower_http::cors::CorsLayer;
 
-    use super::Ledgers;
+    use super::{Ledgers, Served};
     use crate::auth::{AccessSource, AuthState};
     use crate::graphql::broadcast::TransactionBroadcast;
     use crate::graphql::{build_schema_with_access, SharedLedger};
     use crate::health::HealthState;
     use crate::rate_limit::RateLimiter;
     use crate::request_guard::RequestGuardState;
+    use crate::request_log::RequestLogState;
 
-    const OPERATOR: &str = "operator-key-for-the-ledger-routing-tests-0123456789";
+    pub(crate) const OPERATOR: &str = "operator-key-for-the-ledger-routing-tests-0123456789";
 
     /// A node serving `default` and `acme`, with `broken` refused at boot —
-    /// each ledger with its own books and its own access list.
-    fn node() -> (
+    /// each ledger with its own books and its own access list. Its ledgers'
+    /// limiter and the router's are separate (as two `RateLimiter::graphql()`).
+    pub(crate) fn node() -> (
+        tempfile::TempDir,
+        Router,
+        SharedLedger,
+        SharedLedger,
+        Ledgers,
+    ) {
+        build(RateLimiter::graphql(), RateLimiter::graphql(), None)
+    }
+
+    /// [`node`] as `main` builds one: the ledgers' limiter and the router's
+    /// are clones of `limiter` (one trusted-proxy set, one L-37 flag), and
+    /// the request line is `log` when given, the router's own otherwise.
+    pub(crate) fn node_with(
+        limiter: RateLimiter,
+        log: Option<RequestLogState>,
+    ) -> (
+        tempfile::TempDir,
+        Router,
+        SharedLedger,
+        SharedLedger,
+        Ledgers,
+    ) {
+        build(limiter.clone(), limiter, log)
+    }
+
+    /// Hold every request slot of ledger `name` (its next keyed request is
+    /// answered 503 `LEDGER_BUSY`).
+    pub(crate) async fn hold_every_slot(
+        ledgers: &Ledgers,
+        name: &str,
+    ) -> tokio::sync::OwnedSemaphorePermit {
+        let slots = match &*ledgers.get(name).await.expect("served") {
+            Served::Running { slots, .. } => slots.clone(),
+            Served::Failed(_) => panic!("{name} is served"),
+        };
+        let all = u32::try_from(ledgers.max_requests).expect("slots");
+        slots.try_acquire_many_owned(all).expect("every slot")
+    }
+
+    fn build(
+        ledgers_limiter: RateLimiter,
+        limiter: RateLimiter,
+        log: Option<RequestLogState>,
+    ) -> (
         tempfile::TempDir,
         Router,
         SharedLedger,
@@ -618,7 +679,7 @@ mod tests {
         Ledgers,
     ) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let ledgers = Ledgers::new(true, OPERATOR.to_owned(), 64, RateLimiter::graphql());
+        let ledgers = Ledgers::new(true, OPERATOR.to_owned(), 64, ledgers_limiter);
         let mut shared = Vec::new();
         for name in ["default", "acme"] {
             let service = ledger::service::LedgerService::boot(
@@ -655,26 +716,59 @@ mod tests {
         }
         ledgers.by_name.try_write().expect("free").insert(
             "broken".to_owned(),
-            Arc::new(super::Served::Failed(
-                "its ledger.json does not parse".to_owned(),
+            Arc::new(Served::Failed("its ledger.json does not parse".to_owned())),
+        );
+        let guard = RequestGuardState {
+            allowed_hosts: Arc::new(["127.0.0.1".to_owned()].into()),
+            allowed_origins: Arc::new(HashSet::new()),
+            tls_terminated: false,
+        };
+        let app = match log {
+            None => crate::build_application_with_limiter(
+                ledgers.clone(),
+                guard,
+                CorsLayer::new(),
+                false,
+                limiter,
+                None,
+            ),
+            Some(log) => crate::application_routes(
+                ledgers.clone(),
+                guard,
+                CorsLayer::new(),
+                false,
+                limiter,
+                None,
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                log,
+                crate::request_log::request_log,
             )),
-        );
-        let app = crate::build_application_with_limiter(
-            ledgers.clone(),
-            RequestGuardState {
-                allowed_hosts: Arc::new(["127.0.0.1".to_owned()].into()),
-                allowed_origins: Arc::new(HashSet::new()),
-                tls_terminated: false,
-            },
-            CorsLayer::new(),
-            false,
-            RateLimiter::graphql(),
-            None,
-        );
+        };
         let acme = shared.pop().expect("acme");
         let default = shared.pop().expect("default");
         (dir, app, default, acme, ledgers)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::Router;
+    use http_body_util::BodyExt;
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    use super::test_node::{node, OPERATOR};
+    use super::Ledgers;
+    use crate::auth::AuthState;
+    use crate::graphql::broadcast::TransactionBroadcast;
+    use crate::graphql::SharedLedger;
+    use crate::health::HealthState;
+    use crate::rate_limit::RateLimiter;
 
     async fn send(
         app: &Router,
@@ -957,6 +1051,53 @@ mod tests {
             super::Served::Running { .. }
         ));
         assert_eq!(ledgers.running_count().await, 1);
+    }
+
+    /// 009, L-158: a ledger name the node could never serve never reaches a log
+    /// line. `/ledgers/x%0A…/graphql` with `X-Forwarded-For` from a peer not
+    /// in `trustedProxies` fires the L-37 warning inside `dispatch`'s
+    /// rate-limit span, and that span shows the ledger as `-`: the decoded
+    /// newline cannot start a forged line (M-41). Every line captured is the
+    /// node's own `WARN`, the span's among them.
+    ///
+    /// Bug-catch: give the span the unchecked, decoded name again (NL-R14)
+    /// and the warning's line ends at `ledger{ledger=x`, the forged text
+    /// starting a line of its own.
+    #[tokio::test]
+    async fn an_invalid_name_never_reaches_the_dispatch_span() {
+        let (_dir, app, _, _, _) = node();
+        let forged = "2026-11-16T00:00:00.000000Z ERROR gl_node: forged";
+        let path = format!("/ledgers/x%0A{}/graphql", forged.replace(' ', "%20"));
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("host", "127.0.0.1")
+            .header("content-type", "application/json")
+            .header("x-forwarded-for", "203.0.113.9")
+            .body(Body::from(
+                json!({ "query": "{ verify { ok } }" }).to_string(),
+            ))
+            .expect("request");
+        let (response, logged) =
+            crate::test_support::capture_warnings_async(app.oneshot(request)).await;
+        assert_eq!(
+            response.expect("response").status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(
+            logged.contains("trustedProxies"),
+            "the L-37 warning fired: {logged}"
+        );
+        assert!(
+            logged
+                .lines()
+                .any(|line| line.contains("ledger{ledger=-}: gl_node::rate_limit")),
+            "the warning in dispatch's span: {logged}"
+        );
+        for line in logged.lines() {
+            assert!(!line.starts_with(forged), "a forged line: {logged}");
+            assert!(line.contains(" WARN "), "not the node's own line: {line}");
+        }
     }
 
     /// 003: a ledger this node does not serve — unknown, refused at boot, or

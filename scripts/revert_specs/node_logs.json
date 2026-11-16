@@ -1,0 +1,233 @@
+{
+  "NL-R1-the-layer-removed": {
+    "file": "crates/gl-node/src/main.rs",
+    "old": "    application_routes(ledgers, guard_state, cors, graphiql, limiter, node).layer(\n        middleware::from_fn_with_state(log, request_log::request_log),\n    )",
+    "new": "    let _ = log;\n    application_routes(ledgers, guard_state, cors, graphiql, limiter, node)",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_keyed_request_logs_one_line_with_ledger_user_operation_and_status"
+      ],
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "the_shipped_binary_logs_each_request_in_plain_text"
+      ]
+    ]
+  },
+  "NL-R2-graphql-handler-sets-no-note": {
+    "file": "crates/gl-node/src/graphql/mod.rs",
+    "old": "            RequestNote::new(Some(caller), operation_name.as_deref(), errors).attach(response)",
+    "new": "            let _ = (caller, &operation_name, errors);\n            response",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_keyed_request_logs_one_line_with_ledger_user_operation_and_status"
+      ]
+    ]
+  },
+  "NL-R3-client-is-the-tcp-peer": {
+    "file": "crates/gl-node/src/request_log.rs",
+    "old": "        client: state.clients.client_of(&request),",
+    "new": "        client: crate::rate_limit::peer_of(&request),",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_client_is_the_forwarded_address_only_behind_a_trusted_proxy"
+      ]
+    ]
+  },
+  "NL-R4-operation-name-unchecked": {
+    "file": "crates/gl-node/src/request_log.rs",
+    "old": "        Some(name) if is_graphql_name(name) => name,",
+    "new": "        Some(name) => name,",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_control_character_in_a_path_or_operation_name_cannot_start_a_line"
+      ]
+    ]
+  },
+  "NL-R5-a-full-line-without-a-note": {
+    "file": "crates/gl-node/src/request_log.rs",
+    "old": "    let suppressed = match note {\n        Some(_) => None,",
+    "new": "    let suppressed = match Some(()) {\n        Some(_) => None,",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "strangers_requests_log_one_line_per_client_per_window"
+      ]
+    ]
+  },
+  "NL-R6-health-at-info": {
+    "file": "crates/gl-node/src/request_log.rs",
+    "old": "        Some(StatusCode::OK) if head.health => Level::Debug,",
+    "new": "        Some(StatusCode::OK) if head.health => Level::Info,",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_passing_health_check_logs_at_debug_only"
+      ]
+    ]
+  },
+  "NL-R7-ansi-always-on": {
+    "file": "crates/gl-node/src/main.rs",
+    "old": "        .with_ansi(std::io::stdout().is_terminal())",
+    "new": "        .with_ansi(true)",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--test",
+        "shipped_binary",
+        "the_shipped_binary_logs_each_request_in_plain_text"
+      ]
+    ]
+  },
+  "NL-R8-the-uri-not-its-path": {
+    "file": "crates/gl-node/src/request_log.rs",
+    "old": "        path: escaped(path, MAX_PATH_BYTES),",
+    "new": "        path: escaped(&request.uri().to_string(), MAX_PATH_BYTES),",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_log_never_carries_the_key_the_variables_the_query_or_a_query_string"
+      ]
+    ]
+  },
+  "NL-R9-escaping-left-to-tracing": {
+    "file": "crates/gl-node/src/request_log.rs",
+    "old": "        if character.is_control() || character.is_whitespace() {",
+    "new": "        if false {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_control_character_in_a_path_or_operation_name_cannot_start_a_line"
+      ]
+    ]
+  },
+  "NL-R10-the-drop-guard-removed": {
+    "file": "crates/gl-node/src/request_log.rs",
+    "old": "            write_line(&self.state, &head, None, None);",
+    "new": "            let _ = head;",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_request_cut_short_still_logs_a_throttled_line"
+      ]
+    ]
+  },
+  "NL-R11-the-method-as-sent": {
+    "file": "crates/gl-node/src/request_log.rs",
+    "old": "        method: method_field(request.method()).to_owned(),",
+    "new": "        method: request.method().as_str().to_owned(),",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "every_line_is_under_512_bytes"
+      ]
+    ]
+  },
+  "NL-R12-throttle-keyed-on-the-tcp-peer": {
+    "file": "crates/gl-node/src/request_log.rs",
+    "old": "        None => match state.throttle.note(bucket_key(head.client), Instant::now()) {",
+    "new": "        None => match state.throttle.note(IpAddr::from([127, 0, 0, 1]), Instant::now()) {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "strangers_behind_one_proxy_are_throttled_per_forwarded_client"
+      ]
+    ]
+  },
+  "NL-R13-ledger-name-from-the-raw-path": {
+    "file": "crates/gl-node/src/request_log.rs",
+    "old": "    match percent_encoding::percent_decode_str(segment).decode_utf8() {",
+    "new": "    match Ok::<_, std::str::Utf8Error>(std::borrow::Cow::Borrowed(segment)) {",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_percent_encoded_ledger_name_logs_as_the_ledger_it_serves"
+      ]
+    ]
+  },
+  "NL-R14-dispatch-span-shows-the-unchecked-name": {
+    "file": "crates/gl-node/src/ledgers.rs",
+    "old": "            let logged_name = if is_valid_ledger_name(name) {\n                name\n            } else {\n                \"-\"\n            };",
+    "new": "            let logged_name = name;",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "an_invalid_name_never_reaches_the_dispatch_span"
+      ]
+    ]
+  },
+  "NL-R15-every-line-at-info": {
+    "file": "crates/gl-node/src/request_log.rs",
+    "old": "        Level::Warn => warn!(target: \"http\", \"{line}\"),",
+    "new": "        Level::Warn => info!(target: \"http\", \"{line}\"),",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_level_follows_the_status"
+      ]
+    ]
+  },
+  "NL-R16-busy-503-without-a-note": {
+    "file": "crates/gl-node/src/ledgers.rs",
+    "old": "            Some(caller) => RequestNote::new(Some(caller), None, 0).attach(response),",
+    "new": "            Some(_) => response,",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_busy_ledger_logs_the_key_holders_503_in_full"
+      ]
+    ]
+  }
+}

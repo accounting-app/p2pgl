@@ -92,7 +92,7 @@
   },
   "U-R7-handler-drops-the-caller": {
     "file": "crates/gl-node/src/graphql/mod.rs",
-    "old": "        request = request.data(caller);",
+    "old": "        request = request.data(caller.clone());",
     "new": "        let _ = caller;",
     "runs": [
       [

@@ -55,6 +55,11 @@ webpki-roots = "1"
 ring = { version = "0.17", default-features = false, features = ["alloc", "std"] }
 
 
+# Decoding a ledger name in the request line as axum's `Path` does (build-log
+# 009); already compiled in through axum.
+percent-encoding = "2"
+
+
 [dev-dependencies]
 # An in-process iroh-relay server for the own-relay tests, on 127.0.0.1
 # (docs/build-log/001-peer-discovery). Test builds only: resolver 2 keeps

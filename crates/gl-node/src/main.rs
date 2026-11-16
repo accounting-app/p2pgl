@@ -24,6 +24,7 @@ mod plaid;
 mod plaid_webhook;
 mod rate_limit;
 mod request_guard;
+mod request_log;
 mod secret_store;
 #[cfg(test)]
 mod test_support;
@@ -42,6 +43,7 @@ use request_guard::RequestGuardState;
 
 use axum::routing::{get, post};
 use axum::{middleware, Router};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -369,6 +371,10 @@ async fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER)),
         )
+        // 009: plain text when stdout is not a terminal (`docker logs`, a log
+        // shipper): tracing-subscriber 0.3.23 otherwise writes colour codes
+        // around every field name.
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
 
     // Determine config path from env or default.
@@ -592,7 +598,13 @@ async fn start_ledgers(
         };
         match (refusal, loaded) {
             (Some(reason), _) => {
-                error!(ledger = %name, %reason, "ledger not served");
+                // 009: a folder's name is any the filesystem allows, a newline
+                // included: escaped, so it cannot start a line (M-41).
+                error!(
+                    ledger = %request_log::escaped(&name, 128),
+                    %reason,
+                    "ledger not served"
+                );
                 served.insert_failed(&name, reason).await;
             }
             (None, Ok(ledger_config)) => queue.push((name, ledger_config)),
@@ -712,7 +724,8 @@ pub(crate) fn build_application(
 
 /// Assemble the full application router.
 ///
-/// Layer order, outermost first: CORS, body limit (H-05), then per route the
+/// Layer order, outermost first: the request line (009, `request_log`), CORS,
+/// body limit (H-05), then per route the
 /// request guard (H-01), the rate limiter and — on `/graphql` only — auth. The
 /// guard is outermost among those so a rejected Host, Content-Type or Origin
 /// never reaches the limiter or the schema.
@@ -735,8 +748,25 @@ pub(crate) fn build_application(
 /// `limiter` carries the trusted-proxy set, so how a client is identified is a
 /// boot-time decision rather than a per-request one (M-04). Since 003 it
 /// drives `/health` only; GraphQL's limiters are the ledgers' own, built from
-/// the same limiter by `Ledgers::new` (`main` passes clones of one).
+/// the same limiter by `Ledgers::new` (`main` passes clones of one). The
+/// request line identifies clients by it too.
 pub(crate) fn build_application_with_limiter(
+    ledgers: ledgers::Ledgers,
+    guard_state: RequestGuardState,
+    cors: CorsLayer,
+    graphiql: bool,
+    limiter: RateLimiter,
+    node: Option<ledger_admin::NodeSchema>,
+) -> Router {
+    let log = request_log::RequestLogState::new(&limiter);
+    application_routes(ledgers, guard_state, cors, graphiql, limiter, node).layer(
+        middleware::from_fn_with_state(log, request_log::request_log),
+    )
+}
+
+/// [`build_application_with_limiter`] without the request line (tests attach
+/// their own).
+pub(crate) fn application_routes(
     ledgers: ledgers::Ledgers,
     guard_state: RequestGuardState,
     cors: CorsLayer,

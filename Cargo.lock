@@ -1620,6 +1620,7 @@ dependencies = [
  "iroh-relay",
  "ledger",
  "p2p",
+ "percent-encoding",
  "reqwest",
  "ring",
  "rust_decimal",

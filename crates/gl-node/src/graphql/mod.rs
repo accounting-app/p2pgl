@@ -24,6 +24,8 @@ use mutation::MutationRoot;
 use query::QueryRoot;
 use subscription::SubscriptionRoot;
 
+use crate::request_log::RequestNote;
+
 /// Shared ledger state — `Arc<RwLock<LedgerService>>` for concurrent access.
 ///
 /// Per §3.5: writes serialize through the write lock; reads use the read lock
@@ -166,16 +168,31 @@ impl ExecuteAsOperator for AppSchema {
 /// The caller the auth middleware authenticated rides along as request data,
 /// for [`crate::access_control::AccessControl`] to judge; a request that
 /// reached here without one is refused there.
+///
+/// 009: the answer carries a [`RequestNote`]: who asked, the operation's
+/// name and the count of errors, so the request gets a line of its own.
 pub async fn graphql_handler(
     State(schema): State<AppSchema>,
     caller: Option<axum::Extension<crate::access_control::Caller>>,
     request: GraphQLRequest,
-) -> GraphQLResponse {
+) -> axum::response::Response {
     let mut request = request.into_inner().data(types::NamesSnapshot::default());
-    if let Some(axum::Extension(caller)) = caller {
-        request = request.data(caller);
+    let caller = caller.map(|axum::Extension(caller)| caller);
+    let operation_name = request.operation_name.clone();
+    if let Some(caller) = &caller {
+        request = request.data(caller.clone());
     }
-    schema.execute(request).await.into()
+    let response = schema.execute(request).await;
+    let errors = response.errors.len();
+    let response = GraphQLResponse::from(response).into_response();
+    // Only with a caller (review): without one — never, behind auth — the
+    // answer is throttled like any answer nobody behind a key made.
+    match &caller {
+        Some(caller) => {
+            RequestNote::new(Some(caller), operation_name.as_deref(), errors).attach(response)
+        }
+        None => response,
+    }
 }
 
 /// The GraphiQL release as a string literal, so the asset URLs below can be
