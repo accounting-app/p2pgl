@@ -1530,7 +1530,10 @@ git; `chmod 600 .env`), that config in `gl-node.local.json`, and run
 `scripts/run_local_node.sh`. It refuses an env file others can read or git
 tracks, passes the secrets to the node only, and runs the newest release in
 `releases/`, a binary you name, or with `--source` the working tree, built
-then and there (`cargo build -p gl-node`). `docs/api/openledger.insomnia.json` has
+then and there (`cargo build -p gl-node`). `--watch` does that again on every
+change to `crates/`, `Cargo.toml`, `Cargo.lock` or the config and restarts
+the node when the build changed it; a change that does not build leaves the
+running node as it was. `docs/api/openledger.insomnia.json` has
 the requests, in order.
 
 #### Webhooks

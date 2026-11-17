@@ -1,6 +1,6 @@
 # Log: node logs, like `heroku logs --tail`
 
-Status: done (2026-11-16, last commit to fill in: unit 2's).
+Status: done (2026-11-16, last commit e5f93ec).
 
 One entry per commit-sized unit, newest last, written when the unit is ready
 to commit. The commit hash is filled in once the maintainer has committed.
@@ -147,4 +147,4 @@ to commit. The commit hash is filled in once the maintainer has committed.
 - **Departures from the plan:** `--since` takes days as hours; the company
   pattern also takes a quoted name (`ledger="acme"`, a `?` field), and the
   field `ledger` only.
-- **Commit:** —
+- **Commit:** e5f93ec

@@ -3,7 +3,7 @@
 # the API locally — Plaid's sandbox above all (README, *Bank connections
 # (Plaid)*; docs/api/openledger.insomnia.json).
 #
-#   scripts/run_local_node.sh [--env FILE] [--config FILE] [--source | BINARY]
+#   scripts/run_local_node.sh [--env FILE] [--config FILE] [--source | --watch | BINARY]
 #
 #   --env FILE      the secrets, one NAME=value a line (default: .env, which
 #                   .gitignore keeps out of git): GL_NODE_PLAID_CLIENT_ID,
@@ -14,10 +14,14 @@
 #                   releases/ for this machine, else target/release/gl-node).
 #   --source        build the working tree (cargo build -p gl-node, a debug
 #                   build) and run that: what is on disk now, not a release.
+#   --watch         --source, and again on every change: crates/, Cargo.toml,
+#                   Cargo.lock or the config, checked each second. A change
+#                   that builds restarts the node (SIGTERM: it folds its
+#                   journals in first); one that does not leaves it running.
 #
 # The secrets are exported to the node only: this script is a process of its
 # own, so nothing it reads stays set in your terminal. It prints the names it
-# found, never a value. Stop the node with Ctrl-C.
+# found, never a value. Stop the node (and --watch) with Ctrl-C.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -25,13 +29,14 @@ fail() { printf 'run_local_node: %s\n' "$*" >&2; exit 1; }
 
 env_file=.env
 config=gl-node.local.json
-binary="" from_source=""
+binary="" from_source="" watch=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --env) [[ $# -ge 2 ]] || fail "--env needs a file"; env_file=$2; shift 2 ;;
     --config) [[ $# -ge 2 ]] || fail "--config needs a file"; config=$2; shift 2 ;;
     --source) from_source=1; shift ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    --watch) from_source=1; watch=1; shift ;;
+    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
     -*) fail "unknown option $1 (see --help)" ;;
     *) [[ -z "$binary" ]] || fail "one binary only"; binary=$1; shift ;;
   esac
@@ -68,7 +73,7 @@ export GL_NODE_CONFIG="$config"
 
 # The working tree, built, when asked for.
 if [[ -n "$from_source" ]]; then
-  [[ -z "$binary" ]] || fail "--source or a BINARY, not both"
+  [[ -z "$binary" ]] || fail "--source (or --watch) or a BINARY, not both"
   cargo build -q -p gl-node || fail "the working tree did not build"
   binary=target/debug/gl-node
 fi
@@ -88,4 +93,64 @@ fi
 
 printf 'run_local_node: %s, config %s, secrets from %s (%s)\n' \
   "$binary" "$config" "$env_file" "${found[*]:-none}"
-exec "$binary"
+[[ -n "$watch" ]] || exec "$binary"
+
+# --watch: the node in the background, rebuilt and restarted on a change.
+node_pid=""
+start_node() {
+  "$binary" &
+  node_pid=$!
+}
+stop_node() {
+  [[ -n "$node_pid" ]] || return 0
+  if kill -0 "$node_pid" 2>/dev/null; then
+    # SIGTERM, as `docker stop` sends it; past 30 s it is killed.
+    kill -TERM "$node_pid" 2>/dev/null || true
+    for _ in $(seq 300); do
+      kill -0 "$node_pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -KILL "$node_pid" 2>/dev/null || true
+  fi
+  wait "$node_pid" 2>/dev/null || true
+  node_pid=""
+}
+# A file changed since the stamp (the first found).
+changed_since() {
+  find crates Cargo.toml Cargo.lock "$config" -type f -newer "$1" \
+    ! -name '.*' ! -path '*/target/*' 2>/dev/null | head -1
+}
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || printf 0; }
+stamp=$(mktemp "${TMPDIR:-/tmp}/run_local_node.XXXXXX")
+trap 'stop_node; rm -f "$stamp"' EXIT
+trap 'exit 0' INT TERM
+start_node
+printf 'run_local_node: watching crates/, Cargo.toml, Cargo.lock and %s (Ctrl-C stops)\n' "$config"
+while true; do
+  sleep 1
+  if [[ -n "$node_pid" ]] && ! kill -0 "$node_pid" 2>/dev/null; then
+    code=0
+    wait "$node_pid" || code=$?
+    node_pid=""
+    printf 'run_local_node: the node exited (status %s); waiting for a change\n' "$code"
+  fi
+  changed=$(changed_since "$stamp" || true)
+  [[ -n "$changed" ]] || continue
+  sleep 0.5  # an editor saving several files at once
+  config_changed=$(find "$config" -newer "$stamp" 2>/dev/null || true)
+  touch "$stamp"
+  before=$(mtime "$binary")
+  printf 'run_local_node: %s changed: building\n' "$changed"
+  if ! cargo build -q -p gl-node; then
+    printf 'run_local_node: the build failed; %s\n' \
+      "$([[ -n "$node_pid" ]] && printf 'the node runs on as it was' || printf 'no node runs')" >&2
+    continue
+  fi
+  if [[ -n "$node_pid" && -z "$config_changed" && "$(mtime "$binary")" == "$before" ]]; then
+    printf 'run_local_node: built; the node is unchanged, so it runs on\n'
+    continue
+  fi
+  printf 'run_local_node: restarting the node\n'
+  stop_node
+  start_node
+done
