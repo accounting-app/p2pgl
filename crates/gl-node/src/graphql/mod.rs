@@ -170,7 +170,7 @@ impl ExecuteAsOperator for AppSchema {
 /// reached here without one is refused there.
 ///
 /// 009: the answer carries a [`RequestNote`]: who asked, the operation's
-/// name and the count of errors, so the request gets a line of its own.
+/// name and the count of errors, for its request line.
 pub async fn graphql_handler(
     State(schema): State<AppSchema>,
     caller: Option<axum::Extension<crate::access_control::Caller>>,
@@ -186,7 +186,7 @@ pub async fn graphql_handler(
     let errors = response.errors.len();
     let response = GraphQLResponse::from(response).into_response();
     // Only with a caller (review): without one — never, behind auth — the
-    // answer is throttled like any answer nobody behind a key made.
+    // line says `user=-`, as for any answer nobody behind a key made.
     match &caller {
         Some(caller) => {
             RequestNote::new(Some(caller), operation_name.as_deref(), errors).attach(response)

@@ -231,6 +231,9 @@ if docker image inspect "$tag" >/dev/null 2>&1; then
   same "image $tag"
 else
   install -m 0755 "$work/gl-node" "$ETC/image/gl-node"
+  # No RUST_LOG in the image: one replaces the node's own filter,
+  # `info,iroh::protocol=error`, and with it the L-72 bound on iroh's
+  # per-handshake warnings (L-159).
   cat > "$ETC/image/Dockerfile" <<EOF
 # Written by the openledger installer: the node's image, the project's runtime
 # stage (Dockerfile, AS runtime) around the binary it was given, its user the
@@ -246,7 +249,6 @@ RUN mkdir -p /data && chown glnode:glnode /data
 USER glnode
 WORKDIR /data
 ENV GL_NODE_CONFIG=/data/gl-node.config.json
-ENV RUST_LOG=info
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \\
     CMD ["/usr/local/bin/gl-node", "--health-check"]
 ENTRYPOINT ["gl-node"]
@@ -445,11 +447,15 @@ usage="usage:
   openledger rollback                back to before the last upgrade: its backup and its binary
   openledger key                     the operator key
   openledger status                  the services, the node, HTTPS as a client sees it, the last backup
-  openledger logs [COMPANY] [--tail] [--since TIME] [--http] [-n N]
+  openledger logs [COMPANY] [--tail] [--since TIME] [--http] [--no-strangers] [-n N]
                                      the node's log: its last N lines (200), then exit; --tail keeps
                                      streaming; COMPANY keeps that company's lines among them, --http
-                                     the request lines (raise -n to look further back); TIME is a
-                                     number and s, m, h or d (30m, 2h, 1d)"
+                                     the request lines, --no-strangers leaves out the request lines
+                                     no key let through (raise -n to look further back); TIME is a
+                                     number and s, m, h or d (30m, 2h, 1d)
+  openledger request-log [on|off|key-holders]
+                                     which requests the node logs: every one (on, the default), a key
+                                     holder's only, or none; restarts the node. Alone: says which"
 fail() { printf 'openledger: %s\n' "$*" >&2; exit 1; }
 [[ $(id -u) -eq 0 ]] || fail "run it as root (sudo openledger …)"
 [[ -r "$settings" ]] || fail "no $settings: is this server set up by the openledger installer?"
@@ -687,7 +693,13 @@ case "$what" in
     flock -w 900 9 || fail "the lock stayed held for 15 min: openledger status" ;;
   backup|restore|upgrade|rollback)
     exec 9>/run/openledger.lock
-    flock -n 9 || fail "another backup, restore, upgrade or rollback is running: wait for it" ;;
+    flock -n 9 || fail "another backup, restore, upgrade, rollback or request-log is running: wait for it" ;;
+  request-log)
+    # Asking which is set takes no lock; setting one does.
+    if [[ $# -gt 0 ]]; then
+      exec 9>/run/openledger.lock
+      flock -n 9 || fail "another backup, restore, upgrade, rollback or request-log is running: wait for it"
+    fi ;;
 esac
 case "$what" in
   company)
@@ -867,6 +879,82 @@ $usage" ;;
     mv "$previous" "$previous.rolled-back-$(date -u +%Y%m%dT%H%M%SZ)"
     printf '\nRolled back to %s, on the books of %s.\n' "$(node --version)" "$BACKUP"
     mesh_rule ;;
+  request-log)
+    # 010: which request lines the node writes — every one (on, the
+    # default), a key holder's only, or none — as the RUST_LOG line in the
+    # node's environment file, which the installer keeps as it is. The node
+    # reads it at start: the container is recreated. The two values below
+    # build on the node's own default filter, DEFAULT_LOG_FILTER in
+    # crates/gl-node/src/main.rs (a test holds them to it).
+    env=/opt/openledger/env
+    secrets=/opt/openledger/secrets.env
+    key_holders='info,iroh::protocol=error,http::stranger=off'
+    no_requests='info,iroh::protocol=error,http=off'
+    [[ -r "$env" ]] || fail "no $env: run the installer"
+    # Any line compose reads as RUST_LOG, in either file the node is given.
+    any_form='^[[:space:]]*(export[[:space:]]+)?RUST_LOG[[:space:]]*[=:]'
+    in_env=$(grep -cE "$any_form" "$env" || true)
+    in_secrets=0
+    if [[ -r "$secrets" ]]; then in_secrets=$(grep -cE "$any_form" "$secrets" || true); fi
+    ours=$(grep -c '^RUST_LOG=' "$env" || true)
+    if (( in_secrets > 0 || in_env > 1 || in_env != ours )); then
+      now=""
+    elif (( ours == 0 )); then
+      now=on
+    else
+      case "$(sed -n 's/^RUST_LOG=//p' "$env")" in
+        "$key_holders") now=key-holders ;;
+        "$no_requests") now=off ;;
+        *) now="" ;;
+      esac
+    fi
+    # What the running node was started with, beside what the file says.
+    started_with=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' openledger-node 2>/dev/null \
+      | sed -n 's/^RUST_LOG=//p' || true)
+    if [[ $# -eq 0 ]]; then
+      if [[ -z "$now" ]]; then
+        printf 'custom: a RUST_LOG this command does not write:\n'
+        grep -hE "$any_form" "$env" "$secrets" 2>/dev/null || true
+        exit 0
+      fi
+      wanted=""
+      case "$now" in key-holders) wanted=$key_holders ;; off) wanted=$no_requests ;; esac
+      if ! running; then
+        printf '%s, but the node is not running (it is %s): openledger request-log %s starts it\n' \
+          "$now" "$(where_node)" "$now"
+      elif [[ "$started_with" != "$wanted" ]]; then
+        printf '%s, but the node runs without it: openledger request-log %s restarts it\n' "$now" "$now"
+      else
+        printf '%s\n' "$now"
+      fi
+      exit 0
+    fi
+    [[ $# -eq 1 ]] || fail "request-log takes on, off or key-holders"
+    case "$1" in
+      on) line="" ;;
+      key-holders) line=$key_holders ;;
+      off) line=$no_requests ;;
+      *) fail "request-log takes on, off or key-holders, not $1" ;;
+    esac
+    # A RUST_LOG someone wrote by hand is theirs: nothing is changed.
+    [[ -n "$now" ]] \
+      || fail "$env or $secrets holds a RUST_LOG this command does not write: edit it by hand"
+    unfinished_rollback
+    unfinished_restore
+    [[ ! -e "$previous/pending" ]] \
+      || fail "an upgrade did not finish (the node is $(where_node)): run openledger upgrade again, or openledger rollback"
+    if [[ "$now" != "$1" ]]; then
+      new=$(mktemp "$env.XXXXXX") || fail "cannot write beside $env"
+      grep -v '^RUST_LOG=' "$env" > "$new" || [[ $? -eq 1 ]] || { rm -f "$new"; fail "cannot read $env"; }
+      [[ -z "$line" ]] || printf 'RUST_LOG=%s\n' "$line" >> "$new"
+      chmod 0600 "$new" && mv "$new" "$env" || { rm -f "$new"; fail "cannot write $env"; }
+    fi
+    # Always: the file may already say it while the node does not run with
+    # it (a restart that failed before). Compose changes nothing if both agree.
+    docker compose -f /opt/openledger/compose.yml up -d node >/dev/null \
+      || fail "the node did not start with request-log $1 (it is $(where_node)): docker logs openledger-node, then run this again"
+    healthy || fail "the node did not become healthy: docker logs openledger-node"
+    printf 'The request log is %s.\n' "$1" ;;
   key)
     key=$(sed -n 's/^GL_NODE_API_KEY=//p' /opt/openledger/env)
     [[ -n "$key" ]] || fail "no GL_NODE_API_KEY in /opt/openledger/env"
@@ -918,11 +1006,12 @@ $usage" ;;
     # 009: the node's log, like `heroku logs`. Every argument is checked
     # before it reaches docker or grep: COMPANY by the ledger-name rule, so
     # it cannot become a pattern; N and TIME by their shapes.
-    company="" follow=() since=() lines=200 http=""
+    company="" follow=() since=() lines=200 http="" no_strangers=""
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --tail) follow=(--follow); shift ;;
         --http) http=1; shift ;;
+        --no-strangers) no_strangers=1; shift ;;
         --since)
           [[ $# -ge 2 && "$2" =~ ^([0-9]{1,6})([smhd])$ ]] \
             || fail "--since takes a number (up to 6 digits) and s, m, h or d (30m, 2h, 1d)"
@@ -951,7 +1040,11 @@ $usage" ;;
     # cannot run is. Every stage is line-buffered, or --tail stalls behind a
     # pipe's buffer.
     matching() { grep --line-buffered -E "$1" || [[ $? -eq 1 ]]; }
-    request_lines() { if [[ -n "$http" ]]; then matching ' http: '; else cat; fi; }
+    leaving_out() { grep --line-buffered -v -E "$1" || [[ $? -eq 1 ]]; }
+    # Targets `http` (a key let the request through) and `http::stranger`
+    # (010: every other request).
+    request_lines() { if [[ -n "$http" ]]; then matching ' http(::stranger)?: '; else cat; fi; }
+    stranger_lines() { if [[ -n "$no_strangers" ]]; then leaving_out ' http::stranger: '; else cat; fi; }
     # `ledger=acme` in a request line, `ledger{ledger=acme}:` in a span: the
     # field `ledger` only (not `other_ledger=acme`), and not `acme-eu`, which
     # `grep -w` would let through (- is not a word character).
@@ -969,7 +1062,7 @@ $usage" ;;
     # The last stage drops every control character but tab and newline, so
     # nothing in the log can drive the terminal.
     docker logs "${follow[@]}" "${since[@]}" --tail "$lines" openledger-node 2>&1 \
-      | request_lines | company_lines | stdbuf -oL tr -d '\000-\010\013-\037\177' ;;
+      | request_lines | stranger_lines | company_lines | stdbuf -oL tr -d '\000-\010\013-\037\177' ;;
   -h|--help|help) printf '%s\n' "$usage" ;;
   *) fail "unknown command $what
 $usage" ;;

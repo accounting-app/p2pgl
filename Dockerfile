@@ -81,9 +81,10 @@ RUN mkdir -p /data && chown glnode:glnode /data
 USER glnode
 WORKDIR /data
 
-# Default environment.
+# Default environment. No RUST_LOG: one replaces the node's own filter,
+# `info,iroh::protocol=error`, and with it the L-72 bound on iroh's
+# per-handshake warnings (L-159).
 ENV GL_NODE_CONFIG=/data/gl-node.config.json
-ENV RUST_LOG=info
 
 # Expose HTTP port (configurable via config).
 EXPOSE 4000

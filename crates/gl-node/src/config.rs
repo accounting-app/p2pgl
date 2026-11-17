@@ -4181,6 +4181,91 @@ mod tests {
         }
     }
 
+    /// L-159 (T105): no shipped image or stack sets `RUST_LOG` — the
+    /// repository's `Dockerfile`, the demo `docker-compose.yml`, and the two
+    /// files the installer writes for the node (its image's Dockerfile and
+    /// `compose.yml`) — so every node they run keeps its own default filter,
+    /// `info,iroh::protocol=error`. One that sets it replaces that whole
+    /// string, and iroh's per-handshake warnings (L-72) come back. No line of
+    /// those may name `RUST_LOG` outside a comment, whatever its form; the
+    /// rest of `install.sh` may, since `openledger request-log` (010) writes
+    /// the operator's own env file, which is how an operator sets one.
+    ///
+    /// Bug-catch: put `RUST_LOG=info` back in either image or the demo stack
+    /// (L159-R1, L159-R2, L159-R3) and every node it runs logs a `WARN` per
+    /// bad handshake, unthrottled, from anyone who dials its QUIC port.
+    #[test]
+    fn l159_no_shipped_image_sets_rust_log() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |file: &str| std::fs::read_to_string(root.join(file)).expect("shipped file");
+        // The lines of `text` from the one that opens `heredoc` to its `EOF`.
+        let heredoc = |text: &str, opener: &str| -> String {
+            let start = text
+                .lines()
+                .position(|line| line.trim() == opener)
+                .unwrap_or_else(|| panic!("install.sh writes no `{opener}`"));
+            text.lines()
+                .skip(start + 1)
+                .take_while(|line| *line != "EOF")
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let installer = read("deploy/install/install.sh");
+        let images = [
+            ("Dockerfile", read("Dockerfile")),
+            (
+                "deploy/docker-compose.yml",
+                read("deploy/docker-compose.yml"),
+            ),
+            (
+                "install.sh's image",
+                heredoc(&installer, r#"cat > "$ETC/image/Dockerfile" <<EOF"#),
+            ),
+            (
+                "install.sh's compose.yml",
+                heredoc(&installer, r#"put "$ETC/compose.yml" 0644 <<EOF"#),
+            ),
+        ];
+        for (file, text) in images {
+            assert!(text.lines().count() > 5, "{file}: {text}");
+            let naming: Vec<&str> = text
+                .lines()
+                .filter(|line| !line.trim_start().starts_with('#') && line.contains("RUST_LOG"))
+                .collect();
+            assert!(
+                naming.is_empty(),
+                "{file} sets RUST_LOG for the node: {naming:?} (it replaces the \
+                 node's own filter, L-159)"
+            );
+        }
+    }
+
+    /// 010: `openledger request-log` and `run_local_node.sh` write filters
+    /// that build on the node's own default, [`crate::DEFAULT_LOG_FILTER`]
+    /// — a copy each, in shell — so a change to the default must reach them:
+    /// a line the installer wrote with an old default would read as a
+    /// hand-written `RUST_LOG`, and keep the old filter (L-159's shape).
+    ///
+    /// Bug-catch: let the installer's `key-holders` value drift from the
+    /// default (NL-R21) and this names the copy.
+    #[test]
+    fn the_request_log_switches_build_on_the_nodes_default_filter() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let default = crate::DEFAULT_LOG_FILTER;
+        let installer =
+            std::fs::read_to_string(root.join("deploy/install/install.sh")).expect("install.sh");
+        for copy in [
+            format!("key_holders='{default},http::stranger=off'"),
+            format!("no_requests='{default},http=off'"),
+        ] {
+            assert!(installer.contains(&copy), "install.sh lacks {copy}");
+        }
+        let local = std::fs::read_to_string(root.join("scripts/run_local_node.sh"))
+            .expect("run_local_node.sh");
+        let copy = format!("${{RUST_LOG:-{default}}}");
+        assert_eq!(local.matches(&copy).count(), 2, "run_local_node.sh: {copy}");
+    }
+
     /// R-9: the shipped docker config sets `meshId` to its own `swarmTopic`
     /// byte for byte — the only value that keeps the stack's already-signed
     /// history verifying — and both pass the signature-domain rules.
@@ -4848,6 +4933,7 @@ mod tests {
     /// thread-per-test parallelism — a concurrent test's logs never land in
     /// this buffer. (Same helper shape as `ledger::service`'s.)
     fn capture_warnings<T>(body: impl FnOnce() -> T) -> (T, String) {
+        crate::test_support::keep_two_dispatchers();
         use std::sync::{Arc, Mutex};
 
         #[derive(Clone, Default)]

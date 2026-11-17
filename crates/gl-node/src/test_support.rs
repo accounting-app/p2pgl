@@ -34,6 +34,7 @@ pub(crate) static NET_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
 /// `tracing::subscriber::with_default` installs a *thread-local* subscriber,
 /// so a concurrent test's logs never land in this buffer.
 pub(crate) fn capture_warnings<T>(body: impl FnOnce() -> T) -> (T, String) {
+    keep_two_dispatchers();
     let (subscriber, buffer) = warning_subscriber();
     let value = tracing::subscriber::with_default(subscriber, body);
     (value, buffer.text())
@@ -44,6 +45,7 @@ pub(crate) fn capture_warnings<T>(body: impl FnOnce() -> T) -> (T, String) {
 /// as the node's default filter (`info`) prints them — a span's fields are
 /// part of the line a caller might forge.
 pub(crate) async fn capture_warnings_async<T>(body: impl Future<Output = T>) -> (T, String) {
+    keep_two_dispatchers();
     use tracing::Level;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::Layer;
@@ -113,6 +115,7 @@ pub(crate) async fn capture_logs<T>(
     directives: &str,
     body: impl Future<Output = T>,
 ) -> (T, String) {
+    keep_two_dispatchers();
     let buffer = SharedBuffer::default();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(buffer.clone())
@@ -123,4 +126,30 @@ pub(crate) async fn capture_logs<T>(
     let value = body.await;
     drop(default);
     (value, buffer.text())
+}
+
+/// Two dispatchers that want nothing, alive for the whole test process (010):
+/// two, so that tracing counts more than one before the first capture's own
+/// is registered.
+static IDLE_DISPATCHERS: LazyLock<[tracing::Dispatch; 2]> = LazyLock::new(|| {
+    [
+        tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()),
+        tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()),
+    ]
+});
+
+/// Keep at least two dispatchers alive while a capture runs (010).
+///
+/// tracing caches, per log statement, whether any live subscriber wants it.
+/// While exactly one dispatcher is alive (tracing-core 0.1.36,
+/// `Dispatchers::has_just_one`) it skips the list of dispatchers and asks
+/// whichever one is the *current thread's* default: a test that reaches a
+/// statement first on a thread with no subscriber of its own caches it as
+/// wanted by none, and a capture running on another thread at that moment
+/// records nothing (seen: empty captures under parallel tests). With this
+/// idle dispatchers always alive beside the capture's, interest is computed
+/// over every live dispatcher, under tracing's lock. Every test that captures
+/// logs with a subscriber of its own calls this first.
+pub(crate) fn keep_two_dispatchers() {
+    LazyLock::force(&IDLE_DISPATCHERS);
 }

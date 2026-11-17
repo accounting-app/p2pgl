@@ -735,19 +735,23 @@ A node bound to a public address accepts QUIC handshakes from anyone. Refusals a
 
 - one line per 10 s for every peer not on the allowlist, taken together;
 - one per 10 s per allowlisted peer and reason;
-- one per 10 s per HTTP client for requests the Host/Origin/Content-Type guard refuses;
-- one request line per 10 s per HTTP client for every request no key let
-  through to a handler (below).
+- one per 10 s per HTTP client for requests the Host/Origin/Content-Type guard refuses.
 
-Each window's suppressed count is logged when the window closes. iroh's own per-handshake warnings (unknown ALPN, a handshake aborted by the peer) are silenced by the default filter, `info,iroh::protocol=error`. **If you set `RUST_LOG`, it replaces that default: keep `iroh::protocol=error` in it**, or any dialer can write ~300–700 bytes of log per handshake. Put the same log-volume controls (rotation, rate limits in your log shipper) on the QUIC port as on the HTTP edge.
+Each window's suppressed count is logged when the window closes. iroh's own per-handshake warnings (unknown ALPN, a handshake aborted by the peer) are silenced by the default filter, `info,iroh::protocol=error`, which the Docker images and the installer leave in force (they set no `RUST_LOG`). **If you set `RUST_LOG`, it replaces that default: keep `iroh::protocol=error` in it**, or any dialer can write ~300–700 bytes of log per handshake. Put the same log-volume controls (rotation, rate limits in your log shipper) on the QUIC port as on the HTTP edge.
+
+The request log (below) is not bounded: one line per HTTP request.
 
 ### Request log
 
-The node writes one line per HTTP request, with target `http`:
+The node writes one line per HTTP request: target `http` for a request a key
+let through to GraphQL (and a busy ledger's 503 to a key holder),
+`http::stranger` for every other — every `/health` included, a keyed one too,
+since `/health` checks the key itself:
 
 ```
 INFO http: ledger=acme method=POST path=/ledgers/acme/graphql operation=AddTransaction user=u_7f3a09c1d2e4b5a6 status=200 errors=0 ms=12 client=203.0.113.9
-WARN http: ledger=acme method=POST path=/ledgers/acme/graphql operation=- user=- status=401 errors=0 ms=0 client=198.51.100.4 suppressed=0
+WARN http::stranger: ledger=acme method=POST path=/ledgers/acme/graphql operation=- user=- status=401 errors=0 ms=0 client=198.51.100.4
+INFO http::stranger: ledger=default method=GET path=/health operation=- user=- status=200 errors=0 ms=0 client=127.0.0.1
 ```
 
 - `ledger` is the company (`default` for `/graphql` and `/health`, `-` for
@@ -756,8 +760,7 @@ WARN http: ledger=acme method=POST path=/ledgers/acme/graphql operation=- user=-
   `?` when it is not a GraphQL name of at most 64 characters.
 - `user` is the person's user id, `operator`, or `-` when no key let the
   request through to a handler. On a loopback node with `auth.enabled:
-  false` every caller is the operator, and every request gets a line of its
-  own.
+  false` every caller is the operator.
 - `errors` counts the GraphQL errors in the answer, never their messages.
 - `client` is the caller's address as the rate limiter works it out: behind a
   proxy listed in `trustedProxies` (the installer's Caddy) the address it
@@ -769,30 +772,34 @@ WARN http: ledger=acme method=POST path=/ledgers/acme/graphql operation=- user=-
   landed — a mutation runs to its end once it starts — so look in the books
   before telling a client their posting failed.
 
-**Level:** `INFO` for an answer below 400; `WARN` for 4xx, 5xx and a request
-cut short — a refused or failed request, not a fault of the node; `DEBUG` for
-a `/health` that answers 200. **Never logged:** the key, any header, the body,
-the query text, its variables, the URL's query string.
+**Level:** `INFO` for an answer below 400, a passing `/health` included;
+`WARN` for 4xx, 5xx and a request cut short — a refused or failed request,
+not a fault of the node. **Never logged:** the key, any header, the body, the
+query text, its variables, the URL's query string.
 
-**Bounded like a refusal.** Only a request a key let through — a GraphQL
-request, or its ledger's 503 `LEDGER_BUSY` — gets a line of its own. Every
-other answer (strangers' 401s, 429s, guard refusals, preflights, 413s, 404s,
-`/health`) gets one line per client per 10 s, ending `suppressed=N`, and a
-summary of the rest when the window closes: about 13 lines a second at most,
-whatever a stranger sends. A key holder's lines are bounded by the request
-rate the node already accepts from them (60 GraphQL requests a minute per
-client per ledger): one who rotates through many addresses (an IPv6 /48) can
-write as many lines as requests it gets through. Each line names their user
-id, and revoking the key stops it. A node-wide cap would hide honest traffic
-exactly when it is needed, so there is none.
+**Every request, unbounded.** Every request gets its line, a stranger's too:
+wrong keys, 429s, guard refusals, preflights, 413s, 404s, `/health` and
+requests cut short (build-log 010). Nothing caps them: a caller with no key
+writes one line, under 512 bytes, per request it sends, as fast as it sends
+them, and a flood can push everything else out of the log's rotation (on an
+installed server, Docker's 10 MB × 5) within minutes. That is the
+maintainer's decision (`docs/audits/OUTSTANDING_TASKS_11_16.md`); on a
+public server, put a request rate limit in front of the node or in your log
+shipper if that matters to you. No line can be forged: every value a caller
+chooses is checked or escaped.
 
 The request line is on by default; `RUST_LOG=info,iroh::protocol=error,http=off`
-turns it off. The node's log is plain text, without colour codes, whenever its
+turns it off, and `…,http::stranger=off` turns off strangers' lines only (a
+filter's target is a prefix: `http` covers both). The node's log is plain text, without colour codes, whenever its
 output is not a terminal (`docker logs`, a file, a log shipper).
 
 On a server set up by the installer, `openledger logs` reads it: `--tail` to
 keep streaming, a company's name for its lines only, `--http` for the request
-lines only (`docs/OPERATIONS.md`).
+lines only, `--no-strangers` without strangers' (`docs/OPERATIONS.md`), and
+`openledger request-log on|off|key-holders` sets which ones the node writes:
+every one (the default), none, or only a key holder's; it restarts the node.
+`scripts/run_local_node.sh --no-strangers` (or `--no-request-log`) runs a
+local node without strangers' (or without any).
 
 ### API keys
 

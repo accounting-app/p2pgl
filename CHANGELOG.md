@@ -9,33 +9,50 @@ break compatibility.
 
 ### Added
 
-- **A request log** (009 unit 1): the node writes one line per HTTP request,
-  target `http`, like a Heroku router line — `ledger method path operation
-  user status errors ms client`. `INFO` below 400, `WARN` for 4xx, 5xx and a
-  request cut short (a refused or failed request, not a fault of the node),
-  `DEBUG` for a passing `/health`. On by default; `RUST_LOG=…,http=off` turns
-  it off. README *Request log*.
+- **A request log** (009 unit 1, 010): the node writes one line for every
+  HTTP request, target `http`, like a Heroku router line — `ledger method
+  path operation user status errors ms client`. `INFO` below 400 (a passing
+  `/health` included), `WARN` for 4xx, 5xx and a request cut short (a
+  refused or failed request, not a fault of the node). A request no key let
+  through to GraphQL has the target `http::stranger` (every `/health` too). On by default;
+  `RUST_LOG=…,http=off` turns it off, `…,http::stranger=off` strangers'
+  lines only. README *Request log*.
 - **Plain text off a terminal:** the node's log has no colour codes when its
   output is not a terminal (`docker logs`, a file, a log shipper). This
   changes the log's bytes for anyone who parsed the escape codes.
-- **`openledger logs [COMPANY] [--tail] [--since TIME] [--http] [-n N]`** on
+- **`openledger logs [COMPANY] [--tail] [--since TIME] [--http] [--no-strangers] [-n N]`** on
   a server set up by the installer (009 unit 2): the node's log, like
   `heroku logs --tail`. A company's name shows only its lines (`acme` leaves
-  out `acme-eu`), `--http` only the request lines. Each argument is checked
-  before it reaches `docker` or `grep`, and control characters are dropped
-  before the terminal.
+  out `acme-eu`), `--http` only the request lines, `--no-strangers` without
+  the ones no key let through. Each argument is checked before it reaches
+  `docker` or `grep`, and control characters are dropped before the
+  terminal.
+- **`openledger request-log [on|off|key-holders]`** (010): which requests
+  the node logs — every one (the default), none, or only those a key let
+  through — as the `RUST_LOG` line in `/opt/openledger/env`; it restarts
+  the node (its earlier log lines go with the old container), and changes
+  nothing if a `RUST_LOG` it did not write is there or in `secrets.env`.
+  Alone, it says which, and whether the running node was started with it.
 
 ### Security
 
+- The Docker images no longer set `RUST_LOG=info` (L-159): it replaced the
+  node's own filter, `info,iroh::protocol=error`, so every node run from an
+  image — the installer's included — logged one `WARN` from iroh per failed
+  handshake on its public QUIC port, unthrottled (what L-72's filter is
+  for). An installed server takes the fix when it upgrades to a release
+  with it (`openledger upgrade --version …`; `--binary` alone runs the old
+  installer, which still writes it: add `--installer`). If you run the
+  image with your own `RUST_LOG`, keep `iroh::protocol=error` in it.
 - The request log never carries the key, a header, the body, the query
   text, its variables or the URL's query string, and every value a caller
   chose is checked or escaped (CR and LF included, which tracing does not
   escape), so no value can start a line; every line is under 512 bytes.
-  Only a request a key let through gets a line of its own; every other
-  answer gets one line per client per 10 s with the count it stood for
-  (M-41, T77). A key holder rotating through many addresses can write as
-  many lines as requests the node accepts from them, each naming their user
-  id — an accepted residual (README *Request log*).
+  **Nothing bounds how many** (010, the maintainer's decision): every
+  request writes its line, a stranger's too, so a caller with no key can
+  write as fast as it sends requests and push older lines out of the log's
+  rotation. M-41's budget no longer covers the request line; the request
+  guard's own refusal lines keep theirs. README *Request log*.
 - A folder in `ledgersDir` whose name is not a valid ledger name is logged
   escaped, so a newline in it cannot start a line.
 - A request to `/ledgers/NAME/graphql` can no longer forge a line in the

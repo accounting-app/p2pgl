@@ -8774,6 +8774,7 @@ pub(crate) mod tests {
     /// ([`crate::DEFAULT_LOG_FILTER`]) — what an operator without `RUST_LOG`
     /// actually gets. Held until the guard drops.
     pub(crate) fn capture_logs() -> (tracing::subscriber::DefaultGuard, LogBuffer, LogBuffer) {
+        crate::test_support::keep_two_dispatchers();
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::Layer;
         let raw = LogBuffer::default();

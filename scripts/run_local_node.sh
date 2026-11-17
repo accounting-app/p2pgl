@@ -3,7 +3,8 @@
 # the API locally — Plaid's sandbox above all (README, *Bank connections
 # (Plaid)*; docs/api/openledger.insomnia.json).
 #
-#   scripts/run_local_node.sh [--env FILE] [--config FILE] [--source | --watch | BINARY]
+#   scripts/run_local_node.sh [--env FILE] [--config FILE] [--no-strangers | --no-request-log]
+#                              [--source | --watch | BINARY]
 #
 #   --env FILE      the secrets, one NAME=value a line (default: .env, which
 #                   .gitignore keeps out of git): GL_NODE_PLAID_CLIENT_ID,
@@ -18,6 +19,10 @@
 #                   Cargo.lock or the config, checked each second. A change
 #                   that builds restarts the node (SIGTERM: it folds its
 #                   journals in first); one that does not leaves it running.
+#   --no-strangers  leave out the request lines no key let through (adds
+#                   http::stranger=off to RUST_LOG, or to the node's default
+#                   filter when RUST_LOG is unset).
+#   --no-request-log  leave out every request line (adds http=off, the same way).
 #
 # The secrets are exported to the node only: this script is a process of its
 # own, so nothing it reads stays set in your terminal. It prints the names it
@@ -29,18 +34,21 @@ fail() { printf 'run_local_node: %s\n' "$*" >&2; exit 1; }
 
 env_file=.env
 config=gl-node.local.json
-binary="" from_source="" watch=""
+binary="" from_source="" watch="" no_strangers="" no_request_log=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --env) [[ $# -ge 2 ]] || fail "--env needs a file"; env_file=$2; shift 2 ;;
     --config) [[ $# -ge 2 ]] || fail "--config needs a file"; config=$2; shift 2 ;;
     --source) from_source=1; shift ;;
     --watch) from_source=1; watch=1; shift ;;
-    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+    --no-strangers) no_strangers=1; shift ;;
+    --no-request-log) no_request_log=1; shift ;;
+    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
     -*) fail "unknown option $1 (see --help)" ;;
     *) [[ -z "$binary" ]] || fail "one binary only"; binary=$1; shift ;;
   esac
 done
+[[ -z "$no_strangers" || -z "$no_request_log" ]] || fail "--no-strangers or --no-request-log, not both"
 
 # The secrets: there, yours alone, and not tracked by git.
 [[ -f "$env_file" ]] || fail "no $env_file: put GL_NODE_PLAID_CLIENT_ID, GL_NODE_PLAID_SECRET and GL_NODE_SECRETS_KEY in it, one NAME=value a line"
@@ -65,6 +73,16 @@ fi
 if { [[ -n "${GL_NODE_PLAID_CLIENT_ID:-}" ]] && [[ -z "${GL_NODE_PLAID_SECRET:-}" ]]; } \
   || { [[ -z "${GL_NODE_PLAID_CLIENT_ID:-}" ]] && [[ -n "${GL_NODE_PLAID_SECRET:-}" ]]; }; then
   fail "set both GL_NODE_PLAID_CLIENT_ID and GL_NODE_PLAID_SECRET in $env_file, or neither"
+fi
+
+# The request lines no key let through, or every one, left out (010).
+# The fallback is a copy of the node's own default filter, DEFAULT_LOG_FILTER
+# in crates/gl-node/src/main.rs: change the two together.
+if [[ -n "$no_strangers" ]]; then
+  export RUST_LOG="${RUST_LOG:-info,iroh::protocol=error},http::stranger=off"
+fi
+if [[ -n "$no_request_log" ]]; then
+  export RUST_LOG="${RUST_LOG:-info,iroh::protocol=error},http=off"
 fi
 
 # The config.

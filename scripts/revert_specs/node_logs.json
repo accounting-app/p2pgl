@@ -45,6 +45,13 @@
         "--bin",
         "gl-node",
         "the_client_is_the_forwarded_address_only_behind_a_trusted_proxy"
+      ],
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "strangers_behind_one_proxy_are_logged_with_their_forwarded_address"
       ]
     ]
   },
@@ -59,34 +66,6 @@
         "--bin",
         "gl-node",
         "a_control_character_in_a_path_or_operation_name_cannot_start_a_line"
-      ]
-    ]
-  },
-  "NL-R5-a-full-line-without-a-note": {
-    "file": "crates/gl-node/src/request_log.rs",
-    "old": "    let suppressed = match note {\n        Some(_) => None,",
-    "new": "    let suppressed = match Some(()) {\n        Some(_) => None,",
-    "runs": [
-      [
-        "-p",
-        "gl-node",
-        "--bin",
-        "gl-node",
-        "strangers_requests_log_one_line_per_client_per_window"
-      ]
-    ]
-  },
-  "NL-R6-health-at-info": {
-    "file": "crates/gl-node/src/request_log.rs",
-    "old": "        Some(StatusCode::OK) if head.health => Level::Debug,",
-    "new": "        Some(StatusCode::OK) if head.health => Level::Info,",
-    "runs": [
-      [
-        "-p",
-        "gl-node",
-        "--bin",
-        "gl-node",
-        "a_passing_health_check_logs_at_debug_only"
       ]
     ]
   },
@@ -134,7 +113,7 @@
   },
   "NL-R10-the-drop-guard-removed": {
     "file": "crates/gl-node/src/request_log.rs",
-    "old": "            write_line(&self.state, &head, None, None);",
+    "old": "            write_line(&head, None, None);",
     "new": "            let _ = head;",
     "runs": [
       [
@@ -142,7 +121,7 @@
         "gl-node",
         "--bin",
         "gl-node",
-        "a_request_cut_short_still_logs_a_throttled_line"
+        "a_request_cut_short_still_logs_a_line"
       ]
     ]
   },
@@ -157,20 +136,6 @@
         "--bin",
         "gl-node",
         "every_line_is_under_512_bytes"
-      ]
-    ]
-  },
-  "NL-R12-throttle-keyed-on-the-tcp-peer": {
-    "file": "crates/gl-node/src/request_log.rs",
-    "old": "        None => match state.throttle.note(bucket_key(head.client), Instant::now()) {",
-    "new": "        None => match state.throttle.note(IpAddr::from([127, 0, 0, 1]), Instant::now()) {",
-    "runs": [
-      [
-        "-p",
-        "gl-node",
-        "--bin",
-        "gl-node",
-        "strangers_behind_one_proxy_are_throttled_per_forwarded_client"
       ]
     ]
   },
@@ -204,8 +169,8 @@
   },
   "NL-R15-every-line-at-info": {
     "file": "crates/gl-node/src/request_log.rs",
-    "old": "        Level::Warn => warn!(target: \"http\", \"{line}\"),",
-    "new": "        Level::Warn => info!(target: \"http\", \"{line}\"),",
+    "old": "        (Level::Warn, false) => warn!(target: \"http\", \"{line}\"),",
+    "new": "        (Level::Warn, false) => info!(target: \"http\", \"{line}\"),",
     "runs": [
       [
         "-p",
@@ -227,6 +192,118 @@
         "--bin",
         "gl-node",
         "a_busy_ledger_logs_the_key_holders_503_in_full"
+      ]
+    ]
+  },
+  "L159-R1-the-image-sets-rust-log": {
+    "file": "Dockerfile",
+    "old": "ENV GL_NODE_CONFIG=/data/gl-node.config.json\n",
+    "new": "ENV GL_NODE_CONFIG=/data/gl-node.config.json\nENV RUST_LOG=info\n",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "l159_no_shipped_image_sets_rust_log"
+      ]
+    ]
+  },
+  "L159-R2-the-installers-image-sets-rust-log": {
+    "file": "deploy/install/install.sh",
+    "old": "ENV GL_NODE_CONFIG=/data/gl-node.config.json\nHEALTHCHECK",
+    "new": "ENV GL_NODE_CONFIG=/data/gl-node.config.json\nENV RUST_LOG=info\nHEALTHCHECK",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "l159_no_shipped_image_sets_rust_log"
+      ]
+    ]
+  },
+  "L159-R3-the-demo-stack-sets-rust-log": {
+    "file": "deploy/docker-compose.yml",
+    "old": "      - GL_NODE_API_KEY=${GL_NODE_0_API_KEY",
+    "new": "      - RUST_LOG=info\n      - GL_NODE_API_KEY=${GL_NODE_0_API_KEY",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "l159_no_shipped_image_sets_rust_log"
+      ]
+    ]
+  },
+  "NL-R17-a-request-without-a-note-left-out": {
+    "file": "crates/gl-node/src/request_log.rs",
+    "old": "    let level = level_of(status);\n",
+    "new": "    if note.is_none() {\n        return;\n    }\n    let level = level_of(status);\n",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "every_request_logs_a_line_of_its_own_strangers_included"
+      ]
+    ]
+  },
+  "NL-R18-a-passing-health-check-left-out": {
+    "file": "crates/gl-node/src/request_log.rs",
+    "old": "    let level = level_of(status);\n",
+    "new": "    if status == Some(StatusCode::OK) && head.path.ends_with(\"/health\") {\n        return;\n    }\n    let level = level_of(status);\n",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "a_passing_health_check_logs_at_info"
+      ]
+    ]
+  },
+  "NL-R19-a-strangers-refusal-at-info": {
+    "file": "crates/gl-node/src/request_log.rs",
+    "old": "        (Level::Warn, true) => warn!(target: \"http::stranger\", \"{line}\"),",
+    "new": "        (Level::Warn, true) => info!(target: \"http::stranger\", \"{line}\"),",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_level_follows_the_status"
+      ]
+    ]
+  },
+  "NL-R20-stranger-lines-under-http": {
+    "file": "crates/gl-node/src/request_log.rs",
+    "old": "    let stranger = note.is_none();",
+    "new": "    let stranger = false;",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "stranger_lines_can_be_turned_off_alone"
+      ]
+    ]
+  },
+  "NL-R21-the-installers-filter-drifts-from-the-default": {
+    "file": "deploy/install/install.sh",
+    "old": "    key_holders='info,iroh::protocol=error,http::stranger=off'",
+    "new": "    key_holders='info,http::stranger=off'",
+    "runs": [
+      [
+        "-p",
+        "gl-node",
+        "--bin",
+        "gl-node",
+        "the_request_log_switches_build_on_the_nodes_default_filter"
       ]
     ]
   }

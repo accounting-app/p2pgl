@@ -36,7 +36,8 @@ reference for every config option; this page is the procedure.
 | Upgrade, roll back | `openledger upgrade --version X.Y.Z` (a backup first), `openledger rollback` — below |
 | The operator key | `openledger key` |
 | Is it all right? | `openledger status` — the services, the node's version, `https://DOMAIN/health` through Caddy, the last backup, the companies; exits non-zero if HTTPS fails or the last backup is two days old |
-| What is it doing? | `openledger logs` — the node's last 200 lines, then exit; `--tail` keeps streaming; `openledger logs acme` keeps acme's lines among them (not `acme-eu`'s), `--http` the request lines (company, user id, operation, status, time, caller; a stranger's are throttled, one per caller per 10 s); `-n 5000` looks further back, `--since 1h` starts an hour ago; *What to watch*, *Requests* |
+| What is it doing? | `openledger logs` — the node's last 200 lines, then exit; `--tail` keeps streaming; `openledger logs acme` keeps acme's lines among them (not `acme-eu`'s), `--http` the request lines (one per request: company, user id, operation, status, time, caller), `--no-strangers` without the ones no key let through; `-n 5000` looks further back, `--since 1h` starts an hour ago; *What to watch*, *Requests* |
+| Which requests are logged | `openledger request-log` says which (and whether the running node was started with it); `openledger request-log key-holders` logs only requests a key let through, `off` none, `on` every one (the default). It restarts the node, and the node's earlier lines go with the old container (`openledger logs` then starts from the restart) |
 
 Each runs the node's own command (`gl-node ledger`, `gl-node user`) in its
 container, with its key; the node judges every change, as *Adding a company*
@@ -694,17 +695,29 @@ Any `ERROR` line, and a node that restarts repeatedly, need a person too. Set
 a public bind*), and rotate logs.
 
 **Requests** — the node writes one line per HTTP request, target `http`
+(`http::stranger` for one no key let through to GraphQL, and every `/health`)
 (README, *Request log*): who asked, for which company, what it answered and
 how long it took; `openledger logs --http` shows them, `--tail` as they
 come. A request line at `WARN` is a **refused or failed request** (a wrong
 key, a 429, a busy ledger's 503), **not a fault of the node**: an
-alert on warnings should leave out target `http` (in a log shipper, the text
-` WARN http: `), or every stranger's wrong key pages someone. Watch instead
+alert on warnings should leave out both targets (in a log shipper, lines
+with ` WARN http: ` or ` WARN http::stranger: `), or every stranger's wrong
+key pages someone. `openledger logs --http --no-strangers` shows only key
+holders' requests; `openledger request-log key-holders` stops the node
+writing strangers' lines at all (`off`: every request line), and
+`openledger request-log on` brings them back. It writes the `RUST_LOG` line
+in `/opt/openledger/env` (the installer keeps the file as it is) and restarts
+the node. It changes nothing if `env` or `secrets.env` holds a `RUST_LOG` it
+did not write, in any form: edit that by hand. It refuses while a restore,
+rollback or upgrade is unfinished. For
+alerts, watch
 for many `status=503` lines for one ledger (it is busy: raise
 `http.maxRequestsPerLedger` or find the caller) and `status=5xx` lines from
 key holders. A line with `cut_short=true` is a request whose answer was
 never sent (the timeout, or a client that hung up); a posting may still have
 landed, so check the books before telling a client it failed. The lines
-carry client addresses and user ids, and stay as long
-as the log's rotation keeps them (on an installed server, Docker's: 10 MB × 5
-files), readable by root.
+carry client addresses and user ids, and stay as long as the log's rotation
+keeps them (on an installed server, Docker's: 10 MB × 5 files), readable by
+root. Every request writes one, a stranger's and Docker's health check (one
+every 30 s) included, with no cap: a flood of requests can rotate the older
+lines away within minutes (README, *Request log*).

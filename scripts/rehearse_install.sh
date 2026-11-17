@@ -167,6 +167,18 @@ for template in "${templates[@]}"; do
     wait || true' _ "$root" "$domain" "$vm_ip" "$key")
   check "openledger logs --tail streams a request made after it started" \
     grep -q ' operation=Tailed user=operator status=200 ' <(printf '%s\n' "$tailed")
+  # 010: a stranger's request (no key) has its own line, target
+  # http::stranger, and --no-strangers leaves it out.
+  answer /ledgers/acme/graphql '' "$verify" >/dev/null
+  strangers() {
+    local all keyed
+    all=$(in_vm sudo openledger logs --http -n 50) || return 1
+    keyed=$(in_vm sudo openledger logs --http --no-strangers -n 50) || return 1
+    grep -q ' WARN http::stranger: ledger=acme method=POST path=/ledgers/acme/graphql operation=- user=- status=401 ' <<< "$all" \
+      && grep -q ' operation=Tailed user=operator ' <<< "$keyed" \
+      && ! grep -q ' http::stranger: ' <<< "$keyed"
+  }
+  check "a stranger's request is logged (http::stranger); --no-strangers leaves it out and keeps the key holders'" strangers
   logs_refused() {  # what openledger says, then the arguments: refused by it, not by docker
     local said=$1 out
     shift
@@ -185,6 +197,49 @@ for template in "${templates[@]}"; do
   docker_log=$(in_vm sudo docker logs openledger-node 2>&1)
   no_colour() { ! grep -q $'\x1b' <<< "$docker_log"; }
   check "docker logs openledger-node has no colour codes" no_colour
+  # 010: openledger request-log switches the node's request lines (last of
+  # the log checks: each switch recreates the container, and its log with
+  # it — so every line read after one was written after it).
+  check "openledger request-log: on by default" test "$(in_vm sudo openledger request-log)" = on
+  started_with() {  # the RUST_LOG the running container was started with
+    in_vm sudo docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' openledger-node \
+      | sed -n 's/^RUST_LOG=//p'
+  }
+  in_vm sudo openledger request-log key-holders >/dev/null || fail "openledger request-log key-holders failed"
+  check "request-log key-holders: the node was started with it" \
+    test "$(started_with)" = 'info,iroh::protocol=error,http::stranger=off'
+  answer /ledgers/acme/graphql '' "$verify" >/dev/null
+  from_vm /graphql "$key" '{"query":"query AfterSwitch { verify { ok } }","operationName":"AfterSwitch"}'
+  key_holders_only() {
+    local lines
+    lines=$(in_vm sudo openledger logs --http -n 500) || return 1
+    # No stranger line at all: the stranger's 401 above and every health
+    # probe since the restart are strangers'.
+    grep -q ' operation=AfterSwitch user=operator ' <<< "$lines" && ! grep -q ' http::stranger: ' <<< "$lines"
+  }
+  check "request-log key-holders: a key holder's request logged, no stranger's" key_holders_only
+  in_vm sudo openledger request-log off >/dev/null || fail "openledger request-log off failed"
+  check "request-log off: the node was started with it" \
+    test "$(started_with)" = 'info,iroh::protocol=error,http=off'
+  from_vm /graphql "$key" '{"query":"query WhileOff { verify { ok } }","operationName":"WhileOff"}'
+  no_request_lines() {
+    local lines
+    lines=$(in_vm sudo openledger logs -n 500) || return 1
+    grep -q 'gl-node starting' <<< "$lines" && ! grep -qE ' http(::stranger)?: ' <<< "$lines"
+  }
+  check "request-log off: the node logs, but no request line" no_request_lines
+  in_vm sudo openledger request-log on >/dev/null || fail "openledger request-log on failed"
+  back_on() {
+    local rust_logs
+    rust_logs=$(in_vm sudo grep -c '^RUST_LOG=' /opt/openledger/env || true)
+    test "$(in_vm sudo openledger request-log)" = on \
+      && test "$rust_logs" = 0 \
+      && test -z "$(started_with)" \
+      && test "$(body /health)" = '{"status":"ok"}' \
+      && grep -q ' INFO http::stranger: ledger=default method=GET path=/health ' \
+        <<< "$(in_vm sudo openledger logs --http -n 500)"
+  }
+  check "request-log on: no RUST_LOG line or variable, it serves, and logs a stranger's /health again" back_on
 
   update="$PWD/target/rehearsal/$vm.update.log"
   install_it ops-2@ledger.test > "$update" 2>&1 || { tail -20 "$update"; fail "the run with a new e-mail failed"; }

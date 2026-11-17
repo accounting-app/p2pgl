@@ -878,9 +878,12 @@ pub(super) mod tests {
                     .with_writer(move || writer.clone())
                     .with_ansi(false),
             );
-        let _guard = tracing::subscriber::set_default(subscriber);
         // Call sites other tests reached first, with no subscriber on their
-        // thread, are cached as uninteresting; judge them again under this one.
+        // thread, are cached as uninteresting: with idle dispatchers alive
+        // beside this one (010) that no longer happens, and the rebuild judges
+        // any reached before them again under this one.
+        crate::test_support::keep_two_dispatchers();
+        let _guard = tracing::subscriber::set_default(subscriber);
         tracing::callsite::rebuild_interest_cache();
 
         let fixture = fixture(true).await;

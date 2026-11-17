@@ -1137,7 +1137,7 @@ pub(crate) async fn node_graphql(
             None,
         )]),
     };
-    // 009: behind `operator_only`, so the operator's: a line of its own.
+    // 009: behind `operator_only`, so the operator's: its line says so.
     let errors = response.errors.len();
     let response = GraphQLResponse::from(response).into_response();
     RequestNote::new(

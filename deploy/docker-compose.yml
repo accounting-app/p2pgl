@@ -99,7 +99,6 @@ services:
       - node0-data:/data
       - ./mesh/node-0.json:/data/gl-node.config.json:ro
     environment:
-      - RUST_LOG=info
       - GL_NODE_CONFIG=/data/gl-node.config.json
       - GL_NODE_API_KEY=${GL_NODE_0_API_KEY:-change-me-0}
     networks:
@@ -124,7 +123,6 @@ services:
       - node1-data:/data
       - ./mesh/node-1.json:/data/gl-node.config.json:ro
     environment:
-      - RUST_LOG=info
       - GL_NODE_CONFIG=/data/gl-node.config.json
       - GL_NODE_API_KEY=${GL_NODE_1_API_KEY:-change-me-1}
     networks:
@@ -152,7 +150,6 @@ services:
       - node2-data:/data
       - ./mesh/node-2.json:/data/gl-node.config.json:ro
     environment:
-      - RUST_LOG=info
       - GL_NODE_CONFIG=/data/gl-node.config.json
       - GL_NODE_API_KEY=${GL_NODE_2_API_KEY:-change-me-2}
     networks:

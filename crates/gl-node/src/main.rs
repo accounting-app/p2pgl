@@ -764,8 +764,7 @@ pub(crate) fn build_application_with_limiter(
     )
 }
 
-/// [`build_application_with_limiter`] without the request line (tests attach
-/// their own).
+/// [`build_application_with_limiter`] without the request line.
 pub(crate) fn application_routes(
     ledgers: ledgers::Ledgers,
     guard_state: RequestGuardState,

@@ -1,43 +1,45 @@
-//! One log line per HTTP request, like a Heroku router line (build-log 009).
+//! One log line per HTTP request, like a Heroku router line (build-logs 009,
+//! 010).
 //!
 //! ```text
 //! INFO http: ledger=acme method=POST path=/ledgers/acme/graphql operation=AddTransaction user=u_7f3a… status=200 errors=0 ms=12 client=203.0.113.9
 //! ```
 //!
 //! [`request_log`] is the outermost layer of the node's router, outside CORS
-//! and the body limit, so it sees every answer the router makes. That is M-41's
-//! shape — a line per request there would be a log echo outside every budget —
-//! so the line is decided **fail-closed**: a request gets a line of its own only
-//! when its response carries a [`RequestNote`], and only code behind a key
-//! attaches one (the GraphQL handlers, after `auth_middleware` or
-//! `operator_only`, and `take_a_slot`'s 503). Every other answer — strangers'
-//! 401s, 429s, guard refusals, preflights, 413s, 404s, `/health`, requests cut
-//! short — goes through a [`KeyedRefusalLog`] keyed on the client's rate-limit
-//! bucket: one line per client per 10 s and the count it stood for, about 13
-//! lines a second at most whatever an attacker controls (M-41, T77).
+//! and the body limit, so it sees every answer the router makes, and every
+//! request gets its line: strangers' 401s, 429s, guard refusals, preflights,
+//! 413s, 404s, `/health` and requests cut short included (010). A request a
+//! key let through carries a [`RequestNote`] — only code behind a key attaches
+//! one: the GraphQL handlers, after `auth_middleware` or `operator_only`, and
+//! `take_a_slot`'s 503 — which fills in its `user` and `operation`; every other
+//! line says `-` for both.
+//! A line with a note has the target `http`; a stranger's, `http::stranger`, so
+//! `RUST_LOG=…,http::stranger=off` leaves strangers out (010).
 //!
-//! Every value is a constant or checked, and anything a caller chose is
-//! escaped here (tracing-subscriber 0.3.23 does not escape CR or LF), so no
-//! value can start a line; and the line stays under 512 bytes. Never the key,
+//! **No budget bounds these lines** (010, the maintainer's decision): a caller
+//! with no key writes one line per request it sends, as fast as it sends them.
+//! That is M-41's shape, accepted for the request line
+//! (`docs/audits/OUTSTANDING_TASKS_11_16.md`). What M-41 also asked for still
+//! holds: every value is a constant or checked, and anything a caller chose
+//! is escaped here (tracing-subscriber 0.3.23 does not escape CR or LF), so no
+//! value can start a line, and the line stays under 512 bytes. Never the key,
 //! a header, the body, the query text, its variables or the URL's query
 //! string.
 
 use std::fmt::Write as _;
 use std::net::IpAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Method, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::access_control::{Caller, CallerId};
 use crate::config::{is_valid_ledger_name, DEFAULT_LEDGER};
-use crate::connection_limiter::{KeyedRefusalLog, MAX_REFUSAL_LOG_SOURCES, REFUSAL_LOG_INTERVAL};
-use crate::rate_limit::{bucket_key, RateLimiter};
+use crate::rate_limit::RateLimiter;
 
 /// Most bytes of a path the line shows, after escaping (M-41's bar).
 const MAX_PATH_BYTES: usize = 128;
@@ -45,9 +47,10 @@ const MAX_PATH_BYTES: usize = 128;
 /// Longest GraphQL operation name the line shows; a longer one is `?`.
 const MAX_OPERATION_CHARS: usize = 64;
 
-/// What a handler behind a key tells the request line (009): the request gets
-/// a line of its own, with these fields. Carried in the response's extensions,
-/// so an answer nobody behind a key made carries none.
+/// What a handler behind a key tells the request line (009): who asked, the
+/// operation's name and the count of errors. Carried in the response's
+/// extensions, so an answer nobody behind a key made carries none, and its
+/// line says `user=- operation=-`.
 #[derive(Clone, Debug)]
 pub(crate) struct RequestNote {
     user: String,
@@ -77,51 +80,20 @@ impl RequestNote {
     }
 }
 
-/// The request line's state: who a client is, and the throttle for answers
-/// without a note.
+/// The request line's state: who a client is.
 #[derive(Clone)]
 pub(crate) struct RequestLogState {
     /// A twin of the node's limiter, for its idea of the client (the
     /// rightmost-untrusted `X-Forwarded-For` rule, L-36, L-37, M-04).
     clients: RateLimiter,
-    /// One line per client per window for every answer without a note.
-    throttle: Arc<KeyedRefusalLog<IpAddr>>,
 }
 
 impl RequestLogState {
     /// The request line for a node whose limiter is `limiter`.
     pub(crate) fn new(limiter: &RateLimiter) -> Self {
-        Self::with_interval(limiter, REFUSAL_LOG_INTERVAL)
-    }
-
-    /// [`Self::new`] with a throttle window of `interval` (tests).
-    pub(crate) fn with_interval(limiter: &RateLimiter, interval: Duration) -> Self {
         RequestLogState {
             clients: limiter.twin(),
-            throttle: Arc::new(KeyedRefusalLog::new(
-                interval,
-                MAX_REFUSAL_LOG_SOURCES,
-                report_unlogged,
-            )),
         }
-    }
-}
-
-/// The throttle's expiry summary: how many of one client's answers had no line
-/// of their own in the window that closed. Always `WARN`: it only ever counts
-/// answers without a note, refused or unbudgeted.
-fn report_unlogged(source: Option<&IpAddr>, suppressed: u64) {
-    match source {
-        Some(client) => warn!(
-            target: "http",
-            "client={client} suppressed={suppressed} requests without a line of their own in the \
-             last window"
-        ),
-        None => warn!(
-            target: "http",
-            "client=- suppressed={suppressed} requests without a line of their own in the last \
-             window (clients past the log table)"
-        ),
     }
 }
 
@@ -130,23 +102,21 @@ struct Head {
     ledger: String,
     method: String,
     path: String,
-    health: bool,
     client: IpAddr,
     started: Instant,
 }
 
 /// Writes the line for a request that never finished (009): the router's
 /// future is dropped by `serve_hardened`'s `TimeoutLayer` (408) and by a
-/// client that hangs up, and the request still gets a (throttled) line.
+/// client that hangs up, and the request still gets its line.
 struct CutShort {
-    state: RequestLogState,
     head: Option<Head>,
 }
 
 impl Drop for CutShort {
     fn drop(&mut self) {
         if let Some(head) = self.head.take() {
-            write_line(&self.state, &head, None, None);
+            write_line(&head, None, None);
         }
     }
 }
@@ -163,18 +133,13 @@ pub(crate) async fn request_log(
         ledger: ledger_field(path),
         method: method_field(request.method()).to_owned(),
         path: escaped(path, MAX_PATH_BYTES),
-        health: is_health(path),
         client: state.clients.client_of(&request),
         started: Instant::now(),
     };
-    let mut cut_short = CutShort {
-        state,
-        head: Some(head),
-    };
+    let mut cut_short = CutShort { head: Some(head) };
     let response = next.run(request).await;
     if let Some(head) = cut_short.head.take() {
         write_line(
-            &cut_short.state,
             &head,
             Some(response.status()),
             response.extensions().get::<RequestNote>(),
@@ -183,68 +148,56 @@ pub(crate) async fn request_log(
     response
 }
 
-/// The level a line is written at (decisions 1 and 3).
+/// The level a line is written at (009 decision 3; 010: a passing `/health`
+/// too is `INFO`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Level {
-    Debug,
     Info,
     Warn,
 }
 
-fn level_of(head: &Head, status: Option<StatusCode>) -> Level {
+fn level_of(status: Option<StatusCode>) -> Level {
     match status {
-        None => Level::Warn,
-        Some(StatusCode::OK) if head.health => Level::Debug,
         Some(status) if status.as_u16() < 400 => Level::Info,
-        Some(_) => Level::Warn,
+        _ => Level::Warn,
     }
 }
 
-fn enabled(level: Level) -> bool {
-    match level {
-        Level::Debug => tracing::enabled!(target: "http", tracing::Level::DEBUG),
-        Level::Info => tracing::enabled!(target: "http", tracing::Level::INFO),
-        Level::Warn => tracing::enabled!(target: "http", tracing::Level::WARN),
+fn enabled(level: Level, stranger: bool) -> bool {
+    match (level, stranger) {
+        (Level::Info, false) => tracing::enabled!(target: "http", tracing::Level::INFO),
+        (Level::Warn, false) => tracing::enabled!(target: "http", tracing::Level::WARN),
+        (Level::Info, true) => tracing::enabled!(target: "http::stranger", tracing::Level::INFO),
+        (Level::Warn, true) => tracing::enabled!(target: "http::stranger", tracing::Level::WARN),
     }
 }
 
-/// Write the line for one request: in full when it carries a note, through
-/// the throttle otherwise. `status` is `None` for a request cut short.
-fn write_line(
-    state: &RequestLogState,
-    head: &Head,
-    status: Option<StatusCode>,
-    note: Option<&RequestNote>,
-) {
-    let level = level_of(head, status);
-    // A line the filter drops costs nothing, not even a throttle window
-    // (`RUST_LOG=…,http=off`; a passing health check at the default `info`).
-    if !enabled(level) {
+/// Write the line for one request. `status` is `None` for a request cut
+/// short; `note` is there when a key let the request through.
+///
+/// A stranger's line — one without a note — has the target
+/// `http::stranger` (010), so `RUST_LOG=…,http::stranger=off` leaves them out
+/// and keeps the key holders'; `http=off` matches both targets (a filter's
+/// target is a prefix) and leaves out every request line.
+fn write_line(head: &Head, status: Option<StatusCode>, note: Option<&RequestNote>) {
+    let level = level_of(status);
+    let stranger = note.is_none();
+    // A line the filter drops is not even formatted.
+    if !enabled(level, stranger) {
         return;
     }
-    let suppressed = match note {
-        Some(_) => None,
-        None => match state.throttle.note(bucket_key(head.client), Instant::now()) {
-            Some(suppressed) => Some(suppressed),
-            None => return,
-        },
-    };
-    let line = line(head, status, note, suppressed);
-    match level {
-        Level::Debug => debug!(target: "http", "{line}"),
-        Level::Info => info!(target: "http", "{line}"),
-        Level::Warn => warn!(target: "http", "{line}"),
+    let line = line(head, status, note);
+    match (level, stranger) {
+        (Level::Info, false) => info!(target: "http", "{line}"),
+        (Level::Warn, false) => warn!(target: "http", "{line}"),
+        (Level::Info, true) => info!(target: "http::stranger", "{line}"),
+        (Level::Warn, true) => warn!(target: "http::stranger", "{line}"),
     }
 }
 
 /// The line's text: `ledger method path operation user status errors ms
-/// client`, then `cut_short=true` and, on a throttled line, `suppressed=N`.
-fn line(
-    head: &Head,
-    status: Option<StatusCode>,
-    note: Option<&RequestNote>,
-    suppressed: Option<u64>,
-) -> String {
+/// client`, then `cut_short=true` for a request that never finished.
+fn line(head: &Head, status: Option<StatusCode>, note: Option<&RequestNote>) -> String {
     let (operation, user, errors) = match note {
         Some(note) => (note.operation.as_str(), note.user.as_str(), note.errors),
         None => ("-", "-", 0),
@@ -261,9 +214,6 @@ fn line(
     );
     if status == "-" {
         line.push_str(" cut_short=true");
-    }
-    if let Some(suppressed) = suppressed {
-        let _ = write!(line, " suppressed={suppressed}");
     }
     line
 }
@@ -284,15 +234,6 @@ fn ledger_field(path: &str) -> String {
         Ok(name) if is_valid_ledger_name(&name) => name.into_owned(),
         _ => "-".to_owned(),
     }
-}
-
-/// Whether `path` is a ledger's `/health`.
-fn is_health(path: &str) -> bool {
-    path == "/health"
-        || path
-            .strip_prefix("/ledgers/")
-            .and_then(|rest| rest.split_once('/'))
-            .is_some_and(|(_, route)| route == "health")
 }
 
 /// A standard method's name, and `?` for any other: http 1.x accepts an
@@ -374,6 +315,7 @@ pub(crate) fn escaped(value: &str, max_bytes: usize) -> String {
 mod tests {
     use std::collections::HashSet;
     use std::net::SocketAddr;
+    use std::time::Duration;
 
     use axum::extract::ConnectInfo;
     use axum::Router;
@@ -443,11 +385,11 @@ mod tests {
         json!({ "query": text })
     }
 
-    /// The request lines (target `http`) in `logged`.
+    /// The request lines (targets `http` and `http::stranger`) in `logged`.
     fn http_lines(logged: &str) -> Vec<&str> {
         logged
             .lines()
-            .filter(|line| line.contains(" http: "))
+            .filter(|line| line.contains(" http: ") || line.contains(" http::stranger: "))
             .collect()
     }
 
@@ -478,11 +420,11 @@ mod tests {
     /// 009: a read key's query on `acme` writes one `INFO` line naming the
     /// ledger, the method, the path, the operation, the person's user id, the
     /// status, the error count, the time taken and the client — and nothing
-    /// after the client (a throttled line would add `suppressed=`).
+    /// after the client.
     ///
     /// Bug-catch: remove the layer from the node's router (NL-R1) and there is
     /// no line; stop `graphql_handler` attaching its note (NL-R2) and the line
-    /// is a throttled one with `user=-`.
+    /// says `user=- operation=-`.
     #[tokio::test]
     async fn a_keyed_request_logs_one_line_with_ledger_user_operation_and_status() {
         let (_dir, app, _, _, _) = node();
@@ -515,28 +457,24 @@ mod tests {
         assert!(rest.ends_with(" client=198.51.100.4"), "{line}");
     }
 
-    /// 009, M-41: everything a stranger can provoke — wrong keys until the
-    /// budget answers 429, a guard refusal, a preflight, a 413, a 404 and a
-    /// 405 — writes one line for that client per window, and when the window
-    /// closes one summary with the count of the rest.
+    /// 010: every request writes its own line, a stranger's too — wrong
+    /// keys until the budget answers 429, a guard refusal, a preflight, a 413,
+    /// a 404 and a 405 — in order, each with its status and its level, and
+    /// none of them summarized (`suppressed=`).
     ///
-    /// Bug-catch: give a request without a note a line of its own (NL-R5) and
-    /// every one of them writes a line, outside every budget.
+    /// Bug-catch: leave out a request without a note (NL-R17) and only the
+    /// requests a key let through are in the log.
     #[tokio::test]
-    async fn strangers_requests_log_one_line_per_client_per_window() {
-        let window = Duration::from_secs(8);
-        let limiter = RateLimiter::graphql();
-        let log = RequestLogState::with_interval(&limiter, window);
-        let (_dir, app, _, _, _) = node_with(limiter, Some(log));
-        let (asked, logged) = capture_logs("info", async {
-            let started = Instant::now();
-            let mut asked = 0;
-            let mut ask = |request: Request<Body>, expected: StatusCode| {
-                asked += 1;
+    async fn every_request_logs_a_line_of_its_own_strangers_included() {
+        let (_dir, app, _, _, _) = node();
+        let (expected, logged) = capture_logs("info", async {
+            let mut expected = Vec::new();
+            let mut ask = |request: Request<Body>, status: StatusCode| {
+                expected.push(status);
                 let app = app.clone();
                 async move {
-                    let (status, body) = answer(&app, request).await;
-                    assert_eq!(status, expected, "{body}");
+                    let (answered, body) = answer(&app, request).await;
+                    assert_eq!(answered, status, "{body}");
                 }
             };
             for _ in 0..crate::rate_limit::GRAPHQL_RATE_LIMIT {
@@ -582,37 +520,29 @@ mod tests {
                 StatusCode::METHOD_NOT_ALLOWED,
             )
             .await;
-            assert!(
-                started.elapsed() < window,
-                "the requests took longer than one window"
-            );
-            let asked = asked;
-            tokio::time::sleep_until((started + window + Duration::from_millis(500)).into()).await;
-            asked
+            expected
         })
         .await;
         let lines = http_lines(&logged);
-        let request_lines: Vec<&&str> = lines
-            .iter()
-            .filter(|line| line.contains(" path="))
-            .collect();
-        assert_eq!(request_lines.len(), 1, "{logged}");
-        assert!(request_lines[0].contains(" WARN http: "), "{logged}");
+        assert_eq!(lines.len(), expected.len(), "{logged}");
+        for (line, status) in lines.iter().zip(&expected) {
+            let level = if status.as_u16() < 400 {
+                " INFO"
+            } else {
+                " WARN"
+            };
+            assert!(
+                line.contains(&format!("{level} http::stranger: ")),
+                "{line}"
+            );
+            assert!(
+                line.contains(&format!(" user=- status={} ", status.as_u16())),
+                "{line}"
+            );
+            assert!(line.ends_with(" client=198.51.100.4"), "{line}");
+        }
         assert!(
-            request_lines[0].contains(" user=- status=401 errors=0 ms="),
-            "{logged}"
-        );
-        assert!(
-            request_lines[0].ends_with(" client=198.51.100.4 suppressed=0"),
-            "{logged}"
-        );
-        let summaries: Vec<&&str> = lines
-            .iter()
-            .filter(|line| line.contains("without a line of their own"))
-            .collect();
-        assert_eq!(summaries.len(), 1, "{logged}");
-        assert!(
-            summaries[0].contains(&format!("client=198.51.100.4 suppressed={}", asked - 1)),
+            lines.iter().all(|line| !line.contains("suppressed=")),
             "{logged}"
         );
     }
@@ -676,7 +606,7 @@ mod tests {
     /// behind the installer's Caddy is `127.0.0.1`.
     #[tokio::test]
     async fn the_client_is_the_forwarded_address_only_behind_a_trusted_proxy() {
-        let (_dir, app, _, _, _) = node_with(trusting_loopback(), None);
+        let (_dir, app, _, _, _) = node_with(trusting_loopback());
         let ((), logged) = capture_logs("info", async {
             let behind = forwarded(
                 request(
@@ -702,15 +632,15 @@ mod tests {
         assert!(lines[1].ends_with(" client=198.51.100.4"), "{logged}");
     }
 
-    /// 009, T77: behind one proxy, two strangers each get their own line —
-    /// the throttle is keyed on the forwarded client, not on the proxy, which
-    /// is every client's TCP peer.
+    /// 009, 010, M-04: behind one proxy, each stranger's request is logged
+    /// with the address the proxy forwarded, not the proxy's own, which is
+    /// every client's TCP peer — one line per request.
     ///
-    /// Bug-catch: key the throttle on the TCP peer (NL-R12) and the first
-    /// stranger's line hides every other's.
+    /// Bug-catch: take `client` from the TCP peer (NL-R3) and every stranger
+    /// behind the installer's Caddy is `127.0.0.1`.
     #[tokio::test]
-    async fn strangers_behind_one_proxy_are_throttled_per_forwarded_client() {
-        let (_dir, app, _, _, _) = node_with(trusting_loopback(), None);
+    async fn strangers_behind_one_proxy_are_logged_with_their_forwarded_address() {
+        let (_dir, app, _, _, _) = node_with(trusting_loopback());
         let ((), logged) = capture_logs("info", async {
             for client in ["203.0.113.1", "203.0.113.2", "203.0.113.1", "203.0.113.2"] {
                 let wrong = forwarded(
@@ -728,9 +658,14 @@ mod tests {
         })
         .await;
         let lines = http_lines(&logged);
-        assert_eq!(lines.len(), 2, "{logged}");
-        assert!(lines[0].contains(" client=203.0.113.1 "), "{logged}");
-        assert!(lines[1].contains(" client=203.0.113.2 "), "{logged}");
+        assert_eq!(lines.len(), 4, "{logged}");
+        for (line, client) in
+            lines
+                .iter()
+                .zip(["203.0.113.1", "203.0.113.2", "203.0.113.1", "203.0.113.2"])
+        {
+            assert!(line.ends_with(&format!(" client={client}")), "{logged}");
+        }
     }
 
     /// 009, M-41: a control character a caller chose never reaches a line —
@@ -768,11 +703,10 @@ mod tests {
             ledger: "-".to_owned(),
             method: "GET".to_owned(),
             path: shown,
-            health: false,
             client: IpAddr::from(PEER),
             started: Instant::now(),
         };
-        let text = line(&head, Some(StatusCode::NOT_FOUND), None, Some(0));
+        let text = line(&head, Some(StatusCode::NOT_FOUND), None);
         assert!(
             !text
                 .chars()
@@ -864,11 +798,11 @@ mod tests {
         );
     }
 
-    /// 009: a key holder's 503 `LEDGER_BUSY` gets a line of its own, naming
-    /// them — "the app is slow" — not a throttled one.
+    /// 009: a key holder's 503 `LEDGER_BUSY` is logged naming them — "the
+    /// app is slow".
     ///
-    /// Bug-catch: drop `take_a_slot`'s note (NL-R16) and the 503 is a
-    /// throttled line with `user=-`.
+    /// Bug-catch: drop `take_a_slot`'s note (NL-R16) and the 503's line says
+    /// `user=-`.
     #[tokio::test]
     async fn a_busy_ledger_logs_the_key_holders_503_in_full() {
         let (_dir, app, _, _, ledgers) = node();
@@ -899,12 +833,12 @@ mod tests {
 
     /// 009, M-13: a request the server gives up on — `serve_hardened`'s
     /// timeout, or a client hanging up, drops the router's future — still
-    /// writes a (throttled) line, `status=- cut_short=true`.
+    /// writes its line, `status=- cut_short=true`.
     ///
     /// Bug-catch: remove the drop guard (NL-R10) and a request cut short
     /// leaves no trace.
     #[tokio::test]
-    async fn a_request_cut_short_still_logs_a_throttled_line() {
+    async fn a_request_cut_short_still_logs_a_line() {
         let (_dir, app, _, acme, _) = node();
         let held = acme.write().await;
         let ((), logged) = capture_logs("info", async {
@@ -926,54 +860,58 @@ mod tests {
         let lines = http_lines(&logged);
         assert_eq!(lines.len(), 1, "{logged}");
         assert!(
-            lines[0].contains(" WARN http: ledger=acme method=POST path=/ledgers/acme/graphql operation=- user=- status=- "),
+            lines[0].contains(" WARN http::stranger: ledger=acme method=POST path=/ledgers/acme/graphql operation=- user=- status=- "),
             "{logged}"
         );
-        assert!(
-            lines[0].contains(" cut_short=true suppressed=0"),
-            "{logged}"
-        );
+        assert!(lines[0].ends_with(" cut_short=true"), "{logged}");
     }
 
-    /// 009, decision 1: a `/health` that answers 200 is written at `DEBUG`
-    /// only — at the default filter it writes nothing and spends no window,
-    /// so the same client's next refusal still gets its line.
+    /// 010 (reverses 009's decision 1): a `/health` that answers 200 is
+    /// written at `INFO`, like every answer below 400 — so it shows at the
+    /// default filter — once per request, a ledger's `/health` too.
     ///
-    /// Bug-catch: write a passing health check at `INFO` (NL-R6) and every
-    /// probe fills the log at the default filter.
+    /// Bug-catch: leave a passing `/health` out (NL-R18) and the probes,
+    /// Docker's among them, never show.
     #[tokio::test]
-    async fn a_passing_health_check_logs_at_debug_only() {
+    async fn a_passing_health_check_logs_at_info() {
         let (_dir, app, _, _, _) = node();
-        let ((), logged) = capture_logs("info", async {
-            let health = request("GET", "/health", None, Value::Null, PEER);
-            assert_eq!(answer(&app, health).await.0, StatusCode::OK);
-            let wrong = request("POST", "/graphql", Some("wrong"), query(READ), PEER);
-            assert_eq!(answer(&app, wrong).await.0, StatusCode::UNAUTHORIZED);
+        let ((), logged) = capture_logs(crate::DEFAULT_LOG_FILTER, async {
+            for _ in 0..2 {
+                let health = request("GET", "/health", None, Value::Null, PEER);
+                assert_eq!(answer(&app, health).await.0, StatusCode::OK);
+            }
+            let named = request(
+                "GET",
+                "/ledgers/acme/health",
+                Some(OPERATOR),
+                Value::Null,
+                PEER,
+            );
+            assert_eq!(answer(&app, named).await.0, StatusCode::OK);
         })
         .await;
         let lines = http_lines(&logged);
-        assert_eq!(lines.len(), 1, "{logged}");
-        assert!(lines[0].contains(" status=401 "), "{logged}");
-        assert!(lines[0].ends_with(" suppressed=0"), "{logged}");
-
-        let ((), logged) = capture_logs("info,http=debug", async {
-            let health = request("GET", "/health", None, Value::Null, [203, 0, 113, 9]);
-            assert_eq!(answer(&app, health).await.0, StatusCode::OK);
-        })
-        .await;
-        let lines = http_lines(&logged);
-        assert_eq!(lines.len(), 1, "{logged}");
+        assert_eq!(lines.len(), 3, "{logged}");
+        for line in &lines[..2] {
+            assert!(
+                line.contains(" INFO http::stranger: ledger=default method=GET path=/health operation=- user=- status=200 "),
+                "{logged}"
+            );
+        }
         assert!(
-            lines[0].contains("DEBUG http: ledger=default method=GET path=/health "),
+            lines[2].contains(
+                " INFO http::stranger: ledger=acme method=GET path=/ledgers/acme/health "
+            ),
             "{logged}"
         );
     }
 
     /// 009, decision 3: `INFO` for an answer below 400, `WARN` for 4xx and
-    /// 5xx — so a warning with target `http` is a refused or failed request.
+    /// 5xx — so a warning with target `http` or `http::stranger` is a refused
+    /// or failed request.
     ///
-    /// Bug-catch: write every line at `INFO` (NL-R15) and a refusal reads as
-    /// a success.
+    /// Bug-catch: write a key holder's warnings at `INFO` (NL-R15), or a
+    /// stranger's (NL-R19), and a refusal reads as a success.
     #[tokio::test]
     async fn the_level_follows_the_status() {
         let (_dir, app, _, _, ledgers) = node();
@@ -1006,12 +944,51 @@ mod tests {
             "{logged}"
         );
         assert!(
-            lines[1].contains(" WARN http: ") && lines[1].contains(" status=401 "),
+            lines[1].contains(" WARN http::stranger: ") && lines[1].contains(" status=401 "),
             "{logged}"
         );
         assert!(
             lines[2].contains(" WARN http: ") && lines[2].contains(" status=503 "),
             "{logged}"
         );
+    }
+
+    /// 010: a stranger's line has the target `http::stranger`, a key
+    /// holder's `http` — so `http::stranger=off` leaves out only strangers',
+    /// and `http=off` (a filter's target is a prefix) leaves out both.
+    ///
+    /// Bug-catch: write a stranger's line under `http` (NL-R20) and
+    /// `http::stranger=off` cannot leave it out.
+    #[tokio::test]
+    async fn stranger_lines_can_be_turned_off_alone() {
+        let (_dir, app, _, _, _) = node();
+        let both = || async {
+            let keyed = request("POST", "/graphql", Some(OPERATOR), query(READ), PEER);
+            assert_eq!(answer(&app, keyed).await.0, StatusCode::OK);
+            let wrong = request("POST", "/graphql", Some("wrong"), query(READ), PEER);
+            assert_eq!(answer(&app, wrong).await.0, StatusCode::UNAUTHORIZED);
+        };
+        let ((), logged) = capture_logs(crate::DEFAULT_LOG_FILTER, both()).await;
+        let lines = http_lines(&logged);
+        assert_eq!(lines.len(), 2, "{logged}");
+        assert!(
+            lines[0].contains(" INFO http: ") && lines[0].contains(" user=operator "),
+            "{logged}"
+        );
+        assert!(
+            lines[1].contains(" WARN http::stranger: ") && lines[1].contains(" status=401 "),
+            "{logged}"
+        );
+
+        let ((), logged) = capture_logs("info,http::stranger=off", both()).await;
+        let lines = http_lines(&logged);
+        assert_eq!(lines.len(), 1, "{logged}");
+        assert!(
+            lines[0].contains(" INFO http: ") && lines[0].contains(" user=operator "),
+            "{logged}"
+        );
+
+        let ((), logged) = capture_logs("info,http=off", both()).await;
+        assert!(http_lines(&logged).is_empty(), "{logged}");
     }
 }

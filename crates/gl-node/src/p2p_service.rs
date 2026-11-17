@@ -1325,6 +1325,7 @@ mod tests {
     /// rather than WARN because the line under test is an INFO line — which is
     /// exactly why M-32 mattered: it printed on every healthy boot.)
     fn capture_info<T>(body: impl FnOnce() -> T) -> (T, String) {
+        crate::test_support::keep_two_dispatchers();
         #[derive(Clone, Default)]
         struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
 
@@ -2971,6 +2972,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         // Spans are recorded only under a subscriber; this thread's, so the
         // runtime below — on this thread too — polls every task under it.
+        crate::test_support::keep_two_dispatchers();
         let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

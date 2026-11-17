@@ -134,7 +134,7 @@ pub(crate) fn ledger_router(
 /// own callers slows only itself.
 ///
 /// 009: the 503 is a key holder's (auth runs first), so it carries a
-/// [`RequestNote`] and gets a line of its own: "the app is slow".
+/// [`RequestNote`]: its request line names them, "the app is slow".
 async fn take_a_slot(
     State(slots): State<Slots>,
     request: Request,
@@ -152,8 +152,8 @@ async fn take_a_slot(
             axum::http::header::RETRY_AFTER,
             axum::http::HeaderValue::from_static("1"),
         );
-        // Only with a caller: without one (never, behind auth) the 503 is
-        // throttled like any answer nobody behind a key made.
+        // Only with a caller: without one (never, behind auth) the 503's line
+        // says `user=-`, as for any answer nobody behind a key made.
         return match caller {
             Some(caller) => RequestNote::new(Some(caller), None, 0).attach(response),
             None => response,
@@ -620,7 +620,6 @@ pub(crate) mod test_node {
     use crate::health::HealthState;
     use crate::rate_limit::RateLimiter;
     use crate::request_guard::RequestGuardState;
-    use crate::request_log::RequestLogState;
 
     pub(crate) const OPERATOR: &str = "operator-key-for-the-ledger-routing-tests-0123456789";
 
@@ -634,15 +633,13 @@ pub(crate) mod test_node {
         SharedLedger,
         Ledgers,
     ) {
-        build(RateLimiter::graphql(), RateLimiter::graphql(), None)
+        build(RateLimiter::graphql(), RateLimiter::graphql())
     }
 
     /// [`node`] as `main` builds one: the ledgers' limiter and the router's
-    /// are clones of `limiter` (one trusted-proxy set, one L-37 flag), and
-    /// the request line is `log` when given, the router's own otherwise.
+    /// are clones of `limiter` (one trusted-proxy set, one L-37 flag).
     pub(crate) fn node_with(
         limiter: RateLimiter,
-        log: Option<RequestLogState>,
     ) -> (
         tempfile::TempDir,
         Router,
@@ -650,7 +647,7 @@ pub(crate) mod test_node {
         SharedLedger,
         Ledgers,
     ) {
-        build(limiter.clone(), limiter, log)
+        build(limiter.clone(), limiter)
     }
 
     /// Hold every request slot of ledger `name` (its next keyed request is
@@ -670,7 +667,6 @@ pub(crate) mod test_node {
     fn build(
         ledgers_limiter: RateLimiter,
         limiter: RateLimiter,
-        log: Option<RequestLogState>,
     ) -> (
         tempfile::TempDir,
         Router,
@@ -723,28 +719,14 @@ pub(crate) mod test_node {
             allowed_origins: Arc::new(HashSet::new()),
             tls_terminated: false,
         };
-        let app = match log {
-            None => crate::build_application_with_limiter(
-                ledgers.clone(),
-                guard,
-                CorsLayer::new(),
-                false,
-                limiter,
-                None,
-            ),
-            Some(log) => crate::application_routes(
-                ledgers.clone(),
-                guard,
-                CorsLayer::new(),
-                false,
-                limiter,
-                None,
-            )
-            .layer(axum::middleware::from_fn_with_state(
-                log,
-                crate::request_log::request_log,
-            )),
-        };
+        let app = crate::build_application_with_limiter(
+            ledgers.clone(),
+            guard,
+            CorsLayer::new(),
+            false,
+            limiter,
+            None,
+        );
         let acme = shared.pop().expect("acme");
         let default = shared.pop().expect("default");
         (dir, app, default, acme, ledgers)
