@@ -137,6 +137,55 @@ for template in "${templates[@]}"; do
   check "openledger status: HTTPS ok" in_vm sudo openledger status
   check "openledger key is the operator key" test "$(in_vm sudo openledger key)" = "$key"
 
+  # 009: the request log, read with openledger logs. Requests from the VM's
+  # own address, so Caddy forwards a caller that is not 127.0.0.1.
+  in_vm sudo openledger company add acme-eu >/dev/null || fail "openledger company add acme-eu failed"
+  from_vm() {  # path key body
+    in_vm sudo curl -sS --max-time 10 --cacert "$root" --resolve "$domain:443:$vm_ip" -o /dev/null \
+      -H "X-Api-Key: $2" -H 'Content-Type: application/json' -d "$3" "https://$domain$1"
+  }
+  from_vm /ledgers/acme/graphql "$ana" '{"query":"query Books { verify { ok } }","operationName":"Books"}'
+  from_vm /ledgers/acme-eu/graphql "$key" "$verify"
+  from_vm /graphql "$key" "$verify"
+  logs=$(in_vm sudo openledger logs --http -n 200)
+  check "openledger logs --http: Ana's request, her user id and the caller's address ($vm_ip)" \
+    grep -Eq " INFO http: ledger=acme method=POST path=/ledgers/acme/graphql operation=Books user=u_[0-9a-f]{16} status=200 errors=0 ms=[0-9]+ client=$vm_ip\$" \
+    <(printf '%s\n' "$logs")
+  others_logged() {  # what openledger logs acme must leave out is there to leave out
+    grep -q ' ledger=acme-eu ' <<< "$logs" && grep -q ' ledger=default ' <<< "$logs"
+  }
+  check "the log holds acme-eu's and default's requests too" others_logged
+  only_acme() {  # the lines of openledger logs acme
+    grep -q ' ledger=acme ' <<< "$1" && ! grep -Eq 'ledger=(acme-eu|default)' <<< "$1"
+  }
+  check "openledger logs acme: acme's lines, none of acme-eu's or default's" \
+    only_acme "$(in_vm sudo openledger logs acme -n 1000)"
+  tailed=$(in_vm sudo bash -c 'timeout 12 openledger logs --tail --http -n 0 & sleep 4
+    curl -sS --max-time 5 --cacert "$1" --resolve "$2:443:$3" -o /dev/null -H "X-Api-Key: $4" \
+      -H "Content-Type: application/json" -d "{\"query\":\"query Tailed { verify { ok } }\",\"operationName\":\"Tailed\"}" \
+      "https://$2/graphql"
+    wait || true' _ "$root" "$domain" "$vm_ip" "$key")
+  check "openledger logs --tail streams a request made after it started" \
+    grep -q ' operation=Tailed user=operator status=200 ' <(printf '%s\n' "$tailed")
+  logs_refused() {  # what openledger says, then the arguments: refused by it, not by docker
+    local said=$1 out
+    shift
+    if out=$(in_vm sudo openledger logs "$@" 2>&1); then return 1; fi
+    grep -qF -- "$said" <<< "$out"
+  }
+  check "openledger logs refuses a COMPANY that is not a company name ('a|b')" \
+    logs_refused 'is not a company name' 'a|b'
+  check "and a --since that is not a time ('1h;x')" \
+    logs_refused '--since takes' --since '1h;x'
+  all_logs=$(in_vm sudo openledger logs -n 100000)
+  no_key() { ! grep -qF -e "$key" -e "$ana" <<< "$all_logs"; }
+  check "no key in the node's log (the operator's, Ana's)" no_key
+  # Captured first: `grep -q` closing a pipe early would fail the pipe, and the
+  # `!` would turn that into a pass.
+  docker_log=$(in_vm sudo docker logs openledger-node 2>&1)
+  no_colour() { ! grep -q $'\x1b' <<< "$docker_log"; }
+  check "docker logs openledger-node has no colour codes" no_colour
+
   update="$PWD/target/rehearsal/$vm.update.log"
   install_it ops-2@ledger.test > "$update" 2>&1 || { tail -20 "$update"; fail "the run with a new e-mail failed"; }
   check "a run with a new e-mail updates the Caddyfile the installer wrote (no .new) and restarts Caddy" \

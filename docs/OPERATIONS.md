@@ -36,6 +36,7 @@ reference for every config option; this page is the procedure.
 | Upgrade, roll back | `openledger upgrade --version X.Y.Z` (a backup first), `openledger rollback` — below |
 | The operator key | `openledger key` |
 | Is it all right? | `openledger status` — the services, the node's version, `https://DOMAIN/health` through Caddy, the last backup, the companies; exits non-zero if HTTPS fails or the last backup is two days old |
+| What is it doing? | `openledger logs` — the node's last 200 lines, then exit; `--tail` keeps streaming; `openledger logs acme` keeps acme's lines among them (not `acme-eu`'s), `--http` the request lines (company, user id, operation, status, time, caller; a stranger's are throttled, one per caller per 10 s); `-n 5000` looks further back, `--since 1h` starts an hour ago; *What to watch*, *Requests* |
 
 Each runs the node's own command (`gl-node ledger`, `gl-node user`) in its
 container, with its key; the node judges every change, as *Adding a company*
@@ -694,8 +695,9 @@ a public bind*), and rotate logs.
 
 **Requests** — the node writes one line per HTTP request, target `http`
 (README, *Request log*): who asked, for which company, what it answered and
-how long it took. A request line at `WARN` is a **refused or failed request**
-(a wrong key, a 429, a busy ledger's 503), **not a fault of the node**: an
+how long it took; `openledger logs --http` shows them, `--tail` as they
+come. A request line at `WARN` is a **refused or failed request** (a wrong
+key, a 429, a busy ledger's 503), **not a fault of the node**: an
 alert on warnings should leave out target `http` (in a log shipper, the text
 ` WARN http: `), or every stranger's wrong key pages someone. Watch instead
 for many `status=503` lines for one ledger (it is busy: raise

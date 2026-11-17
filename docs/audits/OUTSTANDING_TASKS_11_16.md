@@ -50,7 +50,7 @@ for served names only and were already safe.
 - Revert check: NL-R14 in `scripts/revert_specs/node_logs.json` bites.
 - CHANGELOG `[Unreleased]` *Security*; `docs/build-log/009-node-logs/log.md`.
 
-**Commit:** 6129b17.
+**Commit:** 1efb01d (with 009 unit 1).
 
 **Done in 009 unit 1.** A folder in `ledgersDir` whose name is not a valid
 ledger name is logged raw (`error!(ledger = %name, …, "ledger not served")`,

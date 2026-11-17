@@ -57,5 +57,5 @@ them (a typo, a one-line fix) gets no entry.
 | [006](006-list-accounts/) | List a ledger's accounts over GraphQL, posted to or not | done (54b4454) |
 | [007](007-plaid-commitments/) | Keep what we told Plaid: bank connections, token secrecy, MFA before Link, retention in the installer | step 6f (OAuth redirect URI) done; steps 1–2, 7 on hold |
 | [008](008-bank-feed-inbox/) | Bank-feed inbox: fetched bank transactions wait for a bookkeeper to classify them before any entry is written | done (3 of 3, fcec9e2) |
-| [009](009-node-logs/) | One log line per HTTP request, and `openledger logs [--tail]` | unit 1 of 3 (the request line) in progress |
+| [009](009-node-logs/) | One log line per HTTP request, and `openledger logs [--tail]` | done (3 of 3; unit 2's commit to fill in) |
 | — | Relay with a company's own certificate authority (`relayCaCert`) | planned (decision C, 2026-10-09) |

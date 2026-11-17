@@ -96,8 +96,9 @@ books, keys, the config or a file you edited (its version goes beside it as
 downloading one; `--no-firewall` leaves the firewall to you.
 Then, as root on the server, `openledger company add acme` adds a company
 in a mesh of its own, `openledger person add acme --name "Ana Ruiz" --role
-write` gives someone a key, and `openledger status` checks it all through
-HTTPS. It backs the books up every night into
+write` gives someone a key, `openledger status` checks it all through
+HTTPS, and `openledger logs --tail` shows the requests as they are served. It
+backs the books up every night into
 `/var/lib/openledger/backups` (copy them off the server, encrypted: they hold
 the node's keys); `openledger restore FILE` puts one back, `openledger upgrade
 --version X.Y.Z` backs up and moves to another release, and `openledger
@@ -788,6 +789,10 @@ exactly when it is needed, so there is none.
 The request line is on by default; `RUST_LOG=info,iroh::protocol=error,http=off`
 turns it off. The node's log is plain text, without colour codes, whenever its
 output is not a terminal (`docker logs`, a file, a log shipper).
+
+On a server set up by the installer, `openledger logs` reads it: `--tail` to
+keep streaming, a company's name for its lines only, `--http` for the request
+lines only (`docs/OPERATIONS.md`).
 
 ### API keys
 
@@ -1524,7 +1529,8 @@ repository's root (one `NAME=value` a line: `GL_NODE_PLAID_CLIENT_ID`,
 git; `chmod 600 .env`), that config in `gl-node.local.json`, and run
 `scripts/run_local_node.sh`. It refuses an env file others can read or git
 tracks, passes the secrets to the node only, and runs the newest release in
-`releases/` (or a binary you name). `docs/api/openledger.insomnia.json` has
+`releases/`, a binary you name, or with `--source` the working tree, built
+then and there (`cargo build -p gl-node`). `docs/api/openledger.insomnia.json` has
 the requests, in order.
 
 #### Webhooks

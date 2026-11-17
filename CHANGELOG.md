@@ -18,6 +18,12 @@ break compatibility.
 - **Plain text off a terminal:** the node's log has no colour codes when its
   output is not a terminal (`docker logs`, a file, a log shipper). This
   changes the log's bytes for anyone who parsed the escape codes.
+- **`openledger logs [COMPANY] [--tail] [--since TIME] [--http] [-n N]`** on
+  a server set up by the installer (009 unit 2): the node's log, like
+  `heroku logs --tail`. A company's name shows only its lines (`acme` leaves
+  out `acme-eu`), `--http` only the request lines. Each argument is checked
+  before it reaches `docker` or `grep`, and control characters are dropped
+  before the terminal.
 
 ### Security
 

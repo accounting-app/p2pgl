@@ -444,7 +444,12 @@ usage="usage:
   openledger upgrade --version X.Y.Z a backup, then release X.Y.Z (or --binary FILE [--installer FILE])
   openledger rollback                back to before the last upgrade: its backup and its binary
   openledger key                     the operator key
-  openledger status                  the services, the node, HTTPS as a client sees it, the last backup"
+  openledger status                  the services, the node, HTTPS as a client sees it, the last backup
+  openledger logs [COMPANY] [--tail] [--since TIME] [--http] [-n N]
+                                     the node's log: its last N lines (200), then exit; --tail keeps
+                                     streaming; COMPANY keeps that company's lines among them, --http
+                                     the request lines (raise -n to look further back); TIME is a
+                                     number and s, m, h or d (30m, 2h, 1d)"
 fail() { printf 'openledger: %s\n' "$*" >&2; exit 1; }
 [[ $(id -u) -eq 0 ]] || fail "run it as root (sudo openledger …)"
 [[ -r "$settings" ]] || fail "no $settings: is this server set up by the openledger installer?"
@@ -909,6 +914,62 @@ $usage" ;;
     printf '\n'
     node ledger list || status=1
     exit "${status:-0}" ;;
+  logs)
+    # 009: the node's log, like `heroku logs`. Every argument is checked
+    # before it reaches docker or grep: COMPANY by the ledger-name rule, so
+    # it cannot become a pattern; N and TIME by their shapes.
+    company="" follow=() since=() lines=200 http=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --tail) follow=(--follow); shift ;;
+        --http) http=1; shift ;;
+        --since)
+          [[ $# -ge 2 && "$2" =~ ^([0-9]{1,6})([smhd])$ ]] \
+            || fail "--since takes a number (up to 6 digits) and s, m, h or d (30m, 2h, 1d)"
+          # docker takes Go's durations, which have no days.
+          if [[ ${BASH_REMATCH[2]} == d ]]; then
+            since=(--since "$(( 10#${BASH_REMATCH[1]} * 24 ))h")
+          else
+            since=(--since "$2")
+          fi
+          shift 2 ;;
+        -n)
+          [[ $# -ge 2 && "$2" =~ ^[0-9]{1,9}$ ]] || fail "-n takes a number of lines (up to 9 digits)"
+          lines=$(( 10#$2 ))
+          shift 2 ;;
+        -*) fail "unknown logs option $1
+$usage" ;;
+        *)
+          [[ -z "$company" ]] || fail "logs takes one COMPANY"
+          [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,39}$ ]] \
+            || fail "$1 is not a company name (1 to 40 of a-z, 0-9 and -, not starting with -)"
+          company=$1
+          shift ;;
+      esac
+    done
+    # A grep that matches nothing is not a failure (pipefail); one that
+    # cannot run is. Every stage is line-buffered, or --tail stalls behind a
+    # pipe's buffer.
+    matching() { grep --line-buffered -E "$1" || [[ $? -eq 1 ]]; }
+    request_lines() { if [[ -n "$http" ]]; then matching ' http: '; else cat; fi; }
+    # `ledger=acme` in a request line, `ledger{ledger=acme}:` in a span: the
+    # field `ledger` only (not `other_ledger=acme`), and not `acme-eu`, which
+    # `grep -w` would let through (- is not a word character).
+    company_lines() {
+      if [[ -n "$company" ]]; then
+        matching "(^|[ {])ledger=\"?$company\"?([ },:]|\$)"
+      else
+        cat
+      fi
+    }
+    # Behind a filter, docker's own error (no container) would match nothing
+    # and vanish: said first.
+    docker inspect openledger-node >/dev/null 2>&1 \
+      || fail "no openledger-node container: openledger status, docker ps -a"
+    # The last stage drops every control character but tab and newline, so
+    # nothing in the log can drive the terminal.
+    docker logs "${follow[@]}" "${since[@]}" --tail "$lines" openledger-node 2>&1 \
+      | request_lines | company_lines | stdbuf -oL tr -d '\000-\010\013-\037\177' ;;
   -h|--help|help) printf '%s\n' "$usage" ;;
   *) fail "unknown command $what
 $usage" ;;

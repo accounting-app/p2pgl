@@ -3,7 +3,7 @@
 # the API locally — Plaid's sandbox above all (README, *Bank connections
 # (Plaid)*; docs/api/openledger.insomnia.json).
 #
-#   scripts/run_local_node.sh [--env FILE] [--config FILE] [BINARY]
+#   scripts/run_local_node.sh [--env FILE] [--config FILE] [--source | BINARY]
 #
 #   --env FILE      the secrets, one NAME=value a line (default: .env, which
 #                   .gitignore keeps out of git): GL_NODE_PLAID_CLIENT_ID,
@@ -12,6 +12,8 @@
 #   --config FILE   the node's config (default: gl-node.local.json).
 #   BINARY          the gl-node to run (default: the newest release in
 #                   releases/ for this machine, else target/release/gl-node).
+#   --source        build the working tree (cargo build -p gl-node, a debug
+#                   build) and run that: what is on disk now, not a release.
 #
 # The secrets are exported to the node only: this script is a process of its
 # own, so nothing it reads stays set in your terminal. It prints the names it
@@ -23,12 +25,13 @@ fail() { printf 'run_local_node: %s\n' "$*" >&2; exit 1; }
 
 env_file=.env
 config=gl-node.local.json
-binary=""
+binary="" from_source=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --env) [[ $# -ge 2 ]] || fail "--env needs a file"; env_file=$2; shift 2 ;;
     --config) [[ $# -ge 2 ]] || fail "--config needs a file"; config=$2; shift 2 ;;
-    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
+    --source) from_source=1; shift ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     -*) fail "unknown option $1 (see --help)" ;;
     *) [[ -z "$binary" ]] || fail "one binary only"; binary=$1; shift ;;
   esac
@@ -62,6 +65,13 @@ fi
 # The config.
 [[ -f "$config" ]] || fail "no $config (a config with \"plaid\": { \"enabled\": true, \"environment\": \"sandbox\" }, for one)"
 export GL_NODE_CONFIG="$config"
+
+# The working tree, built, when asked for.
+if [[ -n "$from_source" ]]; then
+  [[ -z "$binary" ]] || fail "--source or a BINARY, not both"
+  cargo build -q -p gl-node || fail "the working tree did not build"
+  binary=target/debug/gl-node
+fi
 
 # The binary: given, else the newest release for this machine, else a build.
 if [[ -z "$binary" ]]; then
