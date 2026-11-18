@@ -59,4 +59,5 @@ them (a typo, a one-line fix) gets no entry.
 | [008](008-bank-feed-inbox/) | Bank-feed inbox: fetched bank transactions wait for a bookkeeper to classify them before any entry is written | done (3 of 3, fcec9e2) |
 | [009](009-node-logs/) | One log line per HTTP request, and `openledger logs [--tail]` | done (3 of 3, e5f93ec) |
 | [010](010-every-request-logged/) | A log line for every request, strangers' and `/health` included (no cap); strangers' lines can be turned off (`http::stranger`) | in progress |
+| [011](011-web-ui-on-gl-node/) | gl-node's GraphQL API for a web UI, built first; a new UI (own repo, Vercel) follows | intent and plan in draft (decisions 2–4, 6–7 open) |
 | — | Relay with a company's own certificate authority (`relayCaCert`) | planned (decision C, 2026-10-09) |
